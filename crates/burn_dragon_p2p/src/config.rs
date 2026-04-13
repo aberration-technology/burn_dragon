@@ -8,6 +8,8 @@ use burn_dragon_universality::NcaCorpusConfig;
 #[cfg(feature = "native")]
 use burn_p2p::NetworkManifest;
 use burn_p2p::{AuthConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet, SwarmAddress};
+#[cfg(target_arch = "wasm32")]
+use burn_p2p_browser::BrowserSiteBootstrapConfig;
 use chrono::{DateTime, TimeZone, Utc};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -353,7 +355,7 @@ pub struct DragonNativePeerConfig {
 }
 
 fn default_app_semver() -> Version {
-    Version::parse("0.21.0-pre.12").expect("valid burn_dragon version")
+    Version::parse("0.21.0-pre.13").expect("valid burn_dragon version")
 }
 
 impl DragonNativePeerConfig {
@@ -412,6 +414,35 @@ pub struct DragonBrowserAppConfig {
 }
 
 impl DragonBrowserAppConfig {
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_site_config(config: BrowserSiteBootstrapConfig) -> Self {
+        let mut requested_scopes =
+            BTreeSet::from([ExperimentScope::Connect, ExperimentScope::Discover]);
+        if let Some(experiment_id) = config.selected_experiment_id.as_ref() {
+            requested_scopes.insert(ExperimentScope::Train {
+                experiment_id: experiment_id.clone(),
+            });
+            requested_scopes.insert(ExperimentScope::Validate {
+                experiment_id: experiment_id.clone(),
+            });
+        }
+        Self {
+            network: DragonPeerNetworkConfig::default()
+                .with_edge_base_url(config.edge_base_url)
+                .with_seed_node_urls(Some(config.seed_node_urls)),
+            selected_experiment_id: config
+                .selected_experiment_id
+                .map(|experiment_id| experiment_id.as_str().to_owned()),
+            selected_revision_id: config
+                .selected_revision_id
+                .map(|revision_id| revision_id.as_str().to_owned()),
+            requested_scopes,
+            require_edge_auth: config.require_edge_auth,
+            #[cfg(feature = "wasm-peer")]
+            training: None,
+        }
+    }
+
     pub fn selected_experiment(&self) -> Option<(String, Option<String>)> {
         self.selected_experiment_id
             .as_ref()
@@ -641,7 +672,7 @@ mod tests {
                 ],
                 ..DragonManifestSeed::default()
             },
-            app_semver: Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+            app_semver: Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
             git_commit: None,
             enabled_features_label: None,
             auth: None,
@@ -666,7 +697,7 @@ mod tests {
             identity: Default::default(),
             bootstrap_peers: Vec::new(),
             manifest: DragonManifestSeed::default(),
-            app_semver: Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+            app_semver: Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
             git_commit: None,
             enabled_features_label: None,
             auth: None,

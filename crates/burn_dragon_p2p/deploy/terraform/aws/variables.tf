@@ -47,7 +47,7 @@ variable "bootstrap_install_source" {
 variable "bootstrap_crate_version" {
   description = "Published burn_p2p_bootstrap crate version installed on the bootstrap hosts when bootstrap_install_source = crate."
   type        = string
-  default     = "0.21.0-pre.12"
+  default     = "0.21.0-pre.13"
 }
 
 variable "bootstrap_git_repository" {
@@ -507,7 +507,7 @@ variable "managed_trainer_target" {
 variable "managed_trainer_crate_version" {
   description = "Published burn_dragon_p2p crate version installed on managed trainer instances."
   type        = string
-  default     = "0.21.0-pre.12"
+  default     = "0.21.0-pre.13"
 }
 
 variable "managed_trainer_auth_bundle_parameter_name" {

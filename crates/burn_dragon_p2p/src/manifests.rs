@@ -203,7 +203,7 @@ pub fn build_manifest_bundle(
             experiment_id: experiment_id.clone(),
         },
     ]);
-    let mut metadata = BTreeMap::from([
+    let metadata = BTreeMap::from([
         (
             "experiment_kind".into(),
             experiment_kind.workload_slug().into(),
@@ -226,8 +226,6 @@ pub fn build_manifest_bundle(
             format!("{:.1}", footprint.estimated_tokens_per_second),
         ),
     ]);
-    metadata.extend(profile.metadata_entries()?);
-
     let mut experiment_directory_entry = ExperimentDirectoryEntry {
         network_id: network_manifest.network_id.clone(),
         study_id: StudyId::new(&seed.study_id),
@@ -245,6 +243,7 @@ pub fn build_manifest_bundle(
         allowed_scopes,
         metadata,
     };
+    profile.attach_to_entry(&mut experiment_directory_entry)?;
     experiment_directory_entry.apply_revision_policy(&RevisionManifest {
         experiment_id: experiment_id.clone(),
         revision_id: RevisionId::new(&seed.revision_id),
@@ -356,7 +355,7 @@ mod tests {
             },
             DatasetViewId::new("dataset-view"),
             &footprint,
-            Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+            Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
             "test",
             "native,wgpu",
         )
@@ -412,7 +411,7 @@ mod tests {
             },
             DatasetViewId::new("dataset-view"),
             &footprint,
-            Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+            Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
             "test",
             "native,cpu",
         )

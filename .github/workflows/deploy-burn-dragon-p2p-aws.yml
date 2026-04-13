@@ -40,9 +40,9 @@ on:
           - crate
           - git
       bootstrap_version:
-        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.12`."
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.13`."
         required: false
-        default: 0.21.0-pre.12
+        default: 0.21.0-pre.13
         type: string
       bootstrap_git_ref:
         description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
@@ -355,7 +355,7 @@ jobs:
             bootstrap_version="$bootstrap_version_var"
           fi
           if [ -z "$bootstrap_version" ]; then
-            bootstrap_version="0.21.0-pre.12"
+            bootstrap_version="0.21.0-pre.13"
           fi
 
           bootstrap_git_ref="$bootstrap_git_ref_input"
@@ -394,7 +394,7 @@ jobs:
             managed_trainer_target="trainer"
           fi
           if [ -z "$managed_trainer_crate_version" ]; then
-            managed_trainer_crate_version="0.21.0-pre.12"
+            managed_trainer_crate_version="0.21.0-pre.13"
           fi
           if [ -z "$managed_trainer_auth_bundle_parameter_name" ]; then
             managed_trainer_auth_bundle_parameter_name="${secret_parameter_prefix}/trainer_auth_bundle_json"

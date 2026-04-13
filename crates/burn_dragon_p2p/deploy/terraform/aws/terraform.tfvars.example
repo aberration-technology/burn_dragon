@@ -4,7 +4,7 @@ aws_region              = "us-east-1"
 route53_zone_name       = "aberration.technology"
 edge_domain_name        = "dragon.aberration.technology"
 bootstrap_install_source = "crate"
-bootstrap_crate_version  = "0.21.0-pre.12"
+bootstrap_crate_version  = "0.21.0-pre.13"
 # bootstrap_git_ref      = "main"
 secret_parameter_prefix = "/burn-dragon-p2p/mainnet/bootstrap"
 
@@ -71,6 +71,6 @@ managed_trainer_experiment_kind = "nca"
 # managed_trainer_instance_type = "g5.xlarge"
 # managed_trainer_min_size = 1
 # managed_trainer_max_size = 2
-# managed_trainer_crate_version = "0.21.0-pre.12"
+# managed_trainer_crate_version = "0.21.0-pre.13"
 # managed_trainer_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/trainer_auth_bundle_json"
 # alarm_sns_topic_arn   = "arn:aws:sns:us-east-1:123456789012:burn-dragon-p2p-alerts"

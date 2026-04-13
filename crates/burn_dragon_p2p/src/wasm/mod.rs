@@ -3,13 +3,17 @@ use burn_p2p::{
     AuthProvider, BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId,
     ExperimentDirectoryEntry, ExperimentId, ExperimentScope, ProjectFamilyId, StudyId,
 };
+use burn_p2p_admin::AdminResult;
 use burn_p2p_app::{
-    AuthSessionCard, LifecycleAssignmentStatusCard, RuntimeCapabilityCard, TrainingResultPanel,
-    TransportHealthPanel,
+    AdminSessionCard, AuthSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel,
+    LifecycleAssignmentStatusCard, RolloutPreviewPanel, RolloutSubmissionStatusPanel,
+    RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
 };
 use burn_p2p_browser::{BrowserAppConnectConfig, BrowserAppController, BrowserSessionState};
 use burn_p2p_views::{
-    BrowserAppClientView, ContributionIdentityPanel, LifecycleAssignmentStatusView,
+    AdminSessionSummaryView, BrowserAppClientView, ContributionIdentityPanel,
+    DirectoryEntryDraftView, DirectoryMutationResultView, ExperimentDirectoryEntryView,
+    ExperimentDirectoryListView, LifecycleAssignmentStatusView, RolloutPreviewView,
     RuntimeCapabilitySummaryView, TrainingResultSummaryView,
 };
 use dioxus::prelude::*;
@@ -116,7 +120,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         .map(|bundle| bundle.project_family_id.clone())
         .unwrap_or_else(|| ProjectFamilyId::new("burn-dragon-language"));
     let app_semver = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| {
-        semver::Version::parse("0.21.0-pre.12").expect("valid burn_dragon version")
+        semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version")
     });
 
     ClientReleaseManifest {
@@ -171,7 +175,7 @@ async fn resolve_browser_training_config(
         config.selected_experiment_id.as_deref(),
         config.selected_revision_id.as_deref(),
         None,
-    )
+    )?
     .ok_or_else(|| anyhow!("no Dragon experiment entry was found on the current edge"))?;
     let profile = DragonExperimentProfile::from_entry_metadata(entry)?
         .ok_or_else(|| anyhow!("selected experiment does not publish a Dragon training profile"))?;
@@ -197,6 +201,96 @@ fn auth_provider_label(provider: &AuthProvider) -> String {
         AuthProvider::OAuth { provider } => format!("OAuth ({provider})"),
         AuthProvider::External { authority } => format!("External ({authority})"),
         AuthProvider::Static { authority } => format!("Static ({authority})"),
+    }
+}
+
+fn admin_session_summary_view(
+    session: Option<&BrowserSessionState>,
+    study_id: &str,
+) -> AdminSessionSummaryView {
+    let rollout_enabled = session_has_admin_scope(session, study_id);
+    let Some(session_state) = session else {
+        return AdminSessionSummaryView {
+            session_label: "no active operator session".into(),
+            principal_label: None,
+            provider_label: None,
+            session_id: None,
+            rollout_enabled,
+        };
+    };
+    let session_id = session_state
+        .session_id()
+        .map(|session_id| session_id.as_str().to_owned());
+    let Some(session) = session_state.session.as_ref() else {
+        return AdminSessionSummaryView {
+            session_label: "edge session pending claims".into(),
+            principal_label: None,
+            provider_label: None,
+            session_id,
+            rollout_enabled,
+        };
+    };
+    let claims = &session.claims;
+    AdminSessionSummaryView {
+        session_label: if rollout_enabled {
+            "admin session ready".into()
+        } else {
+            "authenticated session".into()
+        },
+        principal_label: Some(claims.principal_id.as_str().to_owned()),
+        provider_label: Some(auth_provider_label(&claims.provider)),
+        session_id,
+        rollout_enabled,
+    }
+}
+
+fn directory_list_view(
+    entries: &[ExperimentDirectoryEntry],
+    selected_experiment_id: Option<String>,
+    selected_revision_id: Option<String>,
+) -> ExperimentDirectoryListView {
+    ExperimentDirectoryListView::from_entries(
+        "/directory",
+        "/directory/signed",
+        selected_experiment_id,
+        selected_revision_id,
+        entries,
+    )
+}
+
+fn rollout_preview_view(entries: &[ExperimentDirectoryEntry]) -> RolloutPreviewView {
+    let summary_label = match entries.len() {
+        1 => "1 directory entry ready for rollout".into(),
+        count => format!("{count} directory entries ready for rollout"),
+    };
+    RolloutPreviewView {
+        summary_label,
+        submit_path: "/admin".into(),
+        requires_session: true,
+        entries: entries
+            .iter()
+            .map(ExperimentDirectoryEntryView::from)
+            .collect(),
+    }
+}
+
+fn rollout_result_view(result: &AdminResult) -> Option<DirectoryMutationResultView> {
+    match result {
+        AdminResult::AuthPolicyRolledOut {
+            minimum_revocation_epoch,
+            directory_entries,
+            trusted_issuers,
+            reenrollment_required,
+        } => Some(DirectoryMutationResultView {
+            status_label: minimum_revocation_epoch
+                .as_ref()
+                .map(|epoch| format!("auth policy rolled out at epoch {}", epoch.0))
+                .unwrap_or_else(|| "auth policy rolled out".into()),
+            directory_entries: *directory_entries,
+            trusted_issuers: *trusted_issuers,
+            reenrollment_required: *reenrollment_required,
+        }),
+        _ => None,
     }
 }
 
@@ -470,6 +564,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut admin_directory_json = use_signal(String::new);
     let mut admin_entry_json = use_signal(String::new);
     let mut admin_status = use_signal(String::new);
+    let admin_rollout_result = use_signal(|| None::<DirectoryMutationResultView>);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
 
@@ -695,6 +790,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut admin_status = admin_status;
             let mut admin_directory_json = admin_directory_json;
             let mut admin_entry_json = admin_entry_json;
+            let mut admin_rollout_result = admin_rollout_result;
             let mut current_view = current_view;
             spawn(async move {
                 admin_status.set("Rolling out directory…".into());
@@ -745,11 +841,18 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     admin_status.set("Directory draft is empty".into());
                     return;
                 }
-                if let Err(error) =
-                    rollout_directory_entries(&edge_base_url, &session_id, entries).await
-                {
-                    admin_status.set(error.to_string());
-                    return;
+                let rollout_result =
+                    match rollout_directory_entries(&edge_base_url, &session_id, entries.clone())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            admin_status.set(error.to_string());
+                            return;
+                        }
+                    };
+                if let Some(result_view) = rollout_result_view(&rollout_result) {
+                    admin_rollout_result.set(Some(result_view));
                 }
                 match fetch_directory_entries(&edge_base_url).await {
                     Ok(entries) => {
@@ -819,6 +922,28 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         admin_study_id.read().as_str(),
     );
     let admin_scope_label = if admin_scope_ready { "yes" } else { "no" };
+    let admin_session_card_view = admin_session_summary_view(
+        session_state.read().as_ref(),
+        admin_study_id.read().as_str(),
+    );
+    let admin_directory_entries = parse_directory_entries_json(&admin_directory_json.read()).ok();
+    let admin_entry_draft_view = parse_directory_entry_json(&admin_entry_json.read())
+        .ok()
+        .map(|entry| DirectoryEntryDraftView::from_entry(&entry));
+    let admin_directory_list_view = admin_directory_entries.as_ref().map(|entries| {
+        directory_list_view(
+            entries,
+            Some(admin_experiment_id.read().clone()).filter(|value| !value.trim().is_empty()),
+            admin_entry_draft_view
+                .as_ref()
+                .map(|draft| draft.revision_id.clone()),
+        )
+    });
+    let admin_rollout_preview = admin_directory_entries
+        .as_ref()
+        .filter(|entries| !entries.is_empty())
+        .map(|entries| rollout_preview_view(entries));
+    let admin_rollout_status_view = admin_rollout_result.read().clone();
     let browser_host_capabilities = detect_browser_host_capabilities();
     let browser_capability_decision = match (
         props.config.training.as_ref(),
@@ -1040,6 +1165,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             section {
                 h2 { "Operator" }
                 p { "Inspect and roll out live experiment-directory entries with an admin-scoped session." }
+                AdminSessionCard { session: admin_session_card_view }
                 div {
                     label { "Admin Study ID" }
                     input {
@@ -1081,6 +1207,18 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         rows: "16",
                         oninput: move |event| admin_entry_json.set(event.value()),
                     }
+                }
+                if let Some(view) = admin_directory_list_view.clone() {
+                    ExperimentDirectoryListPanel { view }
+                }
+                if let Some(draft) = admin_entry_draft_view.clone() {
+                    DirectoryEntryDraftPanel { draft }
+                }
+                if let Some(view) = admin_rollout_preview.clone() {
+                    RolloutPreviewPanel { view }
+                }
+                if let Some(view) = admin_rollout_status_view.clone() {
+                    RolloutSubmissionStatusPanel { view }
                 }
             }
             {local_training_section}

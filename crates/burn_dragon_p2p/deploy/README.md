@@ -161,7 +161,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.12`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.13`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
@@ -229,7 +229,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to `0.21.0-pre.12`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to `0.21.0-pre.13`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`

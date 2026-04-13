@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_arch = "wasm32")]
-use burn_dragon_p2p::config::{
-    DragonBrowserAppConfig, DragonBrowserSiteBootstrap, DragonPeerNetworkConfig,
-};
+use burn_dragon_p2p::config::{DragonBrowserAppConfig, DragonBrowserSiteBootstrap};
 #[cfg(target_arch = "wasm32")]
 use burn_dragon_p2p::wasm::DragonBrowserApp;
+#[cfg(target_arch = "wasm32")]
+use burn_p2p_browser::BrowserSiteBootstrapConfig;
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::*;
 
@@ -13,16 +13,30 @@ use dioxus::prelude::*;
 const DEFAULT_BOOTSTRAP_PATH: &str = "browser-app-config.json";
 
 #[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum BrowserBootstrapDocument {
+    Dragon(Box<DragonBrowserSiteBootstrap>),
+    Site(BrowserSiteBootstrapConfig),
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BrowserBootstrapDocument {
+    fn into_dragon(self) -> DragonBrowserSiteBootstrap {
+        match self {
+            Self::Dragon(bootstrap) => *bootstrap,
+            Self::Site(config) => DragonBrowserSiteBootstrap {
+                config: DragonBrowserAppConfig::from_site_config(config),
+                release_manifest: None,
+            },
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn default_bootstrap() -> DragonBrowserSiteBootstrap {
     DragonBrowserSiteBootstrap {
-        config: DragonBrowserAppConfig {
-            network: DragonPeerNetworkConfig::default(),
-            selected_experiment_id: None,
-            selected_revision_id: None,
-            requested_scopes: Default::default(),
-            require_edge_auth: true,
-            training: None,
-        },
+        config: DragonBrowserAppConfig::from_site_config(BrowserSiteBootstrapConfig::new(None)),
         release_manifest: None,
     }
 }
@@ -47,10 +61,15 @@ async fn load_browser_site_bootstrap() -> Result<DragonBrowserSiteBootstrap, Str
         Ok(response) if response.status() == 404 && path == DEFAULT_BOOTSTRAP_PATH => {
             Ok(default_bootstrap())
         }
-        Ok(response) if response.ok() => response
-            .json::<DragonBrowserSiteBootstrap>()
-            .await
-            .map_err(|error| format!("failed to decode {path}: {error}")),
+        Ok(response) if response.ok() => {
+            let body = response
+                .text()
+                .await
+                .map_err(|error| format!("failed to read {path}: {error}"))?;
+            serde_json::from_str::<BrowserBootstrapDocument>(&body)
+                .map(BrowserBootstrapDocument::into_dragon)
+                .map_err(|error| format!("failed to decode {path}: {error}"))
+        }
         Ok(response) => Err(format!("failed to load {path}: http {}", response.status())),
         Err(_error) if path == DEFAULT_BOOTSTRAP_PATH => Ok(default_bootstrap()),
         Err(error) => Err(format!("failed to fetch {path}: {error}")),

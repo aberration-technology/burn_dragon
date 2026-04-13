@@ -38,6 +38,7 @@ use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
     ExperimentId, ExperimentScope, PrincipalId, RuntimeStatus,
 };
+use burn_p2p_admin::AdminResult;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -379,7 +380,7 @@ struct AdminRolloutReport {
     experiment_id: String,
     revision_id: String,
     directory_entries: usize,
-    result: String,
+    result: AdminResult,
 }
 
 fn main() -> Result<()> {
@@ -507,7 +508,7 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
             experiment_id: replacement.experiment_id.as_str().to_owned(),
             revision_id: replacement.current_revision_id.as_str().to_owned(),
             directory_entries: directory_entries.len(),
-            result: format!("{result:?}"),
+            result,
         },
     )
 }

@@ -1,7 +1,7 @@
 training_config_paths = ["config/local/generated/p2p/nca.toml"]
 storage_root = "runs/p2p/mainnet-native-wgpu"
 target = "auto"
-app_semver = "0.21.0-pre.12"
+app_semver = "0.21.0-pre.13"
 enabled_features_label = "native,wgpu"
 
 [network]

@@ -1,12 +1,11 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
-use burn_p2p::{ExperimentId, ExperimentScope};
+use burn_p2p::{ExperimentId, RevisionId};
+use burn_p2p_browser::BrowserSiteBootstrapConfig;
 use clap::{ArgAction, Args};
-use serde_json::json;
 use wasm_bindgen_cli_support::Bindgen;
 
 const BROWSER_BIN: &str = "burn_dragon_p2p_browser";
@@ -222,23 +221,7 @@ fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
     Ok(())
 }
 
-fn default_requested_scopes(selected_experiment_id: Option<&str>) -> BTreeSet<ExperimentScope> {
-    let mut scopes = BTreeSet::from([ExperimentScope::Connect, ExperimentScope::Discover]);
-    let Some(experiment_id) = selected_experiment_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return scopes;
-    };
-    let experiment_id = ExperimentId::new(experiment_id.to_owned());
-    scopes.insert(ExperimentScope::Train {
-        experiment_id: experiment_id.clone(),
-    });
-    scopes.insert(ExperimentScope::Validate { experiment_id });
-    scopes
-}
-
-fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value {
+fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> BrowserSiteBootstrapConfig {
     let edge_url = args
         .edge_url
         .as_deref()
@@ -253,22 +236,26 @@ fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect();
-    let requested_scopes = default_requested_scopes(args.selected_experiment_id.as_deref());
 
-    json!({
-        "config": {
-            "network": {
-                "edge_base_url": edge_url,
-                "seed_node_urls": if seed_node_urls.is_empty() { serde_json::Value::Null } else { json!(seed_node_urls) },
-            },
-            "selected_experiment_id": args.selected_experiment_id,
-            "selected_revision_id": args.selected_revision_id,
-            "requested_scopes": requested_scopes,
-            "require_edge_auth": args.require_edge_auth,
-            "training": null,
-        },
-        "release_manifest": null,
-    })
+    let config = BrowserSiteBootstrapConfig::new(edge_url)
+        .with_seed_node_urls(seed_node_urls)
+        .with_edge_auth_requirement(args.require_edge_auth);
+    match args
+        .selected_experiment_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(experiment_id) => config.with_selection(
+            ExperimentId::new(experiment_id),
+            args.selected_revision_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(RevisionId::new),
+        ),
+        None => config,
+    }
 }
 
 fn cargo_bin() -> String {

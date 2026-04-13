@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
+#[cfg(feature = "native")]
+use anyhow::bail;
+use anyhow::{Result, anyhow};
 use burn_p2p::ExperimentDirectoryEntry;
+use burn_p2p_workload::{
+    DirectoryMetadataAttachment, find_matching_directory_entry_with_predicate,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "native")]
@@ -46,6 +51,14 @@ const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
 #[cfg(feature = "native")]
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
+
+fn dragon_profile_attachment() -> DirectoryMetadataAttachment {
+    DirectoryMetadataAttachment::new(
+        DRAGON_PROFILE_VERSION_METADATA_KEY,
+        DRAGON_PROFILE_JSON_METADATA_KEY,
+        DRAGON_PROFILE_VERSION.to_string(),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonExperimentProfile {
@@ -131,24 +144,24 @@ impl DragonExperimentProfile {
         ]))
     }
 
+    pub fn attach_to_entry(&self, entry: &mut ExperimentDirectoryEntry) -> Result<()> {
+        dragon_profile_attachment()
+            .attach(entry, self)
+            .map_err(|error| {
+                anyhow!(
+                    "failed to attach Dragon experiment profile for {}: {error}",
+                    entry.experiment_id.as_str()
+                )
+            })
+    }
+
     pub fn from_entry_metadata(entry: &ExperimentDirectoryEntry) -> Result<Option<Self>> {
-        let Some(profile_json) = entry.metadata.get(DRAGON_PROFILE_JSON_METADATA_KEY) else {
-            return Ok(None);
-        };
-        let profile = serde_json::from_str::<Self>(profile_json).map_err(|error| {
+        dragon_profile_attachment().decode(entry).map_err(|error| {
             anyhow!(
                 "failed to decode Dragon experiment profile for {}: {error}",
                 entry.experiment_id.as_str()
             )
-        })?;
-        if profile.version != DRAGON_PROFILE_VERSION {
-            bail!(
-                "unsupported Dragon experiment profile version {} for {}",
-                profile.version,
-                entry.experiment_id.as_str()
-            );
-        }
-        Ok(Some(profile))
+        })
     }
 }
 
@@ -157,41 +170,18 @@ pub fn find_matching_entry<'a>(
     selected_experiment_id: Option<&str>,
     selected_revision_id: Option<&str>,
     experiment_kind: Option<DragonExperimentKind>,
-) -> Option<&'a ExperimentDirectoryEntry> {
-    let matches_revision = |entry: &&ExperimentDirectoryEntry| {
-        selected_revision_id
-            .is_none_or(|revision_id| entry.current_revision_id.as_str() == revision_id)
-    };
-
-    if let Some(experiment_id) = selected_experiment_id
-        && let Some(entry) = entries
-            .iter()
-            .filter(|entry| entry.experiment_id.as_str() == experiment_id)
-            .find(matches_revision)
-    {
-        return Some(entry);
-    }
-
-    if let Some(experiment_kind) = experiment_kind
-        && let Some(entry) = entries
-            .iter()
-            .filter(|entry| {
-                entry.metadata.get("experiment_kind").map(String::as_str)
-                    == Some(experiment_kind.workload_slug())
-            })
-            .find(matches_revision)
-    {
-        return Some(entry);
-    }
-
-    entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .metadata
-                .contains_key(DRAGON_PROFILE_JSON_METADATA_KEY)
-        })
-        .find(matches_revision)
+) -> Result<Option<&'a ExperimentDirectoryEntry>> {
+    find_matching_directory_entry_with_predicate::<DragonExperimentProfile, _>(
+        entries,
+        &dragon_profile_attachment(),
+        selected_experiment_id,
+        selected_revision_id,
+        |profile| {
+            experiment_kind
+                .map(|experiment_kind| profile.experiment_kind == experiment_kind)
+                .unwrap_or(true)
+        },
+    )
 }
 
 #[cfg(feature = "native")]
@@ -481,7 +471,8 @@ fn fetch_matching_profile_entry(
         Some(&native.manifest.experiment_id),
         Some(&native.manifest.revision_id),
         Some(experiment_kind),
-    ) else {
+    )?
+    else {
         return Ok(None);
     };
     let Some(profile) = DragonExperimentProfile::from_entry_metadata(entry)? else {

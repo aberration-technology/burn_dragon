@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: "Validation suite to run. Example: `smoke` for the normal repo smoke rung, `nca-runtime-cluster` for the ignored 3-peer native runtime cluster test, or `nca-edge-drill` / `climbmix-edge-drill` for the local browser+native control-plane drills."
+        description: "Validation suite to run. Example: `smoke` for the normal repo smoke rung, `nca-artifacts` for the explicit artifact persistence/publication check, `nca-runtime-cluster` for the ignored 3-peer native runtime cluster test, or `nca-edge-drill` / `climbmix-edge-drill` for the local browser+native control-plane drills."
         required: true
         default: smoke
         type: choice
         options:
           - smoke
+          - nca-artifacts
           - nca-runtime-cluster
           - nca-edge-drill
           - climbmix-edge-drill
@@ -46,6 +47,9 @@ jobs:
           case "${{ github.event.inputs.suite }}" in
             smoke)
               cargo run --manifest-path Cargo.toml -p xtask -- smoke
+              ;;
+            nca-artifacts)
+              cargo run --manifest-path Cargo.toml -p xtask -- artifact-check
               ;;
             nca-runtime-cluster)
               cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --test native_training nca_native_runtime_cluster_smoke_converges_and_merges_heads -- --ignored --exact --nocapture

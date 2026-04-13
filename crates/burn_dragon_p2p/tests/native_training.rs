@@ -1369,6 +1369,112 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
 }
 
 #[test]
+fn nca_native_runtime_persists_and_publishes_artifacts() {
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train.toml");
+    let shard_root = root.path().join("nca-runtime-shards");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+    );
+
+    let native = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path],
+        storage_root: root.path().join("storage-runtime-artifacts"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+        git_commit: Some("artifact-smoke".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: shard_root,
+            dataset_name: Some("dragon-nca-runtime-artifacts".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+
+    let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+    let experiment_entry = prepared.manifests.experiment_directory[0].clone();
+    let mut peer = spawn_prepared_native_peer(prepared).expect("spawn peer");
+    let telemetry = peer.telemetry();
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            let snapshot = telemetry.snapshot();
+            snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty()
+        },
+        "artifact runtime did not start",
+    );
+
+    let experiment = peer.mainnet().experiment(
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
+    );
+    let genesis_head = peer
+        .initialize_local_head(&experiment)
+        .expect("init local genesis head");
+    let training = peer
+        .train_window_once_with_pinned_head(&experiment, Some(&genesis_head))
+        .expect("train one window");
+
+    let loss = metric_float_any(&training.report.stats, &["loss", "train_loss"]);
+    assert!(loss.is_finite(), "train loss must be finite");
+    assert_eq!(
+        training.head.parent_head_id,
+        Some(genesis_head.head_id.clone())
+    );
+    assert!(
+        training.artifact.bytes_len > 0,
+        "artifact bytes should be non-zero"
+    );
+    assert!(
+        !training.artifact.chunks.is_empty(),
+        "artifact should contain at least one chunk"
+    );
+
+    let store = peer.artifact_store().expect("artifact store");
+    assert!(
+        store.has_manifest(&training.artifact.artifact_id),
+        "runtime peer should persist the training update artifact manifest locally"
+    );
+    assert!(
+        training
+            .artifact
+            .chunks
+            .iter()
+            .all(|chunk| store.has_chunk(&chunk.chunk_id)),
+        "runtime peer should persist every training update artifact chunk locally"
+    );
+    assert!(
+        store.has_manifest(&training.head.artifact_id),
+        "runtime peer should persist the head artifact manifest locally"
+    );
+
+    peer.publish_head_provider(&experiment, &training.head)
+        .expect("publish head provider");
+    peer.publish_artifact_from_store(&training.artifact.artifact_id)
+        .expect("publish delta artifact from local store");
+    if training.head.artifact_id != training.artifact.artifact_id {
+        peer.publish_artifact_from_store(&training.head.artifact_id)
+            .expect("publish head artifact from local store");
+    }
+
+    shutdown_runtime_peer(peer, "artifact peer");
+}
+
+#[test]
 #[ignore = "manual stress test; upstream libp2p-request-response debug assert can panic during multi-round native runtime runs"]
 fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
     let _guard = native_swarm_test_guard();

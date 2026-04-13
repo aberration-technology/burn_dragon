@@ -71,6 +71,20 @@ jobs:
       - run: cargo test --manifest-path Cargo.toml --workspace --all-targets --exclude burn_dragon_p2p --exclude xtask -- --test-threads=1
       - run: cargo run --manifest-path Cargo.toml -p xtask -- smoke
 
+  artifact-validation:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path Cargo.toml -p xtask -- artifact-check
+
   browser-site:
     runs-on: ubuntu-latest
     needs: lint

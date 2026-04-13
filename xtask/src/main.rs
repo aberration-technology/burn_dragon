@@ -17,6 +17,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
+    ArtifactCheck,
     BuildNative,
     BuildNativeWgpu,
     BuildNativeCuda,
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
         CommandKind::BuildBrowser => build_browser(),
         CommandKind::BuildBrowserSite(args) => browser_site::build_browser_site(&args),
         CommandKind::BuildMatrix => build_matrix(),
+        CommandKind::ArtifactCheck => artifact_check(),
         CommandKind::NativeSmoke => native_smoke(),
         CommandKind::NativeScale => native_scale(),
         CommandKind::NativeLarge => native_large(),
@@ -101,6 +103,25 @@ fn smoke() -> Result<()> {
     wasm_smoke()?;
     build_native_cuda()?;
     Ok(())
+}
+
+fn artifact_check() -> Result<()> {
+    run(
+        "cargo",
+        &[
+            "test",
+            "-p",
+            P2P_PACKAGE,
+            "--features",
+            NativeBuildTarget::Wgpu.features(),
+            "--test",
+            NATIVE_TEST,
+            "nca_native_runtime_persists_and_publishes_artifacts",
+            "--",
+            "--exact",
+            "--nocapture",
+        ],
+    )
 }
 
 fn all() -> Result<()> {

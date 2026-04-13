@@ -65,9 +65,17 @@ locals {
   }
   auth_principals = try(jsondecode(var.auth_principals_json), [])
   secret_parameter_names = {
-    auth_client_id     = "${var.secret_parameter_prefix}/auth_client_id"
-    auth_client_secret = "${var.secret_parameter_prefix}/auth_client_secret"
+    auth_client_id                 = "${var.secret_parameter_prefix}/auth_client_id"
+    auth_client_secret             = "${var.secret_parameter_prefix}/auth_client_secret"
+    authority_key                  = "${var.secret_parameter_prefix}/authority_key"
+    control_plane_redis_auth_token = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
   }
+  bootstrap_primary_private_ip   = "10.42.1.10"
+  bootstrap_secondary_private_ip = "10.42.2.10"
+  bootstrap_peer_internal_multiaddrs = [
+    "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",
+    "/ip4/${local.bootstrap_secondary_private_ip}/tcp/${var.p2p_port}",
+  ]
   bootstrap_data_mount_path   = "/var/lib/burn-p2p"
   bootstrap_auth_root         = "${local.bootstrap_data_mount_path}/auth"
   bootstrap_peer_root         = "${local.bootstrap_data_mount_path}/bootstrap-peer"
@@ -334,7 +342,7 @@ locals {
         }
       }
       platform            = "Native"
-      bootstrap_addresses = []
+      bootstrap_addresses = local.bootstrap_peer_internal_multiaddrs
       listen_addresses = [
         "/ip4/0.0.0.0/tcp/${var.p2p_port}",
         "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
@@ -371,6 +379,11 @@ locals {
     }
     remaining_work_units = var.remaining_work_units
     admin_signer_peer_id = "burn-dragon-bootstrap-authority"
+    operator_state_backend = {
+      kind       = "redis"
+      url        = "$${BURN_P2P_SHARED_REDIS_URL}"
+      key_prefix = "burn-dragon:operator-state"
+    }
     artifact_publication = {
       targets = [
         {
@@ -412,7 +425,7 @@ locals {
           root = local.bootstrap_peer_root
         }
         dataset         = null
-        bootstrap_peers = []
+        bootstrap_peers = local.bootstrap_peer_internal_multiaddrs
         listen_addresses = [
           "/ip4/0.0.0.0/tcp/${var.p2p_port}",
           "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
@@ -432,7 +445,12 @@ locals {
         var.native_target_artifact_hash,
         var.browser_target_artifact_hash,
       ]
-      session_ttl_seconds      = 86400
+      session_ttl_seconds = 86400
+      session_state_backend = {
+        kind       = "redis"
+        url        = "$${BURN_P2P_SHARED_REDIS_URL}"
+        key_prefix = "burn-dragon:auth-sessions"
+      }
       minimum_revocation_epoch = 1
       principals               = local.auth_principals
       provider_policy          = local.auth_provider_policy
@@ -446,12 +464,18 @@ locals {
     http_port        = var.http_port
   })
   secret_sync_script = templatefile("${path.module}/templates/bootstrap-secret-sync.sh.tftpl", {
-    aws_region                       = var.aws_region
-    auth_client_credentials_required = local.auth_oauth_enabled
-    auth_client_id_name              = local.secret_parameter_names.auth_client_id
-    auth_client_secret_name          = local.secret_parameter_names.auth_client_secret
-    auth_redirect_uri                = local.auth_redirect_path == null ? "" : "https://${var.edge_domain_name}${local.auth_redirect_path}"
-    edge_domain_name                 = var.edge_domain_name
+    aws_region                          = var.aws_region
+    auth_client_credentials_required    = local.auth_oauth_enabled
+    auth_client_id_name                 = local.secret_parameter_names.auth_client_id
+    auth_client_secret_name             = local.secret_parameter_names.auth_client_secret
+    auth_redirect_uri                   = local.auth_redirect_path == null ? "" : "https://${var.edge_domain_name}${local.auth_redirect_path}"
+    authority_key_name                  = local.secret_parameter_names.authority_key
+    authority_key_path                  = "${local.bootstrap_auth_root}/bootstrap-authority.key"
+    bootstrap_node_role                 = "$${BOOTSTRAP_NODE_ROLE}"
+    control_plane_redis_auth_token_name = local.secret_parameter_names.control_plane_redis_auth_token
+    control_plane_redis_endpoint        = aws_elasticache_replication_group.control_plane.primary_endpoint_address
+    control_plane_redis_port            = aws_elasticache_replication_group.control_plane.port
+    edge_domain_name                    = var.edge_domain_name
   })
   bootstrap_auth_feature = local.auth_connector_kind == "github" ? "auth-github" : (
     local.auth_connector_kind == "oidc" ? "auth-oidc" : (
@@ -517,7 +541,18 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(local.tags, {
-    Name = "${var.stack_name}-public"
+    Name = "${var.stack_name}-public-a"
+  })
+}
+
+resource "aws_subnet" "public_secondary" {
+  vpc_id                  = aws_vpc.bootstrap.id
+  cidr_block              = "10.42.2.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = true
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-public-b"
   })
 }
 
@@ -544,6 +579,11 @@ resource "aws_route_table" "public" {
 
 resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_secondary" {
+  subnet_id      = aws_subnet.public_secondary.id
   route_table_id = aws_route_table.public.id
 }
 
@@ -646,6 +686,15 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
       {
         Effect = "Allow"
         Action = [
+          "ssm:PutParameter",
+        ]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.secret_parameter_names.authority_key}",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "kms:Decrypt",
         ]
         Resource = [data.aws_kms_alias.ssm.target_key_arn]
@@ -677,6 +726,73 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
 resource "aws_iam_instance_profile" "bootstrap" {
   name = "${var.stack_name}-bootstrap"
   role = aws_iam_role.bootstrap.name
+}
+
+resource "aws_security_group" "control_plane_redis" {
+  name        = "${var.stack_name}-control-plane-redis"
+  description = "burn_dragon_p2p shared redis control plane"
+  vpc_id      = aws_vpc.bootstrap.id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.bootstrap.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-control-plane-redis"
+  })
+}
+
+resource "aws_elasticache_subnet_group" "control_plane" {
+  name       = substr(replace(lower("${var.stack_name}-${terraform.workspace}-cp"), "_", "-"), 0, 40)
+  subnet_ids = [aws_subnet.public.id, aws_subnet.public_secondary.id]
+
+  tags = local.tags
+}
+
+resource "random_password" "control_plane_redis_auth_token" {
+  length  = 32
+  special = false
+}
+
+resource "aws_ssm_parameter" "control_plane_redis_auth_token" {
+  name      = local.secret_parameter_names.control_plane_redis_auth_token
+  type      = "SecureString"
+  key_id    = data.aws_kms_alias.ssm.target_key_arn
+  overwrite = true
+  value     = random_password.control_plane_redis_auth_token.result
+
+  tags = local.tags
+}
+
+resource "aws_elasticache_replication_group" "control_plane" {
+  replication_group_id       = substr(replace(lower("${var.stack_name}-${terraform.workspace}-cp"), "_", "-"), 0, 40)
+  description                = "burn_dragon_p2p shared operator/session state"
+  engine                     = "redis"
+  engine_version             = "7.1"
+  node_type                  = "cache.t4g.small"
+  port                       = 6379
+  parameter_group_name       = "default.redis7"
+  subnet_group_name          = aws_elasticache_subnet_group.control_plane.name
+  security_group_ids         = [aws_security_group.control_plane_redis.id]
+  automatic_failover_enabled = true
+  multi_az_enabled           = true
+  num_cache_clusters         = 2
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = true
+  auth_token                 = random_password.control_plane_redis_auth_token.result
+  apply_immediately          = true
+
+  tags = local.tags
 }
 
 resource "aws_s3_bucket" "artifact" {
@@ -786,6 +902,7 @@ resource "aws_instance" "bootstrap" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.public.id
+  private_ip                  = local.bootstrap_primary_private_ip
   vpc_security_group_ids      = [aws_security_group.bootstrap.id]
   iam_instance_profile        = aws_iam_instance_profile.bootstrap.name
   associate_public_ip_address = true
@@ -808,13 +925,19 @@ resource "aws_instance" "bootstrap" {
     artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
     aws_region                             = var.aws_region
     bootstrap_auth_feature                 = local.bootstrap_auth_feature
+    bootstrap_auth_root                    = local.bootstrap_auth_root
     bootstrap_config_json                  = local.bootstrap_config_json
     bootstrap_data_device_name             = var.data_volume_device_name
     bootstrap_data_mount_path              = local.bootstrap_data_mount_path
     bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_data.id
     bootstrap_git_ref                      = var.bootstrap_git_ref
     bootstrap_git_repo                     = var.bootstrap_git_repository
+    bootstrap_node_role                    = "primary"
     caddyfile                              = local.caddyfile
+    control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token
+    control_plane_redis_endpoint           = aws_elasticache_replication_group.control_plane.primary_endpoint_address
+    control_plane_redis_port               = aws_elasticache_replication_group.control_plane.port
+    authority_key_parameter_name           = local.secret_parameter_names.authority_key
     http_port                              = var.http_port
     secret_sync_script                     = local.secret_sync_script
   })
@@ -828,6 +951,76 @@ resource "aws_volume_attachment" "bootstrap_data" {
   device_name = var.data_volume_device_name
   volume_id   = aws_ebs_volume.bootstrap_data.id
   instance_id = aws_instance.bootstrap.id
+
+  stop_instance_before_detaching = true
+}
+
+resource "aws_ebs_volume" "bootstrap_secondary_data" {
+  availability_zone = aws_subnet.public_secondary.availability_zone
+  size              = var.data_volume_size_gib
+  type              = var.data_volume_type
+  encrypted         = true
+
+  tags = merge(local.tags, {
+    Name           = "${var.stack_name}-bootstrap-secondary-data"
+    SnapshotPolicy = local.bootstrap_data_snapshot_tag
+    Persistence    = "retained-bootstrap-state"
+  })
+}
+
+resource "aws_instance" "bootstrap_secondary" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.public_secondary.id
+  private_ip                  = local.bootstrap_secondary_private_ip
+  vpc_security_group_ids      = [aws_security_group.bootstrap.id]
+  iam_instance_profile        = aws_iam_instance_profile.bootstrap.name
+  associate_public_ip_address = true
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  root_block_device {
+    volume_size           = var.root_volume_size_gib
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
+    artifact_bucket_name                   = local.artifact_bucket_name
+    artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
+    artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
+    aws_region                             = var.aws_region
+    bootstrap_auth_feature                 = local.bootstrap_auth_feature
+    bootstrap_auth_root                    = local.bootstrap_auth_root
+    bootstrap_config_json                  = local.bootstrap_config_json
+    bootstrap_data_device_name             = var.data_volume_device_name
+    bootstrap_data_mount_path              = local.bootstrap_data_mount_path
+    bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_secondary_data.id
+    bootstrap_git_ref                      = var.bootstrap_git_ref
+    bootstrap_git_repo                     = var.bootstrap_git_repository
+    bootstrap_node_role                    = "secondary"
+    caddyfile                              = local.caddyfile
+    control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token
+    control_plane_redis_endpoint           = aws_elasticache_replication_group.control_plane.primary_endpoint_address
+    control_plane_redis_port               = aws_elasticache_replication_group.control_plane.port
+    authority_key_parameter_name           = local.secret_parameter_names.authority_key
+    http_port                              = var.http_port
+    secret_sync_script                     = local.secret_sync_script
+  })
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-bootstrap-secondary"
+  })
+}
+
+resource "aws_volume_attachment" "bootstrap_secondary_data" {
+  device_name = var.data_volume_device_name
+  volume_id   = aws_ebs_volume.bootstrap_secondary_data.id
+  instance_id = aws_instance.bootstrap_secondary.id
 
   stop_instance_before_detaching = true
 }
@@ -951,10 +1144,57 @@ resource "aws_eip" "bootstrap" {
   })
 }
 
-resource "aws_route53_record" "edge" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = var.edge_domain_name
-  type    = "A"
-  ttl     = 60
-  records = [aws_eip.bootstrap.public_ip]
+resource "aws_eip" "bootstrap_secondary" {
+  domain   = "vpc"
+  instance = aws_instance.bootstrap_secondary.id
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-bootstrap-secondary"
+  })
+}
+
+resource "aws_route53_health_check" "edge_primary" {
+  ip_address        = aws_eip.bootstrap.public_ip
+  type              = "TCP"
+  port              = 443
+  request_interval  = 30
+  failure_threshold = 3
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-edge-primary"
+  })
+}
+
+resource "aws_route53_health_check" "edge_secondary" {
+  ip_address        = aws_eip.bootstrap_secondary.public_ip
+  type              = "TCP"
+  port              = 443
+  request_interval  = 30
+  failure_threshold = 3
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-edge-secondary"
+  })
+}
+
+resource "aws_route53_record" "edge_primary" {
+  zone_id                          = data.aws_route53_zone.selected.zone_id
+  name                             = var.edge_domain_name
+  type                             = "A"
+  ttl                              = 60
+  set_identifier                   = "primary"
+  multivalue_answer_routing_policy = true
+  health_check_id                  = aws_route53_health_check.edge_primary.id
+  records                          = [aws_eip.bootstrap.public_ip]
+}
+
+resource "aws_route53_record" "edge_secondary" {
+  zone_id                          = data.aws_route53_zone.selected.zone_id
+  name                             = var.edge_domain_name
+  type                             = "A"
+  ttl                              = 60
+  set_identifier                   = "secondary"
+  multivalue_answer_routing_policy = true
+  health_check_id                  = aws_route53_health_check.edge_secondary.id
+  records                          = [aws_eip.bootstrap_secondary.public_ip]
 }

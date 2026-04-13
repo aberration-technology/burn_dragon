@@ -10,11 +10,13 @@ This folder contains the operator-facing deployment assets for the `burn_dragon_
 
 The AWS Terraform root deploys a single-region bootstrap plane for the Dragon network:
 
-- one EC2 bootstrap/edge host
+- two EC2 bootstrap/edge hosts across two AZs
 - Route53 DNS for the browser edge
 - TLS termination via Caddy on the host
-- single-host retained encrypted EBS data volume for bootstrap/auth/publication state
+- retained encrypted EBS data volume per bootstrap host for local peer/runtime state
 - bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
+- shared Redis-backed auth session and operator state for multi-node control-plane continuity
+- shared authority material synchronized through SSM so both bootstrap nodes serve the same auth/control plane
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
 - EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
@@ -35,7 +37,7 @@ profile, and browser peers fetch only the shards they train on from that externa
 
 Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target.
 
-There is no second artifact node by default. The bootstrap/control-plane host owns artifact publication, while durable artifact bytes live in S3 and bootstrap/auth/session state lives on the retained EBS data volume.
+There is no separate artifact node by default. The bootstrap/control-plane hosts own artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and each bootstrap node keeps its local peer/runtime state on its retained EBS data volume.
 
 ## One-Click GitHub Action
 
@@ -50,9 +52,9 @@ That workflow:
 - creates or reuses the S3 bucket used for durable direct artifact publication
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the edge URL, seed multiaddrs, pinned bootstrap git ref, and artifact S3 prefix in the workflow summary
+- prints the primary and secondary bootstrap instance details, shared Redis endpoint, pinned bootstrap git ref, and artifact S3 prefix in the workflow summary
 
-If you trigger the workflow with a forced bootstrap replacement, Terraform replaces only the EC2 host. The retained bootstrap data volume is reattached to the replacement host, so bootstrap/auth/publication state survives a normal rebuild. State is reset only if you explicitly destroy or replace the retained data volume itself.
+If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the primary EC2 host. The retained primary bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
 
 The workflow still performs a Terraform plan internally before apply. That keeps the operator experience one-click without dropping the safety and auditability of a plan phase.
 

@@ -4,18 +4,33 @@ output "edge_url" {
 }
 
 output "bootstrap_instance_id" {
-  description = "EC2 instance id for the bootstrap edge."
+  description = "EC2 instance id for the primary bootstrap edge."
   value       = aws_instance.bootstrap.id
 }
 
+output "bootstrap_secondary_instance_id" {
+  description = "EC2 instance id for the secondary bootstrap edge."
+  value       = aws_instance.bootstrap_secondary.id
+}
+
 output "bootstrap_public_ip" {
-  description = "Elastic IP attached to the bootstrap edge."
+  description = "Elastic IP attached to the primary bootstrap edge."
   value       = aws_eip.bootstrap.public_ip
 }
 
+output "bootstrap_secondary_public_ip" {
+  description = "Elastic IP attached to the secondary bootstrap edge."
+  value       = aws_eip.bootstrap_secondary.public_ip
+}
+
 output "bootstrap_data_volume_id" {
-  description = "Retained EBS volume id carrying bootstrap/auth/publication state."
+  description = "Retained EBS volume id carrying primary bootstrap/auth/publication state."
   value       = aws_ebs_volume.bootstrap_data.id
+}
+
+output "bootstrap_secondary_data_volume_id" {
+  description = "Retained EBS volume id carrying secondary bootstrap/auth/publication state."
+  value       = aws_ebs_volume.bootstrap_secondary_data.id
 }
 
 output "bootstrap_data_mount_path" {
@@ -29,8 +44,13 @@ output "artifact_bucket_name" {
 }
 
 output "artifact_bucket_uri" {
-  description = "S3 URI prefix receiving directly published checkpoint and metric artifacts from the bootstrap host."
+  description = "S3 URI prefix receiving directly published checkpoint and metric artifacts from the bootstrap hosts."
   value       = local.artifact_bucket_s3_uri
+}
+
+output "control_plane_redis_primary_endpoint" {
+  description = "Primary Redis endpoint backing shared operator and auth session state."
+  value       = aws_elasticache_replication_group.control_plane.primary_endpoint_address
 }
 
 output "seed_node_tcp_multiaddr" {

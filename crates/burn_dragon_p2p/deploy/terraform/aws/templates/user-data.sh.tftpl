@@ -38,6 +38,11 @@ ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
 BOOTSTRAP_DATA_VOLUME_ID="${bootstrap_data_volume_id}"
 BOOTSTRAP_DATA_DEVICE_NAME="${bootstrap_data_device_name}"
 BOOTSTRAP_DATA_MOUNT_PATH="${bootstrap_data_mount_path}"
+BOOTSTRAP_NODE_ROLE="${bootstrap_node_role}"
+BOOTSTRAP_AUTH_ROOT="${bootstrap_auth_root}"
+BOOTSTRAP_AUTHORITY_KEY_PATH="${bootstrap_auth_root}/bootstrap-authority.key"
+AUTHORITY_KEY_PARAMETER_NAME="${authority_key_parameter_name}"
+AWS_REGION="${aws_region}"
 
 resolve_bootstrap_data_device() {
   local candidate
@@ -91,7 +96,7 @@ mountpoint -q "$${BOOTSTRAP_DATA_MOUNT_PATH}" || mount "$${BOOTSTRAP_DATA_MOUNT_
 
 install -d -m 0755 /etc/burn-dragon-p2p
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"
-install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/auth"
+install -d -m 0700 "$${BOOTSTRAP_DATA_MOUNT_PATH}/auth"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/bootstrap-peer"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/public"
 
@@ -134,3 +139,19 @@ systemctl daemon-reload
 systemctl enable caddy burn-p2p-bootstrap
 systemctl restart caddy
 systemctl start burn-p2p-bootstrap
+
+if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then
+  for attempt in $(seq 1 120); do
+    if [ -s "$${BOOTSTRAP_AUTHORITY_KEY_PATH}" ]; then
+      authority_key_b64="$(base64 -w0 "$${BOOTSTRAP_AUTHORITY_KEY_PATH}")"
+      aws ssm put-parameter \
+        --region "$${AWS_REGION}" \
+        --type SecureString \
+        --overwrite \
+        --name "$${AUTHORITY_KEY_PARAMETER_NAME}" \
+        --value "$${authority_key_b64}"
+      break
+    fi
+    sleep 5
+  done
+fi

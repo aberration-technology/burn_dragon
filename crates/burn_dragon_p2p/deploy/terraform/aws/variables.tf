@@ -33,6 +33,12 @@ variable "edge_domain_name" {
   default     = "dragon.aberration.technology"
 }
 
+variable "allow_route53_zone_apex_records" {
+  description = "Whether Terraform may manage records at the Route53 hosted-zone apex. Defaults to false so existing apex websites and CDNs are not accidentally displaced."
+  type        = bool
+  default     = false
+}
+
 variable "bootstrap_install_source" {
   description = "How the bootstrap hosts install burn_p2p_bootstrap. Supported values: crate or git. Production deployments should use the published crate by default."
   type        = string

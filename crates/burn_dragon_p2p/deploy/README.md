@@ -120,6 +120,8 @@ That workflow builds the standalone `burn_dragon_p2p_browser` wasm client throug
 
 The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Validate` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
 
+Terraform now protects the Route53 hosted-zone apex by default. With the production defaults, the stack may manage `dragon.aberration.technology` and `datasets.dragon.aberration.technology`, but it will refuse to claim `aberration.technology` itself unless `allow_route53_zone_apex_records=true` is set explicitly in Terraform.
+
 Optional GitHub repository variables for the Pages workflow:
 
 - `BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL`

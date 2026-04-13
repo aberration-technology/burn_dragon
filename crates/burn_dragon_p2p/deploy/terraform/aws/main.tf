@@ -91,7 +91,10 @@ locals {
   control_plane_dashboard_name    = "${var.stack_name}-${terraform.workspace}-control-plane"
   control_plane_dashboard_url     = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${local.control_plane_dashboard_name}"
   managed_trainer_alarm_threshold = max(var.managed_trainer_desired_capacity, 1)
+  route53_zone_apex               = trimsuffix(lower(trimspace(var.route53_zone_name)), ".")
+  edge_domain_name_normalized     = trimsuffix(lower(trimspace(var.edge_domain_name)), ".")
   dataset_domain_name             = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
+  dataset_domain_name_normalized  = trimsuffix(lower(trimspace(local.dataset_domain_name)), ".")
   default_dataset_bucket_name = trimsuffix(
     substr(
       replace(
@@ -621,10 +624,22 @@ check "artifact_replica_encryption_configuration" {
   }
 }
 
+check "edge_domain_configuration" {
+  assert {
+    condition     = var.allow_route53_zone_apex_records || local.edge_domain_name_normalized != local.route53_zone_apex
+    error_message = "edge_domain_name must not equal the Route53 hosted-zone apex unless allow_route53_zone_apex_records is set. This protects existing apex websites and CDNs from accidental replacement."
+  }
+}
+
 check "dataset_domain_configuration" {
   assert {
     condition     = local.dataset_domain_name != var.edge_domain_name
     error_message = "dataset_domain_name must differ from edge_domain_name so the managed dataset CDN does not conflict with the bootstrap edge hostname."
+  }
+
+  assert {
+    condition     = var.allow_route53_zone_apex_records || local.dataset_domain_name_normalized != local.route53_zone_apex
+    error_message = "dataset_domain_name must not equal the Route53 hosted-zone apex unless allow_route53_zone_apex_records is set. This protects existing apex websites and CDNs from accidental replacement."
   }
 }
 

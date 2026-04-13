@@ -10,7 +10,6 @@ pub mod experiments;
 pub mod manifests;
 pub mod profile;
 
-#[cfg(feature = "native")]
 pub mod admin;
 #[cfg(feature = "native")]
 pub mod native;

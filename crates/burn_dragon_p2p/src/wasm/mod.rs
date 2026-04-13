@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use burn_p2p::{
     AuthProvider, BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId,
-    ExperimentId, ExperimentScope, ProjectFamilyId,
+    ExperimentDirectoryEntry, ExperimentId, ExperimentScope, ProjectFamilyId, StudyId,
 };
 use burn_p2p_app::{
     AuthSessionCard, LifecycleAssignmentStatusCard, RuntimeCapabilityCard, TrainingResultPanel,
@@ -14,6 +14,7 @@ use burn_p2p_views::{
 };
 use dioxus::prelude::*;
 
+use crate::admin::{fetch_directory_entries, rollout_directory_entries, upsert_directory_entry};
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
     load_browser_session, provider_code_from_window_location,
@@ -279,30 +280,105 @@ fn latest_training_result_summary(
     })
 }
 
-async fn ensure_github_session(
+const DEFAULT_ADMIN_STUDY_ID: &str = "burn-dragon-mainnet";
+
+fn admin_requested_scopes(
+    config: &DragonBrowserAppConfig,
+    study_id: &str,
+) -> std::collections::BTreeSet<ExperimentScope> {
+    let mut scopes = config.requested_scopes.clone();
+    let study_id = study_id.trim();
+    if !study_id.is_empty() {
+        scopes.insert(ExperimentScope::Admin {
+            study_id: StudyId::new(study_id.to_owned()),
+        });
+    }
+    scopes
+}
+
+fn granted_admin_studies(session: Option<&BrowserSessionState>) -> Vec<String> {
+    session
+        .and_then(|session| session.session.as_ref())
+        .map(|session| {
+            session
+                .claims
+                .granted_scopes
+                .iter()
+                .filter_map(|scope| match scope {
+                    ExperimentScope::Admin { study_id } => Some(study_id.as_str().to_owned()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn session_has_admin_scope(session: Option<&BrowserSessionState>, study_id: &str) -> bool {
+    let study_id = study_id.trim();
+    !study_id.is_empty()
+        && granted_admin_studies(session)
+            .iter()
+            .any(|value| value == study_id)
+}
+
+fn directory_entries_to_json(entries: &[ExperimentDirectoryEntry]) -> Result<String> {
+    serde_json::to_string_pretty(entries).map_err(Into::into)
+}
+
+fn directory_entry_to_json(entry: &ExperimentDirectoryEntry) -> Result<String> {
+    serde_json::to_string_pretty(entry).map_err(Into::into)
+}
+
+fn parse_directory_entries_json(input: &str) -> Result<Vec<ExperimentDirectoryEntry>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(input).map_err(|error| anyhow!("invalid directory JSON: {error}"))
+}
+
+fn parse_directory_entry_json(input: &str) -> Result<ExperimentDirectoryEntry> {
+    serde_json::from_str(input.trim()).map_err(|error| anyhow!("invalid entry JSON: {error}"))
+}
+
+fn find_directory_entry(
+    entries: &[ExperimentDirectoryEntry],
+    study_id: &str,
+    experiment_id: &str,
+) -> Option<ExperimentDirectoryEntry> {
+    let study_id = study_id.trim();
+    let experiment_id = experiment_id.trim();
+    entries
+        .iter()
+        .find(|entry| {
+            entry.experiment_id.as_str() == experiment_id
+                && (study_id.is_empty() || entry.study_id.as_str() == study_id)
+        })
+        .cloned()
+}
+
+async fn ensure_required_session(
     config: &DragonBrowserAppConfig,
 ) -> Result<Option<BrowserSessionState>> {
     let session = load_browser_session(&resolved_edge_base_url(config)?).await?;
     if config.require_github_auth {
-        let claims = session
-            .session
-            .as_ref()
-            .ok_or_else(|| anyhow!("GitHub sign-in is required before joining this network"))?;
-        if !matches!(claims.claims.provider, AuthProvider::GitHub) {
-            bail!("browser session is not GitHub-authenticated");
-        }
+        let _claims = session.session.as_ref().ok_or_else(|| {
+            anyhow!("an authenticated browser session is required before joining this network")
+        })?;
     }
     Ok(Some(session))
 }
 
 pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let _ = ensure_github_session(config).await?;
+    let _ = ensure_required_session(config).await?;
     let controller = BrowserAppController::connect_with(connect_config(config)?).await?;
     Ok(controller.view())
 }
 
 pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let _ = ensure_github_session(config).await?;
+    let _ = ensure_required_session(config).await?;
     let mut controller = BrowserAppController::connect_with(connect_config(config)?).await?;
     controller.refresh().await.map_err(Into::into)
 }
@@ -330,16 +406,17 @@ pub async fn resume_or_complete_browser_auth(
     Ok(None)
 }
 
-pub async fn start_browser_github_auth(
+pub async fn start_browser_github_auth_with_scopes(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
+    requested_scopes: std::collections::BTreeSet<ExperimentScope>,
 ) -> Result<()> {
     let edge_base_url = resolved_edge_base_url(config)?;
     let release_manifest = resolve_browser_release_manifest(config, release_manifest).await?;
     let login = begin_browser_github_login(
         &edge_base_url,
         &release_manifest,
-        config.requested_scopes.clone(),
+        requested_scopes,
         3600,
         None,
     )
@@ -351,8 +428,16 @@ pub async fn start_browser_github_auth(
         .ok_or_else(|| anyhow!("window unavailable"))?
         .location()
         .set_href(&authorize_url)
-        .map_err(|error| anyhow!("failed to redirect to GitHub auth: {error:?}"))?;
+        .map_err(|error| anyhow!("failed to redirect to edge auth: {error:?}"))?;
     Ok(())
+}
+
+pub async fn start_browser_github_auth(
+    config: &DragonBrowserAppConfig,
+    release_manifest: Option<&ClientReleaseManifest>,
+) -> Result<()> {
+    start_browser_github_auth_with_scopes(config, release_manifest, config.requested_scopes.clone())
+        .await
 }
 
 #[derive(Props, Clone, PartialEq)]
@@ -375,6 +460,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let status = use_signal(String::new);
     let current_view = use_signal(|| None::<BrowserAppClientView>);
     let session_state = use_signal(|| None::<BrowserSessionState>);
+    let mut admin_study_id = use_signal(|| DEFAULT_ADMIN_STUDY_ID.to_owned());
+    let mut admin_experiment_id = use_signal(|| {
+        initial_config
+            .selected_experiment_id
+            .clone()
+            .unwrap_or_else(|| "nca-prepretraining".into())
+    });
+    let mut admin_directory_json = use_signal(String::new);
+    let mut admin_entry_json = use_signal(String::new);
+    let mut admin_status = use_signal(String::new);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
 
@@ -447,11 +542,241 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let release_manifest = props.release_manifest.clone();
             let mut status = status;
             spawn(async move {
-                status.set("Starting GitHub sign-in…".into());
+                status.set("Starting sign-in…".into());
                 if let Err(error) =
                     start_browser_github_auth(&next_config, release_manifest.as_ref()).await
                 {
                     status.set(error.to_string());
+                }
+            });
+        }
+    };
+
+    let admin_github_login_action = {
+        let props = props.clone();
+        move |_| {
+            let mut next_config = props.config.clone();
+            next_config = next_config.with_network_overrides(
+                Some(edge_url.read().clone()),
+                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
+            );
+            let requested_scopes =
+                admin_requested_scopes(&next_config, admin_study_id.read().as_str());
+            let release_manifest = props.release_manifest.clone();
+            let mut admin_status = admin_status;
+            spawn(async move {
+                admin_status.set("Starting admin sign-in…".into());
+                if let Err(error) = start_browser_github_auth_with_scopes(
+                    &next_config,
+                    release_manifest.as_ref(),
+                    requested_scopes,
+                )
+                .await
+                {
+                    admin_status.set(error.to_string());
+                }
+            });
+        }
+    };
+
+    let admin_load_directory_action = {
+        let props = props.clone();
+        move |_| {
+            let mut next_config = props.config.clone();
+            next_config = next_config.with_network_overrides(
+                Some(edge_url.read().clone()),
+                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
+            );
+            let selected_study = admin_study_id.read().clone();
+            let selected_experiment = admin_experiment_id.read().clone();
+            let mut admin_status = admin_status;
+            let mut admin_directory_json = admin_directory_json;
+            let mut admin_entry_json = admin_entry_json;
+            spawn(async move {
+                admin_status.set("Loading directory…".into());
+                let edge_base_url = match resolved_edge_base_url(&next_config) {
+                    Ok(edge_base_url) => edge_base_url,
+                    Err(error) => {
+                        admin_status.set(error.to_string());
+                        return;
+                    }
+                };
+                match fetch_directory_entries(&edge_base_url).await {
+                    Ok(entries) => {
+                        let directory_json = match directory_entries_to_json(&entries) {
+                            Ok(directory_json) => directory_json,
+                            Err(error) => {
+                                admin_status.set(error.to_string());
+                                return;
+                            }
+                        };
+                        let selected_entry =
+                            find_directory_entry(&entries, &selected_study, &selected_experiment);
+                        admin_directory_json.set(directory_json);
+                        if let Some(entry) = selected_entry {
+                            match directory_entry_to_json(&entry) {
+                                Ok(entry_json) => admin_entry_json.set(entry_json),
+                                Err(error) => {
+                                    admin_status.set(error.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        admin_status.set(format!("Loaded {} directory entries", entries.len()));
+                    }
+                    Err(error) => admin_status.set(error.to_string()),
+                }
+            });
+        }
+    };
+
+    let admin_load_selected_entry_action = move |_| {
+        let selected_study = admin_study_id.read().clone();
+        let selected_experiment = admin_experiment_id.read().clone();
+        let directory_json = admin_directory_json.read().clone();
+        match parse_directory_entries_json(&directory_json).and_then(|entries| {
+            find_directory_entry(&entries, &selected_study, &selected_experiment).ok_or_else(|| {
+                anyhow!(
+                    "no directory entry found for study `{}` and experiment `{}`",
+                    selected_study,
+                    selected_experiment
+                )
+            })
+        }) {
+            Ok(entry) => match directory_entry_to_json(&entry) {
+                Ok(entry_json) => {
+                    admin_study_id.set(entry.study_id.as_str().to_owned());
+                    admin_experiment_id.set(entry.experiment_id.as_str().to_owned());
+                    admin_entry_json.set(entry_json);
+                    admin_status.set("Loaded selected entry into the editor".into());
+                }
+                Err(error) => admin_status.set(error.to_string()),
+            },
+            Err(error) => admin_status.set(error.to_string()),
+        }
+    };
+
+    let admin_upsert_editor_entry_action = move |_| {
+        let directory_json = admin_directory_json.read().clone();
+        let entry_json = admin_entry_json.read().clone();
+        match parse_directory_entry_json(&entry_json) {
+            Ok(entry) => match parse_directory_entries_json(&directory_json) {
+                Ok(mut entries) => {
+                    upsert_directory_entry(&mut entries, entry.clone());
+                    match directory_entries_to_json(&entries) {
+                        Ok(directory_json) => {
+                            admin_study_id.set(entry.study_id.as_str().to_owned());
+                            admin_experiment_id.set(entry.experiment_id.as_str().to_owned());
+                            admin_directory_json.set(directory_json);
+                            admin_status.set("Updated local directory draft".into());
+                        }
+                        Err(error) => admin_status.set(error.to_string()),
+                    }
+                }
+                Err(error) => admin_status.set(error.to_string()),
+            },
+            Err(error) => admin_status.set(error.to_string()),
+        }
+    };
+
+    let admin_rollout_directory_action = {
+        let props = props.clone();
+        move |_| {
+            let mut next_config = props.config.clone();
+            next_config = next_config.with_network_overrides(
+                Some(edge_url.read().clone()),
+                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
+            );
+            let selected_study = admin_study_id.read().clone();
+            let selected_experiment = admin_experiment_id.read().clone();
+            let directory_json = admin_directory_json.read().clone();
+            let entry_json = admin_entry_json.read().clone();
+            let session = session_state.read().clone();
+            let mut admin_status = admin_status;
+            let mut admin_directory_json = admin_directory_json;
+            let mut admin_entry_json = admin_entry_json;
+            let mut current_view = current_view;
+            spawn(async move {
+                admin_status.set("Rolling out directory…".into());
+                if selected_study.trim().is_empty() {
+                    admin_status.set("Admin study id is required before rollout".into());
+                    return;
+                }
+                let edge_base_url = match resolved_edge_base_url(&next_config) {
+                    Ok(edge_base_url) => edge_base_url,
+                    Err(error) => {
+                        admin_status.set(error.to_string());
+                        return;
+                    }
+                };
+                let Some(session_id) = session.as_ref().and_then(|session| {
+                    session
+                        .session_id()
+                        .map(|session_id| session_id.as_str().to_owned())
+                }) else {
+                    admin_status.set("No authenticated browser session id found".into());
+                    return;
+                };
+                if !session_has_admin_scope(session.as_ref(), &selected_study) {
+                    admin_status.set(format!(
+                        "Current session does not grant admin scope for study `{}`",
+                        selected_study
+                    ));
+                    return;
+                }
+                let mut entries = match parse_directory_entries_json(&directory_json) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        admin_status.set(error.to_string());
+                        return;
+                    }
+                };
+                if !entry_json.trim().is_empty() {
+                    let entry = match parse_directory_entry_json(&entry_json) {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            admin_status.set(error.to_string());
+                            return;
+                        }
+                    };
+                    upsert_directory_entry(&mut entries, entry);
+                }
+                if entries.is_empty() {
+                    admin_status.set("Directory draft is empty".into());
+                    return;
+                }
+                if let Err(error) =
+                    rollout_directory_entries(&edge_base_url, &session_id, entries).await
+                {
+                    admin_status.set(error.to_string());
+                    return;
+                }
+                match fetch_directory_entries(&edge_base_url).await {
+                    Ok(entries) => {
+                        match directory_entries_to_json(&entries) {
+                            Ok(directory_json) => admin_directory_json.set(directory_json),
+                            Err(error) => {
+                                admin_status.set(error.to_string());
+                                return;
+                            }
+                        }
+                        if let Some(entry) =
+                            find_directory_entry(&entries, &selected_study, &selected_experiment)
+                        {
+                            match directory_entry_to_json(&entry) {
+                                Ok(entry_json) => admin_entry_json.set(entry_json),
+                                Err(error) => {
+                                    admin_status.set(error.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        if let Ok(view) = refresh_browser_app(&next_config).await {
+                            current_view.set(Some(view));
+                        }
+                        admin_status.set(format!("Rolled out {} directory entries", entries.len()));
+                    }
+                    Err(error) => admin_status.set(error.to_string()),
                 }
             });
         }
@@ -469,12 +794,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut session_state = session_state;
             spawn(async move {
-                status.set("Completing GitHub callback…".into());
+                status.set("Completing sign-in callback…".into());
                 match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        status.set("GitHub session ready".into());
+                        status.set("Authenticated session ready".into());
                     }
                     Ok(None) => status.set("No callback code found in URL".into()),
                     Err(error) => status.set(error.to_string()),
@@ -487,6 +812,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let session_panel = session_identity_panel(session_state.read().as_ref());
     let callback_available = provider_code_from_window_location().is_some();
     let auth_required = props.config.require_github_auth;
+    let admin_granted_studies = granted_admin_studies(session_state.read().as_ref());
+    let admin_granted_studies_label = admin_granted_studies.join(", ");
+    let admin_scope_ready = session_has_admin_scope(
+        session_state.read().as_ref(),
+        admin_study_id.read().as_str(),
+    );
+    let admin_scope_label = if admin_scope_ready { "yes" } else { "no" };
     let browser_host_capabilities = detect_browser_host_capabilities();
     let browser_capability_decision = match (
         props.config.training.as_ref(),
@@ -659,7 +991,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         div {
             class: "burn-dragon-p2p-app",
             h1 { "burn_dragon p2p" }
-            p { "Browser peer for NCA and ClimbMix experiment networks." }
+            p { "Browser peer and operator shell for NCA and ClimbMix experiment networks." }
             div {
                 label { "Edge URL" }
                 input {
@@ -678,7 +1010,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 button { onclick: connect_action, "Connect" }
                 button { onclick: refresh_action, "Refresh" }
                 if auth_required {
-                    button { onclick: github_login_action, "GitHub Sign-In" }
+                    button { onclick: github_login_action, "Sign In" }
                 }
                 if callback_available {
                     button { onclick: complete_callback_action, "Complete Callback" }
@@ -704,6 +1036,52 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             section {
                 h2 { "Session" }
                 AuthSessionCard { session: session_panel }
+            }
+            section {
+                h2 { "Operator" }
+                p { "Inspect and roll out live experiment-directory entries with an admin-scoped session." }
+                div {
+                    label { "Admin Study ID" }
+                    input {
+                        value: "{admin_study_id}",
+                        oninput: move |event| admin_study_id.set(event.value()),
+                    }
+                }
+                div {
+                    label { "Experiment ID" }
+                    input {
+                        value: "{admin_experiment_id}",
+                        oninput: move |event| admin_experiment_id.set(event.value()),
+                    }
+                }
+                div {
+                    button { onclick: admin_github_login_action, "Sign In (Admin)" }
+                    button { onclick: admin_load_directory_action, "Load Directory" }
+                    button { onclick: admin_load_selected_entry_action, "Load Selected Entry" }
+                    button { onclick: admin_upsert_editor_entry_action, "Upsert Editor Entry" }
+                    button { onclick: admin_rollout_directory_action, "Roll Out Directory" }
+                }
+                p { "Admin session for selected study: {admin_scope_label}" }
+                if !admin_granted_studies.is_empty() {
+                    p { "Granted admin studies: {admin_granted_studies_label}" }
+                }
+                p { "{admin_status}" }
+                div {
+                    label { "Directory JSON" }
+                    textarea {
+                        value: "{admin_directory_json}",
+                        rows: "18",
+                        oninput: move |event| admin_directory_json.set(event.value()),
+                    }
+                }
+                div {
+                    label { "Entry Editor JSON" }
+                    textarea {
+                        value: "{admin_entry_json}",
+                        rows: "16",
+                        oninput: move |event| admin_entry_json.set(event.value()),
+                    }
+                }
             }
             {local_training_section}
             if let Some(view) = view {

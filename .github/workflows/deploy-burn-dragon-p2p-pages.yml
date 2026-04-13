@@ -24,7 +24,7 @@ on:
         default: nca-r1
         type: string
       require_github_auth:
-        description: "Require GitHub auth before joining from the published browser shell. Example: keep `true` for the default mainnet browser surface."
+        description: "Require an authenticated edge session before joining from the published browser shell. Example: keep `true` for the default mainnet browser surface, which uses GitHub auth by default."
         required: true
         default: true
         type: boolean

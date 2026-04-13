@@ -57,7 +57,9 @@ enum CommandKind {
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
+    #[command(alias = "begin-login")]
     BeginGithubLogin(BeginGithubLoginArgs),
+    #[command(alias = "complete-login")]
     CompleteGithubLogin(CompleteGithubLoginArgs),
     RunPeer(RunPeerArgs),
     MarkRuntimeFailure(MarkRuntimeFailureArgs),

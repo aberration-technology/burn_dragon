@@ -8,6 +8,7 @@ use burn_dragon_universality::NcaCorpusConfig;
 #[cfg(feature = "native")]
 use burn_p2p::NetworkManifest;
 use burn_p2p::{AuthConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet, SwarmAddress};
+use chrono::{DateTime, TimeZone, Utc};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
@@ -90,6 +91,12 @@ fn default_allow_native_validator_fallback() -> bool {
 
 fn default_allow_browser_verifier_fallback() -> bool {
     true
+}
+
+fn default_manifest_timestamp() -> DateTime<Utc> {
+    Utc.timestamp_opt(1_767_225_600, 0)
+        .single()
+        .expect("valid burn_dragon manifest timestamp")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +278,10 @@ pub struct DragonManifestSeed {
     pub authority_public_keys: Vec<String>,
     #[serde(default)]
     pub bootstrap_addrs: Vec<String>,
+    #[serde(default = "default_manifest_timestamp")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "default_manifest_timestamp")]
+    pub release_built_at: DateTime<Utc>,
 }
 
 impl Default for DragonManifestSeed {
@@ -286,6 +297,8 @@ impl Default for DragonManifestSeed {
             protocol_major: 0,
             authority_public_keys: Vec::new(),
             bootstrap_addrs: Vec::new(),
+            created_at: default_manifest_timestamp(),
+            release_built_at: default_manifest_timestamp(),
         }
     }
 }

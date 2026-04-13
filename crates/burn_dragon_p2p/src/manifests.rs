@@ -10,7 +10,6 @@ use burn_p2p::{
     NetworkManifest, PeerRole, PeerRoleSet, Precision, ProjectFamilyId, RevisionId,
     RevisionManifest, StudyId, SupportedWorkload, WindowActivation, WindowId, WorkloadId,
 };
-use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::capability::DragonTrainingFootprint;
@@ -102,7 +101,8 @@ pub fn build_manifest_bundle(
         "dragon-checkpoint-format",
         &serde_json::json!({
             "format": "named_mpk",
-            "precision": "full",
+            "precision": "half",
+            "chunk_size_bytes": 1024 * 1024,
         }),
     );
     let revision_family_hash = stable_content_id(
@@ -161,7 +161,7 @@ pub fn build_manifest_bundle(
         enabled_features_hash: stable_content_id("dragon-features", &enabled_features_label),
         protocol_major: seed.protocol_major,
         supported_workloads: vec![supported_workload.clone()],
-        built_at: Utc::now(),
+        built_at: seed.release_built_at,
     };
     let network_manifest = NetworkManifest {
         network_id: NetworkId::new(&seed.network_id),
@@ -172,7 +172,7 @@ pub fn build_manifest_bundle(
         authority_public_keys: seed.authority_public_keys.clone(),
         bootstrap_addrs: seed.bootstrap_addrs.clone(),
         auth_policy_hash: stable_content_id("dragon-auth-policy", &seed.project_family_id),
-        created_at: Utc::now(),
+        created_at: seed.created_at,
         description: seed.description.clone(),
     };
     let experiment_id = ExperimentId::new(&seed.experiment_id);
@@ -295,7 +295,7 @@ pub fn build_manifest_bundle(
     let experiment_directory = vec![experiment_directory_entry];
     let workload_config = BurnWorkloadConfig::new(
         supported_workload.clone(),
-        BurnArtifactConfig::named_mpk(BurnRecordPrecision::Full, ChunkingScheme::default()),
+        BurnArtifactConfig::named_mpk(BurnRecordPrecision::Half, ChunkingScheme::new(1024 * 1024)?),
     )
     .with_root_ema(BurnWorkloadConfig::standard_root_ema_decay());
     Ok(DragonManifestBundle {
@@ -324,6 +324,7 @@ mod tests {
             protocol_major: 0,
             authority_public_keys: Vec::new(),
             bootstrap_addrs: Vec::new(),
+            ..DragonManifestSeed::default()
         }
     }
 
@@ -380,5 +381,44 @@ mod tests {
                 .estimated_checkpoint_bytes
                 .saturating_add(footprint.estimated_shard_bytes)
         );
+    }
+
+    #[test]
+    fn manifest_seed_timestamps_are_stable_across_builds() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let seed = seed();
+        let bundle = build_manifest_bundle(
+            &seed,
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            &DragonExperimentProfile {
+                version: 1,
+                experiment_kind: DragonExperimentKind::NcaPrepretraining,
+                native: crate::profile::DragonNativeExperimentProfile {
+                    training_toml: String::new(),
+                    nca_corpus_toml: None,
+                },
+                browser: None,
+            },
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+            "test",
+            "native,cpu",
+        )
+        .expect("manifest bundle");
+
+        assert_eq!(bundle.network_manifest.created_at, seed.created_at);
+        assert_eq!(bundle.release_manifest.built_at, seed.release_built_at);
     }
 }

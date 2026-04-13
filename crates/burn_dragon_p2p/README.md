@@ -57,16 +57,16 @@ Browser CPU is not treated as a real deployment mode. The actual browser trainer
 - `cuda`
   - enables native CUDA peers
 
-There is intentionally no Cargo feature called `internet-scale`. GitHub-authenticated network participation is part of the normal runtime policy of this crate.
+There is intentionally no Cargo feature called `internet-scale`. Authenticated network participation is part of the normal runtime policy of this crate. The default deployed control plane uses GitHub auth, but the peer/browser surface follows the edge's configured browser login provider.
 
 ## Auth Model
 
 For network participation:
 
-- native peers require a GitHub-authenticated auth bundle
-- browser peers require a GitHub-authenticated browser session when `require_github_auth` is set
+- native peers require an authenticated edge auth bundle
+- browser peers require an authenticated browser session when `require_github_auth` is set
 - browser training submission requires WebGPU
-- dynamic admin edits are authenticated with a GitHub-backed session id, not a shared bootstrap token
+- dynamic admin edits are authenticated with a session-backed browser or native login, not a shared bootstrap token
 
 The relevant seams are in:
 
@@ -172,6 +172,13 @@ The focused repo also ships a separate Pages workflow:
 - `.github/workflows/deploy-burn-dragon-p2p-pages.yml`
 
 Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`.
+
+The generated browser shell now includes both surfaces:
+
+- peer surface: connect, inspect assignments, and run browser-local training
+- operator surface: inspect the live experiment directory, load a specific entry into a JSON editor, and roll out a replacement directory draft with an admin-scoped session
+
+By default the baked browser config requests `Connect` and `Discover`, plus `Train` and `Validate` for the selected experiment id when one is provided. The separate `Sign In (Admin)` action extends that request with `ExperimentScope::Admin { study_id }` for the study id entered in the operator panel. Under the default deployment, that browser login provider is GitHub.
 
 If you embed the UI yourself instead of using the generated shell, render [DragonBrowserApp](src/wasm/mod.rs) from your Dioxus host and point it at the edge:
 
@@ -347,9 +354,21 @@ The deployed bootstrap can publish updated Dragon experiment profiles without fo
 The secure admin path is:
 
 1. deploy the network with explicit GitHub admin logins
-2. authenticate through the normal GitHub login flow
-3. use the returned session-backed auth bundle for admin actions
+2. authenticate through the normal edge login flow
+3. use the session-backed browser operator UI or the native operator binary for admin actions
 4. roll updated directory entries through `RolloutAuthPolicy`
+
+The recommended day-to-day operator flow is now the browser shell:
+
+1. open the deployed browser shell
+2. click `Sign In (Admin)`
+3. enter the study id, for example `burn-dragon-mainnet`
+4. click `Load Directory`
+5. click `Load Selected Entry` or paste a replacement entry JSON into the editor
+6. click `Upsert Editor Entry` to update the local draft
+7. click `Roll Out Directory`
+
+The native operator binary remains the fallback path for scripted or headless rollout.
 
 Generate a network-publishable Dragon profile from a local training config:
 
@@ -417,8 +436,8 @@ Validation ladder:
   - ignored medium mixed-fleet rung for both experiments
 - `xtask edge-drill`
   - local HTTP edge drill for both experiments
-  - real native GitHub-style login + enrollment
-  - real browser GitHub-style login + enrollment
+  - real native edge login + enrollment
+  - real browser edge login + enrollment
   - session-gated directory access
   - browser training and validation receipt submission/ack against the same edge
 - `xtask all`

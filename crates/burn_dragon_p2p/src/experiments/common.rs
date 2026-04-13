@@ -1080,11 +1080,11 @@ where
             auth.local_peer_auth.is_some() && !auth.trust_bundle_endpoints.is_empty()
         });
     if !auth_available {
-        bail!("burn_dragon_p2p peers require a GitHub-authenticated auth bundle");
+        bail!("burn_dragon_p2p peers require an authenticated edge auth bundle");
     }
 
     let mut node_builder = connect(
-        target_decision.burn_target(),
+        target_decision.burn_target(DragonCapabilityClass::from_backend_label(backend_label)),
         manifests.release_manifest.clone(),
         project.clone(),
         manifests.workload_config.clone(),

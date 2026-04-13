@@ -10,8 +10,8 @@ use anyhow::{Result, anyhow, bail};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p::ProjectFamilyId;
 use burn_p2p::{
-    AuthConfig, AuthProvider, BrowserEdgeSnapshot, ClientReleaseManifest, EdgeAuthClient,
-    EdgeEnrollmentConfig, ExperimentDirectoryEntry, ExperimentScope, LoginStart, PrincipalSession,
+    AuthConfig, BrowserEdgeSnapshot, ClientReleaseManifest, EdgeAuthClient, EdgeEnrollmentConfig,
+    ExperimentDirectoryEntry, ExperimentScope, LoginStart, PrincipalSession,
 };
 #[cfg(feature = "native")]
 use burn_p2p::{ContentId, EdgePeerIdentity, create_peer_auth_envelope};
@@ -28,17 +28,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DragonNativeAuthBundle;
 
-fn github_provider_for_snapshot(
+fn login_provider_for_snapshot(
     snapshot: &BrowserEdgeSnapshot,
 ) -> Result<&burn_p2p::BrowserLoginProvider> {
     snapshot
         .login_providers
-        .iter()
-        .find(|provider| {
-            provider.label.to_ascii_lowercase().contains("github")
-                || provider.login_path.to_ascii_lowercase().contains("github")
-        })
-        .ok_or_else(|| anyhow!("edge snapshot does not advertise a GitHub login provider"))
+        .first()
+        .ok_or_else(|| anyhow!("edge snapshot does not advertise a browser login provider"))
+}
+
+pub fn login_provider_label(snapshot: &BrowserEdgeSnapshot) -> Option<&str> {
+    snapshot
+        .login_providers
+        .first()
+        .map(|provider| provider.label.as_str())
 }
 
 pub fn native_github_enrollment_config(
@@ -51,7 +54,7 @@ pub fn native_github_enrollment_config(
         .trust_bundle
         .as_ref()
         .ok_or_else(|| anyhow!("edge snapshot is missing a trust bundle"))?;
-    let provider = github_provider_for_snapshot(snapshot)?;
+    let provider = login_provider_for_snapshot(snapshot)?;
 
     if !snapshot.allowed_target_artifact_hashes.is_empty()
         && !snapshot
@@ -191,9 +194,6 @@ pub async fn begin_native_github_login(
     } else {
         client.begin_login(principal_hint).await?
     };
-    if !matches!(login.provider, AuthProvider::GitHub) {
-        bail!("edge login flow did not return a GitHub provider");
-    }
     Ok(DragonPendingGitHubLogin {
         edge_base_url: edge_base_url.trim_end_matches('/').to_owned(),
         enrollment,
@@ -212,9 +212,6 @@ pub async fn complete_native_github_login(
     let session = client
         .complete_provider_login(&pending.login, provider_code.to_owned())
         .await?;
-    if !matches!(session.claims.provider, AuthProvider::GitHub) {
-        bail!("completed native session is not GitHub-authenticated");
-    }
     let (node_keypair, identity) = edge_peer_identity_for_storage(storage_root, None)?;
     let certificate = client
         .enroll(&client.build_enrollment_request(&session, &identity))
@@ -274,7 +271,7 @@ pub fn browser_github_enrollment_config(
         .trust_bundle
         .as_ref()
         .ok_or_else(|| anyhow!("edge snapshot is missing a trust bundle"))?;
-    let provider = github_provider_for_snapshot(snapshot)?;
+    let provider = login_provider_for_snapshot(snapshot)?;
     Ok(BrowserEnrollmentConfig {
         network_id: snapshot.network_id.clone(),
         project_family_id: ProjectFamilyId::new(trust_bundle.project_family_id.as_str()),
@@ -295,6 +292,13 @@ pub fn browser_github_enrollment_config(
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_KEY: &str = "burn-dragon-p2p.pending-github-login";
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingBrowserGitHubLogin {
+    login: LoginStart,
+    requested_scopes: BTreeSet<ExperimentScope>,
+}
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 fn browser_storage() -> Result<web_sys::Storage> {
@@ -322,16 +326,17 @@ pub async fn begin_browser_github_login(
     let enrollment = browser_github_enrollment_config(
         &snapshot,
         release_manifest,
-        requested_scopes,
+        requested_scopes.clone(),
         session_ttl_secs,
     )?;
     let client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
     let login = client.begin_login(principal_hint).await?;
-    if !matches!(login.provider, AuthProvider::GitHub) {
-        bail!("browser login flow did not return a GitHub provider");
-    }
+    let pending = PendingBrowserGitHubLogin {
+        login: login.clone(),
+        requested_scopes,
+    };
     browser_storage()?
-        .set_item(PENDING_GITHUB_LOGIN_KEY, &serde_json::to_string(&login)?)
+        .set_item(PENDING_GITHUB_LOGIN_KEY, &serde_json::to_string(&pending)?)
         .map_err(|error| anyhow!("failed to persist pending login: {error:?}"))?;
     Ok(login)
 }
@@ -349,7 +354,14 @@ pub async fn complete_browser_github_login(
         .get_item(PENDING_GITHUB_LOGIN_KEY)
         .map_err(|error| anyhow!("failed to read pending login: {error:?}"))?
         .ok_or_else(|| anyhow!("missing pending GitHub login state"))?;
-    let login: LoginStart = serde_json::from_str(&pending)?;
+    let (login, requested_scopes) =
+        match serde_json::from_str::<PendingBrowserGitHubLogin>(&pending) {
+            Ok(pending) => (pending.login, pending.requested_scopes),
+            Err(_) => (
+                serde_json::from_str::<LoginStart>(&pending)?,
+                requested_scopes,
+            ),
+        };
     let snapshot = BrowserEdgeClient::new(
         BrowserUiBindings::new(edge_base_url),
         BrowserEnrollmentConfig::for_runtime_sync(&fetch_edge_snapshot(edge_base_url).await?),
@@ -366,9 +378,6 @@ pub async fn complete_browser_github_login(
     let session = client
         .complete_provider_login(&login, provider_code.to_owned())
         .await?;
-    if !matches!(session.claims.provider, AuthProvider::GitHub) {
-        bail!("completed browser session is not GitHub-authenticated");
-    }
     let trust_bundle = client.fetch_trust_bundle().await.ok();
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await

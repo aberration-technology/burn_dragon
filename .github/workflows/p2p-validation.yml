@@ -1,0 +1,63 @@
+name: p2p validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Validation suite to run. Example: `smoke` for the normal repo smoke rung, `nca-runtime-cluster` for the ignored 3-peer native runtime cluster test, or `nca-edge-drill` / `climbmix-edge-drill` for the local browser+native control-plane drills."
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - nca-runtime-cluster
+          - nca-edge-drill
+          - climbmix-edge-drill
+
+concurrency:
+  group: p2p-validation-${{ github.ref }}-${{ github.event.inputs.suite }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: cache rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: run selected validation suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ github.event.inputs.suite }}" in
+            smoke)
+              cargo run --manifest-path Cargo.toml -p xtask -- smoke
+              ;;
+            nca-runtime-cluster)
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --test native_training nca_native_runtime_cluster_smoke_converges_and_merges_heads -- --ignored --exact --nocapture
+              ;;
+            nca-edge-drill)
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --test native_training nca_edge_drill_native_and_browser_github_auth_and_receipts -- --ignored --exact --nocapture
+              ;;
+            climbmix-edge-drill)
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --test native_training climbmix_edge_drill_native_and_browser_github_auth_and_receipts -- --ignored --exact --nocapture
+              ;;
+            *)
+              echo "unsupported suite: ${{ github.event.inputs.suite }}" >&2
+              exit 1
+              ;;
+          esac

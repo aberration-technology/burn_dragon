@@ -4,7 +4,7 @@ use burn_dragon_core::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecu
 use burn_dragon_language::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecutor};
 use burn_p2p::WorkloadTrainingBudget;
 #[cfg(feature = "native")]
-use burn_p2p::burn::BurnTarget;
+use burn_p2p::{PeerRole, PeerRoleSet, burn::BurnTarget};
 #[cfg(feature = "wasm-ui")]
 use burn_p2p_browser::{
     BrowserAppTarget, BrowserCapabilityReport, BrowserGpuSupport, BrowserRuntimeRole,
@@ -90,9 +90,19 @@ pub struct DragonNativeCapabilityAssessment {
 
 #[cfg(feature = "native")]
 impl DragonNativeTargetDecision {
-    pub fn burn_target(&self) -> BurnTarget {
+    pub fn burn_target(&self, backend_class: DragonCapabilityClass) -> BurnTarget {
         match self.effective_target {
-            DragonNativeTarget::Auto | DragonNativeTarget::Trainer => BurnTarget::Trainer,
+            DragonNativeTarget::Auto | DragonNativeTarget::Trainer => match backend_class {
+                DragonCapabilityClass::NativeCpu => {
+                    BurnTarget::Custom(PeerRoleSet::new([PeerRole::TrainerCpu]))
+                }
+                DragonCapabilityClass::NativeWgpu | DragonCapabilityClass::NativeCuda => {
+                    BurnTarget::Trainer
+                }
+                DragonCapabilityClass::BrowserCpu | DragonCapabilityClass::BrowserWgpu => {
+                    BurnTarget::Trainer
+                }
+            },
             DragonNativeTarget::Validator => BurnTarget::Validator,
             DragonNativeTarget::Reducer => BurnTarget::Reducer,
         }
@@ -460,5 +470,26 @@ mod tests {
 
         assert!(larger_fp.estimated_training_bytes > tiny_fp.estimated_training_bytes);
         assert!(larger_fp.estimated_tokens_per_second < tiny_fp.estimated_tokens_per_second);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_cpu_trainer_maps_to_trainer_cpu_role() {
+        let decision = DragonNativeTargetDecision {
+            requested_target: DragonNativeTarget::Trainer,
+            effective_target: DragonNativeTarget::Trainer,
+            can_train: true,
+            trainer_memory_budget_bytes: None,
+            downgrade_reason: None,
+        };
+
+        assert_eq!(
+            decision.burn_target(DragonCapabilityClass::NativeCpu),
+            BurnTarget::Custom(PeerRoleSet::new([PeerRole::TrainerCpu]))
+        );
+        assert_eq!(
+            decision.burn_target(DragonCapabilityClass::NativeWgpu),
+            BurnTarget::Trainer
+        );
     }
 }

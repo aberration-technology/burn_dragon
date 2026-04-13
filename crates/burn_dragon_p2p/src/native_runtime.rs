@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -107,6 +108,30 @@ where
 {
     fn drop(&mut self) {
         let _ = self.stop_and_join(Some(DROP_SHUTDOWN_TIMEOUT));
+    }
+}
+
+impl<B> Deref for ManagedRunningNativePeer<B>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    type Target = RunningNode<SelectedWorkloadProject<DragonProjectFamily<B>>>;
+
+    fn deref(&self) -> &Self::Target {
+        self.running
+            .as_ref()
+            .expect("managed native peer should retain running node")
+    }
+}
+
+impl<B> DerefMut for ManagedRunningNativePeer<B>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.running
+            .as_mut()
+            .expect("managed native peer should retain running node")
     }
 }
 

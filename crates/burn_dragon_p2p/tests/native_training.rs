@@ -5,11 +5,11 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use burn_dragon_p2p::auth::{
     begin_native_github_login, complete_native_github_login, fetch_edge_snapshot,
@@ -19,7 +19,10 @@ use burn_dragon_p2p::config::{
     DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonShardExportConfig,
     TokenWindowRecord,
 };
-use burn_dragon_p2p::native::{prepare_climbmix_native_cpu, prepare_nca_native_cpu};
+use burn_dragon_p2p::native::{
+    ManagedRunningNativePeer, prepare_climbmix_native_cpu, prepare_nca_native_cpu,
+    spawn_prepared_native_peer,
+};
 use burn_dragon_p2p::profile::{DragonBrowserProfileTokenSource, DragonExperimentProfile};
 use burn_p2p::burn::{BurnShardedDataset, BurnShardedDatasetConfig, BurnWorkload};
 use burn_p2p::{
@@ -108,6 +111,7 @@ fn native_manifest_seed() -> DragonManifestSeed {
         protocol_major: 0,
         authority_public_keys: Vec::new(),
         bootstrap_addrs: Vec::new(),
+        ..DragonManifestSeed::default()
     }
 }
 
@@ -167,6 +171,18 @@ max_iters = {}
 checkpoint_interval_iters = 4
 log_frequency = 1
 seed = 1337
+
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0001
+maturity_steps = 100
+sample_interval_steps = 8
+replace_interval_steps = 64
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
 
 [optimizer]
 learning_rate = 0.001
@@ -276,6 +292,37 @@ fn metric_integer(stats: &std::collections::BTreeMap<String, MetricValue>, key: 
         MetricValue::Integer(value) => *value,
         other => panic!("expected integer metric for {key}, got {other:?}"),
     }
+}
+
+fn metric_float_any(stats: &std::collections::BTreeMap<String, MetricValue>, keys: &[&str]) -> f64 {
+    for key in keys {
+        match stats.get(*key) {
+            Some(MetricValue::Float(value)) => return *value,
+            Some(MetricValue::Integer(value)) => return *value as f64,
+            Some(other) => panic!("expected numeric metric for {key}, got {other:?}"),
+            None => continue,
+        }
+    }
+    panic!("missing any metric in {:?}", keys);
+}
+
+fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &str) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if predicate() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{message}");
+}
+
+fn native_swarm_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn log_loss_series(label: &str, losses: &[f64]) {
@@ -1319,6 +1366,437 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
     let losses = run_training_windows(&prepared, 3);
     log_loss_series("nca_native_smoke", &losses);
     assert!(losses.last().copied().unwrap_or(f64::INFINITY) <= losses[0] + 0.5);
+}
+
+#[test]
+#[ignore = "manual stress test; upstream libp2p-request-response debug assert can panic during multi-round native runtime runs"]
+fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train.toml");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+    );
+
+    let validator_config = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join("storage-validator"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Validator),
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+        git_commit: Some("runtime-cluster".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join("validator-shards"),
+            dataset_name: Some("dragon-nca-runtime-validator".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let validator_prepared =
+        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
+    let experiment_entry = validator_prepared.manifests.experiment_directory[0].clone();
+    let mut validator = spawn_prepared_native_peer(validator_prepared).expect("spawn validator");
+    let experiment = validator.mainnet().experiment(
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
+    );
+    let validator_telemetry = validator.telemetry();
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            let snapshot = validator_telemetry.snapshot();
+            snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty()
+        },
+        "validator runtime did not start",
+    );
+    let validator_snapshot = validator_telemetry.snapshot();
+    let validator_addr = validator_snapshot
+        .listen_addresses
+        .iter()
+        .find(|address| address.as_str().contains("/tcp/"))
+        .cloned()
+        .unwrap_or_else(|| validator_snapshot.listen_addresses[0].clone());
+    let genesis_head = validator
+        .initialize_local_head(&experiment)
+        .expect("init validator genesis head");
+    assert_eq!(genesis_head.global_step, 0);
+
+    let build_trainer_config = |label: &str| DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join(format!("storage-{label}")),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: vec![validator_addr.clone()],
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.12").expect("valid burn_dragon version"),
+        git_commit: Some(format!("runtime-cluster-{label}")),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join(format!("{label}-shards")),
+            dataset_name: Some(format!("dragon-nca-runtime-{label}")),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+
+    let trainer_a_prepared = prepare_nca_native_cpu(
+        &build_trainer_config("trainer-a"),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("trainer a");
+    let trainer_b_prepared = prepare_nca_native_cpu(
+        &build_trainer_config("trainer-b"),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("trainer b");
+    let mut trainer_a = spawn_prepared_native_peer(trainer_a_prepared).expect("spawn trainer a");
+    let mut trainer_b = spawn_prepared_native_peer(trainer_b_prepared).expect("spawn trainer b");
+    let trainer_a_telemetry = trainer_a.telemetry();
+    let trainer_b_telemetry = trainer_b.telemetry();
+
+    wait_for(
+        Duration::from_secs(15),
+        || validator_telemetry.snapshot().connected_peers >= 2,
+        "validator did not connect to both trainers",
+    );
+    wait_for(
+        Duration::from_secs(15),
+        || trainer_a_telemetry.snapshot().connected_peers >= 1,
+        "trainer a did not connect",
+    );
+    wait_for(
+        Duration::from_secs(15),
+        || trainer_b_telemetry.snapshot().connected_peers >= 1,
+        "trainer b did not connect",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            trainer_a
+                .sync_experiment_head(&experiment)
+                .expect("sync trainer a head")
+                .is_some()
+        },
+        "trainer a did not sync the canonical genesis head",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            trainer_b
+                .sync_experiment_head(&experiment)
+                .expect("sync trainer b head")
+                .is_some()
+        },
+        "trainer b did not sync the canonical genesis head",
+    );
+
+    let synced_a = trainer_a
+        .sync_experiment_head(&experiment)
+        .expect("sync trainer a head")
+        .expect("trainer a synced head");
+    let synced_b = trainer_b
+        .sync_experiment_head(&experiment)
+        .expect("sync trainer b head")
+        .expect("trainer b synced head");
+    assert_eq!(synced_a.head_id, genesis_head.head_id);
+    assert_eq!(synced_b.head_id, genesis_head.head_id);
+
+    let mut trainer_losses = Vec::new();
+    let mut merged_losses = Vec::new();
+    let mut canonical_head = genesis_head.clone();
+
+    for round in 0..3 {
+        let trainer_a_window = trainer_a
+            .train_window_once_with_pinned_head(&experiment, Some(&canonical_head))
+            .expect("trainer a window");
+        let trainer_b_window = trainer_b
+            .train_window_once_with_pinned_head(&experiment, Some(&canonical_head))
+            .expect("trainer b window");
+
+        let trainer_a_loss =
+            metric_float_any(&trainer_a_window.report.stats, &["loss", "train_loss"]);
+        let trainer_b_loss =
+            metric_float_any(&trainer_b_window.report.stats, &["loss", "train_loss"]);
+        trainer_losses.push(trainer_a_loss);
+        trainer_losses.push(trainer_b_loss);
+        assert!(trainer_a_loss.is_finite());
+        assert!(trainer_b_loss.is_finite());
+        assert_eq!(
+            trainer_a_window.head.parent_head_id,
+            Some(canonical_head.head_id.clone())
+        );
+        assert_eq!(
+            trainer_b_window.head.parent_head_id,
+            Some(canonical_head.head_id.clone())
+        );
+
+        trainer_a
+            .publish_head_provider(&experiment, &trainer_a_window.head)
+            .expect("publish trainer a head provider");
+        trainer_a
+            .publish_artifact_from_store(&trainer_a_window.artifact.artifact_id)
+            .expect("publish trainer a delta artifact");
+        if trainer_a_window.head.artifact_id != trainer_a_window.artifact.artifact_id {
+            trainer_a
+                .publish_artifact_from_store(&trainer_a_window.head.artifact_id)
+                .expect("publish trainer a head artifact");
+        }
+        trainer_a
+            .republish_training_window_control_plane(
+                &experiment,
+                trainer_a_window.lease.window_id,
+                &trainer_a_window.contribution.base_head_id,
+                &trainer_a_window.artifact.artifact_id,
+            )
+            .expect("republish trainer a control plane");
+
+        trainer_b
+            .publish_head_provider(&experiment, &trainer_b_window.head)
+            .expect("publish trainer b head provider");
+        trainer_b
+            .publish_artifact_from_store(&trainer_b_window.artifact.artifact_id)
+            .expect("publish trainer b delta artifact");
+        if trainer_b_window.head.artifact_id != trainer_b_window.artifact.artifact_id {
+            trainer_b
+                .publish_artifact_from_store(&trainer_b_window.head.artifact_id)
+                .expect("publish trainer b head artifact");
+        }
+        trainer_b
+            .republish_training_window_control_plane(
+                &experiment,
+                trainer_b_window.lease.window_id,
+                &trainer_b_window.contribution.base_head_id,
+                &trainer_b_window.artifact.artifact_id,
+            )
+            .expect("republish trainer b control plane");
+
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                let snapshot = validator_telemetry.snapshot();
+                snapshot
+                    .control_plane
+                    .update_announcements
+                    .iter()
+                    .any(|announcement| {
+                        announcement.update.delta_artifact_id
+                            == trainer_a_window.artifact.artifact_id
+                    })
+                    && snapshot
+                        .control_plane
+                        .update_announcements
+                        .iter()
+                        .any(|announcement| {
+                            announcement.update.delta_artifact_id
+                                == trainer_b_window.artifact.artifact_id
+                        })
+            },
+            "validator did not observe both trainer updates",
+        );
+
+        let trainer_a_store = trainer_a
+            .artifact_store()
+            .expect("trainer a artifact store");
+        assert!(
+            trainer_a_store.has_manifest(&trainer_a_window.artifact.artifact_id),
+            "trainer a should persist its update artifact manifest locally"
+        );
+        assert!(
+            trainer_a_window
+                .artifact
+                .chunks
+                .iter()
+                .all(|chunk| trainer_a_store.has_chunk(&chunk.chunk_id)),
+            "trainer a should persist all update artifact chunks locally"
+        );
+        let trainer_b_store = trainer_b
+            .artifact_store()
+            .expect("trainer b artifact store");
+        assert!(
+            trainer_b_store.has_manifest(&trainer_b_window.artifact.artifact_id),
+            "trainer b should persist its update artifact manifest locally"
+        );
+        assert!(
+            trainer_b_window
+                .artifact
+                .chunks
+                .iter()
+                .all(|chunk| trainer_b_store.has_chunk(&chunk.chunk_id)),
+            "trainer b should persist all update artifact chunks locally"
+        );
+
+        eprintln!(
+            "nca_runtime_cluster_round_{round}_artifacts: trainer_a_bytes={} trainer_a_chunks={} trainer_b_bytes={} trainer_b_chunks={}",
+            trainer_a_window.artifact.bytes_len,
+            trainer_a_window.artifact.chunks.len(),
+            trainer_b_window.artifact.bytes_len,
+            trainer_b_window.artifact.chunks.len(),
+        );
+
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                let snapshot = validator_telemetry.snapshot();
+                snapshot
+                    .control_plane
+                    .merge_window_announcements
+                    .iter()
+                    .any(|announcement| {
+                        announcement.merge_window.window_id == trainer_a_window.lease.window_id
+                            && announcement.merge_window.base_head_id == canonical_head.head_id
+                    })
+                    && snapshot
+                        .control_plane
+                        .reducer_assignment_announcements
+                        .iter()
+                        .any(|announcement| {
+                            announcement.assignment.window_id == trainer_a_window.lease.window_id
+                        })
+            },
+            "validator did not observe the current round merge topology",
+        );
+
+        let validation_deadline = Instant::now() + Duration::from_secs(20);
+        let mut last_validation_error = None;
+        let validation = loop {
+            match validator.validate_candidates_once(&experiment) {
+                Ok(Some(outcome)) => break outcome,
+                Ok(None) => {}
+                Err(error) => last_validation_error = Some(error.to_string()),
+            }
+            if Instant::now() >= validation_deadline {
+                panic!(
+                    "validation outcome did not materialize for round {round}; last_error={:?}",
+                    last_validation_error
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        let merged_loss =
+            metric_float_any(&validation.merged_head.metrics, &["loss", "train_loss"]);
+        merged_losses.push(merged_loss);
+        assert!(merged_loss.is_finite());
+        assert_eq!(
+            validation.merged_head.parent_head_id,
+            Some(canonical_head.head_id.clone())
+        );
+        assert!(validation.merged_head.global_step > canonical_head.global_step);
+
+        validator
+            .publish_head_provider(&experiment, &validation.merged_head)
+            .expect("publish merged head provider");
+        validator
+            .publish_artifact_from_store(&validation.merged_head.artifact_id)
+            .expect("publish merged head artifact");
+
+        let merged_head_id = validation.merged_head.head_id.clone();
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                validator
+                    .sync_experiment_head(&experiment)
+                    .expect("sync validator merged head")
+                    .as_ref()
+                    .is_some_and(|head| head.head_id == merged_head_id)
+            },
+            "validator did not retain merged head",
+        );
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                trainer_a
+                    .sync_experiment_head(&experiment)
+                    .expect("sync trainer a merged head")
+                    .as_ref()
+                    .is_some_and(|head| head.head_id == merged_head_id)
+            },
+            "trainer a did not sync merged head",
+        );
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                trainer_b
+                    .sync_experiment_head(&experiment)
+                    .expect("sync trainer b merged head")
+                    .as_ref()
+                    .is_some_and(|head| head.head_id == merged_head_id)
+            },
+            "trainer b did not sync merged head",
+        );
+        wait_for(
+            Duration::from_secs(10),
+            || {
+                let validator_snapshot = validator_telemetry.snapshot();
+                let trainer_a_snapshot = trainer_a_telemetry.snapshot();
+                let trainer_b_snapshot = trainer_b_telemetry.snapshot();
+                validator_snapshot.connected_peers >= 2
+                    && trainer_a_snapshot.connected_peers >= 1
+                    && trainer_b_snapshot.connected_peers >= 1
+                    && validator_snapshot.last_error.is_none()
+                    && trainer_a_snapshot.last_error.is_none()
+                    && trainer_b_snapshot.last_error.is_none()
+            },
+            "runtime cluster did not settle cleanly after merged head publication",
+        );
+
+        eprintln!(
+            "nca_runtime_cluster_round_{round}: trainer_losses=({trainer_a_loss:.4}, {trainer_b_loss:.4}) merged_loss={merged_loss:.4} global_step={} connected_peers={}",
+            validation.merged_head.global_step,
+            validator_telemetry.snapshot().connected_peers,
+        );
+        canonical_head = validation.merged_head;
+    }
+
+    log_loss_series("nca_runtime_cluster_trainers", &trainer_losses);
+    log_loss_series("nca_runtime_cluster_merged", &merged_losses);
+    assert!(trainer_losses.iter().all(|loss| loss.is_finite()));
+    assert!(merged_losses.iter().all(|loss| loss.is_finite()));
+    assert!(
+        trainer_losses.iter().copied().fold(f64::INFINITY, f64::min) <= trainer_losses[0] - 0.1,
+        "runtime cluster trainers should show a material best-window improvement"
+    );
+    assert!(
+        merged_losses.iter().copied().fold(f64::INFINITY, f64::min) <= merged_losses[0] - 0.05,
+        "runtime cluster merged heads should improve over the initial merged loss"
+    );
+
+    shutdown_runtime_peer(trainer_a, "trainer a");
+    shutdown_runtime_peer(trainer_b, "trainer b");
+    shutdown_runtime_peer(validator, "validator");
+}
+
+fn shutdown_runtime_peer<B>(peer: ManagedRunningNativePeer<B>, label: &str)
+where
+    B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+{
+    peer.shutdown()
+        .unwrap_or_else(|error| panic!("{label} shutdown: {error:#}"));
+    match peer.await_termination_timeout(Duration::from_secs(10)) {
+        Ok(_prepared) => {}
+        Err(error) if error.to_string().contains("runtime thread panicked") => {
+            eprintln!(
+                "{label} termination hit known upstream libp2p runtime panic during shutdown: {error:#}"
+            );
+        }
+        Err(error) => panic!("{label} termination: {error:#}"),
+    }
 }
 
 #[test]

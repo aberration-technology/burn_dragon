@@ -30,6 +30,18 @@ checkpoint_interval_iters = 4
 log_frequency = 1
 seed = 1337
 
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0001
+maturity_steps = 100
+sample_interval_steps = 8
+replace_interval_steps = 64
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
+
 [optimizer]
 learning_rate = 0.001
 weight_decay = 0.0

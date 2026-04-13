@@ -14,7 +14,7 @@ use burn_autodiff::Autodiff;
 use burn_dragon_core::DragonModel;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
-    AuthProvider, ContentId, ExperimentId, ExperimentScope, PeerRole, PeerRoleSet, RevisionId,
+    ContentId, ExperimentId, ExperimentScope, PeerRole, PeerRoleSet, RevisionId,
     RuntimeTransportPolicy, StudyId, WorkloadId, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
@@ -834,13 +834,10 @@ async fn start_live_browser_participant(
     ]);
     let _ = browser_github_enrollment_config(&snapshot, release_manifest, requested_scopes, 900)?;
     let session = load_browser_session(edge_base_url).await?;
-    let claims = session
+    let _claims = session
         .session
         .as_ref()
         .ok_or_else(|| anyhow!("browser live training requires an authenticated session"))?;
-    if !matches!(claims.claims.provider, AuthProvider::GitHub) {
-        bail!("browser live training requires a GitHub-authenticated session");
-    }
 
     let client = BrowserEdgeClient::new(
         BrowserUiBindings::new(edge_base_url),

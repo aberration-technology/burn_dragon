@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
+use burn_p2p::{ExperimentId, ExperimentScope};
 use clap::{ArgAction, Args};
 use serde_json::json;
 use wasm_bindgen_cli_support::Bindgen;
@@ -59,7 +61,8 @@ body {
   box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
 }
 
-.burn-dragon-p2p-app input {
+.burn-dragon-p2p-app input,
+.burn-dragon-p2p-app textarea {
   width: 100%;
   box-sizing: border-box;
   margin-top: 0.4rem;
@@ -67,6 +70,12 @@ body {
   border-radius: 12px;
   border: 1px solid rgba(18, 24, 38, 0.14);
   background: rgba(255, 255, 255, 0.96);
+}
+
+.burn-dragon-p2p-app textarea {
+  min-height: 12rem;
+  resize: vertical;
+  font-family: "Iosevka Etoile", "IBM Plex Mono", monospace;
 }
 
 .burn-dragon-p2p-app button {
@@ -209,6 +218,22 @@ fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
     Ok(())
 }
 
+fn default_requested_scopes(selected_experiment_id: Option<&str>) -> BTreeSet<ExperimentScope> {
+    let mut scopes = BTreeSet::from([ExperimentScope::Connect, ExperimentScope::Discover]);
+    let Some(experiment_id) = selected_experiment_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return scopes;
+    };
+    let experiment_id = ExperimentId::new(experiment_id.to_owned());
+    scopes.insert(ExperimentScope::Train {
+        experiment_id: experiment_id.clone(),
+    });
+    scopes.insert(ExperimentScope::Validate { experiment_id });
+    scopes
+}
+
 fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value {
     let edge_url = args
         .edge_url
@@ -224,6 +249,7 @@ fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect();
+    let requested_scopes = default_requested_scopes(args.selected_experiment_id.as_deref());
 
     json!({
         "config": {
@@ -233,7 +259,7 @@ fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value
             },
             "selected_experiment_id": args.selected_experiment_id,
             "selected_revision_id": args.selected_revision_id,
-            "requested_scopes": [],
+            "requested_scopes": requested_scopes,
             "require_github_auth": args.require_github_auth,
             "training": null,
         },

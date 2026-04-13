@@ -14335,6 +14335,7 @@ name = "xtask"
 version = "0.21.0-pre.12"
 dependencies = [
  "anyhow",
+ "burn_p2p",
  "burn_p2p_app",
  "clap 4.6.0",
  "serde_json",

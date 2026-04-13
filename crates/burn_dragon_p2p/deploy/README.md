@@ -57,6 +57,8 @@ Before the workflow can publish, set the repository Pages source to `GitHub Acti
 
 That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static; it still connects to the live edge URL you configure. By default, the baked browser config points at `https://dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
 
+The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Validate` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
+
 Optional GitHub repository variables for the Pages workflow:
 
 - `BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL`
@@ -274,12 +276,20 @@ cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
 
 ### Roll out an updated experiment profile
 
-1. Prepare or edit the Dragon training config locally.
-2. Build the new profile JSON or keep the config path for direct rollout.
-3. Authenticate as an admin user.
-4. Roll the updated directory entry through the bootstrap admin API using the native operator binary.
+The recommended operator flow is now browser-first:
 
-Example:
+1. open the deployed Pages shell or another host rendering `DragonBrowserApp`
+2. click `Sign In (Admin)`
+3. set the study id, for example `burn-dragon-mainnet`
+4. click `Load Directory`
+5. click `Load Selected Entry` for the experiment you want to change
+6. paste the replacement entry JSON or update the current entry draft
+7. click `Upsert Editor Entry`
+8. click `Roll Out Directory`
+
+That path uses the same session-authenticated `/admin` surface as the native operator binary. The native CLI remains available for scripted or headless rollout.
+
+Example native fallback:
 
 ```bash
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \

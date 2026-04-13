@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -199,11 +199,12 @@ fn wasm_smoke() -> Result<()> {
     let chrome = resolve_chrome_path()
         .context("could not find Google Chrome; install it or set BURN_DRAGON_PLAYWRIGHT_CHROME")?;
     let chromedriver = ensure_chromedriver(&chrome)?;
+    let wasm_bindgen_test_runner = ensure_wasm_bindgen_test_runner()?;
     let webdriver_json = write_webdriver_config(&chrome)?;
     let mut envs = vec![
         (
             OsString::from("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER"),
-            OsString::from("wasm-bindgen-test-runner"),
+            wasm_bindgen_test_runner.into_os_string(),
         ),
         (
             OsString::from("CHROMEDRIVER"),
@@ -340,6 +341,98 @@ fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> 
         bail!("command failed: {} {}", program, args.join(" "));
     }
     Ok(())
+}
+
+fn ensure_wasm_bindgen_test_runner() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("BURN_DRAGON_WASM_BINDGEN_TEST_RUNNER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Ok(explicit);
+    }
+    if let Some(found) = find_in_path(binary_name("wasm-bindgen-test-runner")) {
+        return Ok(found);
+    }
+
+    let version = lockfile_package_version("wasm-bindgen")?;
+    let install_root = workspace_root()
+        .join("target")
+        .join("xtask")
+        .join("wasm-bindgen-cli")
+        .join(&version);
+    let runner = install_root
+        .join("bin")
+        .join(binary_name("wasm-bindgen-test-runner"));
+    if runner.is_file() {
+        return Ok(runner);
+    }
+
+    fs::create_dir_all(&install_root).with_context(|| {
+        format!(
+            "failed to create wasm-bindgen-cli cache {}",
+            install_root.display()
+        )
+    })?;
+
+    let cargo = cargo_bin();
+    run(
+        &cargo,
+        &[
+            "install",
+            "--locked",
+            "--root",
+            install_root
+                .to_str()
+                .context("wasm-bindgen install root was not valid utf-8")?,
+            "wasm-bindgen-cli",
+            "--version",
+            &version,
+        ],
+    )
+    .with_context(|| format!("failed to install wasm-bindgen-cli {version}"))?;
+
+    ensure!(
+        runner.is_file(),
+        "missing wasm-bindgen test runner at {} after install",
+        runner.display()
+    );
+    Ok(runner)
+}
+
+fn lockfile_package_version(package_name: &str) -> Result<String> {
+    let lockfile = workspace_root().join("Cargo.lock");
+    let text = fs::read_to_string(&lockfile)
+        .with_context(|| format!("failed to read {}", lockfile.display()))?;
+    for block in text.split("[[package]]") {
+        let mut saw_name = false;
+        let mut version = None;
+        for line in block.lines().map(str::trim) {
+            if line == format!("name = \"{package_name}\"") {
+                saw_name = true;
+            } else if let Some(raw_version) = line.strip_prefix("version = ") {
+                version = Some(raw_version.trim_matches('"').to_owned());
+            }
+        }
+        if saw_name {
+            if let Some(version) = version {
+                return Ok(version);
+            }
+            bail!("lockfile entry for {package_name} was missing a version");
+        }
+    }
+    bail!("package {package_name} was not found in Cargo.lock")
+}
+
+fn binary_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_owned()
+    }
+}
+
+fn cargo_bin() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())
 }
 
 fn ensure_chromedriver(chrome: &Path) -> Result<PathBuf> {
@@ -492,7 +585,8 @@ fn resolve_binary(env_var: &str, candidates: &[&str]) -> Option<PathBuf> {
         })
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
+fn find_in_path(binary: impl AsRef<Path>) -> Option<PathBuf> {
+    let binary = binary.as_ref();
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(binary);

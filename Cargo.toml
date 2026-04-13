@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+  "xtask",
+  "crates/burn_dragon_checkpoint",
+  "crates/burn_dragon_core",
+  "crates/burn_dragon_kernel",
+  "crates/burn_dragon_language",
+  "crates/burn_dragon_p2p",
+  "crates/burn_dragon_tokenizer",
+  "crates/burn_dragon_train",
+  "crates/burn_dragon_universality",
+]
+
+[workspace.package]
+version = "0.21.0-pre.12"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mosure/burn_dragon"
+homepage = "https://github.com/mosure/burn_dragon"
+readme = "README.md"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+debug = 0
+
+[profile.wasm-release]
+strip = "symbols"
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

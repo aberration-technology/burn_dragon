@@ -1,0 +1,72 @@
+[package]
+name = "burn_dragon_train"
+description = "Training utilities for burn_dragon"
+version = "0.21.0-pre.12"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/mosure/burn_dragon"
+repository = "https://github.com/mosure/burn_dragon"
+readme = "../../README.md"
+
+[features]
+default = []
+benchmark = ["burn/autotune", "burn/fusion"]
+ddp = ["train", "dep:burn-collective", "dep:burn-communication", "burn-train/ddp"]
+cli = [
+  "train",
+  "dep:burn-autodiff",
+  "dep:burn-ndarray",
+  "dep:burn-train",
+  "dep:clap",
+  "dep:names",
+  "dep:tracing-appender",
+  "dep:tracing-subscriber",
+]
+train = [
+  "burn/dataset",
+  "dep:burn-autodiff",
+  "dep:burn-ndarray",
+  "dep:burn-train",
+  "dep:names",
+  "dep:tracing",
+  "dep:image",
+  "dep:toml",
+]
+cuda = ["burn-cuda"]
+integration_test = ["train"]
+
+[dependencies]
+burn_dragon_core = { path = "../burn_dragon_core", version = "0.21.0-pre.12", default-features = false, features = ["train"] }
+anyhow = "1"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hashbrown = "0.16"
+toml = { version = "0.9", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+names = { version = "0.14", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+burn_dino = { version = "0.7", default-features = false, optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-appender = { version = "0.2", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+burn = { version = "0.21.0-pre.3", default-features = false, features = ["fusion", "ndarray", "std", "wgpu"] }
+burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["fusion", "std"] }
+burn-ndarray = { version = "0.21.0-pre.3", optional = true }
+burn-autodiff = { version = "0.21.0-pre.3", optional = true }
+burn-train = { version = "0.21.0-pre.3", optional = true, default-features = false }
+burn-collective = { version = "0.21.0-pre.3", optional = true }
+burn-communication = { version = "0.21.0-pre.3", optional = true }
+burn-cubecl = { version = "0.21.0-pre.3", default-features = false, features = ["std", "fusion"] }
+burn-fusion = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-ir = "0.21.0-pre.3"
+burn-cuda = { version = "0.21.0-pre.3", optional = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+avirus = "0.2"
+burn-ndarray = "0.21.0-pre.3"
+criterion = { version = "0.7", features = ["html_reports"] }
+tempfile = "3"

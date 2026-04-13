@@ -1,0 +1,9 @@
+/target
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.safetensors
+*.bin
+.DS_Store
+/crates/burn_dragon_core/data/
+/crates/burn_dragon_core/runs/

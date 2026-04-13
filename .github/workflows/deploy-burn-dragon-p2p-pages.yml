@@ -1,0 +1,128 @@
+name: deploy burn_dragon_p2p pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      edge_base_url:
+        description: Optional default edge base URL baked into the static browser shell. Leave empty to use the repo variable or require users to pass ?edge= at runtime.
+        required: false
+        default: ""
+        type: string
+      seed_node_urls:
+        description: Optional comma-separated default seed node multiaddrs baked into the static browser shell.
+        required: false
+        default: ""
+        type: string
+      selected_experiment_id:
+        description: Optional default experiment id selected on load.
+        required: false
+        default: ""
+        type: string
+      selected_revision_id:
+        description: Optional default revision id selected on load.
+        required: false
+        default: ""
+        type: string
+      require_github_auth:
+        description: Require GitHub auth before joining from the published browser shell.
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: deploy-burn-dragon-p2p-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: cache rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: configure pages
+        uses: actions/configure-pages@v5
+
+      - name: resolve browser shell settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          edge_base_url="${{ github.event.inputs.edge_base_url }}"
+          seed_node_urls="${{ github.event.inputs.seed_node_urls }}"
+          selected_experiment_id="${{ github.event.inputs.selected_experiment_id }}"
+          selected_revision_id="${{ github.event.inputs.selected_revision_id }}"
+
+          if [ -z "$edge_base_url" ]; then
+            edge_base_url="${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}"
+          fi
+          if [ -z "$seed_node_urls" ]; then
+            seed_node_urls="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
+          fi
+          if [ -z "$selected_experiment_id" ]; then
+            selected_experiment_id="${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID }}"
+          fi
+          if [ -z "$selected_revision_id" ]; then
+            selected_revision_id="${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID }}"
+          fi
+
+          {
+            echo "EDGE_BASE_URL=$edge_base_url"
+            echo "SEED_NODE_URLS=$seed_node_urls"
+            echo "SELECTED_EXPERIMENT_ID=$selected_experiment_id"
+            echo "SELECTED_REVISION_ID=$selected_revision_id"
+            echo "REQUIRE_GITHUB_AUTH=${{ github.event.inputs.require_github_auth }}"
+          } >>"$GITHUB_ENV"
+
+      - name: build browser site artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(run -p xtask -- build-browser-site --out-dir target/browser-site --require-github-auth "$REQUIRE_GITHUB_AUTH")
+          if [ -n "$EDGE_BASE_URL" ]; then
+            args+=(--edge-url "$EDGE_BASE_URL")
+          fi
+          if [ -n "$SEED_NODE_URLS" ]; then
+            args+=(--seed-node-url "$SEED_NODE_URLS")
+          fi
+          if [ -n "$SELECTED_EXPERIMENT_ID" ]; then
+            args+=(--selected-experiment-id "$SELECTED_EXPERIMENT_ID")
+          fi
+          if [ -n "$SELECTED_REVISION_ID" ]; then
+            args+=(--selected-revision-id "$SELECTED_REVISION_ID")
+          fi
+          cargo "${args[@]}"
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/browser-site
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: deploy to github pages
+        id: deployment
+        uses: actions/deploy-pages@v4

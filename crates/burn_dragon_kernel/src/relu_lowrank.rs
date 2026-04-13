@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};

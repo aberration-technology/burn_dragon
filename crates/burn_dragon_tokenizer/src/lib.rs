@@ -14,6 +14,7 @@ use rayon::prelude::*;
 pub const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
 
 type Pair = (u32, u32);
+type RegexError = Box<fancy_regex::Error>;
 
 /// A Byte Pair Encoding tokenizer that matches the GPT-4 style implementation
 #[cfg_attr(feature = "python-bindings", pyclass)]
@@ -282,11 +283,11 @@ impl Tokenizer {
         log::info!("Finished training: {} merges completed", merges_done);
     }
 
-    pub fn new_with_pattern(pattern: impl Into<String>) -> Result<Self, fancy_regex::Error> {
+    pub fn new_with_pattern(pattern: impl Into<String>) -> Result<Self, RegexError> {
         let pattern = pattern.into();
         Ok(Self {
             merges: StdHashMap::new(),
-            compiled_pattern: Regex::new(&pattern)?,
+            compiled_pattern: Regex::new(&pattern).map_err(Box::new)?,
             pattern,
         })
     }
@@ -294,11 +295,11 @@ impl Tokenizer {
     pub fn from_merges(
         pattern: impl Into<String>,
         merges: StdHashMap<(u32, u32), u32>,
-    ) -> Result<Self, fancy_regex::Error> {
+    ) -> Result<Self, RegexError> {
         let pattern = pattern.into();
         Ok(Self {
             merges,
-            compiled_pattern: Regex::new(&pattern)?,
+            compiled_pattern: Regex::new(&pattern).map_err(Box::new)?,
             pattern,
         })
     }
@@ -308,18 +309,18 @@ impl Tokenizer {
         texts: I,
         vocab_size: u32,
         pattern: Option<&str>,
-    ) -> Result<(), fancy_regex::Error>
+    ) -> Result<(), RegexError>
     where
         I: IntoIterator<Item = &'a str>,
     {
         let pattern_str = pattern.unwrap_or(GPT4_PATTERN).to_string();
         self.pattern = pattern_str.clone();
-        self.compiled_pattern = Regex::new(&pattern_str)?;
+        self.compiled_pattern = Regex::new(&pattern_str).map_err(Box::new)?;
 
         let mut counts: AHashMap<CompactString, i32> = AHashMap::new();
         for text in texts {
             for mat in self.compiled_pattern.find_iter(text) {
-                let piece = mat?.as_str();
+                let piece = mat.map_err(Box::new)?.as_str();
                 *counts.entry(CompactString::from(piece)).or_default() += 1;
             }
         }

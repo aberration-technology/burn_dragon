@@ -63,6 +63,7 @@ pub fn load_matching_native_downgrade<M: serde::Serialize>(
         .filter(|record| record_is_still_binding(record, current_trainer_budget_bytes)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn persist_native_downgrade<M: serde::Serialize>(
     storage_root: &Path,
     experiment_kind: DragonExperimentKind,

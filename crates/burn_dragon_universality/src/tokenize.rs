@@ -21,7 +21,7 @@ pub enum CorpusTokenizer {
         frame_special_tokens: bool,
     },
     RustBpe {
-        inner: RustBpeInner,
+        inner: Box<RustBpeInner>,
         mergeable_vocab_size: usize,
         bos_id: Option<u32>,
         eos_id: Option<u32>,
@@ -72,7 +72,7 @@ impl CorpusTokenizer {
                 )
                 .map_err(|err| anyhow!("failed to load rust_bpe tokenizer: {err}"))?;
                 Ok(Self::RustBpe {
-                    inner,
+                    inner: Box::new(inner),
                     mergeable_vocab_size: *mergeable_vocab_size,
                     bos_id: *bos_id,
                     eos_id: *eos_id,

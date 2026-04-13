@@ -266,6 +266,7 @@ fn resolve_browser_training_backend(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_browser_training_inner<TrainB, EvalB>(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
@@ -611,6 +612,7 @@ fn ordered_manifest_entries<'a>(
     entries
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_shard_manifest_records(
     manifest_url: &str,
     edge_base_url: &str,

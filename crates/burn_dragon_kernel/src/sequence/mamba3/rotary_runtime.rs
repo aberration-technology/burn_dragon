@@ -1,3 +1,4 @@
+#![allow(clippy::let_unit_value)]
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::{Shape, TensorData};
 #[cfg(feature = "cuda")]
@@ -633,7 +634,7 @@ fn rotary_forward_impl(
         let k0 = k[k0_idx];
         let k1 = k[k1_idx];
 
-        if d % 2usize == 0usize {
+        if d.is_multiple_of(2usize) {
             q_rot[q_out_idx] = q0 * cos_val - q1 * sin_val;
             k_rot[k_out_idx] = k0 * cos_val - k1 * sin_val;
         } else {
@@ -890,7 +891,7 @@ fn rotary_backward_impl(
         let gk0 = grad_k_rot[gk0_idx];
         let gk1 = grad_k_rot[gk1_idx];
 
-        if d % 2usize == 0usize {
+        if d.is_multiple_of(2usize) {
             grad_q[gq_idx] = gq0 * cos_val + gq1 * sin_val;
             grad_k[gk_idx] = gk0 * cos_val + gk1 * sin_val;
             grad_angle[grad_angle_idx] = (-(gq0 * q0 + gq1 * q1) * sin_val

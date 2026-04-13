@@ -1,3 +1,4 @@
+#![allow(clippy::let_unit_value)]
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::{Shape, TensorData};
 use burn_cubecl::cubecl;

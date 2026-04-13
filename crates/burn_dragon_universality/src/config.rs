@@ -4,18 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NcaComplexityBand {
     Simple,
+    #[default]
     Medium,
     Complex,
-}
-
-impl Default for NcaComplexityBand {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -95,15 +90,15 @@ impl Default for NcaRuleFilterConfig {
 
 impl NcaRuleFilterConfig {
     pub fn validate(&self, label: &str) -> Result<()> {
-        if let Some(threshold) = self.threshold {
-            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-                return Err(anyhow!("{label}.threshold must be within [0, 1]"));
-            }
+        if let Some(threshold) = self.threshold
+            && (!threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+        {
+            return Err(anyhow!("{label}.threshold must be within [0, 1]"));
         }
-        if let Some(upper_bound) = self.upper_bound {
-            if !upper_bound.is_finite() || !(0.0..=1.0).contains(&upper_bound) {
-                return Err(anyhow!("{label}.upper_bound must be within [0, 1]"));
-            }
+        if let Some(upper_bound) = self.upper_bound
+            && (!upper_bound.is_finite() || !(0.0..=1.0).contains(&upper_bound))
+        {
+            return Err(anyhow!("{label}.upper_bound must be within [0, 1]"));
         }
         if matches!(
             (self.threshold, self.upper_bound),

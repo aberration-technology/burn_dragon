@@ -391,11 +391,7 @@ fn adapt_config_for_min_logical_document_tokens(
         .checked_mul(payload_alignment)
         .ok_or_else(|| anyhow!("on-the-fly NCA target payload length overflow"))?;
 
-    for (family, patches) in config
-        .families
-        .iter_mut()
-        .zip(patches_per_frame.into_iter())
-    {
+    for (family, patches) in config.families.iter_mut().zip(patches_per_frame) {
         let steps = target_payload_tokens
             .checked_div(patches)
             .ok_or_else(|| anyhow!("invalid per-family on-the-fly NCA step layout"))?;

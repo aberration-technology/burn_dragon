@@ -506,6 +506,7 @@ pub fn generate_tokens<B: Backend>(
     Ok(full_tokens)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_tokens_chunked<B: Backend>(
     model: &DragonModel<B>,
     prompt_tokens: Vec<i64>,

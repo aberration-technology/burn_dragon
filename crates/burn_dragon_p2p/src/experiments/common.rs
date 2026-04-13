@@ -350,14 +350,12 @@ fn validation_dataset_config_for(
 fn load_tokenizer_without_dataset(config: &TrainingConfig) -> Result<SharedTokenizer> {
     let tokenizer_cfg = &config.dataset.tokenizer;
     match tokenizer_cfg.storage_path(&config.dataset.cache_dir) {
-        Some(path) if path.is_file() => tokenizer_cfg.load(&path).map_err(Into::into),
+        Some(path) if path.is_file() => tokenizer_cfg.load(&path),
         Some(path) => bail!(
             "shard-first p2p setup requires a persisted tokenizer at {}",
             path.display()
         ),
-        None => tokenizer_cfg
-            .fit(std::iter::empty::<&str>())
-            .map_err(Into::into),
+        None => tokenizer_cfg.fit(std::iter::empty::<&str>()),
     }
 }
 
@@ -629,7 +627,7 @@ fn window_records_from_dataset(
         let mut sample = vec![0_u32; block_size + 1];
         dataset.copy_token_range(start, &mut sample);
         let reset_stream_state =
-            document_span.is_some_and(|document_span| local_start % document_span == 0);
+            document_span.is_some_and(|document_span| local_start.is_multiple_of(document_span));
         records.push(TokenWindowRecord {
             inputs: sample[..block_size]
                 .iter()
@@ -859,7 +857,7 @@ where
     ensure_tokenizer_compatible(
         base_tokenizer,
         prepared.valid.tokenizer().as_ref(),
-        &config.dataset.tokenizer.kind_name(),
+        config.dataset.tokenizer.kind_name(),
     )?;
     Ok(Some(build_valid_loader_for_dataset::<B>(
         prepared.valid,

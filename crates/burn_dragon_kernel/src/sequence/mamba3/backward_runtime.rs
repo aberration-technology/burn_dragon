@@ -1,3 +1,8 @@
+#![allow(
+    clippy::let_unit_value,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::backend::Backend as BackendTrait;
 use burn::tensor::{Shape, TensorData, TensorPrimitive};

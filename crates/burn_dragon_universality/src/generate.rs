@@ -98,7 +98,7 @@ pub fn generate_nca_corpus(config: &NcaCorpusConfig) -> Result<GeneratedCorpusRe
 
     let mut chunks = Vec::with_capacity(train_chunks.len() + val_chunks.len());
     let mut running_offset = 0usize;
-    for chunk in train_chunks.into_iter().chain(val_chunks.into_iter()) {
+    for chunk in train_chunks.into_iter().chain(val_chunks) {
         chunks.push(UniversalityChunkManifest {
             file_name: chunk.file_name,
             split: chunk.split,
@@ -155,7 +155,7 @@ pub fn generate_nca_corpus(config: &NcaCorpusConfig) -> Result<GeneratedCorpusRe
         .copied()
         .reduce(f32::max)
         .unwrap_or_default();
-    let mean_complexity_score = mean(complexity_scores.into_iter());
+    let mean_complexity_score = mean(complexity_scores);
     let min_gzip_complexity_ratio = gzip_ratios
         .iter()
         .copied()
@@ -166,7 +166,7 @@ pub fn generate_nca_corpus(config: &NcaCorpusConfig) -> Result<GeneratedCorpusRe
         .copied()
         .reduce(f32::max)
         .unwrap_or_default();
-    let mean_gzip_complexity_ratio = mean(gzip_ratios.into_iter());
+    let mean_gzip_complexity_ratio = mean(gzip_ratios);
 
     let stats = CorpusStats {
         total_samples,
@@ -219,6 +219,7 @@ pub fn generate_nca_corpus(config: &NcaCorpusConfig) -> Result<GeneratedCorpusRe
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_sample_record(
     config: &NcaCorpusConfig,
     tokenizer: &CorpusTokenizer,

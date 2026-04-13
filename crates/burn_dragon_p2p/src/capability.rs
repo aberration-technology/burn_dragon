@@ -305,17 +305,19 @@ pub fn decide_browser_capability(
     config: Option<&DragonBrowserTrainingConfig>,
     host: &DragonBrowserHostCapabilityProbe,
 ) -> DragonBrowserCapabilityDecision {
-    let mut capability = BrowserCapabilityReport::default();
-    capability.navigator_gpu_exposed = host.navigator_gpu_exposed;
-    capability.worker_gpu_exposed = host.worker_gpu_exposed;
-    capability.dedicated_worker = if host.dedicated_worker_exposed {
-        BrowserWorkerSupport::DedicatedWorker
-    } else {
-        BrowserWorkerSupport::Unavailable("dedicated worker unavailable".into())
+    let mut capability = BrowserCapabilityReport {
+        navigator_gpu_exposed: host.navigator_gpu_exposed,
+        worker_gpu_exposed: host.worker_gpu_exposed,
+        dedicated_worker: if host.dedicated_worker_exposed {
+            BrowserWorkerSupport::DedicatedWorker
+        } else {
+            BrowserWorkerSupport::Unavailable("dedicated worker unavailable".into())
+        },
+        persistent_storage_exposed: host.persistent_storage_exposed,
+        web_transport_exposed: host.web_transport_exposed,
+        web_rtc_exposed: host.web_rtc_exposed,
+        ..BrowserCapabilityReport::default()
     };
-    capability.persistent_storage_exposed = host.persistent_storage_exposed;
-    capability.web_transport_exposed = host.web_transport_exposed;
-    capability.web_rtc_exposed = host.web_rtc_exposed;
 
     let Some(config) = config else {
         capability.gpu_support = if host.navigator_gpu_exposed && host.worker_gpu_exposed {

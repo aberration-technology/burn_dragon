@@ -579,9 +579,11 @@ fn edge_snapshot_for_manifests(
     manifests: &burn_dragon_p2p::config::DragonManifestBundle,
     browser_mode: BrowserMode,
 ) -> BrowserEdgeSnapshot {
-    let mut paths = BrowserEdgePaths::default();
-    paths.login_path = "/login/github".into();
-    paths.callback_path = "/callback/github".into();
+    let paths = BrowserEdgePaths {
+        login_path: "/login/github".into(),
+        callback_path: "/callback/github".into(),
+        ..BrowserEdgePaths::default()
+    };
 
     BrowserEdgeSnapshot {
         network_id: manifests.network_manifest.network_id.clone(),

@@ -28,13 +28,11 @@ where
         return None;
     }
 
-    let sparse_mask = sparse_mask
-        .map(|mask| {
-            let prim_mask = mask.clone().into_primitive().tensor();
-            let mask: CubeTensor<R> = try_cast_primitive::<B, _>(prim_mask)?;
-            (mask.dtype == DType::F32).then_some(mask)
-        })
-        .flatten();
+    let sparse_mask = sparse_mask.and_then(|mask| {
+        let prim_mask = mask.clone().into_primitive().tensor();
+        let mask: CubeTensor<R> = try_cast_primitive::<B, _>(prim_mask)?;
+        (mask.dtype == DType::F32).then_some(mask)
+    });
 
     let output = relu_lowrank_runtime::<R>(input, weight, shape, meta, sparse_mask);
     let output_prim = try_cast_backend::<B, _>(output)?;
@@ -165,10 +163,7 @@ where
         let prim_mask = mask.clone().into_primitive().tensor();
         try_cast_primitive::<B, B::FloatTensorPrimitive>(prim_mask)
     });
-    let mask_inner = mask_ad
-        .clone()
-        .map(extract_autodiff_inner::<B, R>)
-        .flatten();
+    let mask_inner = mask_ad.clone().and_then(extract_autodiff_inner::<B, R>);
     if mask_inner
         .as_ref()
         .is_some_and(|mask| mask.dtype != DType::F32)

@@ -1,3 +1,4 @@
+#![allow(clippy::let_unit_value)]
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::backend::Backend as BackendTrait;
 use burn::tensor::{Shape, TensorData, TensorPrimitive};
@@ -669,7 +670,7 @@ mod tests {
     ) {
         let lhs = lhs.into_data().to_vec::<f32>().expect("lhs f32");
         let rhs = rhs.into_data().to_vec::<f32>().expect("rhs f32");
-        for (l, r) in lhs.into_iter().zip(rhs.into_iter()) {
+        for (l, r) in lhs.into_iter().zip(rhs) {
             assert!(
                 (l - r).abs() <= tol,
                 "expected |{l} - {r}| <= {tol}, got {}",

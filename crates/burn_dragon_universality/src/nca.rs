@@ -624,6 +624,7 @@ fn sample_neural_stochastic_rule(state_count: usize, rng: &mut StdRng) -> Neural
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollout_neural_stochastic(
     rule: &NeuralStochasticRule,
     width: usize,
@@ -641,7 +642,7 @@ fn rollout_neural_stochastic(
     let mut frames = Vec::with_capacity(sampled_steps);
     let total_iterations = start_step.saturating_add(sampled_steps.saturating_mul(step_stride));
     for step in 0..total_iterations {
-        if step >= start_step && (step - start_step) % step_stride == 0 {
+        if step >= start_step && (step - start_step).is_multiple_of(step_stride) {
             frames.push(current.clone());
             if frames.len() == sampled_steps {
                 break;
@@ -675,6 +676,7 @@ fn init_neural_stochastic_state(
     state
 }
 
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn apply_neural_stochastic(
     rule: &NeuralStochasticRule,
     current: &[u8],

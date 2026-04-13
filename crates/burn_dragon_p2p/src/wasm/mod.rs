@@ -39,11 +39,11 @@ fn browser_backend_label(config: &crate::config::DragonBrowserTrainingConfig) ->
 }
 
 fn window_query_string() -> Result<String> {
-    Ok(web_sys::window()
+    web_sys::window()
         .ok_or_else(|| anyhow!("window unavailable"))?
         .location()
         .search()
-        .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))?)
+        .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))
 }
 
 fn config_with_window_network_overrides(

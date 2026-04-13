@@ -67,6 +67,7 @@ fn minimum_system_memory_bytes(backend_label: &str, footprint: &DragonTrainingFo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_manifest_bundle(
     seed: &DragonManifestSeed,
     experiment_kind: DragonExperimentKind,

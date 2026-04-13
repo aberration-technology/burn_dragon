@@ -1,3 +1,4 @@
+#![allow(clippy::let_unit_value, clippy::extra_unused_type_parameters)]
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

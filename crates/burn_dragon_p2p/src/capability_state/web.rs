@@ -113,7 +113,7 @@ pub fn clear_browser_downgrade(
 ) -> Result<()> {
     let (_scope_fingerprint, storage_key) =
         browser_scope_fingerprint(edge_base_url, config, backend_label);
-    let _ = browser_storage()?
+    browser_storage()?
         .remove_item(&storage_key)
         .map_err(|error| anyhow!("failed to clear browser downgrade state: {error:?}"))?;
     Ok(())

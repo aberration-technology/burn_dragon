@@ -1,0 +1,97 @@
+name: Publish Crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run cargo publish as a dry-run instead of publishing to crates.io
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: publish crates in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+          dry_run='${{ github.event.inputs.dry_run }}'
+          version="$(python3 - <<'PYV'
+          from pathlib import Path
+          import tomllib
+          root = Path('Cargo.toml')
+          data = tomllib.loads(root.read_text())
+          print(data['workspace']['package']['version'])
+          PYV
+          )"
+
+          if [ "$dry_run" != "true" ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is required for a real publish" >&2
+            exit 1
+          fi
+
+          crates=(
+            burn_dragon_tokenizer
+            burn_dragon_universality
+            burn_dragon_kernel
+            burn_dragon_core
+            burn_dragon_checkpoint
+            burn_dragon_train
+            burn_dragon_language
+            burn_dragon_p2p
+          )
+
+          wait_for_crate() {
+            local crate="$1"
+            local version="$2"
+            python3 - "$crate" "$version" <<'PY'
+            import json
+            import sys
+            import time
+            import urllib.request
+
+            crate = sys.argv[1]
+            version = sys.argv[2]
+            url = f"https://crates.io/api/v1/crates/{crate}"
+            for _ in range(36):
+                try:
+                    with urllib.request.urlopen(url, timeout=20) as response:
+                        payload = json.load(response)
+                    if any(item.get('num') == version for item in payload.get('versions', [])):
+                        sys.exit(0)
+                except Exception:
+                    pass
+                time.sleep(10)
+            sys.exit(1)
+            PY
+          }
+
+          for crate in "${crates[@]}"; do
+            if [ "$dry_run" = "true" ]; then
+              echo "+ cargo publish --manifest-path Cargo.toml -p ${crate} --dry-run --locked"
+              cargo publish --manifest-path Cargo.toml -p "${crate}" --dry-run --locked
+              continue
+            fi
+
+            echo "+ cargo publish --manifest-path Cargo.toml -p ${crate} --locked"
+            cargo publish --manifest-path Cargo.toml -p "${crate}" --locked
+
+            echo "waiting for ${crate} ${version} to appear on crates.io"
+            wait_for_crate "$crate" "$version"
+          done

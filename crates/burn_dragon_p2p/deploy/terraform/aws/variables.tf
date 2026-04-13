@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "AWS region for the burn_dragon_p2p bootstrap deployment."
   type        = string
-  default     = "us-east-1"
+  default     = "us-east-2"
 }
 
 variable "disaster_recovery_region" {
@@ -299,13 +299,13 @@ variable "instance_type" {
 variable "root_volume_size_gib" {
   description = "Root EBS volume size for the bootstrap edge instance."
   type        = number
-  default     = 256
+  default     = 64
 }
 
 variable "data_volume_size_gib" {
   description = "Dedicated retained EBS data volume size for bootstrap/auth/publication state."
   type        = number
-  default     = 512
+  default     = 128
 }
 
 variable "data_volume_type" {
@@ -473,19 +473,19 @@ variable "managed_trainer_max_size" {
 variable "managed_trainer_instance_type" {
   description = "EC2 instance type used by the managed native trainer pool."
   type        = string
-  default     = "g5.xlarge"
+  default     = "m7i.large"
 }
 
 variable "managed_trainer_root_volume_size_gib" {
   description = "Root EBS volume size for managed native trainer instances."
   type        = number
-  default     = 256
+  default     = 128
 }
 
 variable "managed_trainer_backend" {
   description = "Native backend used by the managed trainer pool. Supported values: cpu, wgpu, cuda."
   type        = string
-  default     = "wgpu"
+  default     = "cpu"
 
   validation {
     condition     = contains(["cpu", "wgpu", "cuda"], lower(trimspace(var.managed_trainer_backend)))

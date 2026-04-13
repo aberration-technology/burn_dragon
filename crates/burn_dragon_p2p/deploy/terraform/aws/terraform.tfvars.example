@@ -1,6 +1,6 @@
 stack_name              = "burn-dragon-p2p-mainnet"
 environment_name        = "production"
-aws_region              = "us-east-1"
+aws_region              = "us-east-2"
 route53_zone_name       = "aberration.technology"
 edge_domain_name        = "dragon.aberration.technology"
 bootstrap_install_source = "crate"
@@ -15,15 +15,15 @@ release_train_hash      = "burn-dragon-mainnet-train"
 
 auth_connector_kind     = "github"
 auth_authority_name     = "burn-dragon-auth"
-github_required_org     = "mosure"
-github_required_team    = "mosure/trainers"
+# github_required_org   = "mosure"
+# github_required_team  = "mosure/trainers"
 github_required_repo    = "mosure/burn_dragon"
 github_admin_logins     = ["mosure"]
 github_admin_required_repo_permission = "admin"
 
 instance_type           = "t3.large"
-root_volume_size_gib    = 256
-data_volume_size_gib    = 512
+root_volume_size_gib    = 64
+data_volume_size_gib    = 128
 enable_data_volume_snapshots = true
 data_volume_snapshot_retention_days = 14
 enable_disaster_recovery_snapshot_copies = true
@@ -38,7 +38,7 @@ create_artifact_replica_bucket = true
 # dataset_bucket_path_prefix = "dragon-datasets"
 # dataset_bucket_force_destroy = false
 managed_trainer_desired_capacity = 0
-managed_trainer_backend = "wgpu"
+managed_trainer_backend = "cpu"
 managed_trainer_experiment_kind = "nca"
 
 # Optional:
@@ -68,9 +68,13 @@ managed_trainer_experiment_kind = "nca"
 #   Owner = "ml-platform"
 # }
 
+# GPU trainers are explicit opt-in only.
+# managed_trainer_backend = "wgpu"
 # managed_trainer_instance_type = "g5.xlarge"
+# CPU trainer default when enabled: m7i.large
+# managed_trainer_instance_type = "m7i.large"
 # managed_trainer_min_size = 1
 # managed_trainer_max_size = 2
 # managed_trainer_crate_version = "0.21.0-pre.13"
 # managed_trainer_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/trainer_auth_bundle_json"
-# alarm_sns_topic_arn   = "arn:aws:sns:us-east-1:123456789012:burn-dragon-p2p-alerts"
+# alarm_sns_topic_arn   = "arn:aws:sns:us-east-2:123456789012:burn-dragon-p2p-alerts"

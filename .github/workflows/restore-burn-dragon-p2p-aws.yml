@@ -17,7 +17,7 @@ on:
         default: mainnet
         type: string
       aws_region:
-        description: "Target AWS region for the restored control plane. Example: `us-west-2` for warm-DR failover. Leave empty to use the GitHub Environment region."
+        description: "Target AWS region for the restored control plane. Example: `us-west-2` for warm-DR failover. Leave empty to use the GitHub Environment region, then fall back to `us-east-2`."
         required: false
         default: ""
         type: string
@@ -231,12 +231,22 @@ jobs:
             aws_region="$aws_region_var"
           fi
 
-          : "${aws_region:?missing target aws_region input or BURN_DRAGON_P2P_AWS_REGION}"
+          if [ -z "$aws_region" ]; then
+            aws_region="us-east-2"
+          fi
           : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_ROLE_ARN}"
-          : "${network_id:?missing BURN_DRAGON_P2P_NETWORK_ID}"
-          : "${project_family_id:?missing BURN_DRAGON_P2P_PROJECT_FAMILY_ID}"
-          : "${study_id:?missing BURN_DRAGON_P2P_STUDY_ID}"
-          : "${release_train_hash:?missing BURN_DRAGON_P2P_RELEASE_TRAIN_HASH}"
+          if [ -z "$network_id" ]; then
+            network_id="burn-dragon-mainnet"
+          fi
+          if [ -z "$project_family_id" ]; then
+            project_family_id="burn-dragon-language"
+          fi
+          if [ -z "$study_id" ]; then
+            study_id="burn-dragon-mainnet"
+          fi
+          if [ -z "$release_train_hash" ]; then
+            release_train_hash="burn-dragon-mainnet-train"
+          fi
 
           native_target_artifact_hash="$native_target_artifact_hash_var"
           if [ -z "$native_target_artifact_hash" ]; then
@@ -326,7 +336,7 @@ jobs:
             managed_trainer_desired_capacity="0"
           fi
           if [ -z "$managed_trainer_backend" ]; then
-            managed_trainer_backend="wgpu"
+            managed_trainer_backend="cpu"
           fi
           if [ -z "$managed_trainer_experiment_kind" ]; then
             managed_trainer_experiment_kind="nca"
@@ -400,8 +410,9 @@ jobs:
           fi
 
           if [ "$auth_connector_kind" = "github" ]; then
-            : "${github_required_org:?missing BURN_DRAGON_P2P_GITHUB_REQUIRED_ORG}"
-            : "${github_required_repo:?missing BURN_DRAGON_P2P_GITHUB_REQUIRED_REPO}"
+            if [ -z "$github_required_repo" ]; then
+              github_required_repo="mosure/burn_dragon"
+            fi
             : "${admin_logins_csv:?no admin logins resolved for github deployment}"
             : "${resolved_auth_client_id:?missing BURN_DRAGON_P2P_AUTH_CLIENT_ID or BURN_DRAGON_P2P_GITHUB_CLIENT_ID secret}"
             : "${resolved_auth_client_secret:?missing BURN_DRAGON_P2P_AUTH_CLIENT_SECRET or BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET secret}"

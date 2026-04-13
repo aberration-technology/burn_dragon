@@ -12,6 +12,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 
 - two EC2 bootstrap/edge hosts across two AZs
 - Route53 DNS for the browser edge
+- no ALB or API Gateway; the browser edge is Caddy on the bootstrap hosts
 - TLS termination via Caddy on the host
 - retained encrypted EBS data volume per bootstrap host for local peer/runtime state
 - bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
@@ -21,6 +22,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
 - managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
+- managed trainers are separate from the bootstrap nodes and default to disabled
 - EC2, Redis, dataset CDN, Route53, and managed-trainer CloudWatch alarms, optionally wired to SNS
 - shared CloudWatch dashboard for control-plane health and throughput
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
@@ -143,23 +145,31 @@ Configure the workflow to target one of those environments. Put the following va
 ### Required Environment Variables
 
 - `BURN_DRAGON_P2P_AWS_ROLE_ARN`
-  - AWS IAM role assumed through GitHub OIDC.
+  - AWS IAM role assumed through GitHub OIDC. This is the only required non-secret variable on the normal path.
 - `BURN_DRAGON_P2P_AWS_REGION`
-  - AWS region for the stack, for example `us-east-1`.
+  - Optional AWS region for the stack. Defaults to `us-east-2`, which is the sane Midwest default.
 - `BURN_DRAGON_P2P_STACK_NAME`
-  - Terraform stack prefix, for example `burn-dragon-p2p-mainnet`.
+  - Optional Terraform stack prefix. Defaults to `burn-dragon-p2p-<environment>`.
 - `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME`
   - Optional public browser edge hostname override. Defaults to `dragon.aberration.technology`.
 - `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME`
   - Optional Route53 public zone override. Defaults to `aberration.technology`.
 - `BURN_DRAGON_P2P_NETWORK_ID`
-  - burn_p2p network id, for example `burn-dragon-mainnet`.
+  - Optional burn_p2p network id. Defaults to `burn-dragon-mainnet`.
 - `BURN_DRAGON_P2P_PROJECT_FAMILY_ID`
-  - burn_p2p project family id, usually `burn-dragon-language`.
+  - Optional burn_p2p project family id. Defaults to `burn-dragon-language`.
 - `BURN_DRAGON_P2P_STUDY_ID`
-  - study id advertised in the experiment directory.
+  - Optional study id advertised in the experiment directory. Defaults to `burn-dragon-mainnet`.
 - `BURN_DRAGON_P2P_RELEASE_TRAIN_HASH`
-  - release-train hash enforced by the auth portal.
+  - Optional release-train hash enforced by the auth portal. Defaults to `burn-dragon-mainnet-train`.
+
+Recommended Midwest baseline:
+
+- `BURN_DRAGON_P2P_AWS_REGION=us-east-2`
+- `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME=dragon.aberration.technology`
+- `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME=aberration.technology`
+- leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` until you explicitly want an always-on trainer
+- if you do enable a trainer, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
@@ -201,7 +211,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_AUTH_EXTERNAL_TRUSTED_INTERNAL_ONLY`
   - whether the external connector should trust only internal ingress traffic. Defaults to `true`.
 - `BURN_DRAGON_P2P_GITHUB_REQUIRED_ORG`
-  - GitHub org required for peer admission when `auth_connector_kind=github`.
+  - optional GitHub org required for peer admission when `auth_connector_kind=github`. Leave empty on the normal repo-gated path.
 - `BURN_DRAGON_P2P_GITHUB_REQUIRED_REPO`
   - repo permission gate used for peer admission when `auth_connector_kind=github`, for example `mosure/burn_dragon`.
 - `BURN_DRAGON_P2P_GITHUB_REQUIRED_TEAM`
@@ -213,19 +223,19 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_INSTANCE_TYPE`
   - override bootstrap host size, default `t3.large`
 - `BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB`
-  - override encrypted EBS root size, default `256`
+  - override encrypted EBS root size, default `64`
 - `BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB`
-  - retained encrypted bootstrap/auth/publication data volume size, default `512`
+  - retained encrypted bootstrap/auth/publication data volume size, default `128`
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY`
   - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND`
-  - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`. Defaults to `wgpu`.
+  - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`. Defaults to `cpu` so GPU trainers stay opt-in.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND`
   - experiment family assigned to the managed trainer pool. Supported values: `nca`, `climbmix`. Defaults to `nca`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET`
   - target role used by managed trainer instances. Defaults to `trainer`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE`
-  - EC2 instance type used by the managed trainer pool. Defaults to `g5.xlarge`.
+  - EC2 instance type used by the managed trainer pool. Defaults to `m7i.large` on the CPU path.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE`
   - optional autoscaling-group minimum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
@@ -313,16 +323,17 @@ The deploy can optionally provision an autoscaled native trainer pool alongside 
 Current behavior:
 
 - each managed trainer instance installs `burn_dragon_p2p_native` from crates.io
-- GPU trainer backends install the NVIDIA and Vulkan user-space stack at first boot; use a GPU-capable instance type like `g5.xlarge` for `wgpu` or `cuda`
+- CPU is now the default managed trainer backend, and the trainer pool still defaults to `0` instances, so no trainer and no GPU resource is created unless you opt in
+- GPU trainer backends still work, but they are explicit opt-in and require a GPU-capable instance type such as `g5.xlarge`
 - the instance fetches a JSON auth bundle from SSM at startup
 - the instance joins the deployed edge as a native trainer for either `nca` or `climbmix`
-- the trainer pool defaults to `0` instances, so nothing is created unless you opt in
 
 Recommended first production setting:
 
-- `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=1`
-- `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=wgpu`
-- `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
+- leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` while you bring up the control plane
+- if you want a low-cost always-on trainer later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=1`
+- set `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
+- set `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
 
 Operational constraint:
 

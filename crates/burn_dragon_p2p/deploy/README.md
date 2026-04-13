@@ -221,7 +221,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION`
   - optional minimum GitHub repository permission for explicitly listed admin logins. Defaults to `admin`. This only applies when `auth_connector_kind=github`.
 - `BURN_DRAGON_P2P_INSTANCE_TYPE`
-  - override bootstrap host size, default `t3.large`
+  - override bootstrap host size, default `t3.small`
 - `BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB`
   - override encrypted EBS root size, default `64`
 - `BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB`

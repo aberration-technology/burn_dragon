@@ -18,9 +18,61 @@ edition = "2024"
 rust-version = "1.92"
 authors = ["mosure <mitchell@mosure.me>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mosure/burn_dragon"
-homepage = "https://github.com/mosure/burn_dragon"
+repository = "https://github.com/aberration-technology/burn_dragon"
+homepage = "https://github.com/aberration-technology/burn_dragon"
 readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1.0"
+burn = { version = "0.21.0-pre.3", default-features = false }
+burn-autodiff = { version = "0.21.0-pre.3", default-features = false }
+burn-collective = "0.21.0-pre.3"
+burn-communication = "0.21.0-pre.3"
+burn-cubecl = { version = "0.21.0-pre.3", default-features = false }
+burn-cuda = { version = "0.21.0-pre.3", default-features = false }
+burn-fusion = { version = "0.21.0-pre.3", default-features = false }
+burn-ir = "0.21.0-pre.3"
+burn-ndarray = { version = "0.21.0-pre.3", default-features = false }
+burn-std = "0.21.0-pre.3"
+burn-store = { version = "0.21.0-pre.3", default-features = false }
+burn-train = { version = "0.21.0-pre.3", default-features = false }
+burn-wgpu = { version = "0.21.0-pre.3", default-features = false }
+
+burn_dragon_checkpoint = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_checkpoint", default-features = false }
+burn_dragon_core = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_core", default-features = false }
+burn_dragon_kernel = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_kernel", default-features = false }
+burn_dragon_language = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_language", default-features = false }
+burn_dragon_p2p = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_p2p", default-features = false }
+burn_dragon_tokenizer = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_tokenizer", default-features = false }
+burn_dragon_train = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_train", default-features = false }
+burn_dragon_universality = { version = "=0.21.0-pre.12", path = "crates/burn_dragon_universality", default-features = false }
+
+burn_p2p = { version = "=0.21.0-pre.12", default-features = false }
+burn_p2p_app = { version = "=0.21.0-pre.12", default-features = false }
+burn_p2p_bootstrap = { version = "=0.21.0-pre.12" }
+burn_p2p_browser = { version = "=0.21.0-pre.12" }
+burn_p2p_core = { version = "=0.21.0-pre.12" }
+burn_p2p_dataloader = { version = "=0.21.0-pre.12" }
+burn_p2p_views = { version = "=0.21.0-pre.12" }
+
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+hashbrown = "0.16"
+hex = "0.4"
+memmap2 = "0.9"
+rand = "0.8"
+rayon = "1.11"
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
+wasm-bindgen-cli-support = "0.2"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
 
 [profile.dev.package."*"]
 opt-level = 3

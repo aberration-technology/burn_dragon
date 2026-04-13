@@ -1,15 +1,15 @@
 [package]
 name = "burn_dragon_kernel"
 description = "Fused GPU kernel crate for burn_dragon execution paths"
-version = "0.21.0-pre.12"
-edition = "2024"
-rust-version = "1.92"
-authors = ["mosure <mitchell@mosure.me>"]
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
 keywords = ["burn", "cuda", "kernel", "recurrent"]
 categories = ["science", "science::neuroscience"]
-homepage = "https://github.com/mosure/burn_dragon"
-repository = "https://github.com/mosure/burn_dragon"
+homepage.workspace = true
+repository.workspace = true
 readme = "../../README.md"
 
 [features]
@@ -17,23 +17,26 @@ default = []
 cuda = ["dep:burn-cuda", "dep:cudarc"]
 
 [dependencies]
-burn = { version = "0.21.0-pre.3", default-features = false, features = ["fusion", "ndarray", "std", "wgpu"] }
-burn-autodiff = { version = "0.21.0-pre.3", default-features = false }
-burn-cuda = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }
-burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["fusion", "std", "template"] }
-burn-cubecl = { version = "0.21.0-pre.3", default-features = false, features = ["std", "fusion"] }
-burn-fusion = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
-burn-std = "0.21.0-pre.3"
-burn-ir = "0.21.0-pre.3"
-pollster = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-wgpu = "26"
+burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
+burn-autodiff.workspace = true
+burn-cubecl = { workspace = true, features = ["std", "fusion"] }
+burn-cuda = { workspace = true, optional = true, features = ["std"] }
+burn-fusion = { workspace = true, features = ["std"] }
+burn-ir.workspace = true
+burn-std.workspace = true
+burn-wgpu = { workspace = true, features = ["fusion", "std", "template"] }
 cudarc = { version = "0.17.8", features = ["cuda-version-from-build-system"], optional = true }
+pollster = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+wgpu = "26"
 
 [dev-dependencies]
-burn-ndarray = "0.21.0-pre.3"
+burn-ndarray.workspace = true
 
 [lib]
 path = "src/lib.rs"
 crate-type = ["rlib"]
+
+[lints]
+workspace = true

@@ -2082,6 +2082,34 @@ mod tests {
 
     type WgpuBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            return (*message).to_owned();
+        }
+        "unknown panic payload".to_owned()
+    }
+
+    fn init_runtime(device: &<WgpuBackend as BackendTrait>::Device) -> Result<(), String> {
+        static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let failure = INIT_FAILURE.get_or_init(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(
+                    device,
+                    burn_wgpu::RuntimeOptions::default(),
+                );
+            }))
+            .err()
+            .map(panic_message)
+        });
+        match failure {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn assert_close<const D: usize>(
         lhs: BurnTensor<WgpuBackend, D>,
         rhs: BurnTensor<WgpuBackend, D>,
@@ -2113,6 +2141,10 @@ mod tests {
     #[test]
     fn reverse_cumsum_bhl_runtime_matches_reference_on_wgpu() {
         let device = <WgpuBackend as BackendTrait>::Device::default();
+        if let Err(reason) = init_runtime(&device) {
+            eprintln!("skipping WGPU test: {reason}");
+            return;
+        }
         let values = BurnTensor::<WgpuBackend, 3>::from_data(
             TensorData::new(
                 (0..(2 * 3 * 5))
@@ -2142,6 +2174,10 @@ mod tests {
     #[test]
     fn reverse_cumsum_blhr_runtime_matches_reference_on_wgpu() {
         let device = <WgpuBackend as BackendTrait>::Device::default();
+        if let Err(reason) = init_runtime(&device) {
+            eprintln!("skipping WGPU test: {reason}");
+            return;
+        }
         let values = BurnTensor::<WgpuBackend, 4>::from_data(
             TensorData::new(
                 (0..(2 * 4 * 3 * 6))
@@ -2172,6 +2208,10 @@ mod tests {
     #[test]
     fn carry_backward_runtime_matches_reference_on_wgpu() {
         let device = <WgpuBackend as BackendTrait>::Device::default();
+        if let Err(reason) = init_runtime(&device) {
+            eprintln!("skipping WGPU test: {reason}");
+            return;
+        }
         let batch = 2;
         let heads = 3;
         let time = 5;
@@ -2242,6 +2282,10 @@ mod tests {
     #[test]
     fn fused_score_carry_backward_runtime_matches_reference_on_wgpu() {
         let device = <WgpuBackend as BackendTrait>::Device::default();
+        if let Err(reason) = init_runtime(&device) {
+            eprintln!("skipping WGPU test: {reason}");
+            return;
+        }
         let batch = 1;
         let heads = 2;
         let time = 4;

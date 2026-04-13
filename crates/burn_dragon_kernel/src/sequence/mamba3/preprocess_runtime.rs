@@ -456,6 +456,34 @@ mod tests {
 
     type WgpuBackend = WgpuCubeBackend;
 
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            return (*message).to_owned();
+        }
+        "unknown panic payload".to_owned()
+    }
+
+    fn init_runtime(device: &<WgpuBackend as BackendTrait>::Device) -> Result<(), String> {
+        static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let failure = INIT_FAILURE.get_or_init(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(
+                    device,
+                    burn_wgpu::RuntimeOptions::default(),
+                );
+            }))
+            .err()
+            .map(panic_message)
+        });
+        match failure {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn assert_close<const D: usize>(
         actual: Tensor<WgpuBackend, D>,
         expected: Tensor<WgpuBackend, D>,
@@ -476,6 +504,10 @@ mod tests {
     #[test]
     fn mamba3_preprocess_runtime_matches_reference_on_wgpu() {
         let device = <WgpuBackend as BackendTrait>::Device::default();
+        if let Err(reason) = init_runtime(&device) {
+            eprintln!("skipping WGPU test: {reason}");
+            return;
+        }
         let batch = 1;
         let time = 3;
         let nheads = 2;

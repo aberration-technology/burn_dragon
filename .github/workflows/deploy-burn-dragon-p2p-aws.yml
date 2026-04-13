@@ -17,22 +17,22 @@ on:
         default: mainnet
         type: string
       auth_connector_kind:
-        description: Optional auth connector kind override. Leave empty to use the GitHub environment variable, or default to github. Supported values: github, oidc, oauth, static, external.
+        description: "Optional auth connector kind override. Leave empty to use the GitHub environment variable, or default to github. Supported values: github, oidc, oauth, static, external."
         required: false
         default: ""
         type: string
       github_admin_logins:
-        description: Comma-separated GitHub username handles granted admin session rights when auth_connector_kind resolves to github. Leave empty to default to the triggering GitHub account.
+        description: "Comma-separated GitHub username handles granted admin session rights when auth_connector_kind resolves to github. Leave empty to default to the triggering GitHub account."
         required: false
         default: ""
         type: string
       climbmix_browser_dataset_base_url:
-        description: Public base URL for the full browser ClimbMix shard pool. The workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile.
+        description: "Public base URL for the full browser ClimbMix shard pool. The workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile."
         required: false
         default: ""
         type: string
       force_replace_bootstrap:
-        description: Replace the EC2 bootstrap host during apply. This is destructive to host-local bootstrap/publication state.
+        description: "Replace the EC2 bootstrap host during apply. This is destructive to host-local bootstrap/publication state."
         required: true
         default: false
         type: boolean
@@ -176,29 +176,12 @@ jobs:
           fi
 
           admin_logins_json="$(
-            python3 - "$github_admin_logins" <<'PY'
-import json
-import sys
-
-raw = sys.argv[1]
-seen = set()
-values = []
-for token in raw.replace("\n", ",").split(","):
-    login = token.strip().lower()
-    if not login or login in seen:
-        continue
-    seen.add(login)
-    values.append(login)
-print(json.dumps(values))
-PY
+            python3 -c 'import json, sys; seen=set(); values=[]; [values.append(login) for token in sys.argv[1].replace("\n", ",").split(",") for login in [token.strip().lower()] if login and login not in seen and not seen.add(login)]; print(json.dumps(values))' "$github_admin_logins"
           )"
           admin_logins_csv="$(
-            python3 - "$admin_logins_json" <<'PY'
-import json
-import sys
-print(",".join(json.loads(sys.argv[1])))
-PY
+            python3 -c 'import json, sys; print(",".join(json.loads(sys.argv[1])))' "$admin_logins_json"
           )"
+
 
           if [ "$auth_connector_kind" = "github" ]; then
             : "${github_required_org:?missing BURN_DRAGON_P2P_GITHUB_REQUIRED_ORG}"

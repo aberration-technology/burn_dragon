@@ -290,6 +290,42 @@ variable "alarm_sns_topic_arn" {
   default     = ""
 }
 
+variable "create_artifact_bucket" {
+  description = "Whether Terraform should create the S3 bucket used for durable artifact replication from the bootstrap host."
+  type        = bool
+  default     = true
+}
+
+variable "artifact_bucket_name" {
+  description = "Optional existing or desired S3 bucket name for replicated Dragon artifacts. Leave empty to let Terraform derive a stable bucket name."
+  type        = string
+  default     = ""
+}
+
+variable "artifact_bucket_force_destroy" {
+  description = "Whether Terraform may destroy the artifact S3 bucket even if it still contains replicated checkpoints and metrics."
+  type        = bool
+  default     = false
+}
+
+variable "artifact_bucket_path_prefix" {
+  description = "Optional key prefix inside the artifact S3 bucket. Leave empty to derive a stack/workspace-scoped prefix automatically."
+  type        = string
+  default     = ""
+}
+
+variable "artifact_bucket_server_side_encryption" {
+  description = "Server-side encryption mode enforced for the artifact S3 bucket and bootstrap sync uploads."
+  type        = string
+  default     = "AES256"
+}
+
+variable "artifact_bucket_sync_interval_minutes" {
+  description = "How often the bootstrap host should sync locally published artifacts into S3."
+  type        = number
+  default     = 5
+}
+
 variable "ssh_cidr_blocks" {
   description = "Optional SSH ingress CIDRs. Leave empty to rely on SSM/sessionless operation."
   type        = list(string)

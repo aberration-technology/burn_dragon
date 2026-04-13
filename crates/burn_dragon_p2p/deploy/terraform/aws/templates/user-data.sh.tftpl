@@ -39,6 +39,11 @@ ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
 BOOTSTRAP_DATA_VOLUME_ID="${bootstrap_data_volume_id}"
 BOOTSTRAP_DATA_DEVICE_NAME="${bootstrap_data_device_name}"
 BOOTSTRAP_DATA_MOUNT_PATH="${bootstrap_data_mount_path}"
+BOOTSTRAP_PUBLICATION_ROOT="${bootstrap_publication_root}"
+ARTIFACT_BUCKET_NAME="${artifact_bucket_name}"
+ARTIFACT_BUCKET_PATH_PREFIX="${artifact_bucket_path_prefix}"
+ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION="${artifact_bucket_server_side_encryption}"
+AWS_REGION="${aws_region}"
 
 resolve_bootstrap_data_device() {
   local candidate
@@ -97,6 +102,34 @@ install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/bootstrap-peer"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/publication/hot"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/public"
 
+cat >/usr/local/bin/burn-dragon-p2p-sync-artifacts <<'EOF_ARTIFACT_SYNC'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOCAL_ROOT="${bootstrap_publication_root}"
+BUCKET="${artifact_bucket_name}"
+PREFIX="${artifact_bucket_path_prefix}"
+SSE="${artifact_bucket_server_side_encryption}"
+AWS_REGION="${aws_region}"
+
+if [ ! -d "$${LOCAL_ROOT}" ]; then
+  exit 0
+fi
+
+destination="s3://$${BUCKET}"
+if [ -n "$${PREFIX}" ]; then
+  destination="$${destination}/$${PREFIX}"
+fi
+
+args=(s3 sync "$${LOCAL_ROOT}/" "$${destination}/" --only-show-errors)
+if [ -n "$${SSE}" ]; then
+  args+=(--sse "$${SSE}")
+fi
+
+aws --region "$${AWS_REGION}" "$${args[@]}"
+EOF_ARTIFACT_SYNC
+chmod 0755 /usr/local/bin/burn-dragon-p2p-sync-artifacts
+
 cat >/usr/local/bin/burn-dragon-p2p-sync-secrets <<'EOF_SYNC'
 ${secret_sync_script}
 EOF_SYNC
@@ -132,7 +165,35 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 EOF_SERVICE
 
+cat >/etc/systemd/system/burn-dragon-p2p-artifact-sync.service <<'EOF_ARTIFACT_SERVICE'
+[Unit]
+Description=Sync burn_dragon_p2p published artifacts to S3
+Wants=network-online.target
+After=network-online.target burn-p2p-bootstrap.service
+ConditionPathIsDirectory=${bootstrap_publication_root}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/burn-dragon-p2p-sync-artifacts
+EOF_ARTIFACT_SERVICE
+
+cat >/etc/systemd/system/burn-dragon-p2p-artifact-sync.timer <<'EOF_ARTIFACT_TIMER'
+[Unit]
+Description=Periodic burn_dragon_p2p artifact sync to S3
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=${artifact_bucket_sync_interval_minutes}min
+Persistent=true
+Unit=burn-dragon-p2p-artifact-sync.service
+
+[Install]
+WantedBy=timers.target
+EOF_ARTIFACT_TIMER
+
 systemctl daemon-reload
-systemctl enable caddy burn-p2p-bootstrap
+systemctl enable caddy burn-p2p-bootstrap burn-dragon-p2p-artifact-sync.timer
 systemctl restart caddy
 systemctl start burn-p2p-bootstrap
+systemctl start burn-dragon-p2p-artifact-sync.service
+systemctl start burn-dragon-p2p-artifact-sync.timer

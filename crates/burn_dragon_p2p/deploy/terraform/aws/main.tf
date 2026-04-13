@@ -74,6 +74,31 @@ locals {
   bootstrap_publication_root  = "${local.bootstrap_data_mount_path}/publication/hot"
   bootstrap_data_snapshot_tag = "${var.stack_name}-bootstrap-data"
   cloudwatch_alarm_actions    = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
+  default_artifact_bucket_name = trimsuffix(
+    substr(
+      replace(
+        replace(
+          replace(
+            lower("${var.stack_name}-${terraform.workspace}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-artifacts"),
+            ".",
+            "-",
+          ),
+          "_",
+          "-",
+        ),
+        "/",
+        "-",
+      ),
+      0,
+      63,
+    ),
+    "-",
+  )
+  artifact_bucket_name        = trimspace(var.artifact_bucket_name) != "" ? trimspace(var.artifact_bucket_name) : local.default_artifact_bucket_name
+  artifact_bucket_path_prefix = trimspace(var.artifact_bucket_path_prefix) != "" ? trim(trimspace(var.artifact_bucket_path_prefix), "/") : "artifacts/${var.stack_name}/${terraform.workspace}"
+  artifact_bucket_arn         = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_bucket_name}"
+  artifact_bucket_object_arn  = "${local.artifact_bucket_arn}/*"
+  artifact_bucket_s3_uri      = "s3://${local.artifact_bucket_name}/${local.artifact_bucket_path_prefix}"
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"
@@ -469,6 +494,13 @@ check "external_connector_configuration" {
   }
 }
 
+check "artifact_bucket_configuration" {
+  assert {
+    condition     = var.create_artifact_bucket || trimspace(var.artifact_bucket_name) != ""
+    error_message = "Set artifact_bucket_name when create_artifact_bucket is false so the bootstrap host has an existing S3 bucket for artifact replication."
+  }
+}
+
 resource "aws_vpc" "bootstrap" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_hostnames = true
@@ -619,6 +651,25 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
         ]
         Resource = [data.aws_kms_alias.ssm.target_key_arn]
       },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketLocation",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+        ]
+        Resource = [local.artifact_bucket_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetObject",
+          "s3:GetObjectAttributes",
+          "s3:PutObject",
+        ]
+        Resource = [local.artifact_bucket_object_arn]
+      },
     ]
   })
 }
@@ -626,6 +677,96 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
 resource "aws_iam_instance_profile" "bootstrap" {
   name = "${var.stack_name}-bootstrap"
   role = aws_iam_role.bootstrap.name
+}
+
+resource "aws_s3_bucket" "artifact" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket        = local.artifact_bucket_name
+  force_destroy = var.artifact_bucket_force_destroy
+
+  tags = merge(local.tags, {
+    Name    = "${var.stack_name}-artifacts"
+    Purpose = "burn-dragon-p2p-artifact-replication"
+  })
+}
+
+resource "aws_s3_bucket_public_access_block" "artifact" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact[0].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "artifact" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact[0].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact[0].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = var.artifact_bucket_server_side_encryption
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "artifact" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact[0].id
+
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "artifact_deny_insecure_transport" {
+  count = var.create_artifact_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.artifact[0].arn,
+          "${aws_s3_bucket.artifact[0].arn}/*",
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.artifact]
 }
 
 resource "aws_ebs_volume" "bootstrap_data" {
@@ -662,17 +803,22 @@ resource "aws_instance" "bootstrap" {
   }
 
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
-    aws_region                 = var.aws_region
-    bootstrap_auth_feature     = local.bootstrap_auth_feature
-    bootstrap_git_ref          = var.bootstrap_git_ref
-    bootstrap_git_repo         = var.bootstrap_git_repository
-    bootstrap_config_json      = local.bootstrap_config_json
-    bootstrap_data_device_name = var.data_volume_device_name
-    bootstrap_data_mount_path  = local.bootstrap_data_mount_path
-    bootstrap_data_volume_id   = aws_ebs_volume.bootstrap_data.id
-    caddyfile                  = local.caddyfile
-    http_port                  = var.http_port
-    secret_sync_script         = local.secret_sync_script
+    artifact_bucket_name                   = local.artifact_bucket_name
+    artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
+    artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
+    artifact_bucket_sync_interval_minutes  = var.artifact_bucket_sync_interval_minutes
+    aws_region                             = var.aws_region
+    bootstrap_auth_feature                 = local.bootstrap_auth_feature
+    bootstrap_config_json                  = local.bootstrap_config_json
+    bootstrap_data_device_name             = var.data_volume_device_name
+    bootstrap_data_mount_path              = local.bootstrap_data_mount_path
+    bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_data.id
+    bootstrap_git_ref                      = var.bootstrap_git_ref
+    bootstrap_git_repo                     = var.bootstrap_git_repository
+    bootstrap_publication_root             = local.bootstrap_publication_root
+    caddyfile                              = local.caddyfile
+    http_port                              = var.http_port
+    secret_sync_script                     = local.secret_sync_script
   })
 
   tags = merge(local.tags, {

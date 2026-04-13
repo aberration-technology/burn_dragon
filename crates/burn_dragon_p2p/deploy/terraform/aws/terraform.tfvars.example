@@ -25,8 +25,14 @@ data_volume_size_gib    = 512
 enable_data_volume_snapshots = true
 data_volume_snapshot_retention_days = 14
 enable_bootstrap_status_alarms = true
+create_artifact_bucket = true
 
 # Optional:
+# artifact_bucket_name = "dragon-aberration-technology-artifacts-prod"
+# artifact_bucket_path_prefix = "artifacts/burn-dragon-p2p-mainnet/mainnet"
+# artifact_bucket_force_destroy = false
+# artifact_bucket_server_side_encryption = "AES256"
+# artifact_bucket_sync_interval_minutes = 5
 # auth_principals_json = jsonencode([
 #   {
 #     principal_id     = "burn-dragon-admin"

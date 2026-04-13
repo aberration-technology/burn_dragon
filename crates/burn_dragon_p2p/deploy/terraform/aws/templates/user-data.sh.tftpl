@@ -15,7 +15,8 @@ apt-get install -y --no-install-recommends \
   libssl-dev \
   unzip \
   awscli \
-  caddy
+  caddy \
+  e2fsprogs
 
 if [ ! -x /root/.cargo/bin/cargo ]; then
   curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
@@ -35,18 +36,71 @@ cargo install \
 install -d -m 0755 /usr/local/bin
 ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
 
+BOOTSTRAP_DATA_VOLUME_ID="${bootstrap_data_volume_id}"
+BOOTSTRAP_DATA_DEVICE_NAME="${bootstrap_data_device_name}"
+BOOTSTRAP_DATA_MOUNT_PATH="${bootstrap_data_mount_path}"
+
+resolve_bootstrap_data_device() {
+  local candidate
+  local volume_id_no_dash="$${BOOTSTRAP_DATA_VOLUME_ID//-/}"
+  local volume_id_suffix="$${BOOTSTRAP_DATA_VOLUME_ID#vol-}"
+
+  for candidate in \
+    "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${BOOTSTRAP_DATA_VOLUME_ID}" \
+    "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${volume_id_no_dash}" \
+    "$${BOOTSTRAP_DATA_DEVICE_NAME}"; do
+    if [ -n "$${candidate}" ] && [ -b "$${candidate}" ]; then
+      printf '%s\n' "$${candidate}"
+      return 0
+    fi
+  done
+
+  lsblk -ndo PATH,SERIAL | awk -v a="$${BOOTSTRAP_DATA_VOLUME_ID}" -v b="$${volume_id_no_dash}" -v c="$${volume_id_suffix}" '
+    $2 == a || $2 == b || $2 == c || $2 == ("vol" c) { print $1; exit }
+  '
+}
+
+wait_for_bootstrap_data_device() {
+  local attempt device
+  for attempt in $(seq 1 90); do
+    device="$(resolve_bootstrap_data_device || true)"
+    if [ -n "$${device}" ] && [ -b "$${device}" ]; then
+      printf '%s\n' "$${device}"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+bootstrap_data_device="$(wait_for_bootstrap_data_device)"
+if [ -z "$${bootstrap_data_device}" ]; then
+  echo "failed to discover retained bootstrap data volume $${BOOTSTRAP_DATA_VOLUME_ID}" >&2
+  exit 1
+fi
+
+if ! blkid "$${bootstrap_data_device}" >/dev/null 2>&1; then
+  mkfs.ext4 -F -L burn-dragon-p2p-data "$${bootstrap_data_device}"
+fi
+
+bootstrap_data_uuid="$(blkid -s UUID -o value "$${bootstrap_data_device}")"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"
+if ! grep -q "$${bootstrap_data_uuid} $${BOOTSTRAP_DATA_MOUNT_PATH} ext4" /etc/fstab; then
+  echo "UUID=$${bootstrap_data_uuid} $${BOOTSTRAP_DATA_MOUNT_PATH} ext4 defaults,nofail,x-systemd.device-timeout=2min 0 2" >> /etc/fstab
+fi
+mountpoint -q "$${BOOTSTRAP_DATA_MOUNT_PATH}" || mount "$${BOOTSTRAP_DATA_MOUNT_PATH}"
+
 install -d -m 0755 /etc/burn-dragon-p2p
-install -d -m 0755 /var/lib/burn-p2p
-install -d -m 0755 /var/lib/burn-p2p/auth
-install -d -m 0755 /var/lib/burn-p2p/bootstrap-peer
-install -d -m 0755 /var/lib/burn-p2p/publication/hot
-install -d -m 0755 /var/lib/burn-p2p/public
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/auth"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/bootstrap-peer"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/publication/hot"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/public"
 
 cat >/usr/local/bin/burn-dragon-p2p-sync-secrets <<'EOF_SYNC'
 ${secret_sync_script}
 EOF_SYNC
 chmod 0755 /usr/local/bin/burn-dragon-p2p-sync-secrets
-
 
 cat >/etc/burn-dragon-p2p/bootstrap.json <<'EOF_CONFIG'
 ${bootstrap_config_json}

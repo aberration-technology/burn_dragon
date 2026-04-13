@@ -13,7 +13,9 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - one EC2 bootstrap/edge host
 - Route53 DNS for the browser edge
 - TLS termination via Caddy on the host
-- single-host encrypted EBS-backed local publication/state storage
+- single-host retained encrypted EBS data volume for bootstrap/auth/publication state
+- daily retained data-volume snapshots with Terraform-managed DLM policy by default
+- EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
 It does not deploy end-user native trainer peers. Native operators still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs.
@@ -42,7 +44,7 @@ That workflow:
 - waits for the edge URL to answer over HTTPS
 - prints the edge URL and seed multiaddrs in the workflow summary
 
-If you trigger the workflow with a forced bootstrap replacement, the EC2 host is replaced and the local bootstrap/publication state on that host is lost. Use that option only for explicit rebuilds.
+If you trigger the workflow with a forced bootstrap replacement, Terraform replaces only the EC2 host. The retained bootstrap data volume is reattached to the replacement host, so bootstrap/auth/publication state survives a normal rebuild. State is reset only if you explicitly destroy or replace the retained data volume itself.
 
 The workflow still performs a Terraform plan internally before apply. That keeps the operator experience one-click without dropping the safety and auditability of a plan phase.
 
@@ -147,6 +149,16 @@ Configure the workflow to target one of those environments. Put the following va
   - override bootstrap host size, default `t3.large`
 - `BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB`
   - override encrypted EBS root size, default `256`
+- `BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB`
+  - retained encrypted bootstrap/auth/publication data volume size, default `512`
+- `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
+  - enable or disable the Terraform-managed daily data-volume snapshot policy. Defaults to `true`.
+- `BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS`
+  - retained daily snapshot count for the bootstrap data volume. Defaults to `14`.
+- `BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS`
+  - enable or disable EC2 status-check CloudWatch alarms for the bootstrap host. Defaults to `true`.
+- `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
+  - optional SNS topic ARN used for bootstrap status-check alarms. Leave empty to create alarms without notifications.
 - `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL`
   - public base URL for the full browser ClimbMix shard pool. Defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Override it when the shard pool lives on a different CDN origin.
 
@@ -170,6 +182,7 @@ The GitHub OIDC role must be able to:
 - manage the Terraform target resources in the selected AWS account
 - write and overwrite SSM parameters under the chosen secret prefix
 - read Route53 hosted zone metadata
+- manage retained EBS volumes, DLM snapshot policies, and CloudWatch alarms for the bootstrap stack
 
 The deployed EC2 instance role is created by Terraform and only needs to read the SSM parameters that hold:
 

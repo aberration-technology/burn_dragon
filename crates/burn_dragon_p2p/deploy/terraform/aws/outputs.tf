@@ -13,6 +13,16 @@ output "bootstrap_public_ip" {
   value       = aws_eip.bootstrap.public_ip
 }
 
+output "bootstrap_data_volume_id" {
+  description = "Retained EBS volume id carrying bootstrap/auth/publication state."
+  value       = aws_ebs_volume.bootstrap_data.id
+}
+
+output "bootstrap_data_mount_path" {
+  description = "Mounted data path used for retained bootstrap/auth/publication state."
+  value       = local.bootstrap_data_mount_path
+}
+
 output "seed_node_tcp_multiaddr" {
   description = "TCP bootstrap multiaddr advertised to native peers."
   value       = "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}"

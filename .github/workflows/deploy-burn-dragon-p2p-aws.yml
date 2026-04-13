@@ -42,7 +42,7 @@ on:
         default: https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1
         type: string
       force_replace_bootstrap:
-        description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. This is destructive to host-local bootstrap/publication state."
+        description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. The retained bootstrap data volume is preserved, so normal host replacement keeps bootstrap/auth/publication state."
         required: true
         default: false
         type: boolean
@@ -120,6 +120,11 @@ jobs:
           bootstrap_git_ref="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}"
           instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
           root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
+          data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
+          enable_data_volume_snapshots="${{ vars.BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS }}"
+          data_volume_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}"
+          enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
+          alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
 
           : "${aws_region:?missing BURN_DRAGON_P2P_AWS_REGION}"
           : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_ROLE_ARN}"
@@ -306,6 +311,21 @@ jobs:
           if [ -n "$root_volume_size_gib" ]; then
             echo "TF_VAR_root_volume_size_gib=$root_volume_size_gib" >>"$GITHUB_ENV"
           fi
+          if [ -n "$data_volume_size_gib" ]; then
+            echo "TF_VAR_data_volume_size_gib=$data_volume_size_gib" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$enable_data_volume_snapshots" ]; then
+            echo "TF_VAR_enable_data_volume_snapshots=$enable_data_volume_snapshots" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$data_volume_snapshot_retention_days" ]; then
+            echo "TF_VAR_data_volume_snapshot_retention_days=$data_volume_snapshot_retention_days" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$enable_bootstrap_status_alarms" ]; then
+            echo "TF_VAR_enable_bootstrap_status_alarms=$enable_bootstrap_status_alarms" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$alarm_sns_topic_arn" ]; then
+            echo "TF_VAR_alarm_sns_topic_arn=$alarm_sns_topic_arn" >>"$GITHUB_ENV"
+          fi
 
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -380,6 +400,8 @@ jobs:
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
           instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
+          data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_volume_id)"
+          data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
 
           {
             echo "edge_url=$edge_url"
@@ -387,6 +409,8 @@ jobs:
             echo "seed_quic=$seed_quic"
             echo "public_ip=$public_ip"
             echo "instance_id=$instance_id"
+            echo "data_volume_id=$data_volume_id"
+            echo "data_mount_path=$data_mount_path"
           } >>"$GITHUB_OUTPUT"
 
       - name: wait for browser edge https health
@@ -416,6 +440,8 @@ jobs:
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
           - Public IP: \`${{ steps.outputs.outputs.public_ip }}\`
           - EC2 instance id: \`${{ steps.outputs.outputs.instance_id }}\`
+          - Data volume id: \`${{ steps.outputs.outputs.data_volume_id }}\`
+          - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`
           - GitHub admin logins: \`${ADMIN_LOGINS_CSV:-n/a}\`
           - Secret prefix: \`${SECRET_PARAMETER_PREFIX}\`

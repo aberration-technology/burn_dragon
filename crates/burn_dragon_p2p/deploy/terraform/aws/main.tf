@@ -68,19 +68,25 @@ locals {
     auth_client_id     = "${var.secret_parameter_prefix}/auth_client_id"
     auth_client_secret = "${var.secret_parameter_prefix}/auth_client_secret"
   }
+  bootstrap_data_mount_path   = "/var/lib/burn-p2p"
+  bootstrap_auth_root         = "${local.bootstrap_data_mount_path}/auth"
+  bootstrap_peer_root         = "${local.bootstrap_data_mount_path}/bootstrap-peer"
+  bootstrap_publication_root  = "${local.bootstrap_data_mount_path}/publication/hot"
+  bootstrap_data_snapshot_tag = "${var.stack_name}-bootstrap-data"
+  cloudwatch_alarm_actions    = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
-      kind = "github"
+      kind          = "github"
       client_id     = "$${BURN_P2P_AUTH_CLIENT_ID}"
       client_secret = "$${BURN_P2P_AUTH_CLIENT_SECRET}"
       redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
     },
     local.auth_endpoint_overrides,
-  ) : (
+    ) : (
     local.auth_connector_kind == "oidc" ? merge(
       {
-        kind = "oidc"
-        issuer = trimspace(var.auth_oidc_issuer)
+        kind          = "oidc"
+        issuer        = trimspace(var.auth_oidc_issuer)
         client_id     = "$${BURN_P2P_AUTH_CLIENT_ID}"
         client_secret = "$${BURN_P2P_AUTH_CLIENT_SECRET}"
         redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
@@ -89,11 +95,11 @@ locals {
         for key, value in local.auth_endpoint_overrides : key => value
         if key != "api_base_url"
       },
-    ) : (
+      ) : (
       local.auth_connector_kind == "oauth" ? merge(
         {
-          kind = "oauth"
-          provider = trimspace(var.auth_oauth_provider)
+          kind          = "oauth"
+          provider      = trimspace(var.auth_oauth_provider)
           client_id     = "$${BURN_P2P_AUTH_CLIENT_ID}"
           client_secret = "$${BURN_P2P_AUTH_CLIENT_SECRET}"
           redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
@@ -102,13 +108,13 @@ locals {
           for key, value in local.auth_endpoint_overrides : key => value
           if key != "api_base_url"
         },
-      ) : (
+        ) : (
         local.auth_connector_kind == "external" ? {
-          kind = "external"
-          authority = trimspace(var.auth_external_authority)
+          kind                     = "external"
+          authority                = trimspace(var.auth_external_authority)
           trusted_principal_header = trimspace(var.auth_external_trusted_principal_header)
-          trusted_internal_only = var.auth_external_trusted_internal_only
-        } : {
+          trusted_internal_only    = var.auth_external_trusted_internal_only
+          } : {
           kind = "static"
         }
       )
@@ -139,7 +145,7 @@ locals {
     local.dragon_experiment_scopes,
     [{ "Admin" = { study_id = var.study_id } }],
   )
-  nca_profile_json      = trimspace(file("${path.module}/../../profiles/nca-r1.profile.json"))
+  nca_profile_json = trimspace(file("${path.module}/../../profiles/nca-r1.profile.json"))
   climbmix_profile = jsondecode(trimspace(file("${path.module}/../../profiles/climbmix-r1.profile.json")))
   climbmix_profile_json = jsonencode(
     local.climbmix_browser_manifest_url == null ? merge(
@@ -147,7 +153,7 @@ locals {
       {
         browser = null
       }
-    ) : merge(
+      ) : merge(
       local.climbmix_profile,
       {
         browser = merge(
@@ -361,7 +367,7 @@ locals {
             "ManifestOnly",
           ]
           eager_alias_names         = []
-          local_root                = "/var/lib/burn-p2p/publication/hot"
+          local_root                = local.bootstrap_publication_root
           bucket                    = null
           endpoint                  = null
           region                    = null
@@ -379,7 +385,7 @@ locals {
       node = {
         identity = "Persistent"
         storage = {
-          root = "/var/lib/burn-p2p/bootstrap-peer"
+          root = local.bootstrap_peer_root
         }
         dataset         = null
         bootstrap_peers = []
@@ -390,10 +396,10 @@ locals {
       }
     }
     auth = {
-      authority_name = var.auth_authority_name
-      connector = local.auth_connector
-      authority_key_path          = "/var/lib/burn-p2p/auth/bootstrap-authority.key"
-      session_state_path          = "/var/lib/burn-p2p/auth/session-state.json"
+      authority_name              = var.auth_authority_name
+      connector                   = local.auth_connector
+      authority_key_path          = "${local.bootstrap_auth_root}/bootstrap-authority.key"
+      session_state_path          = "${local.bootstrap_auth_root}/session-state.json"
       persist_provider_tokens     = false
       issuer_key_id               = "burn-dragon-mainnet"
       project_family_id           = var.project_family_id
@@ -404,9 +410,9 @@ locals {
       ]
       session_ttl_seconds      = 86400
       minimum_revocation_epoch = 1
-      principals        = local.auth_principals
-      provider_policy   = local.auth_provider_policy
-      directory_entries = local.experiment_directory
+      principals               = local.auth_principals
+      provider_policy          = local.auth_provider_policy
+      directory_entries        = local.experiment_directory
     }
   }
 
@@ -416,12 +422,12 @@ locals {
     http_port        = var.http_port
   })
   secret_sync_script = templatefile("${path.module}/templates/bootstrap-secret-sync.sh.tftpl", {
-    aws_region                      = var.aws_region
+    aws_region                       = var.aws_region
     auth_client_credentials_required = local.auth_oauth_enabled
-    auth_client_id_name             = local.secret_parameter_names.auth_client_id
-    auth_client_secret_name         = local.secret_parameter_names.auth_client_secret
-    auth_redirect_uri               = local.auth_redirect_path == null ? "" : "https://${var.edge_domain_name}${local.auth_redirect_path}"
-    edge_domain_name                = var.edge_domain_name
+    auth_client_id_name              = local.secret_parameter_names.auth_client_id
+    auth_client_secret_name          = local.secret_parameter_names.auth_client_secret
+    auth_redirect_uri                = local.auth_redirect_path == null ? "" : "https://${var.edge_domain_name}${local.auth_redirect_path}"
+    edge_domain_name                 = var.edge_domain_name
   })
   bootstrap_auth_feature = local.auth_connector_kind == "github" ? "auth-github" : (
     local.auth_connector_kind == "oidc" ? "auth-oidc" : (
@@ -622,6 +628,19 @@ resource "aws_iam_instance_profile" "bootstrap" {
   role = aws_iam_role.bootstrap.name
 }
 
+resource "aws_ebs_volume" "bootstrap_data" {
+  availability_zone = aws_subnet.public.availability_zone
+  size              = var.data_volume_size_gib
+  type              = var.data_volume_type
+  encrypted         = true
+
+  tags = merge(local.tags, {
+    Name           = "${var.stack_name}-bootstrap-data"
+    SnapshotPolicy = local.bootstrap_data_snapshot_tag
+    Persistence    = "retained-bootstrap-state"
+  })
+}
+
 resource "aws_instance" "bootstrap" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -643,19 +662,140 @@ resource "aws_instance" "bootstrap" {
   }
 
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
-    aws_region            = var.aws_region
-    bootstrap_auth_feature = local.bootstrap_auth_feature
-    bootstrap_git_ref     = var.bootstrap_git_ref
-    bootstrap_git_repo    = var.bootstrap_git_repository
-    bootstrap_config_json = local.bootstrap_config_json
-    caddyfile             = local.caddyfile
-    http_port             = var.http_port
-    secret_sync_script    = local.secret_sync_script
+    aws_region                 = var.aws_region
+    bootstrap_auth_feature     = local.bootstrap_auth_feature
+    bootstrap_git_ref          = var.bootstrap_git_ref
+    bootstrap_git_repo         = var.bootstrap_git_repository
+    bootstrap_config_json      = local.bootstrap_config_json
+    bootstrap_data_device_name = var.data_volume_device_name
+    bootstrap_data_mount_path  = local.bootstrap_data_mount_path
+    bootstrap_data_volume_id   = aws_ebs_volume.bootstrap_data.id
+    caddyfile                  = local.caddyfile
+    http_port                  = var.http_port
+    secret_sync_script         = local.secret_sync_script
   })
 
   tags = merge(local.tags, {
     Name = "${var.stack_name}-bootstrap"
   })
+}
+
+resource "aws_volume_attachment" "bootstrap_data" {
+  device_name = var.data_volume_device_name
+  volume_id   = aws_ebs_volume.bootstrap_data.id
+  instance_id = aws_instance.bootstrap.id
+
+  stop_instance_before_detaching = true
+}
+
+resource "aws_iam_role" "bootstrap_data_snapshot" {
+  count = var.enable_data_volume_snapshots ? 1 : 0
+
+  name = "${var.stack_name}-bootstrap-data-snapshot"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "dlm.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      },
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "bootstrap_data_snapshot" {
+  count = var.enable_data_volume_snapshots ? 1 : 0
+
+  role       = aws_iam_role.bootstrap_data_snapshot[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+}
+
+resource "aws_dlm_lifecycle_policy" "bootstrap_data" {
+  count = var.enable_data_volume_snapshots ? 1 : 0
+
+  description        = "${var.stack_name} retained bootstrap data volume snapshots"
+  execution_role_arn = aws_iam_role.bootstrap_data_snapshot[0].arn
+  state              = "ENABLED"
+
+  policy_details {
+    resource_types = ["VOLUME"]
+    target_tags = {
+      SnapshotPolicy = local.bootstrap_data_snapshot_tag
+    }
+
+    schedule {
+      name = "daily-bootstrap-data"
+
+      create_rule {
+        interval      = 24
+        interval_unit = "HOURS"
+        times         = [var.data_volume_snapshot_time_utc]
+      }
+
+      retain_rule {
+        count = var.data_volume_snapshot_retention_days
+      }
+
+      copy_tags = true
+      tags_to_add = merge(local.tags, {
+        SnapshotSource = "${var.stack_name}-bootstrap-data"
+      })
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "bootstrap_status_check_failed_instance" {
+  count = var.enable_bootstrap_status_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-bootstrap-status-check-failed-instance"
+  alarm_description   = "burn_dragon_p2p bootstrap EC2 instance status check failure"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed_Instance"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    InstanceId = aws_instance.bootstrap.id
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "bootstrap_status_check_failed_system" {
+  count = var.enable_bootstrap_status_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-bootstrap-status-check-failed-system"
+  alarm_description   = "burn_dragon_p2p bootstrap EC2 system status check failure"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed_System"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    InstanceId = aws_instance.bootstrap.id
+  }
+
+  tags = local.tags
 }
 
 resource "aws_eip" "bootstrap" {

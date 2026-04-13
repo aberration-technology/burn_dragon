@@ -21,6 +21,10 @@ github_admin_required_repo_permission = "admin"
 
 instance_type           = "t3.large"
 root_volume_size_gib    = 256
+data_volume_size_gib    = 512
+enable_data_volume_snapshots = true
+data_volume_snapshot_retention_days = 14
+enable_bootstrap_status_alarms = true
 
 # Optional:
 # auth_principals_json = jsonencode([
@@ -39,3 +43,5 @@ root_volume_size_gib    = 256
 # tags = {
 #   Owner = "ml-platform"
 # }
+
+# alarm_sns_topic_arn   = "arn:aws:sns:us-east-1:123456789012:burn-dragon-p2p-alerts"

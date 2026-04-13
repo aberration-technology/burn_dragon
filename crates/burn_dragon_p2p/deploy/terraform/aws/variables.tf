@@ -242,6 +242,54 @@ variable "root_volume_size_gib" {
   default     = 256
 }
 
+variable "data_volume_size_gib" {
+  description = "Dedicated retained EBS data volume size for bootstrap/auth/publication state."
+  type        = number
+  default     = 512
+}
+
+variable "data_volume_type" {
+  description = "EBS volume type for the retained bootstrap data volume."
+  type        = string
+  default     = "gp3"
+}
+
+variable "data_volume_device_name" {
+  description = "EC2 device name requested for the retained bootstrap data volume attachment."
+  type        = string
+  default     = "/dev/sdf"
+}
+
+variable "enable_data_volume_snapshots" {
+  description = "Whether Terraform should manage automatic snapshots for the retained bootstrap data volume."
+  type        = bool
+  default     = true
+}
+
+variable "data_volume_snapshot_retention_days" {
+  description = "How many daily retained bootstrap data volume snapshots to keep when automatic snapshots are enabled."
+  type        = number
+  default     = 14
+}
+
+variable "data_volume_snapshot_time_utc" {
+  description = "UTC time for the daily retained bootstrap data volume snapshot, in HH:MM format."
+  type        = string
+  default     = "03:00"
+}
+
+variable "enable_bootstrap_status_alarms" {
+  description = "Whether Terraform should create EC2 status-check CloudWatch alarms for the bootstrap host."
+  type        = bool
+  default     = true
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "Optional SNS topic ARN notified by bootstrap status-check CloudWatch alarms."
+  type        = string
+  default     = ""
+}
+
 variable "ssh_cidr_blocks" {
   description = "Optional SSH ingress CIDRs. Leave empty to rely on SSM/sessionless operation."
   type        = list(string)

@@ -242,10 +242,40 @@ variable "github_admin_required_repo_permission" {
   default     = "admin"
 }
 
-variable "climbmix_browser_dataset_base_url" {
-  description = "Public base URL for the full browser ClimbMix shard pool. Defaults to the production edge-hosted dataset path under dragon.aberration.technology. Override this when the shard pool lives on a different CDN origin."
+variable "dataset_domain_name" {
+  description = "Public CloudFront hostname serving browser training datasets. Leave empty to derive datasets.<edge_domain_name>."
   type        = string
-  default     = "https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1"
+  default     = ""
+}
+
+variable "dataset_bucket_name" {
+  description = "Optional desired S3 bucket name for managed browser dataset distribution. Leave empty to let Terraform derive a stable bucket name."
+  type        = string
+  default     = ""
+}
+
+variable "dataset_bucket_force_destroy" {
+  description = "Whether Terraform may destroy the managed browser dataset S3 bucket even if it still contains published shard manifests and shard bytes."
+  type        = bool
+  default     = false
+}
+
+variable "dataset_bucket_path_prefix" {
+  description = "Optional key prefix inside the managed browser dataset S3 bucket. Leave empty to use dragon-datasets."
+  type        = string
+  default     = ""
+}
+
+variable "dataset_bucket_server_side_encryption" {
+  description = "Server-side encryption mode enforced for the managed browser dataset S3 bucket."
+  type        = string
+  default     = "AES256"
+}
+
+variable "climbmix_browser_dataset_base_url" {
+  description = "Optional explicit public base URL for the browser ClimbMix shard pool. Leave empty to use the managed dataset CDN path under dataset_domain_name."
+  type        = string
+  default     = ""
 }
 
 variable "github_principal_id" {

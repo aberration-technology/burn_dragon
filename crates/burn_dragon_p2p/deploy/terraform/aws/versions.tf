@@ -21,3 +21,8 @@ provider "aws" {
   alias  = "dr"
   region = trimspace(var.disaster_recovery_region) != "" ? trimspace(var.disaster_recovery_region) : var.aws_region
 }
+
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}

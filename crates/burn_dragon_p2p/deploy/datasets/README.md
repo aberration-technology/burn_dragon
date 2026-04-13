@@ -9,3 +9,5 @@ the initial ClimbMix browser profile, and browser peers download only the shards
 train on.
 
 This folder is kept only for operator documentation; do not commit shard `.bin` payloads here.
+
+Use `.github/workflows/publish-burn-dragon-p2p-dataset.yml` to sync a prepared shard pool from an operator-controlled S3 source prefix into the managed dataset CDN bucket.

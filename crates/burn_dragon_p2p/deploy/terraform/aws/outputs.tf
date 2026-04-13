@@ -48,6 +48,36 @@ output "artifact_bucket_uri" {
   value       = local.artifact_bucket_s3_uri
 }
 
+output "dataset_bucket_name" {
+  description = "S3 bucket used for managed browser dataset distribution."
+  value       = local.dataset_bucket_name
+}
+
+output "dataset_bucket_uri" {
+  description = "S3 URI prefix backing the managed browser dataset distribution."
+  value       = local.dataset_bucket_s3_uri
+}
+
+output "dataset_bucket_path_prefix" {
+  description = "Key prefix inside the managed browser dataset bucket."
+  value       = local.dataset_bucket_path_prefix
+}
+
+output "dataset_distribution_domain_name" {
+  description = "Public CloudFront hostname serving managed browser datasets."
+  value       = local.dataset_domain_name
+}
+
+output "dataset_distribution_id" {
+  description = "CloudFront distribution id serving managed browser datasets."
+  value       = aws_cloudfront_distribution.dataset.id
+}
+
+output "managed_climbmix_browser_dataset_base_url" {
+  description = "Managed default browser ClimbMix shard-pool base URL published into the ClimbMix profile when no explicit override is supplied."
+  value       = local.managed_climbmix_browser_dataset_base_url
+}
+
 output "disaster_recovery_region" {
   description = "Configured warm-disaster-recovery AWS region. Empty when warm DR is disabled."
   value       = trimspace(var.disaster_recovery_region)

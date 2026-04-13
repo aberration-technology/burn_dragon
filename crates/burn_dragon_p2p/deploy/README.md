@@ -5,7 +5,7 @@ This folder contains the operator-facing deployment assets for the `burn_dragon_
 - `native-peer.toml.example`: example native peer config
 - `burn-dragon-p2p-native.service`: example native peer systemd unit
 - `profiles/`: checked-in Dragon experiment profile sources and initial published profile payloads
-- `datasets/README.md`: notes on external browser shard pools that stay out of git
+- `datasets/README.md`: notes on shard-pool source material that stays out of git and can be published into the managed dataset CDN
 - `terraform/aws`: the checked-in AWS bootstrap/edge deployment
 
 The AWS Terraform root deploys a single-region bootstrap plane for the Dragon network:
@@ -20,6 +20,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
 - optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
+- managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
 - EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
@@ -31,15 +32,28 @@ The bootstrap publishes initial Dragon experiment directory entries for:
 - `climbmix-pretraining`
 
 Those entries include Dragon profile metadata, so peers can resolve experiment and training configuration from the network instead of requiring a matching static local config.
-The initial ClimbMix revision is intended to point at a full external browser shard pool. The
-deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser
-profile, and browser peers fetch only the shards they train on from that external pool.
+The initial ClimbMix revision now defaults to the managed dataset CDN path under `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile, and browser peers fetch only the shards they train on from that managed shard pool unless you override the base URL explicitly.
 
 ## Artifact Storage
 
 Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
 
 There is no separate artifact node by default. The bootstrap/control-plane hosts own artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and each bootstrap node keeps its local peer/runtime state on its retained EBS data volume. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow, not by running a second always-on artifact service.
+
+## Managed Dataset Distribution
+
+The stack now also owns a managed browser dataset origin for ClimbMix:
+
+- S3 bucket for shard manifests and shard bytes
+- CloudFront distribution on `dataset_domain_name`
+- Route53 alias records and ACM certificate validation
+- deploy-time default ClimbMix browser manifest URL derived from that managed CDN path
+
+The intended operator entrypoint for publishing a shard pool into that managed origin is:
+
+- `.github/workflows/publish-burn-dragon-p2p-dataset.yml`
+
+That workflow syncs a source S3 prefix into the managed dataset bucket, invalidates the CloudFront distribution, and prints the resulting public base URL. The shard source material still stays out of git.
 
 ## One-Click GitHub Action
 
@@ -97,6 +111,7 @@ Recommended actual failover flow:
 The focused repo also ships a separate browser-shell workflow:
 
 - `.github/workflows/deploy-burn-dragon-p2p-pages.yml`
+- `.github/workflows/publish-burn-dragon-p2p-dataset.yml`
 
 Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`.
 
@@ -244,8 +259,14 @@ Configure the workflow to target one of those environments. Put the following va
   - optional existing bucket name in the warm-DR region for replicated artifacts. Leave empty to auto-derive a stable name.
 - `BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY`
   - whether Terraform may delete a managed warm-DR replica bucket even when it still contains replicated artifacts. Defaults to `false` and should stay that way for production.
+- `BURN_DRAGON_P2P_DATASET_DOMAIN_NAME`
+  - optional public hostname for the managed browser dataset CDN. Defaults to `datasets.dragon.aberration.technology`.
+- `BURN_DRAGON_P2P_DATASET_BUCKET_NAME`
+  - optional S3 bucket name for the managed browser dataset origin. Leave empty to let Terraform derive a stable bucket name.
+- `BURN_DRAGON_P2P_DATASET_BUCKET_PATH_PREFIX`
+  - optional key prefix inside the managed browser dataset bucket. Defaults to `dragon-datasets`.
 - `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL`
-  - public base URL for the full browser ClimbMix shard pool. Defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Override it when the shard pool lives on a different CDN origin.
+  - optional explicit base URL for the full browser ClimbMix shard pool. Defaults to the managed dataset CDN path under `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Override it when the shard pool should live on a different CDN origin.
 
 ### Required Environment Secrets
 
@@ -365,7 +386,7 @@ The initial directory entries are seeded from:
 - `crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
 
-`BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
+`BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 

@@ -35,6 +35,10 @@ data "aws_kms_alias" "ssm" {
   name = "alias/aws/ssm"
 }
 
+data "aws_cloudfront_cache_policy" "caching_optimized" {
+  name = "Managed-CachingOptimized"
+}
+
 locals {
   tags = merge(
     var.tags,
@@ -84,6 +88,32 @@ locals {
   bootstrap_peer_root         = "${local.bootstrap_data_mount_path}/bootstrap-peer"
   bootstrap_data_snapshot_tag = "${var.stack_name}-bootstrap-data"
   cloudwatch_alarm_actions    = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
+  dataset_domain_name         = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
+  default_dataset_bucket_name = trimsuffix(
+    substr(
+      replace(
+        replace(
+          replace(
+            lower("${var.stack_name}-${terraform.workspace}-${data.aws_caller_identity.current.account_id}-datasets"),
+            ".",
+            "-",
+          ),
+          "_",
+          "-",
+        ),
+        "/",
+        "-",
+      ),
+      0,
+      63,
+    ),
+    "-",
+  )
+  dataset_bucket_name        = trimspace(var.dataset_bucket_name) != "" ? trimspace(var.dataset_bucket_name) : local.default_dataset_bucket_name
+  dataset_bucket_path_prefix = trimspace(var.dataset_bucket_path_prefix) != "" ? trim(trimspace(var.dataset_bucket_path_prefix), "/") : "dragon-datasets"
+  dataset_bucket_arn         = "arn:${data.aws_partition.current.partition}:s3:::${local.dataset_bucket_name}"
+  dataset_bucket_object_arn  = "${local.dataset_bucket_arn}/*"
+  dataset_bucket_s3_uri      = "s3://${local.dataset_bucket_name}/${local.dataset_bucket_path_prefix}"
   default_artifact_bucket_name = trimsuffix(
     substr(
       replace(
@@ -203,10 +233,16 @@ locals {
     for login in var.github_admin_logins : lower(trimspace(login))
     if trimspace(login) != ""
   ])))
-  climbmix_browser_manifest_url = trimspace(var.climbmix_browser_dataset_base_url) != "" ? format(
+  managed_climbmix_browser_dataset_base_url = format(
+    "https://%s/%s/climbmix-pretraining/climbmix-r1",
+    local.dataset_domain_name,
+    local.dataset_bucket_path_prefix,
+  )
+  resolved_climbmix_browser_dataset_base_url = trimspace(var.climbmix_browser_dataset_base_url) != "" ? trimsuffix(trimspace(var.climbmix_browser_dataset_base_url), "/") : local.managed_climbmix_browser_dataset_base_url
+  climbmix_browser_manifest_url = format(
     "%s/fetch-manifest.json",
-    trimsuffix(trimspace(var.climbmix_browser_dataset_base_url), "/"),
-  ) : null
+    local.resolved_climbmix_browser_dataset_base_url,
+  )
 
   dragon_experiment_scopes = [
     { "Train" = { experiment_id = "nca-prepretraining" } },
@@ -579,6 +615,13 @@ check "artifact_replica_encryption_configuration" {
   assert {
     condition     = !local.disaster_recovery_enabled || var.artifact_bucket_server_side_encryption == "AES256"
     error_message = "Warm disaster recovery currently supports AES256 artifact bucket encryption. Use the default AES256 mode when disaster_recovery_region is enabled."
+  }
+}
+
+check "dataset_domain_configuration" {
+  assert {
+    condition     = local.dataset_domain_name != var.edge_domain_name
+    error_message = "dataset_domain_name must differ from edge_domain_name so the managed dataset CDN does not conflict with the bootstrap edge hostname."
   }
 }
 
@@ -1137,6 +1180,207 @@ resource "aws_s3_bucket_policy" "artifact_deny_insecure_transport" {
   })
 
   depends_on = [aws_s3_bucket_public_access_block.artifact]
+}
+
+resource "aws_s3_bucket" "dataset" {
+  bucket        = local.dataset_bucket_name
+  force_destroy = var.dataset_bucket_force_destroy
+
+  tags = merge(local.tags, {
+    Name    = "${var.stack_name}-datasets"
+    Purpose = "burn-dragon-p2p-browser-datasets"
+  })
+}
+
+resource "aws_s3_bucket_public_access_block" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = var.dataset_bucket_server_side_encryption
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+resource "aws_acm_certificate" "dataset" {
+  provider          = aws.us_east_1
+  domain_name       = local.dataset_domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = local.tags
+}
+
+resource "aws_route53_record" "dataset_certificate_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.dataset.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = each.value.name
+  type            = each.value.type
+  ttl             = 60
+  records         = [each.value.record]
+}
+
+resource "aws_acm_certificate_validation" "dataset" {
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.dataset.arn
+  validation_record_fqdns = [for record in aws_route53_record.dataset_certificate_validation : record.fqdn]
+}
+
+resource "aws_cloudfront_origin_access_control" "dataset" {
+  name                              = "${var.stack_name}-${terraform.workspace}-dataset"
+  description                       = "burn_dragon_p2p managed browser dataset origin"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "dataset" {
+  enabled         = true
+  is_ipv6_enabled = true
+  aliases         = [local.dataset_domain_name]
+
+  origin {
+    domain_name              = aws_s3_bucket.dataset.bucket_regional_domain_name
+    origin_id                = "dataset-s3"
+    origin_access_control_id = aws_cloudfront_origin_access_control.dataset.id
+
+    s3_origin_config {
+      origin_access_identity = ""
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD", "OPTIONS"]
+    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id
+    compress               = true
+    target_origin_id       = "dataset-s3"
+    viewer_protocol_policy = "redirect-to-https"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.dataset.certificate_arn
+    minimum_protocol_version = "TLSv1.2_2021"
+    ssl_support_method       = "sni-only"
+  }
+
+  tags = merge(local.tags, {
+    Name    = "${var.stack_name}-dataset-cdn"
+    Purpose = "burn-dragon-p2p-browser-dataset-cdn"
+  })
+}
+
+resource "aws_s3_bucket_policy" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.dataset.arn,
+          "${aws_s3_bucket.dataset.arn}/*",
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+      {
+        Sid    = "AllowCloudFrontRead"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudfront.amazonaws.com"
+        }
+        Action   = ["s3:GetObject"]
+        Resource = ["${aws_s3_bucket.dataset.arn}/*"]
+        Condition = {
+          StringEquals = {
+            "AWS:SourceArn" = aws_cloudfront_distribution.dataset.arn
+          }
+        }
+      },
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.dataset]
+}
+
+resource "aws_route53_record" "dataset_distribution" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.dataset_domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.dataset.domain_name
+    zone_id                = aws_cloudfront_distribution.dataset.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource "aws_route53_record" "dataset_distribution_ipv6" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.dataset_domain_name
+  type    = "AAAA"
+
+  alias {
+    name                   = aws_cloudfront_distribution.dataset.domain_name
+    zone_id                = aws_cloudfront_distribution.dataset.hosted_zone_id
+    evaluate_target_health = false
+  }
 }
 
 resource "aws_s3_bucket" "artifact_replica" {

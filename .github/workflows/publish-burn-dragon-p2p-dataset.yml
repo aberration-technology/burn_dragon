@@ -1,0 +1,167 @@
+name: publish burn_dragon_p2p dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub environment suffix. Example: `production` for the `burn-dragon-p2p-production` GitHub Environment."
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+      terraform_workspace:
+        description: "Terraform workspace name backing the target deployment. Example: `mainnet`. The workflow reads the managed dataset bucket and CDN outputs from this workspace."
+        required: true
+        default: mainnet
+        type: string
+      source_s3_uri:
+        description: "Source S3 URI containing the prepared shard pool to publish. Example: `s3://my-source-bucket/climbmix-pretraining/climbmix-r1`."
+        required: true
+        default: ""
+        type: string
+      destination_relative_prefix:
+        description: "Relative destination under the managed dataset bucket path prefix. Example: `climbmix-pretraining/climbmix-r1`."
+        required: true
+        default: climbmix-pretraining/climbmix-r1
+        type: string
+      delete_extra:
+        description: "Whether to delete objects in the destination prefix that are absent from the source shard pool. Set `true` only when you want an exact mirror."
+        required: true
+        default: false
+        type: boolean
+      create_invalidation:
+        description: "Whether to invalidate the managed dataset CloudFront distribution after sync. Keep `true` for normal shard-pool rollouts."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: publish-burn-dragon-p2p-dataset-${{ github.event.inputs.environment }}-${{ github.event.inputs.terraform_workspace }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
+    env:
+      TF_ROOT: crates/burn_dragon_p2p/deploy/terraform/aws
+      DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
+      TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: resolve deployment settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws_region="${{ vars.BURN_DRAGON_P2P_AWS_REGION }}"
+          aws_role_arn="${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}"
+          source_s3_uri="${{ github.event.inputs.source_s3_uri }}"
+          destination_relative_prefix="${{ github.event.inputs.destination_relative_prefix }}"
+          : "${aws_region:?missing BURN_DRAGON_P2P_AWS_REGION}"
+          : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_ROLE_ARN}"
+          : "${source_s3_uri:?missing source_s3_uri}"
+          : "${destination_relative_prefix:?missing destination_relative_prefix}"
+
+          {
+            echo "AWS_REGION=$aws_region"
+            echo "AWS_ROLE_ARN=$aws_role_arn"
+            echo "SOURCE_S3_URI=$source_s3_uri"
+            echo "DESTINATION_RELATIVE_PREFIX=$destination_relative_prefix"
+          } >>"$GITHUB_ENV"
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.8
+
+      - name: terraform init
+        run: terraform -chdir="$TF_ROOT" init -backend=false -input=false
+
+      - name: terraform workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" workspace select "$TF_WORKSPACE_NAME"
+
+      - name: capture dataset outputs
+        id: outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          dataset_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw dataset_bucket_name)"
+          dataset_bucket_path_prefix="$(terraform -chdir="$TF_ROOT" output -raw dataset_bucket_path_prefix)"
+          dataset_distribution_domain_name="$(terraform -chdir="$TF_ROOT" output -raw dataset_distribution_domain_name)"
+          dataset_distribution_id="$(terraform -chdir="$TF_ROOT" output -raw dataset_distribution_id)"
+          managed_climbmix_browser_dataset_base_url="$(terraform -chdir="$TF_ROOT" output -raw managed_climbmix_browser_dataset_base_url)"
+          destination_relative_prefix="${DESTINATION_RELATIVE_PREFIX#/}"
+          bucket_prefix="${dataset_bucket_path_prefix#/}"
+          destination_s3_uri="s3://${dataset_bucket_name}/${bucket_prefix}/${destination_relative_prefix}"
+          destination_https_url="https://${dataset_distribution_domain_name}/${bucket_prefix}/${destination_relative_prefix}"
+          invalidation_path="/${bucket_prefix}/${destination_relative_prefix}/*"
+          manifest_invalidation_path="/${bucket_prefix}/${destination_relative_prefix}/fetch-manifest.json"
+
+          {
+            echo "dataset_bucket_name=$dataset_bucket_name"
+            echo "dataset_bucket_path_prefix=$dataset_bucket_path_prefix"
+            echo "dataset_distribution_domain_name=$dataset_distribution_domain_name"
+            echo "dataset_distribution_id=$dataset_distribution_id"
+            echo "managed_climbmix_browser_dataset_base_url=$managed_climbmix_browser_dataset_base_url"
+            echo "destination_s3_uri=$destination_s3_uri"
+            echo "destination_https_url=$destination_https_url"
+            echo "invalidation_path=$invalidation_path"
+            echo "manifest_invalidation_path=$manifest_invalidation_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: sync dataset shard pool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sync_args=("$SOURCE_S3_URI" "${{ steps.outputs.outputs.destination_s3_uri }}")
+          if [ "${{ github.event.inputs.delete_extra }}" = "true" ]; then
+            sync_args+=(--delete)
+          fi
+          aws s3 sync "${sync_args[@]}"
+
+      - name: invalidate dataset cdn
+        if: ${{ github.event.inputs.create_invalidation == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.outputs.outputs.dataset_distribution_id }}" \
+            --paths "${{ steps.outputs.outputs.invalidation_path }}" "${{ steps.outputs.outputs.manifest_invalidation_path }}" >/dev/null
+
+      - name: publish workflow summary
+        shell: bash
+        run: |
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## burn_dragon_p2p dataset publication
+
+          - Environment: \`${DEPLOY_ENVIRONMENT}\`
+          - Terraform workspace: \`${TF_WORKSPACE_NAME}\`
+          - Source S3 URI: \`${SOURCE_S3_URI}\`
+          - Destination S3 URI: \`${{ steps.outputs.outputs.destination_s3_uri }}\`
+          - Public dataset URL: \`${{ steps.outputs.outputs.destination_https_url }}\`
+          - Managed ClimbMix default URL: \`${{ steps.outputs.outputs.managed_climbmix_browser_dataset_base_url }}\`
+          - Dataset bucket: \`${{ steps.outputs.outputs.dataset_bucket_name }}\`
+          - Dataset bucket prefix: \`${{ steps.outputs.outputs.dataset_bucket_path_prefix }}\`
+          - Dataset CDN hostname: \`${{ steps.outputs.outputs.dataset_distribution_domain_name }}\`
+          - Delete extra objects: \`${{ github.event.inputs.delete_extra }}\`
+          - CloudFront invalidation: \`${{ github.event.inputs.create_invalidation }}\`
+          EOF

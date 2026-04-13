@@ -16,13 +16,15 @@ variable "environment_name" {
 }
 
 variable "route53_zone_name" {
-  description = "Public Route53 hosted zone name that should contain the edge record."
+  description = "Public Route53 hosted zone name that should contain the edge record. Defaults to the aberration.technology production zone."
   type        = string
+  default     = "aberration.technology"
 }
 
 variable "edge_domain_name" {
-  description = "Public domain served by the burn_p2p bootstrap browser edge."
+  description = "Public domain served by the burn_p2p bootstrap browser edge. Defaults to the production root at dragon.aberration.technology."
   type        = string
+  default     = "dragon.aberration.technology"
 }
 
 variable "bootstrap_git_repository" {
@@ -217,9 +219,9 @@ variable "github_admin_required_repo_permission" {
 }
 
 variable "climbmix_browser_dataset_base_url" {
-  description = "Public base URL for the full browser ClimbMix shard pool. A browser-capable deployment should point the initial ClimbMix profile at this external shard pool instead of repo-tracked dataset artifacts."
+  description = "Public base URL for the full browser ClimbMix shard pool. Defaults to the production edge-hosted dataset path under dragon.aberration.technology. Override this when the shard pool lives on a different CDN origin."
   type        = string
-  default     = ""
+  default     = "https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1"
 }
 
 variable "github_principal_id" {

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: GitHub environment suffix to deploy
+        description: "GitHub environment suffix. Example: `production` for the `burn-dragon-p2p-production` GitHub Environment."
         required: true
         default: production
         type: choice
@@ -12,27 +12,37 @@ on:
           - staging
           - production
       terraform_workspace:
-        description: Terraform workspace name
+        description: "Terraform workspace name. Example: `mainnet` or `staging`. This becomes the Terraform state workspace under the AWS stack."
         required: true
         default: mainnet
         type: string
-      auth_connector_kind:
-        description: "Optional auth connector kind override. Leave empty to use the GitHub environment variable, or default to github. Supported values: github, oidc, oauth, static, external."
+      edge_domain_name:
+        description: "Public HTTPS hostname for the bootstrap/browser edge. Example: `dragon.aberration.technology`. Clear it to fall back to the GitHub Environment variable, then to the built-in default."
         required: false
-        default: ""
+        default: dragon.aberration.technology
+        type: string
+      route53_zone_name:
+        description: "Public Route53 hosted zone containing the edge record. Example: `aberration.technology`. Clear it to fall back to the GitHub Environment variable, then to the built-in default."
+        required: false
+        default: aberration.technology
+        type: string
+      auth_connector_kind:
+        description: "Auth connector kind override. Supported values: `github`, `oidc`, `oauth`, `static`, `external`. Clear it to use the GitHub Environment variable, then default to `github`."
+        required: false
+        default: github
         type: string
       github_admin_logins:
-        description: "Comma-separated GitHub username handles granted admin session rights when auth_connector_kind resolves to github. Leave empty to default to the triggering GitHub account."
+        description: "Comma-separated GitHub username handles granted admin session rights when `auth_connector_kind=github`. Example: `alice,bob`. Leave empty to use the GitHub Environment variable, then default to the triggering GitHub account."
         required: false
         default: ""
         type: string
       climbmix_browser_dataset_base_url:
-        description: "Public base URL for the full browser ClimbMix shard pool. The workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile."
+        description: "Public base URL for the browser ClimbMix shard pool. Example: `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile."
         required: false
-        default: ""
+        default: https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1
         type: string
       force_replace_bootstrap:
-        description: "Replace the EC2 bootstrap host during apply. This is destructive to host-local bootstrap/publication state."
+        description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. This is destructive to host-local bootstrap/publication state."
         required: true
         default: false
         type: boolean
@@ -74,8 +84,10 @@ jobs:
 
           aws_region="${{ vars.BURN_DRAGON_P2P_AWS_REGION }}"
           aws_role_arn="${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}"
-          edge_domain_name="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
-          route53_zone_name="${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}"
+          edge_domain_name_input="${{ github.event.inputs.edge_domain_name }}"
+          edge_domain_name_var="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
+          route53_zone_name_input="${{ github.event.inputs.route53_zone_name }}"
+          route53_zone_name_var="${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}"
           network_id="${{ vars.BURN_DRAGON_P2P_NETWORK_ID }}"
           project_family_id="${{ vars.BURN_DRAGON_P2P_PROJECT_FAMILY_ID }}"
           study_id="${{ vars.BURN_DRAGON_P2P_STUDY_ID }}"
@@ -111,13 +123,27 @@ jobs:
 
           : "${aws_region:?missing BURN_DRAGON_P2P_AWS_REGION}"
           : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_ROLE_ARN}"
-          : "${edge_domain_name:?missing BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}"
-          : "${route53_zone_name:?missing BURN_DRAGON_P2P_ROUTE53_ZONE_NAME}"
           : "${network_id:?missing BURN_DRAGON_P2P_NETWORK_ID}"
           : "${project_family_id:?missing BURN_DRAGON_P2P_PROJECT_FAMILY_ID}"
           : "${study_id:?missing BURN_DRAGON_P2P_STUDY_ID}"
           : "${release_train_hash:?missing BURN_DRAGON_P2P_RELEASE_TRAIN_HASH}"
           : "${bootstrap_git_ref:?missing BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF}"
+
+          edge_domain_name="$edge_domain_name_input"
+          if [ -z "$edge_domain_name" ]; then
+            edge_domain_name="$edge_domain_name_var"
+          fi
+          if [ -z "$edge_domain_name" ]; then
+            edge_domain_name="dragon.aberration.technology"
+          fi
+
+          route53_zone_name="$route53_zone_name_input"
+          if [ -z "$route53_zone_name" ]; then
+            route53_zone_name="$route53_zone_name_var"
+          fi
+          if [ -z "$route53_zone_name" ]; then
+            route53_zone_name="aberration.technology"
+          fi
 
           secret_parameter_prefix="/${stack_name}/${TF_WORKSPACE_NAME}/bootstrap"
           auth_connector_kind="$auth_connector_kind_input"
@@ -171,8 +197,7 @@ jobs:
             climbmix_dataset_base_url="$climbmix_dataset_base_url_var"
           fi
           if [ -z "$climbmix_dataset_base_url" ]; then
-            echo "missing ClimbMix browser dataset base URL; set BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL or provide the workflow input" >&2
-            exit 1
+            climbmix_dataset_base_url="https://${edge_domain_name}/dragon-datasets/climbmix-pretraining/climbmix-r1"
           fi
 
           admin_logins_json="$(

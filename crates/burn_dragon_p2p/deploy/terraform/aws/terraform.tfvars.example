@@ -1,8 +1,8 @@
 stack_name              = "burn-dragon-p2p-mainnet"
 environment_name        = "production"
 aws_region              = "us-east-1"
-route53_zone_name       = "example.com"
-edge_domain_name        = "dragon-net.example.com"
+route53_zone_name       = "aberration.technology"
+edge_domain_name        = "dragon.aberration.technology"
 bootstrap_git_ref       = "51717da4e4f8332a711519188e4897f4002a273d"
 secret_parameter_prefix = "/burn-dragon-p2p/mainnet/bootstrap"
 

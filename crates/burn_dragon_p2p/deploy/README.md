@@ -55,7 +55,7 @@ The focused repo also ships a separate browser-shell workflow:
 
 Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`.
 
-That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static; it still connects to the live edge URL you configure.
+That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static; it still connects to the live edge URL you configure. By default, the baked browser config points at `https://dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
 
 Optional GitHub repository variables for the Pages workflow:
 
@@ -64,7 +64,7 @@ Optional GitHub repository variables for the Pages workflow:
 - `BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID`
 - `BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID`
 
-None of those values are secrets. If they are omitted, the published shell still works and operators can supply `?edge=` / `?seed=` query params at runtime or type the values into the UI directly.
+None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, and derives `/dns4/<edge-host>/tcp/4001` plus `/dns4/<edge-host>/udp/4001/quic-v1` automatically. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
 
 ## Required GitHub Environment Configuration
 
@@ -84,9 +84,9 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_STACK_NAME`
   - Terraform stack prefix, for example `burn-dragon-p2p-mainnet`.
 - `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME`
-  - Public browser edge hostname, for example `dragon-net.example.com`.
+  - Optional public browser edge hostname override. Defaults to `dragon.aberration.technology`.
 - `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME`
-  - Route53 public zone name containing the edge record, for example `example.com`.
+  - Optional Route53 public zone override. Defaults to `aberration.technology`.
 - `BURN_DRAGON_P2P_NETWORK_ID`
   - burn_p2p network id, for example `burn-dragon-mainnet`.
 - `BURN_DRAGON_P2P_PROJECT_FAMILY_ID`
@@ -146,8 +146,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB`
   - override encrypted EBS root size, default `256`
 - `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL`
-  - public base URL for the full browser ClimbMix shard pool. The deploy workflow publishes
-    `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile.
+  - public base URL for the full browser ClimbMix shard pool. Defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Override it when the shard pool lives on a different CDN origin.
 
 ### Required Environment Secrets
 
@@ -238,12 +237,7 @@ The initial directory entries are seeded from:
 - `crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
 
-`BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` must point at the external ClimbMix shard
-pool used for browser training. Terraform publishes `${base_url}/fetch-manifest.json` into the
-initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a
-runtime-provided training lease they use the exact assigned microshards; otherwise they use the
-bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app
-now reads that persisted browser training lease automatically before local training starts.
+`BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 
@@ -274,7 +268,7 @@ cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   --training-config crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.training.toml \
   --experiment-kind climbmix \
   --revision-id climbmix-r1 \
-  --browser-climbmix-manifest-url https://datasets.example.com/climbmix/fetch-manifest.json \
+  --browser-climbmix-manifest-url https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1/fetch-manifest.json \
   --output crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json
 ```
 
@@ -293,7 +287,7 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --edge-url https://dragon-net.example.com
+  --edge-url https://dragon.aberration.technology
 
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
   complete-github-login \
@@ -328,9 +322,9 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --edge-url https://dragon-net.example.com \
-  --seed-node-url /dns4/dragon-net.example.com/tcp/4001 \
-  --seed-node-url /dns4/dragon-net.example.com/udp/4001/quic-v1
+  --edge-url https://dragon.aberration.technology \
+  --seed-node-url /dns4/dragon.aberration.technology/tcp/4001 \
+  --seed-node-url /dns4/dragon.aberration.technology/udp/4001/quic-v1
 ```
 
 Native peers can leave `training_config_paths` empty and rely on the published Dragon profile metadata for experiments that have a compatible network profile.

@@ -989,9 +989,9 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                         None => chunk_loss,
                     });
                 }
-                return LanguageModelOutput::new(
+                LanguageModelOutput::new(
                     loss.expect("tbptt valid step should produce at least one loss chunk"),
-                );
+                )
             } else {
                 let mut state = self.model.init_state();
                 let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
@@ -1000,7 +1000,7 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                     &mut state,
                 );
                 let loss = self.language_loss_from_hidden(hidden, batch.targets);
-                return LanguageModelOutput::new(loss);
+                LanguageModelOutput::new(loss)
             }
         } else if let Some(chunk_size) =
             self.effective_tbptt_chunk_size(batch.inputs.shape().dims::<2>()[1])
@@ -1025,13 +1025,13 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                     None => chunk_loss,
                 });
             }
-            return LanguageModelOutput::new(
+            LanguageModelOutput::new(
                 loss.expect("tbptt valid step should produce at least one loss chunk"),
-            );
+            )
         } else {
             let hidden = self.model.forward_hidden(batch.inputs);
             let loss = self.language_loss_from_hidden(hidden, batch.targets);
-            return LanguageModelOutput::new(loss);
+            LanguageModelOutput::new(loss)
         }
     }
 }

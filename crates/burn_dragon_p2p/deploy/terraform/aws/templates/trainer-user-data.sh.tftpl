@@ -38,8 +38,16 @@ cat >/usr/local/bin/burn-dragon-p2p-fetch-auth-bundle <<'EOF_AUTH'
 set -euo pipefail
 
 install -d -m 0700 /var/lib/burn_dragon_p2p
-aws ssm get-parameter   --region "${aws_region}"   --with-decryption   --name "${trainer_auth_bundle_parameter_name}"   --query 'Parameter.Value'   --output text >/var/lib/burn_dragon_p2p/auth-bundle.json
-chmod 0600 /var/lib/burn_dragon_p2p/auth-bundle.json
+for attempt in $(seq 1 60); do
+  if aws ssm get-parameter     --region "${aws_region}"     --with-decryption     --name "${trainer_auth_bundle_parameter_name}"     --query 'Parameter.Value'     --output text >/var/lib/burn_dragon_p2p/auth-bundle.json; then
+    chmod 0600 /var/lib/burn_dragon_p2p/auth-bundle.json
+    exit 0
+  fi
+  sleep 10
+done
+
+echo "trainer auth bundle did not appear in SSM parameter store: ${trainer_auth_bundle_parameter_name}" >&2
+exit 1
 EOF_AUTH
 chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-auth-bundle
 

@@ -71,7 +71,7 @@ pub fn prepare_datasets(
         ensure_validation_tokenizer_compatible(
             tokenizer.as_ref(),
             dataset.tokenizer().as_ref(),
-            &dataset_cfg.tokenizer.kind_name(),
+            dataset_cfg.tokenizer.kind_name(),
         )?;
         info!("Prepared validation override dataset: {dataset_summary}");
         dataset

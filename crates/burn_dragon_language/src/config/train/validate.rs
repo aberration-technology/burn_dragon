@@ -27,12 +27,12 @@ impl TrainingConfig {
                 ));
             }
         }
-        if let Some(min_logical_block_size) = self.training.min_logical_block_size {
-            if min_logical_block_size == 0 {
-                return Err(anyhow!(
-                    "training.min_logical_block_size must be > 0 when set"
-                ));
-            }
+        if let Some(min_logical_block_size) = self.training.min_logical_block_size
+            && min_logical_block_size == 0
+        {
+            return Err(anyhow!(
+                "training.min_logical_block_size must be > 0 when set"
+            ));
         }
         if self.training.tbptt_persist_across_steps && self.training.tbptt_chunk_size.is_none() {
             return Err(anyhow!(
@@ -870,10 +870,10 @@ impl TrainingConfig {
                 resolved_model.n_head
             ));
         }
-        if let Some(schedule) = &self.model.latent_fanout_schedule {
-            if let Err(message) = resolved_model.validate_latent_fanout_schedule(schedule) {
-                return Err(anyhow!(message));
-            }
+        if let Some(schedule) = &self.model.latent_fanout_schedule
+            && let Err(message) = resolved_model.validate_latent_fanout_schedule(schedule)
+        {
+            return Err(anyhow!(message));
         }
         if let Some(dropout) = self.model.dropout
             && dropout < 0.0

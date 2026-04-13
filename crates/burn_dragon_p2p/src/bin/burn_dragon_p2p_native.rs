@@ -16,6 +16,7 @@ use burn_dragon_p2p::admin::{
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
+    enroll_native_static_principal, fetch_edge_snapshot,
 };
 use burn_dragon_p2p::capability_state::{clear_native_downgrade, persist_native_downgrade};
 use burn_dragon_p2p::config::{
@@ -33,7 +34,10 @@ use burn_dragon_p2p::native::{prepare_climbmix_native_cuda, prepare_nca_native_c
 use burn_dragon_p2p::native::{prepare_climbmix_native_wgpu, prepare_nca_native_wgpu};
 use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
-use burn_p2p::{AuthConfig, ExperimentDirectoryEntry, ExperimentScope, RuntimeStatus};
+use burn_p2p::{
+    AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
+    ExperimentId, ExperimentScope, PrincipalId, RuntimeStatus,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -61,6 +65,7 @@ enum CommandKind {
     BeginGithubLogin(BeginGithubLoginArgs),
     #[command(alias = "complete-login")]
     CompleteGithubLogin(CompleteGithubLoginArgs),
+    EnrollStaticPrincipal(EnrollStaticPrincipalArgs),
     RunPeer(RunPeerArgs),
     MarkRuntimeFailure(MarkRuntimeFailureArgs),
     ClearDowngrade(ClearDowngradeArgs),
@@ -272,6 +277,34 @@ struct CompleteGithubLoginArgs {
 }
 
 #[derive(Debug, Parser)]
+struct EnrollStaticPrincipalArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum)]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    principal_id: String,
+    #[arg(long)]
+    principal_hint: Option<String>,
+    #[arg(long)]
+    target_artifact_hash: Option<String>,
+    #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+    session_ttl_secs: i64,
+    #[arg(long)]
+    auth_bundle_out: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
 struct RunPeerArgs {
     #[arg(long)]
     config: PathBuf,
@@ -359,6 +392,7 @@ fn main() -> Result<()> {
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
+        CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
         CommandKind::RunPeer(args) => run_peer(args),
         CommandKind::MarkRuntimeFailure(args) => mark_runtime_failure(args),
         CommandKind::ClearDowngrade(args) => clear_downgrade(args),
@@ -535,6 +569,139 @@ fn complete_github_login(args: CompleteGithubLoginArgs) -> Result<()> {
     )
 }
 
+fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        None,
+    )?;
+    let edge_base_url = config
+        .effective_edge_base_url()
+        .ok_or_else(|| anyhow!("no edge base URL configured"))?
+        .to_owned();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build async runtime for static principal enrollment")?;
+    let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
+    let release_manifest = native_release_manifest_for_snapshot(
+        &config,
+        &snapshot,
+        args.backend,
+        args.target_artifact_hash,
+    )?;
+    let experiment_id = ExperimentId::new(config.manifest.experiment_id.clone());
+    let session = runtime.block_on(enroll_native_static_principal(
+        &config.storage_root,
+        &edge_base_url,
+        &release_manifest,
+        managed_trainer_scopes(&experiment_id),
+        args.session_ttl_secs,
+        args.principal_hint,
+        PrincipalId::new(args.principal_id),
+        None,
+    ))?;
+    write_output(
+        args.auth_bundle_out.as_deref(),
+        args.output_format,
+        &session.auth,
+    )
+}
+
+fn native_target_artifact_id(backend: BackendArg) -> &'static str {
+    match backend {
+        BackendArg::Cpu => "native-cpu",
+        BackendArg::Wgpu => "native-wgpu",
+        BackendArg::Cuda => "native-cuda",
+    }
+}
+
+fn resolve_native_target_artifact_hash(
+    snapshot: &burn_p2p::BrowserEdgeSnapshot,
+    override_hash: Option<String>,
+) -> Result<ContentId> {
+    if let Some(target_artifact_hash) = override_hash.as_deref().map(str::trim)
+        && !target_artifact_hash.is_empty()
+    {
+        return Ok(ContentId::new(target_artifact_hash));
+    }
+
+    let mut allowed = snapshot
+        .allowed_target_artifact_hashes
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if allowed.is_empty()
+        && let Some(trust_bundle) = snapshot.trust_bundle.as_ref()
+    {
+        allowed.extend(trust_bundle.allowed_target_artifact_hashes.iter().cloned());
+    }
+    if allowed.is_empty() {
+        bail!(
+            "edge snapshot is missing allowed target artifact hashes; pass --target-artifact-hash explicitly"
+        )
+    }
+    if allowed.len() == 1 {
+        return Ok(allowed.remove(0));
+    }
+
+    let nativeish = allowed
+        .into_iter()
+        .filter(|hash| {
+            let label = hash.as_str().to_ascii_lowercase();
+            label.contains("native") || !label.contains("browser")
+        })
+        .collect::<Vec<_>>();
+    if nativeish.len() == 1 {
+        return Ok(nativeish.into_iter().next().expect("nativeish hash exists"));
+    }
+
+    bail!(
+        "edge snapshot advertises multiple target artifact hashes; pass --target-artifact-hash explicitly"
+    )
+}
+
+fn native_release_manifest_for_snapshot(
+    config: &DragonNativePeerConfig,
+    snapshot: &burn_p2p::BrowserEdgeSnapshot,
+    backend: BackendArg,
+    target_artifact_hash: Option<String>,
+) -> Result<ClientReleaseManifest> {
+    let trust_bundle = snapshot
+        .trust_bundle
+        .as_ref()
+        .ok_or_else(|| anyhow!("edge snapshot is missing a trust bundle"))?;
+    let release_train_hash = snapshot
+        .required_release_train_hash
+        .clone()
+        .unwrap_or_else(|| trust_bundle.required_release_train_hash.clone());
+    Ok(ClientReleaseManifest {
+        project_family_id: trust_bundle.project_family_id.clone(),
+        release_train_hash,
+        target_artifact_id: native_target_artifact_id(backend).into(),
+        target_artifact_hash: resolve_native_target_artifact_hash(snapshot, target_artifact_hash)?,
+        target_platform: ClientPlatform::Native,
+        app_semver: config.app_semver.clone(),
+        git_commit: config
+            .git_commit
+            .clone()
+            .unwrap_or_else(|| "native-static-enroll".into()),
+        cargo_lock_hash: ContentId::new("dragon-native-auth-lock"),
+        burn_version_string: "0.21.0-pre.3".into(),
+        enabled_features_hash: ContentId::new(
+            config
+                .enabled_features_label
+                .clone()
+                .unwrap_or_else(|| backend.as_label().into()),
+        ),
+        protocol_major: 0,
+        supported_workloads: Vec::new(),
+        built_at: chrono::Utc::now(),
+    })
+}
+
 fn run_peer(args: RunPeerArgs) -> Result<()> {
     let config = resolved_config(
         &args.config,
@@ -708,15 +875,28 @@ fn prepared_manifests(
 }
 
 fn requested_scopes(entry: &ExperimentDirectoryEntry) -> BTreeSet<ExperimentScope> {
+    standard_experiment_scopes(&entry.experiment_id)
+}
+
+fn standard_experiment_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
     BTreeSet::from([
         ExperimentScope::Connect,
         ExperimentScope::Train {
-            experiment_id: entry.experiment_id.clone(),
+            experiment_id: experiment_id.clone(),
         },
         ExperimentScope::Validate {
-            experiment_id: entry.experiment_id.clone(),
+            experiment_id: experiment_id.clone(),
         },
     ])
+}
+
+fn managed_trainer_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
+    let mut scopes = standard_experiment_scopes(experiment_id);
+    scopes.insert(ExperimentScope::Discover);
+    scopes.insert(ExperimentScope::Archive {
+        experiment_id: experiment_id.clone(),
+    });
+    scopes
 }
 
 fn run_prepared_peer<B>(

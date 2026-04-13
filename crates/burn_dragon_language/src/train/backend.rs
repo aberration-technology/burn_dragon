@@ -271,11 +271,11 @@ where
     }
 
     let valid_model = model.valid();
-    let mut iterator = valid_loader.iter();
+    let iterator = valid_loader.iter();
     let mut total = 0.0;
     let mut count = 0usize;
 
-    while let Some(item) = iterator.next() {
+    for item in iterator {
         let output = valid_model.step(item);
         let loss_value: LossValue<ValidBackend<B>> = output.adapt();
         total += mean_scalar_from_valid_loss(loss_value.value());

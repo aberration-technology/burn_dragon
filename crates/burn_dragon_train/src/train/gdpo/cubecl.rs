@@ -166,7 +166,7 @@ fn percentile_thresholds_cubecl_runtime<R: CubeRuntime>(
     let cube_dim = CubeDim::new_3d(1, 1, 1);
     let cube_count = calculate_cube_count_elemwise(&client, out_elems, cube_dim);
 
-    let _ = percentile_thresholds_kernel::launch::<R>(
+    percentile_thresholds_kernel::launch::<R>(
         &client,
         cube_count,
         cube_dim,

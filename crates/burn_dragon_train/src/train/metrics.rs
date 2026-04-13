@@ -466,7 +466,7 @@ where
             && allow_cleanup
             && self.every_epochs > 0
             && epoch != last_epoch
-            && epoch % self.every_epochs == 0
+            && epoch.is_multiple_of(self.every_epochs)
         {
             cleaned |= cleanup_device_memory::<B>(&self.device, self.allow_cuda_cleanup);
         }

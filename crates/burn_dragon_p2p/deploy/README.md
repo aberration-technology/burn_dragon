@@ -54,6 +54,7 @@ That workflow:
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
 - creates or reuses the S3 bucket used for durable direct artifact publication
 - optionally creates an autoscaled managed trainer pool that installs `burn_dragon_p2p_native` from crates.io and fetches its auth bundle from SSM
+- auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
 - prints the primary and secondary bootstrap instance details, shared Redis endpoint, bootstrap install source/version, managed trainer pool outputs, and artifact S3 prefix in the workflow summary
@@ -255,9 +256,9 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET`
   - legacy GitHub-specific secret names still accepted as a fallback when `auth_connector_kind=github`
 - `BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON`
-  - optional JSON auth bundle written into SSM for the managed native trainer pool. Required only when `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY > 0`.
+  - optional JSON auth bundle override written into SSM for the managed native trainer pool. Leave it unset on the normal path. When omitted and `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY > 0`, the deploy workflow seeds a managed static principal, waits for edge health, and mints the trainer auth bundle automatically.
 
-The workflow writes these secrets into AWS SSM Parameter Store before `terraform apply` only when the selected auth connector needs client credentials, so they do not need to be committed into Terraform files or `.tfvars`. When the managed trainer pool is enabled, the workflow also writes the trainer auth bundle secret into SSM before `terraform apply` so trainer instances can fetch it at boot.
+The workflow writes auth client credentials into AWS SSM Parameter Store before `terraform apply` only when the selected auth connector needs client credentials, so they do not need to be committed into Terraform files or `.tfvars`. When the managed trainer pool is enabled, the workflow writes the trainer auth bundle into SSM after the edge is healthy: it uses the explicit override secret when provided, otherwise it auto-enrolls the managed trainer static principal and stores the generated bundle for instance boot.
 
 There is intentionally no shared bootstrap admin token in the production flow. Admin actions are authenticated with a short-lived session id. For GitHub auth, admin capability is granted only to explicitly listed GitHub username handles that also satisfy the org/team/repo policy. For non-GitHub auth, seed explicit admin principals through `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON`.
 

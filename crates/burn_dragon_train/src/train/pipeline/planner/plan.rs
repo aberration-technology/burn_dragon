@@ -293,10 +293,10 @@ fn build_pipeline_events(
     Ok(events)
 }
 
-fn assignments_by_physical_stage<'a>(
+fn assignments_by_physical_stage(
     physical_stage_count: usize,
-    stage_assignments: &'a [PipelineStageAssignment],
-) -> Vec<Vec<&'a PipelineStageAssignment>> {
+    stage_assignments: &[PipelineStageAssignment],
+) -> Vec<Vec<&PipelineStageAssignment>> {
     let mut assignments = vec![Vec::new(); physical_stage_count];
     for assignment in stage_assignments {
         assignments[assignment.physical_stage_id].push(assignment);

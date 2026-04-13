@@ -5,7 +5,7 @@ use burn_dragon_train::ContinualBackpropConfig;
 
 use super::*;
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct DatasetConfig {
     pub cache_dir: PathBuf,
     #[serde(default = "default_train_split_ratio")]
@@ -91,7 +91,7 @@ pub enum HuggingFaceRecordFormat {
     Csv,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct InitTransferConfig {
     #[serde(default)]
@@ -122,27 +122,6 @@ pub struct InitTransferConfig {
     pub preserve_fresh_norm: bool,
     #[serde(default)]
     pub match_fresh_rms: bool,
-}
-
-impl Default for InitTransferConfig {
-    fn default() -> Self {
-        Self {
-            interface_checkpoint_path: None,
-            interface_checkpoint_epoch: None,
-            preserve_interface_input_embedding: false,
-            preserve_interface_output_head: false,
-            interface_output_head_blend_alpha: None,
-            backbone_blend_alpha: None,
-            decoder_blend_alpha: None,
-            norm_blend_alpha: None,
-            backbone_grad_scale: None,
-            backbone_grad_scale_steps: None,
-            fresh_top_layers: None,
-            preserve_fresh_decoder: false,
-            preserve_fresh_norm: false,
-            match_fresh_rms: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

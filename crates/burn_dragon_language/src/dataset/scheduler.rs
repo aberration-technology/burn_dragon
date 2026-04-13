@@ -292,6 +292,7 @@ struct RandomPrefetch {
 }
 
 impl RandomPrefetch {
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         dataset: Arc<dyn TokenSequenceDataset>,
         split: DatasetSplit,
@@ -319,10 +320,10 @@ impl RandomPrefetch {
             handles.push(thread::spawn(move || {
                 loop {
                     let task_index = next_task.fetch_add(1, Ordering::Relaxed);
-                    if let Some(limit) = total_steps {
-                        if task_index >= limit {
-                            break;
-                        }
+                    if let Some(limit) = total_steps
+                        && task_index >= limit
+                    {
+                        break;
                     }
                     let epoch_index = task_index / steps_per_epoch.max(1);
                     dataset.prefetch_epoch(split, epoch_index.saturating_add(1));

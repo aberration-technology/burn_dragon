@@ -44,7 +44,7 @@ pub fn login_provider_label(snapshot: &BrowserEdgeSnapshot) -> Option<&str> {
         .map(|provider| provider.label.as_str())
 }
 
-pub fn native_github_enrollment_config(
+pub fn native_edge_enrollment_config(
     snapshot: &BrowserEdgeSnapshot,
     release_manifest: &ClientReleaseManifest,
     requested_scopes: BTreeSet<ExperimentScope>,
@@ -97,6 +97,47 @@ pub struct DragonPendingGitHubLogin {
 pub struct DragonGitHubSession {
     pub auth: DragonNativeAuthBundle,
     pub session: PrincipalSession,
+}
+
+#[cfg(feature = "native")]
+fn finalize_native_auth_session(
+    storage_root: &Path,
+    edge_base_url: &str,
+    enrollment: &EdgeEnrollmentConfig,
+    session: PrincipalSession,
+    certificate: burn_p2p::NodeCertificate,
+    client_manifest_id: Option<ContentId>,
+    auth_event_label: &str,
+) -> Result<DragonGitHubSession> {
+    let (node_keypair, _) = edge_peer_identity_for_storage(storage_root, None)?;
+    let trust_bundle_endpoint = format!(
+        "{}{}",
+        edge_base_url.trim_end_matches('/'),
+        enrollment.trust_bundle_path
+    );
+    let peer_auth = create_peer_auth_envelope(
+        &node_keypair,
+        certificate,
+        client_manifest_id,
+        enrollment.requested_scopes.clone(),
+        ContentId::new(format!(
+            "{auth_event_label}-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        )),
+        Utc::now(),
+    )?;
+    Ok(DragonGitHubSession {
+        auth: DragonNativeAuthBundle {
+            auth_config: AuthConfig::new()
+                .with_local_peer_auth(peer_auth)
+                .with_trust_bundle_endpoint(trust_bundle_endpoint.clone()),
+            trust_bundle_endpoint,
+            edge_base_url: Some(edge_base_url.trim_end_matches('/').to_owned()),
+            session_id: Some(session.session_id.as_str().to_owned()),
+            principal_id: Some(session.claims.principal_id.as_str().to_owned()),
+        },
+        session,
+    })
 }
 
 #[cfg(feature = "native")]
@@ -182,7 +223,7 @@ pub async fn begin_native_github_login(
     use_device_flow: bool,
 ) -> Result<DragonPendingGitHubLogin> {
     let snapshot = fetch_edge_snapshot(edge_base_url).await?;
-    let enrollment = native_github_enrollment_config(
+    let enrollment = native_edge_enrollment_config(
         &snapshot,
         release_manifest,
         requested_scopes,
@@ -212,38 +253,54 @@ pub async fn complete_native_github_login(
     let session = client
         .complete_provider_login(&pending.login, provider_code.to_owned())
         .await?;
-    let (node_keypair, identity) = edge_peer_identity_for_storage(storage_root, None)?;
+    let (_, identity) = edge_peer_identity_for_storage(storage_root, None)?;
     let certificate = client
         .enroll(&client.build_enrollment_request(&session, &identity))
         .await?;
-    let trust_bundle_endpoint = format!(
-        "{}{}",
-        pending.edge_base_url.trim_end_matches('/'),
-        pending.enrollment.trust_bundle_path
-    );
-    let peer_auth = create_peer_auth_envelope(
-        &node_keypair,
+    finalize_native_auth_session(
+        storage_root,
+        &pending.edge_base_url,
+        &pending.enrollment,
+        session,
         certificate,
         client_manifest_id,
-        pending.enrollment.requested_scopes.clone(),
-        ContentId::new(format!(
-            "github-auth-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        )),
-        Utc::now(),
+        "github-auth",
+    )
+}
+
+#[cfg(feature = "native")]
+#[allow(clippy::too_many_arguments)]
+pub async fn enroll_native_static_principal(
+    storage_root: &Path,
+    edge_base_url: &str,
+    release_manifest: &ClientReleaseManifest,
+    requested_scopes: BTreeSet<ExperimentScope>,
+    session_ttl_secs: i64,
+    principal_hint: Option<String>,
+    principal_id: burn_p2p::PrincipalId,
+    client_manifest_id: Option<ContentId>,
+) -> Result<DragonGitHubSession> {
+    let snapshot = fetch_edge_snapshot(edge_base_url).await?;
+    let enrollment = native_edge_enrollment_config(
+        &snapshot,
+        release_manifest,
+        requested_scopes,
+        session_ttl_secs,
     )?;
-    Ok(DragonGitHubSession {
-        auth: DragonNativeAuthBundle {
-            auth_config: AuthConfig::new()
-                .with_local_peer_auth(peer_auth)
-                .with_trust_bundle_endpoint(trust_bundle_endpoint.clone()),
-            trust_bundle_endpoint,
-            edge_base_url: Some(pending.edge_base_url.clone()),
-            session_id: Some(session.session_id.as_str().to_owned()),
-            principal_id: Some(session.claims.principal_id.as_str().to_owned()),
-        },
-        session,
-    })
+    let client = EdgeAuthClient::new(edge_base_url, enrollment.clone());
+    let (_, identity) = edge_peer_identity_for_storage(storage_root, None)?;
+    let enrolled = client
+        .enroll_static_principal(principal_hint, principal_id, &identity)
+        .await?;
+    finalize_native_auth_session(
+        storage_root,
+        edge_base_url,
+        &enrollment,
+        enrolled.session,
+        enrolled.certificate,
+        client_manifest_id,
+        "static-auth",
+    )
 }
 
 pub fn compose_auth_config(

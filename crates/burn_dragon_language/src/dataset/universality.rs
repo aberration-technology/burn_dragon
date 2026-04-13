@@ -875,18 +875,24 @@ fn fixed_manifest_logical_document_tokens(
 ) -> io::Result<Option<usize>> {
     let train_samples = manifest.stats.train_samples;
     let val_samples = manifest.stats.validation_samples;
-    let train_doc_tokens = if train_samples > 0 {
-        let per_doc = manifest.train_token_count / train_samples;
-        (manifest.train_token_count % train_samples == 0).then_some(per_doc)
-    } else {
-        None
-    };
-    let val_doc_tokens = if val_samples > 0 {
-        let per_doc = manifest.val_token_count / val_samples;
-        (manifest.val_token_count % val_samples == 0).then_some(per_doc)
-    } else {
-        None
-    };
+    let train_doc_tokens = manifest
+        .train_token_count
+        .checked_div(train_samples)
+        .and_then(|per_doc| {
+            manifest
+                .train_token_count
+                .is_multiple_of(train_samples)
+                .then_some(per_doc)
+        });
+    let val_doc_tokens = manifest
+        .val_token_count
+        .checked_div(val_samples)
+        .and_then(|per_doc| {
+            manifest
+                .val_token_count
+                .is_multiple_of(val_samples)
+                .then_some(per_doc)
+        });
     let document_token_count = match (train_doc_tokens, val_doc_tokens) {
         (Some(train), Some(val)) if train == val => Some(train),
         (Some(train), None) => Some(train),

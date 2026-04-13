@@ -39,6 +39,7 @@ where
     Ok(artifacts)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_bundle<Stage, Artifact, StageNameFn, StageDirFn, ValidateFn, RunFn>(
     bundle_name: &str,
     bundle_root: &Path,

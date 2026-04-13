@@ -332,7 +332,10 @@ where
         }
 
         let mut updated_module = module;
-        if state.step % self.config.replace_interval_steps == 0 {
+        if state
+            .step
+            .is_multiple_of(self.config.replace_interval_steps)
+        {
             let target_lr_scale = A::target_lr_scale(&updated_module);
             let selected =
                 self.select_features_to_replace(&updated_module, &mut state, lr, target_lr_scale);

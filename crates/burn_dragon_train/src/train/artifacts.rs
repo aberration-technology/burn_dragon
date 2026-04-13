@@ -413,7 +413,7 @@ fn write_avi_raw(path: &Path, frames: &[ArtifactFrame], fps: u32) -> Result<()> 
         let chunk_size = encoded.len();
         write_u32(&mut buf, chunk_size as u32);
         buf.extend_from_slice(&encoded);
-        if chunk_size % 2 != 0 {
+        if !chunk_size.is_multiple_of(2) {
             buf.push(0);
         }
         idx_entries.push(AviIndexEntry {

@@ -1744,7 +1744,10 @@ fn render_hf_record(
         }
 
         let mut joined = if ordered.len() == 1 {
-            ordered.into_iter().next().unwrap()
+            ordered
+                .into_iter()
+                .next()
+                .expect("single-field template produced one ordered value")
         } else {
             ordered.join(if cfg.field_separator.is_empty() {
                 DEFAULT_RECORD_DELIMITER

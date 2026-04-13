@@ -1257,8 +1257,12 @@ mod tests {
             .forward(input.clone())
             .into_data()
             .to_vec::<f32>()
-            .unwrap();
-        let restored = loaded.forward(input).into_data().to_vec::<f32>().unwrap();
+            .expect("tiny model reference output should convert to f32 vec");
+        let restored = loaded
+            .forward(input)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("loaded tiny model output should convert to f32 vec");
         assert_eq!(reference, restored);
     }
 
@@ -1291,8 +1295,12 @@ mod tests {
             .forward(input.clone())
             .into_data()
             .to_vec::<f32>()
-            .unwrap();
-        let from_manual = manual.forward(input).into_data().to_vec::<f32>().unwrap();
+            .expect("loaded tiny model output should convert to f32 vec");
+        let from_manual = manual
+            .forward(input)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("manually restored tiny model output should convert to f32 vec");
         assert_eq!(from_loaded, from_manual);
     }
 
@@ -1318,8 +1326,12 @@ mod tests {
             .forward(input.clone())
             .into_data()
             .to_vec::<f32>()
-            .unwrap();
-        let restored = loaded.forward(input).into_data().to_vec::<f32>().unwrap();
+            .expect("tiny model reference output should convert to f32 vec");
+        let restored = loaded
+            .forward(input)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("restored tiny model output should convert to f32 vec");
         assert_eq!(reference, restored);
     }
 }

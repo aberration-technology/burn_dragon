@@ -41,7 +41,7 @@ The initial ClimbMix revision now defaults to the managed dataset CDN path under
 
 ## Artifact Storage
 
-Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
+Checkpoint artifacts, including model weights and exported metric bundles, are published from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. The default Dragon deploy now uses a hybrid publication policy: canonical serve-checkpoint aliases are mirrored eagerly, while heavier exports remain on-demand. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
 
 There is no separate artifact node by default. The bootstrap/control-plane host owns artifact publication, durable artifact bytes live in S3, and bootstrap-local peer/runtime/auth/operator state lives on the root volume by default. If you opt into retained bootstrap storage, that local state moves onto a dedicated EBS volume. If you opt into managed Redis, auth session and operator state are externalized there. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow only when retained bootstrap storage is enabled.
 

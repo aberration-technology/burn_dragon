@@ -479,7 +479,7 @@ locals {
           publication_target_id   = "local-default"
           label                   = "artifact-s3"
           kind                    = "S3Compatible"
-          publication_mode        = "LazyOnDemand"
+          publication_mode        = "Hybrid"
           access_mode             = "Authenticated"
           allow_public_reads      = false
           supports_signed_urls    = true

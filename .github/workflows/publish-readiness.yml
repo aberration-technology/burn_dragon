@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo publish dry-run chain
+      - name: verify publish readiness chain
         shell: bash
         run: |
           set -euo pipefail
@@ -43,7 +43,15 @@ jobs:
             burn_dragon_language
             burn_dragon_p2p
           )
+
+          verify_crate() {
+            local crate="$1"
+            echo "+ cargo package --manifest-path Cargo.toml -p ${crate} --locked --list"
+            cargo package --manifest-path Cargo.toml -p "${crate}" --locked --list >/tmp/${crate}.package.list
+            echo "+ cargo check --manifest-path Cargo.toml -p ${crate} --locked"
+            cargo check --manifest-path Cargo.toml -p "${crate}" --locked
+          }
+
           for crate in "${crates[@]}"; do
-            echo "+ cargo publish --manifest-path Cargo.toml -p ${crate} --dry-run --locked"
-            cargo publish --manifest-path Cargo.toml -p "${crate}" --dry-run --locked
+            verify_crate "${crate}"
           done

@@ -82,10 +82,17 @@ jobs:
             PY
           }
 
+          verify_crate() {
+            local crate="$1"
+            echo "+ cargo package --manifest-path Cargo.toml -p ${crate} --locked --list"
+            cargo package --manifest-path Cargo.toml -p "${crate}" --locked --list >/tmp/${crate}.package.list
+            echo "+ cargo check --manifest-path Cargo.toml -p ${crate} --locked"
+            cargo check --manifest-path Cargo.toml -p "${crate}" --locked
+          }
+
           for crate in "${crates[@]}"; do
             if [ "$dry_run" = "true" ]; then
-              echo "+ cargo publish --manifest-path Cargo.toml -p ${crate} --dry-run --locked"
-              cargo publish --manifest-path Cargo.toml -p "${crate}" --dry-run --locked
+              verify_crate "${crate}"
               continue
             fi
 

@@ -39,10 +39,11 @@ locals {
   tags = merge(
     var.tags,
     {
-      Application = "burn-dragon-p2p"
-      Environment = var.environment_name
-      ManagedBy   = "terraform"
-      Stack       = var.stack_name
+      Application        = "burn-dragon-p2p"
+      Environment        = var.environment_name
+      ManagedBy          = "terraform"
+      Stack              = var.stack_name
+      TerraformWorkspace = terraform.workspace
     },
   )
 
@@ -106,6 +107,33 @@ locals {
   artifact_bucket_arn         = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_bucket_name}"
   artifact_bucket_object_arn  = "${local.artifact_bucket_arn}/*"
   artifact_bucket_s3_uri      = "s3://${local.artifact_bucket_name}/${local.artifact_bucket_path_prefix}"
+  disaster_recovery_enabled   = trimspace(var.disaster_recovery_region) != ""
+  disaster_recovery_region    = trimspace(var.disaster_recovery_region) != "" ? trimspace(var.disaster_recovery_region) : var.aws_region
+  default_artifact_replica_bucket_name = trimsuffix(
+    substr(
+      replace(
+        replace(
+          replace(
+            lower("${var.stack_name}-${terraform.workspace}-${data.aws_caller_identity.current.account_id}-${local.disaster_recovery_region}-artifacts-dr"),
+            ".",
+            "-",
+          ),
+          "_",
+          "-",
+        ),
+        "/",
+        "-",
+      ),
+      0,
+      63,
+    ),
+    "-",
+  )
+  artifact_replica_bucket_name              = trimspace(var.artifact_replica_bucket_name) != "" ? trimspace(var.artifact_replica_bucket_name) : local.default_artifact_replica_bucket_name
+  artifact_replica_bucket_arn               = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_replica_bucket_name}"
+  artifact_replica_bucket_object_arn        = "${local.artifact_replica_bucket_arn}/*"
+  artifact_replica_bucket_s3_uri            = "s3://${local.artifact_replica_bucket_name}/${local.artifact_bucket_path_prefix}"
+  disaster_recovery_snapshot_copies_enabled = local.disaster_recovery_enabled && var.enable_data_volume_snapshots && var.enable_disaster_recovery_snapshot_copies
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"
@@ -524,6 +552,20 @@ check "artifact_bucket_configuration" {
   }
 }
 
+check "artifact_replica_bucket_configuration" {
+  assert {
+    condition     = !local.disaster_recovery_enabled || var.create_artifact_replica_bucket || trimspace(var.artifact_replica_bucket_name) != ""
+    error_message = "Set artifact_replica_bucket_name when create_artifact_replica_bucket is false so warm disaster recovery has an existing replica bucket."
+  }
+}
+
+check "artifact_replica_encryption_configuration" {
+  assert {
+    condition     = !local.disaster_recovery_enabled || var.artifact_bucket_server_side_encryption == "AES256"
+    error_message = "Warm disaster recovery currently supports AES256 artifact bucket encryption. Use the default AES256 mode when disaster_recovery_region is enabled."
+  }
+}
+
 resource "aws_vpc" "bootstrap" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_hostnames = true
@@ -885,16 +927,192 @@ resource "aws_s3_bucket_policy" "artifact_deny_insecure_transport" {
   depends_on = [aws_s3_bucket_public_access_block.artifact]
 }
 
+resource "aws_s3_bucket" "artifact_replica" {
+  provider = aws.dr
+  count    = local.disaster_recovery_enabled && var.create_artifact_replica_bucket ? 1 : 0
+
+  bucket        = local.artifact_replica_bucket_name
+  force_destroy = var.artifact_replica_bucket_force_destroy
+
+  tags = merge(local.tags, {
+    Name    = "${var.stack_name}-artifacts-dr"
+    Purpose = "burn-dragon-p2p-artifact-dr-replica"
+  })
+}
+
+resource "aws_s3_bucket_public_access_block" "artifact_replica" {
+  provider = aws.dr
+  count    = local.disaster_recovery_enabled && var.create_artifact_replica_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact_replica[0].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "artifact_replica" {
+  provider = aws.dr
+  count    = local.disaster_recovery_enabled && var.create_artifact_replica_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact_replica[0].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifact_replica" {
+  provider = aws.dr
+  count    = local.disaster_recovery_enabled && var.create_artifact_replica_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact_replica[0].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = var.artifact_bucket_server_side_encryption
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "artifact_replica_deny_insecure_transport" {
+  provider = aws.dr
+  count    = local.disaster_recovery_enabled && var.create_artifact_replica_bucket ? 1 : 0
+
+  bucket = aws_s3_bucket.artifact_replica[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.artifact_replica[0].arn,
+          "${aws_s3_bucket.artifact_replica[0].arn}/*",
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.artifact_replica]
+}
+
+resource "aws_iam_role" "artifact_replication" {
+  count = local.disaster_recovery_enabled ? 1 : 0
+
+  name = "${var.stack_name}-artifact-replication"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      },
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy" "artifact_replication" {
+  count = local.disaster_recovery_enabled ? 1 : 0
+
+  name = "${var.stack_name}-artifact-replication"
+  role = aws_iam_role.artifact_replication[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetReplicationConfiguration",
+          "s3:ListBucket",
+        ]
+        Resource = [local.artifact_bucket_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObjectVersionForReplication",
+          "s3:GetObjectVersionAcl",
+          "s3:GetObjectVersionTagging",
+        ]
+        Resource = [local.artifact_bucket_object_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:ReplicateObject",
+          "s3:ReplicateDelete",
+          "s3:ReplicateTags",
+          "s3:ObjectOwnerOverrideToBucketOwner",
+        ]
+        Resource = [local.artifact_replica_bucket_object_arn]
+      },
+    ]
+  })
+}
+
+resource "aws_s3_bucket_replication_configuration" "artifact" {
+  count = local.disaster_recovery_enabled ? 1 : 0
+
+  bucket = local.artifact_bucket_name
+  role   = aws_iam_role.artifact_replication[0].arn
+
+  rule {
+    id       = "warm-disaster-recovery"
+    priority = 1
+    status   = "Enabled"
+
+    delete_marker_replication {
+      status = "Enabled"
+    }
+
+    existing_object_replication {
+      status = "Enabled"
+    }
+
+    filter {
+      prefix = local.artifact_bucket_path_prefix
+    }
+
+    destination {
+      bucket        = local.artifact_replica_bucket_arn
+      storage_class = "STANDARD"
+    }
+  }
+
+  depends_on = [
+    aws_s3_bucket_versioning.artifact,
+    aws_s3_bucket_versioning.artifact_replica,
+  ]
+}
+
 resource "aws_ebs_volume" "bootstrap_data" {
   availability_zone = aws_subnet.public.availability_zone
   size              = var.data_volume_size_gib
   type              = var.data_volume_type
   encrypted         = true
+  snapshot_id       = trimspace(var.bootstrap_primary_restore_snapshot_id) != "" ? trimspace(var.bootstrap_primary_restore_snapshot_id) : null
 
   tags = merge(local.tags, {
     Name           = "${var.stack_name}-bootstrap-data"
     SnapshotPolicy = local.bootstrap_data_snapshot_tag
     Persistence    = "retained-bootstrap-state"
+    NodeRole       = "primary"
   })
 }
 
@@ -960,11 +1178,13 @@ resource "aws_ebs_volume" "bootstrap_secondary_data" {
   size              = var.data_volume_size_gib
   type              = var.data_volume_type
   encrypted         = true
+  snapshot_id       = trimspace(var.bootstrap_secondary_restore_snapshot_id) != "" ? trimspace(var.bootstrap_secondary_restore_snapshot_id) : null
 
   tags = merge(local.tags, {
     Name           = "${var.stack_name}-bootstrap-secondary-data"
     SnapshotPolicy = local.bootstrap_data_snapshot_tag
     Persistence    = "retained-bootstrap-state"
+    NodeRole       = "secondary"
   })
 }
 
@@ -1083,6 +1303,20 @@ resource "aws_dlm_lifecycle_policy" "bootstrap_data" {
       tags_to_add = merge(local.tags, {
         SnapshotSource = "${var.stack_name}-bootstrap-data"
       })
+
+      dynamic "cross_region_copy_rule" {
+        for_each = local.disaster_recovery_snapshot_copies_enabled ? [1] : []
+        content {
+          target    = local.disaster_recovery_region
+          encrypted = true
+          copy_tags = true
+
+          retain_rule {
+            interval      = var.disaster_recovery_snapshot_retention_days
+            interval_unit = "DAYS"
+          }
+        }
+      }
     }
   }
 

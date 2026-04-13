@@ -4,6 +4,12 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "disaster_recovery_region" {
+  description = "Optional warm-disaster-recovery AWS region. When set, Terraform enables cross-region artifact replication and cross-region copies of retained bootstrap data snapshots."
+  type        = string
+  default     = ""
+}
+
 variable "stack_name" {
   description = "Logical stack name used for tags and DNS outputs."
   type        = string
@@ -279,6 +285,30 @@ variable "data_volume_snapshot_time_utc" {
   default     = "03:00"
 }
 
+variable "enable_disaster_recovery_snapshot_copies" {
+  description = "Whether Terraform should copy retained bootstrap data volume snapshots into disaster_recovery_region when that region is configured."
+  type        = bool
+  default     = true
+}
+
+variable "disaster_recovery_snapshot_retention_days" {
+  description = "How many daily copied bootstrap data snapshots to keep in disaster_recovery_region when warm-DR snapshot copies are enabled."
+  type        = number
+  default     = 14
+}
+
+variable "bootstrap_primary_restore_snapshot_id" {
+  description = "Optional EBS snapshot id used to restore the primary bootstrap data volume. Leave empty for a normal retained-volume deployment."
+  type        = string
+  default     = ""
+}
+
+variable "bootstrap_secondary_restore_snapshot_id" {
+  description = "Optional EBS snapshot id used to restore the secondary bootstrap data volume. Leave empty for a normal retained-volume deployment."
+  type        = string
+  default     = ""
+}
+
 variable "enable_bootstrap_status_alarms" {
   description = "Whether Terraform should create EC2 status-check CloudWatch alarms for the bootstrap host."
   type        = bool
@@ -319,6 +349,24 @@ variable "artifact_bucket_server_side_encryption" {
   description = "Server-side encryption mode enforced for the artifact S3 bucket and direct bootstrap uploads."
   type        = string
   default     = "AES256"
+}
+
+variable "create_artifact_replica_bucket" {
+  description = "Whether Terraform should create the warm-DR replica S3 bucket in disaster_recovery_region when cross-region replication is enabled."
+  type        = bool
+  default     = true
+}
+
+variable "artifact_replica_bucket_name" {
+  description = "Optional existing or desired S3 bucket name in disaster_recovery_region for replicated Dragon artifacts. Leave empty to let Terraform derive a stable replica bucket name."
+  type        = string
+  default     = ""
+}
+
+variable "artifact_replica_bucket_force_destroy" {
+  description = "Whether Terraform may destroy the disaster-recovery artifact replica S3 bucket even if it still contains replicated checkpoints and metrics."
+  type        = bool
+  default     = false
 }
 
 variable "ssh_cidr_blocks" {

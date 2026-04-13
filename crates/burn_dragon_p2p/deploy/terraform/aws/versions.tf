@@ -16,3 +16,8 @@ terraform {
 provider "aws" {
   region = var.aws_region
 }
+
+provider "aws" {
+  alias  = "dr"
+  region = trimspace(var.disaster_recovery_region) != "" ? trimspace(var.disaster_recovery_region) : var.aws_region
+}

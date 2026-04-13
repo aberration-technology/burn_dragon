@@ -18,6 +18,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - shared Redis-backed auth session and operator state for multi-node control-plane continuity
 - shared authority material synchronized through SSM so both bootstrap nodes serve the same auth/control plane
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
+- optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
 - EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
@@ -35,9 +36,9 @@ profile, and browser peers fetch only the shards they train on from that externa
 
 ## Artifact Storage
 
-Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target.
+Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
 
-There is no separate artifact node by default. The bootstrap/control-plane hosts own artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and each bootstrap node keeps its local peer/runtime state on its retained EBS data volume.
+There is no separate artifact node by default. The bootstrap/control-plane hosts own artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and each bootstrap node keeps its local peer/runtime state on its retained EBS data volume. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow, not by running a second always-on artifact service.
 
 ## One-Click GitHub Action
 
@@ -58,6 +59,34 @@ If you trigger the workflow with a forced bootstrap replacement, Terraform repla
 
 The workflow still performs a Terraform plan internally before apply. That keeps the operator experience one-click without dropping the safety and auditability of a plan phase.
 
+## Disaster Recovery Restore Workflow
+
+The explicit restore and failover entrypoint is:
+
+- `.github/workflows/restore-burn-dragon-p2p-aws.yml`
+
+That workflow can:
+
+- resolve the latest tagged primary and secondary retained-volume snapshots automatically
+- run a `plan_only=true` disaster-recovery drill without applying
+- restore the stack into a target region from explicit or auto-resolved snapshots
+- optionally re-enable warm-DR replication on the restored stack by setting `next_disaster_recovery_region`
+- reuse the normal `data_volume_size_gib` setting, but keep it greater than or equal to the source snapshot volume size
+
+Recommended warm-DR drill flow:
+
+- set `terraform_workspace` to a drill-specific workspace like `dr-drill`
+- set `aws_region` to the warm-DR region that receives copied snapshots
+- leave `restore_from_latest_snapshots=true`
+- keep `plan_only=true`
+
+Recommended actual failover flow:
+
+- set `terraform_workspace` to the production workspace you are failing over
+- set `aws_region` to the warm-DR region
+- leave `restore_from_latest_snapshots=true` unless you are pinning explicit snapshot ids
+- set `plan_only=false`
+- optionally set `next_disaster_recovery_region` if the restored stack should keep a warm-DR target
 
 ## GitHub Pages Browser Shell
 
@@ -165,6 +194,12 @@ Configure the workflow to target one of those environments. Put the following va
   - enable or disable the Terraform-managed daily data-volume snapshot policy. Defaults to `true`.
 - `BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS`
   - retained daily snapshot count for the bootstrap data volume. Defaults to `14`.
+- `BURN_DRAGON_P2P_DISASTER_RECOVERY_REGION`
+  - optional warm-disaster-recovery region, for example `us-west-2`. When set, Terraform enables cross-region artifact replication and copied retained-volume snapshots into that region.
+- `BURN_DRAGON_P2P_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES`
+  - enable or disable copied retained-volume snapshots into the warm-DR region. Defaults to `true` when a disaster recovery region is configured.
+- `BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS`
+  - retained daily copied-snapshot count in the warm-DR region. Defaults to `14`.
 - `BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS`
   - enable or disable EC2 status-check CloudWatch alarms for the bootstrap host. Defaults to `true`.
 - `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
@@ -176,7 +211,13 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY`
   - whether Terraform may delete a managed artifact bucket even when it still contains published data. Defaults to `false` and should stay that way for production.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION`
-  - server-side encryption mode for the managed artifact bucket and direct bootstrap uploads. Defaults to `AES256`.
+  - server-side encryption mode for the managed artifact bucket and direct bootstrap uploads. Defaults to `AES256`. Warm-DR replication currently expects `AES256`.
+- `BURN_DRAGON_P2P_CREATE_ARTIFACT_REPLICA_BUCKET`
+  - whether Terraform should create the warm-DR replica artifact bucket when `BURN_DRAGON_P2P_DISASTER_RECOVERY_REGION` is set. Defaults to `true`.
+- `BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_NAME`
+  - optional existing bucket name in the warm-DR region for replicated artifacts. Leave empty to auto-derive a stable name.
+- `BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY`
+  - whether Terraform may delete a managed warm-DR replica bucket even when it still contains replicated artifacts. Defaults to `false` and should stay that way for production.
 - `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL`
   - public base URL for the full browser ClimbMix shard pool. Defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Override it when the shard pool lives on a different CDN origin.
 
@@ -201,7 +242,7 @@ The GitHub OIDC role must be able to:
 - write and overwrite SSM parameters under the chosen secret prefix
 - read Route53 hosted zone metadata
 - manage the retained EBS volume, DLM snapshot policies, and CloudWatch alarms for the bootstrap stack
-- create or update the artifact S3 bucket resources when you use the managed-bucket path
+- create or update the artifact S3 bucket resources when you use the managed-bucket path, including optional warm-DR replica bucket resources
 
 The deployed EC2 instance role is created by Terraform and needs to:
 

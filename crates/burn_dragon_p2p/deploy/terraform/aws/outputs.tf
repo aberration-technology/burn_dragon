@@ -48,6 +48,21 @@ output "artifact_bucket_uri" {
   value       = local.artifact_bucket_s3_uri
 }
 
+output "disaster_recovery_region" {
+  description = "Configured warm-disaster-recovery AWS region. Empty when warm DR is disabled."
+  value       = trimspace(var.disaster_recovery_region)
+}
+
+output "artifact_replica_bucket_name" {
+  description = "S3 bucket in the disaster-recovery region receiving replicated checkpoint and metric artifacts. Empty when warm DR is disabled."
+  value       = local.disaster_recovery_enabled ? local.artifact_replica_bucket_name : ""
+}
+
+output "artifact_replica_bucket_uri" {
+  description = "S3 URI prefix in the disaster-recovery region receiving replicated checkpoint and metric artifacts. Empty when warm DR is disabled."
+  value       = local.disaster_recovery_enabled ? local.artifact_replica_bucket_s3_uri : ""
+}
+
 output "control_plane_redis_primary_endpoint" {
   description = "Primary Redis endpoint backing shared operator and auth session state."
   value       = aws_elasticache_replication_group.control_plane.primary_endpoint_address

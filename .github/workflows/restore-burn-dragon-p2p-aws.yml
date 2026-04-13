@@ -207,6 +207,8 @@ jobs:
           disaster_recovery_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS }}"
           enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
           alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
+          enable_control_plane_operational_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}"
+          enable_control_plane_dashboard="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}"
           create_artifact_bucket="${{ github.event.inputs.create_artifact_bucket }}"
           artifact_bucket_name="${{ github.event.inputs.artifact_bucket_name }}"
           artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
@@ -534,6 +536,8 @@ jobs:
           if [ -n "$disaster_recovery_snapshot_retention_days" ]; then echo "TF_VAR_disaster_recovery_snapshot_retention_days=$disaster_recovery_snapshot_retention_days" >>"$GITHUB_ENV"; fi
           if [ -n "$enable_bootstrap_status_alarms" ]; then echo "TF_VAR_enable_bootstrap_status_alarms=$enable_bootstrap_status_alarms" >>"$GITHUB_ENV"; fi
           if [ -n "$alarm_sns_topic_arn" ]; then echo "TF_VAR_alarm_sns_topic_arn=$alarm_sns_topic_arn" >>"$GITHUB_ENV"; fi
+          if [ -n "$enable_control_plane_operational_alarms" ]; then echo "TF_VAR_enable_control_plane_operational_alarms=$enable_control_plane_operational_alarms" >>"$GITHUB_ENV"; fi
+          if [ -n "$enable_control_plane_dashboard" ]; then echo "TF_VAR_enable_control_plane_dashboard=$enable_control_plane_dashboard" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_bucket_name" ]; then echo "TF_VAR_artifact_bucket_name=$artifact_bucket_name" >>"$GITHUB_ENV"; fi
           if [ -n "$dataset_bucket_name" ]; then echo "TF_VAR_dataset_bucket_name=$dataset_bucket_name" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_bucket_path_prefix" ]; then echo "TF_VAR_artifact_bucket_path_prefix=$artifact_bucket_path_prefix" >>"$GITHUB_ENV"; fi
@@ -626,6 +630,8 @@ jobs:
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
+          control_plane_dashboard_name="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_name)"
+          control_plane_dashboard_url="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_url)"
           artifact_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_name)"
           artifact_bucket_uri="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_uri)"
           dataset_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw dataset_bucket_name)"
@@ -645,6 +651,8 @@ jobs:
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "redis_endpoint=$redis_endpoint"
+            echo "control_plane_dashboard_name=$control_plane_dashboard_name"
+            echo "control_plane_dashboard_url=$control_plane_dashboard_url"
             echo "artifact_bucket_name=$artifact_bucket_name"
             echo "artifact_bucket_uri=$artifact_bucket_uri"
             echo "dataset_bucket_name=$dataset_bucket_name"
@@ -768,6 +776,8 @@ jobs:
           - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
           - Shared Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
+          - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
           - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
           - Dataset bucket: \`${{ steps.outputs.outputs.dataset_bucket_name }}\`

@@ -21,7 +21,8 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
 - managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
-- EC2 status-check CloudWatch alarms, optionally wired to SNS
+- EC2, Redis, dataset CDN, Route53, and managed-trainer CloudWatch alarms, optionally wired to SNS
+- shared CloudWatch dashboard for control-plane health and throughput
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
 It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity.
@@ -71,7 +72,7 @@ That workflow:
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the primary and secondary bootstrap instance details, shared Redis endpoint, bootstrap install source/version, managed trainer pool outputs, and artifact S3 prefix in the workflow summary
+- prints the primary and secondary bootstrap instance details, shared Redis endpoint, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the primary EC2 host. The retained primary bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
 
@@ -244,7 +245,11 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS`
   - enable or disable EC2 status-check CloudWatch alarms for the bootstrap host. Defaults to `true`.
 - `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
-  - optional SNS topic ARN used for bootstrap status-check alarms. Leave empty to create alarms without notifications.
+  - optional SNS topic ARN used for CloudWatch operational alarms. Leave empty to create alarms without notifications.
+- `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS`
+  - enable or disable Redis, dataset CDN, Route53 health-check, and managed-trainer CloudWatch alarms. Defaults to `true`.
+- `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD`
+  - enable or disable the shared CloudWatch dashboard for the Dragon control plane. Defaults to `true`.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME`
   - optional existing S3 bucket name for directly published checkpoints and metrics. Leave empty to let Terraform derive a stable unique bucket name.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX`

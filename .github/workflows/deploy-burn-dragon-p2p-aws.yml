@@ -219,6 +219,8 @@ jobs:
           data_volume_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}"
           enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
           alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
+          enable_control_plane_operational_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}"
+          enable_control_plane_dashboard="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}"
           create_artifact_bucket_input="${{ github.event.inputs.create_artifact_bucket }}"
           artifact_bucket_name_input="${{ github.event.inputs.artifact_bucket_name }}"
           artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
@@ -594,6 +596,12 @@ jobs:
           if [ -n "$alarm_sns_topic_arn" ]; then
             echo "TF_VAR_alarm_sns_topic_arn=$alarm_sns_topic_arn" >>"$GITHUB_ENV"
           fi
+          if [ -n "$enable_control_plane_operational_alarms" ]; then
+            echo "TF_VAR_enable_control_plane_operational_alarms=$enable_control_plane_operational_alarms" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$enable_control_plane_dashboard" ]; then
+            echo "TF_VAR_enable_control_plane_dashboard=$enable_control_plane_dashboard" >>"$GITHUB_ENV"
+          fi
           if [ -n "$artifact_bucket_name" ]; then
             echo "TF_VAR_artifact_bucket_name=$artifact_bucket_name" >>"$GITHUB_ENV"
           fi
@@ -708,6 +716,8 @@ jobs:
           data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
           secondary_public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_secondary_public_ip)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
+          control_plane_dashboard_name="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_name)"
+          control_plane_dashboard_url="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_url)"
           artifact_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_name)"
           artifact_bucket_uri="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_uri)"
           dataset_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw dataset_bucket_name)"
@@ -735,6 +745,8 @@ jobs:
             echo "data_mount_path=$data_mount_path"
             echo "secondary_public_ip=$secondary_public_ip"
             echo "redis_endpoint=$redis_endpoint"
+            echo "control_plane_dashboard_name=$control_plane_dashboard_name"
+            echo "control_plane_dashboard_url=$control_plane_dashboard_url"
             echo "artifact_bucket_name=$artifact_bucket_name"
             echo "artifact_bucket_uri=$artifact_bucket_uri"
             echo "dataset_bucket_name=$dataset_bucket_name"
@@ -850,6 +862,8 @@ jobs:
           - Secondary data volume id: \`${{ steps.outputs.outputs.secondary_data_volume_id }}\`
           - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
           - Shared Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
+          - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Bootstrap install source: \`${TF_VAR_bootstrap_install_source}\`
           - Bootstrap crate version: \`${TF_VAR_bootstrap_crate_version}\`
           - Bootstrap git ref override: \`${TF_VAR_bootstrap_git_ref:-n/a}\`

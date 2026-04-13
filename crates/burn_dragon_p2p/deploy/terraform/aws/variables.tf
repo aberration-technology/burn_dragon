@@ -368,6 +368,36 @@ variable "alarm_sns_topic_arn" {
   default     = ""
 }
 
+variable "enable_control_plane_operational_alarms" {
+  description = "Whether Terraform should create operational CloudWatch alarms for Redis, Route53 health checks, dataset CDN, and managed trainer capacity."
+  type        = bool
+  default     = true
+}
+
+variable "enable_control_plane_dashboard" {
+  description = "Whether Terraform should create a shared CloudWatch dashboard for the Dragon control plane."
+  type        = bool
+  default     = true
+}
+
+variable "redis_engine_cpu_alarm_threshold_percent" {
+  description = "Redis EngineCPUUtilization threshold that triggers the operational alarm."
+  type        = number
+  default     = 80
+}
+
+variable "redis_freeable_memory_alarm_threshold_bytes" {
+  description = "Redis FreeableMemory threshold in bytes that triggers the low-memory operational alarm."
+  type        = number
+  default     = 268435456
+}
+
+variable "dataset_cdn_5xx_error_rate_alarm_threshold_percent" {
+  description = "CloudFront 5xx error-rate percentage that triggers the managed dataset CDN alarm."
+  type        = number
+  default     = 5
+}
+
 variable "create_artifact_bucket" {
   description = "Whether Terraform should create the S3 bucket used for durable artifact publication from the bootstrap host."
   type        = bool

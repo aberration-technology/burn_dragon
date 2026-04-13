@@ -98,6 +98,17 @@ output "control_plane_redis_primary_endpoint" {
   value       = aws_elasticache_replication_group.control_plane.primary_endpoint_address
 }
 
+
+output "control_plane_dashboard_name" {
+  description = "CloudWatch dashboard name for the Dragon control plane. Empty when dashboards are disabled."
+  value       = var.enable_control_plane_dashboard ? local.control_plane_dashboard_name : ""
+}
+
+output "control_plane_dashboard_url" {
+  description = "CloudWatch dashboard URL for the Dragon control plane. Empty when dashboards are disabled."
+  value       = var.enable_control_plane_dashboard ? local.control_plane_dashboard_url : ""
+}
+
 output "managed_trainer_asg_name" {
   description = "Autoscaling group name for the optional managed native trainer pool. Empty when managed trainers are disabled."
   value       = length(aws_autoscaling_group.managed_trainer) > 0 ? aws_autoscaling_group.managed_trainer[0].name : ""

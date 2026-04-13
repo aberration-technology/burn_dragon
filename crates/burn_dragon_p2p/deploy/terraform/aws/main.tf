@@ -83,12 +83,15 @@ locals {
     "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",
     "/ip4/${local.bootstrap_secondary_private_ip}/tcp/${var.p2p_port}",
   ]
-  bootstrap_data_mount_path   = "/var/lib/burn-p2p"
-  bootstrap_auth_root         = "${local.bootstrap_data_mount_path}/auth"
-  bootstrap_peer_root         = "${local.bootstrap_data_mount_path}/bootstrap-peer"
-  bootstrap_data_snapshot_tag = "${var.stack_name}-bootstrap-data"
-  cloudwatch_alarm_actions    = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
-  dataset_domain_name         = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
+  bootstrap_data_mount_path       = "/var/lib/burn-p2p"
+  bootstrap_auth_root             = "${local.bootstrap_data_mount_path}/auth"
+  bootstrap_peer_root             = "${local.bootstrap_data_mount_path}/bootstrap-peer"
+  bootstrap_data_snapshot_tag     = "${var.stack_name}-bootstrap-data"
+  cloudwatch_alarm_actions        = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
+  control_plane_dashboard_name    = "${var.stack_name}-${terraform.workspace}-control-plane"
+  control_plane_dashboard_url     = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${local.control_plane_dashboard_name}"
+  managed_trainer_alarm_threshold = max(var.managed_trainer_desired_capacity, 1)
+  dataset_domain_name             = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
   default_dataset_bucket_name = trimsuffix(
     substr(
       replace(
@@ -1827,6 +1830,287 @@ resource "aws_cloudwatch_metric_alarm" "bootstrap_status_check_failed_system" {
   }
 
   tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "control_plane_redis_engine_cpu_high" {
+  count = var.enable_control_plane_operational_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-redis-engine-cpu-high"
+  alarm_description   = "burn_dragon_p2p shared Redis EngineCPUUtilization is above the configured threshold"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 5
+  metric_name         = "EngineCPUUtilization"
+  namespace           = "AWS/ElastiCache"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.redis_engine_cpu_alarm_threshold_percent
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    ReplicationGroupId = aws_elasticache_replication_group.control_plane.replication_group_id
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "control_plane_redis_freeable_memory_low" {
+  count = var.enable_control_plane_operational_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-redis-freeable-memory-low"
+  alarm_description   = "burn_dragon_p2p shared Redis freeable memory is below the configured threshold"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  metric_name         = "FreeableMemory"
+  namespace           = "AWS/ElastiCache"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.redis_freeable_memory_alarm_threshold_bytes
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    ReplicationGroupId = aws_elasticache_replication_group.control_plane.replication_group_id
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "edge_primary_health_check_unhealthy" {
+  count = var.enable_control_plane_operational_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-edge-primary-unhealthy"
+  alarm_description   = "burn_dragon_p2p primary edge Route53 health check is unhealthy"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthCheckStatus"
+  namespace           = "AWS/Route53"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    HealthCheckId = aws_route53_health_check.edge_primary.id
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "edge_secondary_health_check_unhealthy" {
+  count = var.enable_control_plane_operational_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-edge-secondary-unhealthy"
+  alarm_description   = "burn_dragon_p2p secondary edge Route53 health check is unhealthy"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthCheckStatus"
+  namespace           = "AWS/Route53"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    HealthCheckId = aws_route53_health_check.edge_secondary.id
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "dataset_cdn_5xx_error_rate_high" {
+  count = var.enable_control_plane_operational_alarms ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-dataset-cdn-5xx-high"
+  alarm_description   = "burn_dragon_p2p managed dataset CDN 5xx error rate is above the configured threshold"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  metric_name         = "5xxErrorRate"
+  namespace           = "AWS/CloudFront"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.dataset_cdn_5xx_error_rate_alarm_threshold_percent
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    DistributionId = aws_cloudfront_distribution.dataset.id
+    Region         = "Global"
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "managed_trainer_in_service_low" {
+  count = var.enable_control_plane_operational_alarms && local.managed_trainer_enabled && var.managed_trainer_desired_capacity > 0 ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-managed-trainer-in-service-low"
+  alarm_description   = "burn_dragon_p2p managed trainer in-service capacity is below the configured desired capacity"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 5
+  metric_name         = "GroupInServiceInstances"
+  namespace           = "AWS/AutoScaling"
+  period              = 60
+  statistic           = "Average"
+  threshold           = local.managed_trainer_alarm_threshold
+  treat_missing_data  = "breaching"
+  alarm_actions       = local.cloudwatch_alarm_actions
+  ok_actions          = local.cloudwatch_alarm_actions
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.managed_trainer[0].name
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_dashboard" "control_plane" {
+  count          = var.enable_control_plane_dashboard ? 1 : 0
+  dashboard_name = local.control_plane_dashboard_name
+  dashboard_body = jsonencode({
+    widgets = concat([
+      {
+        type   = "text"
+        x      = 0
+        y      = 0
+        width  = 24
+        height = 3
+        properties = {
+          markdown = join("\n", [
+            "# burn_dragon control plane",
+            "- edge: https://${var.edge_domain_name}",
+            "- dataset cdn: https://${local.dataset_domain_name}",
+            "- artifact bucket: ${local.artifact_bucket_name}",
+            "- redis replication group: ${aws_elasticache_replication_group.control_plane.replication_group_id}",
+          ])
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 3
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Edge health checks"
+          region  = var.aws_region
+          period  = 60
+          stat    = "Minimum"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/Route53", "HealthCheckStatus", "HealthCheckId", aws_route53_health_check.edge_primary.id, { label = "primary edge" }],
+            [".", ".", "HealthCheckId", aws_route53_health_check.edge_secondary.id, { label = "secondary edge" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 3
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Bootstrap EC2 CPU"
+          region  = var.aws_region
+          period  = 300
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.bootstrap.id, { label = "primary bootstrap" }],
+            [".", ".", "InstanceId", aws_instance.bootstrap_secondary.id, { label = "secondary bootstrap" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 9
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Control plane Redis"
+          region  = var.aws_region
+          period  = 60
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/ElastiCache", "EngineCPUUtilization", "ReplicationGroupId", aws_elasticache_replication_group.control_plane.replication_group_id, { label = "engine cpu %" }],
+            [".", "CurrConnections", ".", ".", { label = "connections", yAxis = "right" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 9
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Control plane Redis memory"
+          region  = var.aws_region
+          period  = 300
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/ElastiCache", "FreeableMemory", "ReplicationGroupId", aws_elasticache_replication_group.control_plane.replication_group_id, { label = "freeable memory bytes" }],
+            [".", "Evictions", ".", ".", { label = "evictions", yAxis = "right" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 15
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Managed dataset CDN"
+          region  = var.aws_region
+          period  = 300
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/CloudFront", "Requests", "DistributionId", aws_cloudfront_distribution.dataset.id, "Region", "Global", { label = "requests", stat = "Sum" }],
+            [".", "4xxErrorRate", ".", ".", ".", ".", { label = "4xx error rate %" }],
+            [".", "5xxErrorRate", ".", ".", ".", ".", { label = "5xx error rate %" }],
+          ]
+        }
+      },
+      ], local.managed_trainer_enabled ? [
+      {
+        type   = "metric"
+        x      = 12
+        y      = 15
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Managed trainer pool"
+          region  = var.aws_region
+          period  = 60
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", aws_autoscaling_group.managed_trainer[0].name, { label = "desired" }],
+            [".", "GroupInServiceInstances", ".", ".", { label = "in service" }],
+            [".", "GroupTotalInstances", ".", ".", { label = "total" }],
+          ]
+        }
+      },
+    ] : [])
+  })
 }
 
 resource "aws_eip" "bootstrap" {

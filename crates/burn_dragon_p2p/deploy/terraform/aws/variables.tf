@@ -293,19 +293,19 @@ variable "github_principal_id" {
 variable "instance_type" {
   description = "EC2 instance type for the bootstrap edge."
   type        = string
-  default     = "t3.small"
+  default     = "t3a.small"
 }
 
 variable "root_volume_size_gib" {
   description = "Root EBS volume size for the bootstrap edge instance."
   type        = number
-  default     = 64
+  default     = 32
 }
 
 variable "data_volume_size_gib" {
-  description = "Dedicated retained EBS data volume size for bootstrap/auth/publication state."
+  description = "Dedicated retained EBS data volume size for bootstrap/auth/publication state when retained bootstrap storage is enabled."
   type        = number
-  default     = 128
+  default     = 64
 }
 
 variable "data_volume_type" {
@@ -320,10 +320,16 @@ variable "data_volume_device_name" {
   default     = "/dev/sdf"
 }
 
-variable "enable_data_volume_snapshots" {
-  description = "Whether Terraform should manage automatic snapshots for the retained bootstrap data volume."
+variable "use_retained_bootstrap_data_volume" {
+  description = "Whether Terraform should provision a separate retained EBS data volume for bootstrap/auth/publication state. Defaults to false so the cheapest path keeps state on the root volume only."
   type        = bool
-  default     = true
+  default     = false
+}
+
+variable "enable_data_volume_snapshots" {
+  description = "Whether Terraform should manage automatic snapshots for the retained bootstrap data volume when that volume is enabled."
+  type        = bool
+  default     = false
 }
 
 variable "data_volume_snapshot_retention_days" {
@@ -339,9 +345,9 @@ variable "data_volume_snapshot_time_utc" {
 }
 
 variable "enable_disaster_recovery_snapshot_copies" {
-  description = "Whether Terraform should copy retained bootstrap data volume snapshots into disaster_recovery_region when that region is configured."
+  description = "Whether Terraform should copy retained bootstrap data volume snapshots into disaster_recovery_region when that region is configured and retained bootstrap storage is enabled."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "disaster_recovery_snapshot_retention_days" {
@@ -366,6 +372,12 @@ variable "alarm_sns_topic_arn" {
   description = "Optional SNS topic ARN notified by bootstrap status-check CloudWatch alarms."
   type        = string
   default     = ""
+}
+
+variable "enable_managed_control_plane_redis" {
+  description = "Whether Terraform should provision a managed Redis node for shared auth session and operator state. Defaults to false so the cheapest path uses local file-backed state on the bootstrap host."
+  type        = bool
+  default     = false
 }
 
 variable "enable_control_plane_operational_alarms" {

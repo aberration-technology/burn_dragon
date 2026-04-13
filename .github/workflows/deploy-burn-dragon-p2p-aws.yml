@@ -17,7 +17,7 @@ on:
         default: mainnet
         type: string
       disaster_recovery_region:
-        description: "Optional warm-disaster-recovery AWS region. Example: `us-west-2`. When set, Terraform enables cross-region artifact replication and cross-region copies of retained bootstrap data snapshots into that region."
+        description: "Optional warm-disaster-recovery AWS region. Example: `us-west-2`. When set, Terraform enables cross-region artifact replication and, only when retained bootstrap storage is enabled, cross-region copies of retained bootstrap data snapshots into that region."
         required: false
         default: ""
         type: string
@@ -112,7 +112,7 @@ on:
           - nca
           - climbmix
       force_replace_bootstrap:
-        description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. The retained bootstrap data volume is preserved, so normal host replacement keeps bootstrap/auth/publication state."
+        description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. If retained bootstrap storage is enabled, the retained data volume is preserved; otherwise bootstrap-local state stays on the root volume and is replaced with the host."
         required: true
         default: false
         type: boolean
@@ -203,6 +203,7 @@ jobs:
           instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
           root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
           data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
+          use_retained_bootstrap_data_volume="${{ vars.BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME }}"
           managed_trainer_desired_capacity_input="${{ github.event.inputs.managed_trainer_desired_capacity }}"
           managed_trainer_desired_capacity_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY }}"
           managed_trainer_backend_input="${{ github.event.inputs.managed_trainer_backend }}"
@@ -221,6 +222,7 @@ jobs:
           alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
           enable_control_plane_operational_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}"
           enable_control_plane_dashboard="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}"
+          enable_managed_control_plane_redis="${{ vars.BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS }}"
           create_artifact_bucket_input="${{ github.event.inputs.create_artifact_bucket }}"
           artifact_bucket_name_input="${{ github.event.inputs.artifact_bucket_name }}"
           artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
@@ -586,6 +588,9 @@ jobs:
           if [ -n "$data_volume_size_gib" ]; then
             echo "TF_VAR_data_volume_size_gib=$data_volume_size_gib" >>"$GITHUB_ENV"
           fi
+          if [ -n "$use_retained_bootstrap_data_volume" ]; then
+            echo "TF_VAR_use_retained_bootstrap_data_volume=$use_retained_bootstrap_data_volume" >>"$GITHUB_ENV"
+          fi
           if [ -n "$managed_trainer_instance_type" ]; then
             echo "TF_VAR_managed_trainer_instance_type=$managed_trainer_instance_type" >>"$GITHUB_ENV"
           fi
@@ -612,6 +617,9 @@ jobs:
           fi
           if [ -n "$enable_control_plane_dashboard" ]; then
             echo "TF_VAR_enable_control_plane_dashboard=$enable_control_plane_dashboard" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$enable_managed_control_plane_redis" ]; then
+            echo "TF_VAR_enable_managed_control_plane_redis=$enable_managed_control_plane_redis" >>"$GITHUB_ENV"
           fi
           if [ -n "$artifact_bucket_name" ]; then
             echo "TF_VAR_artifact_bucket_name=$artifact_bucket_name" >>"$GITHUB_ENV"
@@ -723,7 +731,9 @@ jobs:
           instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
           data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_volume_id)"
           data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
+          bootstrap_state_storage_mode="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_state_storage_mode)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
+          control_plane_state_backend="$(terraform -chdir="$TF_ROOT" output -raw control_plane_state_backend)"
           control_plane_dashboard_name="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_name)"
           control_plane_dashboard_url="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_url)"
           artifact_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_name)"
@@ -749,7 +759,9 @@ jobs:
             echo "instance_id=$instance_id"
             echo "data_volume_id=$data_volume_id"
             echo "data_mount_path=$data_mount_path"
+            echo "bootstrap_state_storage_mode=$bootstrap_state_storage_mode"
             echo "redis_endpoint=$redis_endpoint"
+            echo "control_plane_state_backend=$control_plane_state_backend"
             echo "control_plane_dashboard_name=$control_plane_dashboard_name"
             echo "control_plane_dashboard_url=$control_plane_dashboard_url"
             echo "artifact_bucket_name=$artifact_bucket_name"
@@ -861,9 +873,11 @@ jobs:
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
           - Bootstrap EC2 instance id: \`${{ steps.outputs.outputs.instance_id }}\`
           - Bootstrap public IP: \`${{ steps.outputs.outputs.public_ip }}\`
-          - Bootstrap data volume id: \`${{ steps.outputs.outputs.data_volume_id }}\`
+          - Bootstrap state storage: \`${{ steps.outputs.outputs.bootstrap_state_storage_mode }}\`
+          - Bootstrap data volume id: \`${{ steps.outputs.outputs.data_volume_id || 'disabled' }}\`
           - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
-          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Control-plane state backend: \`${{ steps.outputs.outputs.control_plane_state_backend }}\`
+          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint || 'local-file-backed' }}\`
           - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
           - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Bootstrap install source: \`${TF_VAR_bootstrap_install_source}\`

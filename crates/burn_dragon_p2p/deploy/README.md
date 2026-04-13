@@ -14,12 +14,14 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - Route53 DNS for the browser edge
 - no ALB or API Gateway; the browser edge is Caddy on the bootstrap host
 - TLS termination via Caddy on the host
-- one retained encrypted EBS data volume for bootstrap local peer/runtime state
+- bootstrap-local peer/runtime/auth state on the EC2 root volume by default
 - bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
-- one Redis node for shared auth session and operator state
+- optional retained encrypted EBS data volume for bootstrap local peer/runtime/auth state when you want state to survive host replacement
+- local file-backed auth session and operator state on the bootstrap host by default
+- optional managed Redis node for auth session and operator state when you want externalized control-plane state
 - bootstrap authority material synchronized through SSM and persisted for host replacement
-- daily retained data-volume snapshots with Terraform-managed DLM policy by default
-- optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
+- retained data-volume snapshots disabled by default and only relevant when retained bootstrap storage is enabled
+- optional warm-disaster-recovery region with cross-region artifact replication plus retained-volume snapshot copies when retained bootstrap storage is enabled
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
 - managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
 - managed trainers are separate from the bootstrap nodes and default to disabled
@@ -41,7 +43,7 @@ The initial ClimbMix revision now defaults to the managed dataset CDN path under
 
 Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
 
-There is no separate artifact node by default. The bootstrap/control-plane host owns artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and the bootstrap host keeps its local peer/runtime state on its retained EBS data volume. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow, not by running a second always-on artifact service.
+There is no separate artifact node by default. The bootstrap/control-plane host owns artifact publication, durable artifact bytes live in S3, and bootstrap-local peer/runtime/auth/operator state lives on the root volume by default. If you opt into retained bootstrap storage, that local state moves onto a dedicated EBS volume. If you opt into managed Redis, auth session and operator state are externalized there. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow only when retained bootstrap storage is enabled.
 
 ## Managed Dataset Distribution
 
@@ -74,9 +76,9 @@ That workflow:
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the bootstrap instance details, Redis endpoint, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
+- prints the bootstrap instance details, bootstrap state-storage mode, control-plane state backend, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
 
-If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. The retained bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
+If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. By default that also replaces bootstrap-local root-volume state. If you enable retained bootstrap storage, Terraform reattaches the retained data volume so local peer/runtime/auth state survives a normal rebuild. Artifact publication remains externalized in S3 either way.
 
 The workflow still performs a Terraform plan internally before apply. That keeps the operator experience one-click without dropping the safety and auditability of a plan phase.
 
@@ -88,11 +90,11 @@ The explicit restore and failover entrypoint is:
 
 That workflow can:
 
-- resolve the latest tagged retained bootstrap data-volume snapshot automatically
+- resolve the latest tagged retained bootstrap data-volume snapshot automatically when retained bootstrap storage is enabled
 - run a `plan_only=true` disaster-recovery drill without applying
-- restore the stack into a target region from explicit or auto-resolved snapshots
+- restore the stack into a target region from explicit or auto-resolved snapshots when retained bootstrap storage is enabled
 - optionally re-enable warm-DR replication on the restored stack by setting `next_disaster_recovery_region`
-- reuse the normal `data_volume_size_gib` setting, but keep it greater than or equal to the source snapshot volume size
+- reuse the normal `data_volume_size_gib` setting, but keep it greater than or equal to the source snapshot volume size when restoring from snapshots
 
 Recommended warm-DR drill flow:
 
@@ -221,11 +223,13 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION`
   - optional minimum GitHub repository permission for explicitly listed admin logins. Defaults to `admin`. This only applies when `auth_connector_kind=github`.
 - `BURN_DRAGON_P2P_INSTANCE_TYPE`
-  - override bootstrap host size, default `t3.small`
+  - override bootstrap host size, default `t3a.small`
 - `BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB`
-  - override encrypted EBS root size, default `64`
+  - override encrypted EBS root size, default `32`. EC2 still requires a root EBS volume even on the cheapest path.
 - `BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB`
-  - retained encrypted bootstrap/auth/publication data volume size, default `128`
+  - retained encrypted bootstrap/auth/publication data volume size when retained bootstrap storage is enabled, default `64`
+- `BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME`
+  - whether Terraform should provision a separate retained bootstrap data volume. Defaults to `false`, which keeps bootstrap-local state on the root volume only.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY`
   - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND`
@@ -245,21 +249,23 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
-  - enable or disable the Terraform-managed daily data-volume snapshot policy. Defaults to `true`.
+  - enable or disable the Terraform-managed daily data-volume snapshot policy. Defaults to `false` and only matters when retained bootstrap storage is enabled.
 - `BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS`
   - retained daily snapshot count for the bootstrap data volume. Defaults to `14`.
 - `BURN_DRAGON_P2P_DISASTER_RECOVERY_REGION`
-  - optional warm-disaster-recovery region, for example `us-west-2`. When set, Terraform enables cross-region artifact replication and copied retained-volume snapshots into that region.
+  - optional warm-disaster-recovery region, for example `us-west-2`. When set, Terraform enables cross-region artifact replication and, if retained bootstrap storage is enabled, copied retained-volume snapshots into that region.
 - `BURN_DRAGON_P2P_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES`
-  - enable or disable copied retained-volume snapshots into the warm-DR region. Defaults to `true` when a disaster recovery region is configured.
+  - enable or disable copied retained-volume snapshots into the warm-DR region. Defaults to `false` and only matters when retained bootstrap storage is enabled.
 - `BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS`
   - retained daily copied-snapshot count in the warm-DR region. Defaults to `14`.
 - `BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS`
   - enable or disable EC2 status-check CloudWatch alarms for the bootstrap host. Defaults to `true`.
 - `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
   - optional SNS topic ARN used for CloudWatch operational alarms. Leave empty to create alarms without notifications.
+- `BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS`
+  - whether Terraform should provision a managed Redis node for auth session and operator state. Defaults to `false`.
 - `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS`
-  - enable or disable Redis, dataset CDN, Route53 health-check, and managed-trainer CloudWatch alarms. Defaults to `true`.
+  - enable or disable control-plane alarms. With the cheap defaults this covers bootstrap EC2, dataset CDN, Route53 health-check, and managed-trainer alarms; Redis alarms appear only when managed Redis is enabled. Defaults to `true`.
 - `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD`
   - enable or disable the shared CloudWatch dashboard for the Dragon control plane. Defaults to `true`.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME`
@@ -307,7 +313,7 @@ The GitHub OIDC role must be able to:
 - manage the Terraform target resources in the selected AWS account
 - write and overwrite SSM parameters under the chosen secret prefix
 - read Route53 hosted zone metadata
-- manage the retained EBS volume, DLM snapshot policies, and CloudWatch alarms for the bootstrap stack
+- manage the bootstrap EC2 host, optional retained EBS volume, optional DLM snapshot policies, and CloudWatch alarms for the bootstrap stack
 - create or update the artifact S3 bucket resources when you use the managed-bucket path, including optional warm-DR replica bucket resources
 
 The deployed EC2 instance role is created by Terraform and needs to:

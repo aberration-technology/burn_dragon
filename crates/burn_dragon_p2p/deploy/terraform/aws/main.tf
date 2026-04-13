@@ -81,18 +81,23 @@ locals {
   bootstrap_peer_internal_multiaddrs = [
     "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",
   ]
-  bootstrap_data_mount_path       = "/var/lib/burn-p2p"
-  bootstrap_auth_root             = "${local.bootstrap_data_mount_path}/auth"
-  bootstrap_peer_root             = "${local.bootstrap_data_mount_path}/bootstrap-peer"
-  bootstrap_data_snapshot_tag     = "${var.stack_name}-bootstrap-data"
-  cloudwatch_alarm_actions        = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
-  control_plane_dashboard_name    = "${var.stack_name}-${terraform.workspace}-control-plane"
-  control_plane_dashboard_url     = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${local.control_plane_dashboard_name}"
-  managed_trainer_alarm_threshold = max(var.managed_trainer_desired_capacity, 1)
-  route53_zone_apex               = trimsuffix(lower(trimspace(var.route53_zone_name)), ".")
-  edge_domain_name_normalized     = trimsuffix(lower(trimspace(var.edge_domain_name)), ".")
-  dataset_domain_name             = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
-  dataset_domain_name_normalized  = trimsuffix(lower(trimspace(local.dataset_domain_name)), ".")
+  bootstrap_data_mount_path           = "/var/lib/burn-p2p"
+  bootstrap_auth_root                 = "${local.bootstrap_data_mount_path}/auth"
+  bootstrap_auth_session_state_path   = "${local.bootstrap_auth_root}/session-state.cbor"
+  bootstrap_peer_root                 = "${local.bootstrap_data_mount_path}/bootstrap-peer"
+  bootstrap_data_snapshot_tag         = "${var.stack_name}-bootstrap-data"
+  use_retained_bootstrap_data_volume  = var.use_retained_bootstrap_data_volume
+  managed_control_plane_redis_enabled = var.enable_managed_control_plane_redis
+  bootstrap_state_storage_mode        = local.use_retained_bootstrap_data_volume ? "retained-ebs-volume" : "root-volume"
+  control_plane_state_backend         = local.managed_control_plane_redis_enabled ? "redis" : "local-file"
+  cloudwatch_alarm_actions            = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
+  control_plane_dashboard_name        = "${var.stack_name}-${terraform.workspace}-control-plane"
+  control_plane_dashboard_url         = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${local.control_plane_dashboard_name}"
+  managed_trainer_alarm_threshold     = max(var.managed_trainer_desired_capacity, 1)
+  route53_zone_apex                   = trimsuffix(lower(trimspace(var.route53_zone_name)), ".")
+  edge_domain_name_normalized         = trimsuffix(lower(trimspace(var.edge_domain_name)), ".")
+  dataset_domain_name                 = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
+  dataset_domain_name_normalized      = trimsuffix(lower(trimspace(local.dataset_domain_name)), ".")
   default_dataset_bucket_name = trimsuffix(
     substr(
       replace(
@@ -169,7 +174,7 @@ locals {
   artifact_replica_bucket_arn                = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_replica_bucket_name}"
   artifact_replica_bucket_object_arn         = "${local.artifact_replica_bucket_arn}/*"
   artifact_replica_bucket_s3_uri             = "s3://${local.artifact_replica_bucket_name}/${local.artifact_bucket_path_prefix}"
-  disaster_recovery_snapshot_copies_enabled  = local.disaster_recovery_enabled && var.enable_data_volume_snapshots && var.enable_disaster_recovery_snapshot_copies
+  disaster_recovery_snapshot_copies_enabled  = local.disaster_recovery_enabled && local.use_retained_bootstrap_data_volume && var.enable_data_volume_snapshots && var.enable_disaster_recovery_snapshot_copies
   managed_trainer_enabled                    = var.managed_trainer_desired_capacity > 0
   managed_trainer_backend                    = lower(trimspace(var.managed_trainer_backend))
   managed_trainer_experiment_kind            = lower(trimspace(var.managed_trainer_experiment_kind))
@@ -463,11 +468,11 @@ locals {
     }
     remaining_work_units = var.remaining_work_units
     admin_signer_peer_id = "burn-dragon-bootstrap-authority"
-    operator_state_backend = {
+    operator_state_backend = local.managed_control_plane_redis_enabled ? {
       kind       = "redis"
       url        = "$${BURN_P2P_SHARED_REDIS_URL}"
       key_prefix = "burn-dragon:operator-state"
-    }
+    } : null
     artifact_publication = {
       targets = [
         {
@@ -520,7 +525,7 @@ locals {
       authority_name              = var.auth_authority_name
       connector                   = local.auth_connector
       authority_key_path          = "${local.bootstrap_auth_root}/bootstrap-authority.key"
-      session_state_path          = "${local.bootstrap_auth_root}/session-state.json"
+      session_state_path          = local.bootstrap_auth_session_state_path
       persist_provider_tokens     = false
       issuer_key_id               = "burn-dragon-mainnet"
       project_family_id           = var.project_family_id
@@ -530,11 +535,11 @@ locals {
         var.browser_target_artifact_hash,
       ]
       session_ttl_seconds = 86400
-      session_state_backend = {
+      session_state_backend = local.managed_control_plane_redis_enabled ? {
         kind       = "redis"
         url        = "$${BURN_P2P_SHARED_REDIS_URL}"
         key_prefix = "burn-dragon:auth-sessions"
-      }
+      } : null
       minimum_revocation_epoch = 1
       principals               = local.auth_principals
       provider_policy          = local.auth_provider_policy
@@ -556,9 +561,10 @@ locals {
     authority_key_name                  = local.secret_parameter_names.authority_key
     authority_key_path                  = "${local.bootstrap_auth_root}/bootstrap-authority.key"
     bootstrap_node_role                 = "$${BOOTSTRAP_NODE_ROLE}"
+    control_plane_redis_enabled         = local.managed_control_plane_redis_enabled
     control_plane_redis_auth_token_name = local.secret_parameter_names.control_plane_redis_auth_token
-    control_plane_redis_endpoint        = aws_elasticache_replication_group.control_plane.primary_endpoint_address
-    control_plane_redis_port            = aws_elasticache_replication_group.control_plane.port
+    control_plane_redis_endpoint        = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].primary_endpoint_address : ""
+    control_plane_redis_port            = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].port : 0
     edge_domain_name                    = var.edge_domain_name
   })
   bootstrap_auth_feature = local.auth_connector_kind == "github" ? "auth-github" : (
@@ -1042,6 +1048,8 @@ resource "aws_autoscaling_group" "managed_trainer" {
 }
 
 resource "aws_security_group" "control_plane_redis" {
+  count = local.managed_control_plane_redis_enabled ? 1 : 0
+
   name        = "${var.stack_name}-control-plane-redis"
   description = "burn_dragon_p2p shared redis control plane"
   vpc_id      = aws_vpc.bootstrap.id
@@ -1066,6 +1074,8 @@ resource "aws_security_group" "control_plane_redis" {
 }
 
 resource "aws_elasticache_subnet_group" "control_plane" {
+  count = local.managed_control_plane_redis_enabled ? 1 : 0
+
   name       = substr(replace(lower("${var.stack_name}-${terraform.workspace}-cp"), "_", "-"), 0, 40)
   subnet_ids = [aws_subnet.public.id, aws_subnet.public_secondary.id]
 
@@ -1073,21 +1083,27 @@ resource "aws_elasticache_subnet_group" "control_plane" {
 }
 
 resource "random_password" "control_plane_redis_auth_token" {
+  count = local.managed_control_plane_redis_enabled ? 1 : 0
+
   length  = 32
   special = false
 }
 
 resource "aws_ssm_parameter" "control_plane_redis_auth_token" {
+  count = local.managed_control_plane_redis_enabled ? 1 : 0
+
   name      = local.secret_parameter_names.control_plane_redis_auth_token
   type      = "SecureString"
   key_id    = data.aws_kms_alias.ssm.target_key_arn
   overwrite = true
-  value     = random_password.control_plane_redis_auth_token.result
+  value     = random_password.control_plane_redis_auth_token[0].result
 
   tags = local.tags
 }
 
 resource "aws_elasticache_replication_group" "control_plane" {
+  count = local.managed_control_plane_redis_enabled ? 1 : 0
+
   replication_group_id       = substr(replace(lower("${var.stack_name}-${terraform.workspace}-cp"), "_", "-"), 0, 40)
   description                = "burn_dragon_p2p shared operator/session state"
   engine                     = "redis"
@@ -1095,14 +1111,14 @@ resource "aws_elasticache_replication_group" "control_plane" {
   node_type                  = "cache.t4g.small"
   port                       = 6379
   parameter_group_name       = "default.redis7"
-  subnet_group_name          = aws_elasticache_subnet_group.control_plane.name
-  security_group_ids         = [aws_security_group.control_plane_redis.id]
+  subnet_group_name          = aws_elasticache_subnet_group.control_plane[0].name
+  security_group_ids         = [aws_security_group.control_plane_redis[0].id]
   automatic_failover_enabled = false
   multi_az_enabled           = false
   num_cache_clusters         = 1
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
-  auth_token                 = random_password.control_plane_redis_auth_token.result
+  auth_token                 = random_password.control_plane_redis_auth_token[0].result
   apply_immediately          = true
 
   tags = local.tags
@@ -1574,6 +1590,8 @@ resource "aws_s3_bucket_replication_configuration" "artifact" {
 }
 
 resource "aws_ebs_volume" "bootstrap_data" {
+  count = local.use_retained_bootstrap_data_volume ? 1 : 0
+
   availability_zone = aws_subnet.public.availability_zone
   size              = var.data_volume_size_gib
   type              = var.data_volume_type
@@ -1619,19 +1637,17 @@ resource "aws_instance" "bootstrap" {
     bootstrap_config_json                  = local.bootstrap_config_json
     bootstrap_data_device_name             = var.data_volume_device_name
     bootstrap_data_mount_path              = local.bootstrap_data_mount_path
-    bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_data.id
+    bootstrap_data_volume_id               = local.use_retained_bootstrap_data_volume ? aws_ebs_volume.bootstrap_data[0].id : ""
     bootstrap_crate_version                = var.bootstrap_crate_version
     bootstrap_git_ref                      = var.bootstrap_git_ref
     bootstrap_git_repo                     = var.bootstrap_git_repository
     bootstrap_install_source               = local.bootstrap_install_source
     bootstrap_node_role                    = "primary"
     caddyfile                              = local.caddyfile
-    control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token
-    control_plane_redis_endpoint           = aws_elasticache_replication_group.control_plane.primary_endpoint_address
-    control_plane_redis_port               = aws_elasticache_replication_group.control_plane.port
     authority_key_parameter_name           = local.secret_parameter_names.authority_key
     http_port                              = var.http_port
     secret_sync_script                     = local.secret_sync_script
+    use_retained_bootstrap_data_volume     = local.use_retained_bootstrap_data_volume
   })
 
   tags = merge(local.tags, {
@@ -1640,15 +1656,17 @@ resource "aws_instance" "bootstrap" {
 }
 
 resource "aws_volume_attachment" "bootstrap_data" {
+  count = local.use_retained_bootstrap_data_volume ? 1 : 0
+
   device_name = var.data_volume_device_name
-  volume_id   = aws_ebs_volume.bootstrap_data.id
+  volume_id   = aws_ebs_volume.bootstrap_data[0].id
   instance_id = aws_instance.bootstrap.id
 
   stop_instance_before_detaching = true
 }
 
 resource "aws_iam_role" "bootstrap_data_snapshot" {
-  count = var.enable_data_volume_snapshots ? 1 : 0
+  count = local.use_retained_bootstrap_data_volume && var.enable_data_volume_snapshots ? 1 : 0
 
   name = "${var.stack_name}-bootstrap-data-snapshot"
 
@@ -1669,14 +1687,14 @@ resource "aws_iam_role" "bootstrap_data_snapshot" {
 }
 
 resource "aws_iam_role_policy_attachment" "bootstrap_data_snapshot" {
-  count = var.enable_data_volume_snapshots ? 1 : 0
+  count = local.use_retained_bootstrap_data_volume && var.enable_data_volume_snapshots ? 1 : 0
 
   role       = aws_iam_role.bootstrap_data_snapshot[0].name
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
 }
 
 resource "aws_dlm_lifecycle_policy" "bootstrap_data" {
-  count = var.enable_data_volume_snapshots ? 1 : 0
+  count = local.use_retained_bootstrap_data_volume && var.enable_data_volume_snapshots ? 1 : 0
 
   description        = "${var.stack_name} retained bootstrap data volume snapshots"
   execution_role_arn = aws_iam_role.bootstrap_data_snapshot[0].arn
@@ -1772,7 +1790,7 @@ resource "aws_cloudwatch_metric_alarm" "bootstrap_status_check_failed_system" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "control_plane_redis_engine_cpu_high" {
-  count = var.enable_control_plane_operational_alarms ? 1 : 0
+  count = var.enable_control_plane_operational_alarms && local.managed_control_plane_redis_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-redis-engine-cpu-high"
   alarm_description   = "burn_dragon_p2p shared Redis EngineCPUUtilization is above the configured threshold"
@@ -1788,14 +1806,14 @@ resource "aws_cloudwatch_metric_alarm" "control_plane_redis_engine_cpu_high" {
   ok_actions          = local.cloudwatch_alarm_actions
 
   dimensions = {
-    ReplicationGroupId = aws_elasticache_replication_group.control_plane.replication_group_id
+    ReplicationGroupId = aws_elasticache_replication_group.control_plane[0].replication_group_id
   }
 
   tags = local.tags
 }
 
 resource "aws_cloudwatch_metric_alarm" "control_plane_redis_freeable_memory_low" {
-  count = var.enable_control_plane_operational_alarms ? 1 : 0
+  count = var.enable_control_plane_operational_alarms && local.managed_control_plane_redis_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-redis-freeable-memory-low"
   alarm_description   = "burn_dragon_p2p shared Redis freeable memory is below the configured threshold"
@@ -1811,7 +1829,7 @@ resource "aws_cloudwatch_metric_alarm" "control_plane_redis_freeable_memory_low"
   ok_actions          = local.cloudwatch_alarm_actions
 
   dimensions = {
-    ReplicationGroupId = aws_elasticache_replication_group.control_plane.replication_group_id
+    ReplicationGroupId = aws_elasticache_replication_group.control_plane[0].replication_group_id
   }
 
   tags = local.tags
@@ -1899,13 +1917,16 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
         width  = 24
         height = 3
         properties = {
-          markdown = join("\n", [
+          markdown = join("\n", concat([
             "# burn_dragon control plane",
             "- edge: https://${var.edge_domain_name}",
             "- dataset cdn: https://${local.dataset_domain_name}",
             "- artifact bucket: ${local.artifact_bucket_name}",
-            "- redis endpoint: ${aws_elasticache_replication_group.control_plane.primary_endpoint_address}",
-          ])
+            ], local.managed_control_plane_redis_enabled ? [
+            "- control-plane state backend: redis (${aws_elasticache_replication_group.control_plane[0].primary_endpoint_address})",
+            ] : [
+            "- control-plane state backend: local-file on bootstrap root volume",
+          ]))
         }
       },
       {
@@ -1947,6 +1968,27 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
       {
         type   = "metric"
         x      = 0
+        y      = 15
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Managed dataset CDN"
+          region  = var.aws_region
+          period  = 300
+          stat    = "Average"
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/CloudFront", "Requests", "DistributionId", aws_cloudfront_distribution.dataset.id, "Region", "Global", { label = "requests", stat = "Sum" }],
+            [".", "4xxErrorRate", ".", ".", ".", ".", { label = "4xx error rate %" }],
+            [".", "5xxErrorRate", ".", ".", ".", ".", { label = "5xx error rate %" }],
+          ]
+        }
+      },
+      ], local.managed_control_plane_redis_enabled ? [
+      {
+        type   = "metric"
+        x      = 0
         y      = 9
         width  = 12
         height = 6
@@ -1958,7 +2000,7 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
           view    = "timeSeries"
           stacked = false
           metrics = [
-            ["AWS/ElastiCache", "EngineCPUUtilization", "ReplicationGroupId", aws_elasticache_replication_group.control_plane.replication_group_id, { label = "engine cpu %" }],
+            ["AWS/ElastiCache", "EngineCPUUtilization", "ReplicationGroupId", aws_elasticache_replication_group.control_plane[0].replication_group_id, { label = "engine cpu %" }],
             [".", "CurrConnections", ".", ".", { label = "connections", yAxis = "right" }],
           ]
         }
@@ -1977,32 +2019,12 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
           view    = "timeSeries"
           stacked = false
           metrics = [
-            ["AWS/ElastiCache", "FreeableMemory", "ReplicationGroupId", aws_elasticache_replication_group.control_plane.replication_group_id, { label = "freeable memory bytes" }],
+            ["AWS/ElastiCache", "FreeableMemory", "ReplicationGroupId", aws_elasticache_replication_group.control_plane[0].replication_group_id, { label = "freeable memory bytes" }],
             [".", "Evictions", ".", ".", { label = "evictions", yAxis = "right" }],
           ]
         }
       },
-      {
-        type   = "metric"
-        x      = 0
-        y      = 15
-        width  = 12
-        height = 6
-        properties = {
-          title   = "Managed dataset CDN"
-          region  = var.aws_region
-          period  = 300
-          stat    = "Average"
-          view    = "timeSeries"
-          stacked = false
-          metrics = [
-            ["AWS/CloudFront", "Requests", "DistributionId", aws_cloudfront_distribution.dataset.id, "Region", "Global", { label = "requests", stat = "Sum" }],
-            [".", "4xxErrorRate", ".", ".", ".", ".", { label = "4xx error rate %" }],
-            [".", "5xxErrorRate", ".", ".", ".", ".", { label = "5xx error rate %" }],
-          ]
-        }
-      },
-      ], local.managed_trainer_enabled ? [
+      ] : [], local.managed_trainer_enabled ? [
       {
         type   = "metric"
         x      = 12

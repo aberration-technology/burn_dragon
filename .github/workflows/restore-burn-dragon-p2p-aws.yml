@@ -55,12 +55,12 @@ on:
         default: ""
         type: string
       restore_from_latest_snapshots:
-        description: "Automatically resolve the latest tagged bootstrap data snapshot in `source_snapshot_region` when an explicit snapshot id is not supplied."
+        description: "Automatically resolve the latest tagged bootstrap data snapshot in `source_snapshot_region` when an explicit snapshot id is not supplied. This is only relevant when retained bootstrap storage is enabled."
         required: true
         default: true
         type: boolean
       bootstrap_primary_restore_snapshot_id:
-        description: "Optional explicit EBS snapshot id for the bootstrap data volume. Example: `snap-0123456789abcdef0`. Leave empty to auto-resolve when `restore_from_latest_snapshots=true`."
+        description: "Optional explicit EBS snapshot id for the bootstrap data volume. Example: `snap-0123456789abcdef0`. Leave empty to auto-resolve when `restore_from_latest_snapshots=true`. Ignored when retained bootstrap storage is disabled."
         required: false
         default: ""
         type: string
@@ -187,6 +187,7 @@ jobs:
           instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
           root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
           data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
+          use_retained_bootstrap_data_volume="${{ vars.BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME }}"
           managed_trainer_desired_capacity="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY }}"
           managed_trainer_backend="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND }}"
           managed_trainer_experiment_kind="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}"
@@ -204,6 +205,7 @@ jobs:
           alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
           enable_control_plane_operational_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}"
           enable_control_plane_dashboard="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}"
+          enable_managed_control_plane_redis="${{ vars.BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS }}"
           create_artifact_bucket="${{ github.event.inputs.create_artifact_bucket }}"
           artifact_bucket_name="${{ github.event.inputs.artifact_bucket_name }}"
           artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
@@ -344,6 +346,12 @@ jobs:
           if [ -z "$managed_trainer_auth_bundle_parameter_name" ]; then
             managed_trainer_auth_bundle_parameter_name="/${stack_name}/${TF_WORKSPACE_NAME}/bootstrap/trainer_auth_bundle_json"
           fi
+          if [ -z "$use_retained_bootstrap_data_volume" ]; then
+            use_retained_bootstrap_data_volume="false"
+          fi
+          if [ -z "$enable_managed_control_plane_redis" ]; then
+            enable_managed_control_plane_redis="false"
+          fi
           managed_trainer_experiment_id="nca-prepretraining"
           managed_trainer_revision_id="nca-r1"
           if [ "$managed_trainer_experiment_kind" = "climbmix" ]; then
@@ -415,24 +423,28 @@ jobs:
             : "${resolved_auth_client_secret:?missing BURN_DRAGON_P2P_AUTH_CLIENT_SECRET secret}"
           fi
 
-          if [ "$restore_from_latest_snapshots" = "true" ]; then
-            if [ -z "$primary_restore_snapshot_id" ]; then
-              primary_restore_snapshot_id="$(aws ec2 describe-snapshots \
-                --region "$snapshot_search_region" \
-                --owner-ids self \
-                --filters \
-                  "Name=tag:Stack,Values=$stack_name" \
-                  "Name=tag:TerraformWorkspace,Values=$TF_WORKSPACE_NAME" \
-                  "Name=tag:NodeRole,Values=primary" \
-                  "Name=status,Values=completed" \
-                --query 'reverse(sort_by(Snapshots,&StartTime))[0].SnapshotId' \
-                --output text)"
+          if [ "$use_retained_bootstrap_data_volume" = "true" ]; then
+            if [ "$restore_from_latest_snapshots" = "true" ]; then
+              if [ -z "$primary_restore_snapshot_id" ]; then
+                primary_restore_snapshot_id="$(aws ec2 describe-snapshots \
+                  --region "$snapshot_search_region" \
+                  --owner-ids self \
+                  --filters \
+                    "Name=tag:Stack,Values=$stack_name" \
+                    "Name=tag:TerraformWorkspace,Values=$TF_WORKSPACE_NAME" \
+                    "Name=tag:NodeRole,Values=primary" \
+                    "Name=status,Values=completed" \
+                  --query 'reverse(sort_by(Snapshots,&StartTime))[0].SnapshotId' \
+                  --output text)"
+              fi
             fi
-          fi
 
-          if [ -z "$primary_restore_snapshot_id" ] || [ "$primary_restore_snapshot_id" = "None" ]; then
-            echo "missing bootstrap restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots" >&2
-            exit 1
+            if [ -z "$primary_restore_snapshot_id" ] || [ "$primary_restore_snapshot_id" = "None" ]; then
+              echo "missing bootstrap restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots" >&2
+              exit 1
+            fi
+          else
+            primary_restore_snapshot_id=""
           fi
 
           secret_parameter_prefix="/${stack_name}/${TF_WORKSPACE_NAME}/bootstrap"
@@ -478,7 +490,6 @@ jobs:
             echo "TF_VAR_dataset_domain_name=$dataset_domain_name"
             echo "TF_VAR_dataset_bucket_path_prefix=$dataset_bucket_path_prefix"
             echo "TF_VAR_create_artifact_replica_bucket=$create_artifact_replica_bucket"
-            echo "TF_VAR_bootstrap_primary_restore_snapshot_id=$primary_restore_snapshot_id"
             echo "AUTH_CONNECTOR_KIND=$auth_connector_kind"
           } >>"$GITHUB_ENV"
           {
@@ -514,6 +525,7 @@ jobs:
           if [ -n "$instance_type" ]; then echo "TF_VAR_instance_type=$instance_type" >>"$GITHUB_ENV"; fi
           if [ -n "$root_volume_size_gib" ]; then echo "TF_VAR_root_volume_size_gib=$root_volume_size_gib" >>"$GITHUB_ENV"; fi
           if [ -n "$data_volume_size_gib" ]; then echo "TF_VAR_data_volume_size_gib=$data_volume_size_gib" >>"$GITHUB_ENV"; fi
+          if [ -n "$use_retained_bootstrap_data_volume" ]; then echo "TF_VAR_use_retained_bootstrap_data_volume=$use_retained_bootstrap_data_volume" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_instance_type" ]; then echo "TF_VAR_managed_trainer_instance_type=$managed_trainer_instance_type" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_min_size" ]; then echo "TF_VAR_managed_trainer_min_size=$managed_trainer_min_size" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_max_size" ]; then echo "TF_VAR_managed_trainer_max_size=$managed_trainer_max_size" >>"$GITHUB_ENV"; fi
@@ -525,6 +537,7 @@ jobs:
           if [ -n "$alarm_sns_topic_arn" ]; then echo "TF_VAR_alarm_sns_topic_arn=$alarm_sns_topic_arn" >>"$GITHUB_ENV"; fi
           if [ -n "$enable_control_plane_operational_alarms" ]; then echo "TF_VAR_enable_control_plane_operational_alarms=$enable_control_plane_operational_alarms" >>"$GITHUB_ENV"; fi
           if [ -n "$enable_control_plane_dashboard" ]; then echo "TF_VAR_enable_control_plane_dashboard=$enable_control_plane_dashboard" >>"$GITHUB_ENV"; fi
+          if [ -n "$enable_managed_control_plane_redis" ]; then echo "TF_VAR_enable_managed_control_plane_redis=$enable_managed_control_plane_redis" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_bucket_name" ]; then echo "TF_VAR_artifact_bucket_name=$artifact_bucket_name" >>"$GITHUB_ENV"; fi
           if [ -n "$dataset_bucket_name" ]; then echo "TF_VAR_dataset_bucket_name=$dataset_bucket_name" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_bucket_path_prefix" ]; then echo "TF_VAR_artifact_bucket_path_prefix=$artifact_bucket_path_prefix" >>"$GITHUB_ENV"; fi
@@ -532,6 +545,7 @@ jobs:
           if [ -n "$artifact_bucket_force_destroy" ]; then echo "TF_VAR_artifact_bucket_force_destroy=$artifact_bucket_force_destroy" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_replica_bucket_force_destroy" ]; then echo "TF_VAR_artifact_replica_bucket_force_destroy=$artifact_replica_bucket_force_destroy" >>"$GITHUB_ENV"; fi
           if [ -n "$artifact_bucket_server_side_encryption" ]; then echo "TF_VAR_artifact_bucket_server_side_encryption=$artifact_bucket_server_side_encryption" >>"$GITHUB_ENV"; fi
+          if [ -n "$primary_restore_snapshot_id" ]; then echo "TF_VAR_bootstrap_primary_restore_snapshot_id=$primary_restore_snapshot_id" >>"$GITHUB_ENV"; fi
           if [ -n "$climbmix_dataset_base_url" ]; then echo "TF_VAR_climbmix_browser_dataset_base_url=$climbmix_dataset_base_url" >>"$GITHUB_ENV"; fi
           if [ -n "$next_disaster_recovery_region" ]; then echo "TF_VAR_disaster_recovery_region=$next_disaster_recovery_region" >>"$GITHUB_ENV"; fi
 
@@ -617,6 +631,8 @@ jobs:
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
+          control_plane_state_backend="$(terraform -chdir="$TF_ROOT" output -raw control_plane_state_backend)"
+          bootstrap_state_storage_mode="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_state_storage_mode)"
           control_plane_dashboard_name="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_name)"
           control_plane_dashboard_url="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_url)"
           artifact_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_name)"
@@ -638,6 +654,8 @@ jobs:
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "redis_endpoint=$redis_endpoint"
+            echo "control_plane_state_backend=$control_plane_state_backend"
+            echo "bootstrap_state_storage_mode=$bootstrap_state_storage_mode"
             echo "control_plane_dashboard_name=$control_plane_dashboard_name"
             echo "control_plane_dashboard_url=$control_plane_dashboard_url"
             echo "artifact_bucket_name=$artifact_bucket_name"
@@ -746,7 +764,8 @@ jobs:
           - Terraform workspace: \`${TF_WORKSPACE_NAME}\`
           - Target AWS region: \`${AWS_REGION}\`
           - Snapshot search region: \`${SNAPSHOT_SEARCH_REGION}\`
-          - Bootstrap restore snapshot: \`${PRIMARY_RESTORE_SNAPSHOT_ID}\`
+          - Bootstrap state storage: \`${TF_VAR_use_retained_bootstrap_data_volume:-false}\`
+          - Bootstrap restore snapshot: \`${PRIMARY_RESTORE_SNAPSHOT_ID:-disabled}\`
           - Plan only: \`${{ github.event.inputs.plan_only }}\`
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`
           - GitHub admin logins: \`${ADMIN_LOGINS_CSV:-n/a}\`
@@ -761,7 +780,9 @@ jobs:
           - Edge URL: ${{ steps.outputs.outputs.edge_url }}
           - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
-          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Bootstrap state storage mode: \`${{ steps.outputs.outputs.bootstrap_state_storage_mode }}\`
+          - Control-plane state backend: \`${{ steps.outputs.outputs.control_plane_state_backend }}\`
+          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint || 'local-file-backed' }}\`
           - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
           - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`

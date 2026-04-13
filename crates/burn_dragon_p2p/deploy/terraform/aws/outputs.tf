@@ -14,13 +14,18 @@ output "bootstrap_public_ip" {
 }
 
 output "bootstrap_data_volume_id" {
-  description = "Retained EBS volume id carrying bootstrap/auth/publication state."
-  value       = aws_ebs_volume.bootstrap_data.id
+  description = "Retained EBS volume id carrying bootstrap/auth/publication state. Empty when root-volume-only bootstrap storage is enabled."
+  value       = local.use_retained_bootstrap_data_volume ? aws_ebs_volume.bootstrap_data[0].id : ""
 }
 
 output "bootstrap_data_mount_path" {
-  description = "Mounted data path used for retained bootstrap/auth/publication state."
+  description = "Mounted data path used for bootstrap/auth/publication state."
   value       = local.bootstrap_data_mount_path
+}
+
+output "bootstrap_state_storage_mode" {
+  description = "Bootstrap local state storage mode."
+  value       = local.bootstrap_state_storage_mode
 }
 
 output "artifact_bucket_name" {
@@ -79,10 +84,14 @@ output "artifact_replica_bucket_uri" {
 }
 
 output "control_plane_redis_primary_endpoint" {
-  description = "Primary Redis endpoint backing shared operator and auth session state."
-  value       = aws_elasticache_replication_group.control_plane.primary_endpoint_address
+  description = "Primary Redis endpoint backing shared operator and auth session state. Empty when local file-backed control-plane state is enabled."
+  value       = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].primary_endpoint_address : ""
 }
 
+output "control_plane_state_backend" {
+  description = "Configured control-plane state backend."
+  value       = local.control_plane_state_backend
+}
 
 output "control_plane_dashboard_name" {
   description = "CloudWatch dashboard name for the Dragon control plane. Empty when dashboards are disabled."

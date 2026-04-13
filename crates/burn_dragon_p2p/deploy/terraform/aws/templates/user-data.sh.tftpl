@@ -54,7 +54,9 @@ BOOTSTRAP_AUTH_ROOT="${bootstrap_auth_root}"
 BOOTSTRAP_AUTHORITY_KEY_PATH="${bootstrap_auth_root}/bootstrap-authority.key"
 AUTHORITY_KEY_PARAMETER_NAME="${authority_key_parameter_name}"
 AWS_REGION="${aws_region}"
+USE_RETAINED_BOOTSTRAP_DATA_VOLUME="${use_retained_bootstrap_data_volume}"
 
+%{ if use_retained_bootstrap_data_volume ~}
 resolve_bootstrap_data_device() {
   local candidate
   local volume_id_no_dash="$${BOOTSTRAP_DATA_VOLUME_ID//-/}"
@@ -104,6 +106,7 @@ if ! grep -q "$${bootstrap_data_uuid} $${BOOTSTRAP_DATA_MOUNT_PATH} ext4" /etc/f
   echo "UUID=$${bootstrap_data_uuid} $${BOOTSTRAP_DATA_MOUNT_PATH} ext4 defaults,nofail,x-systemd.device-timeout=2min 0 2" >> /etc/fstab
 fi
 mountpoint -q "$${BOOTSTRAP_DATA_MOUNT_PATH}" || mount "$${BOOTSTRAP_DATA_MOUNT_PATH}"
+%{ endif ~}
 
 install -d -m 0755 /etc/burn-dragon-p2p
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"

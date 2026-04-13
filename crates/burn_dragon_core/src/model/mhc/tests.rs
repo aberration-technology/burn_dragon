@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use burn::module::Module;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, Tensor, TensorData};
@@ -23,11 +25,30 @@ struct MemorySnapshot {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn init_wgpu_runtime(device: &<WgpuBackend as Backend>::Device) {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(device, RuntimeOptions::default());
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
+    }
+    "unknown panic payload".to_owned()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn init_wgpu_runtime(device: &<WgpuBackend as Backend>::Device) -> Result<(), String> {
+    static INIT_FAILURE: OnceLock<Option<String>> = OnceLock::new();
+    let failure = INIT_FAILURE.get_or_init(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(device, RuntimeOptions::default());
+        }))
+        .err()
+        .map(panic_message)
     });
+    match failure {
+        Some(reason) => Err(reason.clone()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -516,7 +537,10 @@ fn mhc_passthrough_with_explicit_coefficients_matches_one_shot_path() {
 #[test]
 fn mhc_wgpu_passthrough_memory_stays_bounded_across_repeated_calls() {
     let device = <WgpuBackend as Backend>::Device::default();
-    init_wgpu_runtime(&device);
+    if let Err(reason) = init_wgpu_runtime(&device) {
+        eprintln!("skipping WGPU test without adapter: {reason}");
+        return;
+    }
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 4,
@@ -558,7 +582,10 @@ fn mhc_wgpu_passthrough_memory_stays_bounded_across_repeated_calls() {
 #[test]
 fn mhc_wgpu_width_and_depth_are_autodiff_stable_after_one_step() {
     let device = <WgpuAutodiffBackend as Backend>::Device::default();
-    init_wgpu_runtime(&device);
+    if let Err(reason) = init_wgpu_runtime(&device) {
+        eprintln!("skipping WGPU test without adapter: {reason}");
+        return;
+    }
 
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,

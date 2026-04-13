@@ -564,10 +564,8 @@ where
             residual_combine_ns,
         });
     }
-    if memory_prof_enabled {
-        if let Ok(mut profile) = lowrank_residual_memory_profile_state().lock() {
-            profile.calls = profile.calls.saturating_add(1);
-        }
+    if memory_prof_enabled && let Ok(mut profile) = lowrank_residual_memory_profile_state().lock() {
+        profile.calls = profile.calls.saturating_add(1);
     }
 
     LowRankResidualInternal {

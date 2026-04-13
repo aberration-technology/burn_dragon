@@ -212,7 +212,7 @@ impl MambaSequenceConfig {
             if self.headdim == 0 {
                 return Err(format!("headdim must be positive for {memory_system:?}"));
             }
-            if d_inner % self.headdim != 0 {
+            if !d_inner.is_multiple_of(self.headdim) {
                 return Err(format!(
                     "{memory_system:?} requires d_inner divisible by headdim (got d_inner={d_inner} headdim={})",
                     self.headdim
@@ -222,7 +222,7 @@ impl MambaSequenceConfig {
             if self.ngroups == 0 {
                 return Err(format!("ngroups must be positive for {memory_system:?}"));
             }
-            if nheads % self.ngroups != 0 {
+            if !nheads.is_multiple_of(self.ngroups) {
                 return Err(format!(
                     "{memory_system:?} requires nheads divisible by ngroups (got nheads={nheads} ngroups={})",
                     self.ngroups

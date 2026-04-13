@@ -342,7 +342,7 @@ fn dense_causal_attention_cube_runtime<R: CubeRuntime>(
         (batch * heads) as u32,
     );
 
-    let _ = dense_causal_attention_cube_kernel::launch::<R>(
+    dense_causal_attention_cube_kernel::launch::<R>(
         &client,
         cube_count,
         cube_dim,

@@ -271,7 +271,7 @@ impl<B: Backend> DragonModel<B> {
         for batch_idx in 0..batch {
             for time_idx in 0..time {
                 let mut stream_norms = vec![0.0f64; streams];
-                for stream_idx in 0..streams {
+                for (stream_idx, stream_norm) in stream_norms.iter_mut().enumerate().take(streams) {
                     let mut sum_sq = 0.0f64;
                     let base = ((batch_idx * streams + stream_idx) * time + time_idx) * dim;
                     for dim_idx in 0..dim {
@@ -279,7 +279,7 @@ impl<B: Backend> DragonModel<B> {
                         sum_sq += value * value;
                     }
                     let norm = sum_sq.sqrt();
-                    stream_norms[stream_idx] = norm;
+                    *stream_norm = norm;
                     stream_norm_sum += norm;
                     stream_norm_sq_sum += norm * norm;
                     stream_norm_count += 1;

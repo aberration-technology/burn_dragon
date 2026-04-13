@@ -549,9 +549,10 @@ impl ModuleDisplayDefault for YNeuronRecurrenceConfig {
 
 impl ModuleDisplay for YNeuronRecurrenceConfig {}
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LanguageHeadConfig {
+    #[default]
     StandardTokenClassification,
     NcaFactorizedPatch {
         state_count: usize,
@@ -561,12 +562,6 @@ pub enum LanguageHeadConfig {
         #[serde(default)]
         eos_id: Option<u32>,
     },
-}
-
-impl Default for LanguageHeadConfig {
-    fn default() -> Self {
-        Self::StandardTokenClassification
-    }
 }
 
 impl LanguageHeadConfig {
@@ -602,13 +597,13 @@ impl LanguageHeadConfig {
                         vocab_size
                     ));
                 }
-                if let Some(eos_id) = eos_id {
-                    if *eos_id as usize >= vocab_size {
-                        return Err(format!(
-                            "language_head.eos_id must be < vocab_size (got eos_id={} vocab_size={})",
-                            eos_id, vocab_size
-                        ));
-                    }
+                if let Some(eos_id) = eos_id
+                    && *eos_id as usize >= vocab_size
+                {
+                    return Err(format!(
+                        "language_head.eos_id must be < vocab_size (got eos_id={} vocab_size={})",
+                        eos_id, vocab_size
+                    ));
                 }
                 Ok(())
             }
@@ -721,12 +716,12 @@ impl DragonConfig {
     pub fn latent_per_head(&self) -> usize {
         let total = self.max_latent_total();
         assert!(
-            total % self.n_head == 0,
+            total.is_multiple_of(self.n_head),
             "latent size must be divisible by the number of heads"
         );
         let latent_per_head = total / self.n_head;
         assert!(
-            latent_per_head % self.n_expert == 0,
+            latent_per_head.is_multiple_of(self.n_expert),
             "latent per head {} must be divisible by experts {}",
             latent_per_head,
             self.n_expert
@@ -779,12 +774,12 @@ impl DragonConfig {
     pub fn latent_per_head_for_layer(&self, layer_idx: usize) -> usize {
         let total = self.latent_total_for_layer(layer_idx);
         assert!(
-            total % self.n_head == 0,
+            total.is_multiple_of(self.n_head),
             "layer latent size must be divisible by the number of heads"
         );
         let latent_per_head = total / self.n_head;
         assert!(
-            latent_per_head % self.n_expert == 0,
+            latent_per_head.is_multiple_of(self.n_expert),
             "layer latent per head {} must be divisible by experts {}",
             latent_per_head,
             self.n_expert
@@ -827,7 +822,7 @@ impl DragonConfig {
                     total, max_total
                 ));
             }
-            if total % quantum != 0 {
+            if !total.is_multiple_of(quantum) {
                 return Err(format!(
                     "model.latent_fanout_schedule.{label} must be divisible by lcm(n_embd, n_head*n_expert) (got total={} n_embd={} n_head={} n_expert={})",
                     total, self.n_embd, self.n_head, self.n_expert

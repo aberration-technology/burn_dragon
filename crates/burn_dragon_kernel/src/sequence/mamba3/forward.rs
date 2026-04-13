@@ -808,7 +808,7 @@ pub fn tensorized_mamba3_forward_custom_backward<B: BackendTrait>(
     }
     #[cfg(feature = "cuda")]
     {
-        return try_tensorized_mamba3_autodiff_cuda(
+        try_tensorized_mamba3_autodiff_cuda(
             hidden_states,
             d_inner,
             d_state,
@@ -828,7 +828,7 @@ pub fn tensorized_mamba3_forward_custom_backward<B: BackendTrait>(
             out_proj,
             state,
         )
-        .expect("mamba3 custom backward wrapper requires wgpu or cuda autodiff cube backend");
+        .expect("mamba3 custom backward wrapper requires wgpu or cuda autodiff cube backend")
     }
     #[cfg(not(feature = "cuda"))]
     {

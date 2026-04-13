@@ -315,6 +315,7 @@ impl<B: Backend> DragonModel<B> {
         updated
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn adapted_transferred_backbone(
         &self,
         fresh: &Self,

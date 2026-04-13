@@ -1245,7 +1245,7 @@ fn lowrank_grad_input_cube_runtime<R: CubeRuntime>(
         (shape.batch * shape.input_heads) as u32,
     );
 
-    let _ = lowrank_grad_input_cube_kernel::launch::<R>(
+    lowrank_grad_input_cube_kernel::launch::<R>(
         &client,
         cube_count,
         cube_dim,

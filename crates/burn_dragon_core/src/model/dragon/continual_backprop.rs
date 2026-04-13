@@ -76,7 +76,7 @@ impl SharedLowrankContinualBackpropRuntime {
 
     pub fn should_sample_step(&self) -> bool {
         let next_optimizer_step = self.optimizer_step.load(Ordering::Relaxed) + 1;
-        next_optimizer_step % self.sample_interval_steps == 0
+        next_optimizer_step.is_multiple_of(self.sample_interval_steps)
     }
 
     pub fn optimizer_step(&self) -> Arc<AtomicUsize> {
@@ -204,24 +204,28 @@ impl<B: Backend> DragonModel<B> {
         let mut outgoing_l1 = vec![0.0; latent_per_head];
 
         for head in 0..heads {
-            for local_idx in 0..latent_per_head {
+            for (local_idx, incoming_total) in
+                incoming_l1.iter_mut().enumerate().take(latent_per_head)
+            {
                 let mut incoming = 0.0f32;
                 for embd_idx in 0..embd {
                     let base = (head * embd + embd_idx) * latent_per_head + local_idx;
                     incoming += encoder[base].abs();
                     incoming += encoder_v[base].abs();
                 }
-                incoming_l1[local_idx] += incoming;
+                *incoming_total += incoming;
             }
         }
 
         let decoder_width = self.decoder.val().shape().dims::<2>()[1];
         for head in 0..heads {
-            for local_idx in 0..latent_per_head {
+            for (local_idx, outgoing_total) in
+                outgoing_l1.iter_mut().enumerate().take(latent_per_head)
+            {
                 let row = head * latent_per_head + local_idx;
                 let row_start = row * decoder_width;
                 let row_end = row_start + decoder_width;
-                outgoing_l1[local_idx] += decoder[row_start..row_end]
+                *outgoing_total += decoder[row_start..row_end]
                     .iter()
                     .map(|value| value.abs())
                     .sum::<f32>();

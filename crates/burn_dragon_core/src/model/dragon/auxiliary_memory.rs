@@ -167,7 +167,7 @@ impl<B: Backend> DragonModel<B> {
 
         if branch_time == 1
             && chunk_tokens > 1
-            && start_pos % chunk_tokens != 0
+            && !start_pos.is_multiple_of(chunk_tokens)
             && let Some(cached) = self.resolve_clocked_slow_hidden(
                 layer_state,
                 branch_batch,
@@ -255,7 +255,7 @@ impl<B: Backend> DragonModel<B> {
         let chunk_tokens = self.summary_memory.chunk_tokens.max(1);
         if branch_time == 1
             && chunk_tokens > 1
-            && start_pos % chunk_tokens != 0
+            && !start_pos.is_multiple_of(chunk_tokens)
             && let Some(cached) = self.resolve_summary_memory_hidden(
                 layer_state,
                 branch_batch,

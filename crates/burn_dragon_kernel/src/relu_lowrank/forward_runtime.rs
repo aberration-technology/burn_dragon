@@ -472,7 +472,7 @@ fn relu_lowrank_cube_runtime<R: CubeRuntime>(
         (shape.batch * shape.heads) as u32,
     );
 
-    let _ = relu_lowrank_cube_kernel::launch::<R>(
+    relu_lowrank_cube_kernel::launch::<R>(
         &client,
         cube_count,
         cube_dim,

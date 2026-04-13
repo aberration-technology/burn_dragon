@@ -218,13 +218,13 @@ impl<B: Backend> DragonModel<B> {
                         |values| self.norm.forward(values),
                     )
                 });
-            if should_capture_shared_lowrank_cbp {
-                if let (Some(runtime), Some(output)) =
+            if should_capture_shared_lowrank_cbp
+                && let (Some(runtime), Some(output)) =
                     (shared_lowrank_cbp_runtime.as_ref(), output.as_ref())
-                {
-                    runtime.record_y_neuron_stats(output.y_neuron.clone());
-                }
+            {
+                runtime.record_y_neuron_stats(output.y_neuron.clone());
             }
+            #[allow(unused_variables)]
             let branch_out = if let Some(output) = output.as_ref() {
                 output
                     .next
@@ -362,6 +362,7 @@ impl<B: Backend> DragonModel<B> {
         pipeline_state
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_hidden_with_state_from_embedded_single_pass_layer_limit(
         &self,
         embedded: Tensor<B, 3>,

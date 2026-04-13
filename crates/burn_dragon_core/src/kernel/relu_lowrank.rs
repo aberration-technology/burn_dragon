@@ -185,6 +185,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use burn::tensor::{TensorData, backend::Backend as BackendTrait};
     use burn_ndarray::NdArray;
@@ -256,6 +258,17 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            return (*message).to_owned();
+        }
+        "unknown panic payload".to_owned()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn fused_forward_routes_to_wgpu_kernel_when_supported() {
         use burn::tensor::Distribution;
@@ -263,11 +276,21 @@ mod tests {
 
         type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
-        static INIT: std::sync::Once = std::sync::Once::new();
+        static INIT_FAILURE: OnceLock<Option<String>> = OnceLock::new();
         let device = <Backend as BackendTrait>::Device::default();
-        INIT.call_once(|| {
-            burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(&device, RuntimeOptions::default());
-        });
+        if let Some(reason) = INIT_FAILURE.get_or_init(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(
+                    &device,
+                    RuntimeOptions::default(),
+                );
+            }))
+            .err()
+            .map(panic_message)
+        }) {
+            eprintln!("skipping WGPU fused-forward route test without adapter: {reason}");
+            return;
+        }
 
         let input = Tensor::<Backend, 4>::random([2, 1, 11, 16], Distribution::Default, &device);
         let weight = Tensor::<Backend, 4>::random([1, 4, 16, 12], Distribution::Default, &device);

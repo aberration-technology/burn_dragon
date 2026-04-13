@@ -227,10 +227,10 @@ impl NcaFactorizedHeadTables {
             special_token_ids.push(patch_vocab_size as u32);
             special_token_ids.push((patch_vocab_size + 1) as u32);
         }
-        if let Some(eos_id) = eos_id {
-            if !special_token_ids.contains(eos_id) {
-                special_token_ids.push(*eos_id);
-            }
+        if let Some(eos_id) = eos_id
+            && !special_token_ids.contains(eos_id)
+        {
+            special_token_ids.push(*eos_id);
         }
 
         let mut patch_digit_tables = vec![vec![0i64; vocab_size]; patch_cells];

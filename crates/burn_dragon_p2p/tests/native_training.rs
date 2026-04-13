@@ -26,11 +26,11 @@ use burn_dragon_p2p::native::{
 use burn_dragon_p2p::profile::{DragonBrowserProfileTokenSource, DragonExperimentProfile};
 use burn_p2p::burn::{BurnShardedDataset, BurnShardedDatasetConfig, BurnWorkload};
 use burn_p2p::{
-    AuthConfig, AuthProvider, BrowserMode, CallbackPayload, ContentId, EdgePeerEnrollmentRequest,
-    ExperimentDirectoryEntry, ExperimentScope, HeadDescriptor, LeaseId, LoginRequest, MetricValue,
-    MicroShardId, NodeCertificate, NodeCertificateClaims, PeerId, PeerRole, PeerRoleSet,
-    PrincipalClaims, PrincipalId, PrincipalSession, ProjectFamilyId, RevocationEpoch, ShardCache,
-    WindowCtx, WindowId, WorkloadInputSource, WorkloadTrainingLease,
+    AuthConfig, AuthProvider, BrowserMode, CallbackPayload, ClientPlatform, ContentId,
+    EdgePeerEnrollmentRequest, ExperimentDirectoryEntry, ExperimentScope, HeadDescriptor, LeaseId,
+    LoginRequest, MetricValue, MicroShardId, NodeCertificate, NodeCertificateClaims, PeerId,
+    PeerRole, PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession, ProjectFamilyId,
+    RevocationEpoch, ShardCache, WindowCtx, WindowId, WorkloadInputSource, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
     BrowserConformanceHarness, BrowserDirectorySnapshot, BrowserEdgeClient, BrowserEdgeMode,
@@ -323,6 +323,13 @@ fn native_swarm_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn loopback_swarm_address() -> burn_p2p::SwarmAddress {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("loopback addr").port();
+    drop(listener);
+    burn_p2p::SwarmAddress::new(format!("/ip4/127.0.0.1/tcp/{port}")).expect("swarm address")
 }
 
 fn log_loss_series(label: &str, losses: &[f64]) {
@@ -1886,6 +1893,370 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
     shutdown_runtime_peer(trainer_a, "trainer a");
     shutdown_runtime_peer(trainer_b, "trainer b");
     shutdown_runtime_peer(validator, "validator");
+}
+
+#[test]
+fn nca_bootstrap_only_topology_supports_explicit_separate_validator_role() {
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train.toml");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+    );
+
+    let bootstrap_roles = burn_p2p_bootstrap::BootstrapPreset::BootstrapOnly.roles();
+    let bootstrap_services = burn_p2p_bootstrap::BootstrapPreset::BootstrapOnly.services();
+    assert!(bootstrap_roles.contains(&PeerRole::Bootstrap));
+    assert!(bootstrap_roles.contains(&PeerRole::RelayHelper));
+    assert!(!bootstrap_roles.contains(&PeerRole::Validator));
+    assert!(!bootstrap_services.contains(&burn_p2p_bootstrap::BootstrapService::Validator));
+
+    let bootstrap_addr = loopback_swarm_address();
+    let validator_config = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join("storage-validator-bootstrap-only"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Validator),
+        identity: Default::default(),
+        bootstrap_peers: vec![bootstrap_addr.clone()],
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        git_commit: Some("bootstrap-only-validator".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: DragonCapabilityPolicy {
+            allow_native_validator_fallback: false,
+            ..Default::default()
+        },
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join("validator-shards-bootstrap-only"),
+            dataset_name: Some("dragon-nca-bootstrap-only-validator".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let validator_prepared =
+        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
+    assert_eq!(
+        validator_prepared.target_decision.effective_target,
+        DragonNativeTarget::Validator
+    );
+    assert!(!validator_prepared.target_decision.can_train);
+
+    let trainer_config = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join("storage-trainer-bootstrap-only"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: vec![bootstrap_addr],
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        git_commit: Some("bootstrap-only-trainer".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join("trainer-shards-bootstrap-only"),
+            dataset_name: Some("dragon-nca-bootstrap-only-trainer".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let trainer_prepared =
+        prepare_nca_native_cpu(&trainer_config, Some(&dummy_auth_bundle())).expect("trainer");
+    assert_eq!(
+        trainer_prepared.target_decision.effective_target,
+        DragonNativeTarget::Trainer
+    );
+    assert!(trainer_prepared.target_decision.can_train);
+}
+
+#[test]
+#[ignore = "manual e2e; upstream libp2p-request-response debug assert can panic during multi-peer native runtime runs"]
+fn nca_bootstrap_only_topology_uses_separate_validator_for_canonical_promotion() {
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let bootstrap_storage = tempdir().expect("bootstrap storage");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train.toml");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+    );
+
+    let bootstrap_addr = loopback_swarm_address();
+    let bootstrap_plan = burn_p2p_bootstrap::BootstrapSpec {
+        preset: burn_p2p_bootstrap::BootstrapPreset::BootstrapOnly,
+        genesis: burn_p2p_core::GenesisSpec {
+            network_id: burn_p2p_core::NetworkId::new("dragon-p2p-testnet"),
+            protocol_version: Version::new(0, 1, 0),
+            display_name: "dragon bootstrap-only topology".into(),
+            created_at: Utc::now(),
+            metadata: BTreeMap::new(),
+        },
+        platform: ClientPlatform::Native,
+        bootstrap_addresses: Vec::new(),
+        listen_addresses: vec![bootstrap_addr.clone()],
+        authority: None,
+        archive: burn_p2p_bootstrap::ArchivePlan::default(),
+        admin_api: burn_p2p_bootstrap::AdminApiPlan::default(),
+    }
+    .plan()
+    .expect("bootstrap plan");
+    let bootstrap = bootstrap_plan
+        .spawn_bootstrap_peer_daemon(burn_p2p_bootstrap::BootstrapPeerDaemonConfig {
+            node: burn_p2p::NodeConfig {
+                identity: burn_p2p::IdentityConfig::Persistent,
+                storage: Some(burn_p2p::StorageConfig::new(bootstrap_storage.path())),
+                dataset: None,
+                auth: None,
+                network_manifest: None,
+                client_release_manifest: None,
+                selected_workload_id: None,
+                metrics_retention: burn_p2p::MetricsRetentionConfig::default(),
+                bootstrap_peers: Vec::new(),
+                listen_addresses: vec![bootstrap_addr.clone()],
+            },
+        })
+        .expect("spawn bootstrap peer daemon");
+    let bootstrap_telemetry = bootstrap.telemetry();
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            let snapshot = bootstrap_telemetry.snapshot();
+            snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty()
+        },
+        "bootstrap-only peer daemon did not start",
+    );
+    let bootstrap_snapshot = bootstrap_telemetry.snapshot();
+    assert!(
+        bootstrap_snapshot
+            .configured_roles
+            .contains(&PeerRole::Bootstrap)
+    );
+    assert!(
+        bootstrap_snapshot
+            .configured_roles
+            .contains(&PeerRole::RelayHelper)
+    );
+    assert!(
+        !bootstrap_snapshot
+            .configured_roles
+            .contains(&PeerRole::Validator)
+    );
+
+    let validator_config = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join("storage-validator-bootstrap-only"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Validator),
+        identity: Default::default(),
+        bootstrap_peers: vec![bootstrap_addr.clone()],
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        git_commit: Some("bootstrap-only-validator".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: DragonCapabilityPolicy {
+            allow_native_validator_fallback: false,
+            ..Default::default()
+        },
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join("validator-shards-bootstrap-only"),
+            dataset_name: Some("dragon-nca-bootstrap-only-validator".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let validator_prepared =
+        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
+    assert_eq!(
+        validator_prepared.target_decision.effective_target,
+        DragonNativeTarget::Validator
+    );
+    assert!(!validator_prepared.target_decision.can_train);
+    let experiment_entry = validator_prepared.manifests.experiment_directory[0].clone();
+    let mut validator = spawn_prepared_native_peer(validator_prepared).expect("spawn validator");
+    let validator_telemetry = validator.telemetry();
+    let experiment = validator.mainnet().experiment(
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
+    );
+
+    let trainer_config = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path.clone()],
+        storage_root: root.path().join("storage-trainer-bootstrap-only"),
+        network: Default::default(),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: vec![bootstrap_addr.clone()],
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        git_commit: Some("bootstrap-only-trainer".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: root.path().join("trainer-shards-bootstrap-only"),
+            dataset_name: Some("dragon-nca-bootstrap-only-trainer".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let trainer_prepared =
+        prepare_nca_native_cpu(&trainer_config, Some(&dummy_auth_bundle())).expect("trainer");
+    assert_eq!(
+        trainer_prepared.target_decision.effective_target,
+        DragonNativeTarget::Trainer
+    );
+    assert!(trainer_prepared.target_decision.can_train);
+    let mut trainer = spawn_prepared_native_peer(trainer_prepared).expect("spawn trainer");
+    let trainer_telemetry = trainer.telemetry();
+
+    wait_for(
+        Duration::from_secs(20),
+        || bootstrap_telemetry.snapshot().connected_peers >= 2,
+        "bootstrap-only peer did not connect to both validator and trainer",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || validator_telemetry.snapshot().connected_peers >= 1,
+        "validator did not connect through bootstrap-only peer",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || trainer_telemetry.snapshot().connected_peers >= 1,
+        "trainer did not connect through bootstrap-only peer",
+    );
+
+    let genesis_head = validator
+        .initialize_local_head(&experiment)
+        .expect("initialize validator genesis head");
+    validator
+        .publish_head_provider(&experiment, &genesis_head)
+        .expect("publish validator genesis head provider");
+    validator
+        .publish_artifact_from_store(&genesis_head.artifact_id)
+        .expect("publish validator genesis artifact");
+
+    wait_for(
+        Duration::from_secs(30),
+        || {
+            trainer
+                .sync_experiment_head(&experiment)
+                .expect("sync trainer genesis head")
+                .as_ref()
+                .is_some_and(|head| head.head_id == genesis_head.head_id)
+        },
+        "trainer did not sync the validator genesis head through the bootstrap-only peer",
+    );
+
+    let training = trainer
+        .train_window_once_with_pinned_head(&experiment, Some(&genesis_head))
+        .expect("trainer window");
+    assert_eq!(
+        training.head.parent_head_id,
+        Some(genesis_head.head_id.clone())
+    );
+    trainer
+        .publish_head_provider(&experiment, &training.head)
+        .expect("publish trainer head provider");
+    trainer
+        .publish_artifact_from_store(&training.artifact.artifact_id)
+        .expect("publish trainer delta artifact");
+    if training.head.artifact_id != training.artifact.artifact_id {
+        trainer
+            .publish_artifact_from_store(&training.head.artifact_id)
+            .expect("publish trainer head artifact");
+    }
+    trainer
+        .republish_training_window_control_plane(
+            &experiment,
+            training.lease.window_id,
+            &training.contribution.base_head_id,
+            &training.artifact.artifact_id,
+        )
+        .expect("republish trainer control plane");
+
+    wait_for(
+        Duration::from_secs(30),
+        || {
+            validator_telemetry
+                .snapshot()
+                .control_plane
+                .update_announcements
+                .iter()
+                .any(|announcement| {
+                    announcement.update.delta_artifact_id == training.artifact.artifact_id
+                })
+        },
+        "validator did not observe the trainer update through the bootstrap-only peer",
+    );
+
+    let validation_deadline = Instant::now() + Duration::from_secs(30);
+    let merged = loop {
+        match validator.validate_candidates_once(&experiment) {
+            Ok(Some(outcome)) => break outcome,
+            Ok(None) => {}
+            Err(error) => panic!("validator promotion failed: {error:#}"),
+        }
+        assert!(
+            Instant::now() < validation_deadline,
+            "validator did not promote a canonical head in the bootstrap-only topology"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        merged.merged_head.parent_head_id,
+        Some(genesis_head.head_id.clone())
+    );
+    assert!(merged.merged_head.global_step > genesis_head.global_step);
+    validator
+        .publish_head_provider(&experiment, &merged.merged_head)
+        .expect("publish merged head provider");
+    validator
+        .publish_artifact_from_store(&merged.merged_head.artifact_id)
+        .expect("publish merged head artifact");
+
+    wait_for(
+        Duration::from_secs(30),
+        || {
+            trainer
+                .sync_experiment_head(&experiment)
+                .expect("sync trainer merged head")
+                .as_ref()
+                .is_some_and(|head| head.head_id == merged.merged_head.head_id)
+        },
+        "trainer did not sync the promoted canonical head",
+    );
+    assert!(
+        !bootstrap_telemetry
+            .snapshot()
+            .configured_roles
+            .contains(&PeerRole::Validator)
+    );
+
+    shutdown_runtime_peer(trainer, "bootstrap-only trainer");
+    shutdown_runtime_peer(validator, "bootstrap-only validator");
+    bootstrap
+        .shutdown()
+        .expect("bootstrap-only peer daemon shutdown");
+    bootstrap
+        .await_termination()
+        .expect("bootstrap-only peer daemon termination");
 }
 
 fn shutdown_runtime_peer<B>(peer: ManagedRunningNativePeer<B>, label: &str)

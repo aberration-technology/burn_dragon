@@ -528,6 +528,53 @@ variable "managed_trainer_auth_bundle_parameter_name" {
   default     = ""
 }
 
+variable "managed_validator_enabled" {
+  description = "Whether Terraform should provision a single managed native validator instance for canonical promotion. This validator is CPU-only, runs no training loop, and performs validation/promotion work separately from the bootstrap edge."
+  type        = bool
+  default     = true
+}
+
+variable "managed_validator_instance_type" {
+  description = "EC2 instance type used by the managed native validator instance. Keep this small and CPU-only unless validation pressure proves otherwise."
+  type        = string
+  default     = "t3a.small"
+}
+
+variable "managed_validator_root_volume_size_gib" {
+  description = "Root EBS volume size for the managed native validator instance."
+  type        = number
+  default     = 32
+}
+
+variable "managed_validator_experiment_kind" {
+  description = "Experiment kind assigned to the managed validator instance. Supported values: nca, climbmix."
+  type        = string
+  default     = "nca"
+
+  validation {
+    condition     = contains(["nca", "climbmix"], lower(trimspace(var.managed_validator_experiment_kind)))
+    error_message = "managed_validator_experiment_kind must be one of: nca, climbmix."
+  }
+}
+
+variable "managed_validator_crate_version" {
+  description = "Published burn_dragon_p2p crate version installed on the managed validator instance."
+  type        = string
+  default     = "0.21.0-pre.13"
+}
+
+variable "managed_validator_auth_bundle_parameter_name" {
+  description = "Optional SSM parameter name containing the JSON auth bundle used by the managed validator instance. Leave empty to derive a standard name under secret_parameter_prefix."
+  type        = string
+  default     = ""
+}
+
+variable "managed_validator_validation_interval_millis" {
+  description = "Validation loop interval for the managed validator instance. Lower values promote canonicals more aggressively at the cost of more CPU churn."
+  type        = number
+  default     = 250
+}
+
 variable "ssh_cidr_blocks" {
   description = "Optional SSH ingress CIDRs. Leave empty to rely on SSM/sessionless operation."
   type        = list(string)

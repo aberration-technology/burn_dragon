@@ -76,6 +76,7 @@ locals {
     authority_key                  = "${var.secret_parameter_prefix}/authority_key"
     control_plane_redis_auth_token = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
     trainer_auth_bundle            = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
+    validator_auth_bundle          = "${var.secret_parameter_prefix}/validator_auth_bundle_json"
   }
   bootstrap_primary_private_ip = "10.42.1.10"
   bootstrap_peer_internal_multiaddrs = [
@@ -189,6 +190,14 @@ locals {
     "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
     "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
   ]
+  managed_validator_enabled                    = var.managed_validator_enabled
+  managed_validator_experiment_kind            = lower(trimspace(var.managed_validator_experiment_kind))
+  managed_validator_features                   = "native"
+  managed_validator_enabled_features_label     = local.managed_validator_features
+  managed_validator_experiment_id              = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
+  managed_validator_revision_id                = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_validator_auth_bundle_parameter_name = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
+  managed_validator_seed_node_urls             = local.managed_trainer_seed_node_urls
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"
@@ -1045,6 +1054,153 @@ resource "aws_autoscaling_group" "managed_trainer" {
     value               = "managed-trainer"
     propagate_at_launch = true
   }
+}
+
+resource "aws_security_group" "managed_validator" {
+  count       = local.managed_validator_enabled ? 1 : 0
+  name        = "${var.stack_name}-managed-validator"
+  description = "burn_dragon_p2p managed native validator"
+  vpc_id      = aws_vpc.bootstrap.id
+
+  ingress {
+    from_port   = var.p2p_port
+    to_port     = var.p2p_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = var.p2p_port
+    to_port     = var.p2p_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  dynamic "ingress" {
+    for_each = var.ssh_cidr_blocks
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-managed-validator"
+  })
+}
+
+resource "aws_iam_role" "managed_validator" {
+  count = local.managed_validator_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-validator"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      },
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "managed_validator_ssm_managed_core" {
+  count      = local.managed_validator_enabled ? 1 : 0
+  role       = aws_iam_role.managed_validator[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "managed_validator_secret_access" {
+  count = local.managed_validator_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-validator-secret-access"
+  role  = aws_iam_role.managed_validator[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+        ]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.managed_validator_auth_bundle_parameter_name}",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+        ]
+        Resource = [data.aws_kms_alias.ssm.target_key_arn]
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "managed_validator" {
+  count = local.managed_validator_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-validator"
+  role  = aws_iam_role.managed_validator[0].name
+}
+
+resource "aws_instance" "managed_validator" {
+  count                  = local.managed_validator_enabled ? 1 : 0
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.managed_validator_instance_type
+  subnet_id              = aws_subnet.public.id
+  iam_instance_profile   = aws_iam_instance_profile.managed_validator[0].name
+  vpc_security_group_ids = [aws_security_group.managed_validator[0].id]
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  root_block_device {
+    volume_size           = var.managed_validator_root_volume_size_gib
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  user_data = templatefile("${path.module}/templates/validator-user-data.sh.tftpl", {
+    aws_region                           = var.aws_region
+    dragon_crate_version                 = var.managed_validator_crate_version
+    validator_backend                    = "cpu"
+    validator_features                   = local.managed_validator_features
+    validator_enabled_features_label     = local.managed_validator_enabled_features_label
+    validator_edge_base_url              = "https://${var.edge_domain_name}"
+    validator_seed_node_urls             = local.managed_validator_seed_node_urls
+    validator_project_family_id          = var.project_family_id
+    validator_network_id                 = var.network_id
+    validator_study_id                   = var.study_id
+    validator_experiment_id              = local.managed_validator_experiment_id
+    validator_revision_id                = local.managed_validator_revision_id
+    validator_experiment_kind            = local.managed_validator_experiment_kind
+    validator_auth_bundle_parameter_name = local.managed_validator_auth_bundle_parameter_name
+    validator_validation_interval_millis = var.managed_validator_validation_interval_millis
+  })
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-managed-validator"
+    Role = "managed-validator"
+  })
 }
 
 resource "aws_security_group" "control_plane_redis" {

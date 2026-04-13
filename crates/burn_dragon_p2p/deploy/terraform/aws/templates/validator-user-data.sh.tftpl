@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y --no-install-recommends \
+  awscli \
+  build-essential \
+  ca-certificates \
+  curl \
+  jq \
+  pkg-config \
+  libssl-dev \
+  python3
+
+if [ ! -x /root/.cargo/bin/cargo ]; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+fi
+
+source /root/.cargo/env
+
+cargo install \
+  --locked \
+  burn_dragon_p2p \
+  --version "${dragon_crate_version}" \
+  --bin burn_dragon_p2p_native \
+  --no-default-features \
+  --features "${validator_features}"
+
+install -d -m 0755 /usr/local/bin
+ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native
+
+install -d -m 0755 /etc/burn_dragon_p2p
+install -d -m 0700 /var/lib/burn_dragon_p2p
+install -d -m 0755 /var/lib/burn_dragon_p2p/storage
+
+cat >/usr/local/bin/burn-dragon-p2p-fetch-validator-auth-bundle <<'EOF_AUTH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+install -d -m 0700 /var/lib/burn_dragon_p2p
+for attempt in $(seq 1 60); do
+  if aws ssm get-parameter \
+    --region "${aws_region}" \
+    --with-decryption \
+    --name "${validator_auth_bundle_parameter_name}" \
+    --query 'Parameter.Value' \
+    --output text >/var/lib/burn_dragon_p2p/auth-bundle.json; then
+    chmod 0600 /var/lib/burn_dragon_p2p/auth-bundle.json
+    exit 0
+  fi
+  sleep 10
+done
+
+echo "validator auth bundle did not appear in SSM parameter store: ${validator_auth_bundle_parameter_name}" >&2
+exit 1
+EOF_AUTH
+chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-validator-auth-bundle
+
+cat >/etc/burn_dragon_p2p/native-validator.toml <<'EOF_CONFIG'
+training_config_paths = []
+storage_root = "/var/lib/burn_dragon_p2p/storage"
+target = "validator"
+app_semver = "${dragon_crate_version}"
+enabled_features_label = "${validator_enabled_features_label}"
+
+[network]
+edge_base_url = "${validator_edge_base_url}"
+seed_node_urls = [
+%{ for url in validator_seed_node_urls ~}
+  "${url}",
+%{ endfor ~}
+]
+
+[manifest]
+project_family_id = "${validator_project_family_id}"
+network_id = "${validator_network_id}"
+study_id = "${validator_study_id}"
+experiment_id = "${validator_experiment_id}"
+revision_id = "${validator_revision_id}"
+display_name = "burn_dragon managed ${validator_experiment_kind} validator"
+description = "Managed burn_dragon ${validator_experiment_kind} canonical promotion validator"
+protocol_major = 0
+authority_public_keys = []
+bootstrap_addrs = []
+
+[capability_policy]
+allow_native_validator_fallback = false
+EOF_CONFIG
+
+cat >/etc/systemd/system/burn-dragon-p2p-validator.service <<'EOF_SERVICE'
+[Unit]
+Description=burn_dragon_p2p managed validator daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/burn_dragon_p2p
+Environment=RUST_LOG=info
+ExecStartPre=/usr/local/bin/burn-dragon-p2p-fetch-validator-auth-bundle
+ExecStart=/usr/local/bin/burn_dragon_p2p_native run-validator-daemon \
+  --config /etc/burn_dragon_p2p/native-validator.toml \
+  --experiment-kind ${validator_experiment_kind} \
+  --backend ${validator_backend} \
+  --validation-interval-millis ${validator_validation_interval_millis} \
+  --auth-bundle /var/lib/burn_dragon_p2p/auth-bundle.json
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+systemctl daemon-reload
+systemctl enable burn-dragon-p2p-validator
+systemctl start burn-dragon-p2p-validator

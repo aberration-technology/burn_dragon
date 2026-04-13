@@ -138,6 +138,7 @@ jobs:
       GITHUB_CLIENT_ID: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_ID }}
       GITHUB_CLIENT_SECRET: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET }}
       TRAINER_AUTH_BUNDLE_JSON: ${{ secrets.BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON }}
+      VALIDATOR_AUTH_BUNDLE_JSON: ${{ secrets.BURN_DRAGON_P2P_VALIDATOR_AUTH_BUNDLE_JSON }}
 
     steps:
       - name: checkout repository
@@ -216,6 +217,13 @@ jobs:
           managed_trainer_target="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}"
           managed_trainer_crate_version="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION }}"
           managed_trainer_auth_bundle_parameter_name="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME }}"
+          managed_validator_enabled="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_ENABLED }}"
+          managed_validator_experiment_kind="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_EXPERIMENT_KIND }}"
+          managed_validator_instance_type="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_INSTANCE_TYPE }}"
+          managed_validator_root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_ROOT_VOLUME_SIZE_GIB }}"
+          managed_validator_crate_version="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_CRATE_VERSION }}"
+          managed_validator_auth_bundle_parameter_name="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_AUTH_BUNDLE_PARAMETER_NAME }}"
+          managed_validator_validation_interval_millis="${{ vars.BURN_DRAGON_P2P_MANAGED_VALIDATOR_VALIDATION_INTERVAL_MILLIS }}"
           enable_data_volume_snapshots="${{ vars.BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS }}"
           data_volume_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}"
           enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
@@ -430,6 +438,42 @@ jobs:
             fi
           fi
 
+          if [ -z "$managed_validator_enabled" ]; then
+            managed_validator_enabled="true"
+          fi
+          managed_validator_enabled="$(printf '%s' "$managed_validator_enabled" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ -z "$managed_validator_experiment_kind" ]; then
+            managed_validator_experiment_kind="nca"
+          fi
+          managed_validator_experiment_kind="$(printf '%s' "$managed_validator_experiment_kind" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ -z "$managed_validator_crate_version" ]; then
+            managed_validator_crate_version="0.21.0-pre.13"
+          fi
+          if [ -z "$managed_validator_auth_bundle_parameter_name" ]; then
+            managed_validator_auth_bundle_parameter_name="${secret_parameter_prefix}/validator_auth_bundle_json"
+          fi
+          if [ -z "$managed_validator_validation_interval_millis" ]; then
+            managed_validator_validation_interval_millis="250"
+          fi
+          managed_validator_experiment_id="nca-prepretraining"
+          managed_validator_revision_id="nca-r1"
+          if [ "$managed_validator_experiment_kind" = "climbmix" ]; then
+            managed_validator_experiment_id="climbmix-pretraining"
+            managed_validator_revision_id="climbmix-r1"
+          fi
+          managed_validator_auth_mode="disabled"
+          managed_validator_principal_id=""
+          if [ "$managed_validator_enabled" = "true" ]; then
+            managed_validator_principal_suffix="$(printf '%s-%s' "$TF_WORKSPACE_NAME" "$managed_validator_experiment_kind" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
+            managed_validator_principal_id="managed-validator-${managed_validator_principal_suffix%-}"
+            if [ -n "$VALIDATOR_AUTH_BUNDLE_JSON" ]; then
+              managed_validator_auth_mode="provided_bundle"
+            else
+              managed_validator_auth_mode="bootstrap_static_principal"
+              auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; stack_name = sys.argv[5]; environment = sys.argv[6]; principal = {"principal_id": principal_id, "display_name": f"burn_dragon managed {experiment_id} validator", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": ["Validator", "Archive"]}, "granted_scopes": ["Connect", "Discover", {"Validate": {"experiment_id": experiment_id}}, {"Archive": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "managed_validator": "true", "managed_validator_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$managed_validator_principal_id" "$managed_validator_experiment_id" "$network_id" "$stack_name" "$DEPLOY_ENVIRONMENT")"
+            fi
+          fi
+
           create_artifact_bucket="$create_artifact_bucket_input"
           artifact_bucket_name="$artifact_bucket_name_input"
           if [ -z "$artifact_bucket_name" ]; then
@@ -527,6 +571,11 @@ jobs:
             echo "TF_VAR_managed_trainer_target=$managed_trainer_target"
             echo "TF_VAR_managed_trainer_crate_version=$managed_trainer_crate_version"
             echo "TF_VAR_managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
+            echo "TF_VAR_managed_validator_enabled=$managed_validator_enabled"
+            echo "TF_VAR_managed_validator_experiment_kind=$managed_validator_experiment_kind"
+            echo "TF_VAR_managed_validator_crate_version=$managed_validator_crate_version"
+            echo "TF_VAR_managed_validator_auth_bundle_parameter_name=$managed_validator_auth_bundle_parameter_name"
+            echo "TF_VAR_managed_validator_validation_interval_millis=$managed_validator_validation_interval_millis"
             echo "TF_VAR_native_target_artifact_hash=$native_target_artifact_hash"
             echo "TF_VAR_create_artifact_replica_bucket=$create_artifact_replica_bucket"
             echo "AUTH_CONNECTOR_KIND=$auth_connector_kind"
@@ -534,6 +583,10 @@ jobs:
             echo "MANAGED_TRAINER_PRINCIPAL_ID=$managed_trainer_principal_id"
             echo "MANAGED_TRAINER_EXPERIMENT_ID=$managed_trainer_experiment_id"
             echo "MANAGED_TRAINER_REVISION_ID=$managed_trainer_revision_id"
+            echo "MANAGED_VALIDATOR_AUTH_MODE=$managed_validator_auth_mode"
+            echo "MANAGED_VALIDATOR_PRINCIPAL_ID=$managed_validator_principal_id"
+            echo "MANAGED_VALIDATOR_EXPERIMENT_ID=$managed_validator_experiment_id"
+            echo "MANAGED_VALIDATOR_REVISION_ID=$managed_validator_revision_id"
             echo "TF_VAR_auth_connector_kind=$auth_connector_kind"
             echo "TF_VAR_auth_authority_name=$auth_authority_name"
           } >>"$GITHUB_ENV"
@@ -599,6 +652,12 @@ jobs:
           fi
           if [ -n "$managed_trainer_max_size" ]; then
             echo "TF_VAR_managed_trainer_max_size=$managed_trainer_max_size" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$managed_validator_instance_type" ]; then
+            echo "TF_VAR_managed_validator_instance_type=$managed_validator_instance_type" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$managed_validator_root_volume_size_gib" ]; then
+            echo "TF_VAR_managed_validator_root_volume_size_gib=$managed_validator_root_volume_size_gib" >>"$GITHUB_ENV"
           fi
           if [ -n "$enable_data_volume_snapshots" ]; then
             echo "TF_VAR_enable_data_volume_snapshots=$enable_data_volume_snapshots" >>"$GITHUB_ENV"
@@ -681,8 +740,8 @@ jobs:
             --name "${SECRET_PARAMETER_PREFIX}/auth_client_secret" \
             --value "$AUTH_CLIENT_SECRET_RESOLVED"
 
-      - name: setup rust toolchain for managed trainer auth enrollment
-        if: ${{ env.MANAGED_TRAINER_AUTH_MODE == 'bootstrap_static_principal' }}
+      - name: setup rust toolchain for managed trainer or validator auth enrollment
+        if: ${{ env.MANAGED_TRAINER_AUTH_MODE == 'bootstrap_static_principal' || env.MANAGED_VALIDATOR_AUTH_MODE == 'bootstrap_static_principal' }}
         uses: dtolnay/rust-toolchain@stable
 
       - name: setup terraform
@@ -750,6 +809,9 @@ jobs:
           managed_trainer_asg_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_asg_name)"
           managed_trainer_desired_capacity="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_desired_capacity)"
           managed_trainer_auth_bundle_parameter_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_auth_bundle_parameter_name)"
+          managed_validator_instance_id="$(terraform -chdir="$TF_ROOT" output -raw managed_validator_instance_id)"
+          managed_validator_public_ip="$(terraform -chdir="$TF_ROOT" output -raw managed_validator_public_ip)"
+          managed_validator_auth_bundle_parameter_name="$(terraform -chdir="$TF_ROOT" output -raw managed_validator_auth_bundle_parameter_name)"
 
           {
             echo "edge_url=$edge_url"
@@ -778,6 +840,9 @@ jobs:
             echo "managed_trainer_asg_name=$managed_trainer_asg_name"
             echo "managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
             echo "managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
+            echo "managed_validator_instance_id=$managed_validator_instance_id"
+            echo "managed_validator_public_ip=$managed_validator_public_ip"
+            echo "managed_validator_auth_bundle_parameter_name=$managed_validator_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
       - name: wait for browser edge https health
@@ -860,6 +925,74 @@ jobs:
             --name "$TF_VAR_managed_trainer_auth_bundle_parameter_name" \
             --value "$bundle_json"
 
+      - name: seed managed validator auth bundle in ssm parameter store
+        if: ${{ env.TF_VAR_managed_validator_enabled == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_json="${VALIDATOR_AUTH_BUNDLE_JSON:-}"
+
+          if [ "${MANAGED_VALIDATOR_AUTH_MODE:-disabled}" = "bootstrap_static_principal" ]; then
+            tmpdir="$(mktemp -d)"
+            config_path="$tmpdir/validator-auth-config.toml"
+            bundle_path="$tmpdir/auth-bundle.json"
+            cat <<EOF | sed 's/^            //' >"$config_path"
+            training_config_paths = []
+            storage_root = "$tmpdir/storage"
+            target = "validator"
+            app_semver = "$TF_VAR_managed_validator_crate_version"
+
+            [network]
+            edge_base_url = "${{ steps.outputs.outputs.edge_url }}"
+            seed_node_urls = [
+              "${{ steps.outputs.outputs.seed_tcp }}",
+              "${{ steps.outputs.outputs.seed_quic }}",
+            ]
+
+            [manifest]
+            project_family_id = "$TF_VAR_project_family_id"
+            network_id = "$TF_VAR_network_id"
+            study_id = "$TF_VAR_study_id"
+            experiment_id = "$MANAGED_VALIDATOR_EXPERIMENT_ID"
+            revision_id = "$MANAGED_VALIDATOR_REVISION_ID"
+            display_name = "burn_dragon managed $TF_VAR_managed_validator_experiment_kind validator auth seed"
+            description = "managed validator auth seed"
+            protocol_major = 0
+            authority_public_keys = []
+            bootstrap_addrs = []
+            EOF
+
+            for attempt in $(seq 1 10); do
+              if cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native -- \
+                enroll-static-principal \
+                --config "$config_path" \
+                --experiment-kind "$TF_VAR_managed_validator_experiment_kind" \
+                --backend cpu \
+                --principal-kind validator \
+                --principal-id "$MANAGED_VALIDATOR_PRINCIPAL_ID" \
+                --principal-hint "$MANAGED_VALIDATOR_PRINCIPAL_ID" \
+                --target-artifact-hash "$TF_VAR_native_target_artifact_hash" \
+                --auth-bundle-out "$bundle_path" \
+                --output-format json; then
+                bundle_json="$(cat "$bundle_path")"
+                break
+              fi
+              sleep 15
+            done
+          fi
+
+          if [ -z "$bundle_json" ]; then
+            echo "failed to resolve managed validator auth bundle" >&2
+            exit 1
+          fi
+
+          aws ssm put-parameter \
+            --region "$AWS_REGION" \
+            --type SecureString \
+            --overwrite \
+            --name "$TF_VAR_managed_validator_auth_bundle_parameter_name" \
+            --value "$bundle_json"
+
       - name: publish workflow summary
         shell: bash
         run: |
@@ -888,6 +1021,11 @@ jobs:
           - Managed trainer auth mode: \`${MANAGED_TRAINER_AUTH_MODE}\`
           - Managed trainer principal id: \`${MANAGED_TRAINER_PRINCIPAL_ID:-n/a}\`
           - Managed trainer auth bundle parameter: \`${{ steps.outputs.outputs.managed_trainer_auth_bundle_parameter_name || 'n/a' }}\`
+          - Managed validator instance id: \`${{ steps.outputs.outputs.managed_validator_instance_id || 'disabled' }}\`
+          - Managed validator public IP: \`${{ steps.outputs.outputs.managed_validator_public_ip || 'disabled' }}\`
+          - Managed validator auth mode: \`${MANAGED_VALIDATOR_AUTH_MODE}\`
+          - Managed validator principal id: \`${MANAGED_VALIDATOR_PRINCIPAL_ID:-n/a}\`
+          - Managed validator auth bundle parameter: \`${{ steps.outputs.outputs.managed_validator_auth_bundle_parameter_name || 'n/a' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
           - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
           - Dataset bucket: \`${{ steps.outputs.outputs.dataset_bucket_name }}\`

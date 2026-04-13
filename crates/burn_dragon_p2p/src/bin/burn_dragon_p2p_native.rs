@@ -25,8 +25,8 @@ use burn_dragon_p2p::config::{
 };
 use burn_dragon_p2p::experiments::common::PreparedNativePeer;
 use burn_dragon_p2p::native::{
-    assess_native_peer, prepare_climbmix_native_cpu, prepare_nca_native_cpu,
-    spawn_prepared_native_peer,
+    ManagedRunningNativePeer, assess_native_peer, prepare_climbmix_native_cpu,
+    prepare_nca_native_cpu, spawn_prepared_native_peer,
 };
 #[cfg(feature = "cuda")]
 use burn_dragon_p2p::native::{prepare_climbmix_native_cuda, prepare_nca_native_cuda};
@@ -45,8 +45,10 @@ use serde::{Serialize, de::DeserializeOwned};
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_SESSION_TTL_SECS: i64 = 1800;
 const DEFAULT_STATUS_INTERVAL_SECS: u64 = 30;
+const DEFAULT_VALIDATION_INTERVAL_MILLIS: u64 = 250;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_dragon native peer operator")]
@@ -68,6 +70,7 @@ enum CommandKind {
     CompleteGithubLogin(CompleteGithubLoginArgs),
     EnrollStaticPrincipal(EnrollStaticPrincipalArgs),
     RunPeer(RunPeerArgs),
+    RunValidatorDaemon(RunValidatorDaemonArgs),
     MarkRuntimeFailure(MarkRuntimeFailureArgs),
     ClearDowngrade(ClearDowngradeArgs),
 }
@@ -115,6 +118,12 @@ impl BackendArg {
             Self::Cuda => "cuda",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ManagedPrincipalKindArg {
+    Trainer,
+    Validator,
 }
 
 #[derive(Debug, Parser, Clone, Default)]
@@ -295,6 +304,8 @@ struct EnrollStaticPrincipalArgs {
     principal_id: String,
     #[arg(long)]
     principal_hint: Option<String>,
+    #[arg(long, value_enum, default_value = "trainer")]
+    principal_kind: ManagedPrincipalKindArg,
     #[arg(long)]
     target_artifact_hash: Option<String>,
     #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
@@ -325,6 +336,36 @@ struct RunPeerArgs {
     auth_bundle_format: ConfigFormat,
     #[arg(long, default_value_t = DEFAULT_STATUS_INTERVAL_SECS)]
     status_interval_secs: u64,
+    #[command(flatten)]
+    capability_policy: CapabilityPolicyArgs,
+}
+
+#[derive(Debug, Parser)]
+struct RunValidatorDaemonArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    auth_bundle: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "auto")]
+    auth_bundle_format: ConfigFormat,
+    #[arg(long, default_value_t = DEFAULT_STATUS_INTERVAL_SECS)]
+    status_interval_secs: u64,
+    #[arg(long, default_value_t = DEFAULT_VALIDATION_INTERVAL_MILLIS)]
+    validation_interval_millis: u64,
+    #[arg(long, default_value_t = true)]
+    initialize_head_on_start: bool,
+    #[arg(long, default_value_t = true)]
+    restore_head_on_start: bool,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
 }
@@ -395,6 +436,7 @@ fn main() -> Result<()> {
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
         CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
         CommandKind::RunPeer(args) => run_peer(args),
+        CommandKind::RunValidatorDaemon(args) => run_validator_daemon(args),
         CommandKind::MarkRuntimeFailure(args) => mark_runtime_failure(args),
         CommandKind::ClearDowngrade(args) => clear_downgrade(args),
     }
@@ -594,11 +636,15 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
         args.target_artifact_hash,
     )?;
     let experiment_id = ExperimentId::new(config.manifest.experiment_id.clone());
+    let requested_scopes = match args.principal_kind {
+        ManagedPrincipalKindArg::Trainer => managed_trainer_scopes(&experiment_id),
+        ManagedPrincipalKindArg::Validator => managed_validator_scopes(&experiment_id),
+    };
     let session = runtime.block_on(enroll_native_static_principal(
         &config.storage_root,
         &edge_base_url,
         &release_manifest,
-        managed_trainer_scopes(&experiment_id),
+        requested_scopes,
         args.session_ttl_secs,
         args.principal_hint,
         PrincipalId::new(args.principal_id),
@@ -767,6 +813,100 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
     }
 }
 
+fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        Some(args.capability_policy),
+    )?;
+    let auth_bundle = match args.auth_bundle {
+        Some(path) => Some(load_typed::<DragonNativeAuthBundle>(
+            &path,
+            args.auth_bundle_format,
+        )?),
+        None => None,
+    };
+
+    match (args.experiment_kind.into_config(), args.backend) {
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
+            run_prepared_validator_daemon(
+                prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
+            run_prepared_validator_daemon(
+                prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
+            run_prepared_validator_daemon(
+                prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
+            run_prepared_validator_daemon(
+                prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
+            run_prepared_validator_daemon(
+                prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
+            run_prepared_validator_daemon(
+                prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(not(feature = "wgpu"))]
+        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
+        #[cfg(not(feature = "cuda"))]
+        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+    }
+}
+
 fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
     let config = resolved_config(
         &args.config,
@@ -900,6 +1040,19 @@ fn managed_trainer_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentSc
     scopes
 }
 
+fn managed_validator_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
+    BTreeSet::from([
+        ExperimentScope::Connect,
+        ExperimentScope::Discover,
+        ExperimentScope::Validate {
+            experiment_id: experiment_id.clone(),
+        },
+        ExperimentScope::Archive {
+            experiment_id: experiment_id.clone(),
+        },
+    ])
+}
+
 fn run_prepared_peer<B>(
     prepared: PreparedNativePeer<B>,
     config: &DragonNativePeerConfig,
@@ -969,6 +1122,164 @@ where
             _ => {}
         }
 
+        thread::sleep(STATUS_POLL_INTERVAL);
+    }
+}
+
+fn run_prepared_validator_daemon<B>(
+    prepared: PreparedNativePeer<B>,
+    config: &DragonNativePeerConfig,
+    backend: BackendArg,
+    status_interval_secs: u64,
+    validation_interval_millis: u64,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let experiment_entry = prepared
+        .manifests
+        .experiment_directory
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("prepared validator manifest bundle is missing an experiment"))?;
+    eprintln!(
+        "starting burn_dragon validator daemon: experiment={} backend={} target={:?} can_train={} edge={} seeds={} storage_root={}",
+        prepared.experiment_kind.workload_slug(),
+        backend.as_label(),
+        prepared.target_decision.effective_target,
+        prepared.target_decision.can_train,
+        config.effective_edge_base_url().unwrap_or("<none>"),
+        config.effective_seed_node_urls().len(),
+        config.storage_root.display(),
+    );
+    if let Some(reason) = prepared.target_decision.downgrade_reason.as_deref() {
+        eprintln!("capability decision: {reason}");
+    }
+    if prepared.target_decision.effective_target
+        != burn_dragon_p2p::config::DragonNativeTarget::Validator
+    {
+        bail!(
+            "validator daemon requires effective validator target; resolved {:?}",
+            prepared.target_decision.effective_target
+        );
+    }
+
+    let mut running = spawn_prepared_native_peer(prepared)?;
+    wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_requested_for_handler = Arc::clone(&shutdown_requested);
+    let control = running.control_handle();
+    ctrlc::set_handler(move || {
+        if !shutdown_requested_for_handler.swap(true, Ordering::SeqCst) {
+            let _ = control.shutdown();
+        }
+    })
+    .context("failed to install ctrl-c handler")?;
+
+    let experiment = running.mainnet().experiment(
+        experiment_entry.study_id,
+        experiment_entry.experiment_id,
+        experiment_entry.current_revision_id,
+    );
+    let restored = if restore_head_on_start {
+        running.restore_experiment_head(&experiment)?
+    } else {
+        None
+    };
+    let synced = running.sync_experiment_head(&experiment)?;
+    if restored.is_none() && synced.is_none() && initialize_head_on_start {
+        let head = running.initialize_local_head(&experiment)?;
+        eprintln!(
+            "validator-daemon initialized genesis head id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
+    }
+
+    let status_interval = Duration::from_secs(status_interval_secs.max(1));
+    let validation_interval = Duration::from_millis(validation_interval_millis.max(25));
+    let mut last_status = Instant::now()
+        .checked_sub(status_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_validation = Instant::now()
+        .checked_sub(validation_interval)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        let snapshot = running.snapshot();
+        if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
+            eprintln!(
+                "validator-status status={:?} node_state={:?} connected_peers={} last_error={}",
+                snapshot.status,
+                snapshot.node_state,
+                snapshot.connected_peers,
+                snapshot.last_error.as_deref().unwrap_or("-"),
+            );
+            last_status = Instant::now();
+        }
+
+        match snapshot.status {
+            RuntimeStatus::Failed => {
+                let reason = snapshot
+                    .last_error
+                    .unwrap_or_else(|| "validator runtime failed".into());
+                let _ = running.shutdown();
+                let _ = running.await_termination_timeout(SHUTDOWN_TIMEOUT);
+                bail!("validator runtime failed: {reason}");
+            }
+            RuntimeStatus::Stopped => {
+                let _prepared = running.await_termination_timeout(SHUTDOWN_TIMEOUT)?;
+                eprintln!("validator stopped cleanly");
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if last_validation.elapsed() >= validation_interval {
+            match running.validate_candidates_once(&experiment) {
+                Ok(Some(outcome)) => {
+                    eprintln!(
+                        "validator-promoted merged_head_id={} global_step={}",
+                        outcome.merged_head.head_id.as_str(),
+                        outcome.merged_head.global_step,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("validator-validation-pass-error: {error}");
+                }
+            }
+            last_validation = Instant::now();
+        }
+
+        thread::sleep(STATUS_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_runtime_ready<B>(running: &ManagedRunningNativePeer<B>, timeout: Duration) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = running.snapshot();
+        if snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty() {
+            return Ok(());
+        }
+        if snapshot.status == RuntimeStatus::Failed {
+            bail!(
+                "peer runtime failed before becoming ready: {}",
+                snapshot.last_error.as_deref().unwrap_or("unknown error"),
+            );
+        }
+        if snapshot.status == RuntimeStatus::Stopped {
+            bail!("peer runtime stopped before becoming ready");
+        }
+        if Instant::now() >= deadline {
+            bail!("peer runtime did not become ready within {:?}", timeout);
+        }
         thread::sleep(STATUS_POLL_INTERVAL);
     }
 }

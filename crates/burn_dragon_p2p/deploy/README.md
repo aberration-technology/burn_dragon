@@ -23,13 +23,14 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - retained data-volume snapshots disabled by default and only relevant when retained bootstrap storage is enabled
 - optional warm-disaster-recovery region with cross-region artifact replication plus retained-volume snapshot copies when retained bootstrap storage is enabled
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
+- small managed CPU validator instance for canonical promotion, separate from the bootstrap edge
 - managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
 - managed trainers are separate from the bootstrap nodes and default to disabled
 - EC2, Redis, dataset CDN, Route53, and managed-trainer CloudWatch alarms, optionally wired to SNS
 - shared CloudWatch dashboard for control-plane health and throughput
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
-It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity.
+It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity. The default minimal production topology is now explicit: one bootstrap-only edge host plus one small validator host. The bootstrap host handles GitHub auth, seed/discovery, browser edge, and S3 publication. The managed validator does no training, but it still performs real validation and canonical promotion work. The current protocol does not support a truthfully named aggregation-only canonical promoter with zero model evaluation.
 
 The bootstrap publishes initial Dragon experiment directory entries for:
 
@@ -38,6 +39,24 @@ The bootstrap publishes initial Dragon experiment directory entries for:
 
 Those entries include Dragon profile metadata, so peers can resolve experiment and training configuration from the network instead of requiring a matching static local config.
 The initial ClimbMix revision now defaults to the managed dataset CDN path under `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile, and browser peers fetch only the shards they train on from that managed shard pool unless you override the base URL explicitly.
+
+## Minimal Topology
+
+The cheapest honest production topology is now:
+
+- one bootstrap-only EC2 node
+- one small CPU validator EC2 node
+- zero Redis nodes by default
+- zero managed trainers by default
+- zero GPU infrastructure by default
+
+Role split:
+
+- bootstrap: GitHub auth, browser edge, seed/discovery, operator API, S3 artifact publication
+- validator: validation passes plus canonical promotion, no training loop
+- trainers: browser peers and any optional external or managed trainers
+
+Important constraint: the managed validator is intentionally small and CPU-only, but it is not a fake reducer-only node. Under the current `burn_p2p` validation flow, canonical promotion still requires validator-side model evaluation through `validate_candidates_once(...)`. Separate reducer-only aggregation is not sufficient for canonical promotion in the checked-in Dragon topology.
 
 ## Artifact Storage
 
@@ -73,7 +92,9 @@ That workflow:
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
 - creates or reuses the S3 bucket used for durable direct artifact publication
 - optionally creates an autoscaled managed trainer pool that installs `burn_dragon_p2p_native` from crates.io and fetches its auth bundle from SSM
+- provisions one small managed validator instance by default, installs `burn_dragon_p2p_native`, and fetches its auth bundle from SSM
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
+- auto-seeds a deploy-managed static validator principal and mints its auth bundle after edge health when the managed validator is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
 - prints the bootstrap instance details, bootstrap state-storage mode, control-plane state backend, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary

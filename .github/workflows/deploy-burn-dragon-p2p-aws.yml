@@ -32,7 +32,7 @@ on:
         default: aberration.technology
         type: string
       bootstrap_install_source:
-        description: "How to install `burn_p2p_bootstrap` on the bootstrap hosts. Example: `crate` for the published crates.io package or `git` only when intentionally testing an unpublished burn_p2p revision."
+        description: "How to install `burn_p2p_bootstrap` on the bootstrap host. Example: `crate` for the published crates.io package or `git` only when intentionally testing an unpublished burn_p2p revision."
         required: true
         default: crate
         type: choice
@@ -721,11 +721,8 @@ jobs:
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
           instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
-          secondary_instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_secondary_instance_id)"
           data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_volume_id)"
-          secondary_data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_secondary_data_volume_id)"
           data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
-          secondary_public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_secondary_public_ip)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
           control_plane_dashboard_name="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_name)"
           control_plane_dashboard_url="$(terraform -chdir="$TF_ROOT" output -raw control_plane_dashboard_url)"
@@ -750,11 +747,8 @@ jobs:
             echo "seed_quic=$seed_quic"
             echo "public_ip=$public_ip"
             echo "instance_id=$instance_id"
-            echo "secondary_instance_id=$secondary_instance_id"
             echo "data_volume_id=$data_volume_id"
-            echo "secondary_data_volume_id=$secondary_data_volume_id"
             echo "data_mount_path=$data_mount_path"
-            echo "secondary_public_ip=$secondary_public_ip"
             echo "redis_endpoint=$redis_endpoint"
             echo "control_plane_dashboard_name=$control_plane_dashboard_name"
             echo "control_plane_dashboard_url=$control_plane_dashboard_url"
@@ -865,14 +859,11 @@ jobs:
           - Edge URL: ${{ steps.outputs.outputs.edge_url }}
           - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
-          - Primary EC2 instance id: \`${{ steps.outputs.outputs.instance_id }}\`
-          - Secondary EC2 instance id: \`${{ steps.outputs.outputs.secondary_instance_id }}\`
-          - Primary public IP: \`${{ steps.outputs.outputs.public_ip }}\`
-          - Secondary public IP: \`${{ steps.outputs.outputs.secondary_public_ip }}\`
-          - Primary data volume id: \`${{ steps.outputs.outputs.data_volume_id }}\`
-          - Secondary data volume id: \`${{ steps.outputs.outputs.secondary_data_volume_id }}\`
+          - Bootstrap EC2 instance id: \`${{ steps.outputs.outputs.instance_id }}\`
+          - Bootstrap public IP: \`${{ steps.outputs.outputs.public_ip }}\`
+          - Bootstrap data volume id: \`${{ steps.outputs.outputs.data_volume_id }}\`
           - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
-          - Shared Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
           - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
           - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Bootstrap install source: \`${TF_VAR_bootstrap_install_source}\`

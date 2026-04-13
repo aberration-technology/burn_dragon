@@ -50,7 +50,6 @@ managed_trainer_experiment_kind = "nca"
 # artifact_replica_bucket_force_destroy = false
 # artifact_bucket_server_side_encryption = "AES256"
 # bootstrap_primary_restore_snapshot_id = "snap-0123456789abcdef0"
-# bootstrap_secondary_restore_snapshot_id = "snap-0fedcba9876543210"
 # auth_principals_json = jsonencode([
 #   {
 #     principal_id     = "burn-dragon-admin"

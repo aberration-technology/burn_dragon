@@ -77,11 +77,9 @@ locals {
     control_plane_redis_auth_token = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
     trainer_auth_bundle            = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
   }
-  bootstrap_primary_private_ip   = "10.42.1.10"
-  bootstrap_secondary_private_ip = "10.42.2.10"
+  bootstrap_primary_private_ip = "10.42.1.10"
   bootstrap_peer_internal_multiaddrs = [
     "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",
-    "/ip4/${local.bootstrap_secondary_private_ip}/tcp/${var.p2p_port}",
   ]
   bootstrap_data_mount_path       = "/var/lib/burn-p2p"
   bootstrap_auth_root             = "${local.bootstrap_data_mount_path}/auth"
@@ -1099,9 +1097,9 @@ resource "aws_elasticache_replication_group" "control_plane" {
   parameter_group_name       = "default.redis7"
   subnet_group_name          = aws_elasticache_subnet_group.control_plane.name
   security_group_ids         = [aws_security_group.control_plane_redis.id]
-  automatic_failover_enabled = true
-  multi_az_enabled           = true
-  num_cache_clusters         = 2
+  automatic_failover_enabled = false
+  multi_az_enabled           = false
+  num_cache_clusters         = 1
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   auth_token                 = random_password.control_plane_redis_auth_token.result
@@ -1649,80 +1647,6 @@ resource "aws_volume_attachment" "bootstrap_data" {
   stop_instance_before_detaching = true
 }
 
-resource "aws_ebs_volume" "bootstrap_secondary_data" {
-  availability_zone = aws_subnet.public_secondary.availability_zone
-  size              = var.data_volume_size_gib
-  type              = var.data_volume_type
-  encrypted         = true
-  snapshot_id       = trimspace(var.bootstrap_secondary_restore_snapshot_id) != "" ? trimspace(var.bootstrap_secondary_restore_snapshot_id) : null
-
-  tags = merge(local.tags, {
-    Name           = "${var.stack_name}-bootstrap-secondary-data"
-    SnapshotPolicy = local.bootstrap_data_snapshot_tag
-    Persistence    = "retained-bootstrap-state"
-    NodeRole       = "secondary"
-  })
-}
-
-resource "aws_instance" "bootstrap_secondary" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
-  subnet_id                   = aws_subnet.public_secondary.id
-  private_ip                  = local.bootstrap_secondary_private_ip
-  vpc_security_group_ids      = [aws_security_group.bootstrap.id]
-  iam_instance_profile        = aws_iam_instance_profile.bootstrap.name
-  associate_public_ip_address = true
-
-  metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
-  }
-
-  root_block_device {
-    volume_size           = var.root_volume_size_gib
-    volume_type           = "gp3"
-    encrypted             = true
-    delete_on_termination = true
-  }
-
-  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
-    artifact_bucket_name                   = local.artifact_bucket_name
-    artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
-    artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
-    aws_region                             = var.aws_region
-    bootstrap_auth_feature                 = local.bootstrap_auth_feature
-    bootstrap_auth_root                    = local.bootstrap_auth_root
-    bootstrap_config_json                  = local.bootstrap_config_json
-    bootstrap_data_device_name             = var.data_volume_device_name
-    bootstrap_data_mount_path              = local.bootstrap_data_mount_path
-    bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_secondary_data.id
-    bootstrap_crate_version                = var.bootstrap_crate_version
-    bootstrap_git_ref                      = var.bootstrap_git_ref
-    bootstrap_git_repo                     = var.bootstrap_git_repository
-    bootstrap_install_source               = local.bootstrap_install_source
-    bootstrap_node_role                    = "secondary"
-    caddyfile                              = local.caddyfile
-    control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token
-    control_plane_redis_endpoint           = aws_elasticache_replication_group.control_plane.primary_endpoint_address
-    control_plane_redis_port               = aws_elasticache_replication_group.control_plane.port
-    authority_key_parameter_name           = local.secret_parameter_names.authority_key
-    http_port                              = var.http_port
-    secret_sync_script                     = local.secret_sync_script
-  })
-
-  tags = merge(local.tags, {
-    Name = "${var.stack_name}-bootstrap-secondary"
-  })
-}
-
-resource "aws_volume_attachment" "bootstrap_secondary_data" {
-  device_name = var.data_volume_device_name
-  volume_id   = aws_ebs_volume.bootstrap_secondary_data.id
-  instance_id = aws_instance.bootstrap_secondary.id
-
-  stop_instance_before_detaching = true
-}
-
 resource "aws_iam_role" "bootstrap_data_snapshot" {
   count = var.enable_data_volume_snapshots ? 1 : 0
 
@@ -1916,29 +1840,6 @@ resource "aws_cloudwatch_metric_alarm" "edge_primary_health_check_unhealthy" {
   tags = local.tags
 }
 
-resource "aws_cloudwatch_metric_alarm" "edge_secondary_health_check_unhealthy" {
-  count = var.enable_control_plane_operational_alarms ? 1 : 0
-
-  alarm_name          = "${var.stack_name}-edge-secondary-unhealthy"
-  alarm_description   = "burn_dragon_p2p secondary edge Route53 health check is unhealthy"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "HealthCheckStatus"
-  namespace           = "AWS/Route53"
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 1
-  treat_missing_data  = "breaching"
-  alarm_actions       = local.cloudwatch_alarm_actions
-  ok_actions          = local.cloudwatch_alarm_actions
-
-  dimensions = {
-    HealthCheckId = aws_route53_health_check.edge_secondary.id
-  }
-
-  tags = local.tags
-}
-
 resource "aws_cloudwatch_metric_alarm" "dataset_cdn_5xx_error_rate_high" {
   count = var.enable_control_plane_operational_alarms ? 1 : 0
 
@@ -2003,7 +1904,7 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
             "- edge: https://${var.edge_domain_name}",
             "- dataset cdn: https://${local.dataset_domain_name}",
             "- artifact bucket: ${local.artifact_bucket_name}",
-            "- redis replication group: ${aws_elasticache_replication_group.control_plane.replication_group_id}",
+            "- redis endpoint: ${aws_elasticache_replication_group.control_plane.primary_endpoint_address}",
           ])
         }
       },
@@ -2021,8 +1922,7 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
           view    = "timeSeries"
           stacked = false
           metrics = [
-            ["AWS/Route53", "HealthCheckStatus", "HealthCheckId", aws_route53_health_check.edge_primary.id, { label = "primary edge" }],
-            [".", ".", "HealthCheckId", aws_route53_health_check.edge_secondary.id, { label = "secondary edge" }],
+            ["AWS/Route53", "HealthCheckStatus", "HealthCheckId", aws_route53_health_check.edge_primary.id, { label = "edge" }],
           ]
         }
       },
@@ -2040,8 +1940,7 @@ resource "aws_cloudwatch_dashboard" "control_plane" {
           view    = "timeSeries"
           stacked = false
           metrics = [
-            ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.bootstrap.id, { label = "primary bootstrap" }],
-            [".", ".", "InstanceId", aws_instance.bootstrap_secondary.id, { label = "secondary bootstrap" }],
+            ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.bootstrap.id, { label = "bootstrap" }],
           ]
         }
       },
@@ -2137,15 +2036,6 @@ resource "aws_eip" "bootstrap" {
   })
 }
 
-resource "aws_eip" "bootstrap_secondary" {
-  domain   = "vpc"
-  instance = aws_instance.bootstrap_secondary.id
-
-  tags = merge(local.tags, {
-    Name = "${var.stack_name}-bootstrap-secondary"
-  })
-}
-
 resource "aws_route53_health_check" "edge_primary" {
   ip_address        = aws_eip.bootstrap.public_ip
   type              = "TCP"
@@ -2158,36 +2048,11 @@ resource "aws_route53_health_check" "edge_primary" {
   })
 }
 
-resource "aws_route53_health_check" "edge_secondary" {
-  ip_address        = aws_eip.bootstrap_secondary.public_ip
-  type              = "TCP"
-  port              = 443
-  request_interval  = 30
-  failure_threshold = 3
-
-  tags = merge(local.tags, {
-    Name = "${var.stack_name}-edge-secondary"
-  })
-}
-
 resource "aws_route53_record" "edge_primary" {
-  zone_id                          = data.aws_route53_zone.selected.zone_id
-  name                             = var.edge_domain_name
-  type                             = "A"
-  ttl                              = 60
-  set_identifier                   = "primary"
-  multivalue_answer_routing_policy = true
-  health_check_id                  = aws_route53_health_check.edge_primary.id
-  records                          = [aws_eip.bootstrap.public_ip]
-}
-
-resource "aws_route53_record" "edge_secondary" {
-  zone_id                          = data.aws_route53_zone.selected.zone_id
-  name                             = var.edge_domain_name
-  type                             = "A"
-  ttl                              = 60
-  set_identifier                   = "secondary"
-  multivalue_answer_routing_policy = true
-  health_check_id                  = aws_route53_health_check.edge_secondary.id
-  records                          = [aws_eip.bootstrap_secondary.public_ip]
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = var.edge_domain_name
+  type            = "A"
+  ttl             = 60
+  health_check_id = aws_route53_health_check.edge_primary.id
+  records         = [aws_eip.bootstrap.public_ip]
 }

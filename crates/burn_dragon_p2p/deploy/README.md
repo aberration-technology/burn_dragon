@@ -10,14 +10,14 @@ This folder contains the operator-facing deployment assets for the `burn_dragon_
 
 The AWS Terraform root deploys a single-region bootstrap plane for the Dragon network:
 
-- two EC2 bootstrap/edge hosts across two AZs
+- one EC2 bootstrap/edge host
 - Route53 DNS for the browser edge
-- no ALB or API Gateway; the browser edge is Caddy on the bootstrap hosts
+- no ALB or API Gateway; the browser edge is Caddy on the bootstrap host
 - TLS termination via Caddy on the host
-- retained encrypted EBS data volume per bootstrap host for local peer/runtime state
+- one retained encrypted EBS data volume for bootstrap local peer/runtime state
 - bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
-- shared Redis-backed auth session and operator state for multi-node control-plane continuity
-- shared authority material synchronized through SSM so both bootstrap nodes serve the same auth/control plane
+- one Redis node for shared auth session and operator state
+- bootstrap authority material synchronized through SSM and persisted for host replacement
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
 - optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
@@ -41,7 +41,7 @@ The initial ClimbMix revision now defaults to the managed dataset CDN path under
 
 Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.
 
-There is no separate artifact node by default. The bootstrap/control-plane hosts own artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and each bootstrap node keeps its local peer/runtime state on its retained EBS data volume. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow, not by running a second always-on artifact service.
+There is no separate artifact node by default. The bootstrap/control-plane host owns artifact publication, durable artifact bytes live in S3, shared auth session plus operator state live in Redis, and the bootstrap host keeps its local peer/runtime state on its retained EBS data volume. Cross-region retained-volume recovery is handled through copied EBS snapshots plus the restore workflow, not by running a second always-on artifact service.
 
 ## Managed Dataset Distribution
 
@@ -74,9 +74,9 @@ That workflow:
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the primary and secondary bootstrap instance details, shared Redis endpoint, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
+- prints the bootstrap instance details, Redis endpoint, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
 
-If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the primary EC2 host. The retained primary bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
+If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. The retained bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
 
 The workflow still performs a Terraform plan internally before apply. That keeps the operator experience one-click without dropping the safety and auditability of a plan phase.
 
@@ -88,7 +88,7 @@ The explicit restore and failover entrypoint is:
 
 That workflow can:
 
-- resolve the latest tagged primary and secondary retained-volume snapshots automatically
+- resolve the latest tagged retained bootstrap data-volume snapshot automatically
 - run a `plan_only=true` disaster-recovery drill without applying
 - restore the stack into a target region from explicit or auto-resolved snapshots
 - optionally re-enable warm-DR replication on the restored stack by setting `next_disaster_recovery_region`

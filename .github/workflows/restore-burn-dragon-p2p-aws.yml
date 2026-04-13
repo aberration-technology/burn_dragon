@@ -55,17 +55,12 @@ on:
         default: ""
         type: string
       restore_from_latest_snapshots:
-        description: "Automatically resolve the latest tagged primary and secondary bootstrap data snapshots in `source_snapshot_region` when explicit snapshot ids are not supplied."
+        description: "Automatically resolve the latest tagged bootstrap data snapshot in `source_snapshot_region` when an explicit snapshot id is not supplied."
         required: true
         default: true
         type: boolean
       bootstrap_primary_restore_snapshot_id:
-        description: "Optional explicit EBS snapshot id for the primary bootstrap data volume. Example: `snap-0123456789abcdef0`. Leave empty to auto-resolve when `restore_from_latest_snapshots=true`."
-        required: false
-        default: ""
-        type: string
-      bootstrap_secondary_restore_snapshot_id:
-        description: "Optional explicit EBS snapshot id for the secondary bootstrap data volume. Example: `snap-0fedcba9876543210`. Leave empty to auto-resolve when `restore_from_latest_snapshots=true`."
+        description: "Optional explicit EBS snapshot id for the bootstrap data volume. Example: `snap-0123456789abcdef0`. Leave empty to auto-resolve when `restore_from_latest_snapshots=true`."
         required: false
         default: ""
         type: string
@@ -75,7 +70,7 @@ on:
         default: true
         type: boolean
       force_replace_bootstrap:
-        description: "Force primary bootstrap instance replacement during the restore plan/apply. Usually keep `false`; use `true` only when you intentionally want a fresh host replacement in an existing workspace."
+        description: "Force bootstrap instance replacement during the restore plan/apply. Usually keep `false`; use `true` only when you intentionally want a fresh host replacement in an existing workspace."
         required: true
         default: false
         type: boolean
@@ -223,7 +218,6 @@ jobs:
           restore_from_latest_snapshots="${{ github.event.inputs.restore_from_latest_snapshots }}"
           source_snapshot_region_input="${{ github.event.inputs.source_snapshot_region }}"
           primary_restore_snapshot_id="${{ github.event.inputs.bootstrap_primary_restore_snapshot_id }}"
-          secondary_restore_snapshot_id="${{ github.event.inputs.bootstrap_secondary_restore_snapshot_id }}"
           next_disaster_recovery_region="${{ github.event.inputs.next_disaster_recovery_region }}"
 
           aws_region="$aws_region_input"
@@ -434,26 +428,10 @@ jobs:
                 --query 'reverse(sort_by(Snapshots,&StartTime))[0].SnapshotId' \
                 --output text)"
             fi
-            if [ -z "$secondary_restore_snapshot_id" ]; then
-              secondary_restore_snapshot_id="$(aws ec2 describe-snapshots \
-                --region "$snapshot_search_region" \
-                --owner-ids self \
-                --filters \
-                  "Name=tag:Stack,Values=$stack_name" \
-                  "Name=tag:TerraformWorkspace,Values=$TF_WORKSPACE_NAME" \
-                  "Name=tag:NodeRole,Values=secondary" \
-                  "Name=status,Values=completed" \
-                --query 'reverse(sort_by(Snapshots,&StartTime))[0].SnapshotId' \
-                --output text)"
-            fi
           fi
 
           if [ -z "$primary_restore_snapshot_id" ] || [ "$primary_restore_snapshot_id" = "None" ]; then
-            echo "missing primary restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots" >&2
-            exit 1
-          fi
-          if [ -z "$secondary_restore_snapshot_id" ] || [ "$secondary_restore_snapshot_id" = "None" ]; then
-            echo "missing secondary restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots" >&2
+            echo "missing bootstrap restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots" >&2
             exit 1
           fi
 
@@ -467,7 +445,6 @@ jobs:
             echo "ROUTE53_ZONE_NAME=$route53_zone_name"
             echo "SECRET_PARAMETER_PREFIX=$secret_parameter_prefix"
             echo "PRIMARY_RESTORE_SNAPSHOT_ID=$primary_restore_snapshot_id"
-            echo "SECONDARY_RESTORE_SNAPSHOT_ID=$secondary_restore_snapshot_id"
             echo "SNAPSHOT_SEARCH_REGION=$snapshot_search_region"
             echo "TF_VAR_aws_region=$aws_region"
             echo "TF_VAR_stack_name=$stack_name"
@@ -502,7 +479,6 @@ jobs:
             echo "TF_VAR_dataset_bucket_path_prefix=$dataset_bucket_path_prefix"
             echo "TF_VAR_create_artifact_replica_bucket=$create_artifact_replica_bucket"
             echo "TF_VAR_bootstrap_primary_restore_snapshot_id=$primary_restore_snapshot_id"
-            echo "TF_VAR_bootstrap_secondary_restore_snapshot_id=$secondary_restore_snapshot_id"
             echo "AUTH_CONNECTOR_KIND=$auth_connector_kind"
           } >>"$GITHUB_ENV"
           {
@@ -770,8 +746,7 @@ jobs:
           - Terraform workspace: \`${TF_WORKSPACE_NAME}\`
           - Target AWS region: \`${AWS_REGION}\`
           - Snapshot search region: \`${SNAPSHOT_SEARCH_REGION}\`
-          - Primary restore snapshot: \`${PRIMARY_RESTORE_SNAPSHOT_ID}\`
-          - Secondary restore snapshot: \`${SECONDARY_RESTORE_SNAPSHOT_ID}\`
+          - Bootstrap restore snapshot: \`${PRIMARY_RESTORE_SNAPSHOT_ID}\`
           - Plan only: \`${{ github.event.inputs.plan_only }}\`
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`
           - GitHub admin logins: \`${ADMIN_LOGINS_CSV:-n/a}\`
@@ -786,7 +761,7 @@ jobs:
           - Edge URL: ${{ steps.outputs.outputs.edge_url }}
           - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
-          - Shared Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
+          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
           - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
           - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`

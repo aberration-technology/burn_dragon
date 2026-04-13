@@ -40,7 +40,7 @@ variable "allow_route53_zone_apex_records" {
 }
 
 variable "bootstrap_install_source" {
-  description = "How the bootstrap hosts install burn_p2p_bootstrap. Supported values: crate or git. Production deployments should use the published crate by default."
+  description = "How the bootstrap host installs burn_p2p_bootstrap. Supported values: crate or git. Production deployments should use the published crate by default."
   type        = string
   default     = "crate"
 
@@ -51,7 +51,7 @@ variable "bootstrap_install_source" {
 }
 
 variable "bootstrap_crate_version" {
-  description = "Published burn_p2p_bootstrap crate version installed on the bootstrap hosts when bootstrap_install_source = crate."
+  description = "Published burn_p2p_bootstrap crate version installed on the bootstrap host when bootstrap_install_source = crate."
   type        = string
   default     = "0.21.0-pre.13"
 }
@@ -351,13 +351,7 @@ variable "disaster_recovery_snapshot_retention_days" {
 }
 
 variable "bootstrap_primary_restore_snapshot_id" {
-  description = "Optional EBS snapshot id used to restore the primary bootstrap data volume. Leave empty for a normal retained-volume deployment."
-  type        = string
-  default     = ""
-}
-
-variable "bootstrap_secondary_restore_snapshot_id" {
-  description = "Optional EBS snapshot id used to restore the secondary bootstrap data volume. Leave empty for a normal retained-volume deployment."
+  description = "Optional EBS snapshot id used to restore the bootstrap data volume. Leave empty for a normal retained-volume deployment."
   type        = string
   default     = ""
 }

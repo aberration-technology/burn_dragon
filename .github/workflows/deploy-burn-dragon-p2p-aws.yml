@@ -26,6 +26,11 @@ on:
         required: false
         default: aberration.technology
         type: string
+      bootstrap_git_ref:
+        description: "Pinned `burn_p2p` git ref used to install `burn_p2p_bootstrap`. Example: `0c89aaf`, a full commit SHA, or a release tag. Leave the default unless you are intentionally testing a newer bootstrap build."
+        required: false
+        default: 0c89aaf
+        type: string
       auth_connector_kind:
         description: "Auth connector kind override. Supported values: `github`, `oidc`, `oauth`, `static`, `external`. Clear it to use the GitHub Environment variable, then default to `github`."
         required: false
@@ -42,12 +47,12 @@ on:
         default: https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1
         type: string
       create_artifact_bucket:
-        description: "Whether Terraform should create and manage the S3 bucket used for replicated Dragon checkpoints and metrics. Example: keep `true` for the normal path; set `false` only when `artifact_bucket_name` points at an existing bucket you already manage."
+        description: "Whether Terraform should create and manage the S3 bucket used for direct Dragon checkpoint and metric publication. Example: keep `true` for the normal path; set `false` only when `artifact_bucket_name` points at an existing bucket you already manage."
         required: true
         default: true
         type: boolean
       artifact_bucket_name:
-        description: "Optional S3 bucket name for replicated checkpoints and metrics. Example: `dragon-aberration-technology-artifacts-prod`. Leave empty to auto-derive a stable unique bucket name from the stack, workspace, account, and region. Required when `create_artifact_bucket=false`."
+        description: "Optional S3 bucket name for directly published checkpoints and metrics. Example: `dragon-aberration-technology-artifacts-prod`. Leave empty to auto-derive a stable unique bucket name from the stack, workspace, account, and region. Required when `create_artifact_bucket=false`."
         required: false
         default: ""
         type: string
@@ -132,7 +137,8 @@ jobs:
           github_admin_logins_var="${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_LOGINS }}"
           climbmix_dataset_base_url_input="${{ github.event.inputs.climbmix_browser_dataset_base_url }}"
           climbmix_dataset_base_url_var="${{ vars.BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL }}"
-          bootstrap_git_ref="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}"
+          bootstrap_git_ref_input="${{ github.event.inputs.bootstrap_git_ref }}"
+          bootstrap_git_ref_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}"
           instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
           root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
           data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
@@ -147,7 +153,6 @@ jobs:
           artifact_bucket_path_prefix_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX }}"
           artifact_bucket_force_destroy="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY }}"
           artifact_bucket_server_side_encryption="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}"
-          artifact_bucket_sync_interval_minutes="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SYNC_INTERVAL_MINUTES }}"
 
           : "${aws_region:?missing BURN_DRAGON_P2P_AWS_REGION}"
           : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_ROLE_ARN}"
@@ -155,7 +160,6 @@ jobs:
           : "${project_family_id:?missing BURN_DRAGON_P2P_PROJECT_FAMILY_ID}"
           : "${study_id:?missing BURN_DRAGON_P2P_STUDY_ID}"
           : "${release_train_hash:?missing BURN_DRAGON_P2P_RELEASE_TRAIN_HASH}"
-          : "${bootstrap_git_ref:?missing BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF}"
 
           edge_domain_name="$edge_domain_name_input"
           if [ -z "$edge_domain_name" ]; then
@@ -226,6 +230,14 @@ jobs:
           fi
           if [ -z "$climbmix_dataset_base_url" ]; then
             climbmix_dataset_base_url="https://${edge_domain_name}/dragon-datasets/climbmix-pretraining/climbmix-r1"
+          fi
+
+          bootstrap_git_ref="$bootstrap_git_ref_input"
+          if [ -z "$bootstrap_git_ref" ]; then
+            bootstrap_git_ref="$bootstrap_git_ref_var"
+          fi
+          if [ -z "$bootstrap_git_ref" ]; then
+            bootstrap_git_ref="0c89aaf"
           fi
 
           create_artifact_bucket="$create_artifact_bucket_input"
@@ -376,9 +388,6 @@ jobs:
           if [ -n "$artifact_bucket_server_side_encryption" ]; then
             echo "TF_VAR_artifact_bucket_server_side_encryption=$artifact_bucket_server_side_encryption" >>"$GITHUB_ENV"
           fi
-          if [ -n "$artifact_bucket_sync_interval_minutes" ]; then
-            echo "TF_VAR_artifact_bucket_sync_interval_minutes=$artifact_bucket_sync_interval_minutes" >>"$GITHUB_ENV"
-          fi
 
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -455,7 +464,6 @@ jobs:
           instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
           data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_volume_id)"
           data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
-          publication_root="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_publication_root)"
           artifact_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_name)"
           artifact_bucket_uri="$(terraform -chdir="$TF_ROOT" output -raw artifact_bucket_uri)"
 
@@ -467,7 +475,6 @@ jobs:
             echo "instance_id=$instance_id"
             echo "data_volume_id=$data_volume_id"
             echo "data_mount_path=$data_mount_path"
-            echo "publication_root=$publication_root"
             echo "artifact_bucket_name=$artifact_bucket_name"
             echo "artifact_bucket_uri=$artifact_bucket_uri"
           } >>"$GITHUB_OUTPUT"
@@ -501,7 +508,7 @@ jobs:
           - EC2 instance id: \`${{ steps.outputs.outputs.instance_id }}\`
           - Data volume id: \`${{ steps.outputs.outputs.data_volume_id }}\`
           - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
-          - Local publication root: \`${{ steps.outputs.outputs.publication_root }}\`
+          - Bootstrap git ref: \`${TF_VAR_bootstrap_git_ref}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
           - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`

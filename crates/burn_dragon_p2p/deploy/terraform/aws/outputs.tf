@@ -23,18 +23,13 @@ output "bootstrap_data_mount_path" {
   value       = local.bootstrap_data_mount_path
 }
 
-output "bootstrap_publication_root" {
-  description = "Local retained publication root where the bootstrap host writes checkpoint and metric artifacts before S3 replication."
-  value       = local.bootstrap_publication_root
-}
-
 output "artifact_bucket_name" {
-  description = "S3 bucket used for durable replicated checkpoint and metric artifacts."
+  description = "S3 bucket used for durable checkpoint and metric artifact publication."
   value       = local.artifact_bucket_name
 }
 
 output "artifact_bucket_uri" {
-  description = "S3 URI prefix receiving replicated checkpoint and metric artifacts from the bootstrap host."
+  description = "S3 URI prefix receiving directly published checkpoint and metric artifacts from the bootstrap host."
   value       = local.artifact_bucket_s3_uri
 }
 

@@ -14,7 +14,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - Route53 DNS for the browser edge
 - TLS termination via Caddy on the host
 - single-host retained encrypted EBS data volume for bootstrap/auth/publication state
-- bootstrap-managed S3 replication for checkpoint and metric artifacts using the EC2 instance role
+- bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
 - EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
@@ -33,11 +33,9 @@ profile, and browser peers fetch only the shards they train on from that externa
 
 ## Artifact Storage
 
-Checkpoint artifacts, including model weights and exported metric bundles, are written first into the retained local publication store on the bootstrap host:
+Checkpoint artifacts, including model weights and exported metric bundles, are published directly from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target.
 
-- `/var/lib/burn-p2p/publication/hot`
-
-That local store remains the hot edge-facing publication root. The deployment now also configures the bootstrap host itself to replicate published artifacts into S3 on a short timer using its EC2 instance-role IAM permissions. There is no second artifact node by default; the bootstrap/control-plane host owns both hot local publication and durable S3 replication.
+There is no second artifact node by default. The bootstrap/control-plane host owns artifact publication, while durable artifact bytes live in S3 and bootstrap/auth/session state lives on the retained EBS data volume.
 
 ## One-Click GitHub Action
 
@@ -49,10 +47,10 @@ That workflow:
 
 - seeds auth client credentials into AWS SSM Parameter Store when the selected auth connector needs them
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
-- creates or reuses the S3 bucket used for durable artifact replication
+- creates or reuses the S3 bucket used for durable direct artifact publication
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the edge URL, seed multiaddrs, local publication root, and artifact S3 prefix in the workflow summary
+- prints the edge URL, seed multiaddrs, pinned bootstrap git ref, and artifact S3 prefix in the workflow summary
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces only the EC2 host. The retained bootstrap data volume is reattached to the replacement host, so bootstrap/auth/publication state survives a normal rebuild. State is reset only if you explicitly destroy or replace the retained data volume itself.
 
@@ -110,7 +108,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_RELEASE_TRAIN_HASH`
   - release-train hash enforced by the auth portal.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
-  - pinned `burn_p2p` git ref used to install `burn_p2p_bootstrap` on the edge host.
+  - optional pinned `burn_p2p` git ref used to install `burn_p2p_bootstrap` on the edge host. Defaults to `0c89aaf`, the first `burn_p2p` commit with ambient-IAM direct S3 publication support.
 
 ### Optional Environment Variables
 
@@ -170,15 +168,13 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
   - optional SNS topic ARN used for bootstrap status-check alarms. Leave empty to create alarms without notifications.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME`
-  - optional existing S3 bucket name for replicated checkpoints and metrics. Leave empty to let Terraform derive a stable unique bucket name.
+  - optional existing S3 bucket name for directly published checkpoints and metrics. Leave empty to let Terraform derive a stable unique bucket name.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX`
   - optional key prefix inside the artifact bucket. Defaults to `artifacts/<stack>/<workspace>`.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY`
-  - whether Terraform may delete a managed artifact bucket even when it still contains replicated data. Defaults to `false` and should stay that way for production.
+  - whether Terraform may delete a managed artifact bucket even when it still contains published data. Defaults to `false` and should stay that way for production.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION`
-  - server-side encryption mode for the managed artifact bucket and bootstrap sync uploads. Defaults to `AES256`.
-- `BURN_DRAGON_P2P_ARTIFACT_BUCKET_SYNC_INTERVAL_MINUTES`
-  - how often the bootstrap host syncs local publication artifacts into S3. Defaults to `5`.
+  - server-side encryption mode for the managed artifact bucket and direct bootstrap uploads. Defaults to `AES256`.
 - `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL`
   - public base URL for the full browser ClimbMix shard pool. Defaults to `https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Override it when the shard pool lives on a different CDN origin.
 
@@ -208,7 +204,7 @@ The GitHub OIDC role must be able to:
 The deployed EC2 instance role is created by Terraform and needs to:
 
 - read the SSM parameters that hold the auth client credentials when the selected auth connector uses them
-- list and upload objects into the configured artifact S3 bucket so the bootstrap host can replicate published checkpoints and metrics without static AWS keys
+- list, upload, and delete objects in the configured artifact S3 bucket so the bootstrap host can publish and prune checkpoints and metrics without static AWS keys
 
 ## Dynamic Admin Flow
 

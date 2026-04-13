@@ -34,8 +34,9 @@ variable "bootstrap_git_repository" {
 }
 
 variable "bootstrap_git_ref" {
-  description = "Pinned burn_p2p git ref used to install burn_p2p_bootstrap."
+  description = "Pinned burn_p2p git ref used to install burn_p2p_bootstrap. Defaults to the first burn_p2p commit with ambient-IAM direct S3 publication support."
   type        = string
+  default     = "0c89aaf"
 }
 
 variable "secret_parameter_prefix" {
@@ -291,19 +292,19 @@ variable "alarm_sns_topic_arn" {
 }
 
 variable "create_artifact_bucket" {
-  description = "Whether Terraform should create the S3 bucket used for durable artifact replication from the bootstrap host."
+  description = "Whether Terraform should create the S3 bucket used for durable artifact publication from the bootstrap host."
   type        = bool
   default     = true
 }
 
 variable "artifact_bucket_name" {
-  description = "Optional existing or desired S3 bucket name for replicated Dragon artifacts. Leave empty to let Terraform derive a stable bucket name."
+  description = "Optional existing or desired S3 bucket name for published Dragon artifacts. Leave empty to let Terraform derive a stable bucket name."
   type        = string
   default     = ""
 }
 
 variable "artifact_bucket_force_destroy" {
-  description = "Whether Terraform may destroy the artifact S3 bucket even if it still contains replicated checkpoints and metrics."
+  description = "Whether Terraform may destroy the artifact S3 bucket even if it still contains published checkpoints and metrics."
   type        = bool
   default     = false
 }
@@ -315,15 +316,9 @@ variable "artifact_bucket_path_prefix" {
 }
 
 variable "artifact_bucket_server_side_encryption" {
-  description = "Server-side encryption mode enforced for the artifact S3 bucket and bootstrap sync uploads."
+  description = "Server-side encryption mode enforced for the artifact S3 bucket and direct bootstrap uploads."
   type        = string
   default     = "AES256"
-}
-
-variable "artifact_bucket_sync_interval_minutes" {
-  description = "How often the bootstrap host should sync locally published artifacts into S3."
-  type        = number
-  default     = 5
 }
 
 variable "ssh_cidr_blocks" {

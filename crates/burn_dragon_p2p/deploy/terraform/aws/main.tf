@@ -71,7 +71,6 @@ locals {
   bootstrap_data_mount_path   = "/var/lib/burn-p2p"
   bootstrap_auth_root         = "${local.bootstrap_data_mount_path}/auth"
   bootstrap_peer_root         = "${local.bootstrap_data_mount_path}/bootstrap-peer"
-  bootstrap_publication_root  = "${local.bootstrap_data_mount_path}/publication/hot"
   bootstrap_data_snapshot_tag = "${var.stack_name}-bootstrap-data"
   cloudwatch_alarm_actions    = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
   default_artifact_bucket_name = trimsuffix(
@@ -376,13 +375,13 @@ locals {
       targets = [
         {
           publication_target_id   = "local-default"
-          label                   = "hot-local"
-          kind                    = "LocalFilesystem"
+          label                   = "artifact-s3"
+          kind                    = "S3Compatible"
           publication_mode        = "LazyOnDemand"
           access_mode             = "Authenticated"
           allow_public_reads      = false
-          supports_signed_urls    = false
-          edge_proxy_required     = true
+          supports_signed_urls    = true
+          edge_proxy_required     = false
           max_artifact_size_bytes = var.local_artifact_max_size_bytes
           retention_ttl_secs      = var.local_artifact_retention_ttl_secs
           allowed_artifact_profiles = [
@@ -392,17 +391,17 @@ locals {
             "ManifestOnly",
           ]
           eager_alias_names         = []
-          local_root                = local.bootstrap_publication_root
-          bucket                    = null
-          endpoint                  = null
-          region                    = null
+          local_root                = null
+          bucket                    = local.artifact_bucket_name
+          endpoint                  = "https://s3.${var.aws_region}.amazonaws.com"
+          region                    = var.aws_region
           access_key_id             = null
           secret_access_key         = null
           session_token             = null
-          path_prefix               = "hot"
-          multipart_threshold_bytes = null
-          server_side_encryption    = null
-          signed_url_ttl_secs       = null
+          path_prefix               = local.artifact_bucket_path_prefix
+          multipart_threshold_bytes = 16777216
+          server_side_encryption    = var.artifact_bucket_server_side_encryption
+          signed_url_ttl_secs       = 900
         },
       ]
     }
@@ -497,7 +496,7 @@ check "external_connector_configuration" {
 check "artifact_bucket_configuration" {
   assert {
     condition     = var.create_artifact_bucket || trimspace(var.artifact_bucket_name) != ""
-    error_message = "Set artifact_bucket_name when create_artifact_bucket is false so the bootstrap host has an existing S3 bucket for artifact replication."
+    error_message = "Set artifact_bucket_name when create_artifact_bucket is false so the bootstrap host has an existing S3 bucket for direct artifact publication."
   }
 }
 
@@ -664,6 +663,7 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
         Effect = "Allow"
         Action = [
           "s3:AbortMultipartUpload",
+          "s3:DeleteObject",
           "s3:GetObject",
           "s3:GetObjectAttributes",
           "s3:PutObject",
@@ -687,7 +687,7 @@ resource "aws_s3_bucket" "artifact" {
 
   tags = merge(local.tags, {
     Name    = "${var.stack_name}-artifacts"
-    Purpose = "burn-dragon-p2p-artifact-replication"
+    Purpose = "burn-dragon-p2p-artifact-publication"
   })
 }
 
@@ -806,7 +806,6 @@ resource "aws_instance" "bootstrap" {
     artifact_bucket_name                   = local.artifact_bucket_name
     artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
     artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
-    artifact_bucket_sync_interval_minutes  = var.artifact_bucket_sync_interval_minutes
     aws_region                             = var.aws_region
     bootstrap_auth_feature                 = local.bootstrap_auth_feature
     bootstrap_config_json                  = local.bootstrap_config_json
@@ -815,7 +814,6 @@ resource "aws_instance" "bootstrap" {
     bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_data.id
     bootstrap_git_ref                      = var.bootstrap_git_ref
     bootstrap_git_repo                     = var.bootstrap_git_repository
-    bootstrap_publication_root             = local.bootstrap_publication_root
     caddyfile                              = local.caddyfile
     http_port                              = var.http_port
     secret_sync_script                     = local.secret_sync_script

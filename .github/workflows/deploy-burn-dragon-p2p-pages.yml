@@ -23,8 +23,8 @@ on:
         required: false
         default: nca-r1
         type: string
-      require_github_auth:
-        description: "Require an authenticated edge session before joining from the published browser shell. Example: keep `true` for the default mainnet browser surface, which uses GitHub auth by default."
+      require_edge_auth:
+        description: "Require an authenticated edge session before joining from the published browser shell. Example: keep `true` for the default mainnet browser surface so peers must complete the edge login flow before joining."
         required: true
         default: true
         type: boolean
@@ -100,14 +100,14 @@ jobs:
             echo "SEED_NODE_URLS=$seed_node_urls"
             echo "SELECTED_EXPERIMENT_ID=$selected_experiment_id"
             echo "SELECTED_REVISION_ID=$selected_revision_id"
-            echo "REQUIRE_GITHUB_AUTH=${{ github.event.inputs.require_github_auth }}"
+            echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}"
           } >>"$GITHUB_ENV"
 
       - name: build browser site artifact
         shell: bash
         run: |
           set -euo pipefail
-          args=(run -p xtask -- build-browser-site --out-dir target/browser-site --require-github-auth "$REQUIRE_GITHUB_AUTH")
+          args=(run -p xtask -- build-browser-site --out-dir target/browser-site --require-edge-auth "$REQUIRE_EDGE_AUTH")
           if [ -n "$EDGE_BASE_URL" ]; then
             args+=(--edge-url "$EDGE_BASE_URL")
           fi

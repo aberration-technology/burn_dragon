@@ -68,6 +68,21 @@ output "control_plane_redis_primary_endpoint" {
   value       = aws_elasticache_replication_group.control_plane.primary_endpoint_address
 }
 
+output "managed_trainer_asg_name" {
+  description = "Autoscaling group name for the optional managed native trainer pool. Empty when managed trainers are disabled."
+  value       = length(aws_autoscaling_group.managed_trainer) > 0 ? aws_autoscaling_group.managed_trainer[0].name : ""
+}
+
+output "managed_trainer_desired_capacity" {
+  description = "Desired capacity for the optional managed native trainer pool."
+  value       = var.managed_trainer_desired_capacity
+}
+
+output "managed_trainer_auth_bundle_parameter_name" {
+  description = "SSM parameter name expected to contain the managed trainer auth bundle JSON. Empty when managed trainers are disabled."
+  value       = local.managed_trainer_enabled ? local.managed_trainer_auth_bundle_parameter_name : ""
+}
+
 output "seed_node_tcp_multiaddr" {
   description = "TCP bootstrap multiaddr advertised to native peers."
   value       = "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}"

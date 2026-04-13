@@ -19,10 +19,11 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - shared authority material synchronized through SSM so both bootstrap nodes serve the same auth/control plane
 - daily retained data-volume snapshots with Terraform-managed DLM policy by default
 - optional warm-disaster-recovery region with cross-region artifact replication plus cross-region snapshot copies
+- optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
 - EC2 status-check CloudWatch alarms, optionally wired to SNS
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
-It does not deploy end-user native trainer peers. Native operators still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs.
+It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity.
 
 The bootstrap publishes initial Dragon experiment directory entries for:
 
@@ -49,11 +50,13 @@ The intended operator entrypoint is:
 That workflow:
 
 - seeds auth client credentials into AWS SSM Parameter Store when the selected auth connector needs them
+- installs `burn_p2p_bootstrap` from the published crate by default, with an explicit git fallback only for testing unpublished upstream revisions
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
 - creates or reuses the S3 bucket used for durable direct artifact publication
+- optionally creates an autoscaled managed trainer pool that installs `burn_dragon_p2p_native` from crates.io and fetches its auth bundle from SSM
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
-- prints the primary and secondary bootstrap instance details, shared Redis endpoint, pinned bootstrap git ref, and artifact S3 prefix in the workflow summary
+- prints the primary and secondary bootstrap instance details, shared Redis endpoint, bootstrap install source/version, managed trainer pool outputs, and artifact S3 prefix in the workflow summary
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the primary EC2 host. The retained primary bootstrap data volume is reattached to the replacement host, so local peer/runtime state survives a normal rebuild. Shared auth session state, operator state, and artifact publication remain externalized in Redis and S3.
 
@@ -138,8 +141,12 @@ Configure the workflow to target one of those environments. Put the following va
   - study id advertised in the experiment directory.
 - `BURN_DRAGON_P2P_RELEASE_TRAIN_HASH`
   - release-train hash enforced by the auth portal.
+- `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
+  - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
+- `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.12`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
-  - optional pinned `burn_p2p` git ref used to install `burn_p2p_bootstrap` on the edge host. Defaults to `0c89aaf`, the first `burn_p2p` commit with ambient-IAM direct S3 publication support.
+  - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
 ### Optional Environment Variables
 
@@ -190,6 +197,24 @@ Configure the workflow to target one of those environments. Put the following va
   - override encrypted EBS root size, default `256`
 - `BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB`
   - retained encrypted bootstrap/auth/publication data volume size, default `512`
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY`
+  - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND`
+  - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`. Defaults to `wgpu`.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND`
+  - experiment family assigned to the managed trainer pool. Supported values: `nca`, `climbmix`. Defaults to `nca`.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET`
+  - target role used by managed trainer instances. Defaults to `trainer`.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE`
+  - EC2 instance type used by the managed trainer pool. Defaults to `g5.xlarge`.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE`
+  - optional autoscaling-group minimum size. Leave empty or `0` to default to the desired capacity.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
+  - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to `0.21.0-pre.12`.
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
+  - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
   - enable or disable the Terraform-managed daily data-volume snapshot policy. Defaults to `true`.
 - `BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS`
@@ -229,8 +254,10 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_GITHUB_CLIENT_ID`
 - `BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET`
   - legacy GitHub-specific secret names still accepted as a fallback when `auth_connector_kind=github`
+- `BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON`
+  - optional JSON auth bundle written into SSM for the managed native trainer pool. Required only when `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY > 0`.
 
-The workflow writes these secrets into AWS SSM Parameter Store before `terraform apply` only when the selected auth connector needs client credentials, so they do not need to be committed into Terraform files or `.tfvars`.
+The workflow writes these secrets into AWS SSM Parameter Store before `terraform apply` only when the selected auth connector needs client credentials, so they do not need to be committed into Terraform files or `.tfvars`. When the managed trainer pool is enabled, the workflow also writes the trainer auth bundle secret into SSM before `terraform apply` so trainer instances can fetch it at boot.
 
 There is intentionally no shared bootstrap admin token in the production flow. Admin actions are authenticated with a short-lived session id. For GitHub auth, admin capability is granted only to explicitly listed GitHub username handles that also satisfy the org/team/repo policy. For non-GitHub auth, seed explicit admin principals through `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON`.
 
@@ -248,6 +275,31 @@ The deployed EC2 instance role is created by Terraform and needs to:
 
 - read the SSM parameters that hold the auth client credentials when the selected auth connector uses them
 - list, upload, and delete objects in the configured artifact S3 bucket so the bootstrap host can publish and prune checkpoints and metrics without static AWS keys
+- when managed trainers are enabled, the managed trainer EC2 role additionally needs SSM read access for the trainer auth bundle parameter and KMS decrypt rights for the SSM key
+
+## Managed Native Trainer Pool
+
+The deploy can optionally provision an autoscaled native trainer pool alongside the bootstrap plane.
+
+Current behavior:
+
+- each managed trainer instance installs `burn_dragon_p2p_native` from crates.io
+- GPU trainer backends install the NVIDIA and Vulkan user-space stack at first boot; use a GPU-capable instance type like `g5.xlarge` for `wgpu` or `cuda`
+- the instance fetches a JSON auth bundle from SSM at startup
+- the instance joins the deployed edge as a native trainer for either `nca` or `climbmix`
+- the trainer pool defaults to `0` instances, so nothing is created unless you opt in
+
+Recommended first production setting:
+
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=1`
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=wgpu`
+- `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
+
+Operational constraint:
+
+- the trainer auth bundle must be suitable for unattended use
+- if your auth provider issues short-lived human sessions only, do not point the managed trainer pool at that bundle
+- use a long-lived service principal, static principal, or equivalent operator-managed credential path instead
 
 ## Dynamic Admin Flow
 

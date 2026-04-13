@@ -20,7 +20,7 @@ fn default_bootstrap() -> DragonBrowserSiteBootstrap {
             selected_experiment_id: None,
             selected_revision_id: None,
             requested_scopes: Default::default(),
-            require_github_auth: true,
+            require_edge_auth: true,
             training: None,
         },
         release_manifest: None,

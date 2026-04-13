@@ -64,7 +64,7 @@ There is intentionally no Cargo feature called `internet-scale`. Authenticated n
 For network participation:
 
 - native peers require an authenticated edge auth bundle
-- browser peers require an authenticated browser session when `require_github_auth` is set
+- browser peers require an authenticated browser session when `require_edge_auth` is set
 - browser training submission requires WebGPU
 - dynamic admin edits are authenticated with a session-backed browser or native login, not a shared bootstrap token
 
@@ -193,7 +193,7 @@ let config = DragonBrowserAppConfig {
     selected_experiment_id: None,
     selected_revision_id: None,
     requested_scopes: Default::default(),
-    require_github_auth: true,
+    require_edge_auth: true,
     training: None,
 };
 

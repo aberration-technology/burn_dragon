@@ -363,7 +363,7 @@ async fn ensure_required_session(
     config: &DragonBrowserAppConfig,
 ) -> Result<Option<BrowserSessionState>> {
     let session = load_browser_session(&resolved_edge_base_url(config)?).await?;
-    if config.require_github_auth {
+    if config.require_edge_auth {
         let _claims = session.session.as_ref().ok_or_else(|| {
             anyhow!("an authenticated browser session is required before joining this network")
         })?;
@@ -400,7 +400,7 @@ pub async fn resume_or_complete_browser_auth(
         .await?;
         return Ok(Some(session));
     }
-    if config.require_github_auth {
+    if config.require_edge_auth {
         return load_browser_session(&edge_base_url).await.map(Some);
     }
     Ok(None)
@@ -811,7 +811,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let view = current_view.read().clone();
     let session_panel = session_identity_panel(session_state.read().as_ref());
     let callback_available = provider_code_from_window_location().is_some();
-    let auth_required = props.config.require_github_auth;
+    let auth_required = props.config.require_edge_auth;
     let admin_granted_studies = granted_admin_studies(session_state.read().as_ref());
     let admin_granted_studies_label = admin_granted_studies.join(", ");
     let admin_scope_ready = session_has_admin_scope(

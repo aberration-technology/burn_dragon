@@ -64,12 +64,14 @@ locals {
     revoke_url         = trimspace(var.auth_revoke_url) != "" ? trimspace(var.auth_revoke_url) : null
     jwks_url           = trimspace(var.auth_jwks_url) != "" ? trimspace(var.auth_jwks_url) : null
   }
-  auth_principals = try(jsondecode(var.auth_principals_json), [])
+  auth_principals          = try(jsondecode(var.auth_principals_json), [])
+  bootstrap_install_source = lower(trimspace(var.bootstrap_install_source))
   secret_parameter_names = {
     auth_client_id                 = "${var.secret_parameter_prefix}/auth_client_id"
     auth_client_secret             = "${var.secret_parameter_prefix}/auth_client_secret"
     authority_key                  = "${var.secret_parameter_prefix}/authority_key"
     control_plane_redis_auth_token = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
+    trainer_auth_bundle            = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
   }
   bootstrap_primary_private_ip   = "10.42.1.10"
   bootstrap_secondary_private_ip = "10.42.2.10"
@@ -129,11 +131,25 @@ locals {
     ),
     "-",
   )
-  artifact_replica_bucket_name              = trimspace(var.artifact_replica_bucket_name) != "" ? trimspace(var.artifact_replica_bucket_name) : local.default_artifact_replica_bucket_name
-  artifact_replica_bucket_arn               = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_replica_bucket_name}"
-  artifact_replica_bucket_object_arn        = "${local.artifact_replica_bucket_arn}/*"
-  artifact_replica_bucket_s3_uri            = "s3://${local.artifact_replica_bucket_name}/${local.artifact_bucket_path_prefix}"
-  disaster_recovery_snapshot_copies_enabled = local.disaster_recovery_enabled && var.enable_data_volume_snapshots && var.enable_disaster_recovery_snapshot_copies
+  artifact_replica_bucket_name               = trimspace(var.artifact_replica_bucket_name) != "" ? trimspace(var.artifact_replica_bucket_name) : local.default_artifact_replica_bucket_name
+  artifact_replica_bucket_arn                = "arn:${data.aws_partition.current.partition}:s3:::${local.artifact_replica_bucket_name}"
+  artifact_replica_bucket_object_arn         = "${local.artifact_replica_bucket_arn}/*"
+  artifact_replica_bucket_s3_uri             = "s3://${local.artifact_replica_bucket_name}/${local.artifact_bucket_path_prefix}"
+  disaster_recovery_snapshot_copies_enabled  = local.disaster_recovery_enabled && var.enable_data_volume_snapshots && var.enable_disaster_recovery_snapshot_copies
+  managed_trainer_enabled                    = var.managed_trainer_desired_capacity > 0
+  managed_trainer_backend                    = lower(trimspace(var.managed_trainer_backend))
+  managed_trainer_experiment_kind            = lower(trimspace(var.managed_trainer_experiment_kind))
+  managed_trainer_min_size_effective         = var.managed_trainer_min_size > 0 ? var.managed_trainer_min_size : var.managed_trainer_desired_capacity
+  managed_trainer_max_size_effective         = var.managed_trainer_max_size > 0 ? var.managed_trainer_max_size : max(var.managed_trainer_desired_capacity, 1)
+  managed_trainer_features                   = local.managed_trainer_backend == "cpu" ? "native" : "native,${local.managed_trainer_backend}"
+  managed_trainer_enabled_features_label     = local.managed_trainer_features
+  managed_trainer_experiment_id              = local.managed_trainer_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
+  managed_trainer_revision_id                = local.managed_trainer_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_trainer_auth_bundle_parameter_name = trimspace(var.managed_trainer_auth_bundle_parameter_name) != "" ? trimspace(var.managed_trainer_auth_bundle_parameter_name) : local.secret_parameter_names.trainer_auth_bundle
+  managed_trainer_seed_node_urls = [
+    "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
+    "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
+  ]
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"
@@ -566,6 +582,27 @@ check "artifact_replica_encryption_configuration" {
   }
 }
 
+check "bootstrap_install_source_configuration" {
+  assert {
+    condition     = local.bootstrap_install_source != "git" || trimspace(var.bootstrap_git_ref) != ""
+    error_message = "Set bootstrap_git_ref when bootstrap_install_source = git."
+  }
+}
+
+check "managed_trainer_scaling_configuration" {
+  assert {
+    condition     = !local.managed_trainer_enabled || (local.managed_trainer_min_size_effective <= var.managed_trainer_desired_capacity && local.managed_trainer_max_size_effective >= var.managed_trainer_desired_capacity)
+    error_message = "Managed trainer min/max size must bracket managed_trainer_desired_capacity."
+  }
+}
+
+check "managed_trainer_instance_type_configuration" {
+  assert {
+    condition     = !local.managed_trainer_enabled || local.managed_trainer_backend == "cpu" || startswith(lower(var.managed_trainer_instance_type), "g") || startswith(lower(var.managed_trainer_instance_type), "p")
+    error_message = "Managed trainer backends wgpu and cuda require a GPU-capable instance type, for example g5.xlarge."
+  }
+}
+
 resource "aws_vpc" "bootstrap" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_hostnames = true
@@ -768,6 +805,181 @@ resource "aws_iam_role_policy" "bootstrap_secret_access" {
 resource "aws_iam_instance_profile" "bootstrap" {
   name = "${var.stack_name}-bootstrap"
   role = aws_iam_role.bootstrap.name
+}
+
+resource "aws_security_group" "managed_trainer" {
+  count       = local.managed_trainer_enabled ? 1 : 0
+  name        = "${var.stack_name}-managed-trainer"
+  description = "burn_dragon_p2p managed native trainer"
+  vpc_id      = aws_vpc.bootstrap.id
+
+  dynamic "ingress" {
+    for_each = var.ssh_cidr_blocks
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-managed-trainer"
+  })
+}
+
+resource "aws_iam_role" "managed_trainer" {
+  count = local.managed_trainer_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-trainer"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      },
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "managed_trainer_ssm_managed_core" {
+  count      = local.managed_trainer_enabled ? 1 : 0
+  role       = aws_iam_role.managed_trainer[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "managed_trainer_secret_access" {
+  count = local.managed_trainer_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-trainer-secret-access"
+  role  = aws_iam_role.managed_trainer[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+        ]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.managed_trainer_auth_bundle_parameter_name}",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+        ]
+        Resource = [data.aws_kms_alias.ssm.target_key_arn]
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "managed_trainer" {
+  count = local.managed_trainer_enabled ? 1 : 0
+  name  = "${var.stack_name}-managed-trainer"
+  role  = aws_iam_role.managed_trainer[0].name
+}
+
+resource "aws_launch_template" "managed_trainer" {
+  count         = local.managed_trainer_enabled ? 1 : 0
+  name_prefix   = "${var.stack_name}-managed-trainer-"
+  image_id      = data.aws_ami.ubuntu.id
+  instance_type = var.managed_trainer_instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.managed_trainer[0].name
+  }
+
+  vpc_security_group_ids = [aws_security_group.managed_trainer[0].id]
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_size           = var.managed_trainer_root_volume_size_gib
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  user_data = base64encode(templatefile("${path.module}/templates/trainer-user-data.sh.tftpl", {
+    aws_region                         = var.aws_region
+    dragon_crate_version               = var.managed_trainer_crate_version
+    trainer_backend                    = local.managed_trainer_backend
+    trainer_features                   = local.managed_trainer_features
+    trainer_enabled_features_label     = local.managed_trainer_enabled_features_label
+    trainer_edge_base_url              = "https://${var.edge_domain_name}"
+    trainer_seed_node_urls             = local.managed_trainer_seed_node_urls
+    trainer_project_family_id          = var.project_family_id
+    trainer_network_id                 = var.network_id
+    trainer_study_id                   = var.study_id
+    trainer_experiment_id              = local.managed_trainer_experiment_id
+    trainer_revision_id                = local.managed_trainer_revision_id
+    trainer_experiment_kind            = local.managed_trainer_experiment_kind
+    trainer_target                     = var.managed_trainer_target
+    trainer_auth_bundle_parameter_name = local.managed_trainer_auth_bundle_parameter_name
+  }))
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = merge(local.tags, {
+      Name = "${var.stack_name}-managed-trainer"
+      Role = "managed-trainer"
+    })
+  }
+
+  update_default_version = true
+}
+
+resource "aws_autoscaling_group" "managed_trainer" {
+  count                     = local.managed_trainer_enabled ? 1 : 0
+  name                      = "${var.stack_name}-managed-trainer"
+  min_size                  = local.managed_trainer_min_size_effective
+  max_size                  = local.managed_trainer_max_size_effective
+  desired_capacity          = var.managed_trainer_desired_capacity
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+  vpc_zone_identifier       = [aws_subnet.public.id, aws_subnet.public_secondary.id]
+
+  launch_template {
+    id      = aws_launch_template.managed_trainer[0].id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.stack_name}-managed-trainer"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "managed-trainer"
+    propagate_at_launch = true
+  }
 }
 
 resource "aws_security_group" "control_plane_redis" {
@@ -1148,8 +1360,10 @@ resource "aws_instance" "bootstrap" {
     bootstrap_data_device_name             = var.data_volume_device_name
     bootstrap_data_mount_path              = local.bootstrap_data_mount_path
     bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_data.id
+    bootstrap_crate_version                = var.bootstrap_crate_version
     bootstrap_git_ref                      = var.bootstrap_git_ref
     bootstrap_git_repo                     = var.bootstrap_git_repository
+    bootstrap_install_source               = local.bootstrap_install_source
     bootstrap_node_role                    = "primary"
     caddyfile                              = local.caddyfile
     control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token
@@ -1220,8 +1434,10 @@ resource "aws_instance" "bootstrap_secondary" {
     bootstrap_data_device_name             = var.data_volume_device_name
     bootstrap_data_mount_path              = local.bootstrap_data_mount_path
     bootstrap_data_volume_id               = aws_ebs_volume.bootstrap_secondary_data.id
+    bootstrap_crate_version                = var.bootstrap_crate_version
     bootstrap_git_ref                      = var.bootstrap_git_ref
     bootstrap_git_repo                     = var.bootstrap_git_repository
+    bootstrap_install_source               = local.bootstrap_install_source
     bootstrap_node_role                    = "secondary"
     caddyfile                              = local.caddyfile
     control_plane_redis_auth_token_name    = local.secret_parameter_names.control_plane_redis_auth_token

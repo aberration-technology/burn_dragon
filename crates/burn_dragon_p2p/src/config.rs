@@ -404,8 +404,8 @@ pub struct DragonBrowserAppConfig {
     pub selected_revision_id: Option<String>,
     #[serde(default)]
     pub requested_scopes: BTreeSet<ExperimentScope>,
-    #[serde(default)]
-    pub require_github_auth: bool,
+    #[serde(default, alias = "require_github_auth")]
+    pub require_edge_auth: bool,
     #[cfg(feature = "wasm-peer")]
     #[serde(default)]
     pub training: Option<DragonBrowserTrainingConfig>,

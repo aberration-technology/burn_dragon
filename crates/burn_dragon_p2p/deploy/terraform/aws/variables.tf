@@ -33,16 +33,33 @@ variable "edge_domain_name" {
   default     = "dragon.aberration.technology"
 }
 
+variable "bootstrap_install_source" {
+  description = "How the bootstrap hosts install burn_p2p_bootstrap. Supported values: crate or git. Production deployments should use the published crate by default."
+  type        = string
+  default     = "crate"
+
+  validation {
+    condition     = contains(["crate", "git"], lower(trimspace(var.bootstrap_install_source)))
+    error_message = "bootstrap_install_source must be one of: crate, git."
+  }
+}
+
+variable "bootstrap_crate_version" {
+  description = "Published burn_p2p_bootstrap crate version installed on the bootstrap hosts when bootstrap_install_source = crate."
+  type        = string
+  default     = "0.21.0-pre.12"
+}
+
 variable "bootstrap_git_repository" {
-  description = "Git repository used to install burn_p2p_bootstrap on the edge host."
+  description = "Git repository used to install burn_p2p_bootstrap when bootstrap_install_source = git."
   type        = string
   default     = "https://github.com/aberration-technology/burn_p2p.git"
 }
 
 variable "bootstrap_git_ref" {
-  description = "Pinned burn_p2p git ref used to install burn_p2p_bootstrap. Defaults to the first burn_p2p commit with ambient-IAM direct S3 publication support."
+  description = "Pinned burn_p2p git ref used to install burn_p2p_bootstrap when bootstrap_install_source = git."
   type        = string
-  default     = "0c89aaf"
+  default     = ""
 }
 
 variable "secret_parameter_prefix" {
@@ -367,6 +384,76 @@ variable "artifact_replica_bucket_force_destroy" {
   description = "Whether Terraform may destroy the disaster-recovery artifact replica S3 bucket even if it still contains replicated checkpoints and metrics."
   type        = bool
   default     = false
+}
+
+variable "managed_trainer_desired_capacity" {
+  description = "Desired instance count for the optional managed native trainer pool. Set to 0 to disable managed trainers."
+  type        = number
+  default     = 0
+}
+
+variable "managed_trainer_min_size" {
+  description = "Optional minimum size for the managed native trainer pool. Leave 0 to default to managed_trainer_desired_capacity."
+  type        = number
+  default     = 0
+}
+
+variable "managed_trainer_max_size" {
+  description = "Optional maximum size for the managed native trainer pool. Leave 0 to default to managed_trainer_desired_capacity."
+  type        = number
+  default     = 0
+}
+
+variable "managed_trainer_instance_type" {
+  description = "EC2 instance type used by the managed native trainer pool."
+  type        = string
+  default     = "g5.xlarge"
+}
+
+variable "managed_trainer_root_volume_size_gib" {
+  description = "Root EBS volume size for managed native trainer instances."
+  type        = number
+  default     = 256
+}
+
+variable "managed_trainer_backend" {
+  description = "Native backend used by the managed trainer pool. Supported values: cpu, wgpu, cuda."
+  type        = string
+  default     = "wgpu"
+
+  validation {
+    condition     = contains(["cpu", "wgpu", "cuda"], lower(trimspace(var.managed_trainer_backend)))
+    error_message = "managed_trainer_backend must be one of: cpu, wgpu, cuda."
+  }
+}
+
+variable "managed_trainer_experiment_kind" {
+  description = "Experiment kind assigned to the managed trainer pool. Supported values: nca, climbmix."
+  type        = string
+  default     = "nca"
+
+  validation {
+    condition     = contains(["nca", "climbmix"], lower(trimspace(var.managed_trainer_experiment_kind)))
+    error_message = "managed_trainer_experiment_kind must be one of: nca, climbmix."
+  }
+}
+
+variable "managed_trainer_target" {
+  description = "Native target mode used by managed trainer instances."
+  type        = string
+  default     = "trainer"
+}
+
+variable "managed_trainer_crate_version" {
+  description = "Published burn_dragon_p2p crate version installed on managed trainer instances."
+  type        = string
+  default     = "0.21.0-pre.12"
+}
+
+variable "managed_trainer_auth_bundle_parameter_name" {
+  description = "Optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive a standard name under secret_parameter_prefix."
+  type        = string
+  default     = ""
 }
 
 variable "ssh_cidr_blocks" {

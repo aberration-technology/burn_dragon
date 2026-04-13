@@ -115,8 +115,12 @@ pub struct BuildBrowserSiteArgs {
     pub selected_experiment_id: Option<String>,
     #[arg(long)]
     pub selected_revision_id: Option<String>,
-    #[arg(long, default_value_t = true)]
-    pub require_github_auth: bool,
+    #[arg(
+        long = "require-edge-auth",
+        alias = "require-github-auth",
+        default_value_t = true
+    )]
+    pub require_edge_auth: bool,
 }
 
 impl Default for BuildBrowserSiteArgs {
@@ -127,7 +131,7 @@ impl Default for BuildBrowserSiteArgs {
             seed_node_urls: Vec::new(),
             selected_experiment_id: None,
             selected_revision_id: None,
-            require_github_auth: true,
+            require_edge_auth: true,
         }
     }
 }
@@ -260,7 +264,7 @@ fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> serde_json::Value
             "selected_experiment_id": args.selected_experiment_id,
             "selected_revision_id": args.selected_revision_id,
             "requested_scopes": requested_scopes,
-            "require_github_auth": args.require_github_auth,
+            "require_edge_auth": args.require_edge_auth,
             "training": null,
         },
         "release_manifest": null,

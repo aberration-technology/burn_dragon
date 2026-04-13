@@ -31,10 +31,23 @@ on:
         required: false
         default: aberration.technology
         type: string
-      bootstrap_git_ref:
-        description: "Pinned `burn_p2p` git ref used to install `burn_p2p_bootstrap`. Example: `0c89aaf`, a full commit SHA, or a release tag. Leave the default unless you are intentionally testing a newer bootstrap build."
+      bootstrap_install_source:
+        description: "How to install `burn_p2p_bootstrap` on the bootstrap hosts. Example: `crate` for the published crates.io package or `git` only when intentionally testing an unpublished burn_p2p revision."
+        required: true
+        default: crate
+        type: choice
+        options:
+          - crate
+          - git
+      bootstrap_version:
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.12`."
         required: false
-        default: 0c89aaf
+        default: 0.21.0-pre.12
+        type: string
+      bootstrap_git_ref:
+        description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
+        required: false
+        default: ""
         type: string
       auth_connector_kind:
         description: "Auth connector kind override. Supported values: `github`, `oidc`, `oauth`, `static`, `external`. Clear it to use the GitHub Environment variable, then default to `github`."
@@ -76,6 +89,28 @@ on:
         required: false
         default: ""
         type: string
+      managed_trainer_desired_capacity:
+        description: "Desired instance count for the optional managed native trainer pool. Example: `1` to keep one managed trainer online. Keep `0` to disable the pool."
+        required: false
+        default: "0"
+        type: string
+      managed_trainer_backend:
+        description: "Native backend used by the managed trainer pool. Example: `wgpu` for the normal fleet, `cuda` for CUDA trainers, or `cpu` only for explicit debugging."
+        required: true
+        default: wgpu
+        type: choice
+        options:
+          - wgpu
+          - cuda
+          - cpu
+      managed_trainer_experiment_kind:
+        description: "Experiment kind assigned to the managed trainer pool. Example: `nca` for the default warm trainer fleet or `climbmix` when bringing up that experiment."
+        required: true
+        default: nca
+        type: choice
+        options:
+          - nca
+          - climbmix
       force_replace_bootstrap:
         description: "Replace the EC2 bootstrap host during apply. Example: set `true` only for an explicit rebuild. The retained bootstrap data volume is preserved, so normal host replacement keeps bootstrap/auth/publication state."
         required: true
@@ -102,6 +137,7 @@ jobs:
       AUTH_CLIENT_SECRET: ${{ secrets.BURN_DRAGON_P2P_AUTH_CLIENT_SECRET }}
       GITHUB_CLIENT_ID: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_ID }}
       GITHUB_CLIENT_SECRET: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET }}
+      TRAINER_AUTH_BUNDLE_JSON: ${{ secrets.BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON }}
 
     steps:
       - name: checkout repository
@@ -154,11 +190,27 @@ jobs:
           github_admin_logins_var="${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_LOGINS }}"
           climbmix_dataset_base_url_input="${{ github.event.inputs.climbmix_browser_dataset_base_url }}"
           climbmix_dataset_base_url_var="${{ vars.BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL }}"
+          bootstrap_install_source_input="${{ github.event.inputs.bootstrap_install_source }}"
+          bootstrap_install_source_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE }}"
+          bootstrap_version_input="${{ github.event.inputs.bootstrap_version }}"
+          bootstrap_version_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_VERSION }}"
           bootstrap_git_ref_input="${{ github.event.inputs.bootstrap_git_ref }}"
           bootstrap_git_ref_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}"
           instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
           root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
           data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
+          managed_trainer_desired_capacity_input="${{ github.event.inputs.managed_trainer_desired_capacity }}"
+          managed_trainer_desired_capacity_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY }}"
+          managed_trainer_backend_input="${{ github.event.inputs.managed_trainer_backend }}"
+          managed_trainer_backend_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND }}"
+          managed_trainer_experiment_kind_input="${{ github.event.inputs.managed_trainer_experiment_kind }}"
+          managed_trainer_experiment_kind_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}"
+          managed_trainer_instance_type="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE }}"
+          managed_trainer_min_size="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE }}"
+          managed_trainer_max_size="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE }}"
+          managed_trainer_target="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}"
+          managed_trainer_crate_version="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION }}"
+          managed_trainer_auth_bundle_parameter_name="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME }}"
           enable_data_volume_snapshots="${{ vars.BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS }}"
           data_volume_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}"
           enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
@@ -261,12 +313,74 @@ jobs:
             climbmix_dataset_base_url="https://${edge_domain_name}/dragon-datasets/climbmix-pretraining/climbmix-r1"
           fi
 
+          bootstrap_install_source="$bootstrap_install_source_input"
+          if [ -z "$bootstrap_install_source" ]; then
+            bootstrap_install_source="$bootstrap_install_source_var"
+          fi
+          if [ -z "$bootstrap_install_source" ]; then
+            bootstrap_install_source="crate"
+          fi
+          bootstrap_install_source="$(printf '%s' "$bootstrap_install_source" | tr '[:upper:]' '[:lower:]' | xargs)"
+          case "$bootstrap_install_source" in
+            crate|git) ;;
+            *)
+              echo "unsupported bootstrap_install_source: $bootstrap_install_source" >&2
+              exit 1
+              ;;
+          esac
+
+          bootstrap_version="$bootstrap_version_input"
+          if [ -z "$bootstrap_version" ]; then
+            bootstrap_version="$bootstrap_version_var"
+          fi
+          if [ -z "$bootstrap_version" ]; then
+            bootstrap_version="0.21.0-pre.12"
+          fi
+
           bootstrap_git_ref="$bootstrap_git_ref_input"
           if [ -z "$bootstrap_git_ref" ]; then
             bootstrap_git_ref="$bootstrap_git_ref_var"
           fi
-          if [ -z "$bootstrap_git_ref" ]; then
-            bootstrap_git_ref="0c89aaf"
+          if [ "$bootstrap_install_source" = "git" ] && [ -z "$bootstrap_git_ref" ]; then
+            echo "bootstrap_git_ref is required when bootstrap_install_source=git" >&2
+            exit 1
+          fi
+
+          managed_trainer_desired_capacity="$managed_trainer_desired_capacity_input"
+          if [ -z "$managed_trainer_desired_capacity" ]; then
+            managed_trainer_desired_capacity="$managed_trainer_desired_capacity_var"
+          fi
+          if [ -z "$managed_trainer_desired_capacity" ]; then
+            managed_trainer_desired_capacity="0"
+          fi
+          managed_trainer_backend="$managed_trainer_backend_input"
+          if [ -z "$managed_trainer_backend" ]; then
+            managed_trainer_backend="$managed_trainer_backend_var"
+          fi
+          if [ -z "$managed_trainer_backend" ]; then
+            managed_trainer_backend="wgpu"
+          fi
+          managed_trainer_backend="$(printf '%s' "$managed_trainer_backend" | tr '[:upper:]' '[:lower:]' | xargs)"
+          managed_trainer_experiment_kind="$managed_trainer_experiment_kind_input"
+          if [ -z "$managed_trainer_experiment_kind" ]; then
+            managed_trainer_experiment_kind="$managed_trainer_experiment_kind_var"
+          fi
+          if [ -z "$managed_trainer_experiment_kind" ]; then
+            managed_trainer_experiment_kind="nca"
+          fi
+          managed_trainer_experiment_kind="$(printf '%s' "$managed_trainer_experiment_kind" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ -z "$managed_trainer_target" ]; then
+            managed_trainer_target="trainer"
+          fi
+          if [ -z "$managed_trainer_crate_version" ]; then
+            managed_trainer_crate_version="0.21.0-pre.12"
+          fi
+          if [ -z "$managed_trainer_auth_bundle_parameter_name" ]; then
+            managed_trainer_auth_bundle_parameter_name="${secret_parameter_prefix}/trainer_auth_bundle_json"
+          fi
+          if [ "$managed_trainer_desired_capacity" != "0" ] && [ -z "$TRAINER_AUTH_BUNDLE_JSON" ]; then
+            echo "missing BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON secret while managed_trainer_desired_capacity=$managed_trainer_desired_capacity" >&2
+            exit 1
           fi
 
           create_artifact_bucket="$create_artifact_bucket_input"
@@ -351,8 +465,16 @@ jobs:
             echo "TF_VAR_project_family_id=$project_family_id"
             echo "TF_VAR_study_id=$study_id"
             echo "TF_VAR_release_train_hash=$release_train_hash"
+            echo "TF_VAR_bootstrap_install_source=$bootstrap_install_source"
+            echo "TF_VAR_bootstrap_crate_version=$bootstrap_version"
             echo "TF_VAR_bootstrap_git_ref=$bootstrap_git_ref"
             echo "TF_VAR_create_artifact_bucket=$create_artifact_bucket"
+            echo "TF_VAR_managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
+            echo "TF_VAR_managed_trainer_backend=$managed_trainer_backend"
+            echo "TF_VAR_managed_trainer_experiment_kind=$managed_trainer_experiment_kind"
+            echo "TF_VAR_managed_trainer_target=$managed_trainer_target"
+            echo "TF_VAR_managed_trainer_crate_version=$managed_trainer_crate_version"
+            echo "TF_VAR_managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
             echo "TF_VAR_create_artifact_replica_bucket=$create_artifact_replica_bucket"
             echo "AUTH_CONNECTOR_KIND=$auth_connector_kind"
             echo "TF_VAR_auth_connector_kind=$auth_connector_kind"
@@ -408,6 +530,15 @@ jobs:
           fi
           if [ -n "$data_volume_size_gib" ]; then
             echo "TF_VAR_data_volume_size_gib=$data_volume_size_gib" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$managed_trainer_instance_type" ]; then
+            echo "TF_VAR_managed_trainer_instance_type=$managed_trainer_instance_type" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$managed_trainer_min_size" ]; then
+            echo "TF_VAR_managed_trainer_min_size=$managed_trainer_min_size" >>"$GITHUB_ENV"
+          fi
+          if [ -n "$managed_trainer_max_size" ]; then
+            echo "TF_VAR_managed_trainer_max_size=$managed_trainer_max_size" >>"$GITHUB_ENV"
           fi
           if [ -n "$enable_data_volume_snapshots" ]; then
             echo "TF_VAR_enable_data_volume_snapshots=$enable_data_volume_snapshots" >>"$GITHUB_ENV"
@@ -478,6 +609,22 @@ jobs:
             --name "${SECRET_PARAMETER_PREFIX}/auth_client_secret" \
             --value "$AUTH_CLIENT_SECRET_RESOLVED"
 
+      - name: seed managed trainer auth bundle in ssm parameter store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${TF_VAR_managed_trainer_desired_capacity:-0}" = "0" ]; then
+            echo "managed trainer pool disabled; skipping trainer auth bundle sync"
+            exit 0
+          fi
+
+          aws ssm put-parameter \
+            --region "$AWS_REGION" \
+            --type SecureString \
+            --overwrite \
+            --name "$TF_VAR_managed_trainer_auth_bundle_parameter_name" \
+            --value "$TRAINER_AUTH_BUNDLE_JSON"
+
       - name: setup terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -533,6 +680,9 @@ jobs:
           disaster_recovery_region="$(terraform -chdir="$TF_ROOT" output -raw disaster_recovery_region)"
           artifact_replica_bucket_name="$(terraform -chdir="$TF_ROOT" output -raw artifact_replica_bucket_name)"
           artifact_replica_bucket_uri="$(terraform -chdir="$TF_ROOT" output -raw artifact_replica_bucket_uri)"
+          managed_trainer_asg_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_asg_name)"
+          managed_trainer_desired_capacity="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_desired_capacity)"
+          managed_trainer_auth_bundle_parameter_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_auth_bundle_parameter_name)"
 
           {
             echo "edge_url=$edge_url"
@@ -551,6 +701,9 @@ jobs:
             echo "disaster_recovery_region=$disaster_recovery_region"
             echo "artifact_replica_bucket_name=$artifact_replica_bucket_name"
             echo "artifact_replica_bucket_uri=$artifact_replica_bucket_uri"
+            echo "managed_trainer_asg_name=$managed_trainer_asg_name"
+            echo "managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
+            echo "managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
       - name: wait for browser edge https health
@@ -586,7 +739,12 @@ jobs:
           - Secondary data volume id: \`${{ steps.outputs.outputs.secondary_data_volume_id }}\`
           - Data mount path: \`${{ steps.outputs.outputs.data_mount_path }}\`
           - Shared Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint }}\`
-          - Bootstrap git ref: \`${TF_VAR_bootstrap_git_ref}\`
+          - Bootstrap install source: \`${TF_VAR_bootstrap_install_source}\`
+          - Bootstrap crate version: \`${TF_VAR_bootstrap_crate_version}\`
+          - Bootstrap git ref override: \`${TF_VAR_bootstrap_git_ref:-n/a}\`
+          - Managed trainer ASG: \`${{ steps.outputs.outputs.managed_trainer_asg_name || 'disabled' }}\`
+          - Managed trainer desired capacity: \`${{ steps.outputs.outputs.managed_trainer_desired_capacity }}\`
+          - Managed trainer auth bundle parameter: \`${{ steps.outputs.outputs.managed_trainer_auth_bundle_parameter_name || 'n/a' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
           - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
           - Warm DR region: \`${{ steps.outputs.outputs.disaster_recovery_region || 'disabled' }}\`

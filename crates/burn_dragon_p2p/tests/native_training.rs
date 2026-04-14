@@ -318,6 +318,38 @@ fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &st
     panic!("{message}");
 }
 
+fn is_transient_diffusion_artifact_error(message: &str) -> bool {
+    [
+        "timed out waiting for artifact-chunk",
+        "timed out waiting for artifact-manifest",
+        "no connected peer provided chunk",
+        "no connected peer provided artifact",
+        "Failed to dial the requested peer",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+fn advance_diffusion_with_retry(
+    label: &str,
+    deadline: Instant,
+    mut advance: impl FnMut() -> anyhow::Result<()>,
+) {
+    loop {
+        match advance() {
+            Ok(()) => return,
+            Err(error)
+                if Instant::now() < deadline
+                    && is_transient_diffusion_artifact_error(&error.to_string()) =>
+            {
+                eprintln!("{label}: transient diffusion sync retry: {error}");
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("{label}: {error:#}"),
+        }
+    }
+}
+
 fn native_swarm_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -1384,7 +1416,7 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1455,7 +1487,7 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("artifact-smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1639,7 +1671,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             identity: Default::default(),
             bootstrap_peers: vec![bootstrap_addr.clone()],
             manifest: native_manifest_seed(),
-            app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+            app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
             git_commit: Some(format!("runtime-cluster-{label}")),
             enabled_features_label: Some("native-cpu".into()),
             auth: None,
@@ -1887,14 +1919,19 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         ];
         let convergence_deadline = Instant::now() + Duration::from_secs(90);
         let promoted_head = loop {
-            seed.advance_diffusion_steady_state(&experiment, None, None)
-                .expect("advance seed diffusion");
-            trainer_b
-                .advance_diffusion_steady_state(&experiment, None, None)
-                .expect("advance trainer b diffusion");
-            trainer_c
-                .advance_diffusion_steady_state(&experiment, None, None)
-                .expect("advance trainer c diffusion");
+            advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
+                seed.advance_diffusion_steady_state(&experiment, None, None)
+            });
+            advance_diffusion_with_retry(
+                "advance trainer b diffusion",
+                convergence_deadline,
+                || trainer_b.advance_diffusion_steady_state(&experiment, None, None),
+            );
+            advance_diffusion_with_retry(
+                "advance trainer c diffusion",
+                convergence_deadline,
+                || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
+            );
 
             let seed_head = seed
                 .sync_experiment_head(&experiment)
@@ -2024,7 +2061,7 @@ fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
         identity: Default::default(),
         bootstrap_peers: vec![bootstrap_addr],
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("bootstrap-only-trainer".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2164,7 +2201,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
             identity: Default::default(),
             bootstrap_peers: vec![bootstrap_addr.clone()],
             manifest: native_manifest_seed(),
-            app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+            app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
             git_commit: Some(label.into()),
             enabled_features_label: Some("native-cpu".into()),
             auth: None,
@@ -2360,14 +2397,15 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
         trainer_c_window.head.head_id.clone(),
     ];
     let promoted_head = loop {
-        seed.advance_diffusion_steady_state(&experiment, None, None)
-            .expect("advance seed diffusion");
-        trainer_b
-            .advance_diffusion_steady_state(&experiment, None, None)
-            .expect("advance trainer b diffusion");
-        trainer_c
-            .advance_diffusion_steady_state(&experiment, None, None)
-            .expect("advance trainer c diffusion");
+        advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
+            seed.advance_diffusion_steady_state(&experiment, None, None)
+        });
+        advance_diffusion_with_retry("advance trainer b diffusion", convergence_deadline, || {
+            trainer_b.advance_diffusion_steady_state(&experiment, None, None)
+        });
+        advance_diffusion_with_retry("advance trainer c diffusion", convergence_deadline, || {
+            trainer_c.advance_diffusion_steady_state(&experiment, None, None)
+        });
 
         let seed_head = seed
             .sync_experiment_head(&experiment)
@@ -2470,7 +2508,7 @@ fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("downgrade".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2539,7 +2577,7 @@ fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("downgrade-persisted".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2607,7 +2645,7 @@ fn climbmix_native_existing_shards_supports_multi_peer_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2668,7 +2706,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2865,7 +2903,7 @@ fn climbmix_http_shards_publish_http_input_source_descriptor() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("http".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2942,7 +2980,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3051,7 +3089,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3171,7 +3209,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3280,7 +3318,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3409,7 +3447,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3454,7 +3492,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3510,7 +3548,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3555,7 +3593,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3611,7 +3649,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3649,7 +3687,7 @@ fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,

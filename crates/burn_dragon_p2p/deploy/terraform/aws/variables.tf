@@ -53,7 +53,7 @@ variable "bootstrap_install_source" {
 variable "bootstrap_crate_version" {
   description = "Published burn_p2p_bootstrap crate version installed on the bootstrap host when bootstrap_install_source = crate."
   type        = string
-  default     = "0.21.0-pre.14"
+  default     = "0.21.0-pre.15"
 }
 
 variable "bootstrap_git_repository" {
@@ -519,7 +519,7 @@ variable "managed_trainer_target" {
 variable "managed_trainer_crate_version" {
   description = "Published burn_dragon_p2p crate version installed on managed trainer instances."
   type        = string
-  default     = "0.21.0-pre.14"
+  default     = "0.21.0-pre.15"
 }
 
 variable "managed_trainer_auth_bundle_parameter_name" {
@@ -560,7 +560,7 @@ variable "managed_validator_experiment_kind" {
 variable "managed_validator_crate_version" {
   description = "Deprecated manual-only validator crate version. Ignored by the standard trainer-only workflow."
   type        = string
-  default     = "0.21.0-pre.14"
+  default     = "0.21.0-pre.15"
 }
 
 variable "managed_validator_auth_bundle_parameter_name" {

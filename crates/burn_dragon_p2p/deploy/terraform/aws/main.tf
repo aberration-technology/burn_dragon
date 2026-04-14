@@ -264,10 +264,8 @@ locals {
 
   dragon_experiment_scopes = [
     { "Train" = { experiment_id = "nca-prepretraining" } },
-    { "Validate" = { experiment_id = "nca-prepretraining" } },
     { "Archive" = { experiment_id = "nca-prepretraining" } },
     { "Train" = { experiment_id = "climbmix-pretraining" } },
-    { "Validate" = { experiment_id = "climbmix-pretraining" } },
     { "Archive" = { experiment_id = "climbmix-pretraining" } },
   ]
   dragon_admin_scopes = concat(
@@ -301,6 +299,53 @@ locals {
     )
   )
 
+  nca_merge_topology_policy_json = jsonencode({
+    strategy             = "KRegularGossip"
+    reducer_replication  = 0
+    target_leaf_cohort   = 3
+    upper_fanin          = 0
+    window_duration_secs = 60
+    publish_jitter_ms    = 750
+    staleness_windows    = 2
+    promotion_policy = {
+      mode                  = "DiffusionSteadyState"
+      validator_quorum      = 1
+      apply_single_root_ema = true
+      allow_late_rollover   = true
+      promote_serve_head    = true
+      diffusion = {
+        settlement_timeout_secs      = 45
+        observation_poll_ms          = 250
+        required_stable_observations = 4
+        support_margin               = 1
+        allow_solo_promotion         = true
+      }
+    }
+  })
+  climbmix_merge_topology_policy_json = jsonencode({
+    strategy             = "KRegularGossip"
+    reducer_replication  = 0
+    target_leaf_cohort   = 3
+    upper_fanin          = 0
+    window_duration_secs = 180
+    publish_jitter_ms    = 750
+    staleness_windows    = 2
+    promotion_policy = {
+      mode                  = "DiffusionSteadyState"
+      validator_quorum      = 1
+      apply_single_root_ema = true
+      allow_late_rollover   = true
+      promote_serve_head    = true
+      diffusion = {
+        settlement_timeout_secs      = 45
+        observation_poll_ms          = 250
+        required_stable_observations = 4
+        support_margin               = 1
+        allow_solo_promotion         = true
+      }
+    }
+  })
+
   contributor_rule = {
     principal_id   = var.github_principal_id
     display_name   = "burn_dragon mainnet contributor"
@@ -313,7 +358,7 @@ locals {
       },
     ]
     granted_roles = {
-      roles = ["TrainerGpu", "Validator", "Archive"]
+      roles = ["TrainerCpu", "TrainerGpu", "BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]
     }
     granted_scopes   = concat(["Connect", "Discover"], local.dragon_experiment_scopes)
     allowed_networks = [var.network_id]
@@ -337,7 +382,7 @@ locals {
         },
       ]
       granted_roles = {
-        roles = ["TrainerGpu", "Validator", "Archive"]
+        roles = ["TrainerCpu", "TrainerGpu", "BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]
       }
       granted_scopes   = local.dragon_admin_scopes
       allowed_networks = [var.network_id]
@@ -365,8 +410,8 @@ locals {
       model_schema_hash = "burn-dragon-language-nca-v1"
       dataset_view_id   = "burn-dragon-universality-nca-v1"
       resource_requirements = {
-        minimum_roles               = ["TrainerGpu"]
-        minimum_device_memory_bytes = var.nca_min_device_memory_bytes
+        minimum_roles               = []
+        minimum_device_memory_bytes = null
         minimum_system_memory_bytes = var.min_system_memory_bytes
         estimated_download_bytes    = 134217728
         estimated_window_seconds    = 60
@@ -376,18 +421,18 @@ locals {
       current_revision_id = "nca-r1"
       current_head_id     = null
       allowed_roles = {
-        roles = ["TrainerGpu", "Validator", "Archive"]
+        roles = ["TrainerCpu", "TrainerGpu", "BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]
       }
       allowed_scopes = [
         { "Train" = { experiment_id = "nca-prepretraining" } },
-        { "Validate" = { experiment_id = "nca-prepretraining" } },
         { "Archive" = { experiment_id = "nca-prepretraining" } },
       ]
       metadata = {
-        experiment_kind        = "nca-prepretraining"
-        stack                  = var.stack_name
-        dragon_profile_version = "1"
-        dragon_profile_json    = local.nca_profile_json
+        experiment_kind                                = "nca-prepretraining"
+        stack                                          = var.stack_name
+        dragon_profile_version                         = "1"
+        dragon_profile_json                            = local.nca_profile_json
+        "burn_p2p.revision.merge_topology.policy_json" = local.nca_merge_topology_policy_json
       }
     },
     {
@@ -399,8 +444,8 @@ locals {
       model_schema_hash = "burn-dragon-language-climbmix-v1"
       dataset_view_id   = "burn-dragon-climbmix-v1"
       resource_requirements = {
-        minimum_roles               = ["TrainerGpu"]
-        minimum_device_memory_bytes = var.climbmix_min_device_memory_bytes
+        minimum_roles               = []
+        minimum_device_memory_bytes = null
         minimum_system_memory_bytes = var.min_system_memory_bytes
         estimated_download_bytes    = 2147483648
         estimated_window_seconds    = 180
@@ -410,18 +455,18 @@ locals {
       current_revision_id = "climbmix-r1"
       current_head_id     = null
       allowed_roles = {
-        roles = ["TrainerGpu", "Validator", "Archive"]
+        roles = ["TrainerCpu", "TrainerGpu", "BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]
       }
       allowed_scopes = [
         { "Train" = { experiment_id = "climbmix-pretraining" } },
-        { "Validate" = { experiment_id = "climbmix-pretraining" } },
         { "Archive" = { experiment_id = "climbmix-pretraining" } },
       ]
       metadata = {
-        experiment_kind        = "climbmix-pretraining"
-        stack                  = var.stack_name
-        dragon_profile_version = "1"
-        dragon_profile_json    = local.climbmix_profile_json
+        experiment_kind                                = "climbmix-pretraining"
+        stack                                          = var.stack_name
+        dragon_profile_version                         = "1"
+        dragon_profile_json                            = local.climbmix_profile_json
+        "burn_p2p.revision.merge_topology.policy_json" = local.climbmix_merge_topology_policy_json
       }
     },
   ]

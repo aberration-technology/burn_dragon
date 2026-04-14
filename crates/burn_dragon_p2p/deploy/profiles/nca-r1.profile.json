@@ -202,8 +202,8 @@
       "native_wgpu_memory_budget_bytes": 4294967296,
       "native_cuda_memory_budget_bytes": 6442450944,
       "browser_wgpu_memory_budget_bytes": 2147483648,
-      "allow_native_validator_fallback": true,
-      "allow_browser_verifier_fallback": true
+      "allow_native_validator_fallback": false,
+      "allow_browser_verifier_fallback": false
     },
     "train_source": {
       "type": "generated_nca",

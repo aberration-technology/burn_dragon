@@ -53,7 +53,7 @@ variable "bootstrap_install_source" {
 variable "bootstrap_crate_version" {
   description = "Published burn_p2p_bootstrap crate version installed on the bootstrap host when bootstrap_install_source = crate."
   type        = string
-  default     = "0.21.0-pre.13"
+  default     = "0.21.0-pre.14"
 }
 
 variable "bootstrap_git_repository" {
@@ -185,7 +185,7 @@ variable "auth_external_trusted_principal_header" {
 variable "auth_external_trusted_internal_only" {
   description = "Whether the external connector should trust only internal traffic for the principal header."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "project_family_id" {
@@ -519,7 +519,7 @@ variable "managed_trainer_target" {
 variable "managed_trainer_crate_version" {
   description = "Published burn_dragon_p2p crate version installed on managed trainer instances."
   type        = string
-  default     = "0.21.0-pre.13"
+  default     = "0.21.0-pre.14"
 }
 
 variable "managed_trainer_auth_bundle_parameter_name" {
@@ -531,7 +531,7 @@ variable "managed_trainer_auth_bundle_parameter_name" {
 variable "managed_validator_enabled" {
   description = "Whether Terraform should provision a single managed native validator instance for canonical promotion. This validator is CPU-only, runs no training loop, and performs validation/promotion work separately from the bootstrap edge."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "managed_validator_instance_type" {
@@ -560,7 +560,7 @@ variable "managed_validator_experiment_kind" {
 variable "managed_validator_crate_version" {
   description = "Published burn_dragon_p2p crate version installed on the managed validator instance."
   type        = string
-  default     = "0.21.0-pre.13"
+  default     = "0.21.0-pre.14"
 }
 
 variable "managed_validator_auth_bundle_parameter_name" {

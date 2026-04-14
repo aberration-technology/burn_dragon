@@ -4,7 +4,7 @@ aws_region              = "us-east-2"
 route53_zone_name       = "aberration.technology"
 edge_domain_name        = "dragon.aberration.technology"
 bootstrap_install_source = "crate"
-bootstrap_crate_version  = "0.21.0-pre.13"
+bootstrap_crate_version  = "0.21.0-pre.14"
 # bootstrap_git_ref      = "main"
 secret_parameter_prefix = "/burn-dragon-p2p/mainnet/bootstrap"
 
@@ -42,11 +42,11 @@ create_artifact_replica_bucket = true
 managed_trainer_desired_capacity = 0
 managed_trainer_backend = "cpu"
 managed_trainer_experiment_kind = "nca"
-managed_validator_enabled = true
+managed_validator_enabled = false
 managed_validator_experiment_kind = "nca"
 # managed_validator_instance_type = "t3a.small"
 # managed_validator_root_volume_size_gib = 32
-# managed_validator_crate_version = "0.21.0-pre.13"
+# managed_validator_crate_version = "0.21.0-pre.14"
 # managed_validator_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/validator_auth_bundle_json"
 # managed_validator_validation_interval_millis = 250
 
@@ -65,7 +65,7 @@ managed_validator_experiment_kind = "nca"
 #     display_name     = "burn_dragon admin"
 #     org_memberships  = []
 #     group_memberships = []
-#     granted_roles    = { roles = ["TrainerGpu", "Validator", "Archive"] }
+#     granted_roles    = { roles = ["TrainerCpu", "TrainerGpu", "Archive"] }
 #     granted_scopes   = ["Connect", "Discover", { Admin = { study_id = "burn-dragon-mainnet" } }]
 #     allowed_networks = ["burn-dragon-mainnet"]
 #     custom_claims    = { operator_role = "admin", admin_capabilities = "all" }
@@ -83,6 +83,6 @@ managed_validator_experiment_kind = "nca"
 # managed_trainer_instance_type = "m7i.large"
 # managed_trainer_min_size = 1
 # managed_trainer_max_size = 2
-# managed_trainer_crate_version = "0.21.0-pre.13"
+# managed_trainer_crate_version = "0.21.0-pre.14"
 # managed_trainer_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/trainer_auth_bundle_json"
 # alarm_sns_topic_arn   = "arn:aws:sns:us-east-2:123456789012:burn-dragon-p2p-alerts"

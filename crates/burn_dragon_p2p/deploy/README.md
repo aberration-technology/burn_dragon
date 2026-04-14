@@ -143,7 +143,7 @@ Before the workflow can publish, set the repository Pages source to `GitHub Acti
 
 That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static; it still connects to the live edge URL you configure. By default, the baked browser config points at `https://dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
 
-The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Validate` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
+The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Archive` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
 
 Terraform now protects the Route53 hosted-zone apex by default. With the production defaults, the stack may manage `dragon.aberration.technology` and `datasets.dragon.aberration.technology`, but it will refuse to claim `aberration.technology` itself unless `allow_route53_zone_apex_records=true` is set explicitly in Terraform.
 
@@ -196,7 +196,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.13`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.14`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
@@ -266,7 +266,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to `0.21.0-pre.13`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to `0.21.0-pre.14`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
@@ -403,15 +403,13 @@ Use `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON` to inject principals like:
     "display_name": "burn_dragon admin",
     "org_memberships": [],
     "group_memberships": [],
-    "granted_roles": { "roles": ["TrainerGpu", "Validator", "Archive"] },
+    "granted_roles": { "roles": ["TrainerCpu", "TrainerGpu", "Archive"] },
     "granted_scopes": [
       "Connect",
       "Discover",
       { "Train": { "experiment_id": "nca-prepretraining" } },
-      { "Validate": { "experiment_id": "nca-prepretraining" } },
       { "Archive": { "experiment_id": "nca-prepretraining" } },
       { "Train": { "experiment_id": "climbmix-pretraining" } },
-      { "Validate": { "experiment_id": "climbmix-pretraining" } },
       { "Archive": { "experiment_id": "climbmix-pretraining" } },
       { "Admin": { "study_id": "burn-dragon-mainnet" } }
     ],

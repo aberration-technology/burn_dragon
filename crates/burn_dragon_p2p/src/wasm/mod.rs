@@ -120,7 +120,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         .map(|bundle| bundle.project_family_id.clone())
         .unwrap_or_else(|| ProjectFamilyId::new("burn-dragon-language"));
     let app_semver = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| {
-        semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version")
+        semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version")
     });
 
     ClientReleaseManifest {

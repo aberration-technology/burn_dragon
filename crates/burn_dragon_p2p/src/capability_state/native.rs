@@ -147,11 +147,21 @@ pub fn apply_native_downgrade_state(
         config.training.block_size,
         assessment.target_decision.trainer_memory_budget_bytes,
     )? {
-        assessment.target_decision.effective_target = DragonNativeTarget::Validator;
+        let downgraded_target = match record.downgrade_to.as_str() {
+            "reducer" => DragonNativeTarget::Reducer,
+            "validator" => DragonNativeTarget::Validator,
+            _ => DragonNativeTarget::Trainer,
+        };
+        let target_label = match downgraded_target {
+            DragonNativeTarget::Reducer => "reducer",
+            DragonNativeTarget::Validator => "validator",
+            DragonNativeTarget::Auto | DragonNativeTarget::Trainer => "trainer",
+        };
+        assessment.target_decision.effective_target = downgraded_target;
         assessment.target_decision.can_train = false;
         assessment.target_decision.downgrade_reason = Some(format!(
-            "persisted trainer failure for this workload fingerprint at {}: {}; holding validator role until the trainer budget increases or the workload changes",
-            record.observed_at, record.reason
+            "persisted trainer failure for this workload fingerprint at {}: {}; holding {} role until the trainer budget increases or the workload changes",
+            record.observed_at, record.reason, target_label
         ));
     }
     Ok(assessment)

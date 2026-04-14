@@ -178,7 +178,7 @@ The generated browser shell now includes both surfaces:
 - peer surface: connect, inspect assignments, and run browser-local training
 - operator surface: inspect the live experiment directory, load a specific entry into a JSON editor, and roll out a replacement directory draft with an admin-scoped session
 
-By default the baked browser config requests `Connect` and `Discover`, plus `Train` and `Validate` for the selected experiment id when one is provided. The separate `Sign In (Admin)` action extends that request with `ExperimentScope::Admin { study_id }` for the study id entered in the operator panel. Under the default deployment, that browser login provider is GitHub.
+By default the baked browser config requests `Connect` and `Discover`, plus `Train` and `Archive` for the selected experiment id when one is provided. The separate `Sign In (Admin)` action extends that request with `ExperimentScope::Admin { study_id }` for the study id entered in the operator panel. Under the default deployment, that browser login provider is GitHub.
 
 If you embed the UI yourself instead of using the generated shell, render [DragonBrowserApp](src/wasm/mod.rs) from your Dioxus host and point it at the edge:
 

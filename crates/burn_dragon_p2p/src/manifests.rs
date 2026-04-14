@@ -4,11 +4,12 @@ use burn_dragon_language::DragonConfig;
 use burn_p2p::burn::{BurnArtifactConfig, BurnRecordPrecision, BurnWorkloadConfig};
 use burn_p2p::{
     BrowserRolePolicy, BrowserVisibilityPolicy, ChunkingScheme, ClientPlatform,
-    ClientReleaseManifest, ContentId, DatasetViewId, ExperimentDirectoryEntry,
-    ExperimentDirectoryPolicyExt, ExperimentId, ExperimentOptInPolicy,
-    ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, NetworkId,
-    NetworkManifest, PeerRole, PeerRoleSet, Precision, ProjectFamilyId, RevisionId,
-    RevisionManifest, StudyId, SupportedWorkload, WindowActivation, WindowId, WorkloadId,
+    ClientReleaseManifest, ContentId, DatasetViewId, DiffusionSteadyStatePolicy,
+    ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentOptInPolicy,
+    ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadPromotionMode,
+    HeadPromotionPolicy, MergeStrategy, MergeTopologyPolicy, NetworkId, NetworkManifest, PeerRole,
+    PeerRoleSet, Precision, ProjectFamilyId, RevisionId, RevisionManifest, StudyId,
+    SupportedWorkload, WindowActivation, WindowId, WorkloadId,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,6 +64,29 @@ fn minimum_system_memory_bytes(backend_label: &str, footprint: &DragonTrainingFo
             .saturating_add(footprint.estimated_shard_bytes)
             .max(floor),
         _ => floor,
+    }
+}
+
+fn dragon_diffusion_merge_topology(experiment_kind: DragonExperimentKind) -> MergeTopologyPolicy {
+    let window_duration_secs = match experiment_kind {
+        DragonExperimentKind::NcaPrepretraining => 60,
+        DragonExperimentKind::ClimbMixPretraining => 180,
+    };
+
+    MergeTopologyPolicy {
+        strategy: MergeStrategy::KRegularGossip,
+        reducer_replication: 0,
+        target_leaf_cohort: 3,
+        upper_fanin: 0,
+        window_duration_secs,
+        publish_jitter_ms: 750,
+        staleness_windows: 2,
+        promotion_policy: HeadPromotionPolicy {
+            mode: HeadPromotionMode::DiffusionSteadyState,
+            validator_quorum: 1,
+            diffusion: Some(DiffusionSteadyStatePolicy::default()),
+            ..HeadPromotionPolicy::default()
+        },
     }
 }
 
@@ -176,8 +200,9 @@ pub fn build_manifest_bundle(
         description: seed.description.clone(),
     };
     let experiment_id = ExperimentId::new(&seed.experiment_id);
+    let merge_topology_policy = dragon_diffusion_merge_topology(experiment_kind);
     let resource_requirements = ExperimentResourceRequirements {
-        minimum_roles: BTreeSet::from([trainer_minimum_role(backend_label)]),
+        minimum_roles: BTreeSet::new(),
         minimum_device_memory_bytes: minimum_device_memory_bytes(backend_label, footprint),
         minimum_system_memory_bytes: Some(minimum_system_memory_bytes(backend_label, footprint)),
         estimated_download_bytes: footprint
@@ -187,10 +212,9 @@ pub fn build_manifest_bundle(
     };
     let allowed_roles = PeerRoleSet::new([
         trainer_minimum_role(backend_label),
-        PeerRole::Validator,
+        PeerRole::Archive,
         PeerRole::Viewer,
         PeerRole::BrowserObserver,
-        PeerRole::BrowserVerifier,
         PeerRole::BrowserTrainerWgpu,
     ]);
     let allowed_scopes = BTreeSet::from([
@@ -199,7 +223,7 @@ pub fn build_manifest_bundle(
         ExperimentScope::Train {
             experiment_id: experiment_id.clone(),
         },
-        ExperimentScope::Validate {
+        ExperimentScope::Archive {
             experiment_id: experiment_id.clone(),
         },
     ]);
@@ -262,10 +286,7 @@ pub fn build_manifest_bundle(
         ),
         merge_topology_policy_hash: stable_content_id(
             "dragon-merge-topology",
-            &serde_json::json!({
-                "strategy": "microcohort-reduce-plus-validator-promotion",
-                "window_secs": 30,
-            }),
+            &merge_topology_policy,
         ),
         slot_requirements: experiment_directory_entry.resource_requirements.clone(),
         activation_window: WindowActivation {
@@ -278,7 +299,7 @@ pub fn build_manifest_bundle(
         browser_enabled: true,
         browser_role_policy: BrowserRolePolicy {
             observer: true,
-            verifier: true,
+            verifier: false,
             trainer_wgpu: true,
             fallback: true,
         },
@@ -291,6 +312,11 @@ pub fn build_manifest_bundle(
         visibility_policy: BrowserVisibilityPolicy::SwarmEligible,
         description: seed.description.clone(),
     });
+    experiment_directory_entry.metadata.insert(
+        "burn_p2p.revision.merge_topology.policy_json".into(),
+        serde_json::to_string(&merge_topology_policy)
+            .expect("dragon diffusion merge topology should serialize"),
+    );
     let experiment_directory = vec![experiment_directory_entry];
     let workload_config = BurnWorkloadConfig::new(
         supported_workload.clone(),
@@ -355,7 +381,7 @@ mod tests {
             },
             DatasetViewId::new("dataset-view"),
             &footprint,
-            Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
             "test",
             "native,wgpu",
         )
@@ -411,7 +437,7 @@ mod tests {
             },
             DatasetViewId::new("dataset-view"),
             &footprint,
-            Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
             "test",
             "native,cpu",
         )
@@ -419,5 +445,65 @@ mod tests {
 
         assert_eq!(bundle.network_manifest.created_at, seed.created_at);
         assert_eq!(bundle.release_manifest.built_at, seed.release_built_at);
+    }
+
+    #[test]
+    fn manifests_default_to_trainer_only_diffusion_topology() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let bundle = build_manifest_bundle(
+            &seed(),
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            &DragonExperimentProfile {
+                version: 1,
+                experiment_kind: DragonExperimentKind::NcaPrepretraining,
+                native: crate::profile::DragonNativeExperimentProfile {
+                    training_toml: String::new(),
+                    nca_corpus_toml: None,
+                },
+                browser: None,
+            },
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
+            "test",
+            "native,cpu",
+        )
+        .expect("manifest bundle");
+
+        let entry = &bundle.experiment_directory[0];
+        assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
+        assert!(!entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
+        assert!(entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
+        assert!(!entry.allowed_scopes.contains(&ExperimentScope::Validate {
+            experiment_id: entry.experiment_id.clone(),
+        }));
+
+        let topology = entry
+            .merge_topology_policy()
+            .expect("diffusion merge topology");
+        assert_eq!(topology.strategy, MergeStrategy::KRegularGossip);
+        assert_eq!(
+            topology.promotion_policy.mode,
+            HeadPromotionMode::DiffusionSteadyState
+        );
+        assert_eq!(topology.promotion_policy.validator_quorum, 1);
+        assert!(
+            topology
+                .promotion_policy
+                .diffusion
+                .as_ref()
+                .is_some_and(|policy| policy.allow_solo_promotion)
+        );
     }
 }

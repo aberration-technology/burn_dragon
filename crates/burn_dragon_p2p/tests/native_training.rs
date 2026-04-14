@@ -27,10 +27,11 @@ use burn_dragon_p2p::profile::{DragonBrowserProfileTokenSource, DragonExperiment
 use burn_p2p::burn::{BurnShardedDataset, BurnShardedDatasetConfig, BurnWorkload};
 use burn_p2p::{
     AuthConfig, AuthProvider, BrowserMode, CallbackPayload, ClientPlatform, ContentId,
-    EdgePeerEnrollmentRequest, ExperimentDirectoryEntry, ExperimentScope, HeadDescriptor, LeaseId,
-    LoginRequest, MetricValue, MicroShardId, NodeCertificate, NodeCertificateClaims, PeerId,
-    PeerRole, PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession, ProjectFamilyId,
-    RevocationEpoch, ShardCache, WindowCtx, WindowId, WorkloadInputSource, WorkloadTrainingLease,
+    EdgePeerEnrollmentRequest, ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt,
+    ExperimentScope, HeadDescriptor, HeadPromotionMode, LeaseId, LoginRequest, MergeStrategy,
+    MetricValue, MicroShardId, NodeCertificate, NodeCertificateClaims, PeerId, PeerRole,
+    PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession, ProjectFamilyId, RevocationEpoch,
+    ShardCache, WindowCtx, WindowId, WorkloadInputSource, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
     BrowserConformanceHarness, BrowserDirectorySnapshot, BrowserEdgeClient, BrowserEdgeMode,
@@ -1325,7 +1326,7 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1396,7 +1397,7 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("artifact-smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1502,7 +1503,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("runtime-cluster".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1554,7 +1555,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         identity: Default::default(),
         bootstrap_peers: vec![validator_addr.clone()],
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some(format!("runtime-cluster-{label}")),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1896,7 +1897,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
 }
 
 #[test]
-fn nca_bootstrap_only_topology_supports_explicit_separate_validator_role() {
+fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -1914,39 +1915,6 @@ fn nca_bootstrap_only_topology_supports_explicit_separate_validator_role() {
     assert!(!bootstrap_services.contains(&burn_p2p_bootstrap::BootstrapService::Validator));
 
     let bootstrap_addr = loopback_swarm_address();
-    let validator_config = DragonNativePeerConfig {
-        training_config_paths: vec![training_config_path.clone()],
-        storage_root: root.path().join("storage-validator-bootstrap-only"),
-        network: Default::default(),
-        target: Some(DragonNativeTarget::Validator),
-        identity: Default::default(),
-        bootstrap_peers: vec![bootstrap_addr.clone()],
-        manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
-        git_commit: Some("bootstrap-only-validator".into()),
-        enabled_features_label: Some("native-cpu".into()),
-        auth: None,
-        capability_policy: DragonCapabilityPolicy {
-            allow_native_validator_fallback: false,
-            ..Default::default()
-        },
-        shard_export: Some(DragonShardExportConfig {
-            root: root.path().join("validator-shards-bootstrap-only"),
-            dataset_name: Some("dragon-nca-bootstrap-only-validator".into()),
-            microshards: Some(4),
-            max_records: Some(32),
-            http_upstream: None,
-        }),
-        existing_shard_dataset: None,
-    };
-    let validator_prepared =
-        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
-    assert_eq!(
-        validator_prepared.target_decision.effective_target,
-        DragonNativeTarget::Validator
-    );
-    assert!(!validator_prepared.target_decision.can_train);
-
     let trainer_config = DragonNativePeerConfig {
         training_config_paths: vec![training_config_path.clone()],
         storage_root: root.path().join("storage-trainer-bootstrap-only"),
@@ -1955,7 +1923,7 @@ fn nca_bootstrap_only_topology_supports_explicit_separate_validator_role() {
         identity: Default::default(),
         bootstrap_peers: vec![bootstrap_addr],
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("bootstrap-only-trainer".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1976,20 +1944,64 @@ fn nca_bootstrap_only_topology_supports_explicit_separate_validator_role() {
         DragonNativeTarget::Trainer
     );
     assert!(trainer_prepared.target_decision.can_train);
+    let entry = &trainer_prepared.manifests.experiment_directory[0];
+    assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
+    assert!(!entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
+    assert!(entry.allowed_roles.contains(&PeerRole::Archive));
+    assert!(entry.allowed_scopes.contains(&ExperimentScope::Archive {
+        experiment_id: entry.experiment_id.clone(),
+    }));
+    assert!(!entry.allowed_scopes.contains(&ExperimentScope::Validate {
+        experiment_id: entry.experiment_id.clone(),
+    }));
+    let topology = entry
+        .merge_topology_policy()
+        .expect("trainer-only diffusion topology");
+    assert_eq!(topology.strategy, MergeStrategy::KRegularGossip);
+    assert_eq!(
+        topology.promotion_policy.mode,
+        HeadPromotionMode::DiffusionSteadyState
+    );
 }
 
 #[test]
-#[ignore = "manual e2e; upstream libp2p-request-response debug assert can panic during multi-peer native runtime runs"]
-fn nca_bootstrap_only_topology_uses_separate_validator_for_canonical_promotion() {
+#[ignore = "edge-backed diffusion rung; upstream libp2p-request-response debug assert can still panic during multi-peer native runtime runs"]
+fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let bootstrap_storage = tempdir().expect("bootstrap storage");
     let nca_config_path = root.path().join("nca.toml");
-    let training_config_path = root.path().join("nca-train.toml");
+    let training_config_path_seed = root.path().join("nca-train-seed.toml");
+    let training_config_path_b = root.path().join("nca-train-b.toml");
+    let training_config_path_c = root.path().join("nca-train-c.toml");
     write(&nca_config_path, &nca_corpus_config_toml(root.path()));
     write(
-        &training_config_path,
-        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+        &training_config_path_seed,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-seed"),
+            &nca_config_path,
+            SMALL_SPEC,
+        ),
+    );
+    write(
+        &training_config_path_b,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-b"),
+            &nca_config_path,
+            SMALL_SPEC,
+        )
+        .replace("seed = 1337", "seed = 1338")
+        .replace("learning_rate = 0.001", "learning_rate = 0.0015"),
+    );
+    write(
+        &training_config_path_c,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-c"),
+            &nca_config_path,
+            SMALL_SPEC,
+        )
+        .replace("seed = 1337", "seed = 1339")
+        .replace("learning_rate = 0.001", "learning_rate = 0.002"),
     );
 
     let bootstrap_addr = loopback_swarm_address();
@@ -1998,7 +2010,7 @@ fn nca_bootstrap_only_topology_uses_separate_validator_for_canonical_promotion()
         genesis: burn_p2p_core::GenesisSpec {
             network_id: burn_p2p_core::NetworkId::new("dragon-p2p-testnet"),
             protocol_version: Version::new(0, 1, 0),
-            display_name: "dragon bootstrap-only topology".into(),
+            display_name: "dragon bootstrap-only diffusion topology".into(),
             created_at: Utc::now(),
             metadata: BTreeMap::new(),
         },
@@ -2036,212 +2048,6 @@ fn nca_bootstrap_only_topology_uses_separate_validator_for_canonical_promotion()
         },
         "bootstrap-only peer daemon did not start",
     );
-    let bootstrap_snapshot = bootstrap_telemetry.snapshot();
-    assert!(
-        bootstrap_snapshot
-            .configured_roles
-            .contains(&PeerRole::Bootstrap)
-    );
-    assert!(
-        bootstrap_snapshot
-            .configured_roles
-            .contains(&PeerRole::RelayHelper)
-    );
-    assert!(
-        !bootstrap_snapshot
-            .configured_roles
-            .contains(&PeerRole::Validator)
-    );
-
-    let validator_config = DragonNativePeerConfig {
-        training_config_paths: vec![training_config_path.clone()],
-        storage_root: root.path().join("storage-validator-bootstrap-only"),
-        network: Default::default(),
-        target: Some(DragonNativeTarget::Validator),
-        identity: Default::default(),
-        bootstrap_peers: vec![bootstrap_addr.clone()],
-        manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
-        git_commit: Some("bootstrap-only-validator".into()),
-        enabled_features_label: Some("native-cpu".into()),
-        auth: None,
-        capability_policy: DragonCapabilityPolicy {
-            allow_native_validator_fallback: false,
-            ..Default::default()
-        },
-        shard_export: Some(DragonShardExportConfig {
-            root: root.path().join("validator-shards-bootstrap-only"),
-            dataset_name: Some("dragon-nca-bootstrap-only-validator".into()),
-            microshards: Some(4),
-            max_records: Some(32),
-            http_upstream: None,
-        }),
-        existing_shard_dataset: None,
-    };
-    let validator_prepared =
-        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
-    assert_eq!(
-        validator_prepared.target_decision.effective_target,
-        DragonNativeTarget::Validator
-    );
-    assert!(!validator_prepared.target_decision.can_train);
-    let experiment_entry = validator_prepared.manifests.experiment_directory[0].clone();
-    let mut validator = spawn_prepared_native_peer(validator_prepared).expect("spawn validator");
-    let validator_telemetry = validator.telemetry();
-    let experiment = validator.mainnet().experiment(
-        experiment_entry.study_id.clone(),
-        experiment_entry.experiment_id.clone(),
-        experiment_entry.current_revision_id.clone(),
-    );
-
-    let trainer_config = DragonNativePeerConfig {
-        training_config_paths: vec![training_config_path.clone()],
-        storage_root: root.path().join("storage-trainer-bootstrap-only"),
-        network: Default::default(),
-        target: Some(DragonNativeTarget::Trainer),
-        identity: Default::default(),
-        bootstrap_peers: vec![bootstrap_addr.clone()],
-        manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
-        git_commit: Some("bootstrap-only-trainer".into()),
-        enabled_features_label: Some("native-cpu".into()),
-        auth: None,
-        capability_policy: Default::default(),
-        shard_export: Some(DragonShardExportConfig {
-            root: root.path().join("trainer-shards-bootstrap-only"),
-            dataset_name: Some("dragon-nca-bootstrap-only-trainer".into()),
-            microshards: Some(4),
-            max_records: Some(32),
-            http_upstream: None,
-        }),
-        existing_shard_dataset: None,
-    };
-    let trainer_prepared =
-        prepare_nca_native_cpu(&trainer_config, Some(&dummy_auth_bundle())).expect("trainer");
-    assert_eq!(
-        trainer_prepared.target_decision.effective_target,
-        DragonNativeTarget::Trainer
-    );
-    assert!(trainer_prepared.target_decision.can_train);
-    let mut trainer = spawn_prepared_native_peer(trainer_prepared).expect("spawn trainer");
-    let trainer_telemetry = trainer.telemetry();
-
-    wait_for(
-        Duration::from_secs(20),
-        || bootstrap_telemetry.snapshot().connected_peers >= 2,
-        "bootstrap-only peer did not connect to both validator and trainer",
-    );
-    wait_for(
-        Duration::from_secs(20),
-        || validator_telemetry.snapshot().connected_peers >= 1,
-        "validator did not connect through bootstrap-only peer",
-    );
-    wait_for(
-        Duration::from_secs(20),
-        || trainer_telemetry.snapshot().connected_peers >= 1,
-        "trainer did not connect through bootstrap-only peer",
-    );
-
-    let genesis_head = validator
-        .initialize_local_head(&experiment)
-        .expect("initialize validator genesis head");
-    validator
-        .publish_head_provider(&experiment, &genesis_head)
-        .expect("publish validator genesis head provider");
-    validator
-        .publish_artifact_from_store(&genesis_head.artifact_id)
-        .expect("publish validator genesis artifact");
-
-    wait_for(
-        Duration::from_secs(30),
-        || {
-            trainer
-                .sync_experiment_head(&experiment)
-                .expect("sync trainer genesis head")
-                .as_ref()
-                .is_some_and(|head| head.head_id == genesis_head.head_id)
-        },
-        "trainer did not sync the validator genesis head through the bootstrap-only peer",
-    );
-
-    let training = trainer
-        .train_window_once_with_pinned_head(&experiment, Some(&genesis_head))
-        .expect("trainer window");
-    assert_eq!(
-        training.head.parent_head_id,
-        Some(genesis_head.head_id.clone())
-    );
-    trainer
-        .publish_head_provider(&experiment, &training.head)
-        .expect("publish trainer head provider");
-    trainer
-        .publish_artifact_from_store(&training.artifact.artifact_id)
-        .expect("publish trainer delta artifact");
-    if training.head.artifact_id != training.artifact.artifact_id {
-        trainer
-            .publish_artifact_from_store(&training.head.artifact_id)
-            .expect("publish trainer head artifact");
-    }
-    trainer
-        .republish_training_window_control_plane(
-            &experiment,
-            training.lease.window_id,
-            &training.contribution.base_head_id,
-            &training.artifact.artifact_id,
-        )
-        .expect("republish trainer control plane");
-
-    wait_for(
-        Duration::from_secs(30),
-        || {
-            validator_telemetry
-                .snapshot()
-                .control_plane
-                .update_announcements
-                .iter()
-                .any(|announcement| {
-                    announcement.update.delta_artifact_id == training.artifact.artifact_id
-                })
-        },
-        "validator did not observe the trainer update through the bootstrap-only peer",
-    );
-
-    let validation_deadline = Instant::now() + Duration::from_secs(30);
-    let merged = loop {
-        match validator.validate_candidates_once(&experiment) {
-            Ok(Some(outcome)) => break outcome,
-            Ok(None) => {}
-            Err(error) => panic!("validator promotion failed: {error:#}"),
-        }
-        assert!(
-            Instant::now() < validation_deadline,
-            "validator did not promote a canonical head in the bootstrap-only topology"
-        );
-        thread::sleep(Duration::from_millis(100));
-    };
-    assert_eq!(
-        merged.merged_head.parent_head_id,
-        Some(genesis_head.head_id.clone())
-    );
-    assert!(merged.merged_head.global_step > genesis_head.global_step);
-    validator
-        .publish_head_provider(&experiment, &merged.merged_head)
-        .expect("publish merged head provider");
-    validator
-        .publish_artifact_from_store(&merged.merged_head.artifact_id)
-        .expect("publish merged head artifact");
-
-    wait_for(
-        Duration::from_secs(30),
-        || {
-            trainer
-                .sync_experiment_head(&experiment)
-                .expect("sync trainer merged head")
-                .as_ref()
-                .is_some_and(|head| head.head_id == merged.merged_head.head_id)
-        },
-        "trainer did not sync the promoted canonical head",
-    );
     assert!(
         !bootstrap_telemetry
             .snapshot()
@@ -2249,8 +2055,282 @@ fn nca_bootstrap_only_topology_uses_separate_validator_for_canonical_promotion()
             .contains(&PeerRole::Validator)
     );
 
-    shutdown_runtime_peer(trainer, "bootstrap-only trainer");
-    shutdown_runtime_peer(validator, "bootstrap-only validator");
+    let make_trainer_config =
+        |label: &str, training_config_path: &std::path::Path| DragonNativePeerConfig {
+            training_config_paths: vec![training_config_path.to_path_buf()],
+            storage_root: root.path().join(format!("storage-{label}")),
+            network: Default::default(),
+            target: Some(DragonNativeTarget::Trainer),
+            identity: Default::default(),
+            bootstrap_peers: vec![bootstrap_addr.clone()],
+            manifest: native_manifest_seed(),
+            app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+            git_commit: Some(label.into()),
+            enabled_features_label: Some("native-cpu".into()),
+            auth: None,
+            capability_policy: Default::default(),
+            shard_export: Some(DragonShardExportConfig {
+                root: root.path().join(format!("shards-{label}")),
+                dataset_name: Some(format!("dragon-nca-{label}")),
+                microshards: Some(4),
+                max_records: Some(32),
+                http_upstream: None,
+            }),
+            existing_shard_dataset: None,
+        };
+
+    let seed_prepared = prepare_nca_native_cpu(
+        &make_trainer_config("bootstrap-diffusion-seed", &training_config_path_seed),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("seed trainer");
+    let experiment_entry = seed_prepared.manifests.experiment_directory[0].clone();
+    let topology = experiment_entry
+        .merge_topology_policy()
+        .expect("diffusion merge topology");
+    assert_eq!(topology.strategy, MergeStrategy::KRegularGossip);
+    assert_eq!(
+        topology.promotion_policy.mode,
+        HeadPromotionMode::DiffusionSteadyState
+    );
+    assert!(
+        experiment_entry
+            .allowed_roles
+            .contains(&PeerRole::TrainerCpu)
+    );
+    assert!(
+        !experiment_entry
+            .allowed_roles
+            .contains(&PeerRole::Validator)
+    );
+    assert!(
+        !experiment_entry
+            .allowed_scopes
+            .contains(&ExperimentScope::Validate {
+                experiment_id: experiment_entry.experiment_id.clone(),
+            })
+    );
+
+    let trainer_b_prepared = prepare_nca_native_cpu(
+        &make_trainer_config("bootstrap-diffusion-b", &training_config_path_b),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("trainer b");
+    let trainer_c_prepared = prepare_nca_native_cpu(
+        &make_trainer_config("bootstrap-diffusion-c", &training_config_path_c),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("trainer c");
+
+    let mut seed = spawn_prepared_native_peer(seed_prepared).expect("spawn seed trainer");
+    let mut trainer_b = spawn_prepared_native_peer(trainer_b_prepared).expect("spawn trainer b");
+    let mut trainer_c = spawn_prepared_native_peer(trainer_c_prepared).expect("spawn trainer c");
+    let seed_telemetry = seed.telemetry();
+    let trainer_b_telemetry = trainer_b.telemetry();
+    let trainer_c_telemetry = trainer_c.telemetry();
+
+    wait_for(
+        Duration::from_secs(20),
+        || bootstrap_telemetry.snapshot().connected_peers >= 3,
+        "bootstrap-only peer did not connect to trainer cohort",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || seed_telemetry.snapshot().connected_peers >= 1,
+        "seed trainer did not connect",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || trainer_b_telemetry.snapshot().connected_peers >= 1,
+        "trainer b did not connect",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || trainer_c_telemetry.snapshot().connected_peers >= 1,
+        "trainer c did not connect",
+    );
+
+    let experiment = seed.mainnet().experiment(
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
+    );
+    let genesis_head = seed
+        .initialize_local_head(&experiment)
+        .expect("init diffusion genesis head");
+
+    for trainer in [&trainer_b, &trainer_c] {
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                trainer
+                    .sync_experiment_head(&experiment)
+                    .expect("sync trainer genesis head")
+                    .is_some()
+            },
+            "trainer did not sync genesis head",
+        );
+    }
+
+    let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let experiment_for_seed = experiment.clone();
+    let experiment_for_trainer_b = experiment.clone();
+    let experiment_for_trainer_c = experiment.clone();
+    let seed_ref = &mut seed;
+    let trainer_b_ref = &mut trainer_b;
+    let trainer_c_ref = &mut trainer_c;
+    let (seed_window, trainer_b_window, trainer_c_window) = thread::scope(|scope| {
+        let seed = seed_ref;
+        let seed_barrier = std::sync::Arc::clone(&start_barrier);
+        let seed_run = scope.spawn(move || {
+            seed_barrier.wait();
+            seed.train_window_once(&experiment_for_seed)
+        });
+        let trainer_b = trainer_b_ref;
+        let trainer_b_barrier = std::sync::Arc::clone(&start_barrier);
+        let trainer_b_run = scope.spawn(move || {
+            trainer_b_barrier.wait();
+            trainer_b.train_window_once(&experiment_for_trainer_b)
+        });
+        let trainer_c = trainer_c_ref;
+        let trainer_c_barrier = std::sync::Arc::clone(&start_barrier);
+        let trainer_c_run = scope.spawn(move || {
+            trainer_c_barrier.wait();
+            trainer_c.train_window_once(&experiment_for_trainer_c)
+        });
+        let seed_window = seed_run
+            .join()
+            .map_err(|_| anyhow::anyhow!("diffusion seed train thread panicked"))??;
+        let trainer_b_window = trainer_b_run
+            .join()
+            .map_err(|_| anyhow::anyhow!("diffusion trainer b train thread panicked"))??;
+        let trainer_c_window = trainer_c_run
+            .join()
+            .map_err(|_| anyhow::anyhow!("diffusion trainer c train thread panicked"))??;
+        anyhow::Ok((seed_window, trainer_b_window, trainer_c_window))
+    })
+    .expect("parallel diffusion windows");
+    for outcome in [&seed_window, &trainer_b_window, &trainer_c_window] {
+        assert_eq!(
+            outcome.head.parent_head_id,
+            Some(genesis_head.head_id.clone())
+        );
+        assert_eq!(outcome.head.global_step, 1);
+    }
+
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            [
+                seed_telemetry.snapshot(),
+                trainer_b_telemetry.snapshot(),
+                trainer_c_telemetry.snapshot(),
+            ]
+            .into_iter()
+            .all(|snapshot| {
+                let updates = snapshot
+                    .control_plane
+                    .update_announcements
+                    .iter()
+                    .filter(|announcement| {
+                        announcement.update.study_id == experiment.study_id
+                            && announcement.update.experiment_id == experiment.experiment_id
+                            && announcement.update.revision_id == experiment.revision_id
+                            && announcement.update.window_id == WindowId(1)
+                            && announcement.update.base_head_id == genesis_head.head_id
+                    })
+                    .count();
+                updates >= 3
+                    && snapshot
+                        .control_plane
+                        .reducer_assignment_announcements
+                        .is_empty()
+                    && snapshot
+                        .control_plane
+                        .aggregate_proposal_announcements
+                        .is_empty()
+                    && snapshot
+                        .control_plane
+                        .validation_quorum_announcements
+                        .is_empty()
+            })
+        },
+        "diffusion trainers did not observe the trainer-only update frontier",
+    );
+
+    let convergence_deadline = Instant::now() + Duration::from_secs(20);
+    let local_head_ids = [
+        seed_window.head.head_id.clone(),
+        trainer_b_window.head.head_id.clone(),
+        trainer_c_window.head.head_id.clone(),
+    ];
+    let promoted_head = loop {
+        seed.advance_diffusion_steady_state(&experiment, None, None)
+            .expect("advance seed diffusion");
+        trainer_b
+            .advance_diffusion_steady_state(&experiment, None, None)
+            .expect("advance trainer b diffusion");
+        trainer_c
+            .advance_diffusion_steady_state(&experiment, None, None)
+            .expect("advance trainer c diffusion");
+
+        let seed_head = seed
+            .sync_experiment_head(&experiment)
+            .expect("sync diffusion seed head");
+        let trainer_b_head = trainer_b
+            .sync_experiment_head(&experiment)
+            .expect("sync diffusion trainer b head");
+        let trainer_c_head = trainer_c
+            .sync_experiment_head(&experiment)
+            .expect("sync diffusion trainer c head");
+        if let (Some(seed_head), Some(trainer_b_head), Some(trainer_c_head)) =
+            (seed_head, trainer_b_head, trainer_c_head)
+            && seed_head.head_id == trainer_b_head.head_id
+            && seed_head.head_id == trainer_c_head.head_id
+            && seed_head.head_id != genesis_head.head_id
+            && !local_head_ids.contains(&seed_head.head_id)
+        {
+            break seed_head;
+        }
+        assert!(
+            Instant::now() < convergence_deadline,
+            "diffusion trainers did not converge on one promoted head"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    assert_eq!(promoted_head.global_step, 1);
+    assert_eq!(
+        promoted_head.parent_head_id,
+        Some(genesis_head.head_id.clone())
+    );
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            [
+                seed_telemetry.snapshot(),
+                trainer_b_telemetry.snapshot(),
+                trainer_c_telemetry.snapshot(),
+            ]
+            .into_iter()
+            .all(|snapshot| {
+                !snapshot
+                    .control_plane
+                    .diffusion_promotion_certificate_announcements
+                    .is_empty()
+                    && !snapshot.control_plane.merge_announcements.is_empty()
+                    && snapshot
+                        .control_plane
+                        .validation_quorum_announcements
+                        .is_empty()
+            })
+        },
+        "diffusion promotion certificates did not propagate across the trainer swarm",
+    );
+
+    shutdown_runtime_peer(trainer_c, "bootstrap diffusion trainer c");
+    shutdown_runtime_peer(trainer_b, "bootstrap diffusion trainer b");
+    shutdown_runtime_peer(seed, "bootstrap diffusion seed");
     bootstrap
         .shutdown()
         .expect("bootstrap-only peer daemon shutdown");
@@ -2277,7 +2357,7 @@ where
 }
 
 #[test]
-fn nca_native_auto_target_downgrades_to_validator_under_tight_budget() {
+fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2295,7 +2375,7 @@ fn nca_native_auto_target_downgrades_to_validator_under_tight_budget() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("downgrade".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2314,16 +2394,10 @@ fn nca_native_auto_target_downgrades_to_validator_under_tight_budget() {
     );
     assert_eq!(
         prepared.target_decision.effective_target,
-        DragonNativeTarget::Validator
+        DragonNativeTarget::Trainer
     );
     assert!(!prepared.target_decision.can_train);
-    assert!(
-        prepared
-            .target_decision
-            .downgrade_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("downgrading to validator"))
-    );
+    assert!(prepared.target_decision.downgrade_reason.is_none());
     assert_eq!(
         prepared.manifests.experiment_directory[0]
             .resource_requirements
@@ -2352,7 +2426,7 @@ fn nca_native_auto_target_downgrades_to_validator_under_tight_budget() {
 }
 
 #[test]
-fn nca_native_persisted_runtime_failure_downgrades_to_validator_on_reprepare() {
+fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2370,7 +2444,7 @@ fn nca_native_persisted_runtime_failure_downgrades_to_validator_on_reprepare() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("downgrade-persisted".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2394,7 +2468,7 @@ fn nca_native_persisted_runtime_failure_downgrades_to_validator_on_reprepare() {
         prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("reprepare");
     assert_eq!(
         downgraded.target_decision.effective_target,
-        DragonNativeTarget::Validator
+        DragonNativeTarget::Trainer
     );
     assert!(!downgraded.target_decision.can_train);
     assert!(
@@ -2402,7 +2476,8 @@ fn nca_native_persisted_runtime_failure_downgrades_to_validator_on_reprepare() {
             .target_decision
             .downgrade_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("persisted trainer failure"))
+            .is_some_and(|reason| reason.contains("persisted trainer failure")
+                && reason.contains("holding trainer role"))
     );
 
     downgraded
@@ -2437,7 +2512,7 @@ fn climbmix_native_existing_shards_supports_multi_peer_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2498,7 +2573,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2676,7 +2751,7 @@ fn climbmix_http_shards_publish_http_input_source_descriptor() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("http".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2753,7 +2828,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2862,7 +2937,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2983,7 +3058,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3093,7 +3168,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3223,7 +3298,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3269,7 +3344,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3326,7 +3401,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3372,7 +3447,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3429,7 +3504,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3468,7 +3543,7 @@ fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,

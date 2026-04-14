@@ -91,7 +91,7 @@ where
             crate::config::DragonNativeTarget::Reducer => "reducer",
             crate::config::DragonNativeTarget::Validator => "validator",
             crate::config::DragonNativeTarget::Auto
-            | crate::config::DragonNativeTarget::Trainer => "validator",
+            | crate::config::DragonNativeTarget::Trainer => "trainer",
         };
         let _ = persist_native_downgrade(
             &self.storage_root,

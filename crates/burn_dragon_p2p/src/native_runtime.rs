@@ -225,7 +225,7 @@ fn downgrade_target(target: DragonNativeTarget) -> &'static str {
     match target {
         DragonNativeTarget::Reducer => "reducer",
         DragonNativeTarget::Validator => "validator",
-        DragonNativeTarget::Auto | DragonNativeTarget::Trainer => "validator",
+        DragonNativeTarget::Auto | DragonNativeTarget::Trainer => "trainer",
     }
 }
 

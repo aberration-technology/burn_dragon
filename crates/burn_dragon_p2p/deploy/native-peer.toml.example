@@ -1,7 +1,7 @@
 training_config_paths = ["config/local/generated/p2p/nca.toml"]
 storage_root = "runs/p2p/mainnet-native-wgpu"
-target = "auto"
-app_semver = "0.21.0-pre.13"
+target = "trainer"
+app_semver = "0.21.0-pre.14"
 enabled_features_label = "native,wgpu"
 
 [network]
@@ -23,4 +23,4 @@ bootstrap_addrs = []
 
 [capability_policy]
 native_wgpu_memory_budget_bytes = 4294967296
-allow_native_validator_fallback = true
+allow_native_validator_fallback = false

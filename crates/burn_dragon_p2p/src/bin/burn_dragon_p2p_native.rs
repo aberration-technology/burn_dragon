@@ -929,7 +929,7 @@ fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
         assessment.block_size,
         &assessment.footprint,
         assessment.target_decision.trainer_memory_budget_bytes,
-        "validator",
+        "trainer",
         &args.reason,
         &args.source,
     )?;
@@ -1022,22 +1022,18 @@ fn requested_scopes(entry: &ExperimentDirectoryEntry) -> BTreeSet<ExperimentScop
 fn standard_experiment_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
     BTreeSet::from([
         ExperimentScope::Connect,
+        ExperimentScope::Discover,
         ExperimentScope::Train {
             experiment_id: experiment_id.clone(),
         },
-        ExperimentScope::Validate {
+        ExperimentScope::Archive {
             experiment_id: experiment_id.clone(),
         },
     ])
 }
 
 fn managed_trainer_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
-    let mut scopes = standard_experiment_scopes(experiment_id);
-    scopes.insert(ExperimentScope::Discover);
-    scopes.insert(ExperimentScope::Archive {
-        experiment_id: experiment_id.clone(),
-    });
-    scopes
+    standard_experiment_scopes(experiment_id)
 }
 
 fn managed_validator_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {

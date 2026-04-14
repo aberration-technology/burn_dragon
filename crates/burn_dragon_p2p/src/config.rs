@@ -88,11 +88,11 @@ fn default_browser_wgpu_memory_budget_bytes() -> Option<u64> {
 }
 
 fn default_allow_native_validator_fallback() -> bool {
-    true
+    false
 }
 
 fn default_allow_browser_verifier_fallback() -> bool {
-    true
+    false
 }
 
 fn default_manifest_timestamp() -> DateTime<Utc> {
@@ -355,7 +355,7 @@ pub struct DragonNativePeerConfig {
 }
 
 fn default_app_semver() -> Version {
-    Version::parse("0.21.0-pre.13").expect("valid burn_dragon version")
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
 }
 
 impl DragonNativePeerConfig {
@@ -422,7 +422,7 @@ impl DragonBrowserAppConfig {
             requested_scopes.insert(ExperimentScope::Train {
                 experiment_id: experiment_id.clone(),
             });
-            requested_scopes.insert(ExperimentScope::Validate {
+            requested_scopes.insert(ExperimentScope::Archive {
                 experiment_id: experiment_id.clone(),
             });
         }
@@ -672,7 +672,8 @@ mod tests {
                 ],
                 ..DragonManifestSeed::default()
             },
-            app_semver: Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+            app_semver: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
             git_commit: None,
             enabled_features_label: None,
             auth: None,
@@ -697,7 +698,8 @@ mod tests {
             identity: Default::default(),
             bootstrap_peers: Vec::new(),
             manifest: DragonManifestSeed::default(),
-            app_semver: Version::parse("0.21.0-pre.13").expect("valid burn_dragon version"),
+            app_semver: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
             git_commit: None,
             enabled_features_label: None,
             auth: None,

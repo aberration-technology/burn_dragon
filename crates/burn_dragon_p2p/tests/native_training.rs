@@ -3071,7 +3071,6 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
 }
 
 #[test]
-#[ignore = "mixed-fleet scale rung"]
 fn nca_mixed_fleet_browser_and_native_same_net_medium() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
@@ -3185,7 +3184,6 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
 }
 
 #[test]
-#[ignore = "mixed-fleet scale rung"]
 fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-mixed-medium");
@@ -3311,7 +3309,6 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
 }
 
 #[test]
-#[ignore = "scale rung"]
 fn nca_native_peer_medium_model_converges_over_more_windows() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
@@ -3361,7 +3358,6 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
 }
 
 #[test]
-#[ignore = "scale rung"]
 fn climbmix_native_three_peers_medium_model_stays_consistent() {
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-medium");
@@ -3418,7 +3414,6 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
 }
 
 #[test]
-#[ignore = "large rung"]
 fn nca_native_peer_large_model_converges_over_more_windows() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
@@ -3464,7 +3459,6 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
 }
 
 #[test]
-#[ignore = "large rung"]
 fn climbmix_native_three_peers_large_model_stays_consistent() {
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-large");
@@ -3521,7 +3515,6 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
 }
 
 #[test]
-#[ignore = "edge-backed deployment rung"]
 fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
@@ -3560,7 +3553,6 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
 }
 
 #[test]
-#[ignore = "edge-backed deployment rung"]
 fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-edge");

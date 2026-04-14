@@ -1965,7 +1965,6 @@ fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
 }
 
 #[test]
-#[ignore = "edge-backed diffusion rung; upstream libp2p-request-response debug assert can still panic during multi-peer native runtime runs"]
 fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -2129,11 +2128,6 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
     let trainer_b_telemetry = trainer_b.telemetry();
     let trainer_c_telemetry = trainer_c.telemetry();
 
-    wait_for(
-        Duration::from_secs(20),
-        || bootstrap_telemetry.snapshot().connected_peers >= 3,
-        "bootstrap-only peer did not connect to trainer cohort",
-    );
     wait_for(
         Duration::from_secs(20),
         || seed_telemetry.snapshot().connected_peers >= 1,

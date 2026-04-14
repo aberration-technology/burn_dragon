@@ -82,6 +82,12 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
+[profile.dev.package."libp2p-request-response"]
+debug-assertions = false
+
+[profile.test.package."libp2p-request-response"]
+debug-assertions = false
+
 [profile.release]
 strip = "symbols"
 lto = "thin"

@@ -119,17 +119,17 @@ output "managed_trainer_auth_bundle_parameter_name" {
 }
 
 output "managed_validator_instance_id" {
-  description = "EC2 instance id for the managed native validator. Empty when the managed validator is disabled."
+  description = "Deprecated manual-only validator instance id. Empty when the manual validator path is disabled."
   value       = length(aws_instance.managed_validator) > 0 ? aws_instance.managed_validator[0].id : ""
 }
 
 output "managed_validator_public_ip" {
-  description = "Public IP for the managed native validator. Empty when the managed validator is disabled."
+  description = "Deprecated manual-only validator public IP. Empty when the manual validator path is disabled."
   value       = length(aws_instance.managed_validator) > 0 ? aws_instance.managed_validator[0].public_ip : ""
 }
 
 output "managed_validator_auth_bundle_parameter_name" {
-  description = "SSM parameter name expected to contain the managed validator auth bundle JSON. Empty when the managed validator is disabled."
+  description = "Deprecated manual-only validator auth bundle parameter name. Empty when the manual validator path is disabled."
   value       = local.managed_validator_enabled ? local.managed_validator_auth_bundle_parameter_name : ""
 }
 

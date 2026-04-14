@@ -529,25 +529,25 @@ variable "managed_trainer_auth_bundle_parameter_name" {
 }
 
 variable "managed_validator_enabled" {
-  description = "Whether Terraform should provision a single managed native validator instance for canonical promotion. This validator is CPU-only, runs no training loop, and performs validation/promotion work separately from the bootstrap edge."
+  description = "Deprecated manual-only validator path. Leave false for the supported trainer-only diffusion deployment."
   type        = bool
   default     = false
 }
 
 variable "managed_validator_instance_type" {
-  description = "EC2 instance type used by the managed native validator instance. Keep this small and CPU-only unless validation pressure proves otherwise."
+  description = "Deprecated manual-only validator instance type. Ignored by the standard trainer-only workflow."
   type        = string
   default     = "t3a.small"
 }
 
 variable "managed_validator_root_volume_size_gib" {
-  description = "Root EBS volume size for the managed native validator instance."
+  description = "Deprecated manual-only validator root volume size. Ignored by the standard trainer-only workflow."
   type        = number
   default     = 32
 }
 
 variable "managed_validator_experiment_kind" {
-  description = "Experiment kind assigned to the managed validator instance. Supported values: nca, climbmix."
+  description = "Deprecated manual-only validator experiment kind. Supported values remain nca, climbmix for ad hoc use."
   type        = string
   default     = "nca"
 
@@ -558,19 +558,19 @@ variable "managed_validator_experiment_kind" {
 }
 
 variable "managed_validator_crate_version" {
-  description = "Published burn_dragon_p2p crate version installed on the managed validator instance."
+  description = "Deprecated manual-only validator crate version. Ignored by the standard trainer-only workflow."
   type        = string
   default     = "0.21.0-pre.14"
 }
 
 variable "managed_validator_auth_bundle_parameter_name" {
-  description = "Optional SSM parameter name containing the JSON auth bundle used by the managed validator instance. Leave empty to derive a standard name under secret_parameter_prefix."
+  description = "Deprecated manual-only validator auth bundle parameter name. Ignored by the standard trainer-only workflow."
   type        = string
   default     = ""
 }
 
 variable "managed_validator_validation_interval_millis" {
-  description = "Validation loop interval for the managed validator instance. Lower values promote canonicals more aggressively at the cost of more CPU churn."
+  description = "Deprecated manual-only validator interval. Ignored by the standard trainer-only workflow."
   type        = number
   default     = 250
 }

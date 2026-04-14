@@ -42,13 +42,6 @@ create_artifact_replica_bucket = true
 managed_trainer_desired_capacity = 0
 managed_trainer_backend = "cpu"
 managed_trainer_experiment_kind = "nca"
-managed_validator_enabled = false
-managed_validator_experiment_kind = "nca"
-# managed_validator_instance_type = "t3a.small"
-# managed_validator_root_volume_size_gib = 32
-# managed_validator_crate_version = "0.21.0-pre.14"
-# managed_validator_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/validator_auth_bundle_json"
-# managed_validator_validation_interval_millis = 250
 
 # Optional:
 # disaster_recovery_region = "us-west-2"

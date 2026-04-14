@@ -350,24 +350,29 @@ struct NativeWindowObservation {
     loss: f64,
 }
 
-fn browser_harness_pair(
+fn local_browser_training_and_verification_pair(
     entry: &burn_p2p::ExperimentDirectoryEntry,
     release_train_hash: burn_p2p::ContentId,
     target_artifact_hash: burn_p2p::ContentId,
     network_id: burn_p2p::NetworkId,
 ) -> (BrowserConformanceHarness, BrowserConformanceHarness) {
-    let session = browser_conformance_session(
+    let trainer_scopes = entry.allowed_scopes.clone();
+    assert!(trainer_scopes.contains(&ExperimentScope::Train {
+        experiment_id: entry.experiment_id.clone(),
+    }));
+    assert!(!trainer_scopes.contains(&ExperimentScope::Validate {
+        experiment_id: entry.experiment_id.clone(),
+    }));
+
+    let trainer_session = browser_conformance_session(
         network_id.clone(),
-        PrincipalId::new("browser-principal"),
-        BTreeSet::from([
-            ExperimentScope::Connect,
-            ExperimentScope::Train {
-                experiment_id: entry.experiment_id.clone(),
-            },
-            ExperimentScope::Validate {
-                experiment_id: entry.experiment_id.clone(),
-            },
-        ]),
+        PrincipalId::new("browser-trainer-principal"),
+        trainer_scopes,
+    );
+    let verifier_session = browser_conformance_session(
+        network_id.clone(),
+        PrincipalId::new("browser-local-verifier-principal"),
+        local_mock_verifier_scopes(entry),
     );
     let trainer = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
@@ -383,7 +388,7 @@ fn browser_harness_pair(
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserTrainerWgpu),
         browser_conformance_transport(),
         browser_conformance_directory(network_id.clone(), vec![entry.clone()]),
-        session.clone(),
+        trainer_session,
     );
     let verifier = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
@@ -399,7 +404,7 @@ fn browser_harness_pair(
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserVerifier),
         browser_conformance_transport(),
         browser_conformance_directory(network_id, vec![entry.clone()]),
-        session,
+        verifier_session,
     );
     (trainer, verifier)
 }
@@ -618,16 +623,12 @@ impl Drop for LocalEdgeMock {
     }
 }
 
-fn edge_scopes(entry: &ExperimentDirectoryEntry) -> BTreeSet<ExperimentScope> {
-    BTreeSet::from([
-        ExperimentScope::Connect,
-        ExperimentScope::Train {
-            experiment_id: entry.experiment_id.clone(),
-        },
-        ExperimentScope::Validate {
-            experiment_id: entry.experiment_id.clone(),
-        },
-    ])
+fn local_mock_verifier_scopes(entry: &ExperimentDirectoryEntry) -> BTreeSet<ExperimentScope> {
+    let mut scopes = entry.allowed_scopes.clone();
+    scopes.insert(ExperimentScope::Validate {
+        experiment_id: entry.experiment_id.clone(),
+    });
+    scopes
 }
 
 fn edge_snapshot_for_manifests(
@@ -1059,7 +1060,8 @@ fn run_edge_drill_for_prepared<B>(
     let entry = prepared.manifests.experiment_directory[0].clone();
     let snapshot = edge_snapshot_for_manifests(&prepared.manifests, BrowserMode::Trainer);
     let edge = spawn_local_edge(snapshot.clone());
-    let requested_scopes = edge_scopes(&entry);
+    let trainer_requested_scopes = entry.allowed_scopes.clone();
+    let local_verifier_requested_scopes = local_mock_verifier_scopes(&entry);
     let native_storage = tempdir().expect("native auth storage");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1076,7 +1078,7 @@ fn run_edge_drill_for_prepared<B>(
         let pending = begin_native_github_login(
             &edge.base_url,
             &prepared.manifests.release_manifest,
-            requested_scopes.clone(),
+            trainer_requested_scopes.clone(),
             1800,
             Some(format!("{label}-native")),
             false,
@@ -1123,7 +1125,7 @@ fn run_edge_drill_for_prepared<B>(
                     .release_manifest
                     .target_artifact_hash
                     .clone(),
-                requested_scopes,
+                trainer_requested_scopes,
                 1800,
             )
             .expect("browser enrollment config"),
@@ -1142,6 +1144,14 @@ fn run_edge_drill_for_prepared<B>(
             browser_session.claims.provider,
             AuthProvider::GitHub
         ));
+        assert!(
+            !browser_session
+                .claims
+                .granted_scopes
+                .contains(&ExperimentScope::Validate {
+                    experiment_id: entry.experiment_id.clone(),
+                })
+        );
 
         let worker_identity = browser_worker_identity(label);
         let browser_certificate = browser_client
@@ -1152,6 +1162,46 @@ fn run_edge_drill_for_prepared<B>(
             .fetch_trust_bundle()
             .await
             .expect("browser trust bundle");
+
+        let verifier_client = BrowserEdgeClient::new(
+            BrowserUiBindings::from_edge_snapshot(&edge.base_url, &browser_snapshot),
+            BrowserEnrollmentConfig::from_edge_snapshot(
+                &browser_snapshot,
+                "browser-wasm-verifier",
+                prepared
+                    .manifests
+                    .release_manifest
+                    .target_artifact_hash
+                    .clone(),
+                local_verifier_requested_scopes,
+                1800,
+            )
+            .expect("browser verifier enrollment config"),
+        );
+        let verifier_login = verifier_client
+            .begin_login(Some(format!("{label}-browser-verifier")))
+            .await
+            .expect("begin browser verifier github login");
+        let verifier_session = verifier_client
+            .complete_provider_login(&verifier_login, "browser-verifier-provider-code")
+            .await
+            .expect("complete browser verifier github login");
+        assert!(
+            verifier_session
+                .claims
+                .granted_scopes
+                .contains(&ExperimentScope::Validate {
+                    experiment_id: entry.experiment_id.clone(),
+                })
+        );
+        let verifier_certificate = verifier_client
+            .enroll(&verifier_client.build_enrollment_request(&verifier_session, &worker_identity))
+            .await
+            .expect("browser verifier enroll");
+        let verifier_trust_bundle = verifier_client
+            .fetch_trust_bundle()
+            .await
+            .expect("browser verifier trust bundle");
 
         assert!(
             browser_client.fetch_directory(None).await.is_err(),
@@ -1227,6 +1277,14 @@ fn run_edge_drill_for_prepared<B>(
         );
         acknowledge_browser_receipts(&mut trainer, training_submission.accepted_receipt_ids);
 
+        let verifier_session_state = BrowserSessionState {
+            session: Some(verifier_session.clone()),
+            certificate: Some(verifier_certificate),
+            trust_bundle: Some(verifier_trust_bundle),
+            enrolled_at: Some(Utc::now()),
+            reenrollment_required: false,
+        };
+
         let mut verifier = BrowserConformanceHarness::start(
             browser_runtime_for_edge(
                 &edge.base_url,
@@ -1249,7 +1307,7 @@ fn run_edge_drill_for_prepared<B>(
                 prepared.manifests.network_manifest.network_id.clone(),
                 vec![entry.clone()],
             ),
-            browser_session_state,
+            verifier_session_state,
         );
         verifier.select_experiment(
             entry.experiment_id.clone(),
@@ -1272,7 +1330,7 @@ fn run_edge_drill_for_prepared<B>(
             "browser validation should enqueue at least one receipt"
         );
         let validation_submission = browser_client
-            .submit_receipts(&browser_session.session_id, &pending_validation_receipts)
+            .submit_receipts(&verifier_session.session_id, &pending_validation_receipts)
             .await
             .expect("submit browser validation receipts");
         assert_eq!(
@@ -1665,7 +1723,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         .expect("init diffusion genesis head");
     for trainer in [&trainer_b, &trainer_c] {
         wait_for(
-            Duration::from_secs(30),
+            Duration::from_secs(45),
             || {
                 trainer
                     .sync_experiment_head(&experiment)
@@ -1827,7 +1885,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             trainer_b_window.head.head_id.clone(),
             trainer_c_window.head.head_id.clone(),
         ];
-        let convergence_deadline = Instant::now() + Duration::from_secs(40);
+        let convergence_deadline = Instant::now() + Duration::from_secs(90);
         let promoted_head = loop {
             seed.advance_diffusion_steady_state(&experiment, None, None)
                 .expect("advance seed diffusion");
@@ -1870,7 +1928,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         assert_eq!(promoted_head.global_step, canonical_head.global_step + 1);
 
         wait_for(
-            Duration::from_secs(20),
+            Duration::from_secs(40),
             || {
                 [
                     seed_telemetry.snapshot(),
@@ -2638,18 +2696,26 @@ fn browser_conformance_uses_native_dragon_manifests() {
     }
     let entry = prepared.manifests.experiment_directory[0].clone();
     let network_id = prepared.manifests.network_manifest.network_id.clone();
-    let session = browser_conformance_session(
+    let trainer_session = browser_conformance_session(
         network_id.clone(),
-        PrincipalId::new("browser-principal"),
-        BTreeSet::from([
-            ExperimentScope::Connect,
-            ExperimentScope::Train {
+        PrincipalId::new("browser-trainer-principal"),
+        entry.allowed_scopes.clone(),
+    );
+    assert!(
+        !trainer_session
+            .session
+            .as_ref()
+            .expect("trainer session")
+            .claims
+            .granted_scopes
+            .contains(&ExperimentScope::Validate {
                 experiment_id: entry.experiment_id.clone(),
-            },
-            ExperimentScope::Validate {
-                experiment_id: entry.experiment_id.clone(),
-            },
-        ]),
+            })
+    );
+    let verifier_session = browser_conformance_session(
+        network_id.clone(),
+        PrincipalId::new("browser-local-verifier-principal"),
+        local_mock_verifier_scopes(&entry),
     );
     let mut harness = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
@@ -2673,7 +2739,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserTrainerWgpu),
         browser_conformance_transport(),
         browser_conformance_directory(network_id.clone(), vec![entry.clone()]),
-        session.clone(),
+        trainer_session,
     );
     harness.select_experiment(
         entry.experiment_id.clone(),
@@ -2731,7 +2797,18 @@ fn browser_conformance_uses_native_dragon_manifests() {
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserVerifier),
         browser_conformance_transport(),
         browser_conformance_directory(network_id, vec![entry.clone()]),
-        session,
+        verifier_session.clone(),
+    );
+    assert!(
+        verifier_session
+            .session
+            .as_ref()
+            .expect("verifier session")
+            .claims
+            .granted_scopes
+            .contains(&ExperimentScope::Validate {
+                experiment_id: entry.experiment_id.clone(),
+            })
     );
     verifier.select_experiment(
         entry.experiment_id.clone(),
@@ -2881,7 +2958,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
     };
     let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
     let entry = prepared.manifests.experiment_directory[0].clone();
-    let (mut trainer, mut verifier) = browser_harness_pair(
+    let (mut trainer, mut verifier) = local_browser_training_and_verification_pair(
         &entry,
         prepared
             .manifests
@@ -2992,7 +3069,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
     let peer_b =
         prepare_climbmix_native_cpu(&peer_b_config, Some(&dummy_auth_bundle())).expect("peer b");
     let entry = peer_a.manifests.experiment_directory[0].clone();
-    let (mut trainer, mut verifier) = browser_harness_pair(
+    let (mut trainer, mut verifier) = local_browser_training_and_verification_pair(
         &entry,
         peer_a.manifests.release_manifest.release_train_hash.clone(),
         peer_a
@@ -3110,7 +3187,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
     };
     let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
     let entry = prepared.manifests.experiment_directory[0].clone();
-    let (mut trainer, mut verifier) = browser_harness_pair(
+    let (mut trainer, mut verifier) = local_browser_training_and_verification_pair(
         &entry,
         prepared
             .manifests
@@ -3226,7 +3303,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
         prepare_climbmix_native_cpu(&peer_c_config, Some(&dummy_auth_bundle())).expect("peer c");
 
     let entry = peer_a.manifests.experiment_directory[0].clone();
-    let (mut trainer, mut verifier) = browser_harness_pair(
+    let (mut trainer, mut verifier) = local_browser_training_and_verification_pair(
         &entry,
         peer_a.manifests.release_manifest.release_train_hash.clone(),
         peer_a

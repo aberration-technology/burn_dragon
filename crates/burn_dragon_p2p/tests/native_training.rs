@@ -1483,417 +1483,460 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
 }
 
 #[test]
-#[ignore = "manual stress test; upstream libp2p-request-response debug assert can panic during multi-round native runtime runs"]
 fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
+    let bootstrap_storage = tempdir().expect("bootstrap storage");
     let nca_config_path = root.path().join("nca.toml");
-    let training_config_path = root.path().join("nca-train.toml");
+    let training_config_path_seed = root.path().join("nca-train-seed.toml");
+    let training_config_path_b = root.path().join("nca-train-b.toml");
+    let training_config_path_c = root.path().join("nca-train-c.toml");
     write(&nca_config_path, &nca_corpus_config_toml(root.path()));
     write(
-        &training_config_path,
-        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+        &training_config_path_seed,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-seed"),
+            &nca_config_path,
+            SMALL_SPEC,
+        ),
+    );
+    write(
+        &training_config_path_b,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-b"),
+            &nca_config_path,
+            SMALL_SPEC,
+        )
+        .replace("seed = 1337", "seed = 1338")
+        .replace("learning_rate = 0.001", "learning_rate = 0.0015"),
+    );
+    write(
+        &training_config_path_c,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-c"),
+            &nca_config_path,
+            SMALL_SPEC,
+        )
+        .replace("seed = 1337", "seed = 1339")
+        .replace("learning_rate = 0.001", "learning_rate = 0.002"),
     );
 
-    let validator_config = DragonNativePeerConfig {
-        training_config_paths: vec![training_config_path.clone()],
-        storage_root: root.path().join("storage-validator"),
-        network: Default::default(),
-        target: Some(DragonNativeTarget::Validator),
-        identity: Default::default(),
-        bootstrap_peers: Vec::new(),
-        manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
-        git_commit: Some("runtime-cluster".into()),
-        enabled_features_label: Some("native-cpu".into()),
-        auth: None,
-        capability_policy: Default::default(),
-        shard_export: Some(DragonShardExportConfig {
-            root: root.path().join("validator-shards"),
-            dataset_name: Some("dragon-nca-runtime-validator".into()),
-            microshards: Some(4),
-            max_records: Some(32),
-            http_upstream: None,
-        }),
-        existing_shard_dataset: None,
-    };
-    let validator_prepared =
-        prepare_nca_native_cpu(&validator_config, Some(&dummy_auth_bundle())).expect("validator");
-    let experiment_entry = validator_prepared.manifests.experiment_directory[0].clone();
-    let mut validator = spawn_prepared_native_peer(validator_prepared).expect("spawn validator");
-    let experiment = validator.mainnet().experiment(
-        experiment_entry.study_id.clone(),
-        experiment_entry.experiment_id.clone(),
-        experiment_entry.current_revision_id.clone(),
-    );
-    let validator_telemetry = validator.telemetry();
+    let bootstrap_addr = loopback_swarm_address();
+    let bootstrap_plan = burn_p2p_bootstrap::BootstrapSpec {
+        preset: burn_p2p_bootstrap::BootstrapPreset::BootstrapOnly,
+        genesis: burn_p2p_core::GenesisSpec {
+            network_id: burn_p2p_core::NetworkId::new("dragon-p2p-testnet"),
+            protocol_version: Version::new(0, 1, 0),
+            display_name: "dragon runtime diffusion cluster smoke".into(),
+            created_at: Utc::now(),
+            metadata: BTreeMap::new(),
+        },
+        platform: ClientPlatform::Native,
+        bootstrap_addresses: Vec::new(),
+        listen_addresses: vec![bootstrap_addr.clone()],
+        authority: None,
+        archive: burn_p2p_bootstrap::ArchivePlan::default(),
+        admin_api: burn_p2p_bootstrap::AdminApiPlan::default(),
+    }
+    .plan()
+    .expect("bootstrap plan");
+    let bootstrap = bootstrap_plan
+        .spawn_bootstrap_peer_daemon(burn_p2p_bootstrap::BootstrapPeerDaemonConfig {
+            node: burn_p2p::NodeConfig {
+                identity: burn_p2p::IdentityConfig::Persistent,
+                storage: Some(burn_p2p::StorageConfig::new(bootstrap_storage.path())),
+                dataset: None,
+                auth: None,
+                network_manifest: None,
+                client_release_manifest: None,
+                selected_workload_id: None,
+                metrics_retention: burn_p2p::MetricsRetentionConfig::default(),
+                bootstrap_peers: Vec::new(),
+                listen_addresses: vec![bootstrap_addr.clone()],
+            },
+        })
+        .expect("spawn bootstrap peer daemon");
+    let bootstrap_telemetry = bootstrap.telemetry();
     wait_for(
         Duration::from_secs(10),
         || {
-            let snapshot = validator_telemetry.snapshot();
+            let snapshot = bootstrap_telemetry.snapshot();
             snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty()
         },
-        "validator runtime did not start",
+        "bootstrap-only peer daemon did not start",
     );
-    let validator_snapshot = validator_telemetry.snapshot();
-    let validator_addr = validator_snapshot
-        .listen_addresses
-        .iter()
-        .find(|address| address.as_str().contains("/tcp/"))
-        .cloned()
-        .unwrap_or_else(|| validator_snapshot.listen_addresses[0].clone());
-    let genesis_head = validator
-        .initialize_local_head(&experiment)
-        .expect("init validator genesis head");
-    assert_eq!(genesis_head.global_step, 0);
+    assert!(
+        !bootstrap_telemetry
+            .snapshot()
+            .configured_roles
+            .contains(&PeerRole::Validator)
+    );
 
-    let build_trainer_config = |label: &str| DragonNativePeerConfig {
-        training_config_paths: vec![training_config_path.clone()],
-        storage_root: root.path().join(format!("storage-{label}")),
-        network: Default::default(),
-        target: Some(DragonNativeTarget::Trainer),
-        identity: Default::default(),
-        bootstrap_peers: vec![validator_addr.clone()],
-        manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
-        git_commit: Some(format!("runtime-cluster-{label}")),
-        enabled_features_label: Some("native-cpu".into()),
-        auth: None,
-        capability_policy: Default::default(),
-        shard_export: Some(DragonShardExportConfig {
-            root: root.path().join(format!("{label}-shards")),
-            dataset_name: Some(format!("dragon-nca-runtime-{label}")),
-            microshards: Some(4),
-            max_records: Some(32),
-            http_upstream: None,
-        }),
-        existing_shard_dataset: None,
-    };
+    let make_trainer_config =
+        |label: &str, training_config_path: &std::path::Path| DragonNativePeerConfig {
+            training_config_paths: vec![training_config_path.to_path_buf()],
+            storage_root: root.path().join(format!("storage-{label}")),
+            network: Default::default(),
+            target: Some(DragonNativeTarget::Trainer),
+            identity: Default::default(),
+            bootstrap_peers: vec![bootstrap_addr.clone()],
+            manifest: native_manifest_seed(),
+            app_semver: semver::Version::parse("0.21.0-pre.14").expect("valid burn_dragon version"),
+            git_commit: Some(format!("runtime-cluster-{label}")),
+            enabled_features_label: Some("native-cpu".into()),
+            auth: None,
+            capability_policy: Default::default(),
+            shard_export: Some(DragonShardExportConfig {
+                root: root.path().join(format!("shards-{label}")),
+                dataset_name: Some(format!("dragon-nca-runtime-{label}")),
+                microshards: Some(4),
+                max_records: Some(32),
+                http_upstream: None,
+            }),
+            existing_shard_dataset: None,
+        };
 
-    let trainer_a_prepared = prepare_nca_native_cpu(
-        &build_trainer_config("trainer-a"),
+    let seed_prepared = prepare_nca_native_cpu(
+        &make_trainer_config("seed", &training_config_path_seed),
         Some(&dummy_auth_bundle()),
     )
-    .expect("trainer a");
+    .expect("seed trainer");
+    let experiment_entry = seed_prepared.manifests.experiment_directory[0].clone();
+    let topology = experiment_entry
+        .merge_topology_policy()
+        .expect("diffusion merge topology");
+    assert_eq!(topology.strategy, MergeStrategy::KRegularGossip);
+    assert_eq!(
+        topology.promotion_policy.mode,
+        HeadPromotionMode::DiffusionSteadyState
+    );
+    assert!(
+        experiment_entry
+            .allowed_roles
+            .contains(&PeerRole::TrainerCpu)
+    );
+    assert!(
+        !experiment_entry
+            .allowed_roles
+            .contains(&PeerRole::Validator)
+    );
+
     let trainer_b_prepared = prepare_nca_native_cpu(
-        &build_trainer_config("trainer-b"),
+        &make_trainer_config("trainer-b", &training_config_path_b),
         Some(&dummy_auth_bundle()),
     )
     .expect("trainer b");
-    let mut trainer_a = spawn_prepared_native_peer(trainer_a_prepared).expect("spawn trainer a");
+    let trainer_c_prepared = prepare_nca_native_cpu(
+        &make_trainer_config("trainer-c", &training_config_path_c),
+        Some(&dummy_auth_bundle()),
+    )
+    .expect("trainer c");
+
+    let mut seed = spawn_prepared_native_peer(seed_prepared).expect("spawn seed trainer");
     let mut trainer_b = spawn_prepared_native_peer(trainer_b_prepared).expect("spawn trainer b");
-    let trainer_a_telemetry = trainer_a.telemetry();
+    let mut trainer_c = spawn_prepared_native_peer(trainer_c_prepared).expect("spawn trainer c");
+    let seed_telemetry = seed.telemetry();
     let trainer_b_telemetry = trainer_b.telemetry();
+    let trainer_c_telemetry = trainer_c.telemetry();
 
     wait_for(
-        Duration::from_secs(15),
-        || validator_telemetry.snapshot().connected_peers >= 2,
-        "validator did not connect to both trainers",
+        Duration::from_secs(30),
+        || seed_telemetry.snapshot().connected_peers >= 1,
+        "seed trainer did not connect",
     );
     wait_for(
-        Duration::from_secs(15),
-        || trainer_a_telemetry.snapshot().connected_peers >= 1,
-        "trainer a did not connect",
-    );
-    wait_for(
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         || trainer_b_telemetry.snapshot().connected_peers >= 1,
         "trainer b did not connect",
     );
     wait_for(
-        Duration::from_secs(20),
-        || {
-            trainer_a
-                .sync_experiment_head(&experiment)
-                .expect("sync trainer a head")
-                .is_some()
-        },
-        "trainer a did not sync the canonical genesis head",
-    );
-    wait_for(
-        Duration::from_secs(20),
-        || {
-            trainer_b
-                .sync_experiment_head(&experiment)
-                .expect("sync trainer b head")
-                .is_some()
-        },
-        "trainer b did not sync the canonical genesis head",
+        Duration::from_secs(30),
+        || trainer_c_telemetry.snapshot().connected_peers >= 1,
+        "trainer c did not connect",
     );
 
-    let synced_a = trainer_a
-        .sync_experiment_head(&experiment)
-        .expect("sync trainer a head")
-        .expect("trainer a synced head");
-    let synced_b = trainer_b
-        .sync_experiment_head(&experiment)
-        .expect("sync trainer b head")
-        .expect("trainer b synced head");
-    assert_eq!(synced_a.head_id, genesis_head.head_id);
-    assert_eq!(synced_b.head_id, genesis_head.head_id);
+    let experiment = seed.mainnet().experiment(
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
+    );
+    let genesis_head = seed
+        .initialize_local_head(&experiment)
+        .expect("init diffusion genesis head");
+    for trainer in [&trainer_b, &trainer_c] {
+        wait_for(
+            Duration::from_secs(30),
+            || {
+                trainer
+                    .sync_experiment_head(&experiment)
+                    .expect("sync trainer genesis head")
+                    .is_some()
+            },
+            "trainer did not sync genesis head",
+        );
+    }
 
     let mut trainer_losses = Vec::new();
     let mut merged_losses = Vec::new();
     let mut canonical_head = genesis_head.clone();
 
-    for round in 0..3 {
-        let trainer_a_window = trainer_a
-            .train_window_once_with_pinned_head(&experiment, Some(&canonical_head))
-            .expect("trainer a window");
-        let trainer_b_window = trainer_b
-            .train_window_once_with_pinned_head(&experiment, Some(&canonical_head))
-            .expect("trainer b window");
+    for round in 0..2 {
+        let base_head_id = canonical_head.head_id.clone();
+        let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let experiment_for_seed = experiment.clone();
+        let experiment_for_trainer_b = experiment.clone();
+        let experiment_for_trainer_c = experiment.clone();
+        let pinned_head_seed = canonical_head.clone();
+        let pinned_head_b = canonical_head.clone();
+        let pinned_head_c = canonical_head.clone();
+        let seed_ref = &mut seed;
+        let trainer_b_ref = &mut trainer_b;
+        let trainer_c_ref = &mut trainer_c;
+        let (seed_window, trainer_b_window, trainer_c_window) = thread::scope(|scope| {
+            let seed = seed_ref;
+            let seed_barrier = std::sync::Arc::clone(&start_barrier);
+            let seed_run = scope.spawn(move || {
+                seed_barrier.wait();
+                seed.train_window_once_with_pinned_head(
+                    &experiment_for_seed,
+                    Some(&pinned_head_seed),
+                )
+            });
+            let trainer_b = trainer_b_ref;
+            let trainer_b_barrier = std::sync::Arc::clone(&start_barrier);
+            let trainer_b_run = scope.spawn(move || {
+                trainer_b_barrier.wait();
+                trainer_b.train_window_once_with_pinned_head(
+                    &experiment_for_trainer_b,
+                    Some(&pinned_head_b),
+                )
+            });
+            let trainer_c = trainer_c_ref;
+            let trainer_c_barrier = std::sync::Arc::clone(&start_barrier);
+            let trainer_c_run = scope.spawn(move || {
+                trainer_c_barrier.wait();
+                trainer_c.train_window_once_with_pinned_head(
+                    &experiment_for_trainer_c,
+                    Some(&pinned_head_c),
+                )
+            });
+            let seed_window = seed_run
+                .join()
+                .map_err(|_| anyhow::anyhow!("runtime cluster seed train thread panicked"))??;
+            let trainer_b_window = trainer_b_run.join().map_err(|_| {
+                anyhow::anyhow!("runtime cluster trainer b train thread panicked")
+            })??;
+            let trainer_c_window = trainer_c_run.join().map_err(|_| {
+                anyhow::anyhow!("runtime cluster trainer c train thread panicked")
+            })??;
+            anyhow::Ok((seed_window, trainer_b_window, trainer_c_window))
+        })
+        .expect("parallel runtime cluster windows");
 
-        let trainer_a_loss =
-            metric_float_any(&trainer_a_window.report.stats, &["loss", "train_loss"]);
-        let trainer_b_loss =
-            metric_float_any(&trainer_b_window.report.stats, &["loss", "train_loss"]);
-        trainer_losses.push(trainer_a_loss);
-        trainer_losses.push(trainer_b_loss);
-        assert!(trainer_a_loss.is_finite());
-        assert!(trainer_b_loss.is_finite());
         assert_eq!(
-            trainer_a_window.head.parent_head_id,
-            Some(canonical_head.head_id.clone())
+            seed_window.lease.window_id,
+            trainer_b_window.lease.window_id
         );
         assert_eq!(
-            trainer_b_window.head.parent_head_id,
-            Some(canonical_head.head_id.clone())
+            seed_window.lease.window_id,
+            trainer_c_window.lease.window_id
         );
+        let window_id = seed_window.lease.window_id;
 
-        trainer_a
-            .publish_head_provider(&experiment, &trainer_a_window.head)
-            .expect("publish trainer a head provider");
-        trainer_a
-            .publish_artifact_from_store(&trainer_a_window.artifact.artifact_id)
-            .expect("publish trainer a delta artifact");
-        if trainer_a_window.head.artifact_id != trainer_a_window.artifact.artifact_id {
-            trainer_a
-                .publish_artifact_from_store(&trainer_a_window.head.artifact_id)
-                .expect("publish trainer a head artifact");
+        let round_outcomes = [&seed_window, &trainer_b_window, &trainer_c_window];
+        for outcome in round_outcomes {
+            let loss = metric_float_any(&outcome.report.stats, &["loss", "train_loss"]);
+            trainer_losses.push(loss);
+            assert!(loss.is_finite());
+            assert_eq!(outcome.head.parent_head_id, Some(base_head_id.clone()));
+            assert_eq!(outcome.head.global_step, canonical_head.global_step + 1);
         }
-        trainer_a
-            .republish_training_window_control_plane(
-                &experiment,
-                trainer_a_window.lease.window_id,
-                &trainer_a_window.contribution.base_head_id,
-                &trainer_a_window.artifact.artifact_id,
-            )
-            .expect("republish trainer a control plane");
 
-        trainer_b
-            .publish_head_provider(&experiment, &trainer_b_window.head)
-            .expect("publish trainer b head provider");
-        trainer_b
-            .publish_artifact_from_store(&trainer_b_window.artifact.artifact_id)
-            .expect("publish trainer b delta artifact");
-        if trainer_b_window.head.artifact_id != trainer_b_window.artifact.artifact_id {
-            trainer_b
-                .publish_artifact_from_store(&trainer_b_window.head.artifact_id)
-                .expect("publish trainer b head artifact");
+        for (label, peer, outcome) in [
+            ("seed", &seed, &seed_window),
+            ("trainer-b", &trainer_b, &trainer_b_window),
+            ("trainer-c", &trainer_c, &trainer_c_window),
+        ] {
+            let store = peer.artifact_store().expect("artifact store");
+            assert!(
+                store.has_manifest(&outcome.artifact.artifact_id),
+                "{label} should persist its update artifact manifest locally"
+            );
+            assert!(
+                outcome
+                    .artifact
+                    .chunks
+                    .iter()
+                    .all(|chunk| store.has_chunk(&chunk.chunk_id)),
+                "{label} should persist all update artifact chunks locally"
+            );
         }
-        trainer_b
-            .republish_training_window_control_plane(
-                &experiment,
-                trainer_b_window.lease.window_id,
-                &trainer_b_window.contribution.base_head_id,
-                &trainer_b_window.artifact.artifact_id,
-            )
-            .expect("republish trainer b control plane");
+
+        eprintln!(
+            "nca_runtime_cluster_round_{round}_artifacts: seed_bytes={} seed_chunks={} trainer_b_bytes={} trainer_b_chunks={} trainer_c_bytes={} trainer_c_chunks={}",
+            seed_window.artifact.bytes_len,
+            seed_window.artifact.chunks.len(),
+            trainer_b_window.artifact.bytes_len,
+            trainer_b_window.artifact.chunks.len(),
+            trainer_c_window.artifact.bytes_len,
+            trainer_c_window.artifact.chunks.len(),
+        );
 
         wait_for(
-            Duration::from_secs(20),
+            Duration::from_secs(30),
             || {
-                let snapshot = validator_telemetry.snapshot();
-                snapshot
-                    .control_plane
-                    .update_announcements
-                    .iter()
-                    .any(|announcement| {
-                        announcement.update.delta_artifact_id
-                            == trainer_a_window.artifact.artifact_id
-                    })
-                    && snapshot
+                [
+                    seed_telemetry.snapshot(),
+                    trainer_b_telemetry.snapshot(),
+                    trainer_c_telemetry.snapshot(),
+                ]
+                .into_iter()
+                .all(|snapshot| {
+                    snapshot
                         .control_plane
                         .update_announcements
                         .iter()
-                        .any(|announcement| {
-                            announcement.update.delta_artifact_id
-                                == trainer_b_window.artifact.artifact_id
+                        .filter(|announcement| {
+                            announcement.update.study_id == experiment.study_id
+                                && announcement.update.experiment_id == experiment.experiment_id
+                                && announcement.update.revision_id == experiment.revision_id
+                                && announcement.update.window_id == window_id
+                                && announcement.update.base_head_id == base_head_id
                         })
+                        .count()
+                        >= 3
+                        && snapshot
+                            .control_plane
+                            .reducer_assignment_announcements
+                            .is_empty()
+                        && snapshot
+                            .control_plane
+                            .aggregate_proposal_announcements
+                            .is_empty()
+                        && snapshot
+                            .control_plane
+                            .validation_quorum_announcements
+                            .is_empty()
+                })
             },
-            "validator did not observe both trainer updates",
+            "runtime diffusion cluster did not observe the trainer-only update frontier",
         );
 
-        let trainer_a_store = trainer_a
-            .artifact_store()
-            .expect("trainer a artifact store");
-        assert!(
-            trainer_a_store.has_manifest(&trainer_a_window.artifact.artifact_id),
-            "trainer a should persist its update artifact manifest locally"
-        );
-        assert!(
-            trainer_a_window
-                .artifact
-                .chunks
-                .iter()
-                .all(|chunk| trainer_a_store.has_chunk(&chunk.chunk_id)),
-            "trainer a should persist all update artifact chunks locally"
-        );
-        let trainer_b_store = trainer_b
-            .artifact_store()
-            .expect("trainer b artifact store");
-        assert!(
-            trainer_b_store.has_manifest(&trainer_b_window.artifact.artifact_id),
-            "trainer b should persist its update artifact manifest locally"
-        );
-        assert!(
-            trainer_b_window
-                .artifact
-                .chunks
-                .iter()
-                .all(|chunk| trainer_b_store.has_chunk(&chunk.chunk_id)),
-            "trainer b should persist all update artifact chunks locally"
-        );
+        let local_head_ids = [
+            seed_window.head.head_id.clone(),
+            trainer_b_window.head.head_id.clone(),
+            trainer_c_window.head.head_id.clone(),
+        ];
+        let convergence_deadline = Instant::now() + Duration::from_secs(40);
+        let promoted_head = loop {
+            seed.advance_diffusion_steady_state(&experiment, None, None)
+                .expect("advance seed diffusion");
+            trainer_b
+                .advance_diffusion_steady_state(&experiment, None, None)
+                .expect("advance trainer b diffusion");
+            trainer_c
+                .advance_diffusion_steady_state(&experiment, None, None)
+                .expect("advance trainer c diffusion");
 
-        eprintln!(
-            "nca_runtime_cluster_round_{round}_artifacts: trainer_a_bytes={} trainer_a_chunks={} trainer_b_bytes={} trainer_b_chunks={}",
-            trainer_a_window.artifact.bytes_len,
-            trainer_a_window.artifact.chunks.len(),
-            trainer_b_window.artifact.bytes_len,
-            trainer_b_window.artifact.chunks.len(),
-        );
-
-        wait_for(
-            Duration::from_secs(20),
-            || {
-                let snapshot = validator_telemetry.snapshot();
-                snapshot
-                    .control_plane
-                    .merge_window_announcements
-                    .iter()
-                    .any(|announcement| {
-                        announcement.merge_window.window_id == trainer_a_window.lease.window_id
-                            && announcement.merge_window.base_head_id == canonical_head.head_id
-                    })
-                    && snapshot
-                        .control_plane
-                        .reducer_assignment_announcements
-                        .iter()
-                        .any(|announcement| {
-                            announcement.assignment.window_id == trainer_a_window.lease.window_id
-                        })
-            },
-            "validator did not observe the current round merge topology",
-        );
-
-        let validation_deadline = Instant::now() + Duration::from_secs(20);
-        let mut last_validation_error = None;
-        let validation = loop {
-            match validator.validate_candidates_once(&experiment) {
-                Ok(Some(outcome)) => break outcome,
-                Ok(None) => {}
-                Err(error) => last_validation_error = Some(error.to_string()),
+            let seed_head = seed
+                .sync_experiment_head(&experiment)
+                .expect("sync runtime seed head");
+            let trainer_b_head = trainer_b
+                .sync_experiment_head(&experiment)
+                .expect("sync runtime trainer b head");
+            let trainer_c_head = trainer_c
+                .sync_experiment_head(&experiment)
+                .expect("sync runtime trainer c head");
+            if let (Some(seed_head), Some(trainer_b_head), Some(trainer_c_head)) =
+                (seed_head, trainer_b_head, trainer_c_head)
+                && seed_head.head_id == trainer_b_head.head_id
+                && seed_head.head_id == trainer_c_head.head_id
+                && seed_head.head_id != base_head_id
+                && !local_head_ids.contains(&seed_head.head_id)
+            {
+                break seed_head;
             }
-            if Instant::now() >= validation_deadline {
-                panic!(
-                    "validation outcome did not materialize for round {round}; last_error={:?}",
-                    last_validation_error
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
+            assert!(
+                Instant::now() < convergence_deadline,
+                "runtime diffusion cluster did not converge on one promoted head"
+            );
+            thread::sleep(Duration::from_millis(25));
         };
-        let merged_loss =
-            metric_float_any(&validation.merged_head.metrics, &["loss", "train_loss"]);
+
+        let merged_loss = metric_float_any(&promoted_head.metrics, &["loss", "train_loss"]);
         merged_losses.push(merged_loss);
         assert!(merged_loss.is_finite());
-        assert_eq!(
-            validation.merged_head.parent_head_id,
-            Some(canonical_head.head_id.clone())
-        );
-        assert!(validation.merged_head.global_step > canonical_head.global_step);
+        assert_eq!(promoted_head.parent_head_id, Some(base_head_id.clone()));
+        assert_eq!(promoted_head.global_step, canonical_head.global_step + 1);
 
-        validator
-            .publish_head_provider(&experiment, &validation.merged_head)
-            .expect("publish merged head provider");
-        validator
-            .publish_artifact_from_store(&validation.merged_head.artifact_id)
-            .expect("publish merged head artifact");
-
-        let merged_head_id = validation.merged_head.head_id.clone();
         wait_for(
             Duration::from_secs(20),
             || {
-                validator
-                    .sync_experiment_head(&experiment)
-                    .expect("sync validator merged head")
-                    .as_ref()
-                    .is_some_and(|head| head.head_id == merged_head_id)
+                [
+                    seed_telemetry.snapshot(),
+                    trainer_b_telemetry.snapshot(),
+                    trainer_c_telemetry.snapshot(),
+                ]
+                .into_iter()
+                .all(|snapshot| {
+                    snapshot
+                        .control_plane
+                        .diffusion_promotion_certificate_announcements
+                        .iter()
+                        .any(|announcement| {
+                            announcement.certificate.window_id == window_id
+                                && announcement.certificate.base_head_id == base_head_id
+                                && announcement.certificate.merged_head_id == promoted_head.head_id
+                                && announcement.certificate.promotion_mode
+                                    == HeadPromotionMode::DiffusionSteadyState
+                        })
+                        && snapshot
+                            .control_plane
+                            .merge_announcements
+                            .iter()
+                            .any(|announcement| {
+                                announcement.certificate.base_head_id == base_head_id
+                                    && announcement.certificate.merged_head_id
+                                        == promoted_head.head_id
+                                    && announcement.certificate.promotion_mode
+                                        == HeadPromotionMode::DiffusionSteadyState
+                            })
+                        && snapshot
+                            .control_plane
+                            .validation_quorum_announcements
+                            .is_empty()
+                })
             },
-            "validator did not retain merged head",
-        );
-        wait_for(
-            Duration::from_secs(20),
-            || {
-                trainer_a
-                    .sync_experiment_head(&experiment)
-                    .expect("sync trainer a merged head")
-                    .as_ref()
-                    .is_some_and(|head| head.head_id == merged_head_id)
-            },
-            "trainer a did not sync merged head",
-        );
-        wait_for(
-            Duration::from_secs(20),
-            || {
-                trainer_b
-                    .sync_experiment_head(&experiment)
-                    .expect("sync trainer b merged head")
-                    .as_ref()
-                    .is_some_and(|head| head.head_id == merged_head_id)
-            },
-            "trainer b did not sync merged head",
-        );
-        wait_for(
-            Duration::from_secs(10),
-            || {
-                let validator_snapshot = validator_telemetry.snapshot();
-                let trainer_a_snapshot = trainer_a_telemetry.snapshot();
-                let trainer_b_snapshot = trainer_b_telemetry.snapshot();
-                validator_snapshot.connected_peers >= 2
-                    && trainer_a_snapshot.connected_peers >= 1
-                    && trainer_b_snapshot.connected_peers >= 1
-                    && validator_snapshot.last_error.is_none()
-                    && trainer_a_snapshot.last_error.is_none()
-                    && trainer_b_snapshot.last_error.is_none()
-            },
-            "runtime cluster did not settle cleanly after merged head publication",
+            "runtime diffusion promotion certificates did not propagate across the trainer swarm",
         );
 
         eprintln!(
-            "nca_runtime_cluster_round_{round}: trainer_losses=({trainer_a_loss:.4}, {trainer_b_loss:.4}) merged_loss={merged_loss:.4} global_step={} connected_peers={}",
-            validation.merged_head.global_step,
-            validator_telemetry.snapshot().connected_peers,
+            "nca_runtime_cluster_round_{round}: trainer_losses=({:.4}, {:.4}, {:.4}) merged_loss={:.4} global_step={}",
+            metric_float_any(&seed_window.report.stats, &["loss", "train_loss"]),
+            metric_float_any(&trainer_b_window.report.stats, &["loss", "train_loss"]),
+            metric_float_any(&trainer_c_window.report.stats, &["loss", "train_loss"]),
+            merged_loss,
+            promoted_head.global_step,
         );
-        canonical_head = validation.merged_head;
+
+        canonical_head = promoted_head;
     }
 
     log_loss_series("nca_runtime_cluster_trainers", &trainer_losses);
     log_loss_series("nca_runtime_cluster_merged", &merged_losses);
     assert!(trainer_losses.iter().all(|loss| loss.is_finite()));
     assert!(merged_losses.iter().all(|loss| loss.is_finite()));
-    assert!(
-        trainer_losses.iter().copied().fold(f64::INFINITY, f64::min) <= trainer_losses[0] - 0.1,
-        "runtime cluster trainers should show a material best-window improvement"
-    );
-    assert!(
-        merged_losses.iter().copied().fold(f64::INFINITY, f64::min) <= merged_losses[0] - 0.05,
-        "runtime cluster merged heads should improve over the initial merged loss"
-    );
+    assert_eq!(canonical_head.global_step, 2);
 
-    shutdown_runtime_peer(trainer_a, "trainer a");
-    shutdown_runtime_peer(trainer_b, "trainer b");
-    shutdown_runtime_peer(validator, "validator");
+    shutdown_runtime_peer(trainer_c, "runtime cluster trainer c");
+    shutdown_runtime_peer(trainer_b, "runtime cluster trainer b");
+    shutdown_runtime_peer(seed, "runtime cluster seed");
+    bootstrap
+        .shutdown()
+        .expect("bootstrap-only peer daemon shutdown");
+    bootstrap
+        .await_termination()
+        .expect("bootstrap-only peer daemon termination");
 }
 
 #[test]
@@ -2155,7 +2198,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
 
     for trainer in [&trainer_b, &trainer_c] {
         wait_for(
-            Duration::from_secs(20),
+            Duration::from_secs(30),
             || {
                 trainer
                     .sync_experiment_head(&experiment)

@@ -1556,10 +1556,10 @@ resource "aws_acm_certificate" "dataset" {
 
 resource "aws_route53_record" "dataset_caa" {
   allow_overwrite = true
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.dataset_domain_name
-  type    = "CAA"
-  ttl     = 300
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.dataset_domain_name
+  type            = "CAA"
+  ttl             = 300
   records = [
     "0 issue \"amazon.com\"",
     "0 issue \"amazontrust.com\"",

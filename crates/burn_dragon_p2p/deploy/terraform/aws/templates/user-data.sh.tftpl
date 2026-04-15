@@ -34,28 +34,6 @@ export CARGO_HOME=/root/.cargo
 export RUSTUP_HOME=/root/.rustup
 source /root/.cargo/env
 
-if [ "${bootstrap_install_source}" = "crate" ]; then
-  cargo install \
-    --locked \
-    burn_p2p_bootstrap \
-    --version "${bootstrap_crate_version}" \
-    --bin burn-p2p-bootstrap \
-    --no-default-features \
-    --features admin-http,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
-else
-  cargo install \
-    --locked \
-    --git "${bootstrap_git_repo}" \
-    --rev "${bootstrap_git_ref}" \
-    burn_p2p_bootstrap \
-    --bin burn-p2p-bootstrap \
-    --no-default-features \
-    --features admin-http,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
-fi
-
-install -d -m 0755 /usr/local/bin
-ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
-
 BOOTSTRAP_DATA_VOLUME_ID="${bootstrap_data_volume_id}"
 BOOTSTRAP_DATA_DEVICE_NAME="${bootstrap_data_device_name}"
 BOOTSTRAP_DATA_MOUNT_PATH="${bootstrap_data_mount_path}"
@@ -161,6 +139,28 @@ EOF_SERVICE
 systemctl daemon-reload
 systemctl enable caddy burn-p2p-bootstrap
 systemctl restart caddy
+
+if [ "${bootstrap_install_source}" = "crate" ]; then
+  cargo install \
+    --locked \
+    burn_p2p_bootstrap \
+    --version "${bootstrap_crate_version}" \
+    --bin burn-p2p-bootstrap \
+    --no-default-features \
+    --features admin-http,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
+else
+  cargo install \
+    --locked \
+    --git "${bootstrap_git_repo}" \
+    --rev "${bootstrap_git_ref}" \
+    burn_p2p_bootstrap \
+    --bin burn-p2p-bootstrap \
+    --no-default-features \
+    --features admin-http,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
+fi
+
+install -d -m 0755 /usr/local/bin
+ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
 systemctl start burn-p2p-bootstrap
 
 if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then

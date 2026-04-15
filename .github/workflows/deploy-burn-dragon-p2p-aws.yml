@@ -146,101 +146,192 @@ jobs:
 
       - name: resolve deployment settings
         shell: bash
+        env:
+          VAR_STACK_NAME: ${{ vars.BURN_DRAGON_P2P_STACK_NAME }}
+          VAR_AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+          VAR_AWS_ROLE_ARN: ${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}
+          INPUT_DISASTER_RECOVERY_REGION: ${{ github.event.inputs.disaster_recovery_region }}
+          VAR_DISASTER_RECOVERY_REGION: ${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_REGION }}
+          INPUT_EDGE_DOMAIN_NAME: ${{ github.event.inputs.edge_domain_name }}
+          VAR_EDGE_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}
+          INPUT_ROUTE53_ZONE_NAME: ${{ github.event.inputs.route53_zone_name }}
+          VAR_ROUTE53_ZONE_NAME: ${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}
+          VAR_BROWSER_APP_BASE_URL: ${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}
+          VAR_AUTH_REDIRECT_BASE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL }}
+          VAR_BROWSER_APP_PAGES_DOMAIN_TARGET: ${{ vars.BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}
+          VAR_NETWORK_ID: ${{ vars.BURN_DRAGON_P2P_NETWORK_ID }}
+          VAR_PROJECT_FAMILY_ID: ${{ vars.BURN_DRAGON_P2P_PROJECT_FAMILY_ID }}
+          VAR_STUDY_ID: ${{ vars.BURN_DRAGON_P2P_STUDY_ID }}
+          VAR_RELEASE_TRAIN_HASH: ${{ vars.BURN_DRAGON_P2P_RELEASE_TRAIN_HASH }}
+          VAR_NATIVE_TARGET_ARTIFACT_HASH: ${{ vars.BURN_DRAGON_P2P_NATIVE_TARGET_ARTIFACT_HASH }}
+          INPUT_AUTH_CONNECTOR_KIND: ${{ github.event.inputs.auth_connector_kind }}
+          VAR_AUTH_CONNECTOR_KIND: ${{ vars.BURN_DRAGON_P2P_AUTH_CONNECTOR_KIND }}
+          VAR_AUTH_AUTHORITY_NAME: ${{ vars.BURN_DRAGON_P2P_AUTH_AUTHORITY_NAME }}
+          VAR_AUTH_PRINCIPALS_JSON: ${{ vars.BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON }}
+          VAR_AUTH_AUTHORIZE_BASE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_AUTHORIZE_BASE_URL }}
+          VAR_AUTH_EXCHANGE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_EXCHANGE_URL }}
+          VAR_AUTH_TOKEN_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_TOKEN_URL }}
+          VAR_AUTH_API_BASE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_API_BASE_URL }}
+          VAR_AUTH_USERINFO_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_USERINFO_URL }}
+          VAR_AUTH_REFRESH_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_REFRESH_URL }}
+          VAR_AUTH_REVOKE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_REVOKE_URL }}
+          VAR_AUTH_JWKS_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_JWKS_URL }}
+          VAR_AUTH_OIDC_ISSUER: ${{ vars.BURN_DRAGON_P2P_AUTH_OIDC_ISSUER }}
+          VAR_AUTH_OAUTH_PROVIDER: ${{ vars.BURN_DRAGON_P2P_AUTH_OAUTH_PROVIDER }}
+          VAR_AUTH_EXTERNAL_AUTHORITY: ${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_AUTHORITY }}
+          VAR_AUTH_EXTERNAL_TRUSTED_PRINCIPAL_HEADER: ${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_TRUSTED_PRINCIPAL_HEADER }}
+          VAR_AUTH_EXTERNAL_TRUSTED_INTERNAL_ONLY: ${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_TRUSTED_INTERNAL_ONLY }}
+          VAR_GITHUB_REQUIRED_ORG: ${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_ORG }}
+          VAR_GITHUB_REQUIRED_TEAM: ${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_TEAM }}
+          VAR_GITHUB_REQUIRED_REPO: ${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_REPO }}
+          VAR_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION: ${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION }}
+          INPUT_GITHUB_ADMIN_LOGINS: ${{ github.event.inputs.github_admin_logins }}
+          VAR_GITHUB_ADMIN_LOGINS: ${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_LOGINS }}
+          INPUT_CLIMBMIX_BROWSER_DATASET_BASE_URL: ${{ github.event.inputs.climbmix_browser_dataset_base_url }}
+          VAR_CLIMBMIX_BROWSER_DATASET_BASE_URL: ${{ vars.BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL }}
+          VAR_DATASET_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_DATASET_DOMAIN_NAME }}
+          VAR_DATASET_BUCKET_NAME: ${{ vars.BURN_DRAGON_P2P_DATASET_BUCKET_NAME }}
+          VAR_DATASET_BUCKET_PATH_PREFIX: ${{ vars.BURN_DRAGON_P2P_DATASET_BUCKET_PATH_PREFIX }}
+          INPUT_BOOTSTRAP_INSTALL_SOURCE: ${{ github.event.inputs.bootstrap_install_source }}
+          VAR_BOOTSTRAP_INSTALL_SOURCE: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE }}
+          INPUT_BOOTSTRAP_VERSION: ${{ github.event.inputs.bootstrap_version }}
+          VAR_BOOTSTRAP_VERSION: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_VERSION }}
+          INPUT_BOOTSTRAP_GIT_REF: ${{ github.event.inputs.bootstrap_git_ref }}
+          VAR_BOOTSTRAP_GIT_REF: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}
+          VAR_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}
+          VAR_ROOT_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}
+          VAR_DATA_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}
+          VAR_USE_RETAINED_BOOTSTRAP_DATA_VOLUME: ${{ vars.BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME }}
+          INPUT_MANAGED_TRAINER_DESIRED_CAPACITY: ${{ github.event.inputs.managed_trainer_desired_capacity }}
+          VAR_MANAGED_TRAINER_DESIRED_CAPACITY: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY }}
+          INPUT_MANAGED_TRAINER_BACKEND: ${{ github.event.inputs.managed_trainer_backend }}
+          VAR_MANAGED_TRAINER_BACKEND: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND }}
+          INPUT_MANAGED_TRAINER_EXPERIMENT_KIND: ${{ github.event.inputs.managed_trainer_experiment_kind }}
+          VAR_MANAGED_TRAINER_EXPERIMENT_KIND: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}
+          VAR_MANAGED_TRAINER_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE }}
+          VAR_MANAGED_TRAINER_MIN_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE }}
+          VAR_MANAGED_TRAINER_MAX_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE }}
+          VAR_MANAGED_TRAINER_TARGET: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}
+          VAR_MANAGED_TRAINER_CRATE_VERSION: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION }}
+          VAR_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME }}
+          VAR_ENABLE_DATA_VOLUME_SNAPSHOTS: ${{ vars.BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS }}
+          VAR_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS: ${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}
+          VAR_ENABLE_BOOTSTRAP_STATUS_ALARMS: ${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}
+          VAR_ALARM_SNS_TOPIC_ARN: ${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}
+          VAR_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS: ${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}
+          VAR_ENABLE_CONTROL_PLANE_DASHBOARD: ${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}
+          VAR_ENABLE_MANAGED_CONTROL_PLANE_REDIS: ${{ vars.BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS }}
+          INPUT_CREATE_ARTIFACT_BUCKET: ${{ github.event.inputs.create_artifact_bucket }}
+          INPUT_ARTIFACT_BUCKET_NAME: ${{ github.event.inputs.artifact_bucket_name }}
+          VAR_ARTIFACT_BUCKET_NAME: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}
+          INPUT_ARTIFACT_BUCKET_PATH_PREFIX: ${{ github.event.inputs.artifact_bucket_path_prefix }}
+          VAR_ARTIFACT_BUCKET_PATH_PREFIX: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX }}
+          INPUT_CREATE_ARTIFACT_REPLICA_BUCKET: ${{ github.event.inputs.create_artifact_replica_bucket }}
+          VAR_CREATE_ARTIFACT_REPLICA_BUCKET: ${{ vars.BURN_DRAGON_P2P_CREATE_ARTIFACT_REPLICA_BUCKET }}
+          INPUT_ARTIFACT_REPLICA_BUCKET_NAME: ${{ github.event.inputs.artifact_replica_bucket_name }}
+          VAR_ARTIFACT_REPLICA_BUCKET_NAME: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_NAME }}
+          VAR_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY }}
+          VAR_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES: ${{ vars.BURN_DRAGON_P2P_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES }}
+          VAR_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS: ${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS }}
+          VAR_ARTIFACT_BUCKET_FORCE_DESTROY: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY }}
+          VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}
+          GITHUB_REPOSITORY_OWNER_CONTEXT: ${{ github.repository_owner }}
+          GITHUB_ACTOR_CONTEXT: ${{ github.actor }}
         run: |
           set -euo pipefail
 
-          stack_name="${{ vars.BURN_DRAGON_P2P_STACK_NAME }}"
+          stack_name="$VAR_STACK_NAME"
           if [ -z "$stack_name" ]; then
             stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
           fi
 
-          aws_region="${{ vars.BURN_DRAGON_P2P_AWS_REGION }}"
-          aws_role_arn="${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}"
-          disaster_recovery_region_input="${{ github.event.inputs.disaster_recovery_region }}"
-          disaster_recovery_region_var="${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_REGION }}"
-          edge_domain_name_input="${{ github.event.inputs.edge_domain_name }}"
-          edge_domain_name_var="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
-          route53_zone_name_input="${{ github.event.inputs.route53_zone_name }}"
-          route53_zone_name_var="${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}"
-          browser_app_base_url_var="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
-          auth_redirect_base_url_var="${{ vars.BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL }}"
-          browser_app_pages_domain_target_var="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}"
-          network_id="${{ vars.BURN_DRAGON_P2P_NETWORK_ID }}"
-          project_family_id="${{ vars.BURN_DRAGON_P2P_PROJECT_FAMILY_ID }}"
-          study_id="${{ vars.BURN_DRAGON_P2P_STUDY_ID }}"
-          release_train_hash="${{ vars.BURN_DRAGON_P2P_RELEASE_TRAIN_HASH }}"
-          native_target_artifact_hash_var="${{ vars.BURN_DRAGON_P2P_NATIVE_TARGET_ARTIFACT_HASH }}"
-          auth_connector_kind_input="${{ github.event.inputs.auth_connector_kind }}"
-          auth_connector_kind_var="${{ vars.BURN_DRAGON_P2P_AUTH_CONNECTOR_KIND }}"
-          auth_authority_name="${{ vars.BURN_DRAGON_P2P_AUTH_AUTHORITY_NAME }}"
-          auth_principals_json="${{ vars.BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON }}"
-          auth_authorize_base_url="${{ vars.BURN_DRAGON_P2P_AUTH_AUTHORIZE_BASE_URL }}"
-          auth_exchange_url="${{ vars.BURN_DRAGON_P2P_AUTH_EXCHANGE_URL }}"
-          auth_token_url="${{ vars.BURN_DRAGON_P2P_AUTH_TOKEN_URL }}"
-          auth_api_base_url="${{ vars.BURN_DRAGON_P2P_AUTH_API_BASE_URL }}"
-          auth_userinfo_url="${{ vars.BURN_DRAGON_P2P_AUTH_USERINFO_URL }}"
-          auth_refresh_url="${{ vars.BURN_DRAGON_P2P_AUTH_REFRESH_URL }}"
-          auth_revoke_url="${{ vars.BURN_DRAGON_P2P_AUTH_REVOKE_URL }}"
-          auth_jwks_url="${{ vars.BURN_DRAGON_P2P_AUTH_JWKS_URL }}"
-          auth_oidc_issuer="${{ vars.BURN_DRAGON_P2P_AUTH_OIDC_ISSUER }}"
-          auth_oauth_provider="${{ vars.BURN_DRAGON_P2P_AUTH_OAUTH_PROVIDER }}"
-          auth_external_authority="${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_AUTHORITY }}"
-          auth_external_trusted_principal_header="${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_TRUSTED_PRINCIPAL_HEADER }}"
-          auth_external_trusted_internal_only="${{ vars.BURN_DRAGON_P2P_AUTH_EXTERNAL_TRUSTED_INTERNAL_ONLY }}"
-          github_required_org="${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_ORG }}"
-          github_required_team="${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_TEAM }}"
-          github_required_repo="${{ vars.BURN_DRAGON_P2P_GITHUB_REQUIRED_REPO }}"
-          github_admin_required_repo_permission="${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION }}"
-          github_admin_logins_input="${{ github.event.inputs.github_admin_logins }}"
-          github_admin_logins_var="${{ vars.BURN_DRAGON_P2P_GITHUB_ADMIN_LOGINS }}"
-          climbmix_dataset_base_url_input="${{ github.event.inputs.climbmix_browser_dataset_base_url }}"
-          climbmix_dataset_base_url_var="${{ vars.BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL }}"
-          dataset_domain_name_var="${{ vars.BURN_DRAGON_P2P_DATASET_DOMAIN_NAME }}"
-          dataset_bucket_name_var="${{ vars.BURN_DRAGON_P2P_DATASET_BUCKET_NAME }}"
-          dataset_bucket_path_prefix_var="${{ vars.BURN_DRAGON_P2P_DATASET_BUCKET_PATH_PREFIX }}"
-          bootstrap_install_source_input="${{ github.event.inputs.bootstrap_install_source }}"
-          bootstrap_install_source_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE }}"
-          bootstrap_version_input="${{ github.event.inputs.bootstrap_version }}"
-          bootstrap_version_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_VERSION }}"
-          bootstrap_git_ref_input="${{ github.event.inputs.bootstrap_git_ref }}"
-          bootstrap_git_ref_var="${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}"
-          instance_type="${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}"
-          root_volume_size_gib="${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}"
-          data_volume_size_gib="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}"
-          use_retained_bootstrap_data_volume="${{ vars.BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME }}"
-          managed_trainer_desired_capacity_input="${{ github.event.inputs.managed_trainer_desired_capacity }}"
-          managed_trainer_desired_capacity_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY }}"
-          managed_trainer_backend_input="${{ github.event.inputs.managed_trainer_backend }}"
-          managed_trainer_backend_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND }}"
-          managed_trainer_experiment_kind_input="${{ github.event.inputs.managed_trainer_experiment_kind }}"
-          managed_trainer_experiment_kind_var="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}"
-          managed_trainer_instance_type="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE }}"
-          managed_trainer_min_size="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE }}"
-          managed_trainer_max_size="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE }}"
-          managed_trainer_target="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}"
-          managed_trainer_crate_version="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION }}"
-          managed_trainer_auth_bundle_parameter_name="${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME }}"
-          enable_data_volume_snapshots="${{ vars.BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS }}"
-          data_volume_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS }}"
-          enable_bootstrap_status_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS }}"
-          alarm_sns_topic_arn="${{ vars.BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN }}"
-          enable_control_plane_operational_alarms="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS }}"
-          enable_control_plane_dashboard="${{ vars.BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD }}"
-          enable_managed_control_plane_redis="${{ vars.BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS }}"
-          create_artifact_bucket_input="${{ github.event.inputs.create_artifact_bucket }}"
-          artifact_bucket_name_input="${{ github.event.inputs.artifact_bucket_name }}"
-          artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
-          artifact_bucket_path_prefix_input="${{ github.event.inputs.artifact_bucket_path_prefix }}"
-          artifact_bucket_path_prefix_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX }}"
-          create_artifact_replica_bucket_input="${{ github.event.inputs.create_artifact_replica_bucket }}"
-          create_artifact_replica_bucket_var="${{ vars.BURN_DRAGON_P2P_CREATE_ARTIFACT_REPLICA_BUCKET }}"
-          artifact_replica_bucket_name_input="${{ github.event.inputs.artifact_replica_bucket_name }}"
-          artifact_replica_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_NAME }}"
-          artifact_replica_bucket_force_destroy="${{ vars.BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY }}"
-          enable_disaster_recovery_snapshot_copies="${{ vars.BURN_DRAGON_P2P_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES }}"
-          disaster_recovery_snapshot_retention_days="${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS }}"
-          artifact_bucket_force_destroy="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY }}"
-          artifact_bucket_server_side_encryption="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}"
+          aws_region="$VAR_AWS_REGION"
+          aws_role_arn="$VAR_AWS_ROLE_ARN"
+          disaster_recovery_region_input="$INPUT_DISASTER_RECOVERY_REGION"
+          disaster_recovery_region_var="$VAR_DISASTER_RECOVERY_REGION"
+          edge_domain_name_input="$INPUT_EDGE_DOMAIN_NAME"
+          edge_domain_name_var="$VAR_EDGE_DOMAIN_NAME"
+          route53_zone_name_input="$INPUT_ROUTE53_ZONE_NAME"
+          route53_zone_name_var="$VAR_ROUTE53_ZONE_NAME"
+          browser_app_base_url_var="$VAR_BROWSER_APP_BASE_URL"
+          auth_redirect_base_url_var="$VAR_AUTH_REDIRECT_BASE_URL"
+          browser_app_pages_domain_target_var="$VAR_BROWSER_APP_PAGES_DOMAIN_TARGET"
+          network_id="$VAR_NETWORK_ID"
+          project_family_id="$VAR_PROJECT_FAMILY_ID"
+          study_id="$VAR_STUDY_ID"
+          release_train_hash="$VAR_RELEASE_TRAIN_HASH"
+          native_target_artifact_hash_var="$VAR_NATIVE_TARGET_ARTIFACT_HASH"
+          auth_connector_kind_input="$INPUT_AUTH_CONNECTOR_KIND"
+          auth_connector_kind_var="$VAR_AUTH_CONNECTOR_KIND"
+          auth_authority_name="$VAR_AUTH_AUTHORITY_NAME"
+          auth_principals_json="$VAR_AUTH_PRINCIPALS_JSON"
+          auth_authorize_base_url="$VAR_AUTH_AUTHORIZE_BASE_URL"
+          auth_exchange_url="$VAR_AUTH_EXCHANGE_URL"
+          auth_token_url="$VAR_AUTH_TOKEN_URL"
+          auth_api_base_url="$VAR_AUTH_API_BASE_URL"
+          auth_userinfo_url="$VAR_AUTH_USERINFO_URL"
+          auth_refresh_url="$VAR_AUTH_REFRESH_URL"
+          auth_revoke_url="$VAR_AUTH_REVOKE_URL"
+          auth_jwks_url="$VAR_AUTH_JWKS_URL"
+          auth_oidc_issuer="$VAR_AUTH_OIDC_ISSUER"
+          auth_oauth_provider="$VAR_AUTH_OAUTH_PROVIDER"
+          auth_external_authority="$VAR_AUTH_EXTERNAL_AUTHORITY"
+          auth_external_trusted_principal_header="$VAR_AUTH_EXTERNAL_TRUSTED_PRINCIPAL_HEADER"
+          auth_external_trusted_internal_only="$VAR_AUTH_EXTERNAL_TRUSTED_INTERNAL_ONLY"
+          github_required_org="$VAR_GITHUB_REQUIRED_ORG"
+          github_required_team="$VAR_GITHUB_REQUIRED_TEAM"
+          github_required_repo="$VAR_GITHUB_REQUIRED_REPO"
+          github_admin_required_repo_permission="$VAR_GITHUB_ADMIN_REQUIRED_REPO_PERMISSION"
+          github_admin_logins_input="$INPUT_GITHUB_ADMIN_LOGINS"
+          github_admin_logins_var="$VAR_GITHUB_ADMIN_LOGINS"
+          climbmix_dataset_base_url_input="$INPUT_CLIMBMIX_BROWSER_DATASET_BASE_URL"
+          climbmix_dataset_base_url_var="$VAR_CLIMBMIX_BROWSER_DATASET_BASE_URL"
+          dataset_domain_name_var="$VAR_DATASET_DOMAIN_NAME"
+          dataset_bucket_name_var="$VAR_DATASET_BUCKET_NAME"
+          dataset_bucket_path_prefix_var="$VAR_DATASET_BUCKET_PATH_PREFIX"
+          bootstrap_install_source_input="$INPUT_BOOTSTRAP_INSTALL_SOURCE"
+          bootstrap_install_source_var="$VAR_BOOTSTRAP_INSTALL_SOURCE"
+          bootstrap_version_input="$INPUT_BOOTSTRAP_VERSION"
+          bootstrap_version_var="$VAR_BOOTSTRAP_VERSION"
+          bootstrap_git_ref_input="$INPUT_BOOTSTRAP_GIT_REF"
+          bootstrap_git_ref_var="$VAR_BOOTSTRAP_GIT_REF"
+          instance_type="$VAR_INSTANCE_TYPE"
+          root_volume_size_gib="$VAR_ROOT_VOLUME_SIZE_GIB"
+          data_volume_size_gib="$VAR_DATA_VOLUME_SIZE_GIB"
+          use_retained_bootstrap_data_volume="$VAR_USE_RETAINED_BOOTSTRAP_DATA_VOLUME"
+          managed_trainer_desired_capacity_input="$INPUT_MANAGED_TRAINER_DESIRED_CAPACITY"
+          managed_trainer_desired_capacity_var="$VAR_MANAGED_TRAINER_DESIRED_CAPACITY"
+          managed_trainer_backend_input="$INPUT_MANAGED_TRAINER_BACKEND"
+          managed_trainer_backend_var="$VAR_MANAGED_TRAINER_BACKEND"
+          managed_trainer_experiment_kind_input="$INPUT_MANAGED_TRAINER_EXPERIMENT_KIND"
+          managed_trainer_experiment_kind_var="$VAR_MANAGED_TRAINER_EXPERIMENT_KIND"
+          managed_trainer_instance_type="$VAR_MANAGED_TRAINER_INSTANCE_TYPE"
+          managed_trainer_min_size="$VAR_MANAGED_TRAINER_MIN_SIZE"
+          managed_trainer_max_size="$VAR_MANAGED_TRAINER_MAX_SIZE"
+          managed_trainer_target="$VAR_MANAGED_TRAINER_TARGET"
+          managed_trainer_crate_version="$VAR_MANAGED_TRAINER_CRATE_VERSION"
+          managed_trainer_auth_bundle_parameter_name="$VAR_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME"
+          enable_data_volume_snapshots="$VAR_ENABLE_DATA_VOLUME_SNAPSHOTS"
+          data_volume_snapshot_retention_days="$VAR_DATA_VOLUME_SNAPSHOT_RETENTION_DAYS"
+          enable_bootstrap_status_alarms="$VAR_ENABLE_BOOTSTRAP_STATUS_ALARMS"
+          alarm_sns_topic_arn="$VAR_ALARM_SNS_TOPIC_ARN"
+          enable_control_plane_operational_alarms="$VAR_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS"
+          enable_control_plane_dashboard="$VAR_ENABLE_CONTROL_PLANE_DASHBOARD"
+          enable_managed_control_plane_redis="$VAR_ENABLE_MANAGED_CONTROL_PLANE_REDIS"
+          create_artifact_bucket_input="$INPUT_CREATE_ARTIFACT_BUCKET"
+          artifact_bucket_name_input="$INPUT_ARTIFACT_BUCKET_NAME"
+          artifact_bucket_name_var="$VAR_ARTIFACT_BUCKET_NAME"
+          artifact_bucket_path_prefix_input="$INPUT_ARTIFACT_BUCKET_PATH_PREFIX"
+          artifact_bucket_path_prefix_var="$VAR_ARTIFACT_BUCKET_PATH_PREFIX"
+          create_artifact_replica_bucket_input="$INPUT_CREATE_ARTIFACT_REPLICA_BUCKET"
+          create_artifact_replica_bucket_var="$VAR_CREATE_ARTIFACT_REPLICA_BUCKET"
+          artifact_replica_bucket_name_input="$INPUT_ARTIFACT_REPLICA_BUCKET_NAME"
+          artifact_replica_bucket_name_var="$VAR_ARTIFACT_REPLICA_BUCKET_NAME"
+          artifact_replica_bucket_force_destroy="$VAR_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY"
+          enable_disaster_recovery_snapshot_copies="$VAR_ENABLE_DISASTER_RECOVERY_SNAPSHOT_COPIES"
+          disaster_recovery_snapshot_retention_days="$VAR_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS"
+          artifact_bucket_force_destroy="$VAR_ARTIFACT_BUCKET_FORCE_DESTROY"
+          artifact_bucket_server_side_encryption="$VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION"
 
           if [ -z "$aws_region" ]; then
             aws_region="us-east-2"
@@ -294,7 +385,7 @@ jobs:
 
           browser_app_pages_domain_target="$browser_app_pages_domain_target_var"
           if [ -z "$browser_app_pages_domain_target" ] && [ -n "$browser_app_base_url" ]; then
-            browser_app_pages_domain_target="${{ github.repository_owner }}.github.io"
+            browser_app_pages_domain_target="${GITHUB_REPOSITORY_OWNER_CONTEXT}.github.io"
           fi
 
           browser_app_host=""
@@ -352,7 +443,7 @@ jobs:
             github_admin_logins="$github_admin_logins_var"
           fi
           if [ "$auth_connector_kind" = "github" ] && [ -z "$github_admin_logins" ]; then
-            github_admin_logins="${{ github.actor }}"
+            github_admin_logins="${GITHUB_ACTOR_CONTEXT}"
           fi
           dataset_domain_name="$dataset_domain_name_var"
           if [ -z "$dataset_domain_name" ]; then

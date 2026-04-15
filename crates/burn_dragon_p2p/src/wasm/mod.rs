@@ -576,7 +576,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut admin_entry_json = use_signal(String::new);
     let mut admin_status = use_signal(String::new);
     let admin_rollout_result = use_signal(|| None::<DirectoryMutationResultView>);
-    let advanced_controls_enabled = window_query_flag("debug") || window_query_flag("advanced");
+    let debug_controls_enabled = window_query_flag("debug");
     let mut show_connection_settings = use_signal(|| false);
     let mut show_live_details = use_signal(|| false);
     let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
@@ -1081,7 +1081,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let hero_subtitle = if needs_sign_in {
         "contribute training from your browser.".to_owned()
     } else if ready_to_connect {
-        "ready when you are.".to_owned()
+        "connect this tab to start training.".to_owned()
     } else {
         "training from this tab.".to_owned()
     };
@@ -1093,8 +1093,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             || raw_status_message.contains("connection"))
     {
         String::from("the edge is unavailable right now. try again soon.")
-    } else if (raw_status_message.contains("/metrics/catchup/")
-        && raw_status_message.contains("404"))
+    } else if raw_status_message.contains("/metrics/catchup/")
         || raw_status_message.contains("metrics indexer disabled")
     {
         String::from("connect is unavailable right now. try again soon.")
@@ -1281,7 +1280,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         tone: "accent",
                     }
                 }
-                if advanced_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
+                if debug_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
                     ActivityNotice {
                         label: String::from("capability policy"),
                         detail: browser_capability_decision.downgrade_reason.clone().unwrap_or_default(),
@@ -1315,39 +1314,39 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             } else {
                                 {train_button}
-                                if advanced_controls_enabled {
+                                if debug_controls_enabled {
                                     ActionButton {
-                                        label: "refresh",
+                                        label: "sync",
                                         tone: "secondary",
                                         onclick: refresh_action,
                                     }
                                 }
                             }
-                            if advanced_controls_enabled {
+                            if debug_controls_enabled {
                                 if (ready_to_connect || has_connected_view) && show_connection_settings_active {
                                     button {
                                         r#type: "button",
                                         class: "action-button action-button-secondary",
                                         onclick: move |_| show_connection_settings.set(false),
-                                        "close settings"
+                                        "hide debug"
                                     }
                                 } else if ready_to_connect || has_connected_view {
                                     button {
                                         r#type: "button",
                                         class: "action-button action-button-secondary",
                                         onclick: move |_| show_connection_settings.set(true),
-                                        "connection settings"
+                                        "debug"
                                     }
                                 }
                             }
-                            if advanced_controls_enabled && has_connected_view && show_live_details_active {
+                            if debug_controls_enabled && has_connected_view && show_live_details_active {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_live_details.set(false),
-                                    "close details"
+                                    "hide details"
                                 }
-                            } else if advanced_controls_enabled && has_connected_view {
+                            } else if debug_controls_enabled && has_connected_view {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
@@ -1356,7 +1355,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        if advanced_controls_enabled && show_connection_settings_active {
+                        if debug_controls_enabled && show_connection_settings_active {
                             div { class: "edge-editor dragon-advanced-settings",
                                 EdgeConnectField {
                                     label: "edge url",
@@ -1378,8 +1377,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     section { class: "panel primary-panel browser-focus-panel",
                         SectionHeader {
                             eyebrow: "live",
-                            title: "ready",
-                            detail: "train from this tab.",
+                            title: "connected",
+                            detail: "run training from this tab.",
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack",
@@ -1393,25 +1392,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         strong { "{view.training.throughput_summary.clone().unwrap_or_else(|| \"n/a\".into())}" }
                                     }
                                     div { class: "keyvalue-row",
-                                        span { "optimizer steps" }
-                                        strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
-                                    }
-                                    div { class: "keyvalue-row",
-                                        span { "accepted samples" }
-                                        strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
-                                    }
-                                    div { class: "keyvalue-row",
                                         span { "peers" }
                                         strong { "{peer_summary}" }
                                     }
-                                    div { class: "keyvalue-row",
-                                        span { "head" }
-                                        strong { "{active_head_label}" }
+                                }
+                                if debug_controls_enabled {
+                                    div { class: "keyvalue-list",
+                                        div { class: "keyvalue-row",
+                                            span { "optimizer steps" }
+                                            strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                        }
+                                        div { class: "keyvalue-row",
+                                            span { "accepted samples" }
+                                            strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                        }
+                                        div { class: "keyvalue-row",
+                                            span { "head" }
+                                            strong { "{active_head_label}" }
+                                        }
                                     }
                                 }
                             }
                         }
-                        if advanced_controls_enabled && props.config.training.is_some() {
+                        if debug_controls_enabled && props.config.training.is_some() {
                             div { class: "browser-metric-band dragon-metric-band",
                                 StatTile {
                                     label: "recommended role",

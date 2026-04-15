@@ -1021,25 +1021,11 @@ jobs:
               tf_import_if_missing aws_route_table.public "$route_table_id"
 
               if [ -n "${public_subnet_id:-}" ] && [ "$public_subnet_id" != "None" ]; then
-                public_route_assoc_id="$(aws ec2 describe-route-tables \
-                  --region "$AWS_REGION" \
-                  --route-table-ids "$route_table_id" \
-                  --query "RouteTables[0].Associations[?SubnetId=='${public_subnet_id}'].RouteTableAssociationId | [0]" \
-                  --output text 2>/dev/null || true)"
-                if [ -n "$public_route_assoc_id" ] && [ "$public_route_assoc_id" != "None" ]; then
-                  tf_import_if_missing aws_route_table_association.public "$public_route_assoc_id"
-                fi
+                tf_import_if_missing aws_route_table_association.public "${public_subnet_id}/${route_table_id}"
               fi
 
               if [ -n "${public_secondary_subnet_id:-}" ] && [ "$public_secondary_subnet_id" != "None" ]; then
-                public_secondary_route_assoc_id="$(aws ec2 describe-route-tables \
-                  --region "$AWS_REGION" \
-                  --route-table-ids "$route_table_id" \
-                  --query "RouteTables[0].Associations[?SubnetId=='${public_secondary_subnet_id}'].RouteTableAssociationId | [0]" \
-                  --output text 2>/dev/null || true)"
-                if [ -n "$public_secondary_route_assoc_id" ] && [ "$public_secondary_route_assoc_id" != "None" ]; then
-                  tf_import_if_missing aws_route_table_association.public_secondary "$public_secondary_route_assoc_id"
-                fi
+                tf_import_if_missing aws_route_table_association.public_secondary "${public_secondary_subnet_id}/${route_table_id}"
               fi
             fi
 

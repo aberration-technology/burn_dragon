@@ -1263,7 +1263,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             "refresh the live state when needed, or run a short browser training window from this tab.",
         )
     };
-    let status_message = status.read().clone();
+    let raw_status_message = status.read().clone();
+    let status_message = if public_landing
+        && (raw_status_message.contains("failed to fetch edge snapshot")
+            || raw_status_message.contains("Failed to fetch")
+            || raw_status_message.contains("tls")
+            || raw_status_message.contains("connection"))
+    {
+        String::from("sign-in is temporarily unavailable while the edge reconnects. try again soon.")
+    } else {
+        raw_status_message
+    };
     let edge_summary = edge_url.read().clone();
 
     #[cfg(feature = "wasm-peer")]

@@ -68,6 +68,13 @@ locals {
     revoke_url         = trimspace(var.auth_revoke_url) != "" ? trimspace(var.auth_revoke_url) : null
     jwks_url           = trimspace(var.auth_jwks_url) != "" ? trimspace(var.auth_jwks_url) : null
   }
+  auth_endpoint_overrides_nonnull = {
+    for key, value in local.auth_endpoint_overrides : key => value
+    if value != null
+  }
+  github_auth_endpoint_defaults = {
+    token_url = "https://github.com/login/oauth/access_token"
+  }
   auth_principals          = try(jsondecode(var.auth_principals_json), [])
   bootstrap_install_source = lower(trimspace(var.bootstrap_install_source))
   secret_parameter_names = {
@@ -226,7 +233,8 @@ locals {
       client_secret = "$${BURN_P2P_AUTH_CLIENT_SECRET}"
       redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
     },
-    local.auth_endpoint_overrides,
+    local.github_auth_endpoint_defaults,
+    local.auth_endpoint_overrides_nonnull,
     ) : (
     local.auth_connector_kind == "oidc" ? merge(
       {
@@ -237,7 +245,7 @@ locals {
         redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
       },
       {
-        for key, value in local.auth_endpoint_overrides : key => value
+        for key, value in local.auth_endpoint_overrides_nonnull : key => value
         if key != "api_base_url"
       },
       ) : (
@@ -250,7 +258,7 @@ locals {
           redirect_uri  = "$${BURN_P2P_AUTH_REDIRECT_URI}"
         },
         {
-          for key, value in local.auth_endpoint_overrides : key => value
+          for key, value in local.auth_endpoint_overrides_nonnull : key => value
           if key != "api_base_url"
         },
         ) : (

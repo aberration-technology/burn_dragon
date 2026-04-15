@@ -30,76 +30,100 @@ const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
 "#;
 const EXTRA_STYLESHEET: &str = r#"
 :root {
-  color-scheme: light;
   font-family: "Iosevka Etoile", "IBM Plex Sans", system-ui, sans-serif;
-  background: #eef2f8;
-  color: #121826;
 }
 
-body {
-  margin: 0;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at top, rgba(78, 111, 255, 0.12), transparent 40%),
-    linear-gradient(180deg, #f8fbff 0%, #eef2f8 100%);
+.dragon-browser-shell {
+  gap: 22px;
 }
 
-.burn-dragon-p2p-app {
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 2rem 1.25rem 3rem;
+.dragon-hero-actions {
+  align-self: stretch;
+}
+
+.dragon-connection-editor {
   display: grid;
-  gap: 1rem;
+  gap: 12px;
+  width: min(100%, 900px);
 }
 
-.burn-dragon-p2p-app > div,
-.burn-dragon-p2p-app > section {
-  background: rgba(255, 255, 255, 0.9);
-  border: 1px solid rgba(18, 24, 38, 0.08);
-  border-radius: 16px;
-  padding: 1rem 1.1rem;
-  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
+.dragon-metric-band {
+  margin-top: 8px;
 }
 
-.burn-dragon-p2p-app input,
-.burn-dragon-p2p-app textarea {
+.dragon-panel-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.dragon-operator-summary {
+  margin-top: 4px;
+}
+
+.dragon-admin-actions {
+  margin-top: 4px;
+}
+
+.dragon-editor-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.dragon-editor-grid-wide {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.dragon-editor-field {
+  display: grid;
+  gap: 8px;
+}
+
+.dragon-text-input,
+.dragon-textarea {
   width: 100%;
   box-sizing: border-box;
-  margin-top: 0.4rem;
-  padding: 0.75rem 0.9rem;
-  border-radius: 12px;
-  border: 1px solid rgba(18, 24, 38, 0.14);
-  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px 14px;
+  font: inherit;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.03);
 }
 
-.burn-dragon-p2p-app textarea {
-  min-height: 12rem;
+.dragon-text-input::placeholder,
+.dragon-textarea::placeholder {
+  color: rgba(221, 213, 199, 0.55);
+}
+
+.dragon-textarea {
+  min-height: 16rem;
   resize: vertical;
   font-family: "Iosevka Etoile", "IBM Plex Mono", monospace;
-}
-
-.burn-dragon-p2p-app button {
-  margin-right: 0.75rem;
-  margin-bottom: 0.5rem;
-  padding: 0.7rem 1rem;
-  border: none;
-  border-radius: 999px;
-  background: #1f4fff;
-  color: white;
-  font-weight: 600;
-  cursor: pointer;
+  line-height: 1.5;
 }
 
 .burn-dragon-p2p-bootstrap-loading,
 .burn-dragon-p2p-bootstrap-error {
-  max-width: 720px;
-  margin: 10vh auto;
-  padding: 2rem;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px clamp(18px, 4vw, 36px) 40px;
 }
 
 .burn-dragon-p2p-bootstrap-error pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  margin: 0;
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+@media (max-width: 960px) {
+  .dragon-editor-grid-wide {
+    grid-template-columns: 1fr;
+  }
 }
 "#;
 

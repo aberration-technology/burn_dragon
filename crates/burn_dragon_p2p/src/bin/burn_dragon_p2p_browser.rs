@@ -112,18 +112,30 @@ fn App() -> Element {
             }
         }
         Some(Err(error)) => rsx! {
-            main {
-                class: "burn-dragon-p2p-bootstrap-error",
-                h1 { "burn_dragon p2p" }
-                p { "Failed to load browser app bootstrap." }
-                pre { "{error}" }
+            main { class: "browser-app-shell burn-dragon-p2p-bootstrap-error",
+                section { class: "panel hero browser-hero",
+                    div { class: "browser-hero-grid",
+                        div { class: "browser-hero-copy",
+                            div { class: "eyebrow", "burn_dragon" }
+                            h1 { class: "app-title", "bootstrap load failed" }
+                            p { class: "app-subtitle", "The browser app shell loaded, but its bootstrap config could not be fetched or decoded." }
+                        }
+                    }
+                    pre { "{error}" }
+                }
             }
         },
         None => rsx! {
-            main {
-                class: "burn-dragon-p2p-bootstrap-loading",
-                h1 { "burn_dragon p2p" }
-                p { "Loading browser peer shell..." }
+            main { class: "browser-app-shell burn-dragon-p2p-bootstrap-loading",
+                section { class: "panel hero browser-hero",
+                    div { class: "browser-hero-grid",
+                        div { class: "browser-hero-copy",
+                            div { class: "eyebrow", "burn_dragon" }
+                            h1 { class: "app-title", "loading browser shell" }
+                            p { class: "app-subtitle", "Resolving the edge, auth, and experiment bootstrap config." }
+                        }
+                    }
+                }
             }
         },
     }

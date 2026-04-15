@@ -1128,7 +1128,28 @@ jobs:
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
-          instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
+          instance_id=""
+          if [ -n "$public_ip" ] && [ "$public_ip" != "None" ]; then
+            instance_id="$(aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters \
+                "Name=ip-address,Values=${public_ip}" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[] | sort_by(@, &LaunchTime)[-1].InstanceId' \
+              --output text 2>/dev/null || true)"
+          fi
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            instance_id="$(aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters \
+                "Name=tag:Name,Values=${STACK_NAME}-bootstrap" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[] | sort_by(@, &LaunchTime)[-1].InstanceId' \
+              --output text 2>/dev/null || true)"
+          fi
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
+          fi
           data_volume_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_volume_id)"
           data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
           bootstrap_state_storage_mode="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_state_storage_mode)"

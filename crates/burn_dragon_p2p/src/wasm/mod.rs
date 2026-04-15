@@ -1081,9 +1081,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let hero_subtitle = if needs_sign_in {
         "contribute training from your browser.".to_owned()
     } else if ready_to_connect {
-        "connect to begin.".to_owned()
+        "ready when you are.".to_owned()
     } else {
-        "browser peer connected.".to_owned()
+        "training from this tab.".to_owned()
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1093,9 +1093,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             || raw_status_message.contains("connection"))
     {
         String::from("the edge is unavailable right now. try again soon.")
-    } else if raw_status_message.contains("/metrics/catchup/") && raw_status_message.contains("404")
+    } else if (raw_status_message.contains("/metrics/catchup/")
+        && raw_status_message.contains("404"))
+        || raw_status_message.contains("metrics indexer disabled")
     {
-        String::from("browser sync is unavailable right now. try again soon.")
+        String::from("connect is unavailable right now. try again soon.")
     } else {
         raw_status_message
     };
@@ -1313,10 +1315,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             } else {
                                 {train_button}
-                                ActionButton {
-                                    label: "refresh",
-                                    tone: "secondary",
-                                    onclick: refresh_action,
+                                if advanced_controls_enabled {
+                                    ActionButton {
+                                        label: "refresh",
+                                        tone: "secondary",
+                                        onclick: refresh_action,
+                                    }
                                 }
                             }
                             if advanced_controls_enabled {
@@ -1407,7 +1411,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        if props.config.training.is_some() {
+                        if advanced_controls_enabled && props.config.training.is_some() {
                             div { class: "browser-metric-band dragon-metric-band",
                                 StatTile {
                                     label: "recommended role",

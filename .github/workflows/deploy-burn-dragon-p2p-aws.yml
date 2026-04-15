@@ -1224,6 +1224,11 @@ jobs:
           ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
           BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
           CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
+          BOOTSTRAP_INSTALL_SOURCE: ${{ env.TF_VAR_bootstrap_install_source }}
+          BOOTSTRAP_CRATE_VERSION: ${{ env.TF_VAR_bootstrap_crate_version }}
+          BOOTSTRAP_GIT_REPOSITORY: https://github.com/aberration-technology/burn_p2p.git
+          BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
+          AUTH_CONNECTOR_KIND: ${{ env.AUTH_CONNECTOR_KIND }}
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh
@@ -1245,6 +1250,16 @@ jobs:
           done
           echo "edge did not become healthy: $edge_url" >&2
           exit 1
+
+      - name: verify browser metrics catchup api is enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_url="${{ steps.outputs.outputs.edge_url }}"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 5 \
+            --max-time 20 \
+            "$edge_url/metrics/catchup" >/dev/null
 
       - name: verify auth authorize url is fully configured
         if: ${{ env.AUTH_CONNECTOR_KIND == 'github' || env.AUTH_CONNECTOR_KIND == 'oidc' || env.AUTH_CONNECTOR_KIND == 'oauth' }}

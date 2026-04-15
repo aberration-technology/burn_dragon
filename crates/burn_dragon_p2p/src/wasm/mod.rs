@@ -5,16 +5,14 @@ use burn_p2p::{
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_app::{
-    AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel,
-    LifecycleAssignmentStatusCard, RolloutPreviewPanel, RolloutSubmissionStatusPanel,
-    RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
+    AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
+    RolloutSubmissionStatusPanel, RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
 };
 use burn_p2p_browser::{BrowserAppConnectConfig, BrowserAppController, BrowserSessionState};
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
     DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
-    LifecycleAssignmentStatusView, RolloutPreviewView, RuntimeCapabilitySummaryView,
-    TrainingResultSummaryView,
+    RolloutPreviewView, RuntimeCapabilitySummaryView, TrainingResultSummaryView,
 };
 use dioxus::prelude::*;
 use url::form_urlencoded;
@@ -376,27 +374,6 @@ fn browser_runtime_role_label(role: &burn_p2p_browser::BrowserRuntimeRole) -> &'
     }
 }
 
-fn lifecycle_assignment_status(
-    view: &BrowserAppClientView,
-) -> Option<LifecycleAssignmentStatusView> {
-    let experiment = view.selected_experiment.as_ref()?;
-    let assignment_status = if view.training.active_assignment.is_some() {
-        "active".into()
-    } else if experiment.train_available {
-        "train-ready".into()
-    } else if experiment.validate_available {
-        "validate-ready".into()
-    } else {
-        "viewer-only".into()
-    };
-    Some(LifecycleAssignmentStatusView {
-        experiment_label: experiment.display_name.clone(),
-        revision_label: experiment.revision_id.clone(),
-        lifecycle_phase: view.default_surface.as_str().into(),
-        assignment_status,
-    })
-}
-
 fn latest_training_result_summary(
     view: &BrowserAppClientView,
 ) -> Option<TrainingResultSummaryView> {
@@ -599,6 +576,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut admin_entry_json = use_signal(String::new);
     let mut admin_status = use_signal(String::new);
     let admin_rollout_result = use_signal(|| None::<DirectoryMutationResultView>);
+    let advanced_controls_enabled = window_query_flag("debug") || window_query_flag("advanced");
     let mut show_connection_settings = use_signal(|| false);
     let mut show_live_details = use_signal(|| false);
     let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
@@ -1046,16 +1024,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .trainer_memory_budget_bytes
         .map(|bytes| format!("{} MiB", bytes / (1024 * 1024)))
         .unwrap_or_else(|| "n/a".into());
-    let capability_footprint_label = browser_capability_decision
-        .footprint
-        .as_ref()
-        .map(|footprint| format!("{} MiB", footprint.estimated_training_bytes / (1024 * 1024)))
-        .unwrap_or_else(|| "n/a".into());
-    let capability_tokens_per_second_label = browser_capability_decision
-        .footprint
-        .as_ref()
-        .map(|footprint| format!("{:.1}", footprint.estimated_tokens_per_second))
-        .unwrap_or_else(|| "n/a".into());
     let capability_window_label = browser_capability_decision
         .training_budget
         .as_ref()
@@ -1155,12 +1123,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             || raw_status_message.contains("connection"))
     {
         String::from("the edge is unavailable right now. try again soon.")
+    } else if raw_status_message.contains("/metrics/catchup/") && raw_status_message.contains("404")
+    {
+        String::from("browser sync is unavailable right now. try again soon.")
     } else {
         raw_status_message
     };
     let show_public_retry = callback_available && !status_message.is_empty();
-    let edge_summary = edge_url.read().clone();
-
     #[cfg(feature = "wasm-peer")]
     let train_action = {
         let props = props.clone();
@@ -1396,19 +1365,21 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     onclick: refresh_action,
                                 }
                             }
-                            if (ready_to_connect || has_connected_view) && show_connection_settings_active {
-                                button {
-                                    r#type: "button",
-                                    class: "action-button action-button-secondary",
-                                    onclick: move |_| show_connection_settings.set(false),
-                                    "close settings"
-                                }
-                            } else if ready_to_connect || has_connected_view {
-                                button {
-                                    r#type: "button",
-                                    class: "action-button action-button-secondary",
-                                    onclick: move |_| show_connection_settings.set(true),
-                                    "connection settings"
+                            if advanced_controls_enabled {
+                                if (ready_to_connect || has_connected_view) && show_connection_settings_active {
+                                    button {
+                                        r#type: "button",
+                                        class: "action-button action-button-secondary",
+                                        onclick: move |_| show_connection_settings.set(false),
+                                        "close settings"
+                                    }
+                                } else if ready_to_connect || has_connected_view {
+                                    button {
+                                        r#type: "button",
+                                        class: "action-button action-button-secondary",
+                                        onclick: move |_| show_connection_settings.set(true),
+                                        "connection settings"
+                                    }
                                 }
                             }
                             if has_connected_view && show_live_details_active {
@@ -1427,7 +1398,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        if show_connection_settings_active {
+                        if advanced_controls_enabled && show_connection_settings_active {
                             div { class: "edge-editor dragon-advanced-settings",
                                 EdgeConnectField {
                                     label: "edge url",
@@ -1439,14 +1410,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     value: seed_node_urls.read().clone(),
                                     oninput: move |value| seed_node_urls.set(value),
                                 }
-                            }
-                        }
-                    }
-                    div { class: "browser-hero-actions",
-                        if has_connected_view {
-                            div { class: "edge-summary",
-                                span { class: "toolbar-meta-label", "edge" }
-                                strong { class: "edge-summary-pill", "{edge_summary}" }
                             }
                         }
                     }
@@ -1508,45 +1471,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     label: "shard",
                                     value: capability_shard_label,
                                     detail: Some("budget".into()),
-                                }
-                            }
-                        }
-                    }
-                    aside { class: "support-stack",
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "fit",
-                                title: "workload",
-                                detail: "expected load for this tab.",
-                            }
-                            div { class: "keyvalue-list",
-                                div { class: "keyvalue-row",
-                                    span { "role" }
-                                    strong { "{browser_runtime_role_label(&browser_capability_decision.capability.recommended_role).replace('_', \" \")}" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "estimated footprint" }
-                                    strong { "{capability_footprint_label}" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "window budget" }
-                                    strong { "{capability_window_label} secs" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "tokens/sec" }
-                                    strong { "{capability_tokens_per_second_label}" }
-                                }
-                            }
-                        }
-                        if let Some(view) = view.clone() {
-                            if let Some(status) = lifecycle_assignment_status(&view) {
-                                section { class: "panel compact-panel",
-                                    SectionHeader {
-                                        eyebrow: "assignment",
-                                        title: "current role",
-                                        detail: "what the selected revision thinks this browser can do right now.",
-                                    }
-                                    LifecycleAssignmentStatusCard { status: status }
                                 }
                             }
                         }

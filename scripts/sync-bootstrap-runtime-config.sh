@@ -8,6 +8,27 @@ artifact_bucket_name="${ARTIFACT_BUCKET_NAME:?ARTIFACT_BUCKET_NAME is required}"
 bootstrap_config_json_b64="${BOOTSTRAP_CONFIG_JSON_B64:?BOOTSTRAP_CONFIG_JSON_B64 is required}"
 caddyfile_b64="${CADDYFILE_B64:?CADDYFILE_B64 is required}"
 runtime_config_prefix="${RUNTIME_CONFIG_PREFIX:-runtime-config/bootstrap/${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}}"
+bootstrap_install_source="${BOOTSTRAP_INSTALL_SOURCE:-crate}"
+bootstrap_crate_version="${BOOTSTRAP_CRATE_VERSION:-0.21.0-pre.15}"
+bootstrap_git_repository="${BOOTSTRAP_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_p2p.git}"
+bootstrap_git_ref="${BOOTSTRAP_GIT_REF:-}"
+auth_connector_kind="${AUTH_CONNECTOR_KIND:-github}"
+bootstrap_auth_feature="${BOOTSTRAP_AUTH_FEATURE:-}"
+bootstrap_features="${BOOTSTRAP_FEATURES:-}"
+
+if [ -z "$bootstrap_auth_feature" ]; then
+  case "$auth_connector_kind" in
+    github) bootstrap_auth_feature="auth-github" ;;
+    oidc) bootstrap_auth_feature="auth-oidc" ;;
+    oauth) bootstrap_auth_feature="auth-oauth" ;;
+    external) bootstrap_auth_feature="auth-external" ;;
+    *) bootstrap_auth_feature="auth-static" ;;
+  esac
+fi
+
+if [ -z "$bootstrap_features" ]; then
+  bootstrap_features="admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
+fi
 
 tmpdir="$(mktemp -d)"
 bootstrap_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/bootstrap.json"
@@ -48,6 +69,35 @@ params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" CADDY_OBJECT_URI="$c
 import json
 import os
 
+bootstrap_install_source = os.environ["BOOTSTRAP_INSTALL_SOURCE"]
+bootstrap_crate_version = os.environ["BOOTSTRAP_CRATE_VERSION"]
+bootstrap_git_repository = os.environ["BOOTSTRAP_GIT_REPOSITORY"]
+bootstrap_git_ref = os.environ["BOOTSTRAP_GIT_REF"]
+bootstrap_features = os.environ["BOOTSTRAP_FEATURES"]
+
+install_command = (
+    "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; "
+    ". /root/.cargo/env; "
+)
+if bootstrap_install_source == "crate":
+    install_command += (
+        "cargo install --locked burn_p2p_bootstrap "
+        f"--version '{bootstrap_crate_version}' "
+        "--bin burn-p2p-bootstrap --no-default-features "
+        f"--features '{bootstrap_features}'"
+    )
+else:
+    if not bootstrap_git_ref:
+        raise SystemExit("BOOTSTRAP_GIT_REF is required when BOOTSTRAP_INSTALL_SOURCE=git")
+    install_command += (
+        "cargo install --locked "
+        f"--git '{bootstrap_git_repository}' "
+        f"--rev '{bootstrap_git_ref}' "
+        "burn_p2p_bootstrap "
+        "--bin burn-p2p-bootstrap --no-default-features "
+        f"--features '{bootstrap_features}'"
+    )
+
 commands = [
     "set -eu",
     "cloud-init status --wait || true",
@@ -56,6 +106,8 @@ commands = [
     "aws s3 cp '{}' /etc/burn-dragon-p2p/bootstrap.json".format(os.environ["BOOTSTRAP_OBJECT_URI"]),
     "aws s3 cp '{}' /etc/caddy/Caddyfile".format(os.environ["CADDY_OBJECT_URI"]),
     "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile",
+    install_command,
+    "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
     "/usr/local/bin/burn-dragon-p2p-sync-secrets",
     "systemctl restart caddy",
     "systemctl restart burn-p2p-bootstrap",

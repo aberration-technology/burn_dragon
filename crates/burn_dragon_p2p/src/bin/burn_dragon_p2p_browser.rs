@@ -117,8 +117,8 @@ fn App() -> Element {
                     div { class: "browser-hero-grid",
                         div { class: "browser-hero-copy",
                             div { class: "eyebrow", "burn_dragon" }
-                            h1 { class: "app-title", "bootstrap load failed" }
-                            p { class: "app-subtitle", "The browser app shell loaded, but its bootstrap config could not be fetched or decoded." }
+                            h1 { class: "app-title", "app load failed" }
+                            p { class: "app-subtitle", "could not load the site config." }
                         }
                     }
                     pre { "{error}" }
@@ -131,8 +131,8 @@ fn App() -> Element {
                     div { class: "browser-hero-grid",
                         div { class: "browser-hero-copy",
                             div { class: "eyebrow", "burn_dragon" }
-                            h1 { class: "app-title", "loading browser shell" }
-                            p { class: "app-subtitle", "Resolving the edge, auth, and experiment bootstrap config." }
+                            h1 { class: "app-title", "loading" }
+                            p { class: "app-subtitle", "fetching site config." }
                         }
                     }
                 }

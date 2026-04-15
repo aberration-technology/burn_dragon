@@ -999,14 +999,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut session_state = session_state;
             spawn(async move {
-                status.set("Completing sign-in callback…".into());
+                status.set("Completing sign-in…".into());
                 match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        status.set("Authenticated session ready".into());
+                        status.set("Signed in".into());
                     }
-                    Ok(None) => status.set("No callback code found in URL".into()),
+                    Ok(None) => status.set("No callback found".into()),
                     Err(error) => status.set(error.to_string()),
                 }
             });
@@ -1024,14 +1024,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut session_state = session_state;
             spawn(async move {
-                status.set("Completing sign-in callback…".into());
+                status.set("Completing sign-in…".into());
                 match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        status.set("Authenticated session ready".into());
+                        status.set("Signed in".into());
                     }
-                    Ok(None) => status.set("No callback code found in URL".into()),
+                    Ok(None) => status.set("No callback found".into()),
                     Err(error) => status.set(error.to_string()),
                 }
             });
@@ -1199,11 +1199,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 .replace('_', " ")
         });
     let hero_title = if has_connected_view {
-        "this browser is live".to_owned()
+        "browser peer live".to_owned()
     } else if ready_to_connect {
-        "your session is ready".to_owned()
+        "ready to join".to_owned()
     } else {
-        "train dragon together".to_owned()
+        "help train dragon".to_owned()
     };
     let hero_runtime_label = if has_connected_view || has_session {
         runtime_label.clone()
@@ -1221,24 +1221,24 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let hero_subtitle = if needs_sign_in {
         format!(
-            "{} · {} · sign in, connect once, and let this tab contribute short browser training windows.",
+            "{} · {} · sign in and train from your browser.",
             selected_experiment_label, selected_revision_label
         )
     } else if ready_to_connect {
         format!(
-            "{} · {} · one more step and this browser joins the live training network.",
+            "{} · {} · connect this tab to join the live run.",
             selected_experiment_label, selected_revision_label
         )
     } else {
         format!(
-            "{} · {} · this tab is synced and ready to contribute compute.",
+            "{} · {} · connected and ready for short training windows.",
             selected_experiment_label, selected_revision_label
         )
     };
     let landing_notice = if callback_available {
         Some((
-            String::from("signing in"),
-            String::from("finishing github sign-in"),
+            String::from("sign-in"),
+            String::from("checking github callback"),
             "accent",
         ))
     } else {
@@ -1246,22 +1246,18 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let landing_header = if needs_sign_in {
         (
+            "browser training",
             "start here",
-            "contribute from a browser",
-            "sign in with github, connect this tab once, then leave it open whenever you want to donate short training windows.",
+            "sign in to join the live run from this browser.",
         )
     } else if ready_to_connect {
         (
-            "next step",
-            "join the live network",
-            "your session is ready. connect once and the training controls will appear.",
+            "session",
+            "ready to join",
+            "connect this tab to sync and start training.",
         )
     } else {
-        (
-            "live session",
-            "training controls are unlocked",
-            "refresh the live state when needed, or run a short browser training window from this tab.",
-        )
+        ("live", "ready", "train or refresh from this tab.")
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1270,7 +1266,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             || raw_status_message.contains("tls")
             || raw_status_message.contains("connection"))
     {
-        String::from("sign-in is temporarily unavailable while the edge reconnects. try again soon.")
+        String::from(
+            "sign-in is temporarily unavailable while the edge reconnects. try again soon.",
+        )
     } else {
         raw_status_message
     };
@@ -1345,10 +1343,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
 
     #[cfg(feature = "wasm-peer")]
     let train_button = {
-        let has_training_config =
-            has_connected_view
-                && resolved_edge_base_url(&initial_config).is_ok()
-                && browser_can_attempt_dynamic_training;
+        let has_training_config = has_connected_view
+            && resolved_edge_base_url(&initial_config).is_ok()
+            && browser_can_attempt_dynamic_training;
         rsx! {
             if has_training_config {
                 button {
@@ -1497,21 +1494,21 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                                 if callback_available {
                                     ActionButton {
-                                        label: "finish sign-in",
+                                        label: "complete sign-in",
                                         tone: "secondary",
                                         onclick: finish_callback_action,
                                     }
                                 }
                             } else if ready_to_connect {
                                 ActionButton {
-                                    label: "connect this browser",
+                                    label: "connect",
                                     tone: "primary",
                                     onclick: connect_action,
                                 }
                             } else {
                                 {train_button}
                                 ActionButton {
-                                    label: "refresh live state",
+                                    label: "refresh",
                                     tone: "secondary",
                                     onclick: refresh_action,
                                 }
@@ -1521,18 +1518,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_connection_settings.set(false),
-                                    "hide network settings"
+                                    "close settings"
                                 }
                             } else if ready_to_connect || has_connected_view {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_connection_settings.set(true),
-                                    if has_connected_view {
-                                        "network settings"
-                                    } else {
-                                        "show network settings"
-                                    }
+                                    "connection settings"
                                 }
                             }
                             if has_connected_view && show_live_details_active {
@@ -1540,14 +1533,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_live_details.set(false),
-                                    "hide live details"
+                                    "close details"
                                 }
                             } else if has_connected_view {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_live_details.set(true),
-                                    "show live details"
+                                    "details"
                                 }
                             }
                         }
@@ -1568,7 +1561,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         r#type: "button",
                                         class: "action-button action-button-secondary",
                                         onclick: complete_callback_action,
-                                        "retry callback"
+                                        "retry sign-in"
                                     }
                                 }
                             }
@@ -1592,30 +1585,27 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         detail: landing_header.2,
                     }
                     if needs_sign_in {
-                        p { class: "section-detail dragon-public-copy",
-                            "the public flow is simple: sign in, connect this tab, then contribute short training windows whenever you want."
-                        }
                         div { class: "dragon-landing-grid",
                             LandingCard {
                                 eyebrow: "step 1",
                                 title: "sign in",
-                                detail: "start a github-backed session for this browser.",
+                                detail: "use github to start a session.",
                             }
                             LandingCard {
                                 eyebrow: "step 2",
                                 title: "connect",
-                                detail: "join the live edge and sync the latest head.",
+                                detail: "join the edge and sync the latest head.",
                             }
                             LandingCard {
                                 eyebrow: "step 3",
-                                title: "contribute",
-                                detail: "run short webgpu windows from this tab.",
+                                title: "train",
+                                detail: "run short webgpu windows when you want.",
                             }
                         }
                     } else if ready_to_connect {
                         ActivityNotice {
-                            label: String::from("session ready"),
-                            detail: String::from("connect this browser once to unlock live training controls and network state."),
+                            label: String::from("ready"),
+                            detail: String::from("connect to begin."),
                             tone: "accent",
                         }
                         div { class: "keyvalue-list",
@@ -1636,7 +1626,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         div { class: "dragon-panel-stack",
                             ActivityNotice {
                                 label: String::from("connected"),
-                                detail: String::from("this browser is connected to the selected revision and can now contribute training windows."),
+                                detail: String::from("ready for browser training."),
                                 tone: "accent",
                             }
                             div { class: "keyvalue-list",
@@ -1693,9 +1683,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     if needs_sign_in {
                         section { class: "panel compact-panel",
                             SectionHeader {
-                                eyebrow: "why join",
-                                title: "what this tab can do",
-                                detail: "a browser peer helps with short, lightweight training windows.",
+                                eyebrow: "browser",
+                                title: "what you do",
+                                detail: "short training from one tab.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
@@ -1714,9 +1704,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                         section { class: "panel compact-panel",
                             SectionHeader {
-                                eyebrow: "what you need",
-                                title: "before you start",
-                                detail: "just the basics for a first contribution.",
+                                eyebrow: "setup",
+                                title: "what you need",
+                                detail: "github and a browser with webgpu when available.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
@@ -1738,24 +1728,24 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             SectionHeader {
                                 eyebrow: "identity",
                                 title: "session",
-                                detail: "this browser is authenticated and ready for the first connect.",
+                                detail: "signed in and ready to connect.",
                             }
                             AuthSessionCard { session: session_panel }
                         }
                         section { class: "panel compact-panel",
                             SectionHeader {
                                 eyebrow: "next",
-                                title: "after you connect",
-                                detail: "the live network view and training controls appear after the first successful connect.",
+                                title: "next step",
+                                detail: "connect this tab.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
-                                    span { "first action" }
-                                    strong { "connect this browser" }
+                                    span { "action" }
+                                    strong { "connect" }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "then" }
-                                    strong { "refresh or train" }
+                                    strong { "train or refresh" }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "edge" }
@@ -1768,15 +1758,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             SectionHeader {
                                 eyebrow: "identity",
                                 title: "session",
-                                detail: "who this browser is acting as on the edge.",
+                                detail: "current browser identity.",
                             }
                             AuthSessionCard { session: session_panel }
                         }
                         section { class: "panel compact-panel",
                             SectionHeader {
-                                eyebrow: "network",
-                                title: "what this browser will do",
-                                detail: "a short fit check before you donate compute.",
+                                eyebrow: "fit",
+                                title: "workload",
+                                detail: "expected load for this tab.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
@@ -1896,7 +1886,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                         if !admin_status.read().is_empty() {
                             ActivityNotice {
-                                label: String::from("operator status"),
+                                label: String::from("status"),
                                 detail: admin_status.read().clone(),
                                 tone: "neutral",
                             }

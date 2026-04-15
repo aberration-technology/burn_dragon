@@ -162,11 +162,12 @@ commands = [
     "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/burn_dragon_p2p/bootstrap-head-mirror.toml /etc/systemd/system/burn-dragon-p2p-head-mirror.service",
     "chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle",
     "/usr/local/bin/burn-dragon-p2p-sync-secrets",
-    "systemctl restart caddy",
-    "systemctl restart burn-p2p-bootstrap",
     "systemctl daemon-reload",
+    "systemctl restart caddy",
     "systemctl enable burn-dragon-p2p-head-mirror",
     "systemctl restart burn-dragon-p2p-head-mirror || true",
+    "systemctl enable burn-p2p-bootstrap",
+    "systemctl restart burn-p2p-bootstrap",
     "systemctl is-active caddy",
     "systemctl is-active burn-p2p-bootstrap",
     "journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 60 || true",
@@ -176,9 +177,10 @@ if bootstrap_binary_object_uri:
         "aws s3 cp '{}' /usr/local/bin/burn-p2p-bootstrap".format(bootstrap_binary_object_uri),
         "chmod 0755 /usr/local/bin/burn-p2p-bootstrap",
     ]
-elif bootstrap_reinstall:
+else:
     install_command = (
         "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; "
+        "if [ ! -x /root/.cargo/bin/cargo ]; then curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal; fi; "
         ". /root/.cargo/env; "
     )
     if bootstrap_install_source == "crate":
@@ -200,9 +202,8 @@ elif bootstrap_reinstall:
             f"--features '{bootstrap_features}'"
         )
     commands[1:1] = [
-        "ready=0; for attempt in $(seq 1 180); do if [ -x /usr/local/bin/burn-p2p-bootstrap ]; then ready=1; break; fi; sleep 5; done; if [ \"$ready\" -ne 1 ]; then echo 'burn-p2p-bootstrap executable was not ready before runtime sync' >&2; exit 1; fi",
-        install_command,
-        "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
+        "if [ ! -x /usr/local/bin/burn-p2p-bootstrap ] && [ ! -x /root/.cargo/bin/burn-p2p-bootstrap ]; then " + install_command + "; fi",
+        "if [ -x /root/.cargo/bin/burn-p2p-bootstrap ]; then ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap; fi",
     ]
 if head_mirror_binary_object_uri:
     commands[1:1] = [
@@ -211,11 +212,11 @@ if head_mirror_binary_object_uri:
     ]
 elif head_mirror_reinstall:
     commands[1:1] = [
-        "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; . /root/.cargo/env; cargo install --locked --git '{}' --rev '{}' burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native".format(
+        "if [ ! -x /usr/local/bin/burn_dragon_p2p_native ] && [ ! -x /root/.cargo/bin/burn_dragon_p2p_native ]; then export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; if [ ! -x /root/.cargo/bin/cargo ]; then curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal; fi; . /root/.cargo/env; cargo install --locked --git '{}' --rev '{}' burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native; fi".format(
             dragon_git_repository,
             dragon_git_ref,
         ),
-        "ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native",
+        "if [ -x /root/.cargo/bin/burn_dragon_p2p_native ]; then ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native; fi",
     ]
 print(json.dumps({"commands": commands}))
 PY

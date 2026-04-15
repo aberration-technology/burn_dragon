@@ -109,7 +109,7 @@ locals {
   browser_app_origin = coalesce(local.browser_app_base_url, local.edge_base_url)
   browser_app_hostname = local.browser_app_base_url == null ? null : split(
     "/",
-    regexreplace(local.browser_app_base_url, "^https?://", ""),
+    replace(replace(local.browser_app_base_url, "https://", ""), "http://", ""),
   )[0]
   browser_app_pages_domain_target = trimspace(var.browser_app_pages_domain_target) != "" ? trimsuffix(
     trimspace(var.browser_app_pages_domain_target),

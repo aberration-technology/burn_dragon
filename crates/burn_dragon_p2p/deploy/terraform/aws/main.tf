@@ -1553,6 +1553,19 @@ resource "aws_acm_certificate" "dataset" {
   tags = local.tags
 }
 
+resource "aws_route53_record" "dataset_caa" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.dataset_domain_name
+  type    = "CAA"
+  ttl     = 300
+  records = [
+    "0 issue \"amazon.com\"",
+    "0 issue \"amazontrust.com\"",
+    "0 issue \"amazonaws.com\"",
+    "0 issue \"awstrust.com\"",
+  ]
+}
+
 resource "aws_route53_record" "dataset_certificate_validation" {
   for_each = {
     for dvo in aws_acm_certificate.dataset.domain_validation_options : dvo.domain_name => {
@@ -1574,6 +1587,7 @@ resource "aws_acm_certificate_validation" "dataset" {
   provider                = aws.us_east_1
   certificate_arn         = aws_acm_certificate.dataset.arn
   validation_record_fqdns = [for record in aws_route53_record.dataset_certificate_validation : record.fqdn]
+  depends_on              = [aws_route53_record.dataset_caa]
 }
 
 resource "aws_cloudfront_origin_access_control" "dataset" {
@@ -2356,10 +2370,9 @@ resource "aws_route53_health_check" "edge_primary" {
 }
 
 resource "aws_route53_record" "edge_primary" {
-  zone_id         = data.aws_route53_zone.selected.zone_id
-  name            = var.edge_domain_name
-  type            = "A"
-  ttl             = 60
-  health_check_id = aws_route53_health_check.edge_primary.id
-  records         = [aws_eip.bootstrap.public_ip]
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = var.edge_domain_name
+  type    = "A"
+  ttl     = 60
+  records = [aws_eip.bootstrap.public_ip]
 }

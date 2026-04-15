@@ -452,6 +452,10 @@ jobs:
             echo "bootstrap_git_ref is required when bootstrap_install_source=git" >&2
             exit 1
           fi
+          if [ "$auth_connector_kind" = "github" ] && [ "$bootstrap_install_source" = "crate" ] && [ "$bootstrap_version" = "0.21.0-pre.15" ]; then
+            echo "burn_p2p_bootstrap 0.21.0-pre.15 is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate" >&2
+            exit 1
+          fi
           if [ -z "$managed_trainer_desired_capacity" ]; then
             managed_trainer_desired_capacity="0"
           fi

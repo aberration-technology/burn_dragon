@@ -873,6 +873,85 @@ jobs:
           terraform -chdir="$TF_ROOT" workspace select "$TF_WORKSPACE_NAME" || \
           terraform -chdir="$TF_ROOT" workspace new "$TF_WORKSPACE_NAME"
 
+      - name: adopt existing named aws resources into terraform state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tf_has_state() {
+            terraform -chdir="$TF_ROOT" state show "$1" >/dev/null 2>&1
+          }
+
+          tf_import_if_missing() {
+            local address="$1"
+            local import_id="$2"
+            if tf_has_state "$address"; then
+              return 0
+            fi
+            terraform -chdir="$TF_ROOT" import -input=false "$address" "$import_id"
+          }
+
+          normalize_bucket_name() {
+            python3 -c 'import sys; print(sys.argv[1].lower().replace(".", "-").replace("_", "-").replace("/", "-")[:63].rstrip("-"))' "$1"
+          }
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          role_name="${STACK_NAME}-bootstrap"
+          profile_name="${STACK_NAME}-bootstrap"
+          inline_policy_name="${STACK_NAME}-secret-access"
+          artifact_bucket_name="${TF_VAR_artifact_bucket_name:-}"
+          dataset_bucket_name="${TF_VAR_dataset_bucket_name:-}"
+          if [ -z "$artifact_bucket_name" ]; then
+            artifact_bucket_name="$(normalize_bucket_name "${STACK_NAME}-${TF_WORKSPACE_NAME}-${account_id}-${AWS_REGION}-artifacts")"
+          fi
+          if [ -z "$dataset_bucket_name" ]; then
+            dataset_bucket_name="$(normalize_bucket_name "${STACK_NAME}-${TF_WORKSPACE_NAME}-${account_id}-datasets")"
+          fi
+          response_headers_policy_name="${STACK_NAME}-${TF_WORKSPACE_NAME}-dataset-cors"
+          origin_access_control_name="${STACK_NAME}-${TF_WORKSPACE_NAME}-dataset"
+
+          if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+            tf_import_if_missing aws_iam_role.bootstrap "$role_name"
+          fi
+
+          if aws iam get-role-policy --role-name "$role_name" --policy-name "$inline_policy_name" >/dev/null 2>&1; then
+            tf_import_if_missing aws_iam_role_policy.bootstrap_secret_access "${role_name}:${inline_policy_name}"
+          fi
+
+          if aws iam get-instance-profile --instance-profile-name "$profile_name" >/dev/null 2>&1; then
+            tf_import_if_missing aws_iam_instance_profile.bootstrap "$profile_name"
+          fi
+
+          if aws iam list-attached-role-policies \
+            --role-name "$role_name" \
+            --query 'AttachedPolicies[?PolicyArn==`arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`]' \
+            --output text | grep -q AmazonSSMManagedInstanceCore; then
+            tf_import_if_missing aws_iam_role_policy_attachment.ssm_managed_core "${role_name}/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          fi
+
+          if aws s3api head-bucket --bucket "$artifact_bucket_name" >/dev/null 2>&1; then
+            tf_import_if_missing 'aws_s3_bucket.artifact[0]' "$artifact_bucket_name"
+          fi
+
+          if aws s3api head-bucket --bucket "$dataset_bucket_name" >/dev/null 2>&1; then
+            tf_import_if_missing aws_s3_bucket.dataset "$dataset_bucket_name"
+          fi
+
+          response_headers_policy_id="$(aws cloudfront list-response-headers-policies \
+            --type custom \
+            --query "ResponseHeadersPolicyList.Items[?ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name=='${response_headers_policy_name}'].ResponseHeadersPolicy.Id | [0]" \
+            --output text 2>/dev/null || true)"
+          if [ -n "$response_headers_policy_id" ] && [ "$response_headers_policy_id" != "None" ]; then
+            tf_import_if_missing aws_cloudfront_response_headers_policy.dataset_cors "$response_headers_policy_id"
+          fi
+
+          origin_access_control_id="$(aws cloudfront list-origin-access-controls \
+            --query "OriginAccessControlList.Items[?Name=='${origin_access_control_name}'].Id | [0]" \
+            --output text 2>/dev/null || true)"
+          if [ -n "$origin_access_control_id" ] && [ "$origin_access_control_id" != "None" ]; then
+            tf_import_if_missing aws_cloudfront_origin_access_control.dataset "$origin_access_control_id"
+          fi
+
       - name: terraform validate
         run: terraform -chdir="$TF_ROOT" validate
 

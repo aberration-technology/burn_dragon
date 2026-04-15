@@ -8,6 +8,18 @@ output "browser_app_url" {
   value       = local.browser_app_base_url == null ? "" : local.browser_app_base_url
 }
 
+output "bootstrap_config_json" {
+  description = "Rendered bootstrap daemon configuration written to the edge host."
+  value       = local.bootstrap_config_json
+  sensitive   = true
+}
+
+output "bootstrap_caddyfile" {
+  description = "Rendered Caddy configuration written to the edge host."
+  value       = local.caddyfile
+  sensitive   = true
+}
+
 output "bootstrap_instance_id" {
   description = "EC2 instance id for the bootstrap edge."
   value       = aws_instance.bootstrap.id

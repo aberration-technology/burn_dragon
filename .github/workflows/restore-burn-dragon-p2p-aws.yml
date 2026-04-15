@@ -838,6 +838,9 @@ jobs:
           set -euo pipefail
           edge_url="$(terraform -chdir="$TF_ROOT" output -raw edge_url)"
           browser_app_url="$(terraform -chdir="$TF_ROOT" output -raw browser_app_url)"
+          bootstrap_config_json_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_config_json | base64 -w0)"
+          caddyfile_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_caddyfile | base64 -w0)"
+          instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
@@ -862,6 +865,9 @@ jobs:
           {
             echo "edge_url=$edge_url"
             echo "browser_app_url=$browser_app_url"
+            echo "bootstrap_config_json_b64=$bootstrap_config_json_b64"
+            echo "caddyfile_b64=$caddyfile_b64"
+            echo "instance_id=$instance_id"
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "redis_endpoint=$redis_endpoint"
@@ -883,6 +889,18 @@ jobs:
             echo "managed_trainer_asg_name=$managed_trainer_asg_name"
             echo "managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
           } >>"$GITHUB_OUTPUT"
+
+      - name: sync bootstrap runtime config and restart services
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        env:
+          BOOTSTRAP_INSTANCE_ID: ${{ steps.outputs.outputs.instance_id }}
+          ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
+          BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
+          CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
+          RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh
 
       - name: wait for bootstrap api/auth edge https health
         if: ${{ github.event.inputs.plan_only != 'true' }}

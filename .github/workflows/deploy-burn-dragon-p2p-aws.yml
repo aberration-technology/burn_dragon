@@ -1123,6 +1123,8 @@ jobs:
           set -euo pipefail
           edge_url="$(terraform -chdir="$TF_ROOT" output -raw edge_url)"
           browser_app_url="$(terraform -chdir="$TF_ROOT" output -raw browser_app_url)"
+          bootstrap_config_json_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_config_json | base64 -w0)"
+          caddyfile_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_caddyfile | base64 -w0)"
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
@@ -1152,6 +1154,8 @@ jobs:
           {
             echo "edge_url=$edge_url"
             echo "browser_app_url=$browser_app_url"
+            echo "bootstrap_config_json_b64=$bootstrap_config_json_b64"
+            echo "caddyfile_b64=$caddyfile_b64"
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "public_ip=$public_ip"
@@ -1179,78 +1183,16 @@ jobs:
             echo "managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
-      - name: restart bootstrap to reload synced auth secrets
+      - name: sync bootstrap runtime config and restart services
         shell: bash
+        env:
+          BOOTSTRAP_INSTANCE_ID: ${{ steps.outputs.outputs.instance_id }}
+          ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
+          BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
+          CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
+          RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          set -euo pipefail
-          instance_id="${{ steps.outputs.outputs.instance_id }}"
-          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
-            echo "no bootstrap instance id available; skipping restart" >&2
-            exit 0
-          fi
-
-          ssm_status=""
-          for attempt in $(seq 1 60); do
-            ssm_status="$(aws ssm describe-instance-information \
-              --region "$AWS_REGION" \
-              --filters "Key=InstanceIds,Values=$instance_id" \
-              --query 'InstanceInformationList[0].PingStatus' \
-              --output text 2>/dev/null || true)"
-            if [ "${ssm_status:-}" = "Online" ]; then
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "${ssm_status:-}" != "Online" ]; then
-            echo "bootstrap instance did not reach SSM Online status; cannot restart service to reload auth secrets" >&2
-            exit 1
-          fi
-
-          command_id="$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids "$instance_id" \
-            --document-name AWS-RunShellScript \
-            --comment "restart burn-p2p-bootstrap to reload auth secrets" \
-            --parameters 'commands=[
-              "set -eu",
-              "/usr/local/bin/burn-dragon-p2p-sync-secrets",
-              "systemctl restart burn-p2p-bootstrap",
-              "systemctl is-active burn-p2p-bootstrap",
-              "journalctl -u burn-p2p-bootstrap --no-pager -n 40 || true"
-            ]' \
-            --query 'Command.CommandId' \
-            --output text)"
-
-          for attempt in $(seq 1 30); do
-            invocation_status="$(aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$command_id" \
-              --instance-id "$instance_id" \
-              --query 'Status' \
-              --output text 2>/dev/null || true)"
-            case "$invocation_status" in
-              Success)
-                break
-                ;;
-              Cancelled|TimedOut|Failed|Cancelling)
-                echo "bootstrap restart failed with status ${invocation_status}" >&2
-                aws ssm get-command-invocation \
-                  --region "$AWS_REGION" \
-                  --command-id "$command_id" \
-                  --instance-id "$instance_id" \
-                  --output json || true
-                exit 1
-                ;;
-            esac
-            sleep 5
-          done
-
-          aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$command_id" \
-            --instance-id "$instance_id" \
-            --output json
+          /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh
 
       - name: wait for bootstrap api/auth edge https health
         id: edge_health

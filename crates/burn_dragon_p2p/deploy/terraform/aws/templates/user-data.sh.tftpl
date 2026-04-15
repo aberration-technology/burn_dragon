@@ -29,6 +29,9 @@ if [ ! -x /root/.cargo/bin/cargo ]; then
   curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
 fi
 
+export HOME=/root
+export CARGO_HOME=/root/.cargo
+export RUSTUP_HOME=/root/.rustup
 source /root/.cargo/env
 
 if [ "${bootstrap_install_source}" = "crate" ]; then

@@ -3,10 +3,6 @@ http://${edge_domain_name} {
 }
 
 https://${edge_domain_name} {
-    tls {
-        ca https://api.buypass.com/acme/directory
-    }
-
     encode gzip zstd
 
 %{ if browser_app_base_url != "" ~}

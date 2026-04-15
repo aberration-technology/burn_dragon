@@ -68,6 +68,33 @@ jobs:
             jq -r '.[]?'
           }
 
+          list_bucket_names_by_prefix() {
+            local prefix="$1"
+            aws s3api list-buckets \
+              --output json | jq -r --arg prefix "${prefix}-" '
+                .Buckets[].Name
+                | select(startswith($prefix))
+              '
+          }
+
+          list_instance_profile_names_by_prefix() {
+            local prefix="$1"
+            aws iam list-instance-profiles \
+              --output json | jq -r --arg prefix "${prefix}-" '
+                .InstanceProfiles[].InstanceProfileName
+                | select(startswith($prefix))
+              '
+          }
+
+          list_role_names_by_prefix() {
+            local prefix="$1"
+            aws iam list-roles \
+              --output json | jq -r --arg prefix "${prefix}-" '
+                .Roles[].RoleName
+                | select(startswith($prefix))
+              '
+          }
+
           describe_instances_by_name_prefix() {
             local prefix="$1"
             aws ec2 describe-instances \
@@ -230,9 +257,7 @@ jobs:
               return 0
             fi
 
-            aws s3api list-buckets \
-              --query "Buckets[?contains(Name, \`${prefix}\`)].Name" \
-              --output json | jq_array | while read -r bucket_name; do
+            list_bucket_names_by_prefix "$prefix" | while read -r bucket_name; do
                 key_count="$(aws s3api list-objects-v2 --bucket "$bucket_name" --max-keys 1 --query 'KeyCount' --output text 2>/dev/null || echo 1)"
                 if [ "$key_count" = "0" ]; then
                   echo "deleting empty bucket ${bucket_name}"
@@ -246,9 +271,7 @@ jobs:
           cleanup_iam_by_prefix() {
             local prefix="$1"
 
-            aws iam list-instance-profiles \
-              --query "InstanceProfiles[?contains(InstanceProfileName, \`${prefix}\`)].InstanceProfileName" \
-              --output json | jq_array | while read -r profile_name; do
+            list_instance_profile_names_by_prefix "$prefix" | while read -r profile_name; do
                 mapfile -t roles < <(aws iam get-instance-profile --instance-profile-name "$profile_name" --query 'InstanceProfile.Roles[].RoleName' --output json | jq -r '.[]?')
                 for role_name in "${roles[@]}"; do
                   aws iam remove-role-from-instance-profile --instance-profile-name "$profile_name" --role-name "$role_name" >/dev/null || true
@@ -257,9 +280,7 @@ jobs:
                 aws iam delete-instance-profile --instance-profile-name "$profile_name" >/dev/null || true
               done
 
-            aws iam list-roles \
-              --query "Roles[?contains(RoleName, \`${prefix}\`)].RoleName" \
-              --output json | jq_array | while read -r role_name; do
+            list_role_names_by_prefix "$prefix" | while read -r role_name; do
                 mapfile -t inline_policies < <(aws iam list-role-policies --role-name "$role_name" --query 'PolicyNames' --output json | jq -r '.[]?')
                 for policy_name in "${inline_policies[@]}"; do
                   aws iam delete-role-policy --role-name "$role_name" --policy-name "$policy_name" >/dev/null || true
@@ -398,9 +419,7 @@ jobs:
                 ]
               '
             echo "buckets"
-            aws s3api list-buckets \
-              --query "Buckets[?contains(Name, \`${stack}\`)].Name" \
-              --output json
+            list_bucket_names_by_prefix "$stack" | jq -R -s -c 'split("\n") | map(select(length > 0))'
             echo "::endgroup::"
           }
 

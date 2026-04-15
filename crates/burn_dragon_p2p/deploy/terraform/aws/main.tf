@@ -637,7 +637,7 @@ locals {
     auth_redirect_uri                   = local.auth_redirect_path == null ? "" : "${coalesce(local.auth_redirect_base_url, local.edge_base_url)}${local.auth_redirect_path}"
     authority_key_name                  = local.secret_parameter_names.authority_key
     authority_key_path                  = "${local.bootstrap_auth_root}/bootstrap-authority.key"
-    bootstrap_node_role                 = "$${BOOTSTRAP_NODE_ROLE}"
+    bootstrap_node_role                 = "primary"
     control_plane_redis_enabled         = local.managed_control_plane_redis_enabled
     control_plane_redis_auth_token_name = local.secret_parameter_names.control_plane_redis_auth_token
     control_plane_redis_endpoint        = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].primary_endpoint_address : ""

@@ -37,6 +37,14 @@ const EXTRA_STYLESHEET: &str = r#"
   gap: 22px;
 }
 
+.dragon-browser-shell .browser-hero-copy {
+  max-width: 46rem;
+}
+
+.dragon-browser-shell .browser-quick-card strong {
+  line-height: 1.35;
+}
+
 .dragon-hero-actions {
   align-self: stretch;
 }
@@ -75,6 +83,10 @@ const EXTRA_STYLESHEET: &str = r#"
 .dragon-panel-stack {
   display: grid;
   gap: 16px;
+}
+
+.dragon-public-copy {
+  max-width: 48rem;
 }
 
 .dragon-operator-summary {

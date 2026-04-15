@@ -1012,6 +1012,31 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             });
         }
     };
+    let finish_callback_action = {
+        let props = props.clone();
+        move |_| {
+            let mut next_config = props.config.clone();
+            next_config = next_config.with_network_overrides(
+                Some(edge_url.read().clone()),
+                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
+            );
+            let release_manifest = props.release_manifest.clone();
+            let mut status = status;
+            let mut session_state = session_state;
+            spawn(async move {
+                status.set("Completing sign-in callback…".into());
+                match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
+                {
+                    Ok(Some(session)) => {
+                        session_state.set(Some(session));
+                        status.set("Authenticated session ready".into());
+                    }
+                    Ok(None) => status.set("No callback code found in URL".into()),
+                    Err(error) => status.set(error.to_string()),
+                }
+            });
+        }
+    };
 
     let view = current_view.read().clone();
     let session_panel = session_identity_panel(session_state.read().as_ref());
@@ -1048,7 +1073,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let admin_rollout_status_view = admin_rollout_result.read().clone();
     let show_connection_settings_active = *show_connection_settings.read();
     let show_live_details_active = *show_live_details.read();
-    let show_admin_tools_active = *show_admin_tools.read() || admin_scope_ready;
+    let show_admin_tools_active = *show_admin_tools.read();
     let browser_host_capabilities = detect_browser_host_capabilities();
     let browser_capability_decision = match (
         props.config.training.as_ref(),
@@ -1163,6 +1188,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .and_then(|session| session.session.as_ref())
         .is_some();
     let has_connected_view = view.is_some();
+    let public_landing = !has_session && !has_connected_view;
     let needs_sign_in = auth_required && !has_session;
     let ready_to_connect = !needs_sign_in && !has_connected_view;
     let runtime_label = view
@@ -1172,33 +1198,40 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             browser_runtime_role_label(&browser_capability_decision.capability.recommended_role)
                 .replace('_', " ")
         });
+    let hero_title = if has_connected_view {
+        "this browser is live".to_owned()
+    } else if ready_to_connect {
+        "your session is ready".to_owned()
+    } else {
+        "train dragon together".to_owned()
+    };
     let hero_runtime_label = if has_connected_view || has_session {
         runtime_label.clone()
     } else {
-        "browser training".to_owned()
+        "browser peer".to_owned()
     };
     let contributor_mode_label = if has_connected_view {
         "connected".to_owned()
     } else if needs_sign_in {
-        "sign in to start".to_owned()
+        "sign in".to_owned()
     } else if has_session {
-        "ready to connect".to_owned()
+        "ready".to_owned()
     } else {
-        "guest access enabled".to_owned()
+        "ready".to_owned()
     };
     let hero_subtitle = if needs_sign_in {
         format!(
-            "{} · {} · sign in first, then connect this tab to contribute short browser training windows.",
+            "{} · {} · sign in, connect once, and let this tab contribute short browser training windows.",
             selected_experiment_label, selected_revision_label
         )
     } else if ready_to_connect {
         format!(
-            "{} · {} · your session is ready. connect this tab to join the training network.",
+            "{} · {} · one more step and this browser joins the live training network.",
             selected_experiment_label, selected_revision_label
         )
     } else {
         format!(
-            "{} · {} · this tab is live on the current training network.",
+            "{} · {} · this tab is synced and ready to contribute compute.",
             selected_experiment_label, selected_revision_label
         )
     };
@@ -1213,21 +1246,21 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let landing_header = if needs_sign_in {
         (
-            "how it works",
-            "browser training, without the install",
-            "sign in first. the rest of the controls stay hidden until this tab can actually use them.",
+            "start here",
+            "contribute from a browser",
+            "sign in with github, connect this tab once, then leave it open whenever you want to donate short training windows.",
         )
     } else if ready_to_connect {
         (
             "next step",
-            "connect this tab",
-            "your session is ready. connect once, then the live training controls will appear.",
+            "join the live network",
+            "your session is ready. connect once and the training controls will appear.",
         )
     } else {
         (
             "live session",
-            "this browser is connected",
-            "refresh the network, inspect the current head, or run a browser training window.",
+            "training controls are unlocked",
+            "refresh the live state when needed, or run a short browser training window from this tab.",
         )
     };
     let status_message = status.read().clone();
@@ -1402,7 +1435,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 div { class: "browser-hero-grid",
                     div { class: "browser-hero-copy",
                         div { class: "eyebrow", "burn_dragon" }
-                        h1 { class: "app-title", "train dragon together" }
+                        h1 { class: "app-title", "{hero_title}" }
                         p { class: "app-subtitle", "{hero_subtitle}" }
                         div { class: "badge-row",
                             StatusPill { label: contributor_mode_label, tone: "accent" }
@@ -1412,13 +1445,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                     div { class: "browser-quick-grid",
                         if needs_sign_in {
-                            QuickCard { label: "no install", value: String::from("runs in your browser") }
-                            QuickCard { label: "sign in", value: if auth_required { String::from("github session") } else { String::from("guest access") } }
-                            QuickCard { label: "compute", value: String::from("short webgpu windows") }
+                            QuickCard { label: "runs", value: String::from("in your browser") }
+                            QuickCard { label: "identity", value: if auth_required { String::from("github session") } else { String::from("guest access") } }
+                            QuickCard { label: "contribution", value: String::from("short webgpu windows") }
                         } else if ready_to_connect {
                             QuickCard { label: "session", value: session_summary.clone() }
                             QuickCard { label: "next", value: String::from("connect this tab") }
-                            QuickCard { label: "compute", value: String::from("browser training ready") }
+                            QuickCard { label: "contribution", value: String::from("browser training ready") }
                         } else {
                             QuickCard { label: "head", value: active_head_label }
                             QuickCard { label: "peers", value: peer_summary }
@@ -1452,36 +1485,43 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     tone: "primary",
                                     onclick: github_login_action,
                                 }
+                                if callback_available {
+                                    ActionButton {
+                                        label: "finish sign-in",
+                                        tone: "secondary",
+                                        onclick: finish_callback_action,
+                                    }
+                                }
                             } else if ready_to_connect {
                                 ActionButton {
-                                    label: "connect browser peer",
+                                    label: "connect this browser",
                                     tone: "primary",
                                     onclick: connect_action,
                                 }
                             } else {
                                 {train_button}
                                 ActionButton {
-                                    label: "refresh network",
+                                    label: "refresh live state",
                                     tone: "secondary",
                                     onclick: refresh_action,
                                 }
                             }
-                            if (has_session || has_connected_view || !auth_required) && show_connection_settings_active {
+                            if (ready_to_connect || has_connected_view) && show_connection_settings_active {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_connection_settings.set(false),
-                                    "hide connection settings"
+                                    "hide network settings"
                                 }
-                            } else if has_session || has_connected_view || !auth_required {
+                            } else if ready_to_connect || has_connected_view {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_connection_settings.set(true),
                                     if has_connected_view {
-                                        "connection settings"
+                                        "network settings"
                                     } else {
-                                        "show connection settings"
+                                        "show network settings"
                                     }
                                 }
                             }
@@ -1525,9 +1565,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                     div { class: "browser-hero-actions",
-                        div { class: "edge-summary",
-                            span { class: "toolbar-meta-label", "edge" }
-                            strong { class: "edge-summary-pill", "{edge_summary}" }
+                        if !public_landing {
+                            div { class: "edge-summary",
+                                span { class: "toolbar-meta-label", "edge" }
+                                strong { class: "edge-summary-pill", "{edge_summary}" }
+                            }
                         }
                     }
                 }
@@ -1540,30 +1582,30 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         detail: landing_header.2,
                     }
                     if needs_sign_in {
-                        p { class: "section-detail",
-                            "sign in with github, connect this tab, and let it contribute short webgpu training windows back to the shared head."
+                        p { class: "section-detail dragon-public-copy",
+                            "the public flow is simple: sign in, connect this tab, then contribute short training windows whenever you want."
                         }
                         div { class: "dragon-landing-grid",
                             LandingCard {
-                                eyebrow: "1",
+                                eyebrow: "step 1",
                                 title: "sign in",
-                                detail: "start a github-backed browser session.",
+                                detail: "start a github-backed session for this browser.",
                             }
                             LandingCard {
-                                eyebrow: "2",
+                                eyebrow: "step 2",
                                 title: "connect",
-                                detail: "join the edge and sync the current checkpoint.",
+                                detail: "join the live edge and sync the latest head.",
                             }
                             LandingCard {
-                                eyebrow: "3",
-                                title: "train",
-                                detail: "run a short browser window when you're ready.",
+                                eyebrow: "step 3",
+                                title: "contribute",
+                                detail: "run short webgpu windows from this tab.",
                             }
                         }
                     } else if ready_to_connect {
                         ActivityNotice {
                             label: String::from("session ready"),
-                            detail: String::from("connect this browser once to unlock the live training controls."),
+                            detail: String::from("connect this browser once to unlock live training controls and network state."),
                             tone: "accent",
                         }
                         div { class: "keyvalue-list",
@@ -1584,7 +1626,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         div { class: "dragon-panel-stack",
                             ActivityNotice {
                                 label: String::from("connected"),
-                                detail: String::from("this browser has a live view of the selected revision and can now inspect peer state or run a browser window."),
+                                detail: String::from("this browser is connected to the selected revision and can now contribute training windows."),
                                 tone: "accent",
                             }
                             div { class: "keyvalue-list",
@@ -1607,7 +1649,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             }
                         }
                     }
-                    if props.config.training.is_some() && !needs_sign_in {
+                    if props.config.training.is_some() && has_connected_view {
                         div { class: "browser-metric-band dragon-metric-band",
                             StatTile {
                                 label: "recommended role",
@@ -1641,30 +1683,30 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     if needs_sign_in {
                         section { class: "panel compact-panel",
                             SectionHeader {
-                                eyebrow: "project",
-                                title: "at a glance",
-                                detail: "the public surface keeps just the essentials up front.",
+                                eyebrow: "why join",
+                                title: "what this tab can do",
+                                detail: "a browser peer helps with short, lightweight training windows.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
+                                    span { "training" }
+                                    strong { "short local windows" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "sync" }
+                                    strong { "shared checkpoint head" }
+                                }
+                                div { class: "keyvalue-row",
                                     span { "revision" }
                                     strong { "{selected_revision_label}" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "edge" }
-                                    strong { "{edge_summary}" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "access" }
-                                    strong { if auth_required { "github sign-in" } else { "guest" } }
                                 }
                             }
                         }
                         section { class: "panel compact-panel",
                             SectionHeader {
-                                eyebrow: "requirements",
-                                title: "what you'll use",
-                                detail: "nothing shows up here until it is actually useful.",
+                                eyebrow: "what you need",
+                                title: "before you start",
+                                detail: "just the basics for a first contribution.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
@@ -1694,12 +1736,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             SectionHeader {
                                 eyebrow: "next",
                                 title: "after you connect",
-                                detail: "the live network and training controls appear after the first successful connect.",
+                                detail: "the live network view and training controls appear after the first successful connect.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
                                     span { "first action" }
-                                    strong { "connect browser peer" }
+                                    strong { "connect this browser" }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "then" }
@@ -1760,7 +1802,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
-            if show_live_details_active || view.is_some() {
+            if show_live_details_active {
                 div { class: "surface-layout browser-surface-layout",
                     section { class: "panel primary-panel browser-focus-panel",
                         SectionHeader {

@@ -126,7 +126,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          args=(run -p xtask -- build-browser-site --out-dir target/browser-site --require-edge-auth "$REQUIRE_EDGE_AUTH")
+          args=(run -p xtask -- build-browser-site --out-dir target/browser-site "--require-edge-auth=$REQUIRE_EDGE_AUTH")
           if [ -n "$EDGE_BASE_URL" ]; then
             args+=(--edge-url "$EDGE_BASE_URL")
           fi

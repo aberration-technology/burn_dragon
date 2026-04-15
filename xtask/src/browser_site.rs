@@ -117,7 +117,8 @@ pub struct BuildBrowserSiteArgs {
     #[arg(
         long = "require-edge-auth",
         alias = "require-github-auth",
-        default_value_t = true
+        default_value_t = true,
+        action = ArgAction::Set
     )]
     pub require_edge_auth: bool,
 }

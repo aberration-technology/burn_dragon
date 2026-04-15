@@ -16,6 +16,11 @@ on:
         required: true
         default: mainnet
         type: string
+      cleanup_legacy_bootstrap_instances:
+        description: "Terminate non-canonical bootstrap instances for this deployment environment before inspection. Use this only for one-time cleanup of legacy stack-name drift."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -35,14 +40,57 @@ jobs:
       - name: inspect bootstrap instance
         shell: bash
         env:
-          STACK_NAME: ${{ vars.BURN_DRAGON_P2P_STACK_NAME }}
+          STACK_NAME_VAR: ${{ vars.BURN_DRAGON_P2P_STACK_NAME }}
           AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
           TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
           EDGE_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}
+          DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
+          CLEANUP_LEGACY_BOOTSTRAP_INSTANCES: ${{ github.event.inputs.cleanup_legacy_bootstrap_instances }}
         run: |
           set -euo pipefail
 
-          instance_name="${STACK_NAME}-bootstrap"
+          canonical_stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
+          if [ -n "${STACK_NAME_VAR:-}" ] && [ "$STACK_NAME_VAR" != "$canonical_stack_name" ]; then
+            echo "ignoring legacy stack name override '$STACK_NAME_VAR' and inspecting canonical stack '$canonical_stack_name'" >&2
+          fi
+
+          instance_name="${canonical_stack_name}-bootstrap"
+          bootstrap_rows="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Application,Values=burn-dragon-p2p" \
+              "Name=tag:Environment,Values=${DEPLOY_ENVIRONMENT}" \
+              "Name=tag:Name,Values=*bootstrap*" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --output json | jq -r '
+              [
+                .Reservations[].Instances[]
+                | {
+                    name: ([.Tags[]? | select(.Key == "Name") | .Value][0] // ""),
+                    id: .InstanceId,
+                    state: .State.Name
+                  }
+                | select(.name != "")
+                | [.name, .id, .state]
+                | @tsv
+              ] | .[]
+            ')"
+
+          if [ -n "$bootstrap_rows" ]; then
+            echo "bootstrap instances for Application=burn-dragon-p2p Environment=${DEPLOY_ENVIRONMENT}:"
+            printf '%s\n' "$bootstrap_rows" | awk -F '\t' '{printf "  - name=%s id=%s state=%s\n", $1, $2, $3}'
+          fi
+
+          legacy_instance_ids="$(printf '%s\n' "$bootstrap_rows" | awk -F '\t' -v expected="$instance_name" '$1 != "" && $1 != expected {print $2}')"
+          if [ -n "$legacy_instance_ids" ] && [ "${CLEANUP_LEGACY_BOOTSTRAP_INSTANCES}" = "true" ]; then
+            echo "terminating legacy bootstrap instances:"
+            printf '%s\n' "$legacy_instance_ids" | sed 's/^/  - /'
+            aws ec2 terminate-instances \
+              --region "$AWS_REGION" \
+              --instance-ids $legacy_instance_ids \
+              >/dev/null
+          fi
+
           instance_id="$(aws ec2 describe-instances \
             --region "$AWS_REGION" \
             --filters \

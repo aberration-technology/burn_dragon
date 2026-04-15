@@ -13,6 +13,11 @@ variable "disaster_recovery_region" {
 variable "stack_name" {
   description = "Logical stack name used for tags and DNS outputs."
   type        = string
+
+  validation {
+    condition     = can(regex("^burn-dragon-p2p(?:-[a-z0-9][a-z0-9-]*)?$", var.stack_name))
+    error_message = "stack_name must use the canonical burn-dragon-p2p-* naming scheme."
+  }
 }
 
 variable "environment_name" {

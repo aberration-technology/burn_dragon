@@ -93,6 +93,7 @@ That workflow:
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
 - prints the bootstrap instance details, bootstrap state-storage mode, control-plane state backend, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
+- derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. By default that also replaces bootstrap-local root-volume state. If you enable retained bootstrap storage, Terraform reattaches the retained data volume so local peer/runtime/auth state survives a normal rebuild. Artifact publication remains externalized in S3 either way.
 
@@ -111,6 +112,13 @@ That workflow can:
 - restore the stack into a target region from explicit or auto-resolved snapshots when retained bootstrap storage is enabled
 - optionally re-enable warm-DR replication on the restored stack by setting `next_disaster_recovery_region`
 - reuse the normal `data_volume_size_gib` setting, but keep it greater than or equal to the source snapshot volume size when restoring from snapshots
+- derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
+
+The bootstrap inspection workflow is:
+
+- `.github/workflows/inspect-burn-dragon-p2p-aws.yml`
+
+It now lists every bootstrap instance tagged for the selected deployment environment and can terminate non-canonical legacy bootstrap instances when `cleanup_legacy_bootstrap_instances=true`.
 
 Recommended warm-DR drill flow:
 
@@ -167,7 +175,7 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_AWS_REGION`
   - Optional AWS region for the stack. Defaults to `us-east-2`, which is the sane Midwest default.
 - `BURN_DRAGON_P2P_STACK_NAME`
-  - Optional Terraform stack prefix. Defaults to `burn-dragon-p2p-<environment>`.
+  - Optional Terraform stack prefix for manual or local Terraform usage. Managed GitHub deploy and restore workflows require the canonical name `burn-dragon-p2p-<environment>` and will fail if this variable is set to a different legacy alias.
 - `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME`
   - Optional public bootstrap API/auth hostname override. Defaults to `edge.dragon.aberration.technology`.
 - `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL`

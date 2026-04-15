@@ -240,10 +240,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          stack_name="$VAR_STACK_NAME"
-          if [ -z "$stack_name" ]; then
-            stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
+          canonical_stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
+          if [ -n "$VAR_STACK_NAME" ] && [ "$VAR_STACK_NAME" != "$canonical_stack_name" ]; then
+            echo "BURN_DRAGON_P2P_STACK_NAME is set to '$VAR_STACK_NAME', but managed ${DEPLOY_ENVIRONMENT} deploys require '$canonical_stack_name'." >&2
+            echo "Update or remove the environment override before rerunning this workflow to avoid duplicate stacks." >&2
+            exit 1
           fi
+          stack_name="$canonical_stack_name"
 
           aws_region="$VAR_AWS_REGION"
           aws_role_arn="$VAR_AWS_ROLE_ARN"
@@ -784,6 +787,48 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: guard canonical bootstrap naming
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          canonical_bootstrap_name="${STACK_NAME}-bootstrap"
+          bootstrap_rows="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Application,Values=burn-dragon-p2p" \
+              "Name=tag:Environment,Values=${DEPLOY_ENVIRONMENT}" \
+              "Name=tag:Name,Values=*bootstrap*" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --output json | jq -r '
+              [
+                .Reservations[].Instances[]
+                | {
+                    name: ([.Tags[]? | select(.Key == "Name") | .Value][0] // ""),
+                    id: .InstanceId,
+                    state: .State.Name
+                  }
+                | select(.name != "")
+                | [.name, .id, .state]
+                | @tsv
+              ] | .[]
+            ')"
+
+          if [ -z "$bootstrap_rows" ]; then
+            exit 0
+          fi
+
+          bootstrap_count="$(printf '%s\n' "$bootstrap_rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+          unexpected_rows="$(printf '%s\n' "$bootstrap_rows" | awk -F '\t' -v expected="$canonical_bootstrap_name" '$1 != expected')"
+
+          if [ "$bootstrap_count" -gt 1 ] || [ -n "$unexpected_rows" ]; then
+            echo "detected conflicting bootstrap instances for Application=burn-dragon-p2p Environment=${DEPLOY_ENVIRONMENT}" >&2
+            printf '%s\n' "$bootstrap_rows" | awk -F '\t' '{printf "  - name=%s id=%s state=%s\n", $1, $2, $3}' >&2
+            echo "Expected exactly one bootstrap instance named ${canonical_bootstrap_name}." >&2
+            echo "Terminate or migrate the legacy instance(s) before running deploy again." >&2
+            exit 1
+          fi
 
       - name: seed bootstrap auth secrets in ssm parameter store
         shell: bash

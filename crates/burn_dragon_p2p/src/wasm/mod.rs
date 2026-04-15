@@ -1012,31 +1012,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             });
         }
     };
-    let finish_callback_action = {
-        let props = props.clone();
-        move |_| {
-            let mut next_config = props.config.clone();
-            next_config = next_config.with_network_overrides(
-                Some(edge_url.read().clone()),
-                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
-            );
-            let release_manifest = props.release_manifest.clone();
-            let mut status = status;
-            let mut session_state = session_state;
-            spawn(async move {
-                status.set("Completing sign-in…".into());
-                match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
-                {
-                    Ok(Some(session)) => {
-                        session_state.set(Some(session));
-                        status.set("Signed in".into());
-                    }
-                    Ok(None) => status.set("No callback found".into()),
-                    Err(error) => status.set(error.to_string()),
-                }
-            });
-        }
-    };
 
     let view = current_view.read().clone();
     let session_panel = session_identity_panel(session_state.read().as_ref());
@@ -1237,8 +1212,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let landing_notice = if callback_available {
         Some((
-            String::from("sign-in"),
-            String::from("checking github callback"),
+            String::from("signing in"),
+            String::from("finishing your session"),
             "accent",
         ))
     } else {
@@ -1272,6 +1247,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     } else {
         raw_status_message
     };
+    let show_public_retry = callback_available && !status_message.is_empty();
     let edge_summary = edge_url.read().clone();
 
     #[cfg(feature = "wasm-peer")]
@@ -1453,7 +1429,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     div { class: "browser-quick-grid",
                         if needs_sign_in {
                             QuickCard { label: "runs", value: String::from("in your browser") }
-                            QuickCard { label: "identity", value: if auth_required { String::from("github session") } else { String::from("guest access") } }
+                            QuickCard { label: "identity", value: if auth_required { String::from("signed session") } else { String::from("guest access") } }
                             QuickCard { label: "contribution", value: String::from("short webgpu windows") }
                         } else if ready_to_connect {
                             QuickCard { label: "session", value: session_summary.clone() }
@@ -1487,16 +1463,19 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     div { class: "dragon-connection-editor",
                         div { class: "browser-action-row",
                             if needs_sign_in {
-                                ActionButton {
-                                    label: "sign in with github",
-                                    tone: "primary",
-                                    onclick: github_login_action,
-                                }
                                 if callback_available {
+                                    if show_public_retry {
+                                        ActionButton {
+                                            label: "try again",
+                                            tone: "secondary",
+                                            onclick: complete_callback_action,
+                                        }
+                                    }
+                                } else {
                                     ActionButton {
-                                        label: "complete sign-in",
-                                        tone: "secondary",
-                                        onclick: finish_callback_action,
+                                        label: "get started",
+                                        tone: "primary",
+                                        onclick: github_login_action,
                                     }
                                 }
                             } else if ready_to_connect {
@@ -1556,14 +1535,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     value: seed_node_urls.read().clone(),
                                     oninput: move |value| seed_node_urls.set(value),
                                 }
-                                if callback_available {
-                                    button {
-                                        r#type: "button",
-                                        class: "action-button action-button-secondary",
-                                        onclick: complete_callback_action,
-                                        "retry sign-in"
-                                    }
-                                }
                             }
                         }
                     }
@@ -1589,7 +1560,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             LandingCard {
                                 eyebrow: "step 1",
                                 title: "sign in",
-                                detail: "use github to start a session.",
+                                detail: "start a session.",
                             }
                             LandingCard {
                                 eyebrow: "step 2",
@@ -1706,12 +1677,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             SectionHeader {
                                 eyebrow: "setup",
                                 title: "what you need",
-                                detail: "github and a browser with webgpu when available.",
+                                detail: "an approved account and a browser with webgpu when available.",
                             }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
-                                    span { "identity" }
-                                    strong { "github" }
+                                    span { "access" }
+                                    strong { "approved account" }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "runtime" }

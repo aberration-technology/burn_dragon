@@ -1,0 +1,444 @@
+name: cleanup burn_dragon_p2p aws
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub environment suffix. Example: `production` for the `burn-dragon-p2p-production` GitHub Environment."
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+      terraform_workspace:
+        description: "Terraform workspace name. Example: `mainnet` or `staging`."
+        required: true
+        default: mainnet
+        type: string
+      cleanup_legacy_stack:
+        description: "Delete compute, network, IAM, SSM, and monitoring resources from the legacy `dragon-p2p-prod` stack."
+        required: true
+        default: true
+        type: boolean
+      cleanup_orphan_canonical_network:
+        description: "Delete extra canonical VPC/network resources not attached to the active canonical bootstrap instance."
+        required: true
+        default: true
+        type: boolean
+      cleanup_empty_legacy_buckets:
+        description: "Delete legacy S3 buckets only when they are empty. Non-empty buckets are reported and left in place."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
+    env:
+      AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+      DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
+      TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
+      CLEANUP_LEGACY_STACK: ${{ github.event.inputs.cleanup_legacy_stack }}
+      CLEANUP_ORPHAN_CANONICAL_NETWORK: ${{ github.event.inputs.cleanup_orphan_canonical_network }}
+      CLEANUP_EMPTY_LEGACY_BUCKETS: ${{ github.event.inputs.cleanup_empty_legacy_buckets }}
+
+    steps:
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+
+      - name: cleanup legacy and orphaned aws resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          canonical_stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
+          canonical_bootstrap_name="${canonical_stack_name}-bootstrap"
+          legacy_stack_name="dragon-p2p-prod"
+
+          jq_array() {
+            jq -r '.[]?'
+          }
+
+          describe_instances_by_name_prefix() {
+            local prefix="$1"
+            aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${prefix}*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --output json
+          }
+
+          instance_ids_by_prefix() {
+            local prefix="$1"
+            describe_instances_by_name_prefix "$prefix" | jq -r '.Reservations[].Instances[].InstanceId'
+          }
+
+          latest_instance_id_by_name() {
+            local name="$1"
+            aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${name}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId' \
+              --output text 2>/dev/null || true
+          }
+
+          active_instance_id="$(latest_instance_id_by_name "$canonical_bootstrap_name")"
+          if [ -z "$active_instance_id" ] || [ "$active_instance_id" = "None" ]; then
+            echo "canonical bootstrap instance ${canonical_bootstrap_name} was not found" >&2
+            exit 1
+          fi
+
+          active_vpc_id="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --instance-ids "$active_instance_id" \
+            --query 'Reservations[0].Instances[0].VpcId' \
+            --output text)"
+          active_eip_allocation_id="$(aws ec2 describe-addresses \
+            --region "$AWS_REGION" \
+            --filters "Name=instance-id,Values=${active_instance_id}" \
+            --query 'Addresses[0].AllocationId' \
+            --output text 2>/dev/null || true)"
+
+          echo "active canonical bootstrap instance: $active_instance_id"
+          echo "active canonical vpc: $active_vpc_id"
+          echo "active canonical eip allocation: ${active_eip_allocation_id:-none}"
+
+          wait_for_instances_terminated() {
+            local instance_ids=("$@")
+            if [ "${#instance_ids[@]}" -eq 0 ]; then
+              return 0
+            fi
+            aws ec2 wait instance-terminated --region "$AWS_REGION" --instance-ids "${instance_ids[@]}"
+          }
+
+          terminate_instances_except() {
+            local prefix="$1"
+            local preserve_id="$2"
+            mapfile -t ids < <(instance_ids_by_prefix "$prefix")
+            if [ "${#ids[@]}" -eq 0 ]; then
+              return 0
+            fi
+
+            local victims=()
+            for instance_id in "${ids[@]}"; do
+              if [ -n "$preserve_id" ] && [ "$instance_id" = "$preserve_id" ]; then
+                continue
+              fi
+              victims+=("$instance_id")
+            done
+
+            if [ "${#victims[@]}" -eq 0 ]; then
+              return 0
+            fi
+
+            echo "terminating instances for prefix ${prefix}: ${victims[*]}"
+            aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "${victims[@]}" >/dev/null
+            wait_for_instances_terminated "${victims[@]}"
+          }
+
+          release_eips_by_prefix() {
+            local prefix="$1"
+            local preserve_alloc_id="$2"
+            aws ec2 describe-addresses \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${prefix}*" \
+              --output json | jq -c '.Addresses[]?' | while read -r address; do
+                alloc_id="$(jq -r '.AllocationId' <<<"$address")"
+                assoc_id="$(jq -r '.AssociationId // empty' <<<"$address")"
+                public_ip="$(jq -r '.PublicIp // empty' <<<"$address")"
+
+                if [ -n "$preserve_alloc_id" ] && [ "$alloc_id" = "$preserve_alloc_id" ]; then
+                  continue
+                fi
+
+                echo "releasing elastic ip ${alloc_id} (${public_ip})"
+                if [ -n "$assoc_id" ]; then
+                  aws ec2 disassociate-address --region "$AWS_REGION" --association-id "$assoc_id" >/dev/null || true
+                fi
+                aws ec2 release-address --region "$AWS_REGION" --allocation-id "$alloc_id" >/dev/null || true
+              done
+          }
+
+          delete_available_volumes_by_prefix() {
+            local prefix="$1"
+            aws ec2 describe-volumes \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${prefix}*" "Name=status,Values=available" \
+              --query 'Volumes[].VolumeId' \
+              --output json | jq_array | while read -r volume_id; do
+                echo "deleting available volume ${volume_id}"
+                aws ec2 delete-volume --region "$AWS_REGION" --volume-id "$volume_id" >/dev/null || true
+              done
+          }
+
+          delete_alarms_by_prefix() {
+            local prefix="$1"
+            aws cloudwatch describe-alarms \
+              --query "MetricAlarms[?starts_with(AlarmName, \`${prefix}\`)].AlarmName" \
+              --output json | jq_array | while read -r alarm_name; do
+                echo "deleting alarm ${alarm_name}"
+                aws cloudwatch delete-alarms --alarm-names "$alarm_name"
+              done
+          }
+
+          delete_dashboards_by_prefix() {
+            local prefix="$1"
+            aws cloudwatch list-dashboards \
+              --query "DashboardEntries[?starts_with(DashboardName, \`${prefix}\`)].DashboardName" \
+              --output json | jq_array | while read -r dashboard_name; do
+                echo "deleting dashboard ${dashboard_name}"
+                aws cloudwatch delete-dashboards --dashboard-names "$dashboard_name"
+              done
+          }
+
+          delete_ssm_parameters_by_prefix() {
+            local prefix="$1"
+            local next_token=""
+            local params_json=""
+
+            while :; do
+              if [ -n "$next_token" ]; then
+                params_json="$(aws ssm get-parameters-by-path --region "$AWS_REGION" --path "$prefix" --recursive --with-decryption --max-results 10 --next-token "$next_token" --output json)"
+              else
+                params_json="$(aws ssm get-parameters-by-path --region "$AWS_REGION" --path "$prefix" --recursive --with-decryption --max-results 10 --output json)"
+              fi
+
+              mapfile -t param_names < <(jq -r '.Parameters[].Name' <<<"$params_json")
+              if [ "${#param_names[@]}" -gt 0 ]; then
+                echo "deleting ssm parameters under ${prefix}: ${param_names[*]}"
+                aws ssm delete-parameters --region "$AWS_REGION" --names "${param_names[@]}" >/dev/null
+              fi
+
+              next_token="$(jq -r '.NextToken // empty' <<<"$params_json")"
+              if [ -z "$next_token" ]; then
+                break
+              fi
+            done
+          }
+
+          delete_empty_buckets_by_prefix() {
+            local prefix="$1"
+            if [ "$CLEANUP_EMPTY_LEGACY_BUCKETS" != "true" ]; then
+              return 0
+            fi
+
+            aws s3api list-buckets \
+              --query "Buckets[?contains(Name, \`${prefix}\`)].Name" \
+              --output json | jq_array | while read -r bucket_name; do
+                key_count="$(aws s3api list-objects-v2 --bucket "$bucket_name" --max-keys 1 --query 'KeyCount' --output text 2>/dev/null || echo 1)"
+                if [ "$key_count" = "0" ]; then
+                  echo "deleting empty bucket ${bucket_name}"
+                  aws s3api delete-bucket --bucket "$bucket_name" --region "$AWS_REGION" >/dev/null || true
+                else
+                  echo "leaving non-empty bucket ${bucket_name} in place"
+                fi
+              done
+          }
+
+          cleanup_iam_by_prefix() {
+            local prefix="$1"
+
+            aws iam list-instance-profiles \
+              --query "InstanceProfiles[?contains(InstanceProfileName, \`${prefix}\`)].InstanceProfileName" \
+              --output json | jq_array | while read -r profile_name; do
+                mapfile -t roles < <(aws iam get-instance-profile --instance-profile-name "$profile_name" --query 'InstanceProfile.Roles[].RoleName' --output json | jq -r '.[]?')
+                for role_name in "${roles[@]}"; do
+                  aws iam remove-role-from-instance-profile --instance-profile-name "$profile_name" --role-name "$role_name" >/dev/null || true
+                done
+                echo "deleting instance profile ${profile_name}"
+                aws iam delete-instance-profile --instance-profile-name "$profile_name" >/dev/null || true
+              done
+
+            aws iam list-roles \
+              --query "Roles[?contains(RoleName, \`${prefix}\`)].RoleName" \
+              --output json | jq_array | while read -r role_name; do
+                mapfile -t inline_policies < <(aws iam list-role-policies --role-name "$role_name" --query 'PolicyNames' --output json | jq -r '.[]?')
+                for policy_name in "${inline_policies[@]}"; do
+                  aws iam delete-role-policy --role-name "$role_name" --policy-name "$policy_name" >/dev/null || true
+                done
+
+                aws iam list-attached-role-policies \
+                  --role-name "$role_name" \
+                  --query 'AttachedPolicies[].PolicyArn' \
+                  --output json | jq_array | while read -r policy_arn; do
+                    aws iam detach-role-policy --role-name "$role_name" --policy-arn "$policy_arn" >/dev/null || true
+                  done
+
+                echo "deleting role ${role_name}"
+                aws iam delete-role --role-name "$role_name" >/dev/null || true
+              done
+          }
+
+          cleanup_vpc() {
+            local vpc_id="$1"
+            local prefix="$2"
+
+            if [ -z "$vpc_id" ] || [ "$vpc_id" = "None" ]; then
+              return 0
+            fi
+
+            echo "cleaning vpc ${vpc_id} for prefix ${prefix}"
+
+            mapfile -t vpc_instance_ids < <(aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].InstanceId' \
+              --output json | jq -r '.[]?')
+            if [ "${#vpc_instance_ids[@]}" -gt 0 ]; then
+              echo "terminating instances in vpc ${vpc_id}: ${vpc_instance_ids[*]}"
+              aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "${vpc_instance_ids[@]}" >/dev/null || true
+              wait_for_instances_terminated "${vpc_instance_ids[@]}"
+            fi
+
+            mapfile -t eni_ids < <(aws ec2 describe-network-interfaces \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" \
+              --query 'NetworkInterfaces[?Status==`available` && Attachment==null && RequesterManaged==`false`].NetworkInterfaceId' \
+              --output json | jq -r '.[]?')
+            for eni_id in "${eni_ids[@]}"; do
+              echo "deleting network interface ${eni_id}"
+              aws ec2 delete-network-interface --region "$AWS_REGION" --network-interface-id "$eni_id" >/dev/null || true
+            done
+
+            mapfile -t route_table_assoc_ids < <(aws ec2 describe-route-tables \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" \
+              --query 'RouteTables[].Associations[?Main!=`true`].RouteTableAssociationId' \
+              --output json | jq -r '.[][]?')
+            for assoc_id in "${route_table_assoc_ids[@]}"; do
+              echo "disassociating route table association ${assoc_id}"
+              aws ec2 disassociate-route-table --region "$AWS_REGION" --association-id "$assoc_id" >/dev/null || true
+            done
+
+            mapfile -t subnet_ids < <(aws ec2 describe-subnets \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" \
+              --query 'Subnets[].SubnetId' \
+              --output json | jq -r '.[]?')
+            for subnet_id in "${subnet_ids[@]}"; do
+              echo "deleting subnet ${subnet_id}"
+              aws ec2 delete-subnet --region "$AWS_REGION" --subnet-id "$subnet_id" >/dev/null || true
+            done
+
+            mapfile -t route_table_ids < <(aws ec2 describe-route-tables \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" \
+              --query 'RouteTables[?Associations[?Main==`true`] | length(@) == `0`].RouteTableId' \
+              --output json | jq -r '.[]?')
+            for route_table_id in "${route_table_ids[@]}"; do
+              echo "deleting route table ${route_table_id}"
+              aws ec2 delete-route-table --region "$AWS_REGION" --route-table-id "$route_table_id" >/dev/null || true
+            done
+
+            mapfile -t igw_ids < <(aws ec2 describe-internet-gateways \
+              --region "$AWS_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${vpc_id}" \
+              --query 'InternetGateways[].InternetGatewayId' \
+              --output json | jq -r '.[]?')
+            for igw_id in "${igw_ids[@]}"; do
+              echo "detaching and deleting internet gateway ${igw_id}"
+              aws ec2 detach-internet-gateway --region "$AWS_REGION" --internet-gateway-id "$igw_id" --vpc-id "$vpc_id" >/dev/null || true
+              aws ec2 delete-internet-gateway --region "$AWS_REGION" --internet-gateway-id "$igw_id" >/dev/null || true
+            done
+
+            mapfile -t sg_ids < <(aws ec2 describe-security-groups \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${vpc_id}" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output json | jq -r '.[]?')
+            for sg_id in "${sg_ids[@]}"; do
+              echo "deleting security group ${sg_id}"
+              aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$sg_id" >/dev/null || true
+            done
+
+            echo "deleting vpc ${vpc_id}"
+            aws ec2 delete-vpc --region "$AWS_REGION" --vpc-id "$vpc_id" >/dev/null || true
+          }
+
+          inventory_summary() {
+            local stack="$1"
+            echo "::group::remaining inventory ${stack}"
+            echo "instances"
+            aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${stack}*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].{name: Tags[?Key==`Name`]|[0].Value,id: InstanceId,state: State.Name}' \
+              --output json
+            echo "elastic ips"
+            aws ec2 describe-addresses \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${stack}*" \
+              --query 'Addresses[].{name: Tags[?Key==`Name`]|[0].Value,allocation_id: AllocationId,public_ip: PublicIp}' \
+              --output json
+            echo "vpcs"
+            aws ec2 describe-vpcs \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${stack}*" \
+              --query 'Vpcs[].{name: Tags[?Key==`Name`]|[0].Value,id: VpcId}' \
+              --output json
+            echo "security groups"
+            aws ec2 describe-security-groups \
+              --region "$AWS_REGION" \
+              --output json | jq --arg stack "$stack" '
+                [
+                  .SecurityGroups[]
+                  | {
+                      name: ([.Tags[]? | select(.Key == "Name") | .Value][0] // .GroupName),
+                      id: .GroupId
+                    }
+                  | select(.name | contains($stack))
+                ]
+              '
+            echo "buckets"
+            aws s3api list-buckets \
+              --query "Buckets[?contains(Name, \`${stack}\`)].Name" \
+              --output json
+            echo "::endgroup::"
+          }
+
+          if [ "$CLEANUP_LEGACY_STACK" = "true" ]; then
+            terminate_instances_except "$legacy_stack_name" ""
+            release_eips_by_prefix "$legacy_stack_name" ""
+
+            aws ec2 describe-vpcs \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${legacy_stack_name}*" \
+              --query 'Vpcs[].VpcId' \
+              --output json | jq_array | while read -r legacy_vpc_id; do
+                cleanup_vpc "$legacy_vpc_id" "$legacy_stack_name"
+              done
+
+            delete_available_volumes_by_prefix "$legacy_stack_name"
+            delete_alarms_by_prefix "$legacy_stack_name"
+            delete_dashboards_by_prefix "$legacy_stack_name"
+            delete_ssm_parameters_by_prefix "/${legacy_stack_name}/"
+            cleanup_iam_by_prefix "$legacy_stack_name"
+            delete_empty_buckets_by_prefix "$legacy_stack_name"
+          fi
+
+          if [ "$CLEANUP_ORPHAN_CANONICAL_NETWORK" = "true" ]; then
+            terminate_instances_except "$canonical_stack_name" "$active_instance_id"
+            release_eips_by_prefix "$canonical_stack_name" "${active_eip_allocation_id:-}"
+
+            aws ec2 describe-vpcs \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${canonical_stack_name}-vpc" \
+              --query 'Vpcs[].VpcId' \
+              --output json | jq_array | while read -r canonical_vpc_id; do
+                if [ "$canonical_vpc_id" = "$active_vpc_id" ]; then
+                  continue
+                fi
+                cleanup_vpc "$canonical_vpc_id" "$canonical_stack_name"
+              done
+          fi
+
+          inventory_summary "$canonical_stack_name"
+          inventory_summary "$legacy_stack_name"

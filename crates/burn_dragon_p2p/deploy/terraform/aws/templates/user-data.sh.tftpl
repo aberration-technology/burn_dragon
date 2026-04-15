@@ -136,10 +136,6 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 EOF_SERVICE
 
-systemctl daemon-reload
-systemctl enable caddy burn-p2p-bootstrap
-systemctl restart caddy
-
 if [ "${bootstrap_install_source}" = "crate" ]; then
   cargo install \
     --locked \
@@ -161,6 +157,9 @@ fi
 
 install -d -m 0755 /usr/local/bin
 ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
+systemctl daemon-reload
+systemctl enable caddy burn-p2p-bootstrap
+systemctl restart caddy
 systemctl start burn-p2p-bootstrap
 
 if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then

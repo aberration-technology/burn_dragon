@@ -50,6 +50,9 @@ import os
 
 commands = [
     "set -eu",
+    "cloud-init status --wait || true",
+    "ready=0; for attempt in $(seq 1 180); do if [ -x /usr/local/bin/burn-p2p-bootstrap ]; then ready=1; break; fi; sleep 5; done; if [ \"$ready\" -ne 1 ]; then echo 'burn-p2p-bootstrap executable was not ready before runtime sync' >&2; exit 1; fi",
+    "systemctl reset-failed burn-p2p-bootstrap || true",
     "aws s3 cp '{}' /etc/burn-dragon-p2p/bootstrap.json".format(os.environ["BOOTSTRAP_OBJECT_URI"]),
     "aws s3 cp '{}' /etc/caddy/Caddyfile".format(os.environ["CADDY_OBJECT_URI"]),
     "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile",

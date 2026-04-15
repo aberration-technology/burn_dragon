@@ -106,7 +106,7 @@ jobs:
 
           legacy_stack_name="dragon-p2p-prod"
           printf '%s\n' "resource inventory"
-          cat <<'PY' | sed 's/^          //' | python3 -
+          cat <<'PY' | sed 's/^            //' | python3 -
             import json
             import os
             import subprocess

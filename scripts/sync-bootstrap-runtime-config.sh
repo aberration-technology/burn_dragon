@@ -15,12 +15,14 @@ bootstrap_install_source="${BOOTSTRAP_INSTALL_SOURCE:-crate}"
 bootstrap_crate_version="${BOOTSTRAP_CRATE_VERSION:-0.21.0-pre.15}"
 bootstrap_git_repository="${BOOTSTRAP_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_p2p.git}"
 bootstrap_git_ref="${BOOTSTRAP_GIT_REF:-}"
+bootstrap_binary_path="${BOOTSTRAP_BINARY_PATH:-}"
 auth_connector_kind="${AUTH_CONNECTOR_KIND:-github}"
 bootstrap_auth_feature="${BOOTSTRAP_AUTH_FEATURE:-}"
 bootstrap_features="${BOOTSTRAP_FEATURES:-}"
 bootstrap_reinstall="${BOOTSTRAP_REINSTALL:-false}"
 dragon_git_repository="${DRAGON_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_dragon.git}"
 dragon_git_ref="${DRAGON_GIT_REF:-main}"
+head_mirror_binary_path="${HEAD_MIRROR_BINARY_PATH:-}"
 head_mirror_reinstall="${HEAD_MIRROR_REINSTALL:-true}"
 
 if [ -z "$bootstrap_auth_feature" ]; then
@@ -43,6 +45,15 @@ caddy_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/Caddyfil
 head_mirror_config_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/bootstrap-head-mirror.toml"
 head_mirror_auth_script_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-dragon-p2p-fetch-head-mirror-auth-bundle"
 head_mirror_service_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-dragon-p2p-head-mirror.service"
+bootstrap_binary_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-p2p-bootstrap"
+head_mirror_binary_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn_dragon_p2p_native"
+
+if [ -z "$bootstrap_binary_path" ]; then
+  bootstrap_binary_object_uri=""
+fi
+if [ -z "$head_mirror_binary_path" ]; then
+  head_mirror_binary_object_uri=""
+fi
 
 cleanup() {
   aws s3 rm "$bootstrap_object_uri" >/dev/null 2>&1 || true
@@ -50,6 +61,12 @@ cleanup() {
   aws s3 rm "$head_mirror_config_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$head_mirror_auth_script_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$head_mirror_service_object_uri" >/dev/null 2>&1 || true
+  if [ -n "$bootstrap_binary_path" ]; then
+    aws s3 rm "$bootstrap_binary_object_uri" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$head_mirror_binary_path" ]; then
+    aws s3 rm "$head_mirror_binary_object_uri" >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT
@@ -65,6 +82,12 @@ aws s3 cp "$tmpdir/Caddyfile" "$caddy_object_uri" >/dev/null
 aws s3 cp "$tmpdir/bootstrap-head-mirror.toml" "$head_mirror_config_object_uri" >/dev/null
 aws s3 cp "$tmpdir/burn-dragon-p2p-fetch-head-mirror-auth-bundle" "$head_mirror_auth_script_object_uri" >/dev/null
 aws s3 cp "$tmpdir/burn-dragon-p2p-head-mirror.service" "$head_mirror_service_object_uri" >/dev/null
+if [ -n "$bootstrap_binary_path" ]; then
+  aws s3 cp "$bootstrap_binary_path" "$bootstrap_binary_object_uri" >/dev/null
+fi
+if [ -n "$head_mirror_binary_path" ]; then
+  aws s3 cp "$head_mirror_binary_path" "$head_mirror_binary_object_uri" >/dev/null
+fi
 
 ssm_status=""
 for attempt in $(seq 1 60); do
@@ -93,10 +116,12 @@ params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" \
   BOOTSTRAP_CRATE_VERSION="$bootstrap_crate_version" \
   BOOTSTRAP_GIT_REPOSITORY="$bootstrap_git_repository" \
   BOOTSTRAP_GIT_REF="$bootstrap_git_ref" \
+  BOOTSTRAP_BINARY_OBJECT_URI="$bootstrap_binary_object_uri" \
   BOOTSTRAP_FEATURES="$bootstrap_features" \
   BOOTSTRAP_REINSTALL="$bootstrap_reinstall" \
   DRAGON_GIT_REPOSITORY="$dragon_git_repository" \
   DRAGON_GIT_REF="$dragon_git_ref" \
+  HEAD_MIRROR_BINARY_OBJECT_URI="$head_mirror_binary_object_uri" \
   HEAD_MIRROR_REINSTALL="$head_mirror_reinstall" \
   python3 - <<'PY'
 import json
@@ -106,6 +131,7 @@ bootstrap_install_source = os.environ["BOOTSTRAP_INSTALL_SOURCE"]
 bootstrap_crate_version = os.environ["BOOTSTRAP_CRATE_VERSION"]
 bootstrap_git_repository = os.environ["BOOTSTRAP_GIT_REPOSITORY"]
 bootstrap_git_ref = os.environ["BOOTSTRAP_GIT_REF"]
+bootstrap_binary_object_uri = os.environ["BOOTSTRAP_BINARY_OBJECT_URI"]
 bootstrap_features = os.environ["BOOTSTRAP_FEATURES"]
 bootstrap_reinstall = os.environ["BOOTSTRAP_REINSTALL"].lower() in {
     "1",
@@ -115,6 +141,7 @@ bootstrap_reinstall = os.environ["BOOTSTRAP_REINSTALL"].lower() in {
 }
 dragon_git_repository = os.environ["DRAGON_GIT_REPOSITORY"]
 dragon_git_ref = os.environ["DRAGON_GIT_REF"]
+head_mirror_binary_object_uri = os.environ["HEAD_MIRROR_BINARY_OBJECT_URI"]
 head_mirror_reinstall = os.environ["HEAD_MIRROR_REINSTALL"].lower() in {
     "1",
     "true",
@@ -144,7 +171,12 @@ commands = [
     "systemctl is-active burn-p2p-bootstrap",
     "journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 60 || true",
 ]
-if bootstrap_reinstall:
+if bootstrap_binary_object_uri:
+    commands[1:1] = [
+        "aws s3 cp '{}' /usr/local/bin/burn-p2p-bootstrap".format(bootstrap_binary_object_uri),
+        "chmod 0755 /usr/local/bin/burn-p2p-bootstrap",
+    ]
+elif bootstrap_reinstall:
     install_command = (
         "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; "
         ". /root/.cargo/env; "
@@ -172,7 +204,12 @@ if bootstrap_reinstall:
         install_command,
         "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
     ]
-if head_mirror_reinstall:
+if head_mirror_binary_object_uri:
+    commands[1:1] = [
+        "aws s3 cp '{}' /usr/local/bin/burn_dragon_p2p_native".format(head_mirror_binary_object_uri),
+        "chmod 0755 /usr/local/bin/burn_dragon_p2p_native",
+    ]
+elif head_mirror_reinstall:
     commands[1:1] = [
         "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; . /root/.cargo/env; cargo install --locked --git '{}' --rev '{}' burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native".format(
             dragon_git_repository,

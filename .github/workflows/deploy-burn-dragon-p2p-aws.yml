@@ -895,9 +895,53 @@ jobs:
             --name "${SECRET_PARAMETER_PREFIX}/auth_client_secret" \
             --value "$AUTH_CLIENT_SECRET_RESOLVED"
 
-      - name: setup rust toolchain for managed trainer auth enrollment
-        if: ${{ env.MANAGED_TRAINER_AUTH_MODE == 'bootstrap_static_principal' }}
+      - name: setup rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: build edge binaries on runner
+        id: edge_binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bootstrap_binary_path=""
+          if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
+            bootstrap_auth_feature="auth-static"
+            case "${AUTH_CONNECTOR_KIND}" in
+              github) bootstrap_auth_feature="auth-github" ;;
+              oidc) bootstrap_auth_feature="auth-oidc" ;;
+              oauth) bootstrap_auth_feature="auth-oauth" ;;
+              external) bootstrap_auth_feature="auth-external" ;;
+            esac
+
+            bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/target-bootstrap" cargo install \
+              --locked \
+              --root "$bootstrap_root" \
+              --git "https://github.com/aberration-technology/burn_p2p.git" \
+              --rev "${TF_VAR_bootstrap_git_ref}" \
+              burn_p2p_bootstrap \
+              --bin burn-p2p-bootstrap \
+              --no-default-features \
+              --features "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
+            bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"
+          fi
+
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-dragon-native" cargo build \
+            --manifest-path "${GITHUB_WORKSPACE}/Cargo.toml" \
+            --locked \
+            -p burn_dragon_p2p \
+            --bin burn_dragon_p2p_native \
+            --no-default-features \
+            --features native \
+            --release
+
+          head_mirror_binary_path="${RUNNER_TEMP}/target-dragon-native/release/burn_dragon_p2p_native"
+
+          {
+            echo "bootstrap_binary_path=${bootstrap_binary_path}"
+            echo "head_mirror_binary_path=${head_mirror_binary_path}"
+          } >>"$GITHUB_OUTPUT"
 
       - name: setup terraform
         uses: hashicorp/setup-terraform@v3
@@ -1268,11 +1312,13 @@ jobs:
           BOOTSTRAP_CRATE_VERSION: ${{ env.TF_VAR_bootstrap_crate_version }}
           BOOTSTRAP_GIT_REPOSITORY: https://github.com/aberration-technology/burn_p2p.git
           BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
+          BOOTSTRAP_BINARY_PATH: ${{ steps.edge_binaries.outputs.bootstrap_binary_path }}
           DRAGON_GIT_REPOSITORY: ${{ env.TF_VAR_dragon_git_repository }}
           DRAGON_GIT_REF: ${{ env.TF_VAR_dragon_git_ref }}
+          HEAD_MIRROR_BINARY_PATH: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
           AUTH_CONNECTOR_KIND: ${{ env.AUTH_CONNECTOR_KIND }}
           BOOTSTRAP_REINSTALL: "false"
-          HEAD_MIRROR_REINSTALL: "true"
+          HEAD_MIRROR_REINSTALL: "false"
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh

@@ -25,15 +25,6 @@ if ! command -v aws >/dev/null 2>&1; then
   rm -rf "$tmpdir"
 fi
 
-if [ ! -x /root/.cargo/bin/cargo ]; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-fi
-
-export HOME=/root
-export CARGO_HOME=/root/.cargo
-export RUSTUP_HOME=/root/.rustup
-source /root/.cargo/env
-
 BOOTSTRAP_DATA_VOLUME_ID="${bootstrap_data_volume_id}"
 BOOTSTRAP_DATA_DEVICE_NAME="${bootstrap_data_device_name}"
 BOOTSTRAP_DATA_MOUNT_PATH="${bootstrap_data_mount_path}"
@@ -153,6 +144,15 @@ WantedBy=multi-user.target
 EOF_SERVICE
 
 if [ "${bootstrap_install_source}" = "crate" ]; then
+  if [ ! -x /root/.cargo/bin/cargo ]; then
+    curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+  fi
+
+  export HOME=/root
+  export CARGO_HOME=/root/.cargo
+  export RUSTUP_HOME=/root/.rustup
+  source /root/.cargo/env
+
   cargo install \
     --locked \
     burn_p2p_bootstrap \
@@ -161,33 +161,29 @@ if [ "${bootstrap_install_source}" = "crate" ]; then
     --no-default-features \
     --features admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
 else
-  cargo install \
-    --locked \
-    --git "${bootstrap_git_repo}" \
-    --rev "${bootstrap_git_ref}" \
-    burn_p2p_bootstrap \
-    --bin burn-p2p-bootstrap \
-    --no-default-features \
-    --features admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
+  echo "bootstrap_install_source=git; waiting for runtime sync to provide burn-p2p-bootstrap binary"
 fi
 
-cargo install \
-  --locked \
-  --git "${dragon_git_repo}" \
-  --rev "${dragon_git_ref}" \
-  burn_dragon_p2p \
-  --bin burn_dragon_p2p_native \
-  --no-default-features \
-  --features native
-
 install -d -m 0755 /usr/local/bin
-ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
-ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native
 systemctl daemon-reload
-systemctl enable caddy burn-p2p-bootstrap burn-dragon-p2p-head-mirror
+systemctl enable caddy
 systemctl restart caddy
-systemctl start burn-p2p-bootstrap
-systemctl start burn-dragon-p2p-head-mirror
+
+if [ -x /root/.cargo/bin/burn-p2p-bootstrap ]; then
+  ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
+fi
+if [ -x /usr/local/bin/burn-p2p-bootstrap ]; then
+  systemctl enable burn-p2p-bootstrap
+  systemctl start burn-p2p-bootstrap
+fi
+
+if [ -x /root/.cargo/bin/burn_dragon_p2p_native ]; then
+  ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native
+fi
+if [ -x /usr/local/bin/burn_dragon_p2p_native ]; then
+  systemctl enable burn-dragon-p2p-head-mirror
+  systemctl start burn-dragon-p2p-head-mirror
+fi
 
 if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then
   for attempt in $(seq 1 120); do

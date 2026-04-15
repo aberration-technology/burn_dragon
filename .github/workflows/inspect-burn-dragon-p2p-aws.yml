@@ -1,0 +1,134 @@
+name: inspect burn_dragon_p2p aws
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub environment suffix. Example: `production` for the `burn-dragon-p2p-production` GitHub Environment."
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+      terraform_workspace:
+        description: "Terraform workspace name. Example: `mainnet` or `staging`."
+        required: true
+        default: mainnet
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
+    steps:
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+
+      - name: inspect bootstrap instance
+        shell: bash
+        env:
+          STACK_NAME: ${{ vars.BURN_DRAGON_P2P_STACK_NAME }}
+          AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+          TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
+          EDGE_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}
+        run: |
+          set -euo pipefail
+
+          instance_name="${STACK_NAME}-bootstrap"
+          instance_id="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Name,Values=${instance_name}" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)"
+
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            echo "bootstrap instance not found for tag Name=${instance_name}" >&2
+            exit 1
+          fi
+
+          echo "instance_id=${instance_id}"
+          echo "edge_domain_name=${EDGE_DOMAIN_NAME}"
+          echo "terraform_workspace=${TF_WORKSPACE_NAME}"
+
+          echo "describe instances"
+          aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --instance-ids "$instance_id" \
+            --output json
+
+          echo "instance status"
+          aws ec2 describe-instance-status \
+            --region "$AWS_REGION" \
+            --include-all-instances \
+            --instance-ids "$instance_id" \
+            --output json || true
+
+          echo "console output"
+          aws ec2 get-console-output \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --latest \
+            --output text || true
+
+          echo "ssm registration"
+          ssm_status="$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$instance_id" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text 2>/dev/null || true)"
+          echo "ssm ping status: ${ssm_status:-missing}"
+
+          if [ "${ssm_status:-}" = "Online" ]; then
+            command_id="$(aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --comment "inspect burn_dragon bootstrap host" \
+              --parameters 'commands=[
+                "set -euxo pipefail",
+                "date -Is",
+                "uname -a",
+                "cloud-init status --long || true",
+                "systemctl status caddy --no-pager || true",
+                "systemctl status burn-p2p-bootstrap --no-pager || true",
+                "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 200 || true",
+                "tail -n 200 /var/log/cloud-init-output.log || true",
+                "ss -ltnup || true",
+                "curl -vkI https://127.0.0.1/portal/snapshot || true",
+                "curl -v http://127.0.0.1:4000/portal/snapshot || true"
+              ]' \
+              --query 'Command.CommandId' \
+              --output text)"
+
+            for attempt in $(seq 1 30); do
+              invocation_status="$(aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$instance_id" \
+                --query 'Status' \
+                --output text 2>/dev/null || true)"
+              case "$invocation_status" in
+                Success|Cancelled|TimedOut|Failed|Cancelling)
+                  break
+                  ;;
+              esac
+              sleep 5
+            done
+
+            echo "ssm command output"
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --output json || true
+          fi

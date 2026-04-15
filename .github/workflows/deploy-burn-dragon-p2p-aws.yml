@@ -1141,7 +1141,10 @@ jobs:
           set -euo pipefail
           edge_url="${{ steps.outputs.outputs.edge_url }}"
           for attempt in $(seq 1 120); do
-            if curl --fail --silent --show-error --location "$edge_url/portal/snapshot" >/dev/null; then
+            if curl --fail --silent --show-error --location \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$edge_url/portal/snapshot" >/dev/null; then
               exit 0
             fi
             sleep 15

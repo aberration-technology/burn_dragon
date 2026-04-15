@@ -144,15 +144,6 @@ jobs:
       - name: checkout repository
         uses: actions/checkout@v4
 
-      - name: require bootstrap replacement for git-based edge builds
-        if: ${{ github.event.inputs.bootstrap_install_source == 'git' && github.event.inputs.force_replace_bootstrap != 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "git-based burn_p2p bootstrap deploys must replace the bootstrap host." >&2
-          echo "rerun with force_replace_bootstrap=true so the instance is rebuilt from user-data with the intended binary." >&2
-          exit 1
-
       - name: resolve deployment settings
         shell: bash
         env:

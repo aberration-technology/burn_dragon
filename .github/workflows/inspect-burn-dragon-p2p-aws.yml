@@ -21,6 +21,11 @@ on:
         required: true
         default: false
         type: boolean
+      repair_edge_tls:
+        description: "Remove the dead Buypass ACME pin from the live bootstrap Caddyfile before inspection and restart Caddy."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -46,6 +51,7 @@ jobs:
           EDGE_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}
           DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
           CLEANUP_LEGACY_BOOTSTRAP_INSTANCES: ${{ github.event.inputs.cleanup_legacy_bootstrap_instances }}
+          REPAIR_EDGE_TLS: ${{ github.event.inputs.repair_edge_tls }}
         run: |
           set -euo pipefail
 
@@ -254,6 +260,45 @@ jobs:
           echo "ssm ping status: ${ssm_status:-missing}"
 
           if [ "${ssm_status:-}" = "Online" ]; then
+            if [ "${REPAIR_EDGE_TLS}" = "true" ]; then
+              repair_command_id="$(aws ssm send-command \
+                --region "$AWS_REGION" \
+                --instance-ids "$instance_id" \
+                --document-name AWS-RunShellScript \
+                --comment "repair burn_dragon bootstrap edge tls issuer" \
+                --parameters 'commands=[
+                  "set -eu",
+                  "python3 - <<'\''PY'\''\nfrom pathlib import Path\np = Path(\"/etc/caddy/Caddyfile\")\ntext = p.read_text()\nold = \"    tls {\\n        ca https://api.buypass.com/acme/directory\\n    }\\n\\n\"\nif old in text:\n    p.write_text(text.replace(old, \"\"))\nPY",
+                  "systemctl restart caddy",
+                  "systemctl status caddy --no-pager || true",
+                  "curl -vkI https://127.0.0.1/portal/snapshot || true"
+                ]' \
+                --query 'Command.CommandId' \
+                --output text)"
+
+              for attempt in $(seq 1 30); do
+                repair_invocation_status="$(aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$repair_command_id" \
+                  --instance-id "$instance_id" \
+                  --query 'Status' \
+                  --output text 2>/dev/null || true)"
+                case "$repair_invocation_status" in
+                  Success|Cancelled|TimedOut|Failed|Cancelling)
+                    break
+                    ;;
+                esac
+                sleep 5
+              done
+
+              echo "repair tls ssm command output"
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$repair_command_id" \
+                --instance-id "$instance_id" \
+                --output json || true
+            fi
+
             command_id="$(aws ssm send-command \
               --region "$AWS_REGION" \
               --instance-ids "$instance_id" \

@@ -10,6 +10,7 @@ on:
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
       - ".github/workflows/publish-crates.yml"
+      - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "cubecl.toml"
@@ -26,6 +27,7 @@ on:
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
       - ".github/workflows/publish-crates.yml"
+      - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "cubecl.toml"
@@ -53,6 +55,8 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - run: bash -n scripts/sync-bootstrap-runtime-config.sh
+      - run: python3 scripts/test_bootstrap_runtime_sync.py
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings

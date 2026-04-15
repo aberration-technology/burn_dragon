@@ -158,6 +158,7 @@ jobs:
           VAR_ROUTE53_ZONE_NAME: ${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}
           VAR_BROWSER_APP_BASE_URL: ${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}
           VAR_AUTH_REDIRECT_BASE_URL: ${{ vars.BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL }}
+          VAR_ACME_CONTACT_EMAIL: ${{ vars.BURN_DRAGON_P2P_ACME_CONTACT_EMAIL }}
           VAR_BROWSER_APP_PAGES_DOMAIN_TARGET: ${{ vars.BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}
           VAR_NETWORK_ID: ${{ vars.BURN_DRAGON_P2P_NETWORK_ID }}
           VAR_PROJECT_FAMILY_ID: ${{ vars.BURN_DRAGON_P2P_PROJECT_FAMILY_ID }}
@@ -258,6 +259,7 @@ jobs:
           route53_zone_name_var="$VAR_ROUTE53_ZONE_NAME"
           browser_app_base_url_var="$VAR_BROWSER_APP_BASE_URL"
           auth_redirect_base_url_var="$VAR_AUTH_REDIRECT_BASE_URL"
+          acme_contact_email_var="$VAR_ACME_CONTACT_EMAIL"
           browser_app_pages_domain_target_var="$VAR_BROWSER_APP_PAGES_DOMAIN_TARGET"
           network_id="$VAR_NETWORK_ID"
           project_family_id="$VAR_PROJECT_FAMILY_ID"
@@ -385,6 +387,11 @@ jobs:
             auth_redirect_base_url="$browser_app_base_url"
           fi
           auth_redirect_base_url="${auth_redirect_base_url%/}"
+
+          acme_contact_email="$acme_contact_email_var"
+          if [ -z "$acme_contact_email" ] && [ -n "$route53_zone_name" ]; then
+            acme_contact_email="admin@${route53_zone_name%.}"
+          fi
 
           browser_app_pages_domain_target="$browser_app_pages_domain_target_var"
           if [ -z "$browser_app_pages_domain_target" ] && [ -n "$browser_app_base_url" ]; then
@@ -627,6 +634,7 @@ jobs:
             echo "EDGE_DOMAIN_NAME=$edge_domain_name"
             echo "BROWSER_APP_BASE_URL=$browser_app_base_url"
             echo "AUTH_REDIRECT_BASE_URL=$auth_redirect_base_url"
+            echo "ACME_CONTACT_EMAIL=$acme_contact_email"
             echo "BROWSER_APP_PAGES_DOMAIN_TARGET=$browser_app_pages_domain_target"
             echo "ROUTE53_ZONE_NAME=$route53_zone_name"
             echo "SECRET_PARAMETER_PREFIX=$secret_parameter_prefix"
@@ -637,6 +645,7 @@ jobs:
             echo "TF_VAR_edge_domain_name=$edge_domain_name"
             echo "TF_VAR_browser_app_base_url=$browser_app_base_url"
             echo "TF_VAR_auth_redirect_base_url=$auth_redirect_base_url"
+            echo "TF_VAR_acme_contact_email=$acme_contact_email"
             echo "TF_VAR_browser_app_pages_domain_target=$browser_app_pages_domain_target"
             echo "TF_VAR_secret_parameter_prefix=$secret_parameter_prefix"
             echo "TF_VAR_network_id=$network_id"

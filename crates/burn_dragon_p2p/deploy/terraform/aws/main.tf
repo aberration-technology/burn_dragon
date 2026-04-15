@@ -122,6 +122,7 @@ locals {
     trimspace(var.browser_app_pages_domain_target),
     ".",
   ) : null
+  acme_contact_email               = trimspace(var.acme_contact_email) != "" ? trimspace(var.acme_contact_email) : "admin@${trimsuffix(trimsuffix(var.route53_zone_name, "."), "/")}"
   browser_app_pages_record_enabled = local.browser_app_hostname != null && local.browser_app_pages_domain_target != null
   dataset_domain_name = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : (
     local.browser_app_hostname != null ? "datasets.${local.browser_app_hostname}" : "datasets.${var.edge_domain_name}"
@@ -632,6 +633,7 @@ locals {
 
   bootstrap_config_json = jsonencode(local.bootstrap_daemon_config)
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
+    acme_contact_email   = local.acme_contact_email
     edge_domain_name     = var.edge_domain_name
     http_port            = var.http_port
     browser_app_base_url = local.browser_app_base_url == null ? "" : local.browser_app_base_url

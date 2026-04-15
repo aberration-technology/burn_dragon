@@ -56,6 +56,12 @@ variable "browser_app_pages_domain_target" {
   default     = ""
 }
 
+variable "acme_contact_email" {
+  description = "Contact email used by Caddy ACME issuers for the bootstrap edge certificate. Leave empty to derive admin@<route53_zone_name>."
+  type        = string
+  default     = ""
+}
+
 variable "allow_route53_zone_apex_records" {
   description = "Whether Terraform may manage records at the Route53 hosted-zone apex. Defaults to false so existing apex websites and CDNs are not accidentally displaced."
   type        = bool

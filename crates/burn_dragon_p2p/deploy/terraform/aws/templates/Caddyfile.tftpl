@@ -1,3 +1,9 @@
+{
+%{ if acme_contact_email != "" ~}
+    email ${acme_contact_email}
+%{ endif ~}
+}
+
 http://${edge_domain_name} {
     redir https://${edge_domain_name}{uri} 308
 }

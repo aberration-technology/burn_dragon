@@ -49,11 +49,19 @@ jobs:
           AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
           TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
           EDGE_DOMAIN_NAME: ${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}
+          ROUTE53_ZONE_NAME: ${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}
+          ACME_CONTACT_EMAIL: ${{ vars.BURN_DRAGON_P2P_ACME_CONTACT_EMAIL }}
           DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
           CLEANUP_LEGACY_BOOTSTRAP_INSTANCES: ${{ github.event.inputs.cleanup_legacy_bootstrap_instances }}
           REPAIR_EDGE_TLS: ${{ github.event.inputs.repair_edge_tls }}
         run: |
           set -euo pipefail
+
+          acme_contact_email="${ACME_CONTACT_EMAIL:-}"
+          if [ -z "$acme_contact_email" ] && [ -n "${ROUTE53_ZONE_NAME:-}" ]; then
+            acme_contact_email="admin@${ROUTE53_ZONE_NAME%.}"
+          fi
+          export EDGE_ACME_CONTACT_EMAIL="$acme_contact_email"
 
           canonical_stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
           if [ -n "${STACK_NAME_VAR:-}" ] && [ "$STACK_NAME_VAR" != "$canonical_stack_name" ]; then
@@ -261,18 +269,31 @@ jobs:
 
           if [ "${ssm_status:-}" = "Online" ]; then
             if [ "${REPAIR_EDGE_TLS}" = "true" ]; then
+              repair_commands_json="$(python3 - <<'PY'
+                import json
+                import os
+                import shlex
+
+                email = (os.environ.get("EDGE_ACME_CONTACT_EMAIL") or "").strip()
+                email_env = f"EDGE_ACME_CONTACT_EMAIL={shlex.quote(email)} "
+                commands = [
+                    "set -eu",
+                    email_env + "python3 - <<'PY'\nfrom pathlib import Path\nimport os\np = Path('/etc/caddy/Caddyfile')\ntext = p.read_text()\nold = \"    tls {\\n        ca https://api.buypass.com/acme/directory\\n    }\\n\\n\"\nif old in text:\n    text = text.replace(old, '')\nemail = os.environ.get('EDGE_ACME_CONTACT_EMAIL', '').strip()\nif email:\n    stripped = text.lstrip()\n    if stripped.startswith('{'):\n        block_end = text.find('\\n}\\n')\n        if block_end != -1:\n            block = text[:block_end + 3]\n            if 'email ' not in block:\n                text = text[:block_end] + f'    email {email}\\n' + text[block_end:]\n    else:\n        text = '{\\n    email ' + email + '\\n}\\n\\n' + text\np.write_text(text)\nPY",
+                    email_env + "python3 - <<'PY'\nimport shutil\nfrom pathlib import Path\nbase = Path('/var/lib/caddy/.local/share/caddy')\nif base.exists():\n    for pattern in ('acme/acme.zerossl.com-v2-dv90', 'acme/acme-v02.api.letsencrypt.org-directory'):\n        target = base / pattern\n        if target.exists():\n            shutil.rmtree(target)\nPY",
+                    "systemctl restart caddy",
+                    "systemctl status caddy --no-pager || true",
+                    "journalctl -u caddy --no-pager -n 120 || true",
+                    "curl -vkI https://127.0.0.1/portal/snapshot || true",
+                ]
+                print(json.dumps(commands))
+                PY
+              )"
               repair_command_id="$(aws ssm send-command \
                 --region "$AWS_REGION" \
                 --instance-ids "$instance_id" \
                 --document-name AWS-RunShellScript \
                 --comment "repair burn_dragon bootstrap edge tls issuer" \
-                --parameters 'commands=[
-                  "set -eu",
-                  "python3 - <<'\''PY'\''\nfrom pathlib import Path\np = Path(\"/etc/caddy/Caddyfile\")\ntext = p.read_text()\nold = \"    tls {\\n        ca https://api.buypass.com/acme/directory\\n    }\\n\\n\"\nif old in text:\n    p.write_text(text.replace(old, \"\"))\nPY",
-                  "systemctl restart caddy",
-                  "systemctl status caddy --no-pager || true",
-                  "curl -vkI https://127.0.0.1/portal/snapshot || true"
-                ]' \
+                --parameters "commands=${repair_commands_json}" \
                 --query 'Command.CommandId' \
                 --output text)"
 

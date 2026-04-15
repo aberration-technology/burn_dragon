@@ -14,11 +14,13 @@ const BROWSER_APP_LOADER: &str = r#"import init from "./burn_dragon_p2p_browser.
 
 await init({ module_or_path: new URL("./burn_dragon_p2p_browser_bg.wasm", import.meta.url) });
 "#;
-const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
+const INDEX_HTML_TEMPLATE: &str = r##"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#000000" />
     <title>burn_dragon</title>
     <link rel="stylesheet" href="__ASSET_PREFIX__/browser-app.css" />
   </head>
@@ -27,10 +29,35 @@ const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
     <script type="module" src="__ASSET_PREFIX__/browser-app-loader.js"></script>
   </body>
 </html>
-"#;
+"##;
 const EXTRA_STYLESHEET: &str = r#"
 :root {
+  --bg: #000000;
+  --bg-elevated: #050505;
+  --panel: rgba(8, 8, 8, 0.9);
+  --panel-strong: rgba(12, 12, 12, 0.96);
+  --panel-soft: rgba(10, 10, 10, 0.78);
+  --ink: #ffffff;
+  --muted: rgba(255, 255, 255, 0.72);
+  --line: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(216, 124, 124, 0.26);
+  --accent: #d87c7c;
+  --accent-strong: #c96b6b;
+  --accent-soft: rgba(216, 124, 124, 0.14);
+  --accent-cool: #d87c7c;
+  --shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+  color-scheme: dark;
   font-family: "Iosevka Etoile", "IBM Plex Sans", system-ui, sans-serif;
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  background:
+    radial-gradient(circle at top center, rgba(216, 124, 124, 0.12), transparent 28%),
+    linear-gradient(180deg, #000000, #030303 35%, #000000 100%);
 }
 
 .dragon-browser-shell {
@@ -103,7 +130,7 @@ const EXTRA_STYLESHEET: &str = r#"
   border-radius: 18px;
   border: 1px solid var(--line);
   background:
-    radial-gradient(circle at top right, rgba(255, 184, 92, 0.08), transparent 30%),
+    radial-gradient(circle at top right, rgba(216, 124, 124, 0.08), transparent 30%),
     rgba(255, 255, 255, 0.025);
 }
 

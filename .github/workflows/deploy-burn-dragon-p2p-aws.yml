@@ -1292,23 +1292,23 @@ jobs:
             --data "{\"network_id\":\"${TF_VAR_network_id}\",\"principal_hint\":null,\"requested_scopes\":[\"Connect\"]}")"
 
           python3 - "$login_json" <<'PY'
-import json
-import sys
-from urllib.parse import urlparse, parse_qs
+          import json
+          import sys
+          from urllib.parse import urlparse, parse_qs
 
-payload = json.loads(sys.argv[1])
-authorize_url = payload.get("authorize_url")
-if not authorize_url:
-    raise SystemExit("missing authorize_url in login response")
+          payload = json.loads(sys.argv[1])
+          authorize_url = payload.get("authorize_url")
+          if not authorize_url:
+              raise SystemExit("missing authorize_url in login response")
 
-query = parse_qs(urlparse(authorize_url).query)
-missing = [key for key in ("client_id", "redirect_uri", "state") if not query.get(key)]
-if missing:
-    raise SystemExit(
-        f"authorize_url is missing required query params {missing}: {authorize_url}"
-    )
-print(authorize_url)
-PY
+          query = parse_qs(urlparse(authorize_url).query)
+          missing = [key for key in ("client_id", "redirect_uri", "state") if not query.get(key)]
+          if missing:
+              raise SystemExit(
+                  f"authorize_url is missing required query params {missing}: {authorize_url}"
+              )
+          print(authorize_url)
+          PY
 
       - name: capture bootstrap diagnostics on health failure
         if: ${{ failure() && steps.outputs.outputs.instance_id != '' }}

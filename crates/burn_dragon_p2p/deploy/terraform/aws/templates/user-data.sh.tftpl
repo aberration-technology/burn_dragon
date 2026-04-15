@@ -100,6 +100,9 @@ install -d -m 0755 /etc/burn-dragon-p2p
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"
 install -d -m 0700 "$${BOOTSTRAP_DATA_MOUNT_PATH}/auth"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/bootstrap-peer"
+install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/head-mirror"
+install -d -m 0755 /etc/burn_dragon_p2p
+install -d -m 0700 /var/lib/burn_dragon_p2p
 
 cat >/usr/local/bin/burn-dragon-p2p-sync-secrets <<'EOF_SYNC'
 ${secret_sync_script}
@@ -113,6 +116,19 @@ EOF_CONFIG
 cat >/etc/caddy/Caddyfile <<'EOF_CADDY'
 ${caddyfile}
 EOF_CADDY
+
+cat >/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle <<'EOF_HEAD_MIRROR_AUTH'
+${bootstrap_head_mirror_auth_script}
+EOF_HEAD_MIRROR_AUTH
+chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle
+
+cat >/etc/burn_dragon_p2p/bootstrap-head-mirror.toml <<'EOF_HEAD_MIRROR_CONFIG'
+${bootstrap_head_mirror_config}
+EOF_HEAD_MIRROR_CONFIG
+
+cat >/etc/systemd/system/burn-dragon-p2p-head-mirror.service <<'EOF_HEAD_MIRROR_SERVICE'
+${bootstrap_head_mirror_service_unit}
+EOF_HEAD_MIRROR_SERVICE
 
 cat >/etc/systemd/system/burn-p2p-bootstrap.service <<'EOF_SERVICE'
 [Unit]
@@ -155,12 +171,23 @@ else
     --features admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social
 fi
 
+cargo install \
+  --locked \
+  --git "${dragon_git_repo}" \
+  --rev "${dragon_git_ref}" \
+  burn_dragon_p2p \
+  --bin burn_dragon_p2p_native \
+  --no-default-features \
+  --features native
+
 install -d -m 0755 /usr/local/bin
 ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap
+ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native
 systemctl daemon-reload
-systemctl enable caddy burn-p2p-bootstrap
+systemctl enable caddy burn-p2p-bootstrap burn-dragon-p2p-head-mirror
 systemctl restart caddy
 systemctl start burn-p2p-bootstrap
+systemctl start burn-dragon-p2p-head-mirror
 
 if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then
   for attempt in $(seq 1 120); do

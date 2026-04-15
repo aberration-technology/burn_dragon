@@ -1,0 +1,18 @@
+[Unit]
+Description=burn_dragon bootstrap native head mirror
+After=network-online.target burn-p2p-bootstrap.service
+Wants=network-online.target burn-p2p-bootstrap.service
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/burn_dragon_p2p
+Environment=RUST_LOG=info
+ExecStartPre=/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle
+ExecStart=/usr/local/bin/burn_dragon_p2p_native run-head-mirror --config ${config_path} --experiment-kind ${experiment_kind} --backend ${backend} --auth-bundle ${auth_bundle_path} --head-sync-interval-secs ${head_sync_interval_secs}
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

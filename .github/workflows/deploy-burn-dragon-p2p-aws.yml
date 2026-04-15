@@ -573,6 +573,19 @@ jobs:
               auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; backend = sys.argv[5]; stack_name = sys.argv[6]; environment = sys.argv[7]; trainer_role = "TrainerCpu" if backend == "cpu" else "TrainerGpu"; principal = {"principal_id": principal_id, "display_name": f"burn_dragon managed {experiment_id} {backend} trainer", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": [trainer_role, "Archive"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}, {"Archive": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "managed_trainer": "true", "managed_trainer_backend": backend, "managed_trainer_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$managed_trainer_principal_id" "$managed_trainer_experiment_id" "$network_id" "$managed_trainer_backend" "$stack_name" "$DEPLOY_ENVIRONMENT")"
             fi
           fi
+          dragon_crate_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              print(tomllib.load(handle)["workspace"]["package"]["version"])
+          PY
+          )"
+          dragon_git_repository="https://github.com/${GITHUB_REPOSITORY}.git"
+          dragon_git_ref="${GITHUB_SHA}"
+          bootstrap_head_mirror_experiment_id="nca-prepretraining"
+          bootstrap_head_mirror_revision_id="nca-r1"
+          bootstrap_head_mirror_principal_id="bootstrap-head-mirror-${TF_WORKSPACE_NAME}-nca"
+          bootstrap_head_mirror_auth_bundle_parameter_name="${secret_parameter_prefix}/bootstrap_head_mirror_auth_bundle_json"
+          auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; stack_name = sys.argv[5]; environment = sys.argv[6]; principal = {"principal_id": principal_id, "display_name": "burn_dragon bootstrap nca head mirror", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": ["TrainerCpu", "Archive"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}, {"Archive": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "bootstrap_head_mirror": "true", "bootstrap_head_mirror_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$bootstrap_head_mirror_principal_id" "$bootstrap_head_mirror_experiment_id" "$network_id" "$stack_name" "$DEPLOY_ENVIRONMENT")"
 
           create_artifact_bucket="$create_artifact_bucket_input"
           artifact_bucket_name="$artifact_bucket_name_input"
@@ -668,6 +681,10 @@ jobs:
             echo "TF_VAR_bootstrap_install_source=$bootstrap_install_source"
             echo "TF_VAR_bootstrap_crate_version=$bootstrap_version"
             echo "TF_VAR_bootstrap_git_ref=$bootstrap_git_ref"
+            echo "TF_VAR_dragon_crate_version=$dragon_crate_version"
+            echo "TF_VAR_dragon_git_repository=$dragon_git_repository"
+            echo "TF_VAR_dragon_git_ref=$dragon_git_ref"
+            echo "TF_VAR_bootstrap_head_mirror_auth_bundle_parameter_name=$bootstrap_head_mirror_auth_bundle_parameter_name"
             echo "TF_VAR_create_artifact_bucket=$create_artifact_bucket"
             echo "DATASET_DOMAIN_NAME=$dataset_domain_name"
             echo "DATASET_BUCKET_PATH_PREFIX=$dataset_bucket_path_prefix"
@@ -686,6 +703,9 @@ jobs:
             echo "MANAGED_TRAINER_PRINCIPAL_ID=$managed_trainer_principal_id"
             echo "MANAGED_TRAINER_EXPERIMENT_ID=$managed_trainer_experiment_id"
             echo "MANAGED_TRAINER_REVISION_ID=$managed_trainer_revision_id"
+            echo "BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID=$bootstrap_head_mirror_principal_id"
+            echo "BOOTSTRAP_HEAD_MIRROR_EXPERIMENT_ID=$bootstrap_head_mirror_experiment_id"
+            echo "BOOTSTRAP_HEAD_MIRROR_REVISION_ID=$bootstrap_head_mirror_revision_id"
             echo "TF_VAR_auth_connector_kind=$auth_connector_kind"
             echo "TF_VAR_auth_authority_name=$auth_authority_name"
           } >>"$GITHUB_ENV"
@@ -1147,6 +1167,9 @@ jobs:
           browser_app_url="$(terraform -chdir="$TF_ROOT" output -raw browser_app_url)"
           bootstrap_config_json_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_config_json | base64 -w0)"
           caddyfile_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_caddyfile | base64 -w0)"
+          bootstrap_head_mirror_config_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_config | base64 -w0)"
+          bootstrap_head_mirror_auth_script_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_fetch_auth_script | base64 -w0)"
+          bootstrap_head_mirror_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_service_unit | base64 -w0)"
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
@@ -1193,12 +1216,16 @@ jobs:
           managed_trainer_asg_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_asg_name)"
           managed_trainer_desired_capacity="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_desired_capacity)"
           managed_trainer_auth_bundle_parameter_name="$(terraform -chdir="$TF_ROOT" output -raw managed_trainer_auth_bundle_parameter_name)"
+          bootstrap_head_mirror_auth_bundle_parameter_name="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_auth_bundle_parameter_name)"
 
           {
             echo "edge_url=$edge_url"
             echo "browser_app_url=$browser_app_url"
             echo "bootstrap_config_json_b64=$bootstrap_config_json_b64"
             echo "caddyfile_b64=$caddyfile_b64"
+            echo "bootstrap_head_mirror_config_b64=$bootstrap_head_mirror_config_b64"
+            echo "bootstrap_head_mirror_auth_script_b64=$bootstrap_head_mirror_auth_script_b64"
+            echo "bootstrap_head_mirror_service_unit_b64=$bootstrap_head_mirror_service_unit_b64"
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "public_ip=$public_ip"
@@ -1224,6 +1251,7 @@ jobs:
             echo "managed_trainer_asg_name=$managed_trainer_asg_name"
             echo "managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
             echo "managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
+            echo "bootstrap_head_mirror_auth_bundle_parameter_name=$bootstrap_head_mirror_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
       - name: sync bootstrap runtime config and restart services
@@ -1233,12 +1261,18 @@ jobs:
           ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
           BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
           CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
+          BOOTSTRAP_HEAD_MIRROR_CONFIG_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_config_b64 }}
+          BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_auth_script_b64 }}
+          BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_service_unit_b64 }}
           BOOTSTRAP_INSTALL_SOURCE: ${{ env.TF_VAR_bootstrap_install_source }}
           BOOTSTRAP_CRATE_VERSION: ${{ env.TF_VAR_bootstrap_crate_version }}
           BOOTSTRAP_GIT_REPOSITORY: https://github.com/aberration-technology/burn_p2p.git
           BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
+          DRAGON_GIT_REPOSITORY: ${{ env.TF_VAR_dragon_git_repository }}
+          DRAGON_GIT_REF: ${{ env.TF_VAR_dragon_git_ref }}
           AUTH_CONNECTOR_KIND: ${{ env.AUTH_CONNECTOR_KIND }}
           BOOTSTRAP_REINSTALL: "false"
+          HEAD_MIRROR_REINSTALL: "true"
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh
@@ -1352,7 +1386,8 @@ jobs:
                 "cloud-init status --long || true",
                 "systemctl status caddy --no-pager || true",
                 "systemctl status burn-p2p-bootstrap --no-pager || true",
-                "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 200 || true",
+                "systemctl status burn-dragon-p2p-head-mirror --no-pager || true",
+                "journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 200 || true",
                 "tail -n 200 /var/log/cloud-init-output.log || true",
                 "ss -ltnup || true"
               ]' \
@@ -1447,6 +1482,141 @@ jobs:
             --overwrite \
             --name "$TF_VAR_managed_trainer_auth_bundle_parameter_name" \
             --value "$bundle_json"
+
+      - name: seed bootstrap head mirror auth bundle in ssm parameter store
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          config_path="$tmpdir/head-mirror-auth-config.toml"
+          bundle_path="$tmpdir/auth-bundle.json"
+          cat <<EOF | sed 's/^          //' >"$config_path"
+          training_config_paths = []
+          storage_root = "$tmpdir/storage"
+          app_semver = "$TF_VAR_dragon_crate_version"
+
+          [network]
+          edge_base_url = "${{ steps.outputs.outputs.edge_url }}"
+          seed_node_urls = [
+            "${{ steps.outputs.outputs.seed_tcp }}",
+            "${{ steps.outputs.outputs.seed_quic }}",
+          ]
+
+          [manifest]
+          project_family_id = "$TF_VAR_project_family_id"
+          network_id = "$TF_VAR_network_id"
+          study_id = "$TF_VAR_study_id"
+          experiment_id = "$BOOTSTRAP_HEAD_MIRROR_EXPERIMENT_ID"
+          revision_id = "$BOOTSTRAP_HEAD_MIRROR_REVISION_ID"
+          display_name = "burn_dragon bootstrap nca head mirror auth seed"
+          description = "bootstrap head mirror auth seed"
+          protocol_major = 0
+          authority_public_keys = []
+          bootstrap_addrs = []
+          EOF
+
+          for attempt in $(seq 1 10); do
+            if cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native -- \
+              enroll-static-principal \
+              --config "$config_path" \
+              --experiment-kind nca \
+              --backend cpu \
+              --principal-id "$BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID" \
+              --principal-hint "$BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID" \
+              --target-artifact-hash "$TF_VAR_native_target_artifact_hash" \
+              --auth-bundle-out "$bundle_path" \
+              --output-format json; then
+              aws ssm put-parameter \
+                --region "$AWS_REGION" \
+                --type SecureString \
+                --overwrite \
+                --name "$TF_VAR_bootstrap_head_mirror_auth_bundle_parameter_name" \
+                --value "$(cat "$bundle_path")"
+              exit 0
+            fi
+            sleep 15
+          done
+
+          echo "failed to resolve bootstrap head mirror auth bundle" >&2
+          exit 1
+
+      - name: restart bootstrap head mirror after auth seed
+        shell: bash
+        env:
+          BOOTSTRAP_INSTANCE_ID: ${{ steps.outputs.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          command_id="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$BOOTSTRAP_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "restart burn_dragon bootstrap head mirror" \
+            --parameters 'commands=[
+              "set -eu",
+              "/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle",
+              "systemctl reset-failed burn-dragon-p2p-head-mirror || true",
+              "systemctl restart burn-dragon-p2p-head-mirror",
+              "systemctl is-active burn-dragon-p2p-head-mirror",
+              "journalctl -u burn-dragon-p2p-head-mirror --no-pager -n 120 || true"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)"
+
+          for attempt in $(seq 1 30); do
+            invocation_status="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)"
+            case "$invocation_status" in
+              Success)
+                exit 0
+                ;;
+              Cancelled|TimedOut|Failed|Cancelling)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$command_id" \
+                  --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          echo "timed out waiting for bootstrap head mirror restart" >&2
+          exit 1
+
+      - name: wait for bootstrap head mirror to publish an nca head
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_url="${{ steps.outputs.outputs.edge_url }}"
+          for attempt in $(seq 1 80); do
+            snapshot_json="$(curl --fail --silent --show-error --location \
+              --connect-timeout 5 \
+              --max-time 20 \
+              "$edge_url/portal/snapshot")"
+            if python3 - "$snapshot_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+heads = payload.get("heads") or []
+for head in heads:
+    if head.get("experiment_id") == "nca-prepretraining":
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+            then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "bootstrap head mirror did not publish an nca head" >&2
+          exit 1
       - name: publish workflow summary
         if: ${{ always() }}
         shell: bash
@@ -1477,6 +1647,8 @@ jobs:
           - Managed trainer auth mode: \`${MANAGED_TRAINER_AUTH_MODE}\`
           - Managed trainer principal id: \`${MANAGED_TRAINER_PRINCIPAL_ID:-n/a}\`
           - Managed trainer auth bundle parameter: \`${{ steps.outputs.outputs.managed_trainer_auth_bundle_parameter_name || 'n/a' }}\`
+          - Bootstrap head mirror principal id: \`${BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID}\`
+          - Bootstrap head mirror auth bundle parameter: \`${{ steps.outputs.outputs.bootstrap_head_mirror_auth_bundle_parameter_name || 'n/a' }}\`
           - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
           - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
           - Dataset bucket: \`${{ steps.outputs.outputs.dataset_bucket_name }}\`

@@ -46,6 +46,7 @@ const MIB: u64 = 1024 * 1024;
 const DEFAULT_SESSION_TTL_SECS: i64 = 1800;
 const DEFAULT_STATUS_INTERVAL_SECS: u64 = 30;
 const DEFAULT_VALIDATION_INTERVAL_MILLIS: u64 = 250;
+const DEFAULT_HEAD_SYNC_INTERVAL_SECS: u64 = 15;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,6 +71,7 @@ enum CommandKind {
     CompleteGithubLogin(CompleteGithubLoginArgs),
     EnrollStaticPrincipal(EnrollStaticPrincipalArgs),
     RunPeer(RunPeerArgs),
+    RunHeadMirror(RunHeadMirrorArgs),
     RunValidatorDaemon(RunValidatorDaemonArgs),
     MarkRuntimeFailure(MarkRuntimeFailureArgs),
     ClearDowngrade(ClearDowngradeArgs),
@@ -336,6 +338,42 @@ struct RunPeerArgs {
     auth_bundle_format: ConfigFormat,
     #[arg(long, default_value_t = DEFAULT_STATUS_INTERVAL_SECS)]
     status_interval_secs: u64,
+    #[arg(long, default_value_t = false)]
+    initialize_head_on_start: bool,
+    #[arg(long, default_value_t = false)]
+    restore_head_on_start: bool,
+    #[arg(long, default_value_t = 0)]
+    head_sync_interval_secs: u64,
+    #[command(flatten)]
+    capability_policy: CapabilityPolicyArgs,
+}
+
+#[derive(Debug, Parser)]
+struct RunHeadMirrorArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    auth_bundle: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "auto")]
+    auth_bundle_format: ConfigFormat,
+    #[arg(long, default_value_t = DEFAULT_STATUS_INTERVAL_SECS)]
+    status_interval_secs: u64,
+    #[arg(long, default_value_t = DEFAULT_HEAD_SYNC_INTERVAL_SECS)]
+    head_sync_interval_secs: u64,
+    #[arg(long, default_value_t = true)]
+    initialize_head_on_start: bool,
+    #[arg(long, default_value_t = true)]
+    restore_head_on_start: bool,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
 }
@@ -436,6 +474,7 @@ fn main() -> Result<()> {
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
         CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
         CommandKind::RunPeer(args) => run_peer(args),
+        CommandKind::RunHeadMirror(args) => run_head_mirror(args),
         CommandKind::RunValidatorDaemon(args) => run_validator_daemon(args),
         CommandKind::MarkRuntimeFailure(args) => mark_runtime_failure(args),
         CommandKind::ClearDowngrade(args) => clear_downgrade(args),
@@ -771,12 +810,18 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
         ),
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => run_prepared_peer(
             prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
         ),
         #[cfg(feature = "wgpu")]
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => run_prepared_peer(
@@ -784,6 +829,9 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
         ),
         #[cfg(feature = "wgpu")]
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => run_prepared_peer(
@@ -791,6 +839,9 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
         ),
         #[cfg(feature = "cuda")]
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => run_prepared_peer(
@@ -798,6 +849,9 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
         ),
         #[cfg(feature = "cuda")]
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => run_prepared_peer(
@@ -805,6 +859,91 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             &config,
             args.backend,
             args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
+        ),
+        #[cfg(not(feature = "wgpu"))]
+        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
+        #[cfg(not(feature = "cuda"))]
+        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+    }
+}
+
+fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        Some(args.capability_policy),
+    )?;
+    let auth_bundle = match args.auth_bundle {
+        Some(path) => Some(load_typed::<DragonNativeAuthBundle>(
+            &path,
+            args.auth_bundle_format,
+        )?),
+        None => None,
+    };
+
+    match (args.experiment_kind.into_config(), args.backend) {
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_head_mirror(
+            prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => run_prepared_head_mirror(
+            prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
+            prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
+            prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => run_prepared_head_mirror(
+            prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => run_prepared_head_mirror(
+            prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
         ),
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
@@ -1054,6 +1193,9 @@ fn run_prepared_peer<B>(
     config: &DragonNativePeerConfig,
     backend: BackendArg,
     status_interval_secs: u64,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+    head_sync_interval_secs: u64,
 ) -> Result<()>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -1072,7 +1214,30 @@ where
         eprintln!("capability decision: {reason}");
     }
 
-    let running = spawn_prepared_native_peer(prepared)?;
+    let experiment_entry = prepared
+        .manifests
+        .experiment_directory
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("prepared native peer is missing an experiment"))?;
+    let mut running = spawn_prepared_native_peer(prepared)?;
+    if initialize_head_on_start || restore_head_on_start || head_sync_interval_secs > 0 {
+        wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
+        let experiment = running.mainnet().experiment(
+            experiment_entry.study_id.clone(),
+            experiment_entry.experiment_id.clone(),
+            experiment_entry.current_revision_id.clone(),
+        );
+        let mut mirrored_head_id = None;
+        let _ = sync_or_initialize_head_provider(
+            &mut running,
+            &experiment,
+            initialize_head_on_start,
+            restore_head_on_start,
+            &mut mirrored_head_id,
+            "peer",
+        )?;
+    }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_requested_for_handler = Arc::clone(&shutdown_requested);
     let control = running.control_handle();
@@ -1087,8 +1252,38 @@ where
     let mut last_status = Instant::now()
         .checked_sub(status_interval)
         .unwrap_or_else(Instant::now);
+    let experiment =
+        if initialize_head_on_start || restore_head_on_start || head_sync_interval_secs > 0 {
+            Some(running.mainnet().experiment(
+                experiment_entry.study_id,
+                experiment_entry.experiment_id,
+                experiment_entry.current_revision_id,
+            ))
+        } else {
+            None
+        };
+    let head_sync_interval = Duration::from_secs(head_sync_interval_secs.max(1));
+    let mut mirrored_head_id = None;
+    let mut last_head_sync = Instant::now()
+        .checked_sub(head_sync_interval)
+        .unwrap_or_else(Instant::now);
 
     loop {
+        if head_sync_interval_secs > 0
+            && let Some(experiment) = experiment.as_ref()
+            && last_head_sync.elapsed() >= head_sync_interval
+        {
+            let _ = sync_or_initialize_head_provider(
+                &mut running,
+                experiment,
+                initialize_head_on_start,
+                restore_head_on_start,
+                &mut mirrored_head_id,
+                "peer",
+            )?;
+            last_head_sync = Instant::now();
+        }
+
         let snapshot = running.snapshot();
         if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
             eprintln!(
@@ -1113,6 +1308,168 @@ where
             RuntimeStatus::Stopped => {
                 let _prepared = running.await_termination_timeout(SHUTDOWN_TIMEOUT)?;
                 eprintln!("peer stopped cleanly");
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        thread::sleep(STATUS_POLL_INTERVAL);
+    }
+}
+
+fn sync_or_initialize_head_provider<B>(
+    running: &mut ManagedRunningNativePeer<B>,
+    experiment: &burn_p2p::ExperimentHandle,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+    mirrored_head_id: &mut Option<burn_p2p::HeadId>,
+    log_prefix: &str,
+) -> Result<Option<burn_p2p::HeadDescriptor>>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let restored = if restore_head_on_start {
+        running.restore_experiment_head(experiment)?
+    } else {
+        None
+    };
+    let synced = running.sync_experiment_head(experiment)?;
+    let head = if let Some(head) = synced.or(restored) {
+        head
+    } else if initialize_head_on_start {
+        let head = running.initialize_local_head(experiment)?;
+        eprintln!(
+            "{log_prefix}-initialized genesis head id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
+        head
+    } else {
+        return Ok(None);
+    };
+
+    // Re-announce the locally materialized head on every sync pass so late
+    // browser peers can always discover at least one live provider.
+    running.publish_head_provider(experiment, &head)?;
+
+    if mirrored_head_id.as_ref() != Some(&head.head_id) {
+        eprintln!(
+            "{log_prefix}-mirroring head id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
+        *mirrored_head_id = Some(head.head_id.clone());
+    }
+
+    Ok(Some(head))
+}
+
+fn run_prepared_head_mirror<B>(
+    prepared: PreparedNativePeer<B>,
+    config: &DragonNativePeerConfig,
+    backend: BackendArg,
+    status_interval_secs: u64,
+    head_sync_interval_secs: u64,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let experiment_entry = prepared
+        .manifests
+        .experiment_directory
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("prepared head mirror is missing an experiment"))?;
+    eprintln!(
+        "starting burn_dragon head mirror: experiment={} backend={} target={:?} can_train={} edge={} seeds={} storage_root={}",
+        prepared.experiment_kind.workload_slug(),
+        backend.as_label(),
+        prepared.target_decision.effective_target,
+        prepared.target_decision.can_train,
+        config.effective_edge_base_url().unwrap_or("<none>"),
+        config.effective_seed_node_urls().len(),
+        config.storage_root.display(),
+    );
+    if let Some(reason) = prepared.target_decision.downgrade_reason.as_deref() {
+        eprintln!("capability decision: {reason}");
+    }
+    if !prepared.target_decision.can_train {
+        eprintln!(
+            "head mirror continuing with estimated training footprint above the configured budget; target={:?}",
+            prepared.target_decision.effective_target,
+        );
+    }
+
+    let mut running = spawn_prepared_native_peer(prepared)?;
+    wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_requested_for_handler = Arc::clone(&shutdown_requested);
+    let control = running.control_handle();
+    ctrlc::set_handler(move || {
+        if !shutdown_requested_for_handler.swap(true, Ordering::SeqCst) {
+            let _ = control.shutdown();
+        }
+    })
+    .context("failed to install ctrl-c handler")?;
+
+    let experiment = running.mainnet().experiment(
+        experiment_entry.study_id,
+        experiment_entry.experiment_id,
+        experiment_entry.current_revision_id,
+    );
+    let status_interval = Duration::from_secs(status_interval_secs.max(1));
+    let head_sync_interval = Duration::from_secs(head_sync_interval_secs.max(1));
+    let mut last_status = Instant::now()
+        .checked_sub(status_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_head_sync = Instant::now()
+        .checked_sub(head_sync_interval)
+        .unwrap_or_else(Instant::now);
+    let mut mirrored_head_id = None;
+
+    loop {
+        if last_head_sync.elapsed() >= head_sync_interval {
+            let _ = sync_or_initialize_head_provider(
+                &mut running,
+                &experiment,
+                initialize_head_on_start,
+                restore_head_on_start,
+                &mut mirrored_head_id,
+                "head-mirror",
+            )?;
+            last_head_sync = Instant::now();
+        }
+
+        let snapshot = running.snapshot();
+        if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
+            eprintln!(
+                "head-mirror-status status={:?} node_state={:?} connected_peers={} mirrored_head={} last_error={}",
+                snapshot.status,
+                snapshot.node_state,
+                snapshot.connected_peers,
+                mirrored_head_id
+                    .as_ref()
+                    .map(|head_id| head_id.as_str())
+                    .unwrap_or("-"),
+                snapshot.last_error.as_deref().unwrap_or("-"),
+            );
+            last_status = Instant::now();
+        }
+
+        match snapshot.status {
+            RuntimeStatus::Failed => {
+                let reason = snapshot
+                    .last_error
+                    .unwrap_or_else(|| "peer runtime failed".into());
+                let _ = running.shutdown();
+                let _ = running.await_termination_timeout(SHUTDOWN_TIMEOUT);
+                bail!("head mirror failed: {reason}");
+            }
+            RuntimeStatus::Stopped => {
+                let _prepared = running.await_termination_timeout(SHUTDOWN_TIMEOUT)?;
+                eprintln!("head mirror stopped cleanly");
                 return Ok(());
             }
             _ => {}

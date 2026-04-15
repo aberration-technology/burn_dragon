@@ -97,6 +97,24 @@ variable "bootstrap_git_ref" {
   default     = ""
 }
 
+variable "dragon_crate_version" {
+  description = "burn_dragon_p2p version label written into bootstrap-side native mirror configs."
+  type        = string
+  default     = "0.21.0-pre.15"
+}
+
+variable "dragon_git_repository" {
+  description = "Git repository used to install burn_dragon_p2p on the bootstrap host for the native head mirror."
+  type        = string
+  default     = "https://github.com/aberration-technology/burn_dragon.git"
+}
+
+variable "dragon_git_ref" {
+  description = "Pinned burn_dragon git ref used to install burn_dragon_p2p on the bootstrap host for the native head mirror."
+  type        = string
+  default     = "main"
+}
+
 variable "secret_parameter_prefix" {
   description = "SSM parameter prefix used for runtime secrets read by the bootstrap host."
   type        = string
@@ -553,6 +571,12 @@ variable "managed_trainer_crate_version" {
 
 variable "managed_trainer_auth_bundle_parameter_name" {
   description = "Optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive a standard name under secret_parameter_prefix."
+  type        = string
+  default     = ""
+}
+
+variable "bootstrap_head_mirror_auth_bundle_parameter_name" {
+  description = "Optional SSM parameter name containing the JSON auth bundle used by the bootstrap-side native head mirror. Leave empty to derive a standard name under secret_parameter_prefix."
   type        = string
   default     = ""
 }

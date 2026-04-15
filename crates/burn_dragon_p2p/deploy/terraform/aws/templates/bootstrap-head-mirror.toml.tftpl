@@ -1,0 +1,28 @@
+training_config_paths = []
+storage_root = "${storage_root}"
+target = "${target}"
+app_semver = "${dragon_crate_version}"
+enabled_features_label = "${enabled_features_label}"
+
+[network]
+edge_base_url = "${edge_base_url}"
+seed_node_urls = [
+%{ for url in seed_node_urls ~}
+  "${url}",
+%{ endfor ~}
+]
+
+[manifest]
+project_family_id = "${project_family_id}"
+network_id = "${network_id}"
+study_id = "${study_id}"
+experiment_id = "${experiment_id}"
+revision_id = "${revision_id}"
+display_name = "burn_dragon bootstrap ${experiment_kind} head mirror"
+description = "Bootstrap-native head mirror for browser initialization and checkpoint distribution"
+protocol_major = 0
+authority_public_keys = []
+bootstrap_addrs = []
+
+[capability_policy]
+allow_native_validator_fallback = false

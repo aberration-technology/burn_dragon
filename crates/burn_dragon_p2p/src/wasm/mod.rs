@@ -1083,7 +1083,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     } else if ready_to_connect {
         "connect this tab to start training.".to_owned()
     } else {
-        "training from this tab.".to_owned()
+        "ready when you are.".to_owned()
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1377,19 +1377,23 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     section { class: "panel primary-panel browser-focus-panel",
                         SectionHeader {
                             eyebrow: "live",
-                            title: "connected",
-                            detail: "run training from this tab.",
+                            title: "ready",
+                            detail: "",
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack",
                                 div { class: "keyvalue-list",
-                                    div { class: "keyvalue-row",
-                                        span { "last loss" }
-                                        strong { "{view.training.last_loss.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                                    if let Some(last_loss) = view.training.last_loss.clone() {
+                                        div { class: "keyvalue-row",
+                                            span { "last loss" }
+                                            strong { "{last_loss}" }
+                                        }
                                     }
-                                    div { class: "keyvalue-row",
-                                        span { "throughput" }
-                                        strong { "{view.training.throughput_summary.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                                    if let Some(throughput_summary) = view.training.throughput_summary.clone() {
+                                        div { class: "keyvalue-row",
+                                            span { "throughput" }
+                                            strong { "{throughput_summary}" }
+                                        }
                                     }
                                     div { class: "keyvalue-row",
                                         span { "peers" }

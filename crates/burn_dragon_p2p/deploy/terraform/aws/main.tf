@@ -78,12 +78,13 @@ locals {
   auth_principals          = try(jsondecode(var.auth_principals_json), [])
   bootstrap_install_source = lower(trimspace(var.bootstrap_install_source))
   secret_parameter_names = {
-    auth_client_id                 = "${var.secret_parameter_prefix}/auth_client_id"
-    auth_client_secret             = "${var.secret_parameter_prefix}/auth_client_secret"
-    authority_key                  = "${var.secret_parameter_prefix}/authority_key"
-    control_plane_redis_auth_token = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
-    trainer_auth_bundle            = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
-    validator_auth_bundle          = "${var.secret_parameter_prefix}/validator_auth_bundle_json"
+    auth_client_id                    = "${var.secret_parameter_prefix}/auth_client_id"
+    auth_client_secret                = "${var.secret_parameter_prefix}/auth_client_secret"
+    authority_key                     = "${var.secret_parameter_prefix}/authority_key"
+    control_plane_redis_auth_token    = "${var.secret_parameter_prefix}/control_plane_redis_auth_token"
+    bootstrap_head_mirror_auth_bundle = "${var.secret_parameter_prefix}/bootstrap_head_mirror_auth_bundle_json"
+    trainer_auth_bundle               = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
+    validator_auth_bundle             = "${var.secret_parameter_prefix}/validator_auth_bundle_json"
   }
   bootstrap_primary_private_ip = "10.42.1.10"
   bootstrap_peer_internal_multiaddrs = [
@@ -219,14 +220,23 @@ locals {
     "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
     "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
   ]
-  managed_validator_enabled                    = var.managed_validator_enabled
-  managed_validator_experiment_kind            = lower(trimspace(var.managed_validator_experiment_kind))
-  managed_validator_features                   = "native"
-  managed_validator_enabled_features_label     = local.managed_validator_features
-  managed_validator_experiment_id              = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
-  managed_validator_revision_id                = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
-  managed_validator_auth_bundle_parameter_name = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
-  managed_validator_seed_node_urls             = local.managed_trainer_seed_node_urls
+  bootstrap_head_mirror_backend                    = "cpu"
+  bootstrap_head_mirror_experiment_kind            = "nca"
+  bootstrap_head_mirror_experiment_id              = "nca-prepretraining"
+  bootstrap_head_mirror_revision_id                = "nca-r1"
+  bootstrap_head_mirror_target                     = "trainer"
+  bootstrap_head_mirror_enabled_features_label     = "native"
+  bootstrap_head_mirror_storage_root               = "${local.bootstrap_data_mount_path}/head-mirror"
+  bootstrap_head_mirror_auth_bundle_parameter_name = trimspace(var.bootstrap_head_mirror_auth_bundle_parameter_name) != "" ? trimspace(var.bootstrap_head_mirror_auth_bundle_parameter_name) : local.secret_parameter_names.bootstrap_head_mirror_auth_bundle
+  bootstrap_head_mirror_seed_node_urls             = local.managed_trainer_seed_node_urls
+  managed_validator_enabled                        = var.managed_validator_enabled
+  managed_validator_experiment_kind                = lower(trimspace(var.managed_validator_experiment_kind))
+  managed_validator_features                       = "native"
+  managed_validator_enabled_features_label         = local.managed_validator_features
+  managed_validator_experiment_id                  = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
+  managed_validator_revision_id                    = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_validator_auth_bundle_parameter_name     = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
+  managed_validator_seed_node_urls                 = local.managed_trainer_seed_node_urls
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"
@@ -653,6 +663,31 @@ locals {
     control_plane_redis_endpoint        = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].primary_endpoint_address : ""
     control_plane_redis_port            = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].port : 0
     edge_domain_name                    = var.edge_domain_name
+  })
+  bootstrap_head_mirror_config = templatefile("${path.module}/templates/bootstrap-head-mirror.toml.tftpl", {
+    dragon_crate_version   = var.dragon_crate_version
+    enabled_features_label = local.bootstrap_head_mirror_enabled_features_label
+    storage_root           = local.bootstrap_head_mirror_storage_root
+    target                 = local.bootstrap_head_mirror_target
+    edge_base_url          = local.edge_base_url
+    seed_node_urls         = local.bootstrap_head_mirror_seed_node_urls
+    project_family_id      = var.project_family_id
+    network_id             = var.network_id
+    study_id               = var.study_id
+    experiment_id          = local.bootstrap_head_mirror_experiment_id
+    revision_id            = local.bootstrap_head_mirror_revision_id
+    experiment_kind        = local.bootstrap_head_mirror_experiment_kind
+  })
+  bootstrap_head_mirror_fetch_auth_script = templatefile("${path.module}/templates/bootstrap-head-mirror-fetch-auth.sh.tftpl", {
+    aws_region                             = var.aws_region
+    head_mirror_auth_bundle_parameter_name = local.bootstrap_head_mirror_auth_bundle_parameter_name
+  })
+  bootstrap_head_mirror_service_unit = templatefile("${path.module}/templates/bootstrap-head-mirror.service.tftpl", {
+    experiment_kind         = local.bootstrap_head_mirror_experiment_kind
+    backend                 = local.bootstrap_head_mirror_backend
+    config_path             = "/etc/burn_dragon_p2p/bootstrap-head-mirror.toml"
+    auth_bundle_path        = "/var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json"
+    head_sync_interval_secs = 15
   })
   bootstrap_auth_feature = local.auth_connector_kind == "github" ? "auth-github" : (
     local.auth_connector_kind == "oidc" ? "auth-oidc" : (
@@ -1934,26 +1969,33 @@ resource "aws_instance" "bootstrap" {
   }
 
   user_data_base64 = base64gzip(templatefile("${path.module}/templates/user-data.sh.tftpl", {
-    artifact_bucket_name                   = local.artifact_bucket_name
-    artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
-    artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
-    aws_region                             = var.aws_region
-    bootstrap_auth_feature                 = local.bootstrap_auth_feature
-    bootstrap_auth_root                    = local.bootstrap_auth_root
-    bootstrap_config_json                  = local.bootstrap_config_json
-    bootstrap_data_device_name             = var.data_volume_device_name
-    bootstrap_data_mount_path              = local.bootstrap_data_mount_path
-    bootstrap_data_volume_id               = local.use_retained_bootstrap_data_volume ? aws_ebs_volume.bootstrap_data[0].id : ""
-    bootstrap_crate_version                = var.bootstrap_crate_version
-    bootstrap_git_ref                      = var.bootstrap_git_ref
-    bootstrap_git_repo                     = var.bootstrap_git_repository
-    bootstrap_install_source               = local.bootstrap_install_source
-    bootstrap_node_role                    = "primary"
-    caddyfile                              = local.caddyfile
-    authority_key_parameter_name           = local.secret_parameter_names.authority_key
-    http_port                              = var.http_port
-    secret_sync_script                     = local.secret_sync_script
-    use_retained_bootstrap_data_volume     = local.use_retained_bootstrap_data_volume
+    artifact_bucket_name                             = local.artifact_bucket_name
+    artifact_bucket_path_prefix                      = local.artifact_bucket_path_prefix
+    artifact_bucket_server_side_encryption           = var.artifact_bucket_server_side_encryption
+    aws_region                                       = var.aws_region
+    bootstrap_auth_feature                           = local.bootstrap_auth_feature
+    bootstrap_auth_root                              = local.bootstrap_auth_root
+    bootstrap_config_json                            = local.bootstrap_config_json
+    bootstrap_data_device_name                       = var.data_volume_device_name
+    bootstrap_data_mount_path                        = local.bootstrap_data_mount_path
+    bootstrap_data_volume_id                         = local.use_retained_bootstrap_data_volume ? aws_ebs_volume.bootstrap_data[0].id : ""
+    bootstrap_crate_version                          = var.bootstrap_crate_version
+    bootstrap_head_mirror_auth_script                = local.bootstrap_head_mirror_fetch_auth_script
+    bootstrap_head_mirror_auth_bundle_parameter_name = local.bootstrap_head_mirror_auth_bundle_parameter_name
+    bootstrap_head_mirror_config                     = local.bootstrap_head_mirror_config
+    bootstrap_head_mirror_service_unit               = local.bootstrap_head_mirror_service_unit
+    bootstrap_git_ref                                = var.bootstrap_git_ref
+    bootstrap_git_repo                               = var.bootstrap_git_repository
+    bootstrap_install_source                         = local.bootstrap_install_source
+    bootstrap_node_role                              = "primary"
+    caddyfile                                        = local.caddyfile
+    dragon_crate_version                             = var.dragon_crate_version
+    dragon_git_ref                                   = var.dragon_git_ref
+    dragon_git_repo                                  = var.dragon_git_repository
+    authority_key_parameter_name                     = local.secret_parameter_names.authority_key
+    http_port                                        = var.http_port
+    secret_sync_script                               = local.secret_sync_script
+    use_retained_bootstrap_data_volume               = local.use_retained_bootstrap_data_volume
   }))
 
   tags = merge(local.tags, {

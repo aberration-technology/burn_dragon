@@ -20,6 +20,29 @@ output "bootstrap_caddyfile" {
   sensitive   = true
 }
 
+output "bootstrap_head_mirror_config" {
+  description = "Rendered bootstrap native head-mirror config written to the edge host."
+  value       = local.bootstrap_head_mirror_config
+  sensitive   = true
+}
+
+output "bootstrap_head_mirror_fetch_auth_script" {
+  description = "Rendered bootstrap native head-mirror auth fetch script written to the edge host."
+  value       = local.bootstrap_head_mirror_fetch_auth_script
+  sensitive   = true
+}
+
+output "bootstrap_head_mirror_service_unit" {
+  description = "Rendered bootstrap native head-mirror systemd unit written to the edge host."
+  value       = local.bootstrap_head_mirror_service_unit
+  sensitive   = true
+}
+
+output "bootstrap_head_mirror_auth_bundle_parameter_name" {
+  description = "SSM parameter name expected to contain the bootstrap native head-mirror auth bundle JSON."
+  value       = local.bootstrap_head_mirror_auth_bundle_parameter_name
+}
+
 output "bootstrap_instance_id" {
   description = "EC2 instance id for the bootstrap edge."
   value       = aws_instance.bootstrap.id

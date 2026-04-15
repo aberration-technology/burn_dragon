@@ -606,7 +606,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             current_view.set(Some(view));
                         }
                         if provider_code_from_window_location().is_some() {
-                            status.set("signed in".into());
+                            status.set(String::new());
                         }
                     }
                     Ok(None) => {}
@@ -643,7 +643,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             Err(_) => None,
                         };
                         session_state.set(session);
-                        status.set("Connected".into());
+                        status.set(String::new());
                     }
                     Err(error) => status.set(error.to_string()),
                 }
@@ -672,7 +672,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             Err(_) => None,
                         };
                         session_state.set(session);
-                        status.set("Refreshed".into());
+                        status.set(String::new());
                     }
                     Err(error) => status.set(error.to_string()),
                 }
@@ -956,9 +956,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        status.set("Signed in".into());
+                        status.set(String::new());
                     }
-                    Ok(None) => status.set("No callback found".into()),
+                    Ok(None) => status.set(String::new()),
                     Err(error) => status.set(error.to_string()),
                 }
             });
@@ -1077,43 +1077,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let public_landing = !has_session && !has_connected_view;
     let needs_sign_in = auth_required && !has_session;
     let ready_to_connect = !needs_sign_in && !has_connected_view;
-    let runtime_label = view
-        .as_ref()
-        .map(|view| view.runtime_label.clone())
-        .unwrap_or_else(|| {
-            browser_runtime_role_label(&browser_capability_decision.capability.recommended_role)
-                .replace('_', " ")
-        });
-    let hero_title = if has_connected_view {
-        "browser peer live".to_owned()
-    } else {
-        "train the dragon".to_owned()
-    };
-    let hero_runtime_label = if has_connected_view || has_session {
-        runtime_label.clone()
-    } else {
-        "browser peer".to_owned()
-    };
-    let contributor_mode_label = if has_connected_view {
-        "connected".to_owned()
-    } else {
-        "browser peer".to_owned()
-    };
+    let hero_title = "train the dragon".to_owned();
     let hero_subtitle = if needs_sign_in {
         "contribute training from your browser.".to_owned()
     } else if ready_to_connect {
-        "connect to join the live run.".to_owned()
+        "connect to begin.".to_owned()
     } else {
-        "connected and ready to train.".to_owned()
-    };
-    let landing_notice = if callback_available {
-        Some((
-            String::from("starting session"),
-            String::from("one moment"),
-            "accent",
-        ))
-    } else {
-        None
+        "browser peer connected.".to_owned()
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1300,23 +1270,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         div { class: "eyebrow", "burn_dragon" }
                         h1 { class: "app-title", "{hero_title}" }
                         p { class: "app-subtitle", "{hero_subtitle}" }
-                        div { class: "badge-row",
-                            StatusPill { label: contributor_mode_label, tone: "accent" }
-                            if has_connected_view {
-                                StatusPill { label: hero_runtime_label.clone(), tone: "neutral" }
-                            }
-                        }
                     }
-                    if has_connected_view {
-                        div { class: "browser-quick-grid",
-                            QuickCard { label: "head", value: active_head_label }
-                            QuickCard { label: "peers", value: peer_summary }
-                            QuickCard { label: "runtime", value: hero_runtime_label.clone() }
-                        }
-                    }
-                }
-                if let Some((label, detail, tone)) = landing_notice {
-                    ActivityNotice { label: label, detail: detail, tone: tone }
                 }
                 if !status_message.is_empty() {
                     ActivityNotice {
@@ -1325,7 +1279,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         tone: "accent",
                     }
                 }
-                if (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
+                if advanced_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
                     ActivityNotice {
                         label: String::from("capability policy"),
                         detail: browser_capability_decision.downgrade_reason.clone().unwrap_or_default(),
@@ -1382,14 +1336,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     }
                                 }
                             }
-                            if has_connected_view && show_live_details_active {
+                            if advanced_controls_enabled && has_connected_view && show_live_details_active {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
                                     onclick: move |_| show_live_details.set(false),
                                     "close details"
                                 }
-                            } else if has_connected_view {
+                            } else if advanced_controls_enabled && has_connected_view {
                                 button {
                                     r#type: "button",
                                     class: "action-button action-button-secondary",
@@ -1421,7 +1375,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         SectionHeader {
                             eyebrow: "live",
                             title: "ready",
-                            detail: "train or refresh from this tab.",
+                            detail: "train from this tab.",
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack",
@@ -1441,6 +1395,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     div { class: "keyvalue-row",
                                         span { "accepted samples" }
                                         strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "peers" }
+                                        strong { "{peer_summary}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "head" }
+                                        strong { "{active_head_label}" }
                                     }
                                 }
                             }
@@ -1653,23 +1615,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn StatusPill(label: String, tone: &'static str) -> Element {
-    rsx! {
-        span { class: "status-pill status-pill-{tone}", "{label}" }
-    }
-}
-
-#[component]
-fn QuickCard(label: &'static str, value: String) -> Element {
-    rsx! {
-        div { class: "browser-quick-card",
-            span { "{label}" }
-            strong { "{value}" }
         }
     }
 }

@@ -15,6 +15,7 @@ bootstrap_git_ref="${BOOTSTRAP_GIT_REF:-}"
 auth_connector_kind="${AUTH_CONNECTOR_KIND:-github}"
 bootstrap_auth_feature="${BOOTSTRAP_AUTH_FEATURE:-}"
 bootstrap_features="${BOOTSTRAP_FEATURES:-}"
+bootstrap_reinstall="${BOOTSTRAP_REINSTALL:-false}"
 
 if [ -z "$bootstrap_auth_feature" ]; then
   case "$auth_connector_kind" in
@@ -74,40 +75,20 @@ bootstrap_crate_version = os.environ["BOOTSTRAP_CRATE_VERSION"]
 bootstrap_git_repository = os.environ["BOOTSTRAP_GIT_REPOSITORY"]
 bootstrap_git_ref = os.environ["BOOTSTRAP_GIT_REF"]
 bootstrap_features = os.environ["BOOTSTRAP_FEATURES"]
-
-install_command = (
-    "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; "
-    ". /root/.cargo/env; "
-)
-if bootstrap_install_source == "crate":
-    install_command += (
-        "cargo install --locked burn_p2p_bootstrap "
-        f"--version '{bootstrap_crate_version}' "
-        "--bin burn-p2p-bootstrap --no-default-features "
-        f"--features '{bootstrap_features}'"
-    )
-else:
-    if not bootstrap_git_ref:
-        raise SystemExit("BOOTSTRAP_GIT_REF is required when BOOTSTRAP_INSTALL_SOURCE=git")
-    install_command += (
-        "cargo install --locked "
-        f"--git '{bootstrap_git_repository}' "
-        f"--rev '{bootstrap_git_ref}' "
-        "burn_p2p_bootstrap "
-        "--bin burn-p2p-bootstrap --no-default-features "
-        f"--features '{bootstrap_features}'"
-    )
+bootstrap_reinstall = os.environ["BOOTSTRAP_REINSTALL"].lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 commands = [
     "set -eu",
     "cloud-init status --wait || true",
-    "ready=0; for attempt in $(seq 1 180); do if [ -x /usr/local/bin/burn-p2p-bootstrap ]; then ready=1; break; fi; sleep 5; done; if [ \"$ready\" -ne 1 ]; then echo 'burn-p2p-bootstrap executable was not ready before runtime sync' >&2; exit 1; fi",
     "systemctl reset-failed burn-p2p-bootstrap || true",
     "aws s3 cp '{}' /etc/burn-dragon-p2p/bootstrap.json".format(os.environ["BOOTSTRAP_OBJECT_URI"]),
     "aws s3 cp '{}' /etc/caddy/Caddyfile".format(os.environ["CADDY_OBJECT_URI"]),
     "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile",
-    install_command,
-    "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
     "/usr/local/bin/burn-dragon-p2p-sync-secrets",
     "systemctl restart caddy",
     "systemctl restart burn-p2p-bootstrap",
@@ -115,6 +96,34 @@ commands = [
     "systemctl is-active burn-p2p-bootstrap",
     "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 60 || true",
 ]
+if bootstrap_reinstall:
+    install_command = (
+        "export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; "
+        ". /root/.cargo/env; "
+    )
+    if bootstrap_install_source == "crate":
+        install_command += (
+            "cargo install --locked burn_p2p_bootstrap "
+            f"--version '{bootstrap_crate_version}' "
+            "--bin burn-p2p-bootstrap --no-default-features "
+            f"--features '{bootstrap_features}'"
+        )
+    else:
+        if not bootstrap_git_ref:
+            raise SystemExit("BOOTSTRAP_GIT_REF is required when BOOTSTRAP_INSTALL_SOURCE=git")
+        install_command += (
+            "cargo install --locked "
+            f"--git '{bootstrap_git_repository}' "
+            f"--rev '{bootstrap_git_ref}' "
+            "burn_p2p_bootstrap "
+            "--bin burn-p2p-bootstrap --no-default-features "
+            f"--features '{bootstrap_features}'"
+        )
+    commands[1:1] = [
+        "ready=0; for attempt in $(seq 1 180); do if [ -x /usr/local/bin/burn-p2p-bootstrap ]; then ready=1; break; fi; sleep 5; done; if [ \"$ready\" -ne 1 ]; then echo 'burn-p2p-bootstrap executable was not ready before runtime sync' >&2; exit 1; fi",
+        install_command,
+        "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
+    ]
 print(json.dumps({"commands": commands}))
 PY
 )"

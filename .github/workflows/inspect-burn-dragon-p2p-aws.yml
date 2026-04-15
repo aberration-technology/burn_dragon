@@ -264,11 +264,16 @@ jobs:
                 "date -Is",
                 "uname -a",
                 "cloud-init status --long || true",
+                "echo \"--- /etc/caddy/Caddyfile ---\"",
+                "sed -n \"1,200p\" /etc/caddy/Caddyfile || true",
+                "echo \"--- caddy adapt ---\"",
+                "caddy adapt --config /etc/caddy/Caddyfile --pretty || true",
                 "systemctl status caddy --no-pager || true",
                 "systemctl status burn-p2p-bootstrap --no-pager || true",
                 "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 200 || true",
                 "tail -n 200 /var/log/cloud-init-output.log || true",
                 "ss -ltnup || true",
+                "curl -v http://127.0.0.1/ || true",
                 "curl -vkI https://127.0.0.1/portal/snapshot || true",
                 "curl -v http://127.0.0.1:4000/portal/snapshot || true"
               ]' \

@@ -19,7 +19,7 @@ const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>burn_dragon p2p</title>
+    <title>burn_dragon</title>
     <link rel="stylesheet" href="__ASSET_PREFIX__/browser-app.css" />
   </head>
   <body>

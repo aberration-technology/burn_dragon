@@ -104,6 +104,167 @@ jobs:
             exit 1
           fi
 
+          legacy_stack_name="dragon-p2p-prod"
+          printf '%s\n' "resource inventory"
+          python3 - <<'PY'
+            import json
+            import os
+            import subprocess
+
+            region = os.environ["AWS_REGION"]
+            env_name = os.environ["DEPLOY_ENVIRONMENT"]
+            canonical = f"burn-dragon-p2p-{env_name}"
+            legacy = "dragon-p2p-prod"
+            stacks = [canonical, legacy]
+
+            def aws_json(args):
+                result = subprocess.run(
+                    ["aws", *args, "--region", region, "--output", "json"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return json.loads(result.stdout)
+
+            def safe_aws_json(args):
+                result = subprocess.run(
+                    ["aws", *args, "--region", region, "--output", "json"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    return None
+                return json.loads(result.stdout)
+
+            vpcs = aws_json(["ec2", "describe-vpcs"]).get("Vpcs", [])
+            subnets = aws_json(["ec2", "describe-subnets"]).get("Subnets", [])
+            igws = aws_json(["ec2", "describe-internet-gateways"]).get("InternetGateways", [])
+            route_tables = aws_json(["ec2", "describe-route-tables"]).get("RouteTables", [])
+            sgs = aws_json(["ec2", "describe-security-groups"]).get("SecurityGroups", [])
+            instances = aws_json(["ec2", "describe-instances"]).get("Reservations", [])
+            addresses = aws_json(["ec2", "describe-addresses"]).get("Addresses", [])
+            volumes = aws_json(["ec2", "describe-volumes"]).get("Volumes", [])
+            roles = aws_json(["iam", "list-roles"]).get("Roles", [])
+            profiles = aws_json(["iam", "list-instance-profiles"]).get("InstanceProfiles", [])
+            buckets = aws_json(["s3api", "list-buckets"]).get("Buckets", [])
+            certs = aws_json(["acm", "list-certificates", "--certificate-statuses", "PENDING_VALIDATION", "ISSUED", "INACTIVE", "EXPIRED", "VALIDATION_TIMED_OUT", "REVOKED", "FAILED"]).get("CertificateSummaryList", [])
+            dists = aws_json(["cloudfront", "list-distributions"]).get("DistributionList", {}).get("Items", [])
+
+            def tag_map(tags):
+                return {t["Key"]: t["Value"] for t in (tags or [])}
+
+            def name_from_tags(tags):
+                return tag_map(tags).get("Name", "")
+
+            def bucket_tags(name):
+                payload = safe_aws_json(["s3api", "get-bucket-tagging", "--bucket", name])
+                if not payload:
+                    return {}
+                return tag_map(payload.get("TagSet", []))
+
+            summary = {stack: {
+                "vpcs": [],
+                "subnets": [],
+                "igws": [],
+                "route_tables": [],
+                "security_groups": [],
+                "instances": [],
+                "eips": [],
+                "volumes": [],
+                "iam_roles": [],
+                "instance_profiles": [],
+                "buckets": [],
+                "cloudfront_distributions": [],
+                "acm_certificates": [],
+            } for stack in stacks}
+
+            for vpc in vpcs:
+                name = name_from_tags(vpc.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["vpcs"].append({"id": vpc["VpcId"], "name": name})
+
+            for subnet in subnets:
+                name = name_from_tags(subnet.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["subnets"].append({"id": subnet["SubnetId"], "name": name})
+
+            for igw in igws:
+                name = name_from_tags(igw.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["igws"].append({"id": igw["InternetGatewayId"], "name": name})
+
+            for rt in route_tables:
+                name = name_from_tags(rt.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["route_tables"].append({"id": rt["RouteTableId"], "name": name})
+
+            for sg in sgs:
+                name = name_from_tags(sg.get("Tags")) or sg.get("GroupName", "")
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["security_groups"].append({"id": sg["GroupId"], "name": name})
+
+            for reservation in instances:
+                for inst in reservation.get("Instances", []):
+                    name = name_from_tags(inst.get("Tags"))
+                    for stack in stacks:
+                        if stack and stack in name:
+                            summary[stack]["instances"].append({"id": inst["InstanceId"], "name": name, "state": inst["State"]["Name"]})
+
+            for addr in addresses:
+                name = name_from_tags(addr.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["eips"].append({"allocation_id": addr.get("AllocationId"), "name": name, "public_ip": addr.get("PublicIp")})
+
+            for vol in volumes:
+                name = name_from_tags(vol.get("Tags"))
+                for stack in stacks:
+                    if stack and stack in name:
+                        summary[stack]["volumes"].append({"id": vol["VolumeId"], "name": name, "state": vol["State"]})
+
+            for role in roles:
+                name = role["RoleName"]
+                for stack in stacks:
+                    if stack in name:
+                        summary[stack]["iam_roles"].append({"name": name})
+
+            for profile in profiles:
+                name = profile["InstanceProfileName"]
+                for stack in stacks:
+                    if stack in name:
+                        summary[stack]["instance_profiles"].append({"name": name})
+
+            for bucket in buckets:
+                name = bucket["Name"]
+                tags = bucket_tags(name)
+                stack_tag = tags.get("Stack", "")
+                for stack in stacks:
+                    if stack in name or stack == stack_tag:
+                        summary[stack]["buckets"].append({"name": name, "stack_tag": stack_tag})
+
+            for dist in dists:
+                aliases = dist.get("Aliases", {}).get("Items", []) or []
+                comment = dist.get("Comment", "")
+                for stack in stacks:
+                    if stack in comment:
+                        summary[stack]["cloudfront_distributions"].append({"id": dist["Id"], "comment": comment, "aliases": aliases})
+
+            for cert in certs:
+                domain = cert.get("DomainName", "")
+                arn = cert.get("CertificateArn", "")
+                for stack in stacks:
+                    if stack in arn:
+                        summary[stack]["acm_certificates"].append({"domain": domain, "arn": arn})
+
+            print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
           echo "instance_id=${instance_id}"
           echo "edge_domain_name=${EDGE_DOMAIN_NAME}"
           echo "terraform_workspace=${TF_WORKSPACE_NAME}"

@@ -1,20 +1,20 @@
 use anyhow::{Result, anyhow};
 use burn_p2p::{
     AuthProvider, BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId,
-    ExperimentDirectoryEntry, ExperimentId, ExperimentScope, ProjectFamilyId, StudyId,
+    ExperimentDirectoryEntry, ExperimentScope, ProjectFamilyId, StudyId,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_app::{
-    AdminSessionCard, AuthSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel,
+    AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel,
     LifecycleAssignmentStatusCard, RolloutPreviewPanel, RolloutSubmissionStatusPanel,
     RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
 };
 use burn_p2p_browser::{BrowserAppConnectConfig, BrowserAppController, BrowserSessionState};
 use burn_p2p_views::{
-    AdminSessionSummaryView, BrowserAppClientView, ContributionIdentityPanel,
-    DirectoryEntryDraftView, DirectoryMutationResultView, ExperimentDirectoryEntryView,
-    ExperimentDirectoryListView, LifecycleAssignmentStatusView, RolloutPreviewView,
-    RuntimeCapabilitySummaryView, TrainingResultSummaryView,
+    AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
+    DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
+    LifecycleAssignmentStatusView, RolloutPreviewView, RuntimeCapabilitySummaryView,
+    TrainingResultSummaryView,
 };
 use dioxus::prelude::*;
 use url::form_urlencoded;
@@ -351,32 +351,6 @@ fn rollout_result_view(result: &AdminResult) -> Option<DirectoryMutationResultVi
         }),
         _ => None,
     }
-}
-
-fn session_identity_panel(
-    session: Option<&BrowserSessionState>,
-) -> Option<ContributionIdentityPanel> {
-    let claims = session?.session.as_ref()?.claims.clone();
-    let scoped_experiments = claims
-        .granted_scopes
-        .into_iter()
-        .filter_map(|scope| match scope {
-            ExperimentScope::Train { experiment_id }
-            | ExperimentScope::Validate { experiment_id }
-            | ExperimentScope::Archive { experiment_id } => Some(experiment_id),
-            ExperimentScope::Connect
-            | ExperimentScope::Discover
-            | ExperimentScope::Admin { .. } => None,
-        })
-        .collect::<std::collections::BTreeSet<ExperimentId>>()
-        .into_iter()
-        .collect();
-    Some(ContributionIdentityPanel {
-        principal_id: claims.principal_id.as_str().into(),
-        provider_label: auth_provider_label(&claims.provider),
-        trust_badges: Vec::new(),
-        scoped_experiments,
-    })
 }
 
 fn runtime_capability_summary(view: &BrowserAppClientView) -> RuntimeCapabilitySummaryView {
@@ -1014,7 +988,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
 
     let view = current_view.read().clone();
-    let session_panel = session_identity_panel(session_state.read().as_ref());
     let callback_available = provider_code_from_window_location().is_some();
     let auth_required = props.config.require_edge_auth;
     let admin_granted_studies = granted_admin_studies(session_state.read().as_ref());
@@ -1103,15 +1076,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .as_ref()
         .map(|footprint| format!("{} MiB", footprint.estimated_shard_bytes / (1024 * 1024)))
         .unwrap_or_else(|| "n/a".into());
-    let selected_revision_label = view
-        .as_ref()
-        .and_then(|view| {
-            view.selected_experiment
-                .as_ref()
-                .map(|experiment| experiment.revision_id.as_str().to_owned())
-        })
-        .or_else(|| props.config.selected_revision_id.clone())
-        .unwrap_or_else(|| "nca-r1".into());
     let active_head_label = view
         .as_ref()
         .and_then(|view| {
@@ -1136,18 +1100,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             }
         })
         .unwrap_or_else(|| "awaiting sync".into());
-    let session_summary = session_state
-        .read()
-        .as_ref()
-        .and_then(|session| session.session.as_ref())
-        .map(|session| session.claims.principal_id.as_str().to_owned())
-        .unwrap_or_else(|| {
-            if auth_required {
-                "sign-in required".into()
-            } else {
-                "guest mode".into()
-            }
-        });
     let has_session = session_state
         .read()
         .as_ref()
@@ -1166,8 +1118,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         });
     let hero_title = if has_connected_view {
         "browser peer live".to_owned()
-    } else if ready_to_connect {
-        "ready to join".to_owned()
     } else {
         "train the dragon".to_owned()
     };
@@ -1178,43 +1128,24 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let contributor_mode_label = if has_connected_view {
         "connected".to_owned()
-    } else if needs_sign_in {
-        "sign in".to_owned()
-    } else if has_session {
-        "ready".to_owned()
     } else {
-        "ready".to_owned()
+        "browser peer".to_owned()
     };
     let hero_subtitle = if needs_sign_in {
-        "sign in and train from your browser.".to_owned()
+        "contribute training from your browser.".to_owned()
     } else if ready_to_connect {
-        "connect this tab to join the live run.".to_owned()
+        "connect to join the live run.".to_owned()
     } else {
-        "connected and ready for short training windows.".to_owned()
+        "connected and ready to train.".to_owned()
     };
     let landing_notice = if callback_available {
         Some((
-            String::from("signing in"),
-            String::from("finishing your session"),
+            String::from("starting session"),
+            String::from("one moment"),
             "accent",
         ))
     } else {
         None
-    };
-    let landing_header = if needs_sign_in {
-        (
-            "browser training",
-            "start here",
-            "sign in to join the live run from this browser.",
-        )
-    } else if ready_to_connect {
-        (
-            "session",
-            "ready to join",
-            "connect this tab to sync and start training.",
-        )
-    } else {
-        ("live", "ready", "train or refresh from this tab.")
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1223,9 +1154,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             || raw_status_message.contains("tls")
             || raw_status_message.contains("connection"))
     {
-        String::from(
-            "sign-in is temporarily unavailable while the edge reconnects. try again soon.",
-        )
+        String::from("the edge is unavailable right now. try again soon.")
     } else {
         raw_status_message
     };
@@ -1405,24 +1334,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         div { class: "badge-row",
                             StatusPill { label: contributor_mode_label, tone: "accent" }
                             if has_connected_view {
-                                StatusPill { label: selected_revision_label.clone(), tone: "neutral" }
+                                StatusPill { label: hero_runtime_label.clone(), tone: "neutral" }
                             }
-                            StatusPill { label: hero_runtime_label, tone: "neutral" }
                         }
                     }
-                    div { class: "browser-quick-grid",
-                        if needs_sign_in {
-                            QuickCard { label: "runs", value: String::from("in your browser") }
-                            QuickCard { label: "identity", value: if auth_required { String::from("signed session") } else { String::from("guest access") } }
-                            QuickCard { label: "contribution", value: String::from("short webgpu windows") }
-                        } else if ready_to_connect {
-                            QuickCard { label: "session", value: session_summary.clone() }
-                            QuickCard { label: "next", value: String::from("connect this tab") }
-                            QuickCard { label: "contribution", value: String::from("browser training ready") }
-                        } else {
+                    if has_connected_view {
+                        div { class: "browser-quick-grid",
                             QuickCard { label: "head", value: active_head_label }
                             QuickCard { label: "peers", value: peer_summary }
-                            QuickCard { label: "session", value: session_summary.clone() }
+                            QuickCard { label: "runtime", value: hero_runtime_label.clone() }
                         }
                     }
                 }
@@ -1523,7 +1443,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                     div { class: "browser-hero-actions",
-                        if !public_landing {
+                        if has_connected_view {
                             div { class: "edge-summary",
                                 span { class: "toolbar-meta-label", "edge" }
                                 strong { class: "edge-summary-pill", "{edge_summary}" }
@@ -1532,145 +1452,67 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
-            div { class: "surface-layout browser-surface-layout",
-                section { class: "panel primary-panel browser-focus-panel",
-                    SectionHeader {
-                        eyebrow: landing_header.0,
-                        title: landing_header.1,
-                        detail: landing_header.2,
-                    }
-                    if needs_sign_in {
-                        div { class: "dragon-landing-grid",
-                            LandingCard {
-                                eyebrow: "step 1",
-                                title: "sign in",
-                                detail: "start a session.",
-                            }
-                            LandingCard {
-                                eyebrow: "step 2",
-                                title: "connect",
-                                detail: "join the edge and sync the latest head.",
-                            }
-                            LandingCard {
-                                eyebrow: "step 3",
-                                title: "train",
-                                detail: "run short webgpu windows when you want.",
+            if has_connected_view {
+                div { class: "surface-layout browser-surface-layout",
+                    section { class: "panel primary-panel browser-focus-panel",
+                        SectionHeader {
+                            eyebrow: "live",
+                            title: "ready",
+                            detail: "train or refresh from this tab.",
+                        }
+                        if let Some(view) = view.clone() {
+                            div { class: "dragon-panel-stack",
+                                div { class: "keyvalue-list",
+                                    div { class: "keyvalue-row",
+                                        span { "last loss" }
+                                        strong { "{view.training.last_loss.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "throughput" }
+                                        strong { "{view.training.throughput_summary.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "optimizer steps" }
+                                        strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "accepted samples" }
+                                        strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                }
                             }
                         }
-                    } else if ready_to_connect {
-                        ActivityNotice {
-                            label: String::from("ready"),
-                            detail: String::from("connect to begin."),
-                            tone: "accent",
-                        }
-                        div { class: "keyvalue-list",
-                            div { class: "keyvalue-row",
-                                span { "signed in as" }
-                                strong { "{session_summary.clone()}" }
-                            }
-                            div { class: "keyvalue-row",
-                                span { "edge" }
-                                strong { "{edge_summary.clone()}" }
-                            }
-                        }
-                    } else if let Some(view) = view.clone() {
-                        div { class: "dragon-panel-stack",
-                            ActivityNotice {
-                                label: String::from("connected"),
-                                detail: String::from("ready for browser training."),
-                                tone: "accent",
-                            }
-                            div { class: "keyvalue-list",
-                                div { class: "keyvalue-row",
-                                    span { "last loss" }
-                                    strong { "{view.training.last_loss.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                        if props.config.training.is_some() {
+                            div { class: "browser-metric-band dragon-metric-band",
+                                StatTile {
+                                    label: "recommended role",
+                                    value: browser_runtime_role_label(&browser_capability_decision.capability.recommended_role).replace('_', " "),
+                                    detail: Some("capability".into()),
                                 }
-                                div { class: "keyvalue-row",
-                                    span { "throughput" }
-                                    strong { "{view.training.throughput_summary.clone().unwrap_or_else(|| \"n/a\".into())}" }
+                                StatTile {
+                                    label: "memory budget",
+                                    value: capability_budget_label,
+                                    detail: Some("trainer".into()),
                                 }
-                                div { class: "keyvalue-row",
-                                    span { "optimizer steps" }
-                                    strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                StatTile {
+                                    label: "checkpoint",
+                                    value: capability_checkpoint_label,
+                                    detail: Some("budget".into()),
                                 }
-                                div { class: "keyvalue-row",
-                                    span { "accepted samples" }
-                                    strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                StatTile {
+                                    label: "window",
+                                    value: capability_window_label.clone(),
+                                    detail: Some("secs".into()),
+                                }
+                                StatTile {
+                                    label: "shard",
+                                    value: capability_shard_label,
+                                    detail: Some("budget".into()),
                                 }
                             }
                         }
                     }
-                    if props.config.training.is_some() && has_connected_view {
-                        div { class: "browser-metric-band dragon-metric-band",
-                            StatTile {
-                                label: "recommended role",
-                                value: browser_runtime_role_label(&browser_capability_decision.capability.recommended_role).replace('_', " "),
-                                detail: Some("capability".into()),
-                            }
-                            StatTile {
-                                label: "memory budget",
-                                value: capability_budget_label,
-                                detail: Some("trainer".into()),
-                            }
-                            StatTile {
-                                label: "checkpoint",
-                                value: capability_checkpoint_label,
-                                detail: Some("budget".into()),
-                            }
-                            StatTile {
-                                label: "window",
-                                value: capability_window_label.clone(),
-                                detail: Some("secs".into()),
-                            }
-                            StatTile {
-                                label: "shard",
-                                value: capability_shard_label,
-                                detail: Some("budget".into()),
-                            }
-                        }
-                    }
-                }
-                if !needs_sign_in {
                     aside { class: "support-stack",
-                    if ready_to_connect {
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "identity",
-                                title: "session",
-                                detail: "signed in and ready to connect.",
-                            }
-                            AuthSessionCard { session: session_panel }
-                        }
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "next",
-                                title: "next step",
-                                detail: "connect this tab.",
-                            }
-                            div { class: "keyvalue-list",
-                                div { class: "keyvalue-row",
-                                    span { "action" }
-                                    strong { "connect" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "then" }
-                                    strong { "train or refresh" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "edge" }
-                                    strong { "{edge_summary}" }
-                                }
-                            }
-                        }
-                    } else {
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "identity",
-                                title: "session",
-                                detail: "current browser identity.",
-                            }
-                            AuthSessionCard { session: session_panel }
-                        }
                         section { class: "panel compact-panel",
                             SectionHeader {
                                 eyebrow: "fit",
@@ -1709,7 +1551,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             }
                         }
                     }
-                }
                 }
             }
             if show_live_details_active {

@@ -1912,7 +1912,7 @@ resource "aws_instance" "bootstrap" {
     delete_on_termination = true
   }
 
-  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
+  user_data_base64 = base64gzip(templatefile("${path.module}/templates/user-data.sh.tftpl", {
     artifact_bucket_name                   = local.artifact_bucket_name
     artifact_bucket_path_prefix            = local.artifact_bucket_path_prefix
     artifact_bucket_server_side_encryption = var.artifact_bucket_server_side_encryption
@@ -1933,7 +1933,7 @@ resource "aws_instance" "bootstrap" {
     http_port                              = var.http_port
     secret_sync_script                     = local.secret_sync_script
     use_retained_bootstrap_data_volume     = local.use_retained_bootstrap_data_volume
-  })
+  }))
 
   tags = merge(local.tags, {
     Name = "${var.stack_name}-bootstrap"

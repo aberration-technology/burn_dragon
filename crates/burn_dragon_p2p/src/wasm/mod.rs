@@ -1626,6 +1626,22 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
+            footer { class: "dragon-site-footer",
+                ul { class: "dragon-site-footer-links",
+                    li {
+                        a {
+                            href: "https://aberration.technology",
+                            "aberration"
+                        }
+                    }
+                    li {
+                        a {
+                            href: "https://github.com/aberration-technology",
+                            "code"
+                        }
+                    }
+                }
+            }
         }
     }
 }

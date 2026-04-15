@@ -37,6 +37,33 @@ const EXTRA_STYLESHEET: &str = r#"
   gap: 22px;
 }
 
+.dragon-site-footer {
+  margin-top: auto;
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 2px;
+}
+
+.dragon-site-footer-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 1rem;
+  font-family: ui-monospace, monospace;
+}
+
+.dragon-site-footer a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.dragon-site-footer a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
 .dragon-browser-shell .browser-hero-copy {
   max-width: 46rem;
 }

@@ -66,7 +66,15 @@ if [ "${ssm_status:-}" != "Online" ]; then
   exit 1
 fi
 
-params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" CADDY_OBJECT_URI="$caddy_object_uri" python3 - <<'PY'
+params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" \
+  CADDY_OBJECT_URI="$caddy_object_uri" \
+  BOOTSTRAP_INSTALL_SOURCE="$bootstrap_install_source" \
+  BOOTSTRAP_CRATE_VERSION="$bootstrap_crate_version" \
+  BOOTSTRAP_GIT_REPOSITORY="$bootstrap_git_repository" \
+  BOOTSTRAP_GIT_REF="$bootstrap_git_ref" \
+  BOOTSTRAP_FEATURES="$bootstrap_features" \
+  BOOTSTRAP_REINSTALL="$bootstrap_reinstall" \
+  python3 - <<'PY'
 import json
 import os
 

@@ -23,6 +23,7 @@ const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
     <link rel="stylesheet" href="__ASSET_PREFIX__/browser-app.css" />
   </head>
   <body>
+    <div id="main"></div>
     <script type="module" src="__ASSET_PREFIX__/browser-app-loader.js"></script>
   </body>
 </html>
@@ -292,4 +293,30 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask should live under workspace root")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INDEX_HTML_TEMPLATE, write_html_page};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn browser_shell_template_includes_main_mount_node() {
+        assert!(INDEX_HTML_TEMPLATE.contains("id=\"main\""));
+    }
+
+    #[test]
+    fn generated_html_page_includes_main_mount_node() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        let temp: PathBuf = std::env::temp_dir().join(format!("burn-dragon-browser-site-{unique}"));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        write_html_page(&temp, "index.html", ".").expect("write html page");
+        let html = std::fs::read_to_string(temp.join("index.html")).expect("read html");
+        assert!(html.contains("<div id=\"main\"></div>"));
+        std::fs::remove_dir_all(&temp).expect("remove temp dir");
+    }
 }

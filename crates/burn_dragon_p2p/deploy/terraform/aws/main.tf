@@ -1545,6 +1545,7 @@ resource "aws_acm_certificate" "dataset" {
   provider          = aws.us_east_1
   domain_name       = local.dataset_domain_name
   validation_method = "DNS"
+  depends_on        = [aws_route53_record.dataset_caa]
 
   lifecycle {
     create_before_destroy = true
@@ -1554,6 +1555,7 @@ resource "aws_acm_certificate" "dataset" {
 }
 
 resource "aws_route53_record" "dataset_caa" {
+  allow_overwrite = true
   zone_id = data.aws_route53_zone.selected.zone_id
   name    = local.dataset_domain_name
   type    = "CAA"
@@ -1682,9 +1684,10 @@ resource "aws_s3_bucket_policy" "dataset" {
 }
 
 resource "aws_route53_record" "dataset_distribution" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.dataset_domain_name
-  type    = "A"
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.dataset_domain_name
+  type            = "A"
 
   alias {
     name                   = aws_cloudfront_distribution.dataset.domain_name
@@ -1694,9 +1697,10 @@ resource "aws_route53_record" "dataset_distribution" {
 }
 
 resource "aws_route53_record" "dataset_distribution_ipv6" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.dataset_domain_name
-  type    = "AAAA"
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.dataset_domain_name
+  type            = "AAAA"
 
   alias {
     name                   = aws_cloudfront_distribution.dataset.domain_name
@@ -1706,12 +1710,13 @@ resource "aws_route53_record" "dataset_distribution_ipv6" {
 }
 
 resource "aws_route53_record" "browser_app_pages" {
-  count   = local.browser_app_pages_record_enabled ? 1 : 0
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.browser_app_hostname
-  type    = "CNAME"
-  ttl     = 300
-  records = [local.browser_app_pages_domain_target]
+  count           = local.browser_app_pages_record_enabled ? 1 : 0
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.browser_app_hostname
+  type            = "CNAME"
+  ttl             = 300
+  records         = [local.browser_app_pages_domain_target]
 }
 
 resource "aws_s3_bucket" "artifact_replica" {
@@ -2370,9 +2375,10 @@ resource "aws_route53_health_check" "edge_primary" {
 }
 
 resource "aws_route53_record" "edge_primary" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = var.edge_domain_name
-  type    = "A"
-  ttl     = 60
-  records = [aws_eip.bootstrap.public_ip]
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = var.edge_domain_name
+  type            = "A"
+  ttl             = 60
+  records         = [aws_eip.bootstrap.public_ip]
 }

@@ -820,8 +820,51 @@ jobs:
       - name: terraform fmt check
         run: terraform -chdir="$TF_ROOT" fmt -check -recursive
 
+      - name: prepare terraform backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          state_bucket="burn-dragon-p2p-tfstate-${account_id}-${AWS_REGION}"
+          state_key="deploy/aws/${STACK_NAME}.tfstate"
+
+          if ! aws s3api head-bucket --bucket "$state_bucket" >/dev/null 2>&1; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$state_bucket"
+            else
+              aws s3api create-bucket \
+                --bucket "$state_bucket" \
+                --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+            fi
+          fi
+
+          aws s3api put-bucket-versioning \
+            --bucket "$state_bucket" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-bucket-encryption \
+            --bucket "$state_bucket" \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+          aws s3api put-public-access-block \
+            --bucket "$state_bucket" \
+            --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          backend_config="$RUNNER_TEMP/terraform-backend.hcl"
+          cat >"$backend_config" <<EOF
+          bucket = "$state_bucket"
+          key    = "$state_key"
+          region = "$AWS_REGION"
+          encrypt = true
+          EOF
+
+          echo "TF_BACKEND_CONFIG=$backend_config" >>"$GITHUB_ENV"
+          echo "TF_STATE_BUCKET=$state_bucket" >>"$GITHUB_ENV"
+          echo "TF_STATE_KEY=$state_key" >>"$GITHUB_ENV"
+
       - name: terraform init
-        run: terraform -chdir="$TF_ROOT" init -input=false
+        run: terraform -chdir="$TF_ROOT" init -input=false -reconfigure -backend-config="$TF_BACKEND_CONFIG"
 
       - name: terraform workspace
         shell: bash

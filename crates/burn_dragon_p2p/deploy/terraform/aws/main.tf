@@ -1569,26 +1569,18 @@ resource "aws_route53_record" "dataset_caa" {
 }
 
 resource "aws_route53_record" "dataset_certificate_validation" {
-  for_each = {
-    for dvo in aws_acm_certificate.dataset.domain_validation_options : dvo.domain_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
-  }
-
   allow_overwrite = true
   zone_id         = data.aws_route53_zone.selected.zone_id
-  name            = each.value.name
-  type            = each.value.type
+  name            = one(aws_acm_certificate.dataset.domain_validation_options).resource_record_name
+  type            = one(aws_acm_certificate.dataset.domain_validation_options).resource_record_type
   ttl             = 60
-  records         = [each.value.record]
+  records         = [one(aws_acm_certificate.dataset.domain_validation_options).resource_record_value]
 }
 
 resource "aws_acm_certificate_validation" "dataset" {
   provider                = aws.us_east_1
   certificate_arn         = aws_acm_certificate.dataset.arn
-  validation_record_fqdns = [for record in aws_route53_record.dataset_certificate_validation : record.fqdn]
+  validation_record_fqdns = [aws_route53_record.dataset_certificate_validation.fqdn]
   depends_on              = [aws_route53_record.dataset_caa]
 }
 

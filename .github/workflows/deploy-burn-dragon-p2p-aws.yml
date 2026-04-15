@@ -953,11 +953,12 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: wait for bootstrap api/auth edge https health
+        id: edge_health
         shell: bash
         run: |
           set -euo pipefail
           edge_url="${{ steps.outputs.outputs.edge_url }}"
-          for attempt in $(seq 1 40); do
+          for attempt in $(seq 1 120); do
             if curl --fail --silent --show-error --location "$edge_url/portal/snapshot" >/dev/null; then
               exit 0
             fi
@@ -965,6 +966,76 @@ jobs:
           done
           echo "edge did not become healthy: $edge_url" >&2
           exit 1
+
+      - name: capture bootstrap diagnostics on health failure
+        if: ${{ failure() && steps.outputs.outputs.instance_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_id="${{ steps.outputs.outputs.instance_id }}"
+
+          echo "bootstrap instance status"
+          aws ec2 describe-instance-status \
+            --region "$AWS_REGION" \
+            --include-all-instances \
+            --instance-ids "$instance_id" \
+            --output json || true
+
+          echo "bootstrap console output"
+          aws ec2 get-console-output \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --latest \
+            --output text || true
+
+          echo "bootstrap ssm registration"
+          ssm_status="$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$instance_id" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text 2>/dev/null || true)"
+          echo "ssm ping status: ${ssm_status:-missing}"
+
+          if [ "${ssm_status:-}" = "Online" ]; then
+            command_id="$(aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --comment "dump burn_dragon bootstrap diagnostics" \
+              --parameters 'commands=[
+                "set -euxo pipefail",
+                "cloud-init status --long || true",
+                "systemctl status caddy --no-pager || true",
+                "systemctl status burn-p2p-bootstrap --no-pager || true",
+                "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 200 || true",
+                "tail -n 200 /var/log/cloud-init-output.log || true",
+                "ss -ltnup || true"
+              ]' \
+              --query 'Command.CommandId' \
+              --output text)"
+
+            for attempt in $(seq 1 30); do
+              invocation_status="$(aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$instance_id" \
+                --query 'Status' \
+                --output text 2>/dev/null || true)"
+              case "$invocation_status" in
+                Success|Cancelled|TimedOut|Failed|Cancelling)
+                  break
+                  ;;
+              esac
+              sleep 5
+            done
+
+            echo "bootstrap ssm command output"
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --output json || true
+          fi
 
       - name: seed managed trainer auth bundle in ssm parameter store
         if: ${{ env.TF_VAR_managed_trainer_desired_capacity != '0' }}
@@ -1032,6 +1103,7 @@ jobs:
             --name "$TF_VAR_managed_trainer_auth_bundle_parameter_name" \
             --value "$bundle_json"
       - name: publish workflow summary
+        if: ${{ always() }}
         shell: bash
         run: |
           cat >>"$GITHUB_STEP_SUMMARY" <<EOF

@@ -1,8 +1,36 @@
 ${edge_domain_name} {
     encode gzip zstd
-    handle /dragon-datasets/* {
-        root * /var/lib/burn-p2p/public
-        file_server
+
+%{ if browser_app_base_url != "" ~}
+    @preflight method OPTIONS
+    @browser_shell_get {
+        method GET HEAD
+        path / /index.html /callback/github /callback/github/* /callback/oidc /callback/oidc/* /callback/oauth /callback/oauth/*
     }
+
+    handle @preflight {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        header Access-Control-Max-Age "3600"
+        header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        respond "" 204
+    }
+
+    handle @browser_shell_get {
+        redir ${browser_app_base_url}{uri} 302
+    }
+
+    handle {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        reverse_proxy 127.0.0.1:${http_port}
+    }
+%{ else ~}
     reverse_proxy 127.0.0.1:${http_port}
+%{ endif ~}
 }

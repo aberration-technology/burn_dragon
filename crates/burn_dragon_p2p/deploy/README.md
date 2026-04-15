@@ -11,8 +11,8 @@ This folder contains the operator-facing deployment assets for the `burn_dragon_
 The AWS Terraform root deploys a single-region bootstrap plane for the Dragon network:
 
 - one EC2 bootstrap/edge host
-- Route53 DNS for the browser edge
-- no ALB or API Gateway; the browser edge is Caddy on the bootstrap host
+- Route53 DNS for the bootstrap API/auth edge
+- no ALB or API Gateway; the bootstrap API/auth edge is Caddy on the bootstrap host
 - TLS termination via Caddy on the host
 - bootstrap-local peer/runtime/auth state on the EC2 root volume by default
 - bootstrap-managed direct S3 publication for checkpoint and metric artifacts using the EC2 instance role
@@ -29,7 +29,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - shared CloudWatch dashboard for control-plane health and throughput
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
-It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity. The supported minimal production topology is now explicit: one bootstrap-only edge host plus optional trainers. The bootstrap host handles GitHub auth, seed/discovery, browser edge, and S3 publication. Trainer-only diffusion promotion happens across trainer peers; the standard AWS workflow no longer provisions a separate validator host.
+It does not attempt to manage every end-user native trainer. Native operators can still install and run `burn_dragon_p2p_native` locally, then point it at the deployed edge and seed URLs. The stack can also own a small managed native trainer pool for always-on capacity. The supported minimal production topology is now explicit: one bootstrap-only edge host plus optional trainers. The bootstrap host handles GitHub auth, seed/discovery, API/auth traffic, and S3 publication. The browser shell is intended to run from GitHub Pages, and dataset bytes are served from the managed dataset CDN. Trainer-only diffusion promotion happens across trainer peers; the standard AWS workflow no longer provisions a separate validator host.
 
 The bootstrap publishes initial Dragon experiment directory entries for:
 
@@ -50,7 +50,7 @@ The cheapest supported production topology is now:
 
 Role split:
 
-- bootstrap: GitHub auth, browser edge, seed/discovery, operator API, S3 artifact publication
+- bootstrap: GitHub auth, API/auth edge, seed/discovery, operator API, S3 artifact publication
 - trainers: browser peers and any optional external or managed trainers
 
 Canonical promotion in the supported deploy path uses trainer-only diffusion steady-state.
@@ -131,16 +131,16 @@ Recommended actual failover flow:
 
 The focused repo also ships a separate browser-shell workflow:
 
-- `.github/workflows/deploy-burn-dragon-p2p-pages.yml`
+- `.github/workflows/deploy-pages.yml`
 - `.github/workflows/publish-burn-dragon-p2p-dataset.yml`
 
-Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`.
+Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`. Under the split-host production layout, use `dragon.aberration.technology` for the published Pages shell, `edge.dragon.aberration.technology` for the bootstrap API/auth edge, and `datasets.dragon.aberration.technology` for the managed shard CDN.
 
-That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static; it still connects to the live edge URL you configure. By default, the baked browser config points at `https://dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
+That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static and is intended to live at `https://dragon.aberration.technology`; it still connects to the live bootstrap API/auth edge you configure. By default, the baked browser config points at `https://edge.dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
 
 The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Archive` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
 
-Terraform now protects the Route53 hosted-zone apex by default. With the production defaults, the stack may manage `dragon.aberration.technology` and `datasets.dragon.aberration.technology`, but it will refuse to claim `aberration.technology` itself unless `allow_route53_zone_apex_records=true` is set explicitly in Terraform.
+Terraform now protects the Route53 hosted-zone apex by default. With the production defaults, the stack may manage `edge.dragon.aberration.technology`, `dragon.aberration.technology`, and `datasets.dragon.aberration.technology`, but it will refuse to claim `aberration.technology` itself unless `allow_route53_zone_apex_records=true` is set explicitly in Terraform.
 
 Optional GitHub repository variables for the Pages workflow:
 
@@ -149,7 +149,7 @@ Optional GitHub repository variables for the Pages workflow:
 - `BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID`
 - `BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID`
 
-None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, and derives `/dns4/<edge-host>/tcp/4001` plus `/dns4/<edge-host>/udp/4001/quic-v1` automatically. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
+None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, and derives `/dns4/<edge-host>/tcp/4001` plus `/dns4/<edge-host>/udp/4001/quic-v1` automatically. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
 
 ## Required GitHub Environment Configuration
 
@@ -169,7 +169,13 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_STACK_NAME`
   - Optional Terraform stack prefix. Defaults to `burn-dragon-p2p-<environment>`.
 - `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME`
-  - Optional public browser edge hostname override. Defaults to `dragon.aberration.technology`.
+  - Optional public bootstrap API/auth hostname override. Defaults to `edge.dragon.aberration.technology`.
+- `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL`
+  - Optional public browser-app URL. Defaults to `https://dragon.aberration.technology` and is used for the separately hosted GitHub Pages shell.
+- `BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL`
+  - Optional OAuth callback base URL. Defaults to `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL`, so GitHub/OIDC/OAuth flows return to the Pages host instead of the bootstrap edge.
+- `BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET`
+  - Optional GitHub Pages DNS target for the browser app hostname. Defaults to `<repo-owner>.github.io` in the deploy workflow and lets Terraform create the Route53 CNAME for `dragon.aberration.technology`.
 - `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME`
   - Optional Route53 public zone override. Defaults to `aberration.technology`.
 - `BURN_DRAGON_P2P_NETWORK_ID`
@@ -184,7 +190,10 @@ Configure the workflow to target one of those environments. Put the following va
 Recommended Midwest baseline:
 
 - `BURN_DRAGON_P2P_AWS_REGION=us-east-2`
-- `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME=dragon.aberration.technology`
+- `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME=edge.dragon.aberration.technology`
+- `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL=https://dragon.aberration.technology`
+- `BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL=https://dragon.aberration.technology`
+- `BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET=aberration-technology.github.io`
 - `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME=aberration.technology`
 - leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` until you explicitly want an always-on trainer
 - if you do enable a trainer, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
@@ -455,7 +464,7 @@ cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   --training-config crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.training.toml \
   --experiment-kind climbmix \
   --revision-id climbmix-r1 \
-  --browser-climbmix-manifest-url https://dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1/fetch-manifest.json \
+  --browser-climbmix-manifest-url https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1/fetch-manifest.json \
   --output crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json
 ```
 
@@ -482,7 +491,7 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --edge-url https://dragon.aberration.technology
+  --edge-url https://edge.dragon.aberration.technology
 
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
   complete-github-login \
@@ -517,16 +526,16 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --edge-url https://dragon.aberration.technology \
-  --seed-node-url /dns4/dragon.aberration.technology/tcp/4001 \
-  --seed-node-url /dns4/dragon.aberration.technology/udp/4001/quic-v1
+  --edge-url https://edge.dragon.aberration.technology \
+  --seed-node-url /dns4/edge.dragon.aberration.technology/tcp/4001 \
+  --seed-node-url /dns4/edge.dragon.aberration.technology/udp/4001/quic-v1
 ```
 
 Native peers can leave `training_config_paths` empty and rely on the published Dragon profile metadata for experiments that have a compatible network profile.
 
 ## Browser Join After Deploy
 
-Open the deployed `edge_url` in a browser, sign in with GitHub, and join the network from the embedded browser edge UI.
+Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
 Browser peers can train directly from the published Dragon profile metadata for experiments that include a browser-capable profile.
 

@@ -14,16 +14,16 @@ const BROWSER_APP_LOADER: &str = r#"import init from "./burn_dragon_p2p_browser.
 
 await init({ module_or_path: new URL("./burn_dragon_p2p_browser_bg.wasm", import.meta.url) });
 "#;
-const INDEX_HTML: &str = r#"<!doctype html>
+const INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>burn_dragon p2p</title>
-    <link rel="stylesheet" href="./browser-app.css" />
+    <link rel="stylesheet" href="__ASSET_PREFIX__/browser-app.css" />
   </head>
   <body>
-    <script type="module" src="./browser-app-loader.js"></script>
+    <script type="module" src="__ASSET_PREFIX__/browser-app-loader.js"></script>
   </body>
 </html>
 "#;
@@ -196,10 +196,11 @@ fn build_browser_wasm_bundle(out_dir: &Path) -> Result<()> {
 }
 
 fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
-    fs::write(out_dir.join("index.html"), INDEX_HTML)
-        .with_context(|| format!("failed to write {}/index.html", out_dir.display()))?;
-    fs::write(out_dir.join("404.html"), INDEX_HTML)
-        .with_context(|| format!("failed to write {}/404.html", out_dir.display()))?;
+    write_html_page(out_dir, "index.html", ".")?;
+    write_html_page(out_dir, "404.html", ".")?;
+    write_html_page(out_dir, "callback/github/index.html", "../..")?;
+    write_html_page(out_dir, "callback/oidc/index.html", "../..")?;
+    write_html_page(out_dir, "callback/oauth/index.html", "../..")?;
     fs::write(out_dir.join(".nojekyll"), "")
         .with_context(|| format!("failed to write {}/.nojekyll", out_dir.display()))?;
     fs::write(out_dir.join("browser-app-loader.js"), BROWSER_APP_LOADER)
@@ -218,6 +219,18 @@ fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
         serde_json::to_vec_pretty(&browser_site_bootstrap_json(args))?,
     )
     .with_context(|| format!("failed to write browser config in {}", out_dir.display()))?;
+    Ok(())
+}
+
+fn write_html_page(out_dir: &Path, relative_path: &str, asset_prefix: &str) -> Result<()> {
+    let page_path = out_dir.join(relative_path);
+    if let Some(parent) = page_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let html = INDEX_HTML_TEMPLATE.replace("__ASSET_PREFIX__", asset_prefix);
+    fs::write(&page_path, html)
+        .with_context(|| format!("failed to write {}", page_path.display()))?;
     Ok(())
 }
 

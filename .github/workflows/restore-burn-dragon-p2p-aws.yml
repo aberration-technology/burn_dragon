@@ -27,9 +27,9 @@ on:
         default: ""
         type: string
       edge_domain_name:
-        description: "Public HTTPS hostname for the restored bootstrap/browser edge. Example: `dragon.aberration.technology`. Leave empty to use the GitHub Environment value or the built-in default."
+        description: "Public HTTPS hostname for the restored bootstrap API/auth edge. Example: `edge.dragon.aberration.technology`. Leave empty to use the GitHub Environment value or the built-in default."
         required: false
-        default: dragon.aberration.technology
+        default: edge.dragon.aberration.technology
         type: string
       route53_zone_name:
         description: "Public Route53 hosted zone containing the edge record. Example: `aberration.technology`. Leave empty to use the GitHub Environment value or the built-in default."
@@ -149,6 +149,9 @@ jobs:
           edge_domain_name_var="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
           route53_zone_name_input="${{ github.event.inputs.route53_zone_name }}"
           route53_zone_name_var="${{ vars.BURN_DRAGON_P2P_ROUTE53_ZONE_NAME }}"
+          browser_app_base_url_var="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
+          auth_redirect_base_url_var="${{ vars.BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL }}"
+          browser_app_pages_domain_target_var="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}"
           network_id="${{ vars.BURN_DRAGON_P2P_NETWORK_ID }}"
           project_family_id="${{ vars.BURN_DRAGON_P2P_PROJECT_FAMILY_ID }}"
           study_id="${{ vars.BURN_DRAGON_P2P_STUDY_ID }}"
@@ -255,7 +258,7 @@ jobs:
             edge_domain_name="$edge_domain_name_var"
           fi
           if [ -z "$edge_domain_name" ]; then
-            edge_domain_name="dragon.aberration.technology"
+            edge_domain_name="edge.dragon.aberration.technology"
           fi
 
           route53_zone_name="$route53_zone_name_input"
@@ -264,6 +267,28 @@ jobs:
           fi
           if [ -z "$route53_zone_name" ]; then
             route53_zone_name="aberration.technology"
+          fi
+
+          browser_app_base_url="$browser_app_base_url_var"
+          if [ -z "$browser_app_base_url" ]; then
+            browser_app_base_url="https://dragon.aberration.technology"
+          fi
+          browser_app_base_url="${browser_app_base_url%/}"
+
+          auth_redirect_base_url="$auth_redirect_base_url_var"
+          if [ -z "$auth_redirect_base_url" ] && [ -n "$browser_app_base_url" ]; then
+            auth_redirect_base_url="$browser_app_base_url"
+          fi
+          auth_redirect_base_url="${auth_redirect_base_url%/}"
+
+          browser_app_pages_domain_target="$browser_app_pages_domain_target_var"
+          if [ -z "$browser_app_pages_domain_target" ] && [ -n "$browser_app_base_url" ]; then
+            browser_app_pages_domain_target="${{ github.repository_owner }}.github.io"
+          fi
+
+          browser_app_host=""
+          if [ -n "$browser_app_base_url" ]; then
+            browser_app_host="$(python3 -c 'from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or "")' "$browser_app_base_url")"
           fi
 
           if [ -z "$auth_connector_kind" ]; then
@@ -287,7 +312,11 @@ jobs:
           fi
           dataset_domain_name="$dataset_domain_name_var"
           if [ -z "$dataset_domain_name" ]; then
-            dataset_domain_name="datasets.${edge_domain_name}"
+            if [ -n "$browser_app_host" ]; then
+              dataset_domain_name="datasets.${browser_app_host}"
+            else
+              dataset_domain_name="datasets.${edge_domain_name}"
+            fi
           fi
           dataset_bucket_name="$dataset_bucket_name_var"
           dataset_bucket_path_prefix="$dataset_bucket_path_prefix_var"
@@ -456,6 +485,9 @@ jobs:
             echo "AWS_ROLE_ARN=$aws_role_arn"
             echo "STACK_NAME=$stack_name"
             echo "EDGE_DOMAIN_NAME=$edge_domain_name"
+            echo "BROWSER_APP_BASE_URL=$browser_app_base_url"
+            echo "AUTH_REDIRECT_BASE_URL=$auth_redirect_base_url"
+            echo "BROWSER_APP_PAGES_DOMAIN_TARGET=$browser_app_pages_domain_target"
             echo "ROUTE53_ZONE_NAME=$route53_zone_name"
             echo "SECRET_PARAMETER_PREFIX=$secret_parameter_prefix"
             echo "PRIMARY_RESTORE_SNAPSHOT_ID=$primary_restore_snapshot_id"
@@ -465,6 +497,9 @@ jobs:
             echo "TF_VAR_environment_name=${DEPLOY_ENVIRONMENT}"
             echo "TF_VAR_route53_zone_name=$route53_zone_name"
             echo "TF_VAR_edge_domain_name=$edge_domain_name"
+            echo "TF_VAR_browser_app_base_url=$browser_app_base_url"
+            echo "TF_VAR_auth_redirect_base_url=$auth_redirect_base_url"
+            echo "TF_VAR_browser_app_pages_domain_target=$browser_app_pages_domain_target"
             echo "TF_VAR_secret_parameter_prefix=$secret_parameter_prefix"
             echo "TF_VAR_network_id=$network_id"
             echo "TF_VAR_project_family_id=$project_family_id"
@@ -630,6 +665,7 @@ jobs:
         run: |
           set -euo pipefail
           edge_url="$(terraform -chdir="$TF_ROOT" output -raw edge_url)"
+          browser_app_url="$(terraform -chdir="$TF_ROOT" output -raw browser_app_url)"
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
@@ -653,6 +689,7 @@ jobs:
 
           {
             echo "edge_url=$edge_url"
+            echo "browser_app_url=$browser_app_url"
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
             echo "redis_endpoint=$redis_endpoint"
@@ -675,14 +712,14 @@ jobs:
             echo "managed_trainer_desired_capacity=$managed_trainer_desired_capacity"
           } >>"$GITHUB_OUTPUT"
 
-      - name: wait for browser edge https health
+      - name: wait for bootstrap api/auth edge https health
         if: ${{ github.event.inputs.plan_only != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           edge_url="${{ steps.outputs.outputs.edge_url }}"
           for attempt in $(seq 1 40); do
-            if curl --fail --silent --show-error --location "$edge_url/" >/dev/null; then
+            if curl --fail --silent --show-error --location "$edge_url/portal/snapshot" >/dev/null; then
               exit 0
             fi
             sleep 15
@@ -779,6 +816,7 @@ jobs:
           if [ "${{ github.event.inputs.plan_only }}" != "true" ]; then
             cat >>"$GITHUB_STEP_SUMMARY" <<EOF
           - Edge URL: ${{ steps.outputs.outputs.edge_url }}
+          - Browser App URL: \`${{ steps.outputs.outputs.browser_app_url || 'not-configured' }}\`
           - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
           - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
           - Bootstrap state storage mode: \`${{ steps.outputs.outputs.bootstrap_state_storage_mode }}\`

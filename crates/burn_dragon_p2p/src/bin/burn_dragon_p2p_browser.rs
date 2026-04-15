@@ -9,8 +9,23 @@ use burn_p2p_browser::BrowserSiteBootstrapConfig;
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::*;
 
-#[cfg(target_arch = "wasm32")]
 const DEFAULT_BOOTSTRAP_PATH: &str = "browser-app-config.json";
+
+fn callback_site_root_prefix(pathname: &str) -> Option<String> {
+    let (prefix, _) = pathname.split_once("/callback/")?;
+    let prefix = prefix.trim_end_matches('/');
+    Some(if prefix.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("{prefix}/")
+    })
+}
+
+fn default_bootstrap_path_for_pathname(pathname: &str) -> String {
+    callback_site_root_prefix(pathname)
+        .map(|prefix| format!("{prefix}{DEFAULT_BOOTSTRAP_PATH}"))
+        .unwrap_or_else(|| DEFAULT_BOOTSTRAP_PATH.into())
+}
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -46,12 +61,17 @@ fn bootstrap_path_from_window_query() -> String {
     let Some(window) = web_sys::window() else {
         return DEFAULT_BOOTSTRAP_PATH.into();
     };
-    let search = window.location().search().unwrap_or_default();
+    let location = window.location();
+    let search = location.search().unwrap_or_default();
     let query = search.strip_prefix('?').unwrap_or(&search);
-    url::form_urlencoded::parse(query.as_bytes())
+    if let Some(path) = url::form_urlencoded::parse(query.as_bytes())
         .find_map(|(key, value)| (key == "config").then(|| value.into_owned()))
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_BOOTSTRAP_PATH.into())
+    {
+        return path;
+    }
+    let pathname = location.pathname().unwrap_or_default();
+    default_bootstrap_path_for_pathname(&pathname)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -118,4 +138,37 @@ fn main() {
 fn main() {
     eprintln!("burn_dragon_p2p_browser must be built for wasm32-unknown-unknown");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{callback_site_root_prefix, default_bootstrap_path_for_pathname};
+
+    #[test]
+    fn callback_paths_resolve_site_root_prefix() {
+        assert_eq!(
+            callback_site_root_prefix("/callback/github").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            callback_site_root_prefix("/repo/callback/github").as_deref(),
+            Some("/repo/")
+        );
+    }
+
+    #[test]
+    fn callback_paths_use_root_bootstrap_config() {
+        assert_eq!(
+            default_bootstrap_path_for_pathname("/callback/github"),
+            "/browser-app-config.json"
+        );
+        assert_eq!(
+            default_bootstrap_path_for_pathname("/repo/callback/github"),
+            "/repo/browser-app-config.json"
+        );
+        assert_eq!(
+            default_bootstrap_path_for_pathname("/repo/"),
+            "browser-app-config.json"
+        );
+    }
 }

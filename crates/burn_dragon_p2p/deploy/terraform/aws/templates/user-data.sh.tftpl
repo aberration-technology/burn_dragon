@@ -112,7 +112,6 @@ install -d -m 0755 /etc/burn-dragon-p2p
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}"
 install -d -m 0700 "$${BOOTSTRAP_DATA_MOUNT_PATH}/auth"
 install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/bootstrap-peer"
-install -d -m 0755 "$${BOOTSTRAP_DATA_MOUNT_PATH}/public"
 
 cat >/usr/local/bin/burn-dragon-p2p-sync-secrets <<'EOF_SYNC'
 ${secret_sync_script}

@@ -1,6 +1,11 @@
 output "edge_url" {
-  description = "Public browser edge URL."
-  value       = "https://${var.edge_domain_name}"
+  description = "Public bootstrap API/auth edge URL."
+  value       = local.edge_base_url
+}
+
+output "browser_app_url" {
+  description = "Public browser app URL when the separately hosted Pages shell is configured. Empty when the bootstrap edge remains the browser entrypoint."
+  value       = local.browser_app_base_url == null ? "" : local.browser_app_base_url
 }
 
 output "bootstrap_instance_id" {

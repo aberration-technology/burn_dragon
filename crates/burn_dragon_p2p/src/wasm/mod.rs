@@ -17,6 +17,7 @@ use burn_p2p_views::{
     RuntimeCapabilitySummaryView, TrainingResultSummaryView,
 };
 use dioxus::prelude::*;
+use url::form_urlencoded;
 
 use crate::admin::{fetch_directory_entries, rollout_directory_entries, upsert_directory_entry};
 use crate::auth::{
@@ -49,6 +50,55 @@ fn window_query_string() -> Result<String> {
         .location()
         .search()
         .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))
+}
+
+fn callback_site_root_pathname(pathname: &str) -> Option<String> {
+    let (prefix, _) = pathname.split_once("/callback/")?;
+    let prefix = prefix.trim_end_matches('/');
+    Some(if prefix.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("{prefix}/")
+    })
+}
+
+fn normalized_browser_callback_url(pathname: &str, search: &str, hash: &str) -> String {
+    let normalized_pathname =
+        callback_site_root_pathname(pathname).unwrap_or_else(|| pathname.to_owned());
+    let mut filtered = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(search.trim_start_matches('?').as_bytes()) {
+        if key == "code" || key == "state" {
+            continue;
+        }
+        filtered.append_pair(&key, &value);
+    }
+    let query = filtered.finish();
+    if query.is_empty() {
+        format!("{normalized_pathname}{hash}")
+    } else {
+        format!("{normalized_pathname}?{query}{hash}")
+    }
+}
+
+fn normalize_provider_callback_window_location() -> Result<()> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("window unavailable"))?;
+    let location = window.location();
+    let pathname = location
+        .pathname()
+        .map_err(|error| anyhow!("failed to inspect browser pathname: {error:?}"))?;
+    let search = location
+        .search()
+        .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))?;
+    let hash = location
+        .hash()
+        .map_err(|error| anyhow!("failed to inspect browser hash: {error:?}"))?;
+    let next_url = normalized_browser_callback_url(&pathname, &search, &hash);
+    window
+        .history()
+        .map_err(|error| anyhow!("failed to access browser history: {error:?}"))?
+        .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next_url))
+        .map_err(|error| anyhow!("failed to replace browser callback URL: {error:?}"))?;
+    Ok(())
 }
 
 fn config_with_window_network_overrides(
@@ -492,6 +542,7 @@ pub async fn resume_or_complete_browser_auth(
             &provider_code,
         )
         .await?;
+        let _ = normalize_provider_callback_window_location();
         return Ok(Some(session));
     }
     if config.require_edge_auth {
@@ -1255,5 +1306,26 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_browser_callback_url;
+
+    #[test]
+    fn callback_url_normalizes_to_site_root() {
+        assert_eq!(
+            normalized_browser_callback_url("/callback/github", "?code=abc&state=xyz", ""),
+            "/"
+        );
+        assert_eq!(
+            normalized_browser_callback_url(
+                "/repo/callback/github",
+                "?code=abc&edge=https%3A%2F%2Fedge.example",
+                "#frag",
+            ),
+            "/repo/?edge=https%3A%2F%2Fedge.example#frag"
+        );
     }
 }

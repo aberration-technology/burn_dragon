@@ -1,30 +1,38 @@
-name: deploy burn_dragon_p2p pages
+name: deploy github pages
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: GitHub environment suffix to deploy
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
       edge_base_url:
-        description: "Default live edge URL baked into the static browser shell. Example: `https://dragon.aberration.technology`. Clear it to use the repo variable, then the built-in default."
+        description: Optional explicit bootstrap API/auth edge URL baked into the browser shell. Leave empty to derive it from environment variables.
         required: false
-        default: https://dragon.aberration.technology
+        default: ""
         type: string
       seed_node_urls:
-        description: "Comma-separated bootstrap multiaddrs baked into the static browser shell. Example: `/dns4/dragon.aberration.technology/tcp/4001,/dns4/dragon.aberration.technology/udp/4001/quic-v1`. Leave empty to derive the standard TCP and QUIC multiaddrs from the resolved edge host."
+        description: Optional comma-separated bootstrap multiaddrs baked into the browser shell. Leave empty to derive them from the resolved edge host.
         required: false
         default: ""
         type: string
       selected_experiment_id:
-        description: "Default experiment id selected on load. Example: `nca-prepretraining`. Clear it to use the repo variable, then the built-in default."
+        description: Default experiment id selected on load.
         required: false
         default: nca-prepretraining
         type: string
       selected_revision_id:
-        description: "Default revision id selected on load. Example: `nca-r1`. Clear it to use the repo variable, then the built-in default."
+        description: Default revision id selected on load.
         required: false
         default: nca-r1
         type: string
       require_edge_auth:
-        description: "Require an authenticated edge session before joining from the published browser shell. Example: keep `true` for the default mainnet browser surface so peers must complete the edge login flow before joining."
+        description: Require an authenticated edge session before joining from the published browser shell.
         required: true
         default: true
         type: boolean
@@ -35,12 +43,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: deploy-burn-dragon-p2p-pages
+  group: deploy-dragon-pages-${{ github.event.inputs.environment }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -69,12 +78,20 @@ jobs:
           seed_node_urls="${{ github.event.inputs.seed_node_urls }}"
           selected_experiment_id="${{ github.event.inputs.selected_experiment_id }}"
           selected_revision_id="${{ github.event.inputs.selected_revision_id }}"
+          browser_app_base_url="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
+          edge_domain_name="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
 
+          if [ -z "$browser_app_base_url" ]; then
+            browser_app_base_url="https://dragon.aberration.technology"
+          fi
           if [ -z "$edge_base_url" ]; then
             edge_base_url="${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}"
           fi
+          if [ -z "$edge_base_url" ] && [ -n "$edge_domain_name" ]; then
+            edge_base_url="https://${edge_domain_name}"
+          fi
           if [ -z "$edge_base_url" ]; then
-            edge_base_url="https://dragon.aberration.technology"
+            edge_base_url="https://edge.dragon.aberration.technology"
           fi
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
@@ -92,8 +109,9 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "dragon.aberration.technology"; print(f"/dns4/{host}/tcp/4001,/dns4/{host}/udp/4001/quic-v1")' "$edge_base_url")"
+            seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "edge.dragon.aberration.technology"; print(f"/dns4/{host}/tcp/4001,/dns4/{host}/udp/4001/quic-v1")' "$edge_base_url")"
           fi
+          site_host="$(python3 -c 'from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or "")' "$browser_app_base_url")"
 
           {
             echo "EDGE_BASE_URL=$edge_base_url"
@@ -101,6 +119,7 @@ jobs:
             echo "SELECTED_EXPERIMENT_ID=$selected_experiment_id"
             echo "SELECTED_REVISION_ID=$selected_revision_id"
             echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}"
+            echo "SITE_HOST=$site_host"
           } >>"$GITHUB_ENV"
 
       - name: build browser site artifact
@@ -121,6 +140,13 @@ jobs:
             args+=(--selected-revision-id "$SELECTED_REVISION_ID")
           fi
           cargo "${args[@]}"
+
+      - name: write pages cname
+        if: ${{ env.SITE_HOST != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SITE_HOST" > target/browser-site/CNAME
 
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v3

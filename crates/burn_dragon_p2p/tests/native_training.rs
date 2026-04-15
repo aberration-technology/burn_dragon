@@ -1398,6 +1398,7 @@ fn run_edge_drill_for_prepared<B>(
 
 #[test]
 fn nca_native_peer_exports_shards_and_executes_training_windows() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2036,6 +2037,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
 
 #[test]
 fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2491,6 +2493,7 @@ where
 
 #[test]
 fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2560,6 +2563,7 @@ fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
 
 #[test]
 fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2627,6 +2631,7 @@ fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
 
 #[test]
 fn climbmix_native_existing_shards_supports_multi_peer_windows() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -2688,6 +2693,7 @@ fn climbmix_native_existing_shards_supports_multi_peer_windows() {
 
 #[test]
 fn browser_conformance_uses_native_dragon_manifests() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -2884,6 +2890,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
 
 #[test]
 fn climbmix_http_shards_publish_http_input_source_descriptor() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-http-shards");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -2962,6 +2969,7 @@ fn climbmix_http_shards_publish_http_input_source_descriptor() {
 
 #[test]
 fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -3071,6 +3079,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
 
 #[test]
 fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-mixed");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -3187,6 +3196,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
 
 #[test]
 fn nca_mixed_fleet_browser_and_native_same_net_medium() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -3300,6 +3310,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
 
 #[test]
 fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-mixed-medium");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -3425,6 +3436,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
 
 #[test]
 fn nca_native_peer_medium_model_converges_over_more_windows() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -3474,6 +3486,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
 
 #[test]
 fn climbmix_native_three_peers_medium_model_stays_consistent() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-medium");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -3530,6 +3543,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
 
 #[test]
 fn nca_native_peer_large_model_converges_over_more_windows() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -3575,6 +3589,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
 
 #[test]
 fn climbmix_native_three_peers_large_model_stays_consistent() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-large");
     fs::create_dir_all(&shard_root).expect("mkdir shards");
@@ -3631,6 +3646,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
 
 #[test]
 fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let nca_config_path = root.path().join("nca.toml");
     let training_config_path = root.path().join("nca-train.toml");
@@ -3669,6 +3685,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
 
 #[test]
 fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
+    let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
     let shard_root = root.path().join("climbmix-shards-edge");
     fs::create_dir_all(&shard_root).expect("mkdir shards");

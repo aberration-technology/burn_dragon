@@ -28,9 +28,27 @@ variable "route53_zone_name" {
 }
 
 variable "edge_domain_name" {
-  description = "Public domain served by the burn_p2p bootstrap browser edge. Defaults to the production root at dragon.aberration.technology."
+  description = "Public domain served by the burn_p2p bootstrap API/auth edge. Defaults to edge.dragon.aberration.technology for the split-host production layout."
   type        = string
-  default     = "dragon.aberration.technology"
+  default     = "edge.dragon.aberration.technology"
+}
+
+variable "browser_app_base_url" {
+  description = "Optional public base URL for the separately hosted browser app, for example https://dragon.aberration.technology. When set, the bootstrap edge becomes API/auth only and redirects browser entry paths to this URL."
+  type        = string
+  default     = ""
+}
+
+variable "auth_redirect_base_url" {
+  description = "Optional public base URL used for OAuth callback redirects. Defaults to browser_app_base_url when set, otherwise falls back to the bootstrap edge URL."
+  type        = string
+  default     = ""
+}
+
+variable "browser_app_pages_domain_target" {
+  description = "Optional GitHub Pages DNS target for browser_app_base_url, for example aberration-technology.github.io. When set, Terraform creates a Route53 CNAME for the browser app host."
+  type        = string
+  default     = ""
 }
 
 variable "allow_route53_zone_apex_records" {

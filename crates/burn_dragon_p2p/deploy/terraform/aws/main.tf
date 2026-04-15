@@ -97,8 +97,29 @@ locals {
   managed_trainer_alarm_threshold     = max(var.managed_trainer_desired_capacity, 1)
   route53_zone_apex                   = trimsuffix(lower(trimspace(var.route53_zone_name)), ".")
   edge_domain_name_normalized         = trimsuffix(lower(trimspace(var.edge_domain_name)), ".")
-  dataset_domain_name                 = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : "datasets.${var.edge_domain_name}"
-  dataset_domain_name_normalized      = trimsuffix(lower(trimspace(local.dataset_domain_name)), ".")
+  edge_base_url                       = "https://${var.edge_domain_name}"
+  browser_app_base_url = trimspace(var.browser_app_base_url) != "" ? trimsuffix(
+    trimspace(var.browser_app_base_url),
+    "/",
+  ) : null
+  auth_redirect_base_url = trimspace(var.auth_redirect_base_url) != "" ? trimsuffix(
+    trimspace(var.auth_redirect_base_url),
+    "/",
+  ) : local.browser_app_base_url
+  browser_app_origin = coalesce(local.browser_app_base_url, local.edge_base_url)
+  browser_app_hostname = local.browser_app_base_url == null ? null : split(
+    "/",
+    regexreplace(local.browser_app_base_url, "^https?://", ""),
+  )[0]
+  browser_app_pages_domain_target = trimspace(var.browser_app_pages_domain_target) != "" ? trimsuffix(
+    trimspace(var.browser_app_pages_domain_target),
+    ".",
+  ) : null
+  browser_app_pages_record_enabled = local.browser_app_hostname != null && local.browser_app_pages_domain_target != null
+  dataset_domain_name = trimspace(var.dataset_domain_name) != "" ? trimspace(var.dataset_domain_name) : (
+    local.browser_app_hostname != null ? "datasets.${local.browser_app_hostname}" : "datasets.${var.edge_domain_name}"
+  )
+  dataset_domain_name_normalized = trimsuffix(lower(trimspace(local.dataset_domain_name)), ".")
   default_dataset_bucket_name = trimsuffix(
     substr(
       replace(
@@ -603,15 +624,17 @@ locals {
 
   bootstrap_config_json = jsonencode(local.bootstrap_daemon_config)
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
-    edge_domain_name = var.edge_domain_name
-    http_port        = var.http_port
+    edge_domain_name     = var.edge_domain_name
+    http_port            = var.http_port
+    browser_app_base_url = local.browser_app_base_url == null ? "" : local.browser_app_base_url
+    browser_app_origin   = local.browser_app_origin
   })
   secret_sync_script = templatefile("${path.module}/templates/bootstrap-secret-sync.sh.tftpl", {
     aws_region                          = var.aws_region
     auth_client_credentials_required    = local.auth_oauth_enabled
     auth_client_id_name                 = local.secret_parameter_names.auth_client_id
     auth_client_secret_name             = local.secret_parameter_names.auth_client_secret
-    auth_redirect_uri                   = local.auth_redirect_path == null ? "" : "https://${var.edge_domain_name}${local.auth_redirect_path}"
+    auth_redirect_uri                   = local.auth_redirect_path == null ? "" : "${coalesce(local.auth_redirect_base_url, local.edge_base_url)}${local.auth_redirect_path}"
     authority_key_name                  = local.secret_parameter_names.authority_key
     authority_key_path                  = "${local.bootstrap_auth_root}/bootstrap-authority.key"
     bootstrap_node_role                 = "$${BOOTSTRAP_NODE_ROLE}"
@@ -698,6 +721,23 @@ check "dataset_domain_configuration" {
   assert {
     condition     = var.allow_route53_zone_apex_records || local.dataset_domain_name_normalized != local.route53_zone_apex
     error_message = "dataset_domain_name must not equal the Route53 hosted-zone apex unless allow_route53_zone_apex_records is set. This protects existing apex websites and CDNs from accidental replacement."
+  }
+}
+
+check "browser_app_domain_configuration" {
+  assert {
+    condition     = local.browser_app_hostname == null || local.browser_app_hostname != local.edge_domain_name_normalized
+    error_message = "browser_app_base_url must use a different hostname than edge_domain_name so the browser shell and bootstrap API edge remain split."
+  }
+}
+
+check "browser_app_pages_domain_configuration" {
+  assert {
+    condition = !local.browser_app_pages_record_enabled || (
+      local.browser_app_hostname != local.route53_zone_apex &&
+      endswith(local.browser_app_hostname, ".${local.route53_zone_apex}")
+    )
+    error_message = "browser_app_base_url must be a non-apex hostname inside the selected Route53 zone when browser_app_pages_domain_target is set."
   }
 }
 
@@ -1467,6 +1507,40 @@ resource "aws_s3_bucket_lifecycle_configuration" "dataset" {
   }
 }
 
+resource "aws_s3_bucket_cors_configuration" "dataset" {
+  bucket = aws_s3_bucket.dataset.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = [local.browser_app_origin]
+    expose_headers  = ["Content-Length", "Content-Type", "ETag"]
+    max_age_seconds = 3600
+  }
+}
+
+resource "aws_cloudfront_response_headers_policy" "dataset_cors" {
+  name = "${var.stack_name}-${terraform.workspace}-dataset-cors"
+
+  cors_config {
+    access_control_allow_credentials = false
+    access_control_allow_headers {
+      items = ["*"]
+    }
+    access_control_allow_methods {
+      items = ["GET", "HEAD", "OPTIONS"]
+    }
+    access_control_allow_origins {
+      items = [local.browser_app_origin]
+    }
+    access_control_expose_headers {
+      items = ["Content-Length", "Content-Type", "ETag"]
+    }
+    access_control_max_age_sec = 3600
+    origin_override            = true
+  }
+}
+
 resource "aws_acm_certificate" "dataset" {
   provider          = aws.us_east_1
   domain_name       = local.dataset_domain_name
@@ -1526,12 +1600,13 @@ resource "aws_cloudfront_distribution" "dataset" {
   }
 
   default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD", "OPTIONS"]
-    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id
-    compress               = true
-    target_origin_id       = "dataset-s3"
-    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS"]
+    cached_methods             = ["GET", "HEAD", "OPTIONS"]
+    cache_policy_id            = data.aws_cloudfront_cache_policy.caching_optimized.id
+    compress                   = true
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.dataset_cors.id
+    target_origin_id           = "dataset-s3"
+    viewer_protocol_policy     = "redirect-to-https"
   }
 
   restrictions {
@@ -1614,6 +1689,15 @@ resource "aws_route53_record" "dataset_distribution_ipv6" {
     zone_id                = aws_cloudfront_distribution.dataset.hosted_zone_id
     evaluate_target_health = false
   }
+}
+
+resource "aws_route53_record" "browser_app_pages" {
+  count   = local.browser_app_pages_record_enabled ? 1 : 0
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.browser_app_hostname
+  type    = "CNAME"
+  ttl     = 300
+  records = [local.browser_app_pages_domain_target]
 }
 
 resource "aws_s3_bucket" "artifact_replica" {

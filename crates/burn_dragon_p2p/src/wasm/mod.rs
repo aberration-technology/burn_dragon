@@ -1112,15 +1112,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         })
         .or_else(|| props.config.selected_revision_id.clone())
         .unwrap_or_else(|| "nca-r1".into());
-    let selected_experiment_label = view
-        .as_ref()
-        .and_then(|view| {
-            view.selected_experiment
-                .as_ref()
-                .map(|experiment| experiment.display_name.clone())
-        })
-        .or_else(|| props.config.selected_experiment_id.clone())
-        .unwrap_or_else(|| "nca-prepretraining".into());
     let active_head_label = view
         .as_ref()
         .and_then(|view| {
@@ -1178,7 +1169,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     } else if ready_to_connect {
         "ready to join".to_owned()
     } else {
-        "help train dragon".to_owned()
+        "train the dragon".to_owned()
     };
     let hero_runtime_label = if has_connected_view || has_session {
         runtime_label.clone()
@@ -1195,20 +1186,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         "ready".to_owned()
     };
     let hero_subtitle = if needs_sign_in {
-        format!(
-            "{} · {} · sign in and train from your browser.",
-            selected_experiment_label, selected_revision_label
-        )
+        "sign in and train from your browser.".to_owned()
     } else if ready_to_connect {
-        format!(
-            "{} · {} · connect this tab to join the live run.",
-            selected_experiment_label, selected_revision_label
-        )
+        "connect this tab to join the live run.".to_owned()
     } else {
-        format!(
-            "{} · {} · connected and ready for short training windows.",
-            selected_experiment_label, selected_revision_label
-        )
+        "connected and ready for short training windows.".to_owned()
     };
     let landing_notice = if callback_available {
         Some((
@@ -1422,7 +1404,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         p { class: "app-subtitle", "{hero_subtitle}" }
                         div { class: "badge-row",
                             StatusPill { label: contributor_mode_label, tone: "accent" }
-                            StatusPill { label: selected_revision_label.clone(), tone: "neutral" }
+                            if has_connected_view {
+                                StatusPill { label: selected_revision_label.clone(), tone: "neutral" }
+                            }
                             StatusPill { label: hero_runtime_label, tone: "neutral" }
                         }
                     }
@@ -1585,10 +1569,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 strong { "{session_summary.clone()}" }
                             }
                             div { class: "keyvalue-row",
-                                span { "revision" }
-                                strong { "{selected_revision_label.clone()}" }
-                            }
-                            div { class: "keyvalue-row",
                                 span { "edge" }
                                 strong { "{edge_summary.clone()}" }
                             }
@@ -1650,51 +1630,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                 }
-                aside { class: "support-stack",
-                    if needs_sign_in {
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "browser",
-                                title: "what you do",
-                                detail: "short training from one tab.",
-                            }
-                            div { class: "keyvalue-list",
-                                div { class: "keyvalue-row",
-                                    span { "training" }
-                                    strong { "short local windows" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "sync" }
-                                    strong { "shared checkpoint head" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "revision" }
-                                    strong { "{selected_revision_label}" }
-                                }
-                            }
-                        }
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "setup",
-                                title: "what you need",
-                                detail: "an approved account and a browser with webgpu when available.",
-                            }
-                            div { class: "keyvalue-list",
-                                div { class: "keyvalue-row",
-                                    span { "access" }
-                                    strong { "approved account" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "runtime" }
-                                    strong { "browser tab" }
-                                }
-                                div { class: "keyvalue-row",
-                                    span { "compute" }
-                                    strong { "webgpu when available" }
-                                }
-                            }
-                        }
-                    } else if ready_to_connect {
+                if !needs_sign_in {
+                    aside { class: "support-stack",
+                    if ready_to_connect {
                         section { class: "panel compact-panel",
                             SectionHeader {
                                 eyebrow: "identity",
@@ -1771,6 +1709,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             }
                         }
                     }
+                }
                 }
             }
             if show_live_details_active {

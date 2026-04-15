@@ -95,7 +95,7 @@ jobs:
               --document-name AWS-RunShellScript \
               --comment "inspect burn_dragon bootstrap host" \
               --parameters 'commands=[
-                "set -euxo pipefail",
+                "set -eu",
                 "date -Is",
                 "uname -a",
                 "cloud-init status --long || true",

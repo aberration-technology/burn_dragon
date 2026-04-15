@@ -1188,7 +1188,7 @@ jobs:
               --document-name AWS-RunShellScript \
               --comment "dump burn_dragon bootstrap diagnostics" \
               --parameters 'commands=[
-                "set -euxo pipefail",
+                "set -eu",
                 "cloud-init status --long || true",
                 "systemctl status caddy --no-pager || true",
                 "systemctl status burn-p2p-bootstrap --no-pager || true",

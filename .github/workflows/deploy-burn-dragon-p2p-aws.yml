@@ -904,6 +904,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          edge_target_dir="${RUNNER_TEMP}/target-edge-binaries"
           bootstrap_binary_path=""
           if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
             bootstrap_auth_feature="auth-static"
@@ -915,7 +916,7 @@ jobs:
             esac
 
             bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
-            CARGO_TARGET_DIR="${RUNNER_TEMP}/target-bootstrap" cargo install \
+            CARGO_TARGET_DIR="$edge_target_dir" cargo install \
               --locked \
               --root "$bootstrap_root" \
               --git "https://github.com/aberration-technology/burn_p2p.git" \
@@ -927,7 +928,7 @@ jobs:
             bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"
           fi
 
-          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-dragon-native" cargo build \
+          CARGO_TARGET_DIR="$edge_target_dir" cargo build \
             --manifest-path "${GITHUB_WORKSPACE}/Cargo.toml" \
             --locked \
             -p burn_dragon_p2p \
@@ -936,7 +937,7 @@ jobs:
             --features native \
             --release
 
-          head_mirror_binary_path="${RUNNER_TEMP}/target-dragon-native/release/burn_dragon_p2p_native"
+          head_mirror_binary_path="${edge_target_dir}/release/burn_dragon_p2p_native"
 
           {
             echo "bootstrap_binary_path=${bootstrap_binary_path}"

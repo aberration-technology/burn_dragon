@@ -909,6 +909,12 @@ jobs:
           fi
           response_headers_policy_name="${STACK_NAME}-${TF_WORKSPACE_NAME}-dataset-cors"
           origin_access_control_name="${STACK_NAME}-${TF_WORKSPACE_NAME}-dataset"
+          bootstrap_name_tag="${STACK_NAME}-bootstrap"
+          vpc_name_tag="${STACK_NAME}-vpc"
+          public_subnet_name_tag="${STACK_NAME}-public-a"
+          public_secondary_subnet_name_tag="${STACK_NAME}-public-b"
+          public_route_table_name_tag="${STACK_NAME}-public"
+          dataset_domain_name="${TF_VAR_dataset_domain_name:-$DATASET_DOMAIN_NAME}"
 
           if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
             tf_import_if_missing aws_iam_role.bootstrap "$role_name"
@@ -950,6 +956,117 @@ jobs:
             --output text 2>/dev/null || true)"
           if [ -n "$origin_access_control_id" ] && [ "$origin_access_control_id" != "None" ]; then
             tf_import_if_missing aws_cloudfront_origin_access_control.dataset "$origin_access_control_id"
+          fi
+
+          bootstrap_instance_id="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=${bootstrap_name_tag}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId' \
+            --output text 2>/dev/null || true)"
+          if [ -n "$bootstrap_instance_id" ] && [ "$bootstrap_instance_id" != "None" ]; then
+            tf_import_if_missing aws_instance.bootstrap "$bootstrap_instance_id"
+          fi
+
+          bootstrap_vpc_id=""
+          if [ -n "$bootstrap_instance_id" ] && [ "$bootstrap_instance_id" != "None" ]; then
+            bootstrap_vpc_id="$(aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --instance-ids "$bootstrap_instance_id" \
+              --query 'Reservations[0].Instances[0].VpcId' \
+              --output text 2>/dev/null || true)"
+          fi
+          if [ -z "$bootstrap_vpc_id" ] || [ "$bootstrap_vpc_id" = "None" ]; then
+            bootstrap_vpc_id="$(aws ec2 describe-vpcs \
+              --region "$AWS_REGION" \
+              --filters "Name=tag:Name,Values=${vpc_name_tag}" "Name=tag:TerraformWorkspace,Values=${TF_WORKSPACE_NAME}" \
+              --query 'Vpcs[0].VpcId' \
+              --output text 2>/dev/null || true)"
+          fi
+          if [ -n "$bootstrap_vpc_id" ] && [ "$bootstrap_vpc_id" != "None" ]; then
+            tf_import_if_missing aws_vpc.bootstrap "$bootstrap_vpc_id"
+
+            public_subnet_id="$(aws ec2 describe-subnets \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${bootstrap_vpc_id}" "Name=tag:Name,Values=${public_subnet_name_tag}" \
+              --query 'Subnets[0].SubnetId' \
+              --output text 2>/dev/null || true)"
+            if [ -n "$public_subnet_id" ] && [ "$public_subnet_id" != "None" ]; then
+              tf_import_if_missing aws_subnet.public "$public_subnet_id"
+            fi
+
+            public_secondary_subnet_id="$(aws ec2 describe-subnets \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${bootstrap_vpc_id}" "Name=tag:Name,Values=${public_secondary_subnet_name_tag}" \
+              --query 'Subnets[0].SubnetId' \
+              --output text 2>/dev/null || true)"
+            if [ -n "$public_secondary_subnet_id" ] && [ "$public_secondary_subnet_id" != "None" ]; then
+              tf_import_if_missing aws_subnet.public_secondary "$public_secondary_subnet_id"
+            fi
+
+            internet_gateway_id="$(aws ec2 describe-internet-gateways \
+              --region "$AWS_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${bootstrap_vpc_id}" \
+              --query 'InternetGateways[0].InternetGatewayId' \
+              --output text 2>/dev/null || true)"
+            if [ -n "$internet_gateway_id" ] && [ "$internet_gateway_id" != "None" ]; then
+              tf_import_if_missing aws_internet_gateway.bootstrap "$internet_gateway_id"
+            fi
+
+            route_table_id="$(aws ec2 describe-route-tables \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${bootstrap_vpc_id}" "Name=tag:Name,Values=${public_route_table_name_tag}" \
+              --query 'RouteTables[0].RouteTableId' \
+              --output text 2>/dev/null || true)"
+            if [ -n "$route_table_id" ] && [ "$route_table_id" != "None" ]; then
+              tf_import_if_missing aws_route_table.public "$route_table_id"
+
+              if [ -n "${public_subnet_id:-}" ] && [ "$public_subnet_id" != "None" ]; then
+                public_route_assoc_id="$(aws ec2 describe-route-tables \
+                  --region "$AWS_REGION" \
+                  --route-table-ids "$route_table_id" \
+                  --query "RouteTables[0].Associations[?SubnetId=='${public_subnet_id}'].RouteTableAssociationId | [0]" \
+                  --output text 2>/dev/null || true)"
+                if [ -n "$public_route_assoc_id" ] && [ "$public_route_assoc_id" != "None" ]; then
+                  tf_import_if_missing aws_route_table_association.public "$public_route_assoc_id"
+                fi
+              fi
+
+              if [ -n "${public_secondary_subnet_id:-}" ] && [ "$public_secondary_subnet_id" != "None" ]; then
+                public_secondary_route_assoc_id="$(aws ec2 describe-route-tables \
+                  --region "$AWS_REGION" \
+                  --route-table-ids "$route_table_id" \
+                  --query "RouteTables[0].Associations[?SubnetId=='${public_secondary_subnet_id}'].RouteTableAssociationId | [0]" \
+                  --output text 2>/dev/null || true)"
+                if [ -n "$public_secondary_route_assoc_id" ] && [ "$public_secondary_route_assoc_id" != "None" ]; then
+                  tf_import_if_missing aws_route_table_association.public_secondary "$public_secondary_route_assoc_id"
+                fi
+              fi
+            fi
+
+            bootstrap_security_group_id="$(aws ec2 describe-security-groups \
+              --region "$AWS_REGION" \
+              --filters "Name=vpc-id,Values=${bootstrap_vpc_id}" "Name=group-name,Values=${bootstrap_name_tag}" \
+              --query 'SecurityGroups[0].GroupId' \
+              --output text 2>/dev/null || true)"
+            if [ -n "$bootstrap_security_group_id" ] && [ "$bootstrap_security_group_id" != "None" ]; then
+              tf_import_if_missing aws_security_group.bootstrap "$bootstrap_security_group_id"
+            fi
+          fi
+
+          bootstrap_eip_allocation_id="$(aws ec2 describe-addresses \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=${bootstrap_name_tag}" \
+            --query 'Addresses[0].AllocationId' \
+            --output text 2>/dev/null || true)"
+          if [ -n "$bootstrap_eip_allocation_id" ] && [ "$bootstrap_eip_allocation_id" != "None" ]; then
+            tf_import_if_missing aws_eip.bootstrap "$bootstrap_eip_allocation_id"
+          fi
+
+          dataset_distribution_id="$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Aliases.Quantity > \`0\` && contains(Aliases.Items, '${dataset_domain_name}')].Id | [0]" \
+            --output text 2>/dev/null || true)"
+          if [ -n "$dataset_distribution_id" ] && [ "$dataset_distribution_id" != "None" ]; then
+            tf_import_if_missing aws_cloudfront_distribution.dataset "$dataset_distribution_id"
           fi
 
       - name: terraform validate

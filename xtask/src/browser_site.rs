@@ -47,8 +47,29 @@ const EXTRA_STYLESHEET: &str = r#"
   width: min(100%, 900px);
 }
 
+.dragon-advanced-settings {
+  padding-top: 4px;
+}
+
 .dragon-metric-band {
   margin-top: 8px;
+}
+
+.dragon-landing-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.dragon-landing-card {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at top right, rgba(255, 184, 92, 0.08), transparent 30%),
+    rgba(255, 255, 255, 0.025);
 }
 
 .dragon-panel-stack {
@@ -72,6 +93,11 @@ const EXTRA_STYLESHEET: &str = r#"
 
 .dragon-editor-grid-wide {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.dragon-admin-surface,
+.dragon-admin-gate {
+  margin-top: 2px;
 }
 
 .dragon-editor-field {

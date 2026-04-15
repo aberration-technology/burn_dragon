@@ -52,6 +52,15 @@ fn window_query_string() -> Result<String> {
         .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))
 }
 
+fn window_query_flag(name: &str) -> bool {
+    let Ok(query) = window_query_string() else {
+        return false;
+    };
+    form_urlencoded::parse(query.trim_start_matches('?').as_bytes()).any(|(key, value)| {
+        key == name && matches!(value.as_ref(), "" | "1" | "true" | "yes" | "on" | "open")
+    })
+}
+
 fn callback_site_root_pathname(pathname: &str) -> Option<String> {
     let (prefix, _) = pathname.split_once("/callback/")?;
     let prefix = prefix.trim_end_matches('/');
@@ -616,8 +625,50 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut admin_entry_json = use_signal(String::new);
     let mut admin_status = use_signal(String::new);
     let admin_rollout_result = use_signal(|| None::<DirectoryMutationResultView>);
+    let mut show_connection_settings = use_signal(|| false);
+    let mut show_live_details = use_signal(|| false);
+    let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
+    let auth_bootstrap_started = use_signal(|| false);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
+
+    {
+        let config = initial_config.clone();
+        let release_manifest = props.release_manifest.clone();
+        let mut session_state = session_state;
+        let mut current_view = current_view;
+        let mut status = status;
+        let mut auth_bootstrap_started = auth_bootstrap_started;
+        use_effect(move || {
+            if *auth_bootstrap_started.read() {
+                return;
+            }
+            auth_bootstrap_started.set(true);
+            let config = config.clone();
+            let release_manifest = release_manifest.clone();
+            spawn(async move {
+                match resume_or_complete_browser_auth(&config, release_manifest.as_ref()).await {
+                    Ok(Some(session)) => {
+                        session_state.set(Some(session));
+                        if let Ok(view) = refresh_browser_app(&config).await {
+                            current_view.set(Some(view));
+                        }
+                        if provider_code_from_window_location().is_some() {
+                            status.set("signed in".into());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if config.require_edge_auth
+                            || provider_code_from_window_location().is_some()
+                        {
+                            status.set(error.to_string());
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     let connect_action = {
         let props = props.clone();
@@ -995,6 +1046,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .filter(|entries| !entries.is_empty())
         .map(|entries| rollout_preview_view(entries));
     let admin_rollout_status_view = admin_rollout_result.read().clone();
+    let show_connection_settings_active = *show_connection_settings.read();
+    let show_live_details_active = *show_live_details.read();
+    let show_admin_tools_active = *show_admin_tools.read() || admin_scope_ready;
     let browser_host_capabilities = detect_browser_host_capabilities();
     let browser_capability_decision = match (
         props.config.training.as_ref(),
@@ -1110,10 +1164,44 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             browser_runtime_role_label(&browser_capability_decision.capability.recommended_role)
                 .replace('_', " ")
         });
+    let contributor_mode_label = if auth_required {
+        if session_state
+            .read()
+            .as_ref()
+            .and_then(|session| session.session.as_ref())
+            .is_some()
+        {
+            "signed in and ready".to_owned()
+        } else {
+            "sign in to contribute compute".to_owned()
+        }
+    } else {
+        "guest access enabled".to_owned()
+    };
     let hero_subtitle = format!(
-        "{} · {} · browser trainer and operator shell",
+        "{} · {} · browser peers help train the current head",
         selected_experiment_label, selected_revision_label
     );
+    let landing_notice = if callback_available {
+        Some((
+            String::from("callback"),
+            String::from("finishing github sign-in"),
+            "accent",
+        ))
+    } else if session_state
+        .read()
+        .as_ref()
+        .and_then(|session| session.session.as_ref())
+        .is_some()
+    {
+        Some((
+            String::from("ready"),
+            String::from("this browser can now connect and contribute receipts"),
+            "accent",
+        ))
+    } else {
+        None
+    };
     let status_message = status.read().clone();
     let edge_summary = edge_url.read().clone();
 
@@ -1194,7 +1282,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     r#type: "button",
                     class: "action-button action-button-primary",
                     onclick: train_action,
-                    "Run Browser Training"
+                    "run browser training"
                 }
             }
         }
@@ -1284,19 +1372,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 div { class: "browser-hero-grid",
                     div { class: "browser-hero-copy",
                         div { class: "eyebrow", "burn_dragon" }
-                        h1 { class: "app-title", "dragon training control" }
+                        h1 { class: "app-title", "train dragon together" }
                         p { class: "app-subtitle", "{hero_subtitle}" }
                         div { class: "badge-row",
-                            StatusPill { label: runtime_label, tone: "accent" }
+                            StatusPill { label: contributor_mode_label, tone: "accent" }
                             StatusPill { label: selected_revision_label.clone(), tone: "neutral" }
-                            StatusPill {
-                                label: if auth_required {
-                                    String::from("edge auth required")
-                                } else {
-                                    String::from("guest edge access")
-                                },
-                                tone: "neutral",
-                            }
+                            StatusPill { label: runtime_label, tone: "neutral" }
                         }
                     }
                     div { class: "browser-quick-grid",
@@ -1304,6 +1385,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         QuickCard { label: "peers", value: peer_summary }
                         QuickCard { label: "session", value: session_summary }
                     }
+                }
+                if let Some((label, detail, tone)) = landing_notice {
+                    ActivityNotice { label: label, detail: detail, tone: tone }
                 }
                 if !status_message.is_empty() {
                     ActivityNotice {
@@ -1321,44 +1405,77 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 }
                 div { class: "browser-hero-bar",
                     div { class: "dragon-connection-editor",
-                        div { class: "edge-editor",
-                            EdgeConnectField {
-                                label: "edge url",
-                                value: edge_url.read().clone(),
-                                oninput: move |value| edge_url.set(value),
-                            }
-                            EdgeConnectField {
-                                label: "seed node urls",
-                                value: seed_node_urls.read().clone(),
-                                oninput: move |value| seed_node_urls.set(value),
-                            }
-                        }
                         div { class: "browser-action-row",
-                            ActionButton {
-                                label: "Connect",
-                                tone: "primary",
-                                onclick: connect_action,
-                            }
-                            ActionButton {
-                                label: "Refresh",
-                                tone: "secondary",
-                                onclick: refresh_action,
-                            }
                             if auth_required {
                                 ActionButton {
-                                    label: "Sign In",
+                                    label: "sign in with github",
                                     tone: "secondary",
                                     onclick: github_login_action,
                                 }
                             }
-                            if callback_available {
-                                ActionButton {
-                                    label: "Complete Callback",
-                                    tone: "secondary",
-                                    onclick: complete_callback_action,
-                                }
+                            ActionButton {
+                                label: "connect browser peer",
+                                tone: "primary",
+                                onclick: connect_action,
+                            }
+                            ActionButton {
+                                label: "refresh network",
+                                tone: "secondary",
+                                onclick: refresh_action,
                             }
                             {train_button}
+                            if show_connection_settings_active {
+                                button {
+                                    r#type: "button",
+                                    class: "action-button action-button-secondary",
+                                    onclick: move |_| show_connection_settings.set(false),
+                                    "hide connection settings"
+                                }
+                            } else {
+                                button {
+                                    r#type: "button",
+                                    class: "action-button action-button-secondary",
+                                    onclick: move |_| show_connection_settings.set(true),
+                                    "advanced connection settings"
+                                }
+                            }
+                            if show_live_details_active {
+                                button {
+                                    r#type: "button",
+                                    class: "action-button action-button-secondary",
+                                    onclick: move |_| show_live_details.set(false),
+                                    "hide live details"
+                                }
+                            } else {
+                                button {
+                                    r#type: "button",
+                                    class: "action-button action-button-secondary",
+                                    onclick: move |_| show_live_details.set(true),
+                                    "show live details"
+                                }
+                            }
+                        }
+                        if show_connection_settings_active {
+                            div { class: "edge-editor dragon-advanced-settings",
+                                EdgeConnectField {
+                                    label: "edge url",
+                                    value: edge_url.read().clone(),
+                                    oninput: move |value| edge_url.set(value),
+                                }
+                                EdgeConnectField {
+                                    label: "seed node urls",
+                                    value: seed_node_urls.read().clone(),
+                                    oninput: move |value| seed_node_urls.set(value),
+                                }
+                                if callback_available {
+                                    button {
+                                        r#type: "button",
+                                        class: "action-button action-button-secondary",
+                                        onclick: complete_callback_action,
+                                        "retry callback"
+                                    }
+                                }
+                            }
                         }
                     }
                     div { class: "browser-hero-actions",
@@ -1372,9 +1489,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             div { class: "surface-layout browser-surface-layout",
                 section { class: "panel primary-panel browser-focus-panel",
                     SectionHeader {
-                        eyebrow: "training",
-                        title: "browser training surface",
-                        detail: "connect, inspect the current head, and run browser-side training windows.",
+                        eyebrow: "landing",
+                        title: "start here",
+                        detail: "the default page is for contributors, not operators. sign in, connect, and let this browser help train the current head.",
+                    }
+                    p { class: "section-detail",
+                        "burn_dragon_p2p lets browser peers join the trainer-only diffusion network, sync the latest checkpoint, and donate spare webgpu compute back into the project."
+                    }
+                    div { class: "dragon-landing-grid",
+                        LandingCard {
+                            eyebrow: "1",
+                            title: "sign in",
+                            detail: "use github so the edge can mint a browser session and scope your contribution receipts.",
+                        }
+                        LandingCard {
+                            eyebrow: "2",
+                            title: "connect",
+                            detail: "the edge and seed nodes are preloaded. most contributors do not need to touch the advanced connection fields.",
+                        }
+                        LandingCard {
+                            eyebrow: "3",
+                            title: "contribute compute",
+                            detail: "run browser training when your machine is idle and let webgpu windows publish signed progress back to the network.",
+                        }
                     }
                     if props.config.training.is_some() {
                         div { class: "browser-metric-band dragon-metric-band",
@@ -1389,24 +1526,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 detail: Some("trainer".into()),
                             }
                             StatTile {
-                                label: "footprint",
-                                value: capability_footprint_label,
-                                detail: Some("estimated".into()),
-                            }
-                            StatTile {
-                                label: "window",
-                                value: capability_window_label,
-                                detail: Some("secs".into()),
-                            }
-                            StatTile {
-                                label: "throughput",
-                                value: capability_tokens_per_second_label,
-                                detail: Some("tokens/sec".into()),
-                            }
-                            StatTile {
                                 label: "checkpoint",
                                 value: capability_checkpoint_label,
                                 detail: Some("budget".into()),
+                            }
+                            StatTile {
+                                label: "window",
+                                value: capability_window_label.clone(),
+                                detail: Some("secs".into()),
                             }
                             StatTile {
                                 label: "shard",
@@ -1417,8 +1544,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                     if let Some(view) = view.clone() {
                         div { class: "dragon-panel-stack",
-                            RuntimeCapabilityCard { summary: runtime_capability_summary(&view) }
-                            TrainingResultPanel { result: latest_training_result_summary(&view) }
+                            ActivityNotice {
+                                label: String::from("connected"),
+                                detail: String::from("this browser has a live view of the selected revision and can now inspect peer state or run a browser window."),
+                                tone: "accent",
+                            }
                             div { class: "keyvalue-list",
                                 div { class: "keyvalue-row",
                                     span { "last loss" }
@@ -1438,179 +1568,244 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                    } else {
-                        EmptyState {
-                            title: "not connected yet",
-                            detail: "connect to the edge to populate runtime health, training metrics, and leaderboard data.",
-                        }
                     }
                 }
                 aside { class: "support-stack",
                     section { class: "panel compact-panel",
                         SectionHeader {
-                            eyebrow: "session",
-                            title: "identity",
-                            detail: "browser auth state and granted contribution scopes.",
+                            eyebrow: "identity",
+                            title: "session",
+                            detail: "who this browser is acting as on the edge.",
                         }
                         AuthSessionCard { session: session_panel }
+                    }
+                    section { class: "panel compact-panel",
+                        SectionHeader {
+                            eyebrow: "network",
+                            title: "what this browser will do",
+                            detail: "a short fit check before you donate compute.",
+                        }
+                        div { class: "keyvalue-list",
+                            div { class: "keyvalue-row",
+                                span { "role" }
+                                strong { "{browser_runtime_role_label(&browser_capability_decision.capability.recommended_role).replace('_', \" \")}" }
+                            }
+                            div { class: "keyvalue-row",
+                                span { "estimated footprint" }
+                                strong { "{capability_footprint_label}" }
+                            }
+                            div { class: "keyvalue-row",
+                                span { "window budget" }
+                                strong { "{capability_window_label} secs" }
+                            }
+                            div { class: "keyvalue-row",
+                                span { "tokens/sec" }
+                                strong { "{capability_tokens_per_second_label}" }
+                            }
+                        }
                     }
                     if let Some(view) = view.clone() {
                         if let Some(status) = lifecycle_assignment_status(&view) {
                             section { class: "panel compact-panel",
                                 SectionHeader {
                                     eyebrow: "assignment",
-                                    title: "lifecycle",
-                                    detail: "current revision role and assignment status.",
+                                    title: "current role",
+                                    detail: "what the selected revision thinks this browser can do right now.",
                                 }
                                 LifecycleAssignmentStatusCard { status: status }
                             }
                         }
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "network",
-                                title: "transport",
-                                detail: "edge connectivity, receipts, and peer visibility.",
-                            }
-                            TransportHealthPanel { network: view.network.clone() }
-                        }
-                    } else {
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "network",
-                                title: "transport",
-                                detail: "connect first to inspect live peer health.",
-                            }
-                            EmptyState {
-                                title: "awaiting edge sync",
-                                detail: "the live transport panel appears after the first successful refresh.",
-                            }
-                        }
                     }
-                    {local_training_section}
                 }
             }
-            div { class: "surface-layout browser-surface-layout",
-                section { class: "panel primary-panel browser-focus-panel",
-                    SectionHeader {
-                        eyebrow: "operator",
-                        title: "directory rollout",
-                        detail: "load, edit, preview, and publish signed experiment directory entries.",
-                    }
-                    AdminSessionCard { session: admin_session_card_view }
-                    div { class: "dragon-operator-summary keyvalue-list",
-                        div { class: "keyvalue-row",
-                            span { "selected study" }
-                            strong { "{admin_study_id}" }
+            if show_live_details_active || view.is_some() {
+                div { class: "surface-layout browser-surface-layout",
+                    section { class: "panel primary-panel browser-focus-panel",
+                        SectionHeader {
+                            eyebrow: "details",
+                            title: "live peer details",
+                            detail: "runtime capability, network training, and the latest checkpoint state.",
                         }
-                        div { class: "keyvalue-row",
-                            span { "admin scope ready" }
-                            strong { "{admin_scope_label}" }
-                        }
-                        if !admin_granted_studies.is_empty() {
-                            div { class: "keyvalue-row",
-                                span { "granted studies" }
-                                strong { "{admin_granted_studies_label}" }
+                        if let Some(view) = view.clone() {
+                            div { class: "dragon-panel-stack",
+                                RuntimeCapabilityCard { summary: runtime_capability_summary(&view) }
+                                TrainingResultPanel { result: latest_training_result_summary(&view) }
+                            }
+                        } else {
+                            EmptyState {
+                                title: "connect first",
+                                detail: "the detailed runtime and training panels appear after the first successful connect or refresh.",
                             }
                         }
                     }
-                    if !admin_status.read().is_empty() {
-                        ActivityNotice {
-                            label: String::from("operator status"),
-                            detail: admin_status.read().clone(),
-                            tone: "neutral",
-                        }
-                    }
-                    div { class: "dragon-editor-grid",
-                        EditorInputField {
-                            label: "admin study id",
-                            value: admin_study_id.read().clone(),
-                            oninput: move |value| admin_study_id.set(value),
-                        }
-                        EditorInputField {
-                            label: "experiment id",
-                            value: admin_experiment_id.read().clone(),
-                            oninput: move |value| admin_experiment_id.set(value),
-                        }
-                    }
-                    div { class: "browser-action-row dragon-admin-actions",
-                        ActionButton {
-                            label: "Sign In (Admin)",
-                            tone: "secondary",
-                            onclick: admin_github_login_action,
-                        }
-                        ActionButton {
-                            label: "Load Directory",
-                            tone: "secondary",
-                            onclick: admin_load_directory_action,
-                        }
-                        ActionButton {
-                            label: "Load Selected Entry",
-                            tone: "secondary",
-                            onclick: admin_load_selected_entry_action,
-                        }
-                        ActionButton {
-                            label: "Upsert Editor Entry",
-                            tone: "secondary",
-                            onclick: admin_upsert_editor_entry_action,
-                        }
-                        ActionButton {
-                            label: "Roll Out Directory",
-                            tone: "primary",
-                            onclick: admin_rollout_directory_action,
-                        }
-                    }
-                    div { class: "dragon-editor-grid dragon-editor-grid-wide",
-                        EditorTextareaField {
-                            label: "directory json",
-                            value: admin_directory_json.read().clone(),
-                            rows: "18",
-                            oninput: move |value| admin_directory_json.set(value),
-                        }
-                        EditorTextareaField {
-                            label: "entry editor json",
-                            value: admin_entry_json.read().clone(),
-                            rows: "16",
-                            oninput: move |value| admin_entry_json.set(value),
-                        }
-                    }
-                    div { class: "dragon-panel-stack",
-                        if let Some(view) = admin_directory_list_view.clone() {
-                            ExperimentDirectoryListPanel { view }
-                        }
-                        if let Some(draft) = admin_entry_draft_view.clone() {
-                            DirectoryEntryDraftPanel { draft }
-                        }
-                        if let Some(view) = admin_rollout_preview.clone() {
-                            RolloutPreviewPanel { view }
-                        }
-                        if let Some(view) = admin_rollout_status_view.clone() {
-                            RolloutSubmissionStatusPanel { view }
-                        }
-                    }
-                }
-                aside { class: "support-stack",
-                    if let Some(view) = view {
-                        section { class: "panel compact-panel",
-                            SectionHeader {
-                                eyebrow: "leaderboard",
-                                title: "top participants",
-                                detail: "current preview from the selected revision.",
-                            }
-                            if view.viewer.leaderboard_preview.is_empty() {
-                                EmptyState {
-                                    title: "leaderboard pending",
-                                    detail: "leaderboard rows appear after the first synced viewer snapshot.",
+                    aside { class: "support-stack",
+                        if let Some(view) = view.clone() {
+                            section { class: "panel compact-panel",
+                                SectionHeader {
+                                    eyebrow: "transport",
+                                    title: "network",
+                                    detail: "edge connectivity, receipts, and peer visibility.",
                                 }
-                            } else {
-                                div { class: "keyvalue-list",
-                                    for entry in view.viewer.leaderboard_preview {
-                                        div { class: "keyvalue-row",
-                                            span { "{entry.label}" }
-                                            strong { "{entry.score} · {entry.receipts} receipts" }
+                                TransportHealthPanel { network: view.network.clone() }
+                            }
+                            section { class: "panel compact-panel",
+                                SectionHeader {
+                                    eyebrow: "leaderboard",
+                                    title: "top participants",
+                                    detail: "current preview from the selected revision.",
+                                }
+                                if view.viewer.leaderboard_preview.is_empty() {
+                                    EmptyState {
+                                        title: "leaderboard pending",
+                                        detail: "leaderboard rows appear after the first synced viewer snapshot.",
+                                    }
+                                } else {
+                                    div { class: "keyvalue-list",
+                                        for entry in view.viewer.leaderboard_preview {
+                                            div { class: "keyvalue-row",
+                                                span { "{entry.label}" }
+                                                strong { "{entry.score} · {entry.receipts} receipts" }
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+                        {local_training_section}
+                    }
+                }
+            }
+            if show_admin_tools_active {
+                div { class: "surface-layout browser-surface-layout dragon-admin-surface",
+                    section { class: "panel primary-panel browser-focus-panel",
+                        SectionHeader {
+                            eyebrow: "admin",
+                            title: "directory rollout",
+                            detail: "load, edit, preview, and publish signed experiment directory entries.",
+                        }
+                        AdminSessionCard { session: admin_session_card_view }
+                        div { class: "dragon-operator-summary keyvalue-list",
+                            div { class: "keyvalue-row",
+                                span { "selected study" }
+                                strong { "{admin_study_id}" }
+                            }
+                            div { class: "keyvalue-row",
+                                span { "admin scope ready" }
+                                strong { "{admin_scope_label}" }
+                            }
+                            if !admin_granted_studies.is_empty() {
+                                div { class: "keyvalue-row",
+                                    span { "granted studies" }
+                                    strong { "{admin_granted_studies_label}" }
+                                }
+                            }
+                        }
+                        if !admin_status.read().is_empty() {
+                            ActivityNotice {
+                                label: String::from("operator status"),
+                                detail: admin_status.read().clone(),
+                                tone: "neutral",
+                            }
+                        }
+                        div { class: "dragon-editor-grid",
+                            EditorInputField {
+                                label: "admin study id",
+                                value: admin_study_id.read().clone(),
+                                oninput: move |value| admin_study_id.set(value),
+                            }
+                            EditorInputField {
+                                label: "experiment id",
+                                value: admin_experiment_id.read().clone(),
+                                oninput: move |value| admin_experiment_id.set(value),
+                            }
+                        }
+                        div { class: "browser-action-row dragon-admin-actions",
+                            ActionButton {
+                                label: "sign in as admin",
+                                tone: "secondary",
+                                onclick: admin_github_login_action,
+                            }
+                            ActionButton {
+                                label: "load directory",
+                                tone: "secondary",
+                                onclick: admin_load_directory_action,
+                            }
+                            ActionButton {
+                                label: "load selected entry",
+                                tone: "secondary",
+                                onclick: admin_load_selected_entry_action,
+                            }
+                            ActionButton {
+                                label: "upsert editor entry",
+                                tone: "secondary",
+                                onclick: admin_upsert_editor_entry_action,
+                            }
+                            ActionButton {
+                                label: "roll out directory",
+                                tone: "primary",
+                                onclick: admin_rollout_directory_action,
+                            }
+                        }
+                        div { class: "dragon-editor-grid dragon-editor-grid-wide",
+                            EditorTextareaField {
+                                label: "directory json",
+                                value: admin_directory_json.read().clone(),
+                                rows: "18",
+                                oninput: move |value| admin_directory_json.set(value),
+                            }
+                            EditorTextareaField {
+                                label: "entry editor json",
+                                value: admin_entry_json.read().clone(),
+                                rows: "16",
+                                oninput: move |value| admin_entry_json.set(value),
+                            }
+                        }
+                        div { class: "dragon-panel-stack",
+                            if let Some(view) = admin_directory_list_view.clone() {
+                                ExperimentDirectoryListPanel { view }
+                            }
+                            if let Some(draft) = admin_entry_draft_view.clone() {
+                                DirectoryEntryDraftPanel { draft }
+                            }
+                            if let Some(view) = admin_rollout_preview.clone() {
+                                RolloutPreviewPanel { view }
+                            }
+                            if let Some(view) = admin_rollout_status_view.clone() {
+                                RolloutSubmissionStatusPanel { view }
+                            }
+                        }
+                    }
+                    aside { class: "support-stack",
+                        section { class: "panel compact-panel",
+                            SectionHeader {
+                                eyebrow: "admin",
+                                title: "hide tools",
+                                detail: "the public landing page stays focused on contributors by default.",
+                            }
+                            div { class: "browser-action-row" ,
+                                button {
+                                    r#type: "button",
+                                    class: "action-button action-button-secondary",
+                                    onclick: move |_| show_admin_tools.set(false),
+                                    "hide admin tools"
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                section { class: "panel compact-panel dragon-admin-gate",
+                    SectionHeader {
+                        eyebrow: "admin",
+                        title: "operator tools are hidden",
+                        detail: "directory rollout stays off the landing page unless you explicitly open it.",
+                    }
+                    div { class: "browser-action-row",
+                        button {
+                            r#type: "button",
+                            class: "action-button action-button-secondary",
+                            onclick: move |_| show_admin_tools.set(true),
+                            "open admin tools"
                         }
                     }
                 }
@@ -1682,6 +1877,17 @@ fn StatTile(label: &'static str, value: String, detail: Option<String>) -> Eleme
             if let Some(detail) = detail {
                 p { class: "stat-detail", "{detail}" }
             }
+        }
+    }
+}
+
+#[component]
+fn LandingCard(eyebrow: &'static str, title: &'static str, detail: &'static str) -> Element {
+    rsx! {
+        article { class: "dragon-landing-card",
+            div { class: "eyebrow", "{eyebrow}" }
+            h3 { class: "browser-focus-title", "{title}" }
+            p { class: "section-detail", "{detail}" }
         }
     }
 }

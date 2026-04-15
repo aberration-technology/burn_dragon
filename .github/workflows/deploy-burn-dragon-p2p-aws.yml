@@ -1179,6 +1179,79 @@ jobs:
             echo "managed_trainer_auth_bundle_parameter_name=$managed_trainer_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
+      - name: restart bootstrap to reload synced auth secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_id="${{ steps.outputs.outputs.instance_id }}"
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            echo "no bootstrap instance id available; skipping restart" >&2
+            exit 0
+          fi
+
+          ssm_status=""
+          for attempt in $(seq 1 60); do
+            ssm_status="$(aws ssm describe-instance-information \
+              --region "$AWS_REGION" \
+              --filters "Key=InstanceIds,Values=$instance_id" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text 2>/dev/null || true)"
+            if [ "${ssm_status:-}" = "Online" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "${ssm_status:-}" != "Online" ]; then
+            echo "bootstrap instance did not reach SSM Online status; cannot restart service to reload auth secrets" >&2
+            exit 1
+          fi
+
+          command_id="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$instance_id" \
+            --document-name AWS-RunShellScript \
+            --comment "restart burn-p2p-bootstrap to reload auth secrets" \
+            --parameters 'commands=[
+              "set -eu",
+              "/usr/local/bin/burn-dragon-p2p-sync-secrets",
+              "systemctl restart burn-p2p-bootstrap",
+              "systemctl is-active burn-p2p-bootstrap",
+              "journalctl -u burn-p2p-bootstrap --no-pager -n 40 || true"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          for attempt in $(seq 1 30); do
+            invocation_status="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)"
+            case "$invocation_status" in
+              Success)
+                break
+                ;;
+              Cancelled|TimedOut|Failed|Cancelling)
+                echo "bootstrap restart failed with status ${invocation_status}" >&2
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$command_id" \
+                  --instance-id "$instance_id" \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$instance_id" \
+            --output json
+
       - name: wait for bootstrap api/auth edge https health
         id: edge_health
         shell: bash
@@ -1196,6 +1269,46 @@ jobs:
           done
           echo "edge did not become healthy: $edge_url" >&2
           exit 1
+
+      - name: verify auth authorize url is fully configured
+        if: ${{ env.AUTH_CONNECTOR_KIND == 'github' || env.AUTH_CONNECTOR_KIND == 'oidc' || env.AUTH_CONNECTOR_KIND == 'oauth' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_url="${{ steps.outputs.outputs.edge_url }}"
+          case "${AUTH_CONNECTOR_KIND}" in
+            github) login_path="/login/github" ;;
+            oidc) login_path="/login/oidc" ;;
+            oauth) login_path="/login/oauth" ;;
+            *)
+              echo "unsupported auth connector kind ${AUTH_CONNECTOR_KIND}" >&2
+              exit 1
+              ;;
+          esac
+
+          login_json="$(curl --fail --silent --show-error \
+            -X POST "${edge_url}${login_path}" \
+            -H 'content-type: application/json' \
+            --data "{\"network_id\":\"${TF_VAR_network_id}\",\"principal_hint\":null,\"requested_scopes\":[\"Connect\"]}")"
+
+          python3 - "$login_json" <<'PY'
+import json
+import sys
+from urllib.parse import urlparse, parse_qs
+
+payload = json.loads(sys.argv[1])
+authorize_url = payload.get("authorize_url")
+if not authorize_url:
+    raise SystemExit("missing authorize_url in login response")
+
+query = parse_qs(urlparse(authorize_url).query)
+missing = [key for key in ("client_id", "redirect_uri", "state") if not query.get(key)]
+if missing:
+    raise SystemExit(
+        f"authorize_url is missing required query params {missing}: {authorize_url}"
+    )
+print(authorize_url)
+PY
 
       - name: capture bootstrap diagnostics on health failure
         if: ${{ failure() && steps.outputs.outputs.instance_id != '' }}

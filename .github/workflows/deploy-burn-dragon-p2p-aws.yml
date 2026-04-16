@@ -1777,9 +1777,11 @@ jobs:
               --experiment-kind nca \
               --backend cpu \
               --check-metrics-catchup \
+              --check-artifact-head-view \
               --require-head-published \
               --require-directory-entry-published \
               --require-metrics-catchup \
+              --require-artifact-head-view \
               "${auth_flags[@]}" \
               --assert-ready \
               --output "$report_path" \
@@ -1813,6 +1815,7 @@ jobs:
           readiness = report.get("readiness") or {}
           profile_resolution = (report.get("profile_resolution") or {}).get("value") or {}
           edge_snapshot = (report.get("edge_snapshot") or {}).get("value") or {}
+          artifact_head_view = report.get("artifact_head_view") or {}
           blockers = readiness.get("blocking_issues") or []
           warnings = readiness.get("observed_warnings") or []
 
@@ -1823,6 +1826,7 @@ jobs:
           print(f"- Matching head present: `{edge_snapshot.get('matching_head_present', False)}`")
           print(f"- Matching head id: `{edge_snapshot.get('matching_head_id') or 'none'}`")
           print(f"- Matching directory entry present: `{edge_snapshot.get('matching_directory_entry_present', False)}`")
+          print(f"- Artifact head probe ok: `{artifact_head_view.get('ok', False)}`")
           print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")
           print(f"- Warnings: `{', '.join(warnings) if warnings else 'none'}`")
           PY

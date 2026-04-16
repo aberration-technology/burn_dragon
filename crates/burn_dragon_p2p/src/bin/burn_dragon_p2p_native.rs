@@ -228,6 +228,8 @@ struct DeploymentDiagnosticsArgs {
     #[arg(long, default_value_t = false)]
     check_auth_authorize: bool,
     #[arg(long, default_value_t = false)]
+    check_artifact_head_view: bool,
+    #[arg(long, default_value_t = false)]
     require_head_published: bool,
     #[arg(long, default_value_t = false)]
     require_directory_entry_published: bool,
@@ -235,6 +237,8 @@ struct DeploymentDiagnosticsArgs {
     require_metrics_catchup: bool,
     #[arg(long, default_value_t = false)]
     require_auth_authorize: bool,
+    #[arg(long, default_value_t = false)]
+    require_artifact_head_view: bool,
     #[arg(long, default_value_t = false)]
     assert_ready: bool,
 }
@@ -579,10 +583,12 @@ fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
         DeploymentDiagnosticsOptions {
             check_metrics_catchup: args.check_metrics_catchup,
             check_auth_authorize: args.check_auth_authorize,
+            check_artifact_head_view: args.check_artifact_head_view,
             require_head_published: args.require_head_published,
             require_directory_entry_published: args.require_directory_entry_published,
             require_metrics_catchup: args.require_metrics_catchup,
             require_auth_authorize: args.require_auth_authorize,
+            require_artifact_head_view: args.require_artifact_head_view,
         },
     );
     write_output(args.output.as_deref(), args.output_format, &report)?;

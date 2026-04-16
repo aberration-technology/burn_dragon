@@ -27,10 +27,12 @@ use crate::profile::{
 pub struct DeploymentDiagnosticsOptions {
     pub check_metrics_catchup: bool,
     pub check_auth_authorize: bool,
+    pub check_artifact_head_view: bool,
     pub require_head_published: bool,
     pub require_directory_entry_published: bool,
     pub require_metrics_catchup: bool,
     pub require_auth_authorize: bool,
+    pub require_artifact_head_view: bool,
 }
 
 #[cfg(feature = "native")]
@@ -43,6 +45,7 @@ pub struct DeploymentDiagnosticsReport {
     pub profile_resolution: DeploymentCheck<DeploymentProfileResolutionSummary>,
     pub metrics_catchup: Option<DeploymentCheck<DeploymentHttpProbe>>,
     pub auth_authorize: Option<DeploymentCheck<DeploymentAuthorizeProbe>>,
+    pub artifact_head_view: Option<DeploymentCheck<DeploymentArtifactHeadProbe>>,
     pub readiness: DeploymentReadinessReport,
 }
 
@@ -106,6 +109,14 @@ pub struct DeploymentAuthorizeProbe {
     pub login_path: String,
     pub redirect_uri: Option<String>,
     pub missing_query_params: Vec<String>,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Serialize)]
+pub struct DeploymentArtifactHeadProbe {
+    pub url: String,
+    pub status_code: u16,
+    pub head_id: String,
 }
 
 #[cfg(feature = "native")]
@@ -181,16 +192,29 @@ pub fn collect_deployment_diagnostics(
         None
     };
 
+    let artifact_head_view = if options.check_artifact_head_view {
+        Some(
+            match probe_artifact_head_view(config, edge_snapshot.value.as_ref()) {
+                Ok(value) => DeploymentCheck::ok(value),
+                Err(error) => DeploymentCheck::err(error),
+            },
+        )
+    } else {
+        None
+    };
+
     let readiness = evaluate_deployment_readiness(
         &capability,
         &edge_snapshot,
         &profile_resolution,
         metrics_catchup.as_ref(),
         auth_authorize.as_ref(),
+        artifact_head_view.as_ref(),
         options.require_head_published,
         options.require_directory_entry_published,
         options.require_metrics_catchup,
         options.require_auth_authorize,
+        options.require_artifact_head_view,
     );
 
     DeploymentDiagnosticsReport {
@@ -201,6 +225,7 @@ pub fn collect_deployment_diagnostics(
         profile_resolution,
         metrics_catchup,
         auth_authorize,
+        artifact_head_view,
         readiness,
     }
 }
@@ -354,16 +379,55 @@ fn probe_auth_authorize(config: &DragonNativePeerConfig) -> Result<DeploymentAut
     })
 }
 
+#[cfg(feature = "native")]
+fn probe_artifact_head_view(
+    config: &DragonNativePeerConfig,
+    edge_snapshot: Option<&DeploymentEdgeSnapshotSummary>,
+) -> Result<DeploymentArtifactHeadProbe> {
+    let edge_base_url = config
+        .effective_edge_base_url()
+        .ok_or_else(|| anyhow!("no edge base URL configured"))?;
+    let head_id = edge_snapshot
+        .and_then(|snapshot| snapshot.matching_head_id.clone())
+        .ok_or_else(|| anyhow!("edge snapshot does not expose a matching head id"))?;
+    let url = format!(
+        "{}/artifacts/heads/{}",
+        edge_base_url.trim_end_matches('/'),
+        head_id
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build async runtime for head artifact probe")?;
+    runtime.block_on(async {
+        let response = Client::new().get(&url).send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("{} {}", status.as_u16(), trim_preview(&body));
+        }
+        serde_json::from_str::<serde_json::Value>(&body)
+            .context("failed to decode artifact head response")?;
+        Ok(DeploymentArtifactHeadProbe {
+            url,
+            status_code: status.as_u16(),
+            head_id,
+        })
+    })
+}
+
 pub fn evaluate_deployment_readiness(
     capability: &DeploymentCheck<DragonNativeCapabilityAssessment>,
     edge_snapshot: &DeploymentCheck<DeploymentEdgeSnapshotSummary>,
     profile_resolution: &DeploymentCheck<DeploymentProfileResolutionSummary>,
     metrics_catchup: Option<&DeploymentCheck<DeploymentHttpProbe>>,
     auth_authorize: Option<&DeploymentCheck<DeploymentAuthorizeProbe>>,
+    artifact_head_view: Option<&DeploymentCheck<DeploymentArtifactHeadProbe>>,
     require_head_published: bool,
     require_directory_entry_published: bool,
     require_metrics_catchup: bool,
     require_auth_authorize: bool,
+    require_artifact_head_view: bool,
 ) -> DeploymentReadinessReport {
     let mut blocking_issues = Vec::new();
     let mut observed_warnings = Vec::new();
@@ -425,6 +489,16 @@ pub fn evaluate_deployment_readiness(
                 blocking_issues.push("auth_authorize_query_incomplete".into());
             } else {
                 observed_warnings.push("auth_authorize_query_incomplete".into());
+            }
+        }
+    }
+
+    if let Some(artifact_head_view) = artifact_head_view {
+        if !artifact_head_view.ok {
+            if require_artifact_head_view {
+                blocking_issues.push("artifact_head_view_probe_failed".into());
+            } else {
+                observed_warnings.push("artifact_head_view_probe_failed".into());
             }
         }
     }
@@ -535,7 +609,9 @@ mod tests {
             &profile_check(),
             None,
             None,
+            None,
             true,
+            false,
             false,
             false,
             false,
@@ -557,6 +633,8 @@ mod tests {
             &profile_check(),
             None,
             None,
+            None,
+            false,
             false,
             false,
             false,
@@ -584,10 +662,12 @@ mod tests {
                 redirect_uri: None,
                 missing_query_params: vec!["redirect_uri".into()],
             })),
+            None,
             false,
             false,
             false,
             true,
+            false,
         );
 
         assert!(!readiness.ready);
@@ -611,8 +691,10 @@ mod tests {
             &profile_check(),
             None,
             None,
+            None,
             true,
             true,
+            false,
             false,
             false,
         );
@@ -622,6 +704,30 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"matching_directory_entry_missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_artifact_head_view_when_requested() {
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge_check(true),
+            &profile_check(),
+            None,
+            None,
+            Some(&DeploymentCheck::err(anyhow!("502 bad gateway"))),
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"artifact_head_view_probe_failed".to_owned())
         );
     }
 }

@@ -25,8 +25,7 @@ use crate::admin::{
 };
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
-    load_browser_session,
-    provider_code_from_window_location,
+    load_browser_session, provider_code_from_window_location,
 };
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 use crate::capability_state::apply_browser_downgrade_state;
@@ -1854,7 +1853,10 @@ fn EditorTextareaField(
 #[cfg(test)]
 mod tests {
     use super::{browser_session_is_authenticated, normalized_browser_callback_url};
-    use burn_p2p::{AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession};
+    use burn_p2p::{
+        AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId,
+        PrincipalSession,
+    };
     use burn_p2p_browser::BrowserSessionState;
     use chrono::Utc;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1877,7 +1879,9 @@ mod tests {
 
     #[test]
     fn browser_session_authentication_requires_session_claims() {
-        assert!(!browser_session_is_authenticated(&BrowserSessionState::default()));
+        assert!(!browser_session_is_authenticated(
+            &BrowserSessionState::default()
+        ));
 
         let now = Utc::now();
         let session = BrowserSessionState {

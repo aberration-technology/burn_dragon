@@ -215,7 +215,7 @@ jobs:
           VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}
           INPUT_SOURCE_SNAPSHOT_REGION: ${{ github.event.inputs.source_snapshot_region }}
           INPUT_RESTORE_FROM_LATEST_SNAPSHOTS: ${{ github.event.inputs.restore_from_latest_snapshots }}
-          INPUT_BOOTSTRAP_DATA_SNAPSHOT_ID: ${{ github.event.inputs.bootstrap_data_snapshot_id }}
+          INPUT_BOOTSTRAP_PRIMARY_RESTORE_SNAPSHOT_ID: ${{ github.event.inputs.bootstrap_primary_restore_snapshot_id }}
           INPUT_NEXT_DISASTER_RECOVERY_REGION: ${{ github.event.inputs.next_disaster_recovery_region }}
           INPUT_PLAN_ONLY: ${{ github.event.inputs.plan_only }}
           GITHUB_REPOSITORY_OWNER_CONTEXT: ${{ github.repository_owner }}

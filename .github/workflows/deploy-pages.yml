@@ -111,22 +111,30 @@ jobs:
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "edge.dragon.aberration.technology"; print(f"/dns4/{host}/udp/4001/webrtc-direct,/dns4/{host}/tcp/443/wss")' "$edge_base_url")"
           fi
-          python3 - "$seed_node_urls" <<'PY'
-import sys
-
-raw = sys.argv[1].strip()
-seed_urls = [seed.strip() for seed in raw.split(",") if seed.strip()]
-if not seed_urls:
-    raise SystemExit("browser pages deploy requires at least one seed multiaddr")
-
-browser_capable = ("webrtc-direct", "webtransport", "/wss", "/ws")
-if not any(any(marker in seed for marker in browser_capable) for seed in seed_urls):
-    raise SystemExit(
-        "browser pages deploy requires at least one browser-capable seed multiaddr "
-        "(expected webrtc-direct, webtransport, or wss/ws); "
-        f"got: {', '.join(seed_urls)}"
-    )
-PY
+          IFS=',' read -r -a seed_node_url_array <<<"$seed_node_urls"
+          browser_seed_count=0
+          browser_capable_seed_count=0
+          for seed in "${seed_node_url_array[@]}"; do
+            seed="${seed#"${seed%%[![:space:]]*}"}"
+            seed="${seed%"${seed##*[![:space:]]}"}"
+            if [ -z "$seed" ]; then
+              continue
+            fi
+            browser_seed_count=$((browser_seed_count + 1))
+            case "$seed" in
+              *webrtc-direct*|*webtransport*|*/wss*|*/ws*)
+                browser_capable_seed_count=$((browser_capable_seed_count + 1))
+                ;;
+            esac
+          done
+          if [ "$browser_seed_count" -eq 0 ]; then
+            echo "browser pages deploy requires at least one seed multiaddr" >&2
+            exit 1
+          fi
+          if [ "$browser_capable_seed_count" -eq 0 ]; then
+            echo "browser pages deploy requires at least one browser-capable seed multiaddr (expected webrtc-direct, webtransport, or wss/ws); got: $seed_node_urls" >&2
+            exit 1
+          fi
           site_host="$(python3 -c 'from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or "")' "$browser_app_base_url")"
 
           {

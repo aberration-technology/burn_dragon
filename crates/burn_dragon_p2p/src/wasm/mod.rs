@@ -17,6 +17,7 @@ use burn_p2p_views::{
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
+use std::cell::RefCell;
 use url::form_urlencoded;
 
 use crate::admin::{
@@ -44,6 +45,10 @@ pub mod training;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const CHECKPOINT_WAIT_REFRESH_INTERVAL_MILLIS: u32 = 5_000;
+
+thread_local! {
+    static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };
+}
 
 #[cfg(feature = "wasm-peer")]
 fn browser_backend_label(config: &crate::config::DragonBrowserTrainingConfig) -> &'static str {
@@ -477,15 +482,26 @@ fn find_directory_entry(
 
 pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
     let controller = BrowserAppController::connect_with(connect_config(config)?).await?;
-    Ok(controller.view())
+    let view = controller.view();
+    DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
+        *slot.borrow_mut() = Some(controller);
+    });
+    Ok(view)
 }
 
 pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    connect_browser_app(config).await
-}
-
-fn browser_view_has_active_checkpoint(view: &BrowserAppClientView) -> bool {
-    view.training.latest_head_id.is_some() || view.training.last_artifact_id.is_some()
+    let mut controller = if let Some(controller) =
+        DRAGON_BROWSER_APP_CONTROLLER.with(|slot| slot.borrow_mut().take())
+    {
+        controller
+    } else {
+        BrowserAppController::connect_with(connect_config(config)?).await?
+    };
+    let refresh_result = controller.refresh().await.map(|_| controller.view());
+    DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
+        *slot.borrow_mut() = Some(controller);
+    });
+    Ok(refresh_result?)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -505,19 +521,11 @@ fn spawn_checkpoint_wait_refresh(
             }
             match refresh_browser_app(&config).await {
                 Ok(view) => {
-                    let has_checkpoint = browser_view_has_active_checkpoint(&view);
                     current_view.set(Some(view));
-                    if has_checkpoint {
-                        let current_generation = *checkpoint_wait_generation.read();
-                        checkpoint_wait_generation.set(current_generation.saturating_add(1));
-                        break;
-                    }
+                    status.set(String::new());
                 }
                 Err(error) => {
                     status.set(error.to_string());
-                    let current_generation = *checkpoint_wait_generation.read();
-                    checkpoint_wait_generation.set(current_generation.saturating_add(1));
-                    break;
                 }
             }
         }
@@ -645,16 +653,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
                         if let Ok(view) = connect_browser_app(&config).await {
-                            let has_checkpoint = browser_view_has_active_checkpoint(&view);
                             current_view.set(Some(view));
-                            if !has_checkpoint {
-                                spawn_checkpoint_wait_refresh(
-                                    config.clone(),
-                                    current_view,
-                                    status,
-                                    checkpoint_wait_generation,
-                                );
-                            }
+                            spawn_checkpoint_wait_refresh(
+                                config.clone(),
+                                current_view,
+                                status,
+                                checkpoint_wait_generation,
+                            );
                         }
                         if provider_code_from_window_location().is_some() {
                             status.set(String::new());
@@ -690,7 +695,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 status.set("Connecting…".into());
                 match connect_browser_app(&next_config).await {
                     Ok(view) => {
-                        let has_checkpoint = browser_view_has_active_checkpoint(&view);
                         current_view.set(Some(view));
                         let session = match resolved_edge_base_url(&next_config) {
                             Ok(edge_base_url) => load_browser_session(&edge_base_url)
@@ -701,14 +705,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         };
                         session_state.set(session);
                         status.set(String::new());
-                        if !has_checkpoint {
-                            spawn_checkpoint_wait_refresh(
-                                next_config,
-                                current_view,
-                                status,
-                                checkpoint_wait_generation,
-                            );
-                        }
+                        spawn_checkpoint_wait_refresh(
+                            next_config,
+                            current_view,
+                            status,
+                            checkpoint_wait_generation,
+                        );
                     }
                     Err(error) => status.set(error.to_string()),
                 }

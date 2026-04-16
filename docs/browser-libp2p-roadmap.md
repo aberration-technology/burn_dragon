@@ -1,25 +1,122 @@
 # Browser Libp2p Roadmap
 
 This document is the implementation handoff for moving browser peers from the
-current edge-mediated runtime to a real browser-capable libp2p participation
-model.
+current edge-mediated runtime to a browser-capable libp2p runtime that behaves
+much more like the native swarm.
 
-It is written from the perspective of `burn_dragon`, but most of the required
-work belongs in `burn_p2p`.
+It is written from the perspective of `burn_dragon`, but almost all transport
+and swarm work belongs in `burn_p2p`.
+
+## Executive Summary
+
+The target architecture is:
+
+1. browser authenticates and bootstraps through the edge
+2. browser receives signed swarm bootstrap material from the edge
+3. browser dials real bootstrap/seed multiaddrs directly
+4. browser joins overlays and receives steady-state updates from the swarm
+5. browser fetches artifacts from peers first and uses the edge only as a
+   fallback
+
+The implementation constraint is explicit:
+
+- browser swarm logic should stay in Rust/wasm
+- JS should be a thin transport bridge only where browser APIs force it
+- `burn_dragon` should consume a finished browser swarm abstraction, not
+  reimplement transport logic itself
+
+## Problem Statement
+
+Today the browser runtime is useful, but it is not a first-class libp2p swarm
+peer in the same sense as the native runtime.
+
+Current symptoms:
+
+- browser state is still edge-mediated for the critical path
+- transport status is partially synthetic
+- peer counts are not fully real
+- steady-state updates still depend on HTTP surfaces
+- artifact fetch still depends heavily on edge routes
+- deployment can look healthy while browser peer behavior is still degraded
+
+That is good enough for a bootstrap product, but it is not the right long-term
+shape if browser peers are expected to operate like real network participants.
 
 ## Goal
 
 After browser auth/bootstrap completes, a browser peer should:
 
 - dial real seed/bootstrap multiaddrs directly
-- establish a real browser-capable peer transport
-- participate in steady-state directory/head/metrics/artifact sync through the
-  swarm instead of edge polling
-- expose real peer/transport status in the UI and diagnostics
+- establish a real browser-capable libp2p transport
+- subscribe to the same overlays a native peer needs for assignment/head sync
+- receive steady-state directory/head/metrics/artifact updates from the swarm
+- report real transport, real peers, and real sync state in diagnostics/UI
 
-The target is not strict equivalence with native nodes. Browsers cannot use the
-same transport surface as native peers. The target is first-class swarm
-participation over browser-capable transports.
+The target is not byte-for-byte equivalence with native nodes. Browsers cannot
+use raw TCP or raw QUIC. The target is first-class swarm participation over
+browser-capable transports.
+
+## Non-Goals
+
+- removing the edge entirely
+- making browsers use native-only transports
+- putting substantial swarm logic in JS
+- forcing `burn_dragon` to own browser transport internals that belong in
+  `burn_p2p`
+
+## Design Principles
+
+### Wasm First
+
+Browser runtime logic should live in Rust/wasm:
+
+- connection lifecycle
+- peer state
+- overlay joins
+- artifact routing policy
+- retry logic
+- sync orchestration
+- diagnostics/state exposure
+
+JS is acceptable only for:
+
+- exposing browser-only transport primitives that Rust libp2p cannot currently
+  reach directly
+- small bindings to browser APIs
+- feature detection for browser transport support
+
+The design should treat JS as a narrow adapter, not as the browser swarm
+runtime.
+
+### Edge For Bootstrap, Swarm For Steady State
+
+The edge remains important, but its role should narrow to:
+
+- auth start / callback / enroll
+- trust/policy distribution
+- signed bootstrap material
+- recovery fallback
+- diagnostics surfaces
+
+The edge should not remain the normal steady-state source for:
+
+- head propagation
+- directory assignment
+- metrics synchronization
+- artifact fetch
+
+### Truthful State
+
+The browser UI and diagnostics must report:
+
+- what is configured
+- what was attempted
+- what is actually connected
+- what transport is actually active
+- where the current data came from
+
+No state should be inferred from “recommended transport” or “edge snapshot was
+reachable.”
 
 ## Current State
 
@@ -29,46 +126,54 @@ Evidence:
 
 - `burn_p2p_swarm` keeps the real libp2p swarm builder and transport stack
   behind native-only cfg gates in
-  [lib.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_swarm/src/lib.rs#L14).
+  [lib.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_swarm/src/lib.rs#L14)
 - the browser control-plane client is HTTP-backed in
-  [browser_edge.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_swarm/src/browser_edge.rs#L24).
+  [browser_edge.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_swarm/src/browser_edge.rs#L24)
 - the Dragon browser runtime starts from the edge snapshot and then syncs
   runtime state through the edge client in
-  [training.rs](/home/mosure/repos/burn_dragon/crates/burn_dragon_p2p/src/wasm/training.rs#L820).
+  [training.rs](/home/mosure/repos/burn_dragon/crates/burn_dragon_p2p/src/wasm/training.rs#L820)
 - browser transport selection is currently a recommendation, not a live dialed
   transport, in
   [transport.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/transport.rs#L115)
   and
-  [worker.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/worker.rs#L792).
-- the browser app currently derives "direct peers" from `transport.active` in
-  [app.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/app.rs#L259),
-  which is not a real peer count.
-- `seed_node_urls` exist in browser config in
-  [site_config.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/site_config.rs#L6)
-  and Dragon config in
-  [config.rs](/home/mosure/repos/burn_dragon/crates/burn_dragon_p2p/src/config.rs#L154),
-  but the current browser connect path does not dial them through a browser
-  swarm runtime.
+  [worker.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/worker.rs#L792)
+- the browser app currently derives “direct peers” from `transport.active` in
+  [app.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/app.rs#L259)
+- `seed_node_urls` exist in browser config, but the current browser connect
+  path does not use them through a real browser swarm runtime
 
-There is one useful precursor already:
+There is one precursor already:
 
-- browser-side artifact fetch can optionally use a peer-swarm JS bridge in
+- browser-side artifact fetch can optionally use a peer transport hook in
   [auth.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/auth.rs#L1486)
   and
   [auth.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/auth.rs#L2045)
 
-That is not a full solution. It is only a narrow artifact-fetch hook.
+That is useful, but it is only a narrow artifact path, not a browser swarm.
 
-## Live Production Constraint
+## Target Symmetry Model
 
-The current production edge at `dragon.aberration.technology` advertises:
+Browser and native peers should become symmetric along the following axes.
 
-- `webrtc_direct = true`
-- `webtransport_gateway = false`
-- `wss_fallback = true`
+### Symmetric
 
-So even the deployment surface is not yet configured for the desired
-WebTransport-capable browser path.
+- both have a real peer identity
+- both dial real seed/bootstrap addresses
+- both join real overlays
+- both learn heads from the swarm
+- both learn directory/assignment from the swarm
+- both prefer peer artifact transport
+- both expose real connected peers and transport state
+
+### Intentionally Asymmetric
+
+- native peers may use TCP/QUIC; browser peers may not
+- browser auth/bootstrap depends on browser-facing edge flows
+- browser transport backend may need a thin adapter for WebRTC/WebTransport
+- browser resource limits and background lifecycle are stricter
+
+The target is not “identical implementation.” It is “same network role, browser
+appropriate transport surface.”
 
 ## Target Architecture
 
@@ -77,40 +182,41 @@ The desired split is:
 1. edge HTTP for auth/bootstrap/fallback only
 2. browser swarm runtime for steady-state peer participation
 
-Edge responsibilities:
+### Edge Responsibilities
 
 - login start / callback / enroll
 - trust bundle and policy distribution
+- signed browser seed advertisement
 - initial signed directory/head bootstrap material
-- diagnostics and recovery fallback
+- diagnostics and operator fallback
+- optional artifact fallback
 
-Browser swarm responsibilities:
+### Browser Swarm Responsibilities
 
-- direct seed dialing from `seed_node_urls`
+- direct seed dialing from signed/bootstrap seed set
+- transport establishment
 - overlay/topic subscription
 - steady-state directory/head/metrics propagation
 - peer artifact fetch and chunk fetch
-- actual peer presence and transport status
+- real peer presence and transport reporting
 
-## Bootstrap Source Of Truth
+## Browser Bootstrap Source Of Truth
 
-The roadmap should not rely only on statically baked `seed_node_urls`.
+The roadmap should not rely only on static `seed_node_urls`.
 
-That is too brittle for the real deployment model because:
+That is too brittle because:
 
 - Pages artifacts can outlive infra changes
 - bootstrap transport addresses can change across deploys
-- the browser still needs an authenticated bootstrap path anyway
+- transport policy can change independently of the site artifact
 
 Preferred model:
 
 1. browser authenticates through the edge
-2. browser fetches a signed browser-dialable seed set from the edge bootstrap
-   surface
-3. browser reconciles that signed seed set with any statically baked
-   `seed_node_urls`
+2. browser fetches a signed browser seed advertisement from the edge
+3. browser reconciles that with any statically baked `seed_node_urls`
 4. browser dials the signed set first
-5. static seed URLs remain fallback only
+5. static site-config seeds remain fallback only
 
 Required output in `burn_p2p`:
 
@@ -123,40 +229,246 @@ Required output in `burn_p2p`:
   - `site_config_fallback`
   - `merged`
 
-## Non-Goals
+## Signed Browser Seed Advertisement
 
-- removing the edge completely
-- making browsers use native-only transports like TCP or QUIC directly
-- making `burn_dragon` own browser transport internals that belong in
-  `burn_p2p`
+`burn_p2p` should define a stable signed payload similar to:
 
-## Repository Ownership
+```json
+{
+  "network_id": "burn-dragon-mainnet",
+  "issued_at": "2026-04-16T00:00:00Z",
+  "expires_at": "2026-04-16T01:00:00Z",
+  "transport_policy": {
+    "preferred": ["webrtc-direct", "webtransport", "wss-fallback"],
+    "allow_fallback_wss": true
+  },
+  "seeds": [
+    {
+      "peer_id": "12D3KooW...",
+      "multiaddrs": [
+        "/dns4/edge.dragon.aberration.technology/udp/4001/webrtc-direct",
+        "/dns4/edge.dragon.aberration.technology/udp/443/webtransport",
+        "/dns4/edge.dragon.aberration.technology/tcp/443/wss"
+      ]
+    }
+  ],
+  "signature": "..."
+}
+```
 
-### `burn_p2p`
+Required properties:
 
-Primary ownership:
+- scoped to one network
+- short-lived
+- signed by the deployment authority
+- explicit about transport priority
+- explicit about fallback policy
 
-- browser swarm transport/runtime
-- browser-capable transport policy
-- browser control-plane/swarm sync model
-- browser artifact peer transport
-- browser transport diagnostics
-- browser acceptance tests
+## Transport Strategy
 
-Likely crates:
+Recommended order:
 
-- `burn_p2p_swarm`
-- `burn_p2p_browser`
-- possibly `burn_p2p_core` for diagnostics/state contracts
+1. WebRTC direct
+2. WebTransport
+3. WSS fallback
+
+Rationale:
+
+- WebRTC direct is the closest browser-native peer path
+- WebTransport is a real browser-capable transport and a good second option
+- WSS fallback can preserve reachability, but should be treated as degraded
+
+`burn_p2p` should represent transport state explicitly:
+
+- `unresolved`
+- `dialing_webrtc`
+- `connected_webrtc`
+- `dialing_webtransport`
+- `connected_webtransport`
+- `dialing_wss`
+- `connected_wss`
+- `failed`
+
+The UI should not flatten that to a single “connected” label.
+
+## Browser Runtime State Machine
+
+The browser runtime should expose a first-class state machine:
+
+1. `unauthenticated`
+2. `auth_bootstrap`
+3. `signed_seed_resolved`
+4. `dialing_seed`
+5. `transport_connected`
+6. `overlay_joining`
+7. `overlay_joined`
+8. `directory_synced`
+9. `head_synced`
+10. `artifact_ready`
+11. `training_ready`
+12. `training_active`
+13. `degraded_fallback`
+14. `failed`
+
+Each transition needs:
+
+- cause
+- timestamp
+- active transport
+- connected peer count
+- last error
+
+This must be library state in `burn_p2p`, not ad hoc UI state in `burn_dragon`.
+
+## Bootstrap Sequence
+
+Expected browser startup flow:
+
+1. load site config
+2. load durable browser session
+3. if no session, remain `unauthenticated`
+4. if session exists:
+   - fetch edge snapshot
+   - fetch signed seed advertisement
+   - fetch trust bundle / policy
+5. merge signed seeds with static seeds
+6. dial seeds in preferred transport order
+7. establish transport
+8. join overlays
+9. receive directory/head updates
+10. fetch active checkpoint artifact if needed
+11. enter `training_ready`
+
+Failure handling:
+
+- if seed advertisement fetch fails, attempt `site_config_fallback`
+- if direct swarm join fails, enter `degraded_fallback`
+- edge polling fallback should be explicit and visible, not silent
+
+## Overlay Participation Requirements
+
+The browser runtime should not stop at “connected transport.”
+
+Required overlay participation:
+
+- directory/assignment overlay
+- head announcement overlay
+- metrics live/catchup overlay if applicable
+- artifact provider discovery overlay if separate
+
+Required diagnostics:
+
+- joined overlays
+- failed overlays
+- last subscription error
+- current assignment source:
+  - `swarm`
+  - `edge_fallback`
+
+## Artifact Transport Model
+
+Artifact fetch should become symmetric too.
+
+Preferred artifact order:
+
+1. peer swarm direct provider fetch
+2. browser transport relay/gateway if necessary
+3. edge HTTP fallback
+
+Required browser diagnostics:
+
+- active head artifact source
+- artifact provider peer ids
+- chunk source counts
+- fallback reason if edge was used
+
+Required invariants:
+
+- peer artifact transport verifies manifest and chunk integrity exactly like
+  edge fallback
+- edge fallback is visible in runtime state
+- successful peer transport should populate real provider peer ids in browser
+  state
+
+## Proposed `burn_p2p` Integration Contract
+
+The first engineer should not have to invent the runtime boundary from scratch.
+
+Recommended library contract:
+
+### `BrowserSwarmBootstrap`
+
+- authenticated browser identity/session handle
+- trust bundle
+- selected experiment/revision
+- browser-dialable signed seed advertisement
+- site-config fallback seeds
+- transport policy
+
+### `BrowserSwarmStatus`
+
+- bootstrap source
+- desired transport
+- connected transport
+- connected peer ids
+- joined overlays
+- assignment source
+- head sync state
+- artifact transport mode
+- last dial/sync error
+- current phase in the runtime state machine
+
+### `BrowserSwarmRuntime`
+
+- `connect(bootstrap)`
+- `disconnect()`
+- `status()`
+- `subscribe_directory()`
+- `subscribe_heads()`
+- `subscribe_metrics()`
+- `fetch_artifact_manifest()`
+- `fetch_artifact_chunk()`
+- `force_edge_resync()`
+
+`burn_p2p_browser` should consume this contract and stop synthesizing
+connection state from HTTP snapshot state.
+
+## Crate Ownership
+
+### `burn_p2p_core`
+
+Own:
+
+- signed browser seed advertisement schema
+- transport/status enums
+- browser swarm diagnostics schema
+
+### `burn_p2p_swarm`
+
+Own:
+
+- browser swarm runtime abstraction
+- browser-capable transport backend
+- overlay join logic
+- seed dialing and retry policy
+
+### `burn_p2p_browser`
+
+Own:
+
+- browser app wiring to the new runtime
+- durable browser session to swarm bootstrap translation
+- truthful UI/runtime state exposure
+- edge fallback orchestration
 
 ### `burn_dragon`
 
-Consumer ownership:
+Own:
 
-- passes edge URL and seed URLs
-- renders real connection state
-- deploys bootstrap nodes with the correct browser-capable listeners enabled
-- adds product-facing diagnostics for browser users
+- passes site config, edge URL, fallback seeds
+- presents product-facing state
+- deploys browser-capable listeners and seed advertisements
+- adds deployment/browser canaries
 
 ## Phase Plan
 
@@ -177,96 +489,99 @@ Required:
 - stop presenting `transport.active` as proof of a live swarm connection
 - stop deriving peer count from `transport.active.is_some()`
 
-Acceptance:
+Exit criteria:
 
-- unsigned and signed browser UI both distinguish:
+- signed and unsigned browser UI can distinguish:
   - edge bootstrap only
   - transport selected
   - transport connected
+  - overlay joined
 - deployment diagnostics can say whether browser swarm join is actually
   happening
 
-### Phase 1: Real Browser Seed Dial
+### Phase 1: Browser Seed Advertisement And Bootstrap Contract
+
+Required:
+
+- define signed browser seed advertisement schema
+- define merge policy with site-config fallback seeds
+- expose signed browser seed fetch from the edge
+- add transport-policy payload
+
+Exit criteria:
+
+- browser can consume a signed seed advertisement
+- diagnostics report the seed source used
+
+### Phase 2: Real Browser Seed Dial
 
 Introduce a browser swarm runtime in `burn_p2p`.
 
 Required:
 
 - add a browser/wasm swarm backend in `burn_p2p_swarm`
-- make browser peers dial `seed_node_urls` directly after auth/bootstrap
+- make browser peers dial bootstrap directly after auth/bootstrap
 - support at least one real browser-capable transport end to end
-- define connection lifecycle states:
-  - `bootstrap_sync`
-  - `dialing_seed`
-  - `transport_connected`
-  - `overlay_joined`
-  - `assignment_ready`
+- define connection lifecycle states
 
-Design constraint:
+Design gate:
 
-- if the current Rust libp2p line cannot cleanly support the needed browser
-  transports, use a thin runtime adapter boundary instead of burying JS glue in
-  `burn_dragon`
-
-Required decision gate before implementation:
-
-- decide whether the first real browser transport backend is:
+- decide whether the first transport backend is:
   - Rust libp2p on wasm directly
   - a JS/browser transport adapter behind a Rust trait boundary
 
-Do not start wiring browser swarm behavior into `burn_dragon` before that
-decision is made in `burn_p2p`.
+Explicit preference:
 
-Acceptance:
+- prefer Rust/wasm-first implementation
+- only use JS where browser transport APIs require a bridge
 
-- browser connects to the bootstrap node using a real browser-capable peer
-  transport
-- transport status is based on a live connection, not recommendation
-- seed dial failure is explicitly visible in diagnostics
+Exit criteria:
 
-### Phase 2: Swarm-Based State Propagation
+- browser connects to bootstrap over a real browser transport
+- transport status is based on real live connection
+- seed dial failures are explicit
+
+### Phase 3: Swarm-Based State Propagation
 
 Replace steady-state edge polling for directory/head/metrics with swarm-fed
 updates.
 
 Required:
 
-- keep edge HTTP snapshot only for bootstrap/recovery
+- keep edge snapshot only for bootstrap/recovery
 - subscribe browser peers to directory/head/metrics overlays
 - reconcile bootstrap snapshot with live swarm state
-- add recovery path back to edge snapshot if swarm join fails
+- add explicit fallback to edge snapshot if swarm join fails
 
-Acceptance:
+Exit criteria:
 
-- browser can stay current without repeatedly polling `/directory`, `/heads`,
-  and `/metrics/live/latest`
-- head updates visible from native peers propagate to the browser over the
-  swarm
+- browser can stay current without repeated `/directory`, `/heads`, or metrics
+  polling
+- head updates from native peers reach the browser through the swarm
 
-### Phase 3: Real Peer Artifact Transport
+### Phase 4: Real Peer Artifact Transport
 
 Turn the existing browser artifact hook into a real browser swarm transport.
 
 Required:
 
-- replace or formalize the ad hoc `__burnP2PArtifactSwarm` bridge in
-  [auth.rs](/home/mosure/repos/burn_p2p/crates/burn_p2p_browser/src/auth.rs#L2045)
+- replace or formalize the ad hoc peer artifact bridge
 - serve artifact manifests/chunks over the actual browser swarm transport
 - keep edge download as fallback only
 - record artifact source in runtime diagnostics
 
-Acceptance:
+Exit criteria:
 
 - browser artifact fetch prefers peer swarm when providers are available
 - chunk fetch metrics distinguish peer swarm success from edge fallback
 
-### Phase 4: Browser-First Deployment Hardening
+### Phase 5: Browser-First Deployment Hardening
 
 Make deployment intentionally support browser peers as swarm participants.
 
 Required:
 
-- bootstrap nodes advertise browser-dialable seed multiaddrs
+- bootstrap nodes advertise browser-dialable multiaddrs
 - production transport matrix is explicit:
   - WebRTC direct
   - WebTransport
@@ -274,72 +589,11 @@ Required:
 - deploy diagnostics fail if browser-capable transports are advertised but not
   actually joinable
 
-Acceptance:
+Exit criteria:
 
-- deploy validation includes a browser-capable transport probe
-- the runtime no longer reports browser transport support that production cannot
-  actually use
-
-## Proposed `burn_p2p` Integration Contract
-
-The first engineer should not have to invent the runtime boundary from scratch.
-
-Recommended library contract:
-
-- `BrowserSwarmBootstrap`
-  - authenticated browser identity/session handle
-  - trust bundle
-  - selected experiment/revision
-  - browser-dialable seed addresses
-  - transport policy
-- `BrowserSwarmStatus`
-  - bootstrap source
-  - desired transport
-  - connected transport
-  - connected peer ids
-  - overlay join state
-  - head sync state
-  - artifact transport mode
-  - last dial/sync error
-- `BrowserSwarmRuntime`
-  - `connect(bootstrap)`
-  - `disconnect()`
-  - `status()`
-  - `subscribe_directory()`
-  - `subscribe_heads()`
-  - `subscribe_metrics()`
-  - `fetch_artifact_manifest()`
-  - `fetch_artifact_chunk()`
-
-`burn_p2p_browser` should consume this contract and stop synthesizing
-connection state from HTTP snapshot state.
-
-## Transport Strategy
-
-Recommended order:
-
-1. WebRTC direct
-2. WebTransport
-3. WSS fallback
-
-Rationale:
-
-- WebRTC direct is the closest browser-native peer path
-- WebTransport is useful where direct browser-peer semantics are harder, but it
-  still gives a browser-capable transport
-- WSS fallback can preserve reachability, but it should be treated as degraded,
-  not as the ideal browser swarm path
-
-## Security Requirements
-
-Browser swarm participation changes trust boundaries. Require:
-
-- authenticated browser identity remains bound to issued cert/session identity
-- overlay join authorization remains scope-gated
-- browser peers cannot join training overlays without enrollment
-- transport-level connection does not bypass session/trust checks
-- artifact peer transport verifies manifest/chunk integrity the same way edge
-  fallback does
+- deploy validation includes browser-capable transport probes
+- production no longer reports transport support that browsers cannot actually
+  use
 
 ## Testing Matrix
 
@@ -347,8 +601,9 @@ Browser swarm participation changes trust boundaries. Require:
 
 `burn_p2p`
 
-- browser transport selection only reports connected transport after a real join
+- transport selection only reports connected transport after a real join
 - seed dial failure produces explicit diagnostics
+- signed seed advertisement merge policy is deterministic
 - overlay subscription state transitions are covered
 - artifact transport falls back correctly from peer swarm to edge HTTP
 
@@ -361,6 +616,7 @@ Browser swarm participation changes trust boundaries. Require:
   - WebRTC direct unavailable
   - WebTransport unavailable
   - WSS fallback only
+- browser receives assignment/head over swarm, not only edge bootstrap
 
 ### Deployment Validation
 
@@ -371,13 +627,59 @@ Browser swarm participation changes trust boundaries. Require:
   - no matching directory entry
   - browser transport advertised but not joinable
   - no signed browser seed advertisement is available
+  - head artifact route is broken
+
+## Security Requirements
+
+Browser swarm participation changes trust boundaries. Require:
+
+- authenticated browser identity remains bound to issued session identity
+- overlay join authorization remains scope-gated
+- browser peers cannot join training overlays without enrollment
+- transport-level connection does not bypass trust checks
+- artifact peer transport verifies manifest/chunk integrity exactly like edge
+  fallback
+- signed seed advertisement is authority-scoped, time-bounded, and network-bound
+
+## Operational Requirements
+
+Deployment/diagnostics should report:
+
+- whether browser swarm transport is actually joinable
+- whether the signed browser seed advertisement is present and valid
+- which transport family is currently enabled in production
+- whether artifact peer transport and edge fallback are both healthy
+
+Inspect/deploy tooling should capture:
+
+- signed seed advertisement payload
+- browser-capable multiaddrs
+- transport flags exposed by the edge
+- artifact route health
+- assignment/head visibility
+
+## Rollout Strategy
+
+Do not cut directly from edge-mediated browser behavior to full browser swarm
+parity.
+
+Use staged rollout:
+
+1. truthful diagnostics only
+2. signed seed advertisement
+3. real browser seed dial
+4. dual-path state propagation
+5. peer-first artifact transport
+6. deployment/browser canary required for production
+
+Each stage should be deployable without requiring the next one immediately.
 
 ## Acceptance Criteria
 
-The project should not claim "browser peers behave like native peers" until all
+The project should not claim “browser peers behave like native peers” until all
 of these are true:
 
-- browser dials `seed_node_urls` directly after auth
+- browser dials bootstrap directly after auth
 - transport label reflects a real live transport connection
 - peer count is real
 - steady-state head/directory updates come from the swarm, not edge polling
@@ -386,19 +688,46 @@ of these are true:
 
 ## First Milestone Recommendation
 
-The first useful milestone is not "full parity." It is:
+The first useful milestone is not full parity. It is:
 
 - browser authenticates through edge
+- browser consumes a signed browser seed advertisement
 - browser dials bootstrap directly
-- browser receives head and directory assignment over a real browser-capable
-  transport
+- browser receives head and directory assignment over a real browser transport
 - browser can train with bootstrap-only topology
 
-That milestone is enough to prove the architecture.
+That milestone proves the architecture without requiring every advanced swarm
+optimization immediately.
+
+## Open Decisions
+
+These decisions still belong in `burn_p2p` before implementation starts:
+
+1. exact first transport backend:
+   - Rust libp2p wasm directly
+   - or thin JS adapter behind a Rust trait boundary
+2. exact shape of the signed browser seed advertisement
+3. whether WebTransport support is required for milestone 1 or phase 4
+4. whether metrics propagation should be overlay-native immediately or may stay
+   partially edge-backed for one milestone
+
+## First PR Slices
+
+If the work is handed to an engineer or agent, split it like this:
+
+1. add signed browser seed advertisement schema to `burn_p2p_core`
+2. add truthful browser transport diagnostics to `burn_p2p_browser`
+3. add browser swarm runtime trait boundary to `burn_p2p_swarm`
+4. implement one real seed dial backend
+5. wire browser app to real runtime status
+6. add swarm-fed head/directory synchronization
+7. add peer-first artifact transport
+8. add deployment/browser canary and hard fail production when browser swarm is
+   not actually available
 
 ## Agent Handoff Checklist
 
-For the agent or engineer implementing this in `burn_p2p`:
+For the engineer or agent implementing this in `burn_p2p`:
 
 1. add a design note describing the chosen browser transport backend
 2. define the signed browser seed advertisement format and merge policy
@@ -415,11 +744,11 @@ For the agent or engineer implementing this in `burn_p2p`:
 
 Once `burn_p2p` has the first milestone:
 
-- simplify the browser UI to show:
+- simplify the browser UI to show only:
   - auth state
   - seed connection state
   - sync state
   - training readiness
-- remove any remaining synthetic transport/peer messaging
-- add a deployment check that fails if the production edge claims browser
-  transport support but the browser cannot join through it
+- remove remaining synthetic transport/peer messaging
+- add a deployment check that fails if production claims browser transport
+  support but the browser cannot actually join through it

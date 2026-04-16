@@ -470,6 +470,236 @@ Own:
 - deploys browser-capable listeners and seed advertisements
 - adds deployment/browser canaries
 
+## Protocol Surface Changes
+
+The roadmap is not complete unless the protocol surfaces that have to change are
+called out explicitly.
+
+### New Or Changed Bootstrap Surfaces
+
+`burn_p2p` should add or formalize:
+
+- one signed browser seed advertisement response
+- one browser transport policy response
+- one browser-visible runtime diagnostics response that distinguishes:
+  - edge bootstrap success
+  - seed resolution success
+  - transport success
+  - overlay join success
+
+These surfaces should be treated as bootstrap-only inputs. The browser should
+not keep polling them as its steady-state data plane.
+
+### New Browser Swarm Status Contract
+
+The browser runtime needs a stable internal state contract for:
+
+- selected transport family
+- live connected transport family
+- connected seed peer ids
+- overlay join state by topic
+- head source
+- directory/assignment source
+- artifact source
+- last fatal and last recoverable error
+
+This should exist in `burn_p2p_core` or another shared contract crate so
+diagnostics, UI, and tests use the same schema.
+
+### Artifact Transport Protocol Expectations
+
+The swarm-side artifact path must support:
+
+- manifest request
+- chunk request
+- provider discovery
+- fallback signaling
+- replay/resume when the browser tab reconnects
+
+The browser should not have to infer “peer transport probably worked” from a
+successful edge fallback.
+
+## Native And Browser Parity Targets
+
+This is the concrete parity target, not a vague aspiration.
+
+### Connection Parity
+
+Native today:
+
+- dials seeds directly
+- owns a real swarm
+- exposes real peers and overlays
+
+Browser target:
+
+- dials seeds directly after auth bootstrap
+- owns a real browser-capable swarm
+- exposes real peers and overlays
+
+### State Propagation Parity
+
+Native today:
+
+- receives head and directory state from the swarm
+
+Browser target:
+
+- receives head and directory state from the swarm after bootstrap
+- may use the edge only for initial snapshot and explicit recovery
+
+### Artifact Parity
+
+Native today:
+
+- gets artifacts from peers/CAS/publication surfaces as a real swarm participant
+
+Browser target:
+
+- gets artifacts from peers first
+- uses the edge only as explicit fallback
+
+### Diagnostics Parity
+
+Native today:
+
+- can describe real runtime state
+
+Browser target:
+
+- can describe real runtime state with no synthetic transport/peer labels
+
+## Compatibility And Rollout Rules
+
+The browser swarm rollout has to coexist with the current edge-mediated path
+without breaking existing deployments.
+
+### Feature Flag Strategy
+
+Recommended rollout flags in `burn_p2p`:
+
+- `browser_signed_seed_bootstrap`
+- `browser_swarm_seed_dial`
+- `browser_swarm_state_sync`
+- `browser_swarm_artifact_transport`
+- `browser_edge_fallback`
+
+Each stage should be able to run with the later stages disabled.
+
+### Backward Compatibility Rules
+
+- old Pages artifacts must still be able to use edge-only bootstrap
+- old bootstrap nodes must not advertise browser swarm support they cannot
+  actually satisfy
+- browser swarm transport should only be considered available when both:
+  - deployment advertises it
+  - runtime confirms it joined successfully
+
+### Protocol Versioning
+
+The signed browser seed advertisement and browser swarm diagnostics contract
+should carry an explicit version.
+
+At minimum:
+
+- `schema_version`
+- `network_id`
+- `transport_policy_version`
+
+Do not rely on “best effort JSON evolution” for the browser swarm bootstrap
+contract.
+
+## Failure And Degradation Model
+
+Browser peers need explicit, bounded degradation instead of silently falling
+back forever.
+
+Required degradation states:
+
+- `bootstrap_only`
+- `seed_resolution_failed`
+- `transport_unavailable`
+- `overlay_join_failed`
+- `artifact_peer_transport_failed`
+- `edge_fallback_active`
+- `recovery_required`
+
+Required behavior:
+
+- edge fallback should be explicit in diagnostics
+- edge fallback should not masquerade as full browser swarm success
+- deploy canaries should treat permanent fallback as degraded, not healthy
+
+## Risk Register
+
+These are the main technical risks that should be tracked up front.
+
+### Risk 1: Rust wasm transport support is insufficient
+
+Mitigation:
+
+- keep the runtime boundary in Rust
+- allow a thin JS transport adapter behind a Rust trait only if necessary
+- do not move browser swarm orchestration into JS
+
+### Risk 2: Deployment advertises transports that browsers cannot really use
+
+Mitigation:
+
+- browser-capable transport probes in deploy validation
+- production diagnostics must prove joinability, not just advertise flags
+
+### Risk 3: Browser background lifecycle breaks long-lived swarm assumptions
+
+Mitigation:
+
+- explicit suspend/resume behavior
+- resumable artifact fetch
+- reconnect path treated as first-class behavior in tests
+
+### Risk 4: Edge fallback remains the accidental steady-state path
+
+Mitigation:
+
+- explicit source reporting for head/directory/artifact state
+- canaries should fail if steady-state remains edge-backed where swarm is
+  expected
+
+## Definition Of Done By Milestone
+
+The phase plan should map to concrete “done” definitions.
+
+### Milestone 1 Done
+
+- browser consumes signed seed advertisement
+- browser dials bootstrap directly
+- browser reports a real connected transport
+- browser reports real seed peer ids
+- browser can receive a head and assignment without repeated edge polling
+
+### Milestone 2 Done
+
+- browser remains current from swarm updates
+- browser reconnect/suspend/resume is stable
+- browser UI no longer depends on synthetic peer/transport state
+
+### Milestone 3 Done
+
+- browser artifact fetch prefers peer swarm
+- edge artifact route is fallback only
+- artifact diagnostics show source and fallback reason
+
+### Production-Ready Done
+
+- deploy canary proves browser joinability
+- deploy diagnostics prove browser-capable transport health
+- browser/native peers are functionally symmetric on:
+  - seed dial
+  - overlay join
+  - head sync
+  - assignment sync
+  - artifact fetch preference
+
 ## Phase Plan
 
 ### Phase 0: Truthful Diagnostics

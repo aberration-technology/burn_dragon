@@ -31,6 +31,16 @@ on:
         required: true
         default: true
         type: boolean
+      cleanup_force_legacy_buckets:
+        description: "Force-delete exact legacy `dragon-p2p-prod-*` S3 buckets, including their contents."
+        required: true
+        default: false
+        type: boolean
+      cleanup_duplicate_dataset_certificates:
+        description: "Delete unused ACM certificates for `datasets.dragon.aberration.technology`, preserving any certificate still attached to CloudFront or otherwise in use."
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   id-token: write
@@ -47,6 +57,8 @@ jobs:
       CLEANUP_LEGACY_STACK: ${{ github.event.inputs.cleanup_legacy_stack }}
       CLEANUP_ORPHAN_CANONICAL_NETWORK: ${{ github.event.inputs.cleanup_orphan_canonical_network }}
       CLEANUP_EMPTY_LEGACY_BUCKETS: ${{ github.event.inputs.cleanup_empty_legacy_buckets }}
+      CLEANUP_FORCE_LEGACY_BUCKETS: ${{ github.event.inputs.cleanup_force_legacy_buckets }}
+      CLEANUP_DUPLICATE_DATASET_CERTIFICATES: ${{ github.event.inputs.cleanup_duplicate_dataset_certificates }}
 
     steps:
       - name: configure aws credentials
@@ -268,6 +280,91 @@ jobs:
               done
           }
 
+          force_delete_bucket() {
+            local bucket_name="$1"
+            echo "force deleting bucket ${bucket_name}"
+
+            aws s3 rm "s3://${bucket_name}" --recursive >/dev/null 2>&1 || true
+
+            local key_marker=""
+            local version_id_marker=""
+            local versions_json=""
+            while :; do
+              if [ -n "$key_marker" ]; then
+                versions_json="$(aws s3api list-object-versions --bucket "$bucket_name" --key-marker "$key_marker" --version-id-marker "$version_id_marker" --output json)"
+              else
+                versions_json="$(aws s3api list-object-versions --bucket "$bucket_name" --output json)"
+              fi
+
+              delete_payload="$(jq -c '{
+                Objects: (((.Versions // []) + (.DeleteMarkers // []))
+                  | map({Key: .Key, VersionId: .VersionId})),
+                Quiet: true
+              }' <<<"$versions_json")"
+              delete_count="$(jq '.Objects | length' <<<"$delete_payload")"
+              if [ "$delete_count" -gt 0 ]; then
+                aws s3api delete-objects --bucket "$bucket_name" --delete "$delete_payload" >/dev/null
+              fi
+
+              is_truncated="$(jq -r '.IsTruncated // false' <<<"$versions_json")"
+              if [ "$is_truncated" != "true" ]; then
+                break
+              fi
+              key_marker="$(jq -r '.NextKeyMarker // empty' <<<"$versions_json")"
+              version_id_marker="$(jq -r '.NextVersionIdMarker // empty' <<<"$versions_json")"
+            done
+
+            aws s3api delete-bucket --bucket "$bucket_name" --region "$AWS_REGION" >/dev/null || true
+          }
+
+          force_delete_buckets_by_prefix() {
+            local prefix="$1"
+            if [ "$CLEANUP_FORCE_LEGACY_BUCKETS" != "true" ]; then
+              return 0
+            fi
+
+            list_bucket_names_by_prefix "$prefix" | while read -r bucket_name; do
+              force_delete_bucket "$bucket_name"
+            done
+          }
+
+          cleanup_duplicate_dataset_certificates() {
+            if [ "$CLEANUP_DUPLICATE_DATASET_CERTIFICATES" != "true" ]; then
+              return 0
+            fi
+
+            local dataset_domain="datasets.dragon.aberration.technology"
+            mapfile -t active_cert_arns < <(
+              aws cloudfront list-distributions \
+                --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, \`${dataset_domain}\`)].ViewerCertificate.ACMCertificateArn" \
+                --output json | jq -r '.[]? | select(. != null and . != "")'
+            )
+
+            aws acm list-certificates \
+              --region us-east-1 \
+              --query "CertificateSummaryList[?DomainName==\`${dataset_domain}\`].CertificateArn" \
+              --output json | jq_array | while read -r certificate_arn; do
+                if printf '%s\n' "${active_cert_arns[@]}" | grep -Fxq "$certificate_arn"; then
+                  continue
+                fi
+
+                in_use_count="$(aws acm describe-certificate \
+                  --region us-east-1 \
+                  --certificate-arn "$certificate_arn" \
+                  --query 'length(Certificate.InUseBy)' \
+                  --output text 2>/dev/null || echo 0)"
+                if [ "$in_use_count" != "0" ] && [ "$in_use_count" != "None" ]; then
+                  echo "preserving in-use dataset certificate ${certificate_arn}"
+                  continue
+                fi
+
+                echo "deleting stale dataset certificate ${certificate_arn}"
+                aws acm delete-certificate \
+                  --region us-east-1 \
+                  --certificate-arn "$certificate_arn" >/dev/null || true
+              done
+          }
+
           cleanup_iam_by_prefix() {
             local prefix="$1"
 
@@ -441,6 +538,7 @@ jobs:
             delete_ssm_parameters_by_prefix "/${legacy_stack_name}/"
             cleanup_iam_by_prefix "$legacy_stack_name"
             delete_empty_buckets_by_prefix "$legacy_stack_name"
+            force_delete_buckets_by_prefix "$legacy_stack_name"
           fi
 
           if [ "$CLEANUP_ORPHAN_CANONICAL_NETWORK" = "true" ]; then
@@ -458,6 +556,8 @@ jobs:
                 cleanup_vpc "$canonical_vpc_id" "$canonical_stack_name"
               done
           fi
+
+          cleanup_duplicate_dataset_certificates
 
           inventory_summary "$canonical_stack_name"
           inventory_summary "$legacy_stack_name"

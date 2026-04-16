@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use burn_p2p::{ContentId, ExperimentDirectoryEntry};
+use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement};
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
 
 fn admin_client(edge_base_url: &str, session_id: Option<&str>) -> AdminClient {
@@ -36,4 +36,15 @@ pub async fn rollout_directory_entries(
         .rollout_directory_entries(directory_entries)
         .await
         .map_err(|error| anyhow!("failed to roll out directory entries: {error}"))
+}
+
+pub async fn register_live_head(
+    edge_base_url: &str,
+    session_id: &str,
+    announcement: HeadAnnouncement,
+) -> Result<AdminResult> {
+    admin_client(edge_base_url, Some(session_id))
+        .register_live_head(announcement)
+        .await
+        .map_err(|error| anyhow!("failed to register live head on edge: {error}"))
 }

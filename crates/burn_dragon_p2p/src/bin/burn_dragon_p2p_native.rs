@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::backend::AutodiffBackend;
 use burn_dragon_language::load_training_config;
 use burn_dragon_p2p::admin::{
-    fetch_directory_entries, rollout_directory_entries, upsert_directory_entry,
+    fetch_directory_entries, register_live_head, rollout_directory_entries, upsert_directory_entry,
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
@@ -39,7 +39,7 @@ use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
-    ExperimentId, ExperimentScope, PrincipalId, RuntimeStatus,
+    ExperimentId, ExperimentScope, HeadAnnouncement, PrincipalId, RuntimeStatus,
 };
 use burn_p2p_admin::AdminResult;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -954,6 +954,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_head_mirror(
             prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -963,6 +964,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => run_prepared_head_mirror(
             prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -973,6 +975,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
             prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -983,6 +986,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
             prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -993,6 +997,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => run_prepared_head_mirror(
             prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -1003,6 +1008,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => run_prepared_head_mirror(
             prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
             &config,
+            auth_bundle.as_ref(),
             args.backend,
             args.status_interval_secs,
             args.head_sync_interval_secs,
@@ -1428,9 +1434,20 @@ where
     Ok(Some(head))
 }
 
+fn register_live_head_with_edge(
+    runtime: &tokio::runtime::Runtime,
+    edge_base_url: &str,
+    session_id: &str,
+    announcement: HeadAnnouncement,
+) -> Result<()> {
+    let _ = runtime.block_on(register_live_head(edge_base_url, session_id, announcement))?;
+    Ok(())
+}
+
 fn run_prepared_head_mirror<B>(
     prepared: PreparedNativePeer<B>,
     config: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
     backend: BackendArg,
     status_interval_secs: u64,
     head_sync_interval_secs: u64,
@@ -1483,6 +1500,24 @@ where
         experiment_entry.experiment_id,
         experiment_entry.current_revision_id,
     );
+    let edge_registration = auth_bundle
+        .and_then(|auth| {
+            auth.session_id.as_ref().and_then(|session_id| {
+                let edge_base_url = auth
+                    .edge_base_url
+                    .clone()
+                    .or_else(|| config.effective_edge_base_url().map(ToOwned::to_owned));
+                edge_base_url.map(|edge_base_url| (edge_base_url, session_id.clone()))
+            })
+        })
+        .map(|(edge_base_url, session_id)| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build async runtime for head mirror edge registration")?;
+            Ok::<_, anyhow::Error>((runtime, edge_base_url, session_id))
+        })
+        .transpose()?;
     let status_interval = Duration::from_secs(status_interval_secs.max(1));
     let head_sync_interval = Duration::from_secs(head_sync_interval_secs.max(1));
     let mut last_status = Instant::now()
@@ -1495,7 +1530,7 @@ where
 
     loop {
         if last_head_sync.elapsed() >= head_sync_interval {
-            let _ = sync_or_initialize_head_provider(
+            let head = sync_or_initialize_head_provider(
                 &mut running,
                 &experiment,
                 initialize_head_on_start,
@@ -1503,6 +1538,27 @@ where
                 &mut mirrored_head_id,
                 "head-mirror",
             )?;
+            if let (Some(head), Some((registration_runtime, edge_base_url, session_id))) =
+                (head.as_ref(), edge_registration.as_ref())
+            {
+                let snapshot = running.snapshot();
+                if let Some(local_peer_id) = snapshot.local_peer_id {
+                    let announcement = HeadAnnouncement {
+                        overlay: experiment.overlay_set()?.heads,
+                        provider_peer_id: Some(local_peer_id),
+                        head: head.clone(),
+                        announced_at: chrono::Utc::now(),
+                    };
+                    if let Err(error) = register_live_head_with_edge(
+                        registration_runtime,
+                        edge_base_url,
+                        session_id,
+                        announcement,
+                    ) {
+                        eprintln!("head-mirror-edge-registration-failed: {error}");
+                    }
+                }
+            }
             last_head_sync = Instant::now();
         }
 

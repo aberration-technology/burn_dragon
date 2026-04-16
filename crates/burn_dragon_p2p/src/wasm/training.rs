@@ -579,7 +579,7 @@ fn shard_selection_rank(selection_key: &str, entry: &burn_p2p_dataloader::ShardF
         entry.microshard_id.as_str(),
         entry.ordinal
     );
-    let digest = multihash_sha256(material.as_bytes()).to_bytes();
+    let digest = multihash_sha256(material.as_bytes());
     let bytes = digest.get(2..10).unwrap_or(&digest[..digest.len().min(8)]);
     let mut rank = [0_u8; 8];
     for (index, byte) in bytes.iter().enumerate() {

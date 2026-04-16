@@ -23,6 +23,9 @@ use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonNativeAuthBundle,
     DragonNativePeerConfig,
 };
+use burn_dragon_p2p::deployment::{
+    DeploymentDiagnosticsOptions, assert_deployment_ready, collect_deployment_diagnostics,
+};
 use burn_dragon_p2p::experiments::common::PreparedNativePeer;
 use burn_dragon_p2p::native::{
     ManagedRunningNativePeer, assess_native_peer, prepare_climbmix_native_cpu,
@@ -62,6 +65,7 @@ struct Cli {
 enum CommandKind {
     ResolveConfig(ResolveConfigArgs),
     AssessCapability(AssessCapabilityArgs),
+    DeploymentDiagnostics(DeploymentDiagnosticsArgs),
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
@@ -198,6 +202,38 @@ struct AssessCapabilityArgs {
     output_format: OutputFormat,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
+}
+
+#[derive(Debug, Parser)]
+struct DeploymentDiagnosticsArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    check_metrics_catchup: bool,
+    #[arg(long, default_value_t = false)]
+    check_auth_authorize: bool,
+    #[arg(long, default_value_t = false)]
+    require_head_published: bool,
+    #[arg(long, default_value_t = false)]
+    require_metrics_catchup: bool,
+    #[arg(long, default_value_t = false)]
+    require_auth_authorize: bool,
+    #[arg(long, default_value_t = false)]
+    assert_ready: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -467,6 +503,7 @@ fn main() -> Result<()> {
     match cli.command {
         CommandKind::ResolveConfig(args) => resolve_config(args),
         CommandKind::AssessCapability(args) => assess_capability(args),
+        CommandKind::DeploymentDiagnostics(args) => deployment_diagnostics(args),
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
@@ -522,6 +559,33 @@ fn assess_capability(args: AssessCapabilityArgs) -> Result<()> {
         )?,
     };
     write_output(None, args.output_format, &report)
+}
+
+fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        None,
+    )?;
+    let report = collect_deployment_diagnostics(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend.as_label(),
+        DeploymentDiagnosticsOptions {
+            check_metrics_catchup: args.check_metrics_catchup,
+            check_auth_authorize: args.check_auth_authorize,
+            require_head_published: args.require_head_published,
+            require_metrics_catchup: args.require_metrics_catchup,
+            require_auth_authorize: args.require_auth_authorize,
+        },
+    );
+    write_output(args.output.as_deref(), args.output_format, &report)?;
+    if args.assert_ready {
+        assert_deployment_ready(&report)?;
+    }
+    Ok(())
 }
 
 fn admin_export_directory(args: AdminExportDirectoryArgs) -> Result<()> {

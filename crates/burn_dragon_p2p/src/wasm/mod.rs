@@ -463,26 +463,12 @@ fn find_directory_entry(
         .cloned()
 }
 
-async fn ensure_required_session(
-    config: &DragonBrowserAppConfig,
-) -> Result<Option<BrowserSessionState>> {
-    let session = load_browser_session(&resolved_edge_base_url(config)?).await?;
-    if config.require_edge_auth {
-        let _claims = session.session.as_ref().ok_or_else(|| {
-            anyhow!("an authenticated browser session is required before joining this network")
-        })?;
-    }
-    Ok(Some(session))
-}
-
 pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let _ = ensure_required_session(config).await?;
     let controller = BrowserAppController::connect_with(connect_config(config)?).await?;
     Ok(controller.view())
 }
 
 pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let _ = ensure_required_session(config).await?;
     let mut controller = BrowserAppController::connect_with(connect_config(config)?).await?;
     controller.refresh().await.map_err(Into::into)
 }

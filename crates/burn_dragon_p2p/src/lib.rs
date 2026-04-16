@@ -5,6 +5,8 @@ pub mod capability;
 pub mod capability_state;
 pub mod config;
 #[cfg(feature = "native")]
+pub mod deployment;
+#[cfg(feature = "native")]
 pub mod experiments;
 #[cfg(feature = "native")]
 pub mod manifests;

@@ -1250,26 +1250,119 @@ jobs:
           echo "timed out waiting for bootstrap head mirror restart" >&2
           exit 1
 
-      - name: wait for bootstrap head mirror to publish an nca head
+      - name: wait for bootstrap deployment diagnostics to turn ready
+        id: deployment_diagnostics
         if: ${{ github.event.inputs.plan_only != 'true' }}
         shell: bash
+        env:
+          DRAGON_NATIVE_BINARY: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
         run: |
           set -euo pipefail
-          edge_url="${{ steps.outputs.outputs.edge_url }}"
+          if [ -z "${DRAGON_NATIVE_BINARY:-}" ] || [ ! -x "${DRAGON_NATIVE_BINARY}" ]; then
+            echo "missing burn_dragon_p2p_native binary for deployment diagnostics" >&2
+            exit 1
+          fi
+
+          tmpdir="$(mktemp -d)"
+          config_path="$tmpdir/bootstrap-head-mirror-diag.toml"
+          report_path="${RUNNER_TEMP}/bootstrap-deployment-diagnostics.json"
+          echo "report_path=$report_path" >>"$GITHUB_OUTPUT"
+          cat <<EOF | sed 's/^          //' >"$config_path"
+          training_config_paths = []
+          storage_root = "$tmpdir/storage"
+          app_semver = "$TF_VAR_dragon_crate_version"
+
+          [network]
+          edge_base_url = "${{ steps.outputs.outputs.edge_url }}"
+          seed_node_urls = [
+            "${{ steps.outputs.outputs.seed_tcp }}",
+            "${{ steps.outputs.outputs.seed_quic }}",
+          ]
+
+          [manifest]
+          project_family_id = "$TF_VAR_project_family_id"
+          network_id = "$TF_VAR_network_id"
+          study_id = "$TF_VAR_study_id"
+          experiment_id = "$BOOTSTRAP_HEAD_MIRROR_EXPERIMENT_ID"
+          revision_id = "$BOOTSTRAP_HEAD_MIRROR_REVISION_ID"
+          display_name = "burn_dragon bootstrap diagnostics"
+          description = "bootstrap restore diagnostics"
+          protocol_major = 0
+          authority_public_keys = []
+          bootstrap_addrs = []
+          EOF
+
+          auth_flags=()
+          case "${AUTH_CONNECTOR_KIND}" in
+            github|oidc|oauth)
+              auth_flags=(--check-auth-authorize --require-auth-authorize)
+              ;;
+          esac
+
           for attempt in $(seq 1 80); do
-            snapshot_json="$(curl --fail --silent --show-error --location \
-              --connect-timeout 5 \
-              --max-time 20 \
-              "$edge_url/portal/snapshot")"
-            if python3 -c 'import json, sys; payload = json.loads(sys.argv[1]); heads = payload.get("heads") or []; raise SystemExit(0 if any(head.get("experiment_id") == "nca-prepretraining" for head in heads) else 1)' "$snapshot_json"
-            then
+            if "${DRAGON_NATIVE_BINARY}" \
+              deployment-diagnostics \
+              --config "$config_path" \
+              --experiment-kind nca \
+              --backend cpu \
+              --check-metrics-catchup \
+              --require-head-published \
+              --require-metrics-catchup \
+              "${auth_flags[@]}" \
+              --assert-ready \
+              --output "$report_path" \
+              --output-format json; then
+              cat "$report_path"
               exit 0
             fi
+            cat "$report_path" || true
             sleep 10
           done
 
-          echo "bootstrap head mirror did not publish an nca head" >&2
+          echo "bootstrap deployment diagnostics never reached ready" >&2
+          cat "$report_path" || true
           exit 1
+
+      - name: summarize deployment diagnostics
+        if: ${{ always() && steps.deployment_diagnostics.outputs.report_path != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="${{ steps.deployment_diagnostics.outputs.report_path }}"
+          if [ ! -f "$report_path" ]; then
+            exit 0
+          fi
+
+          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          readiness = report.get("readiness") or {}
+          profile_resolution = (report.get("profile_resolution") or {}).get("value") or {}
+          edge_snapshot = (report.get("edge_snapshot") or {}).get("value") or {}
+          blockers = readiness.get("blocking_issues") or []
+          warnings = readiness.get("observed_warnings") or []
+
+          print("## deployment diagnostics")
+          print()
+          print(f"- Ready: `{readiness.get('ready', False)}`")
+          print(f"- Profile source: `{profile_resolution.get('source', 'unknown')}`")
+          print(f"- Matching head present: `{edge_snapshot.get('matching_head_present', False)}`")
+          print(f"- Matching head id: `{edge_snapshot.get('matching_head_id') or 'none'}`")
+          print(f"- Matching directory entry present: `{edge_snapshot.get('matching_directory_entry_present', False)}`")
+          print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")
+          print(f"- Warnings: `{', '.join(warnings) if warnings else 'none'}`")
+          PY
+
+      - name: upload deployment diagnostics artifact
+        if: ${{ always() && steps.deployment_diagnostics.outputs.report_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-bootstrap-restore-diagnostics
+          path: ${{ steps.deployment_diagnostics.outputs.report_path }}
+          if-no-files-found: ignore
+
       - name: publish workflow summary
         shell: bash
         run: |

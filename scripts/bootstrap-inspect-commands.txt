@@ -1,52 +1,16 @@
 set -eu
 date -Is
-uname -a
-cloud-init status --long || true
-echo "--- /etc/burn-dragon-p2p/bootstrap.env ---"
-if [ -f /etc/burn-dragon-p2p/bootstrap.env ]; then awk -F= '{ value=$2; gsub(/^"|"$/, "", value); printf "%s=<set:%d chars>\n", $1, length(value) }' /etc/burn-dragon-p2p/bootstrap.env; else echo missing; fi
-echo "--- /etc/burn-dragon-p2p/bootstrap auth connector ---"
-python3 -c 'from pathlib import Path; import json; p=Path("/etc/burn-dragon-p2p/bootstrap.json"); cfg=json.loads(p.read_text()) if p.exists() else {}; connector=((cfg.get("auth") or {}).get("connector") or {}); redacted=dict(connector); [redacted.__setitem__(key, "<redacted>") for key in ("client_secret",) if key in redacted]; print(json.dumps(redacted, indent=2, sort_keys=True))' || true
-echo "--- /etc/caddy/Caddyfile ---"
-sed -n "1,200p" /etc/caddy/Caddyfile || true
-echo "--- /etc/systemd/system/burn-p2p-bootstrap.service ---"
-sed -n "1,200p" /etc/systemd/system/burn-p2p-bootstrap.service || true
-echo "--- /etc/burn_dragon_p2p/bootstrap-head-mirror.toml ---"
-sed -n "1,220p" /etc/burn_dragon_p2p/bootstrap-head-mirror.toml || true
-echo "--- /etc/systemd/system/burn-dragon-p2p-head-mirror.service ---"
-sed -n "1,200p" /etc/systemd/system/burn-dragon-p2p-head-mirror.service || true
-echo "--- bootstrap binary paths ---"
-ls -l /usr/local/bin/burn-p2p-bootstrap /root/.cargo/bin/burn-p2p-bootstrap || true
-readlink -f /usr/local/bin/burn-p2p-bootstrap || true
-echo "--- bootstrap binary stat ---"
-stat /usr/local/bin/burn-p2p-bootstrap /root/.cargo/bin/burn-p2p-bootstrap || true
-echo "--- bootstrap binary file ---"
-file /usr/local/bin/burn-p2p-bootstrap /root/.cargo/bin/burn-p2p-bootstrap || true
-echo "--- bootstrap binary ldd ---"
-ldd /usr/local/bin/burn-p2p-bootstrap || true
-echo "--- bootstrap binary version ---"
-/usr/local/bin/burn-p2p-bootstrap --version || true
-echo "--- dragon native binary version ---"
-/usr/local/bin/burn_dragon_p2p_native --version || true
-echo "--- caddy adapt ---"
-caddy adapt --config /etc/caddy/Caddyfile --pretty || true
+echo "--- deployment diagnostics ---"
+auth_flags="$(python3 -c 'from pathlib import Path; import json; p=Path("/etc/burn-dragon-p2p/bootstrap.json"); cfg=json.loads(p.read_text()) if p.exists() else {}; kind=(((cfg.get("auth") or {}).get("connector") or {}).get("kind") or "").strip(); print("--check-auth-authorize" if kind in {"github","oidc","oauth"} else "")')"
+echo "--- deployment diagnostics json begin ---"
+/usr/local/bin/burn_dragon_p2p_native deployment-diagnostics --config /etc/burn_dragon_p2p/bootstrap-head-mirror.toml --experiment-kind nca --backend cpu --check-metrics-catchup ${auth_flags} --output-format json || true
+echo "--- deployment diagnostics json end ---"
+echo "--- service status ---"
 systemctl status caddy --no-pager || true
 systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
-journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 300 || true
-echo "--- head mirror auth bundle ---"
-ls -l /var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json || true
-echo "--- likely storage files under /var/lib/burn_dragon_p2p ---"
-find /var/lib/burn_dragon_p2p -maxdepth 5 -type f | sort || true
-echo "--- likely publication files preview ---"
-find /var/lib/burn_dragon_p2p -maxdepth 6 -type f \( -name "*.json" -o -name "*.jsonl" -o -name "*.toml" \) -size -8192c -exec echo "=== file ===" \; -exec ls -l {} \; -exec sed -n "1,120p" {} \; || true
-tail -n 200 /var/log/cloud-init-output.log || true
-ss -ltnup || true
-echo "--- localhost /login/github ---"
-curl -fsS -X POST http://127.0.0.1:8787/login/github -H "content-type: application/json" --data "{\"network_id\":\"burn-dragon-mainnet\",\"principal_hint\":null,\"requested_scopes\":[\"Connect\"]}" || true
-echo "--- localhost /heads ---"
-curl -fsS http://127.0.0.1:8787/heads || true
-echo "--- localhost /portal/snapshot ---"
+echo "--- recent journals ---"
+journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 160 || true
+echo "--- local edge probes ---"
 curl -fsS http://127.0.0.1:8787/portal/snapshot || true
-curl -v http://127.0.0.1/ || true
-curl -vkI https://127.0.0.1/portal/snapshot || true
-curl -v http://127.0.0.1:4000/portal/snapshot || true
+curl -fsS http://127.0.0.1:8787/heads || true

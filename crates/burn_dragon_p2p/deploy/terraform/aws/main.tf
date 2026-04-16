@@ -228,7 +228,10 @@ locals {
   bootstrap_head_mirror_enabled_features_label     = "native"
   bootstrap_head_mirror_storage_root               = "${local.bootstrap_data_mount_path}/head-mirror"
   bootstrap_head_mirror_auth_bundle_parameter_name = trimspace(var.bootstrap_head_mirror_auth_bundle_parameter_name) != "" ? trimspace(var.bootstrap_head_mirror_auth_bundle_parameter_name) : local.secret_parameter_names.bootstrap_head_mirror_auth_bundle
-  bootstrap_head_mirror_seed_node_urls             = local.managed_trainer_seed_node_urls
+  # The head mirror is colocated with the bootstrap edge on the same EC2 host.
+  # Seed it against the bootstrap's in-VPC listen address instead of the public
+  # edge DNS so it does not self-dial the instance's own public endpoint.
+  bootstrap_head_mirror_seed_node_urls             = local.bootstrap_peer_internal_multiaddrs
   managed_validator_enabled                        = var.managed_validator_enabled
   managed_validator_experiment_kind                = lower(trimspace(var.managed_validator_experiment_kind))
   managed_validator_features                       = "native"

@@ -6,6 +6,7 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-burn-dragon-p2p-aws.yml"
       - ".github/workflows/restore-burn-dragon-p2p-aws.yml"
+      - ".github/workflows/inspect-burn-dragon-p2p-aws.yml"
       - ".github/workflows/publish-burn-dragon-p2p-dataset.yml"
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
@@ -23,6 +24,7 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-burn-dragon-p2p-aws.yml"
       - ".github/workflows/restore-burn-dragon-p2p-aws.yml"
+      - ".github/workflows/inspect-burn-dragon-p2p-aws.yml"
       - ".github/workflows/publish-burn-dragon-p2p-dataset.yml"
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
@@ -57,12 +59,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash -n scripts/sync-bootstrap-runtime-config.sh
       - run: python3 scripts/test_bootstrap_runtime_sync.py
+      - run: python3 scripts/test_bootstrap_head_mirror_seed_urls.py
+      - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_train -p burn_dragon_language --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --target wasm32-unknown-unknown --no-default-features --features wasm-ui,wasm-peer,wgpu --bin burn_dragon_p2p_browser --no-deps -- -D warnings
+      - run: cargo check --manifest-path Cargo.toml -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native
+      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native --lib deployment::tests:: -- --nocapture"
+      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"
 
   test:
     runs-on: ubuntu-latest

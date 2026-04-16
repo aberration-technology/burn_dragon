@@ -130,6 +130,16 @@ pub struct ResolvedNativeTrainingProfile {
     pub manifest_seed: DragonManifestSeed,
     pub profile: DragonExperimentProfile,
     pub directory_entry: Option<ExperimentDirectoryEntry>,
+    pub source: DragonResolvedProfileSource,
+}
+
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DragonResolvedProfileSource {
+    NetworkPublished,
+    BuiltinFallback,
+    LocalConfig,
 }
 
 impl DragonExperimentProfile {
@@ -431,7 +441,8 @@ fn materialize_native_training_config_for_ids(
         toml::from_str::<TrainingConfig>(&profile.native.training_toml).map_err(|error| {
             anyhow!("failed to decode native Dragon training config for {experiment_id}: {error}")
         })?;
-    let profile_root = profile_storage_root_for_ids(storage_root, study_id, experiment_id, revision_id);
+    let profile_root =
+        profile_storage_root_for_ids(storage_root, study_id, experiment_id, revision_id);
     let cache_dir = profile_root.join("cache");
     fs::create_dir_all(&cache_dir)?;
     config.dataset.cache_dir = cache_dir.clone();
@@ -474,11 +485,9 @@ fn builtin_native_training_profile(
         native.manifest.experiment_id.as_str(),
         native.manifest.revision_id.as_str(),
     ) {
-        (
-            DragonExperimentKind::NcaPrepretraining,
-            "nca-prepretraining",
-            "nca-r1",
-        ) => Ok(Some(serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?)),
+        (DragonExperimentKind::NcaPrepretraining, "nca-prepretraining", "nca-r1") => {
+            Ok(Some(serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?))
+        }
         _ => Ok(None),
     }
 }
@@ -542,6 +551,7 @@ pub fn resolve_native_training_profile(
                         manifest_seed: manifest_seed_from_entry(&native.manifest, &entry),
                         profile,
                         directory_entry: Some(entry),
+                        source: DragonResolvedProfileSource::NetworkPublished,
                     });
                 }
             }
@@ -563,6 +573,7 @@ pub fn resolve_native_training_profile(
             manifest_seed: native.manifest.clone(),
             profile,
             directory_entry: None,
+            source: DragonResolvedProfileSource::BuiltinFallback,
         });
     }
 
@@ -584,6 +595,7 @@ pub fn resolve_native_training_profile(
         manifest_seed: native.manifest.clone(),
         profile,
         directory_entry: None,
+        source: DragonResolvedProfileSource::LocalConfig,
     })
 }
 
@@ -829,6 +841,10 @@ prompt = "1 2 3"
             "nca-prepretraining".to_owned()
         );
         assert_eq!(resolved.manifest_seed.revision_id, "nca-r1".to_owned());
+        assert_eq!(
+            resolved.source,
+            DragonResolvedProfileSource::BuiltinFallback
+        );
         assert_eq!(resolved.config.training.block_size, 128);
         assert_eq!(resolved.config.training.batch_size, 4);
         assert!(matches!(

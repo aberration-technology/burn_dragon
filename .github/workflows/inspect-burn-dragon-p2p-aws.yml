@@ -46,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: inspect bootstrap instance
+        id: inspect
         shell: bash
         env:
           STACK_NAME_VAR: ${{ vars.BURN_DRAGON_P2P_STACK_NAME }}
@@ -59,6 +60,9 @@ jobs:
           REPAIR_EDGE_TLS: ${{ github.event.inputs.repair_edge_tls }}
         run: |
           set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/burn-dragon-inspect"
+          mkdir -p "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >>"$GITHUB_OUTPUT"
 
           canonical_stack_name="burn-dragon-p2p-${DEPLOY_ENVIRONMENT}"
           if [ -n "${STACK_NAME_VAR:-}" ] && [ "$STACK_NAME_VAR" != "$canonical_stack_name" ]; then
@@ -91,6 +95,7 @@ jobs:
             echo "bootstrap instances for Application=burn-dragon-p2p Environment=${DEPLOY_ENVIRONMENT}:"
             printf '%s\n' "$bootstrap_rows" | awk -F '\t' '{printf "  - name=%s id=%s state=%s\n", $1, $2, $3}'
           fi
+          printf '%s\n' "$bootstrap_rows" >"$artifact_dir/bootstrap-instances.tsv"
 
           legacy_instance_ids="$(printf '%s\n' "$bootstrap_rows" | awk -F '\t' -v expected="$instance_name" '$1 != "" && $1 != expected {print $2}')"
           if [ -n "$legacy_instance_ids" ] && [ "${CLEANUP_LEGACY_BOOTSTRAP_INSTANCES}" = "true" ]; then
@@ -114,6 +119,7 @@ jobs:
             echo "bootstrap instance not found for tag Name=${instance_name}" >&2
             exit 1
           fi
+          echo "instance_id=$instance_id" >>"$GITHUB_OUTPUT"
 
           legacy_stack_name="dragon-p2p-prod"
           printf '%s\n' "resource inventory"
@@ -125,42 +131,42 @@ jobs:
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
               --query 'Reservations[].Instances[].{name: Tags[?Key==`Name`]|[0].Value,id: InstanceId,state: State.Name}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-ec2-instances.json"
 
             echo "elastic ips"
             aws ec2 describe-addresses \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'Addresses[].{name: Tags[?Key==`Name`]|[0].Value,allocation_id: AllocationId,public_ip: PublicIp}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-elastic-ips.json"
 
             echo "vpcs"
             aws ec2 describe-vpcs \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'Vpcs[].{name: Tags[?Key==`Name`]|[0].Value,id: VpcId}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-vpcs.json"
 
             echo "subnets"
             aws ec2 describe-subnets \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'Subnets[].{name: Tags[?Key==`Name`]|[0].Value,id: SubnetId}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-subnets.json"
 
             echo "internet gateways"
             aws ec2 describe-internet-gateways \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'InternetGateways[].{name: Tags[?Key==`Name`]|[0].Value,id: InternetGatewayId}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-internet-gateways.json"
 
             echo "route tables"
             aws ec2 describe-route-tables \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'RouteTables[].{name: Tags[?Key==`Name`]|[0].Value,id: RouteTableId}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-route-tables.json"
 
             echo "security groups"
             aws ec2 describe-security-groups \
@@ -174,29 +180,29 @@ jobs:
                     }
                   | select(.name | contains($stack))
                 ]
-              '
+              ' | tee "$artifact_dir/${stack}-security-groups.json"
 
             echo "volumes"
             aws ec2 describe-volumes \
               --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=${stack}*" \
               --query 'Volumes[].{name: Tags[?Key==`Name`]|[0].Value,id: VolumeId,state: State}' \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-volumes.json"
 
             echo "iam roles"
             aws iam list-roles \
               --query "Roles[?contains(RoleName, \`${stack}\`)].RoleName" \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-iam-roles.json"
 
             echo "instance profiles"
             aws iam list-instance-profiles \
               --query "InstanceProfiles[?contains(InstanceProfileName, \`${stack}\`)].InstanceProfileName" \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-instance-profiles.json"
 
             echo "s3 buckets"
             aws s3api list-buckets \
               --query "Buckets[?contains(Name, \`${stack}\`)].Name" \
-              --output json
+              --output json | tee "$artifact_dir/${stack}-s3-buckets.json"
 
             echo "::endgroup::"
           done
@@ -215,21 +221,21 @@ jobs:
                   }
                 | select((.aliases | index("datasets.dragon.aberration.technology")) != null)
               ]
-            '
+            ' | tee "$artifact_dir/shared-cloudfront-distributions.json"
 
           echo "acm certificates for dataset domain"
           aws acm list-certificates \
             --region us-east-1 \
             --certificate-statuses PENDING_VALIDATION ISSUED INACTIVE EXPIRED VALIDATION_TIMED_OUT REVOKED FAILED \
             --query "CertificateSummaryList[?DomainName==\`datasets.dragon.aberration.technology\` || DomainName==\`dragon.aberration.technology\`].{domain: DomainName, arn: CertificateArn}" \
-            --output json
+            --output json | tee "$artifact_dir/shared-acm-certificates.json"
 
           echo "route53 records"
           hosted_zone_id="$(aws route53 list-hosted-zones-by-name --dns-name aberration.technology --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')"
           aws route53 list-resource-record-sets \
             --hosted-zone-id "$hosted_zone_id" \
             --query "ResourceRecordSets[?Name==\`edge.dragon.aberration.technology.\` || Name==\`dragon.aberration.technology.\` || Name==\`datasets.dragon.aberration.technology.\`].[Name,Type,AliasTarget.DNSName,ResourceRecords]" \
-            --output json
+            --output json | tee "$artifact_dir/shared-route53-records.json"
           echo "::endgroup::"
 
           echo "instance_id=${instance_id}"
@@ -240,21 +246,21 @@ jobs:
           aws ec2 describe-instances \
             --region "$AWS_REGION" \
             --instance-ids "$instance_id" \
-            --output json
+            --output json | tee "$artifact_dir/instance-describe.json"
 
           echo "instance status"
           aws ec2 describe-instance-status \
             --region "$AWS_REGION" \
             --include-all-instances \
             --instance-ids "$instance_id" \
-            --output json || true
+            --output json | tee "$artifact_dir/instance-status.json" || true
 
           echo "console output"
           aws ec2 get-console-output \
             --region "$AWS_REGION" \
             --instance-id "$instance_id" \
             --latest \
-            --output text || true
+            --output text | tee "$artifact_dir/console-output.txt" || true
 
           echo "ssm registration"
           ssm_status="$(aws ssm describe-instance-information \
@@ -263,6 +269,7 @@ jobs:
             --query 'InstanceInformationList[0].PingStatus' \
             --output text 2>/dev/null || true)"
           echo "ssm ping status: ${ssm_status:-missing}"
+          echo "ssm_status=${ssm_status:-missing}" >>"$GITHUB_OUTPUT"
 
           if [ "${ssm_status:-}" = "Online" ]; then
             if [ "${REPAIR_EDGE_TLS}" = "true" ]; then
@@ -301,7 +308,7 @@ jobs:
                 --region "$AWS_REGION" \
                 --command-id "$repair_command_id" \
                 --instance-id "$instance_id" \
-                --output json || true
+                --output json | tee "$artifact_dir/repair-edge-tls-command.json" || true
             fi
 
             python3 -c 'import json; from pathlib import Path; commands=[line.rstrip("\n") for line in Path("scripts/bootstrap-inspect-commands.txt").read_text().splitlines() if line.strip()]; Path("/tmp/burn-dragon-inspect-params.json").write_text(json.dumps({"commands": commands}))'
@@ -335,5 +342,110 @@ jobs:
               --region "$AWS_REGION" \
               --command-id "$command_id" \
               --instance-id "$instance_id" \
-              --output json || true
+              --output json | tee "$artifact_dir/inspect-command-output.json" || true
+
+            python3 - "$artifact_dir/inspect-command-output.json" "$artifact_dir/bootstrap-deployment-diagnostics.json" <<'PY'
+            import json
+            import sys
+            from pathlib import Path
+
+            source = Path(sys.argv[1])
+            target = Path(sys.argv[2])
+            if not source.exists():
+                raise SystemExit(0)
+            payload = json.loads(source.read_text())
+            stdout = payload.get("StandardOutputContent") or ""
+            begin = "--- deployment diagnostics json begin ---"
+            end = "--- deployment diagnostics json end ---"
+            if begin not in stdout or end not in stdout:
+                raise SystemExit(0)
+            start = stdout.index(begin) + len(begin)
+            finish = stdout.index(end, start)
+            body = stdout[start:finish].strip()
+            if not body:
+                raise SystemExit(0)
+            json.loads(body)
+            target.write_text(body + "\n")
+            PY
           fi
+
+          printf '%s\n' "${ssm_status:-missing}" >"$artifact_dir/ssm-status.txt"
+
+          python3 - "$artifact_dir" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          artifact_dir = Path(sys.argv[1])
+          summary = {
+              "instance_id": None,
+              "ssm_status": None,
+              "deployment_ready": None,
+              "profile_source": None,
+              "matching_head_present": None,
+              "matching_head_id": None,
+              "blocking_issues": [],
+              "observed_warnings": [],
+          }
+
+          describe_path = artifact_dir / "instance-describe.json"
+          if describe_path.exists():
+              describe = json.loads(describe_path.read_text())
+              reservations = describe.get("Reservations") or []
+              if reservations and reservations[0].get("Instances"):
+                  summary["instance_id"] = reservations[0]["Instances"][0].get("InstanceId")
+
+          diagnostics_path = artifact_dir / "bootstrap-deployment-diagnostics.json"
+          if diagnostics_path.exists():
+              diagnostics = json.loads(diagnostics_path.read_text())
+              readiness = diagnostics.get("readiness") or {}
+              edge_snapshot = (diagnostics.get("edge_snapshot") or {}).get("value") or {}
+              profile_resolution = (diagnostics.get("profile_resolution") or {}).get("value") or {}
+              summary["deployment_ready"] = readiness.get("ready")
+              summary["profile_source"] = profile_resolution.get("source")
+              summary["matching_head_present"] = edge_snapshot.get("matching_head_present")
+              summary["matching_head_id"] = edge_snapshot.get("matching_head_id")
+              summary["blocking_issues"] = readiness.get("blocking_issues") or []
+              summary["observed_warnings"] = readiness.get("observed_warnings") or []
+
+          summary["ssm_status"] = Path(artifact_dir / "ssm-status.txt").read_text().strip() if (artifact_dir / "ssm-status.txt").exists() else None
+          (artifact_dir / "inspection-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: summarize inspection
+        if: ${{ always() && steps.inspect.outputs.artifact_dir != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="${{ steps.inspect.outputs.artifact_dir }}"
+          summary_path="$artifact_dir/inspection-summary.json"
+          if [ ! -f "$summary_path" ]; then
+            exit 0
+          fi
+
+          python3 - "$summary_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          summary = json.load(open(sys.argv[1]))
+          print("## inspection summary")
+          print()
+          print(f"- Instance id: `{summary.get('instance_id') or 'unknown'}`")
+          print(f"- SSM status: `{summary.get('ssm_status') or 'unknown'}`")
+          print(f"- Deployment ready: `{summary.get('deployment_ready')}`")
+          print(f"- Profile source: `{summary.get('profile_source') or 'unknown'}`")
+          print(f"- Matching head present: `{summary.get('matching_head_present')}`")
+          print(f"- Matching head id: `{summary.get('matching_head_id') or 'none'}`")
+          blockers = summary.get("blocking_issues") or []
+          warnings = summary.get("observed_warnings") or []
+          print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")
+          print(f"- Warnings: `{', '.join(warnings) if warnings else 'none'}`")
+          PY
+
+      - name: upload inspection artifact bundle
+        if: ${{ always() && steps.inspect.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-bootstrap-inspection
+          path: ${{ steps.inspect.outputs.artifact_dir }}
+          if-no-files-found: ignore

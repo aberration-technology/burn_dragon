@@ -64,6 +64,11 @@ body {
   gap: 22px;
 }
 
+.dragon-browser-shell .browser-hero {
+  gap: 18px;
+  padding: 26px 26px 22px;
+}
+
 .hero {
   background:
     radial-gradient(circle at top left, rgba(216, 124, 124, 0.16), transparent 26%),
@@ -161,6 +166,12 @@ body {
   max-width: 46rem;
 }
 
+.dragon-browser-shell .browser-hero-bar {
+  justify-content: flex-start;
+  padding-top: 0;
+  border-top: 0;
+}
+
 .dragon-browser-shell .browser-quick-card strong {
   line-height: 1.35;
 }
@@ -172,7 +183,8 @@ body {
 .dragon-connection-editor {
   display: grid;
   gap: 12px;
-  width: min(100%, 900px);
+  width: auto;
+  max-width: 100%;
 }
 
 .dragon-advanced-settings {
@@ -203,6 +215,91 @@ body {
 .dragon-panel-stack {
   display: grid;
   gap: 16px;
+}
+
+.dragon-live-shell-wrap {
+  width: min(100%, 820px);
+  margin: 0 auto;
+}
+
+.dragon-live-shell {
+  gap: 18px;
+}
+
+.dragon-live-summary {
+  gap: 18px;
+}
+
+.dragon-live-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.dragon-live-status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2rem;
+  padding: 0 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: lowercase;
+}
+
+.dragon-live-status-pill-syncing {
+  border-color: rgba(216, 124, 124, 0.26);
+  background: rgba(216, 124, 124, 0.08);
+  color: var(--accent);
+}
+
+.dragon-live-status-pill-ready {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+}
+
+.dragon-live-stats {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.dragon-live-stats .stat-tile {
+  min-height: 112px;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at top right, rgba(216, 124, 124, 0.06), transparent 32%),
+    rgba(255, 255, 255, 0.025);
+}
+
+.dragon-live-stats .stat-tile span {
+  color: var(--muted);
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+.dragon-live-stats .stat-tile strong {
+  font-size: 1.08rem;
+  line-height: 1.25;
+}
+
+.dragon-live-actions {
+  padding-top: 2px;
+}
+
+.dragon-live-shell .section-detail {
+  max-width: 34rem;
 }
 
 .dragon-public-copy {

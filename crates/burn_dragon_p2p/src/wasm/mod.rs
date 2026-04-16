@@ -654,35 +654,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         }
     };
 
-    let refresh_action = {
-        let props = props.clone();
-        move |_| {
-            let mut next_config = props.config.clone();
-            next_config = next_config.with_network_overrides(
-                Some(edge_url.read().clone()),
-                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
-            );
-            let mut status = status;
-            let mut current_view = current_view;
-            let mut session_state = session_state;
-            spawn(async move {
-                status.set("Refreshing…".into());
-                match refresh_browser_app(&next_config).await {
-                    Ok(view) => {
-                        current_view.set(Some(view));
-                        let session = match resolved_edge_base_url(&next_config) {
-                            Ok(edge_base_url) => load_browser_session(&edge_base_url).await.ok(),
-                            Err(_) => None,
-                        };
-                        session_state.set(session);
-                        status.set(String::new());
-                    }
-                    Err(error) => status.set(error.to_string()),
-                }
-            });
-        }
-    };
-
     let github_login_action = {
         let props = props.clone();
         move |_| {
@@ -1059,23 +1030,27 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let has_active_checkpoint = view.as_ref().is_some_and(|view| {
         view.training.latest_head_id.is_some() || view.training.last_artifact_id.is_some()
     });
-    let peer_summary = view
+    let network_summary = view
         .as_ref()
         .map(|view| {
-            if !has_active_checkpoint {
-                "waiting for first checkpoint".to_owned()
-            } else if view.network.estimated_network_size == 0 {
-                "connected".to_owned()
-            } else if view.network.direct_peers == 0 {
+            if view.network.direct_peers > 0 {
+                if view.network.estimated_network_size == 0 {
+                    format!("{} direct", view.network.direct_peers)
+                } else {
+                    format!(
+                        "{} direct · ~{} visible",
+                        view.network.direct_peers, view.network.estimated_network_size
+                    )
+                }
+            } else if view.network.estimated_network_size > 0 {
                 format!("~{} visible", view.network.estimated_network_size)
+            } else if view.network.direct_peers == 0 {
+                "edge connected".to_owned()
             } else {
-                format!(
-                    "{} direct · ~{} visible",
-                    view.network.direct_peers, view.network.estimated_network_size
-                )
+                "connected".to_owned()
             }
         })
-        .unwrap_or_else(|| "waiting for first checkpoint".into());
+        .unwrap_or_else(|| "edge connected".into());
     let has_session = session_state
         .read()
         .as_ref()
@@ -1091,8 +1066,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         "loading…".to_owned()
     } else if needs_sign_in {
         "contribute training from your browser.".to_owned()
-    } else if ready_to_connect {
-        "connect this tab to start training.".to_owned()
     } else {
         "ready when you are.".to_owned()
     };
@@ -1113,11 +1086,21 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let show_public_retry =
         !auth_bootstrap_pending_active && callback_available && !status_message.is_empty();
-    let connected_panel_title = if has_active_checkpoint { "ready" } else { "syncing" };
+    let connected_panel_title = "connected";
     let connected_panel_detail = if has_active_checkpoint {
-        ""
+        "checkpoint ready."
     } else {
-        "waiting for the first checkpoint."
+        "syncing from the edge."
+    };
+    let live_status_label = if has_active_checkpoint {
+        "ready"
+    } else {
+        "syncing"
+    };
+    let checkpoint_summary = if has_active_checkpoint {
+        "ready"
+    } else {
+        "waiting"
     };
     #[cfg(feature = "wasm-peer")]
     let train_action = {
@@ -1306,85 +1289,81 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         tone: "neutral",
                     }
                 }
-                div { class: "browser-hero-bar",
-                    div { class: "dragon-connection-editor",
-                        div { class: "browser-action-row",
-                            if needs_sign_in {
-                                if callback_available {
-                                    if show_public_retry {
+                if needs_sign_in
+                    || ready_to_connect
+                    || (debug_controls_enabled && (ready_to_connect || has_connected_view))
+                {
+                    div { class: "browser-hero-bar",
+                        div { class: "dragon-connection-editor",
+                            div { class: "browser-action-row",
+                                if needs_sign_in {
+                                    if callback_available {
+                                        if show_public_retry {
+                                            ActionButton {
+                                                label: "try again",
+                                                tone: "secondary",
+                                                onclick: complete_callback_action,
+                                            }
+                                        }
+                                    } else {
                                         ActionButton {
-                                            label: "try again",
-                                            tone: "secondary",
-                                            onclick: complete_callback_action,
+                                            label: "get started",
+                                            tone: "primary",
+                                            onclick: github_login_action,
                                         }
                                     }
-                                } else {
+                                } else if ready_to_connect {
                                     ActionButton {
-                                        label: "get started",
+                                        label: "connect",
                                         tone: "primary",
-                                        onclick: github_login_action,
+                                        onclick: connect_action,
                                     }
                                 }
-                            } else if ready_to_connect {
-                                ActionButton {
-                                    label: "connect",
-                                    tone: "primary",
-                                    onclick: connect_action,
-                                }
-                            } else {
-                                {train_button}
                                 if debug_controls_enabled {
-                                    ActionButton {
-                                        label: "sync",
-                                        tone: "secondary",
-                                        onclick: refresh_action,
+                                    if (ready_to_connect || has_connected_view) && show_connection_settings_active {
+                                        button {
+                                            r#type: "button",
+                                            class: "action-button action-button-secondary",
+                                            onclick: move |_| show_connection_settings.set(false),
+                                            "hide debug"
+                                        }
+                                    } else if ready_to_connect || has_connected_view {
+                                        button {
+                                            r#type: "button",
+                                            class: "action-button action-button-secondary",
+                                            onclick: move |_| show_connection_settings.set(true),
+                                            "debug"
+                                        }
                                     }
                                 }
-                            }
-                            if debug_controls_enabled {
-                                if (ready_to_connect || has_connected_view) && show_connection_settings_active {
+                                if debug_controls_enabled && has_connected_view && show_live_details_active {
                                     button {
                                         r#type: "button",
                                         class: "action-button action-button-secondary",
-                                        onclick: move |_| show_connection_settings.set(false),
-                                        "hide debug"
+                                        onclick: move |_| show_live_details.set(false),
+                                        "hide details"
                                     }
-                                } else if ready_to_connect || has_connected_view {
+                                } else if debug_controls_enabled && has_connected_view {
                                     button {
                                         r#type: "button",
                                         class: "action-button action-button-secondary",
-                                        onclick: move |_| show_connection_settings.set(true),
-                                        "debug"
+                                        onclick: move |_| show_live_details.set(true),
+                                        "details"
                                     }
                                 }
                             }
-                            if debug_controls_enabled && has_connected_view && show_live_details_active {
-                                button {
-                                    r#type: "button",
-                                    class: "action-button action-button-secondary",
-                                    onclick: move |_| show_live_details.set(false),
-                                    "hide details"
-                                }
-                            } else if debug_controls_enabled && has_connected_view {
-                                button {
-                                    r#type: "button",
-                                    class: "action-button action-button-secondary",
-                                    onclick: move |_| show_live_details.set(true),
-                                    "details"
-                                }
-                            }
-                        }
-                        if debug_controls_enabled && show_connection_settings_active {
-                            div { class: "edge-editor dragon-advanced-settings",
-                                EdgeConnectField {
-                                    label: "edge url",
-                                    value: edge_url.read().clone(),
-                                    oninput: move |value| edge_url.set(value),
-                                }
-                                EdgeConnectField {
-                                    label: "seed node urls",
-                                    value: seed_node_urls.read().clone(),
-                                    oninput: move |value| seed_node_urls.set(value),
+                            if debug_controls_enabled && show_connection_settings_active {
+                                div { class: "edge-editor dragon-advanced-settings",
+                                    EdgeConnectField {
+                                        label: "edge url",
+                                        value: edge_url.read().clone(),
+                                        oninput: move |value| edge_url.set(value),
+                                    }
+                                    EdgeConnectField {
+                                        label: "seed node urls",
+                                        value: seed_node_urls.read().clone(),
+                                        oninput: move |value| seed_node_urls.set(value),
+                                    }
                                 }
                             }
                         }
@@ -1392,31 +1371,50 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 }
             }
             if has_connected_view {
-                div { class: "surface-layout browser-surface-layout",
-                    section { class: "panel primary-panel browser-focus-panel",
+                div { class: "dragon-live-shell-wrap",
+                    section { class: "panel primary-panel browser-focus-panel dragon-live-shell",
                         SectionHeader {
                             eyebrow: "live",
                             title: connected_panel_title,
                             detail: connected_panel_detail,
                         }
                         if let Some(view) = view.clone() {
-                            div { class: "dragon-panel-stack",
-                                div { class: "keyvalue-list",
+                            div { class: "dragon-panel-stack dragon-live-summary",
+                                div { class: "dragon-live-status-row",
+                                    span {
+                                        class: "dragon-live-status-pill dragon-live-status-pill-{live_status_label}",
+                                        "{live_status_label}"
+                                    }
+                                }
+                                div { class: "dragon-live-stats",
+                                    StatTile {
+                                        label: "network",
+                                        value: network_summary,
+                                        detail: None,
+                                    }
+                                    StatTile {
+                                        label: "checkpoint",
+                                        value: checkpoint_summary,
+                                        detail: None,
+                                    }
                                     if let Some(last_loss) = view.training.last_loss.clone() {
-                                        div { class: "keyvalue-row",
-                                            span { "last loss" }
-                                            strong { "{last_loss}" }
+                                        StatTile {
+                                            label: "last loss",
+                                            value: last_loss,
+                                            detail: None,
                                         }
                                     }
                                     if let Some(throughput_summary) = view.training.throughput_summary.clone() {
-                                        div { class: "keyvalue-row",
-                                            span { "throughput" }
-                                            strong { "{throughput_summary}" }
+                                        StatTile {
+                                            label: "throughput",
+                                            value: throughput_summary,
+                                            detail: None,
                                         }
                                     }
-                                    div { class: "keyvalue-row",
-                                        span { "peers" }
-                                        strong { "{peer_summary}" }
+                                }
+                                if has_active_checkpoint {
+                                    div { class: "dragon-live-actions browser-action-row",
+                                        {train_button}
                                     }
                                 }
                                 if debug_controls_enabled {

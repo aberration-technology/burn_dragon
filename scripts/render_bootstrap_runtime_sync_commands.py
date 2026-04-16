@@ -63,10 +63,28 @@ def head_mirror_install_command(env: Mapping[str, str]) -> str:
     )
 
 
+def ensure_aws_cli_command() -> str:
+    return (
+        "if ! command -v aws >/dev/null 2>&1; then "
+        "tmpdir=$(mktemp -d); "
+        "curl -fsSL 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o \"$tmpdir/awscliv2.zip\"; "
+        "unzip -q \"$tmpdir/awscliv2.zip\" -d \"$tmpdir\"; "
+        "\"$tmpdir/aws/install\" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update; "
+        "rm -rf \"$tmpdir\"; "
+        "fi"
+    )
+
+
 def generate_commands(env: Mapping[str, str]) -> list[str]:
-    commands = [
+    preamble = [
         "set -eu",
+        "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH",
         "cloud-init status --wait || true",
+        ensure_aws_cli_command(),
+    ]
+    bootstrap_setup: list[str] = []
+    head_mirror_setup: list[str] = []
+    commands = [
         "systemctl reset-failed burn-p2p-bootstrap || true",
         "systemctl reset-failed burn-dragon-p2p-head-mirror || true",
         "aws s3 cp '{}' /etc/burn-dragon-p2p/bootstrap.json".format(
@@ -98,12 +116,12 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
 
     bootstrap_binary_object_uri = env.get("BOOTSTRAP_BINARY_OBJECT_URI", "")
     if bootstrap_binary_object_uri:
-        commands[1:1] = [
+        bootstrap_setup = [
             f"aws s3 cp '{bootstrap_binary_object_uri}' /usr/local/bin/burn-p2p-bootstrap",
             "chmod 0755 /usr/local/bin/burn-p2p-bootstrap",
         ]
     else:
-        commands[1:1] = [
+        bootstrap_setup = [
             "if [ ! -x /usr/local/bin/burn-p2p-bootstrap ] && [ ! -x /root/.cargo/bin/burn-p2p-bootstrap ]; then "
             + bootstrap_install_command(env)
             + "; fi",
@@ -112,17 +130,17 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
 
     head_mirror_binary_object_uri = env.get("HEAD_MIRROR_BINARY_OBJECT_URI", "")
     if head_mirror_binary_object_uri:
-        commands[1:1] = [
+        head_mirror_setup = [
             f"aws s3 cp '{head_mirror_binary_object_uri}' /usr/local/bin/burn_dragon_p2p_native",
             "chmod 0755 /usr/local/bin/burn_dragon_p2p_native",
         ]
     elif truthy(env.get("HEAD_MIRROR_REINSTALL")):
-        commands[1:1] = [
+        head_mirror_setup = [
             head_mirror_install_command(env),
             "if [ -x /root/.cargo/bin/burn_dragon_p2p_native ]; then ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native; fi",
         ]
 
-    return commands
+    return preamble + head_mirror_setup + bootstrap_setup + commands
 
 
 def main() -> None:

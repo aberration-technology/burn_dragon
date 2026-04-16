@@ -42,6 +42,18 @@ def base_env() -> dict[str, str]:
 
 
 class BootstrapRuntimeSyncTests(unittest.TestCase):
+    def test_remote_sync_waits_for_cloud_init_and_aws_before_s3_ops(self) -> None:
+        commands = module.generate_commands(base_env())
+        cloud_init_index = commands.index("cloud-init status --wait || true")
+        ensure_aws_index = next(
+            index for index, command in enumerate(commands) if "awscli-exe-linux-x86_64.zip" in command
+        )
+        first_s3_index = next(
+            index for index, command in enumerate(commands) if command.startswith("aws s3 cp ")
+        )
+        self.assertLess(cloud_init_index, ensure_aws_index)
+        self.assertLess(ensure_aws_index, first_s3_index)
+
     def test_crate_path_installs_bootstrap_when_binary_missing(self) -> None:
         commands = module.generate_commands(base_env())
         joined = "\n".join(commands)

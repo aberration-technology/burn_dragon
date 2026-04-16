@@ -327,22 +327,48 @@ jobs:
                 exit 1
               fi
 
+              BOOTSTRAP_PRIVATE_IP="$bootstrap_private_ip" python3 - <<'PY'
+              import json
+              import os
+              from pathlib import Path
+
+              private_ip = os.environ["BOOTSTRAP_PRIVATE_IP"]
+              replacement = f'seed_node_urls = [\\n  "/ip4/{private_ip}/tcp/4001",\\n]\\n'
+              commands = [
+                  "set -eu",
+                  (
+                      "python3 - <<'PY2'\\n"
+                      "from pathlib import Path\\n"
+                      "import re\\n"
+                      "p = Path('/etc/burn_dragon_p2p/bootstrap-head-mirror.toml')\\n"
+                      "text = p.read_text()\\n"
+                      f"replacement = {replacement!r}\\n"
+                      "text, count = re.subn(r'seed_node_urls\\\\s*=\\\\s*\\\\[(?:.|\\\\n)*?\\\\]\\\\n', replacement, text, count=1, flags=re.MULTILINE)\\n"
+                      "if count != 1:\\n"
+                      "    raise SystemExit('failed to rewrite seed_node_urls in bootstrap-head-mirror.toml')\\n"
+                      "p.write_text(text)\\n"
+                      "print(text)\\n"
+                      "PY2"
+                  ),
+                  "/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle || true",
+                  "systemctl reset-failed burn-dragon-p2p-head-mirror || true",
+                  "systemctl restart burn-dragon-p2p-head-mirror",
+                  "systemctl status burn-dragon-p2p-head-mirror --no-pager || true",
+                  "journalctl -u burn-dragon-p2p-head-mirror --no-pager -n 120 || true",
+                  "curl -fsS https://127.0.0.1/heads || true",
+                  "curl -fsS https://127.0.0.1/portal/snapshot || true",
+              ]
+              Path("/tmp/repair-head-mirror-seed-params.json").write_text(
+                  json.dumps({"commands": commands})
+              )
+              PY
+
               repair_head_mirror_command_id="$(aws ssm send-command \
                 --region "$AWS_REGION" \
                 --instance-ids "$instance_id" \
                 --document-name AWS-RunShellScript \
                 --comment "repair burn_dragon bootstrap head mirror seed urls" \
-                --parameters "commands=[
-                  \"set -eu\",
-                  \"python3 - <<'PY'\nfrom pathlib import Path\nimport re\np = Path('/etc/burn_dragon_p2p/bootstrap-head-mirror.toml')\ntext = p.read_text()\nreplacement = 'seed_node_urls = [\\n  \\\"/ip4/${bootstrap_private_ip}/tcp/4001\\\",\\n]\\n'\ntext, count = re.subn(r'seed_node_urls\\s*=\\s*\\[(?:.|\\n)*?\\]\\n', replacement, text, count=1, flags=re.MULTILINE)\nif count != 1:\n    raise SystemExit('failed to rewrite seed_node_urls in bootstrap-head-mirror.toml')\np.write_text(text)\nprint(text)\nPY\",
-                  \"/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle || true\",
-                  \"systemctl reset-failed burn-dragon-p2p-head-mirror || true\",
-                  \"systemctl restart burn-dragon-p2p-head-mirror\",
-                  \"systemctl status burn-dragon-p2p-head-mirror --no-pager || true\",
-                  \"journalctl -u burn-dragon-p2p-head-mirror --no-pager -n 120 || true\",
-                  \"curl -fsS https://127.0.0.1/heads || true\",
-                  \"curl -fsS https://127.0.0.1/portal/snapshot || true\"
-                ]" \
+                --parameters file:///tmp/repair-head-mirror-seed-params.json \
                 --query 'Command.CommandId' \
                 --output text)"
 

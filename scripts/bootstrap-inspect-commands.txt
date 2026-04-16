@@ -11,6 +11,26 @@ systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
 echo "--- binary presence ---"
 ls -l /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native /usr/local/bin/burn-dragon-p2p-sync-secrets 2>&1 || true
+echo "--- authenticated directory probe ---"
+auth_bundle_path="/var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json"
+if [ -f "$auth_bundle_path" ]; then
+  session_id="$(jq -r '.session_id // empty' "$auth_bundle_path" 2>/dev/null || true)"
+  edge_base_url="$(jq -r '.edge_base_url // empty' "$auth_bundle_path" 2>/dev/null || true)"
+  if [ -n "$session_id" ] && [ -n "$edge_base_url" ]; then
+    echo "auth_bundle_path=$auth_bundle_path"
+    echo "edge_base_url=$edge_base_url"
+    echo "session_id_present=true"
+    signed_directory_response="$(curl -fsS -H "x-session-id: ${session_id}" "${edge_base_url}/directory/signed" 2>&1 || true)"
+    printf '%s\n' "$signed_directory_response"
+    if printf '%s' "$signed_directory_response" | jq -e . >/dev/null 2>&1; then
+      printf '%s' "$signed_directory_response" | jq '{network_id: .payload.payload.network_id, entry_count: (.payload.payload.entries | length), entries: [.payload.payload.entries[]? | {study_id, experiment_id, current_revision_id, current_head_id}]}' || true
+    fi
+  else
+    echo "session-backed auth bundle missing session_id or edge_base_url"
+  fi
+else
+  echo "auth bundle not found at $auth_bundle_path"
+fi
 echo "--- recent journals ---"
 journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 160 || true
 echo "--- local edge probes ---"

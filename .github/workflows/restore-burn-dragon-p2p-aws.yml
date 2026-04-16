@@ -924,16 +924,7 @@ jobs:
           bootstrap_head_mirror_auth_script_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_fetch_auth_script | base64 -w0)"
           bootstrap_head_mirror_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_service_unit | base64 -w0)"
           public_ip="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_public_ip)"
-          instance_id=""
-          if [ -n "$public_ip" ] && [ "$public_ip" != "None" ]; then
-            instance_id="$(aws ec2 describe-instances \
-              --region "$AWS_REGION" \
-              --filters \
-                "Name=ip-address,Values=${public_ip}" \
-                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-              --query 'Reservations[].Instances[] | sort_by(@, &LaunchTime)[-1].InstanceId' \
-              --output text 2>/dev/null || true)"
-          fi
+          instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id 2>/dev/null || true)"
           if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
             instance_id="$(aws ec2 describe-instances \
               --region "$AWS_REGION" \
@@ -944,7 +935,15 @@ jobs:
               --output text 2>/dev/null || true)"
           fi
           if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
-            instance_id="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_instance_id)"
+            if [ -n "$public_ip" ] && [ "$public_ip" != "None" ]; then
+              instance_id="$(aws ec2 describe-instances \
+                --region "$AWS_REGION" \
+                --filters \
+                  "Name=ip-address,Values=${public_ip}" \
+                  "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                --query 'Reservations[].Instances[] | sort_by(@, &LaunchTime)[-1].InstanceId' \
+                --output text 2>/dev/null || true)"
+            fi
           fi
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"

@@ -28,6 +28,7 @@ pub struct DeploymentDiagnosticsOptions {
     pub check_metrics_catchup: bool,
     pub check_auth_authorize: bool,
     pub require_head_published: bool,
+    pub require_directory_entry_published: bool,
     pub require_metrics_catchup: bool,
     pub require_auth_authorize: bool,
 }
@@ -187,6 +188,7 @@ pub fn collect_deployment_diagnostics(
         metrics_catchup.as_ref(),
         auth_authorize.as_ref(),
         options.require_head_published,
+        options.require_directory_entry_published,
         options.require_metrics_catchup,
         options.require_auth_authorize,
     );
@@ -359,6 +361,7 @@ pub fn evaluate_deployment_readiness(
     metrics_catchup: Option<&DeploymentCheck<DeploymentHttpProbe>>,
     auth_authorize: Option<&DeploymentCheck<DeploymentAuthorizeProbe>>,
     require_head_published: bool,
+    require_directory_entry_published: bool,
     require_metrics_catchup: bool,
     require_auth_authorize: bool,
 ) -> DeploymentReadinessReport {
@@ -379,7 +382,11 @@ pub fn evaluate_deployment_readiness(
         blocking_issues.push("edge_snapshot_unavailable".into());
     } else if let Some(snapshot) = edge_snapshot.value.as_ref() {
         if !snapshot.matching_directory_entry_present {
-            observed_warnings.push("matching_directory_entry_missing".into());
+            if require_directory_entry_published {
+                blocking_issues.push("matching_directory_entry_missing".into());
+            } else {
+                observed_warnings.push("matching_directory_entry_missing".into());
+            }
         }
         if !snapshot.matching_head_present {
             if require_head_published {
@@ -531,6 +538,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
 
         assert!(!readiness.ready);
@@ -549,6 +557,7 @@ mod tests {
             &profile_check(),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -577,6 +586,7 @@ mod tests {
             })),
             false,
             false,
+            false,
             true,
         );
 
@@ -585,6 +595,33 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"auth_authorize_query_incomplete".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_directory_entry_when_requested() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.matching_directory_entry_present = false;
+            snapshot.directory_entries = 0;
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            true,
+            true,
+            false,
+            false,
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"matching_directory_entry_missing".to_owned())
         );
     }
 }

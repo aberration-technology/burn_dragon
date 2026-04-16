@@ -1262,6 +1262,14 @@ jobs:
                 --overwrite \
                 --name "$TF_VAR_bootstrap_head_mirror_auth_bundle_parameter_name" \
                 --value "$(cat "$bundle_path")"
+              "${dragon_native_cmd[@]}" \
+                admin-rollout-profile \
+                --config "$config_path" \
+                --experiment-kind nca \
+                --backend cpu \
+                --auth-bundle "$bundle_path" \
+                --output-format json >/tmp/bootstrap-head-mirror-admin-rollout.json
+              cat /tmp/bootstrap-head-mirror-admin-rollout.json
               exit 0
             fi
             sleep 15
@@ -1376,6 +1384,7 @@ jobs:
               --backend cpu \
               --check-metrics-catchup \
               --require-head-published \
+              --require-directory-entry-published \
               --require-metrics-catchup \
               "${auth_flags[@]}" \
               --assert-ready \

@@ -29,6 +29,8 @@ def main() -> None:
             '"admin_capabilities": "register_live_head,rollout_auth_policy"',
             str(path),
         )
+        assert_contains(text, "admin-rollout-profile", str(path))
+        assert_contains(text, "--require-directory-entry-published", str(path))
 
     print("head-mirror-admin-capability-ok")
 

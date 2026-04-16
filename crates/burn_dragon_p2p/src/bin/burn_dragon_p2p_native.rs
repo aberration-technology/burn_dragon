@@ -230,6 +230,8 @@ struct DeploymentDiagnosticsArgs {
     #[arg(long, default_value_t = false)]
     require_head_published: bool,
     #[arg(long, default_value_t = false)]
+    require_directory_entry_published: bool,
+    #[arg(long, default_value_t = false)]
     require_metrics_catchup: bool,
     #[arg(long, default_value_t = false)]
     require_auth_authorize: bool,
@@ -578,6 +580,7 @@ fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
             check_metrics_catchup: args.check_metrics_catchup,
             check_auth_authorize: args.check_auth_authorize,
             require_head_published: args.require_head_published,
+            require_directory_entry_published: args.require_directory_entry_published,
             require_metrics_catchup: args.require_metrics_catchup,
             require_auth_authorize: args.require_auth_authorize,
         },

@@ -19,7 +19,10 @@ use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use url::form_urlencoded;
 
-use crate::admin::{fetch_directory_entries, rollout_directory_entries, upsert_directory_entry};
+use crate::admin::{
+    fetch_directory_entries, fetch_signed_directory_entries, rollout_directory_entries,
+    upsert_directory_entry,
+};
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
     load_browser_session, provider_code_from_window_location,
@@ -763,6 +766,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             );
             let selected_study = admin_study_id.read().clone();
             let selected_experiment = admin_experiment_id.read().clone();
+            let session = session_state.read().clone();
             let mut admin_status = admin_status;
             let mut admin_directory_json = admin_directory_json;
             let mut admin_entry_json = admin_entry_json;
@@ -775,7 +779,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
-                match fetch_directory_entries(&edge_base_url).await {
+                let directory_result = if let Some(session_id) =
+                    session.as_ref().and_then(|session| {
+                        session
+                            .session_id()
+                            .map(|session_id| session_id.as_str().to_owned())
+                    }) {
+                    fetch_signed_directory_entries(&edge_base_url, &session_id).await
+                } else {
+                    fetch_directory_entries(&edge_base_url).await
+                };
+                match directory_result {
                     Ok(entries) => {
                         let directory_json = match directory_entries_to_json(&entries) {
                             Ok(directory_json) => directory_json,
@@ -933,7 +947,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 if let Some(result_view) = rollout_result_view(&rollout_result) {
                     admin_rollout_result.set(Some(result_view));
                 }
-                match fetch_directory_entries(&edge_base_url).await {
+                match fetch_signed_directory_entries(&edge_base_url, &session_id).await {
                     Ok(entries) => {
                         match directory_entries_to_json(&entries) {
                             Ok(directory_json) => admin_directory_json.set(directory_json),

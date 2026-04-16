@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::backend::AutodiffBackend;
 use burn_dragon_language::load_training_config;
 use burn_dragon_p2p::admin::{
-    fetch_directory_entries, register_live_head, rollout_directory_entries, upsert_directory_entry,
+    fetch_directory_entries, fetch_signed_directory_entries, register_live_head,
+    rollout_directory_entries, upsert_directory_entry, upsert_directory_entry_current_head,
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
@@ -636,7 +637,8 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build async runtime for admin rollout")?;
-    let mut directory_entries = runtime.block_on(fetch_directory_entries(&edge_base_url))?;
+    let mut directory_entries =
+        runtime.block_on(fetch_signed_directory_entries(&edge_base_url, &session_id))?;
     upsert_directory_entry(&mut directory_entries, replacement.clone());
     let result = runtime.block_on(rollout_directory_entries(
         &edge_base_url,
@@ -1438,9 +1440,27 @@ fn register_live_head_with_edge(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
     session_id: &str,
-    announcement: HeadAnnouncement,
+    directory_template: &ExperimentDirectoryEntry,
+    announcement: &HeadAnnouncement,
 ) -> Result<()> {
-    let _ = runtime.block_on(register_live_head(edge_base_url, session_id, announcement))?;
+    let _ = runtime.block_on(register_live_head(
+        edge_base_url,
+        session_id,
+        announcement.clone(),
+    ))?;
+    let mut directory_entries =
+        runtime.block_on(fetch_signed_directory_entries(edge_base_url, session_id))?;
+    if upsert_directory_entry_current_head(
+        &mut directory_entries,
+        directory_template,
+        announcement.head.head_id.clone(),
+    ) {
+        let _ = runtime.block_on(rollout_directory_entries(
+            edge_base_url,
+            session_id,
+            directory_entries,
+        ))?;
+    }
     Ok(())
 }
 
@@ -1496,9 +1516,9 @@ where
     .context("failed to install ctrl-c handler")?;
 
     let experiment = running.mainnet().experiment(
-        experiment_entry.study_id,
-        experiment_entry.experiment_id,
-        experiment_entry.current_revision_id,
+        experiment_entry.study_id.clone(),
+        experiment_entry.experiment_id.clone(),
+        experiment_entry.current_revision_id.clone(),
     );
     let edge_registration = auth_bundle
         .and_then(|auth| {
@@ -1553,7 +1573,8 @@ where
                         registration_runtime,
                         edge_base_url,
                         session_id,
-                        announcement,
+                        &experiment_entry,
+                        &announcement,
                     ) {
                         eprintln!("head-mirror-edge-registration-failed: {error}");
                     }

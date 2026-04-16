@@ -25,7 +25,8 @@ use crate::admin::{
 };
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
-    load_browser_session, provider_code_from_window_location,
+    load_browser_session,
+    provider_code_from_window_location,
 };
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 use crate::capability_state::apply_browser_downgrade_state;
@@ -435,6 +436,10 @@ fn session_has_admin_scope(session: Option<&BrowserSessionState>, study_id: &str
             .any(|value| value == study_id)
 }
 
+fn browser_session_is_authenticated(session: &BrowserSessionState) -> bool {
+    session.session.is_some()
+}
+
 fn directory_entries_to_json(entries: &[ExperimentDirectoryEntry]) -> Result<String> {
     serde_json::to_string_pretty(entries).map_err(Into::into)
 }
@@ -539,7 +544,8 @@ pub async fn resume_or_complete_browser_auth(
         return Ok(Some(session));
     }
     if config.require_edge_auth {
-        return load_browser_session(&edge_base_url).await.map(Some);
+        let session = load_browser_session(&edge_base_url).await?;
+        return Ok(browser_session_is_authenticated(&session).then_some(session));
     }
     Ok(None)
 }
@@ -688,7 +694,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         let has_checkpoint = browser_view_has_active_checkpoint(&view);
                         current_view.set(Some(view));
                         let session = match resolved_edge_base_url(&next_config) {
-                            Ok(edge_base_url) => load_browser_session(&edge_base_url).await.ok(),
+                            Ok(edge_base_url) => load_browser_session(&edge_base_url)
+                                .await
+                                .ok()
+                                .filter(browser_session_is_authenticated),
                             Err(_) => None,
                         };
                         session_state.set(session);
@@ -1844,7 +1853,11 @@ fn EditorTextareaField(
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_browser_callback_url;
+    use super::{browser_session_is_authenticated, normalized_browser_callback_url};
+    use burn_p2p::{AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession};
+    use burn_p2p_browser::BrowserSessionState;
+    use chrono::Utc;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn callback_url_normalizes_to_site_root() {
@@ -1860,5 +1873,36 @@ mod tests {
             ),
             "/repo/?edge=https%3A%2F%2Fedge.example#frag"
         );
+    }
+
+    #[test]
+    fn browser_session_authentication_requires_session_claims() {
+        assert!(!browser_session_is_authenticated(&BrowserSessionState::default()));
+
+        let now = Utc::now();
+        let session = BrowserSessionState {
+            session: Some(PrincipalSession {
+                session_id: ContentId::new("session-browser-test"),
+                network_id: NetworkId::new("burn-dragon-mainnet"),
+                claims: PrincipalClaims {
+                    principal_id: PrincipalId::new("principal-browser-test"),
+                    provider: AuthProvider::Static {
+                        authority: "test".into(),
+                    },
+                    display_name: "Browser Test".into(),
+                    org_memberships: BTreeSet::new(),
+                    group_memberships: BTreeSet::new(),
+                    granted_roles: PeerRoleSet::default(),
+                    granted_scopes: BTreeSet::new(),
+                    custom_claims: BTreeMap::new(),
+                    issued_at: now,
+                    expires_at: now,
+                },
+                issued_at: now,
+                expires_at: now,
+            }),
+            ..BrowserSessionState::default()
+        };
+        assert!(browser_session_is_authenticated(&session));
     }
 }

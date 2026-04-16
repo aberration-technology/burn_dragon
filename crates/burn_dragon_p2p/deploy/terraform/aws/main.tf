@@ -548,6 +548,7 @@ locals {
           "ExportReceipts",
           "ExportReducerLoad",
           "ExportTrustBundle",
+          "RegisterLiveHead",
           "OperatorRetentionPrune",
           "RolloutAuthPolicy",
         ]

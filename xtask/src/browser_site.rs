@@ -64,6 +64,72 @@ body {
   gap: 22px;
 }
 
+.hero {
+  background:
+    radial-gradient(circle at top left, rgba(216, 124, 124, 0.16), transparent 26%),
+    radial-gradient(circle at 88% 0%, rgba(216, 124, 124, 0.08), transparent 24%),
+    linear-gradient(135deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
+  border-color: var(--line-strong);
+}
+
+.status-pill-accent,
+.status-chip.accent,
+.activity-notice-accent {
+  border-color: rgba(216, 124, 124, 0.32);
+  background: rgba(216, 124, 124, 0.1);
+  color: var(--accent);
+}
+
+.surface-tab:hover {
+  border-color: rgba(216, 124, 124, 0.3);
+  background: rgba(216, 124, 124, 0.08);
+}
+
+.surface-tab.is-active {
+  border-color: rgba(216, 124, 124, 0.52);
+  background:
+    linear-gradient(180deg, rgba(216, 124, 124, 0.14), rgba(201, 107, 107, 0.08)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.leaderboard-row.is-local,
+.experiment-card-button.is-selected,
+.directory-row.is-selected {
+  border-color: rgba(216, 124, 124, 0.36);
+}
+
+.directory-row:hover {
+  border-color: rgba(216, 124, 124, 0.26);
+}
+
+.experiment-card-button.is-selected {
+  background: rgba(216, 124, 124, 0.08);
+}
+
+.directory-row.is-selected {
+  background:
+    linear-gradient(180deg, rgba(216, 124, 124, 0.06), rgba(255, 255, 255, 0.02)),
+    rgba(255, 255, 255, 0.03);
+}
+
+.browser-spotlight {
+  border-color: rgba(216, 124, 124, 0.22);
+  background:
+    radial-gradient(circle at top right, rgba(216, 124, 124, 0.08), transparent 24%),
+    linear-gradient(145deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
+}
+
+.action-button,
+.pill {
+  border-color: rgba(216, 124, 124, 0.3);
+  background: rgba(216, 124, 124, 0.1);
+}
+
+.action-button-primary {
+  border-color: rgba(216, 124, 124, 0.36);
+  background: linear-gradient(180deg, rgba(216, 124, 124, 0.18), rgba(201, 107, 107, 0.12));
+}
+
 .dragon-site-footer {
   margin-top: auto;
   display: flex;

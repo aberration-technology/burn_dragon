@@ -907,7 +907,7 @@ jobs:
             esac
 
             bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
-            CARGO_TARGET_DIR="$edge_target_dir" cargo install \
+            CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="$edge_target_dir" cargo install \
               --locked \
               --root "$bootstrap_root" \
               --git "https://github.com/aberration-technology/burn_p2p.git" \

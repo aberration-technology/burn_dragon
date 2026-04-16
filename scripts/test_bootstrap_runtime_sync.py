@@ -49,6 +49,7 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
             for index, command in enumerate(commands)
             if "timed out waiting for bootstrap runtime sync prerequisites" in command
         )
+        prereq_command = commands[prereq_index]
         ensure_aws_index = next(
             index for index, command in enumerate(commands) if "awscli-exe-linux-x86_64.zip" in command
         )
@@ -57,6 +58,8 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         )
         self.assertLess(prereq_index, ensure_aws_index)
         self.assertLess(ensure_aws_index, first_s3_index)
+        self.assertIn("runtime_sync_ready=1; break;", prereq_command)
+        self.assertNotIn("exit 0;", prereq_command)
 
     def test_crate_path_installs_bootstrap_when_binary_missing(self) -> None:
         commands = module.generate_commands(base_env())
@@ -146,7 +149,12 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
                 path.name,
             )
             self.assertIn(
-                'test -x /usr/local/bin/burn-dragon-p2p-sync-secrets',
+                '/usr/local/bin/burn-dragon-p2p-sync-secrets',
+                text,
+                path.name,
+            )
+            self.assertIn(
+                'missing /usr/local/bin/burn-p2p-bootstrap',
                 text,
                 path.name,
             )

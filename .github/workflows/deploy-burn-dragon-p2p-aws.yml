@@ -1327,8 +1327,8 @@ jobs:
             --comment "ensure burn_dragon bootstrap edge service is active" \
             --parameters 'commands=[
               "set -eu",
-              "test -x /usr/local/bin/burn-dragon-p2p-sync-secrets",
-              "test -x /usr/local/bin/burn-p2p-bootstrap",
+              "[ -x /usr/local/bin/burn-dragon-p2p-sync-secrets ] || { echo missing /usr/local/bin/burn-dragon-p2p-sync-secrets >&2; ls -l /usr/local/bin/burn-dragon-p2p-sync-secrets >&2 || true; exit 1; }",
+              "[ -x /usr/local/bin/burn-p2p-bootstrap ] || { echo missing /usr/local/bin/burn-p2p-bootstrap >&2; ls -l /usr/local/bin/burn-p2p-bootstrap >&2 || true; exit 1; }",
               "systemctl daemon-reload",
               "systemctl enable caddy",
               "systemctl restart caddy",

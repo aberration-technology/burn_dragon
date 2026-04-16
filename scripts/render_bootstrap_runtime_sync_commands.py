@@ -77,14 +77,18 @@ def ensure_aws_cli_command() -> str:
 
 def wait_for_runtime_sync_prereqs_command() -> str:
     return (
+        "runtime_sync_ready=; "
         "for attempt in $(seq 1 60); do "
         "if [ -x /usr/local/bin/burn-dragon-p2p-sync-secrets ] && command -v aws >/dev/null 2>&1; then "
-        "exit 0; "
+        "runtime_sync_ready=1; "
+        "break; "
         "fi; "
         "sleep 5; "
         "done; "
+        "if [ -z \"$runtime_sync_ready\" ]; then "
         "echo 'timed out waiting for bootstrap runtime sync prerequisites' >&2; "
-        "exit 1"
+        "exit 1; "
+        "fi"
     )
 
 

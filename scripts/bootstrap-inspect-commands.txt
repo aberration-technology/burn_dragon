@@ -9,6 +9,8 @@ echo "--- service status ---"
 systemctl status caddy --no-pager || true
 systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
+echo "--- binary presence ---"
+ls -l /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native /usr/local/bin/burn-dragon-p2p-sync-secrets 2>&1 || true
 echo "--- recent journals ---"
 journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 160 || true
 echo "--- local edge probes ---"

@@ -51,6 +51,8 @@ const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
 #[cfg(feature = "native")]
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
+#[cfg(feature = "native")]
+const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r1.profile.json");
 
 fn dragon_profile_attachment() -> DirectoryMetadataAttachment {
     DirectoryMetadataAttachment::new(
@@ -384,12 +386,17 @@ pub fn build_profile_from_local_config(
 }
 
 #[cfg(feature = "native")]
-fn profile_storage_root(storage_root: &Path, entry: &ExperimentDirectoryEntry) -> PathBuf {
+fn profile_storage_root_for_ids(
+    storage_root: &Path,
+    study_id: &str,
+    experiment_id: &str,
+    revision_id: &str,
+) -> PathBuf {
     storage_root
         .join("network_profiles")
-        .join(entry.study_id.as_str())
-        .join(entry.experiment_id.as_str())
-        .join(entry.current_revision_id.as_str())
+        .join(study_id)
+        .join(experiment_id)
+        .join(revision_id)
 }
 
 #[cfg(feature = "native")]
@@ -403,14 +410,28 @@ pub fn materialize_native_training_config(
     entry: &ExperimentDirectoryEntry,
     profile: &DragonExperimentProfile,
 ) -> Result<TrainingConfig> {
+    materialize_native_training_config_for_ids(
+        storage_root,
+        entry.study_id.as_str(),
+        entry.experiment_id.as_str(),
+        entry.current_revision_id.as_str(),
+        profile,
+    )
+}
+
+#[cfg(feature = "native")]
+fn materialize_native_training_config_for_ids(
+    storage_root: &Path,
+    study_id: &str,
+    experiment_id: &str,
+    revision_id: &str,
+    profile: &DragonExperimentProfile,
+) -> Result<TrainingConfig> {
     let mut config =
         toml::from_str::<TrainingConfig>(&profile.native.training_toml).map_err(|error| {
-            anyhow!(
-                "failed to decode native Dragon training config for {}: {error}",
-                entry.experiment_id.as_str()
-            )
+            anyhow!("failed to decode native Dragon training config for {experiment_id}: {error}")
         })?;
-    let profile_root = profile_storage_root(storage_root, entry);
+    let profile_root = profile_storage_root_for_ids(storage_root, study_id, experiment_id, revision_id);
     let cache_dir = profile_root.join("cache");
     fs::create_dir_all(&cache_dir)?;
     config.dataset.cache_dir = cache_dir.clone();
@@ -420,10 +441,7 @@ pub fn materialize_native_training_config(
 
     if let Some(corpus_toml) = profile.native.nca_corpus_toml.as_ref() {
         let mut corpus = toml::from_str::<NcaCorpusConfig>(corpus_toml).map_err(|error| {
-            anyhow!(
-                "failed to decode portable NCA corpus config for {}: {error}",
-                entry.experiment_id.as_str()
-            )
+            anyhow!("failed to decode portable NCA corpus config for {experiment_id}: {error}")
         })?;
         corpus.output_dir = profile_root.join("nca-generated");
         let corpus_path = profile_root.join(PORTABLE_NCA_CORPUS_FILE_NAME);
@@ -444,6 +462,25 @@ pub fn materialize_native_training_config(
     }
 
     Ok(config)
+}
+
+#[cfg(feature = "native")]
+fn builtin_native_training_profile(
+    native: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+) -> Result<Option<DragonExperimentProfile>> {
+    match (
+        experiment_kind,
+        native.manifest.experiment_id.as_str(),
+        native.manifest.revision_id.as_str(),
+    ) {
+        (
+            DragonExperimentKind::NcaPrepretraining,
+            "nca-prepretraining",
+            "nca-r1",
+        ) => Ok(Some(serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(feature = "native")]
@@ -511,6 +548,22 @@ pub fn resolve_native_training_profile(
             Err(error) if !has_local_training => return Err(error),
             Err(_) => {}
         }
+    }
+
+    if let Some(profile) = builtin_native_training_profile(native, experiment_kind)? {
+        let config = materialize_native_training_config_for_ids(
+            &native.storage_root,
+            &native.manifest.study_id,
+            &native.manifest.experiment_id,
+            &native.manifest.revision_id,
+            &profile,
+        )?;
+        return Ok(ResolvedNativeTrainingProfile {
+            config,
+            manifest_seed: native.manifest.clone(),
+            profile,
+            directory_entry: None,
+        });
     }
 
     if !has_local_training {
@@ -732,5 +785,55 @@ prompt = "1 2 3"
             }
             other => panic!("expected shard-manifest browser source, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_nca_profile_fallback_materializes_without_local_or_network_profile() {
+        use crate::config::DragonPeerNetworkConfig;
+        use tempfile::tempdir;
+
+        let storage = tempdir().expect("storage");
+        let native = DragonNativePeerConfig {
+            training_config_paths: Vec::new(),
+            storage_root: storage.path().to_path_buf(),
+            network: DragonPeerNetworkConfig::default(),
+            target: None,
+            identity: Default::default(),
+            bootstrap_peers: Vec::new(),
+            manifest: DragonManifestSeed {
+                study_id: "burn-dragon-mainnet".into(),
+                experiment_id: "nca-prepretraining".into(),
+                revision_id: "nca-r1".into(),
+                ..DragonManifestSeed::default()
+            },
+            app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
+            git_commit: None,
+            enabled_features_label: Some("native".into()),
+            auth: None,
+            capability_policy: DragonCapabilityPolicy::default(),
+            shard_export: None,
+            existing_shard_dataset: None,
+        };
+
+        let resolved = resolve_native_training_profile(
+            &native,
+            DragonExperimentKind::NcaPrepretraining,
+            false,
+        )
+        .expect("builtin fallback should resolve");
+
+        assert_eq!(
+            resolved.manifest_seed.experiment_id,
+            "nca-prepretraining".to_owned()
+        );
+        assert_eq!(resolved.manifest_seed.revision_id, "nca-r1".to_owned());
+        assert_eq!(resolved.config.training.block_size, 128);
+        assert_eq!(resolved.config.training.batch_size, 4);
+        assert!(matches!(
+            resolved.config.dataset.source,
+            DatasetSourceConfig::UniversalityNca { .. }
+        ));
     }
 }

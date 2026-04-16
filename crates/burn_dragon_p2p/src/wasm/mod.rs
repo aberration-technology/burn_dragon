@@ -1062,13 +1062,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let needs_sign_in = !auth_bootstrap_pending_active && auth_required && !has_session;
     let ready_to_connect = !auth_bootstrap_pending_active && !needs_sign_in && !has_connected_view;
     let hero_title = "train the dragon".to_owned();
-    let hero_subtitle = if auth_bootstrap_pending_active {
-        String::new()
-    } else if needs_sign_in {
-        "contribute training from your browser.".to_owned()
-    } else {
-        String::new()
-    };
+    let hero_subtitle = String::new();
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
         && (raw_status_message.contains("failed to fetch edge snapshot")

@@ -1059,15 +1059,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let auth_bootstrap_pending_active = *auth_bootstrap_pending.read();
     let has_connected_view = view.is_some();
     let public_landing = !auth_bootstrap_pending_active && !has_session && !has_connected_view;
-    let needs_sign_in = auth_required && !has_session;
+    let needs_sign_in = !auth_bootstrap_pending_active && auth_required && !has_session;
     let ready_to_connect = !auth_bootstrap_pending_active && !needs_sign_in && !has_connected_view;
     let hero_title = "train the dragon".to_owned();
     let hero_subtitle = if auth_bootstrap_pending_active {
-        "loading…".to_owned()
+        String::new()
     } else if needs_sign_in {
         "contribute training from your browser.".to_owned()
     } else {
-        "ready when you are.".to_owned()
+        String::new()
     };
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
@@ -1272,7 +1272,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     div { class: "browser-hero-copy",
                         div { class: "eyebrow", "burn_dragon" }
                         h1 { class: "app-title", "{hero_title}" }
-                        p { class: "app-subtitle", "{hero_subtitle}" }
+                        if !hero_subtitle.is_empty() {
+                            p { class: "app-subtitle", "{hero_subtitle}" }
+                        }
                     }
                 }
                 if !status_message.is_empty() {

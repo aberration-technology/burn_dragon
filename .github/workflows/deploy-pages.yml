@@ -17,7 +17,7 @@ on:
         default: ""
         type: string
       seed_node_urls:
-        description: Optional comma-separated bootstrap multiaddrs baked into the browser shell. Leave empty to derive them from the resolved edge host.
+        description: Optional comma-separated browser-capable bootstrap multiaddrs baked into the browser shell. Leave empty to derive browser-capable defaults from the resolved edge host.
         required: false
         default: ""
         type: string
@@ -109,8 +109,24 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "edge.dragon.aberration.technology"; print(f"/dns4/{host}/tcp/4001,/dns4/{host}/udp/4001/quic-v1")' "$edge_base_url")"
+            seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "edge.dragon.aberration.technology"; print(f"/dns4/{host}/udp/4001/webrtc-direct,/dns4/{host}/tcp/443/wss")' "$edge_base_url")"
           fi
+          python3 - "$seed_node_urls" <<'PY'
+import sys
+
+raw = sys.argv[1].strip()
+seed_urls = [seed.strip() for seed in raw.split(",") if seed.strip()]
+if not seed_urls:
+    raise SystemExit("browser pages deploy requires at least one seed multiaddr")
+
+browser_capable = ("webrtc-direct", "webtransport", "/wss", "/ws")
+if not any(any(marker in seed for marker in browser_capable) for seed in seed_urls):
+    raise SystemExit(
+        "browser pages deploy requires at least one browser-capable seed multiaddr "
+        "(expected webrtc-direct, webtransport, or wss/ws); "
+        f"got: {', '.join(seed_urls)}"
+    )
+PY
           site_host="$(python3 -c 'from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or "")' "$browser_app_base_url")"
 
           {

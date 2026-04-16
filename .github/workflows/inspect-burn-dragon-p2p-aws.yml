@@ -26,6 +26,11 @@ on:
         required: true
         default: false
         type: boolean
+      repair_head_mirror_seed_urls:
+        description: "Rewrite the live bootstrap head-mirror seed URLs to the instance private bootstrap address and restart the head mirror."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -58,6 +63,7 @@ jobs:
           DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
           CLEANUP_LEGACY_BOOTSTRAP_INSTANCES: ${{ github.event.inputs.cleanup_legacy_bootstrap_instances }}
           REPAIR_EDGE_TLS: ${{ github.event.inputs.repair_edge_tls }}
+          REPAIR_HEAD_MIRROR_SEED_URLS: ${{ github.event.inputs.repair_head_mirror_seed_urls }}
         run: |
           set -euo pipefail
           artifact_dir="${RUNNER_TEMP}/burn-dragon-inspect"
@@ -248,6 +254,10 @@ jobs:
             --instance-ids "$instance_id" \
             --output json | tee "$artifact_dir/instance-describe.json"
 
+          bootstrap_private_ip="$(jq -r '.Reservations[0].Instances[0].PrivateIpAddress // ""' "$artifact_dir/instance-describe.json")"
+          echo "bootstrap_private_ip=${bootstrap_private_ip}"
+          echo "bootstrap_private_ip=${bootstrap_private_ip}" >>"$GITHUB_OUTPUT"
+
           echo "instance status"
           aws ec2 describe-instance-status \
             --region "$AWS_REGION" \
@@ -309,6 +319,54 @@ jobs:
                 --command-id "$repair_command_id" \
                 --instance-id "$instance_id" \
                 --output json | tee "$artifact_dir/repair-edge-tls-command.json" || true
+            fi
+
+            if [ "${REPAIR_HEAD_MIRROR_SEED_URLS}" = "true" ]; then
+              if [ -z "${bootstrap_private_ip:-}" ]; then
+                echo "bootstrap private ip is missing; cannot repair head mirror seed urls" >&2
+                exit 1
+              fi
+
+              repair_head_mirror_command_id="$(aws ssm send-command \
+                --region "$AWS_REGION" \
+                --instance-ids "$instance_id" \
+                --document-name AWS-RunShellScript \
+                --comment "repair burn_dragon bootstrap head mirror seed urls" \
+                --parameters "commands=[
+                  \"set -eu\",
+                  \"python3 - <<'PY'\nfrom pathlib import Path\nimport re\np = Path('/etc/burn_dragon_p2p/bootstrap-head-mirror.toml')\ntext = p.read_text()\nreplacement = 'seed_node_urls = [\\n  \\\"/ip4/${bootstrap_private_ip}/tcp/4001\\\",\\n]\\n'\ntext, count = re.subn(r'seed_node_urls\\s*=\\s*\\[(?:.|\\n)*?\\]\\n', replacement, text, count=1, flags=re.MULTILINE)\nif count != 1:\n    raise SystemExit('failed to rewrite seed_node_urls in bootstrap-head-mirror.toml')\np.write_text(text)\nprint(text)\nPY\",
+                  \"/usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle || true\",
+                  \"systemctl reset-failed burn-dragon-p2p-head-mirror || true\",
+                  \"systemctl restart burn-dragon-p2p-head-mirror\",
+                  \"systemctl status burn-dragon-p2p-head-mirror --no-pager || true\",
+                  \"journalctl -u burn-dragon-p2p-head-mirror --no-pager -n 120 || true\",
+                  \"curl -fsS https://127.0.0.1/heads || true\",
+                  \"curl -fsS https://127.0.0.1/portal/snapshot || true\"
+                ]" \
+                --query 'Command.CommandId' \
+                --output text)"
+
+              for attempt in $(seq 1 30); do
+                repair_head_mirror_invocation_status="$(aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$repair_head_mirror_command_id" \
+                  --instance-id "$instance_id" \
+                  --query 'Status' \
+                  --output text 2>/dev/null || true)"
+                case "$repair_head_mirror_invocation_status" in
+                  Success|Cancelled|TimedOut|Failed|Cancelling)
+                    break
+                    ;;
+                esac
+                sleep 5
+              done
+
+              echo "repair head mirror seed urls ssm command output"
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$repair_head_mirror_command_id" \
+                --instance-id "$instance_id" \
+                --output json | tee "$artifact_dir/repair-head-mirror-seed-urls-command.json" || true
             fi
 
             python3 -c 'import json; from pathlib import Path; commands=[line.rstrip("\n") for line in Path("scripts/bootstrap-inspect-commands.txt").read_text().splitlines() if line.strip()]; Path("/tmp/burn-dragon-inspect-params.json").write_text(json.dumps({"commands": commands}))'

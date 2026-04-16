@@ -1367,6 +1367,16 @@ jobs:
             sleep 5
           done
 
+          if [ "${invocation_status:-}" != "Success" ]; then
+            echo "timed out waiting for bootstrap edge enable/start" >&2
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --output json || true
+            exit 1
+          fi
+
           aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$command_id" \

@@ -135,7 +135,8 @@ command_id="$(aws ssm send-command \
   --query 'Command.CommandId' \
   --output text)"
 
-for attempt in $(seq 1 30); do
+invocation_status=""
+for attempt in $(seq 1 60); do
   invocation_status="$(aws ssm get-command-invocation \
     --region "$aws_region" \
     --command-id "$command_id" \
@@ -158,6 +159,16 @@ for attempt in $(seq 1 30); do
   esac
   sleep 5
 done
+
+if [ "${invocation_status:-}" != "Success" ]; then
+  echo "timed out waiting for bootstrap runtime config sync to finish" >&2
+  aws ssm get-command-invocation \
+    --region "$aws_region" \
+    --command-id "$command_id" \
+    --instance-id "$instance_id" \
+    --output json || true
+  exit 1
+fi
 
 aws ssm get-command-invocation \
   --region "$aws_region" \

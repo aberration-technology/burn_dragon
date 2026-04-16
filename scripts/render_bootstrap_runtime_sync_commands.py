@@ -106,7 +106,6 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         "systemctl daemon-reload",
         "systemctl restart caddy",
         "systemctl enable burn-dragon-p2p-head-mirror",
-        "systemctl restart burn-dragon-p2p-head-mirror || true",
         "systemctl enable burn-p2p-bootstrap",
         "systemctl restart burn-p2p-bootstrap",
         "systemctl is-active caddy",
@@ -120,6 +119,10 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
             f"aws s3 cp '{bootstrap_binary_object_uri}' /usr/local/bin/burn-p2p-bootstrap",
             "chmod 0755 /usr/local/bin/burn-p2p-bootstrap",
         ]
+    elif env.get("BOOTSTRAP_INSTALL_SOURCE") == "git" and not truthy(env.get("BOOTSTRAP_REINSTALL")):
+        raise SystemExit(
+            "BOOTSTRAP_BINARY_OBJECT_URI is required for git bootstrap sync when BOOTSTRAP_REINSTALL is false"
+        )
     else:
         bootstrap_setup = [
             "if [ ! -x /usr/local/bin/burn-p2p-bootstrap ] && [ ! -x /root/.cargo/bin/burn-p2p-bootstrap ]; then "
@@ -134,6 +137,10 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
             f"aws s3 cp '{head_mirror_binary_object_uri}' /usr/local/bin/burn_dragon_p2p_native",
             "chmod 0755 /usr/local/bin/burn_dragon_p2p_native",
         ]
+    elif not truthy(env.get("HEAD_MIRROR_REINSTALL")):
+        raise SystemExit(
+            "HEAD_MIRROR_BINARY_OBJECT_URI is required when HEAD_MIRROR_REINSTALL is false"
+        )
     elif truthy(env.get("HEAD_MIRROR_REINSTALL")):
         head_mirror_setup = [
             head_mirror_install_command(env),

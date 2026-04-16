@@ -37,7 +37,7 @@ def base_env() -> dict[str, str]:
         "HEAD_MIRROR_REINSTALL": "false",
         "BOOTSTRAP_REINSTALL": "false",
         "BOOTSTRAP_BINARY_OBJECT_URI": "",
-        "HEAD_MIRROR_BINARY_OBJECT_URI": "",
+        "HEAD_MIRROR_BINARY_OBJECT_URI": "s3://bucket/runtime/burn_dragon_p2p_native",
     }
 
 
@@ -67,11 +67,14 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
             commands.index("systemctl enable burn-p2p-bootstrap"),
             commands.index("systemctl restart burn-p2p-bootstrap"),
         )
+        self.assertIn("systemctl enable burn-dragon-p2p-head-mirror", joined)
+        self.assertNotIn("systemctl restart burn-dragon-p2p-head-mirror", joined)
 
     def test_git_path_requires_and_uses_bootstrap_git_ref(self) -> None:
         env = base_env()
         env["BOOTSTRAP_INSTALL_SOURCE"] = "git"
         env["BOOTSTRAP_GIT_REF"] = "b14acc12"
+        env["BOOTSTRAP_REINSTALL"] = "true"
         commands = module.generate_commands(env)
         joined = "\n".join(commands)
         self.assertIn(
@@ -90,9 +93,24 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         )
         self.assertNotIn("cargo install --locked burn_p2p_bootstrap", joined)
 
+    def test_missing_prebuilt_bootstrap_binary_is_rejected_for_git_sync_without_reinstall(self) -> None:
+        env = base_env()
+        env["BOOTSTRAP_INSTALL_SOURCE"] = "git"
+        env["BOOTSTRAP_REINSTALL"] = "false"
+        with self.assertRaises(SystemExit):
+            module.generate_commands(env)
+
+    def test_missing_prebuilt_head_mirror_binary_is_rejected_without_reinstall(self) -> None:
+        env = base_env()
+        env["HEAD_MIRROR_REINSTALL"] = "false"
+        env["HEAD_MIRROR_BINARY_OBJECT_URI"] = ""
+        with self.assertRaises(SystemExit):
+            module.generate_commands(env)
+
     def test_head_mirror_reinstall_path_is_guarded(self) -> None:
         env = base_env()
         env["HEAD_MIRROR_REINSTALL"] = "true"
+        env["HEAD_MIRROR_BINARY_OBJECT_URI"] = ""
         commands = module.generate_commands(env)
         joined = "\n".join(commands)
         self.assertIn("cargo install --locked --git", joined)
@@ -118,6 +136,22 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
                 text,
                 path.name,
             )
+            self.assertIn(
+                "timed out waiting for bootstrap edge enable/start",
+                text,
+                path.name,
+            )
+
+    def test_sync_script_times_out_when_ssm_command_never_succeeds(self) -> None:
+        text = (REPO_ROOT / "scripts" / "sync-bootstrap-runtime-config.sh").read_text()
+        self.assertIn(
+            'if [ "${invocation_status:-}" != "Success" ]; then',
+            text,
+        )
+        self.assertIn(
+            "timed out waiting for bootstrap runtime config sync to finish",
+            text,
+        )
 
 
 if __name__ == "__main__":

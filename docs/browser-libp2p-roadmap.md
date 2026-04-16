@@ -92,6 +92,37 @@ Browser swarm responsibilities:
 - peer artifact fetch and chunk fetch
 - actual peer presence and transport status
 
+## Bootstrap Source Of Truth
+
+The roadmap should not rely only on statically baked `seed_node_urls`.
+
+That is too brittle for the real deployment model because:
+
+- Pages artifacts can outlive infra changes
+- bootstrap transport addresses can change across deploys
+- the browser still needs an authenticated bootstrap path anyway
+
+Preferred model:
+
+1. browser authenticates through the edge
+2. browser fetches a signed browser-dialable seed set from the edge bootstrap
+   surface
+3. browser reconciles that signed seed set with any statically baked
+   `seed_node_urls`
+4. browser dials the signed set first
+5. static seed URLs remain fallback only
+
+Required output in `burn_p2p`:
+
+- one signed seed advertisement payload for browser peers
+- one deterministic merge policy between:
+  - edge-published browser-dialable multiaddrs
+  - site-config seed URLs
+- one diagnostics field reporting which source was used:
+  - `edge_signed`
+  - `site_config_fallback`
+  - `merged`
+
 ## Non-Goals
 
 - removing the edge completely
@@ -177,6 +208,15 @@ Design constraint:
   transports, use a thin runtime adapter boundary instead of burying JS glue in
   `burn_dragon`
 
+Required decision gate before implementation:
+
+- decide whether the first real browser transport backend is:
+  - Rust libp2p on wasm directly
+  - a JS/browser transport adapter behind a Rust trait boundary
+
+Do not start wiring browser swarm behavior into `burn_dragon` before that
+decision is made in `burn_p2p`.
+
 Acceptance:
 
 - browser connects to the bootstrap node using a real browser-capable peer
@@ -240,6 +280,40 @@ Acceptance:
 - the runtime no longer reports browser transport support that production cannot
   actually use
 
+## Proposed `burn_p2p` Integration Contract
+
+The first engineer should not have to invent the runtime boundary from scratch.
+
+Recommended library contract:
+
+- `BrowserSwarmBootstrap`
+  - authenticated browser identity/session handle
+  - trust bundle
+  - selected experiment/revision
+  - browser-dialable seed addresses
+  - transport policy
+- `BrowserSwarmStatus`
+  - bootstrap source
+  - desired transport
+  - connected transport
+  - connected peer ids
+  - overlay join state
+  - head sync state
+  - artifact transport mode
+  - last dial/sync error
+- `BrowserSwarmRuntime`
+  - `connect(bootstrap)`
+  - `disconnect()`
+  - `status()`
+  - `subscribe_directory()`
+  - `subscribe_heads()`
+  - `subscribe_metrics()`
+  - `fetch_artifact_manifest()`
+  - `fetch_artifact_chunk()`
+
+`burn_p2p_browser` should consume this contract and stop synthesizing
+connection state from HTTP snapshot state.
+
 ## Transport Strategy
 
 Recommended order:
@@ -296,6 +370,7 @@ Browser swarm participation changes trust boundaries. Require:
   - no matching head
   - no matching directory entry
   - browser transport advertised but not joinable
+  - no signed browser seed advertisement is available
 
 ## Acceptance Criteria
 
@@ -326,14 +401,15 @@ That milestone is enough to prove the architecture.
 For the agent or engineer implementing this in `burn_p2p`:
 
 1. add a design note describing the chosen browser transport backend
-2. introduce a browser swarm runtime abstraction in `burn_p2p_swarm`
-3. make `burn_p2p_browser` consume that abstraction instead of synthetic
+2. define the signed browser seed advertisement format and merge policy
+3. introduce a browser swarm runtime abstraction in `burn_p2p_swarm`
+4. make `burn_p2p_browser` consume that abstraction instead of synthetic
    transport selection
-4. replace UI transport/peer reporting with real swarm state
-5. demote edge snapshot sync to bootstrap/fallback
-6. integrate artifact peer transport with the same runtime
-7. add deployment/browser canary tests
-8. update `burn_dragon` to surface only real connection state
+5. replace UI transport/peer reporting with real swarm state
+6. demote edge snapshot sync to bootstrap/fallback
+7. integrate artifact peer transport with the same runtime
+8. add deployment/browser canary tests
+9. update `burn_dragon` to surface only real connection state
 
 ## Immediate Follow-Up In `burn_dragon`
 

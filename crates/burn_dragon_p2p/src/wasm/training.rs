@@ -885,6 +885,9 @@ async fn start_live_browser_participant(
         capability,
         BrowserTransportStatus {
             active: None,
+            selected: None,
+            connected: None,
+            connected_peer_ids: Vec::new(),
             webrtc_direct_enabled: snapshot.transports.webrtc_direct,
             webtransport_enabled: snapshot.transports.webtransport_gateway,
             wss_fallback_enabled: snapshot.transports.wss_fallback,

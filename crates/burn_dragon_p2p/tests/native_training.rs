@@ -409,6 +409,7 @@ fn local_browser_training_and_verification_pair(
     let trainer = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
             role: BrowserRuntimeRole::BrowserTrainerWgpu,
+            site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
             ..BrowserRuntimeConfig::new(
                 "https://edge.example",
                 network_id.clone(),
@@ -425,6 +426,7 @@ fn local_browser_training_and_verification_pair(
     let verifier = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
             role: BrowserRuntimeRole::BrowserVerifier,
+            site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
             ..BrowserRuntimeConfig::new(
                 "https://edge.example",
                 network_id.clone(),
@@ -1072,6 +1074,7 @@ fn browser_runtime_for_edge(
 ) -> BrowserRuntimeConfig {
     BrowserRuntimeConfig {
         role,
+        site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
         ..BrowserRuntimeConfig::new(
             edge_base_url,
             network_id,

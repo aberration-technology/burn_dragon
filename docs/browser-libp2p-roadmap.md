@@ -924,6 +924,92 @@ pub trait BrowserSwarmRuntime {
 This is not mandatory syntax, but the actual implementation should be this
 level of explicit.
 
+## Wasm Transport Adapter Boundary
+
+The wasm-first constraint needs a sharper boundary than "minimal JS."
+
+### Rust Must Own
+
+- seed advertisement fetch, validation, and merge policy
+- transport selection and downgrade policy
+- dial lifecycle and retry policy
+- browser swarm state machine
+- overlay join logic
+- assignment/head/artifact source tracking
+- diagnostics and metrics emission
+- integrity verification for manifests and chunks
+
+### JS May Own
+
+- feature detection for browser transport APIs that Rust cannot reach directly
+- construction of raw browser transport handles when required by the platform
+- narrow event forwarding into wasm
+- narrow send/close primitives for an already-established transport
+
+### JS Must Not Own
+
+- swarm orchestration
+- runtime state transitions
+- retry logic
+- overlay subscription policy
+- artifact routing policy
+- truth-source diagnostics
+
+If a JS bridge is required, it should be shaped like a transport device driver,
+not a browser swarm runtime.
+
+### Preferred Rust Boundary
+
+If browser transport APIs force a JS adapter, `burn_p2p_swarm` should still own
+the public trait boundary, for example:
+
+```rust
+#[async_trait(?Send)]
+pub trait BrowserTransportAdapter {
+    async fn connect(&mut self, dial: BrowserDialRequest) -> Result<BrowserTransportHandle>;
+    async fn send(&mut self, frame: BrowserTransportFrame) -> Result<()>;
+    async fn recv(&mut self) -> Result<BrowserTransportFrame>;
+    async fn close(&mut self) -> Result<()>;
+    fn capabilities(&self) -> BrowserTransportCapabilities;
+}
+```
+
+That keeps the portability and correctness boundary in Rust even if one thin JS
+implementation is temporarily necessary.
+
+## Signed Advertisement Validation Rules
+
+The signed advertisement contract needs strict validation rules or it will
+become an accidental dynamic config channel.
+
+The browser runtime should reject advertisements when:
+
+- `schema_version` is unsupported
+- `network_id` does not match the selected network
+- `issued_at` is too far in the future
+- `expires_at` is in the past
+- signature validation fails
+- the seed list is empty
+- all advertised multiaddrs are on disallowed transport families
+
+The browser runtime should sanitize advertisements by:
+
+- deduplicating peer ids
+- deduplicating multiaddrs
+- dropping unsupported transport families
+- dropping expired or malformed entries
+- enforcing an upper bound on seed count and total address count
+
+The browser runtime should report:
+
+- advertisement acceptance or rejection
+- rejection reason
+- accepted seed count
+- resulting preferred transport order
+- whether site-config fallback was merged
+
+This is important operationally. "Got JSON from the edge" is not good enough.
+
 ## File And Module Touch Map
 
 The roadmap should also show likely landing zones so work is not scattered
@@ -1036,6 +1122,69 @@ Operators should be able to answer:
 - did artifact fetch come from peers or the edge?
 
 That means the browser runtime needs structured debug state, not just UI text.
+
+## Milestone Exit Checklists
+
+The milestone definitions above are useful, but implementation should also have
+short exit checklists that reviewers can actually apply.
+
+### Milestone 1 Exit Checklist
+
+- browser resolves a valid signed advertisement
+- browser dials a real seed directly from that advertisement or explicit merge
+- browser reports the actual connected transport family
+- browser reports real connected peer ids
+- unsigned or invalid advertisements degrade cleanly without fake success
+
+### Milestone 2 Exit Checklist
+
+- directory and head state can remain current from swarm updates
+- browser reconnect after tab suspend is verified
+- UI state is driven by runtime truth, not HTTP heuristics
+- edge fallback is visible when active
+
+### Milestone 3 Exit Checklist
+
+- browser requests manifests and chunks from peers first
+- peer provider ids are visible in diagnostics
+- edge artifact fallback is explicit and measurable
+- chunk integrity verification matches native behavior
+
+### Production Exit Checklist
+
+- staging canary passes on browser-only topology
+- mixed browser/native canary passes
+- direct transport success rate meets the agreed budget
+- edge fallback rate is below the agreed threshold
+- deploy diagnostics prove signed advertisement validity and browser joinability
+
+## Release Gating And Signoff
+
+This roadmap should end in a concrete release process, not just merged code.
+
+### Required Artifacts Before Production Enablement
+
+- updated ADR in `burn_p2p` describing the chosen first browser transport backend
+- staging canary results for browser-only and mixed-fleet scenarios
+- operator diagnostics examples showing real connected transport and peers
+- rollback instructions tested against the previous edge-mediated path
+
+### Required Signoff
+
+- `burn_p2p` transport owner signs off on the runtime boundary
+- deployment owner signs off on browser-capable listener configuration
+- product owner signs off on the browser UX states
+- operator/debug owner signs off on diagnostics completeness
+
+### Hard Production Blockers
+
+Do not enable browser swarm by default if any of these remain true:
+
+- browser sessions cannot prove direct seed dial success
+- browser peers still derive peer count from heuristics
+- edge fallback cannot be distinguished from swarm success
+- artifact fetch integrity differs from the native path
+- rollback to edge-mediated mode is untested
 
 ## Migration Rules
 

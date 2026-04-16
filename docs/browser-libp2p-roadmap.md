@@ -700,6 +700,209 @@ The phase plan should map to concrete “done” definitions.
   - assignment sync
   - artifact fetch preference
 
+## Dependency Graph
+
+The phases are not independent. The order below is the minimum dependency chain.
+
+### Hard Dependencies
+
+- truthful diagnostics must land before transport rollout
+- signed browser seed advertisement must exist before real browser seed dial
+- real browser seed dial must exist before swarm-based steady-state sync
+- swarm-based steady-state sync must exist before artifact transport can be
+  judged as symmetric
+- deployment hardening must happen before production can claim browser/native
+  symmetry
+
+### Recommended Build Order
+
+1. diagnostics contracts and browser-visible state taxonomy
+2. signed seed advertisement schema and bootstrap fetch path
+3. browser swarm runtime trait boundary
+4. first real browser transport backend
+5. overlay join and swarm-fed assignment/head state
+6. peer-first artifact transport
+7. deployment/browser canary and production hard gates
+
+## Deliverables By Phase
+
+Each phase should produce concrete code, not just behavior.
+
+### Phase 0 Deliverables
+
+- new diagnostics/status schema in `burn_p2p_core`
+- browser runtime/UI wiring updated to expose truthful state
+- tests proving peer/transport labels are not synthetic
+
+### Phase 1 Deliverables
+
+- signed browser seed advertisement schema
+- edge endpoint or response field that returns the signed advertisement
+- browser seed merge policy implementation
+- diagnostics field showing the actual bootstrap source
+
+### Phase 2 Deliverables
+
+- `BrowserSwarmRuntime` trait and supporting status types
+- one browser-capable transport backend
+- browser seed dial orchestration in wasm
+- tests covering successful and failed seed dial paths
+
+### Phase 3 Deliverables
+
+- swarm-fed head update path
+- swarm-fed directory/assignment update path
+- explicit edge recovery path
+- tests proving the browser can stay current without repeated edge polling
+
+### Phase 4 Deliverables
+
+- browser swarm artifact manifest/chunk fetch path
+- provider discovery wiring
+- explicit fallback accounting for edge artifact fetch
+- tests proving peer-first artifact preference
+
+### Phase 5 Deliverables
+
+- deployment/browser canary
+- diagnostics gate for browser transport joinability
+- production transport matrix validation
+- operator-facing diagnostics for bootstrap seed advertisement and browser
+  transport health
+
+## Milestone Ownership Map
+
+This section exists so work can be split cleanly across repos and crates.
+
+### `burn_p2p_core`
+
+- signed browser seed advertisement schema
+- browser swarm status and diagnostics schema
+- transport family/status enums
+- protocol versioning for browser bootstrap contracts
+
+### `burn_p2p_swarm`
+
+- browser swarm runtime trait
+- transport implementation
+- seed dial orchestration
+- overlay join logic
+- reconnect/suspend-resume logic
+
+### `burn_p2p_browser`
+
+- browser session/bootstrap integration
+- runtime/UI state projection
+- explicit fallback orchestration
+- artifact transport selection policy
+
+### `burn_dragon`
+
+- Pages config and product-facing browser state
+- deployment/browser canary
+- production transport policy exposure
+- deployment diagnostics integration
+
+## Suggested Issue Breakdown
+
+If this roadmap is turned into issues, the first useful set should be:
+
+1. add browser swarm status contract to `burn_p2p_core`
+2. add signed browser seed advertisement schema and versioning
+3. expose signed browser seed advertisement from bootstrap edge
+4. introduce `BrowserSwarmRuntime` trait in `burn_p2p_swarm`
+5. implement first real browser transport backend
+6. wire `burn_p2p_browser` to real transport state
+7. add swarm-fed directory/head sync
+8. add peer-first artifact fetch in browser runtime
+9. add deployment/browser canary in `burn_dragon`
+
+Each issue should name:
+
+- owning crate
+- dependency issue ids
+- acceptance test
+- rollback/degradation behavior
+
+## Migration Rules
+
+The browser path needs explicit migration semantics while both old and new
+behavior coexist.
+
+### Client Migration Rules
+
+- browsers without signed seed advertisement support should continue to operate
+  in edge-bootstrap mode
+- browsers with signed seed advertisement support but no browser transport join
+  should expose `degraded_fallback`, not “connected”
+- browsers with active swarm join should prefer swarm-fed state and only use
+  edge fallback when required
+
+### Deployment Migration Rules
+
+- production must not flip to “browser swarm required” until canaries prove the
+  browser transport path works
+- bootstrap nodes must not advertise browser transport support unless the
+  transport is actually wired and reachable
+- Pages config should not hard-depend on new swarm-only fields until the edge
+  path is available
+
+## Browser UX State Requirements
+
+The roadmap should also constrain the browser UX, because misleading UI is part
+of the current asymmetry.
+
+Required public runtime states:
+
+- `sign in`
+- `connecting`
+- `joined network`
+- `syncing head`
+- `ready to train`
+- `training`
+- `degraded fallback`
+- `reconnect required`
+
+The UI should never:
+
+- label a browser “connected” when it only has a cached edge snapshot
+- label peer count from a synthetic heuristic
+- hide that it is operating in edge fallback mode
+
+## Observability Requirements
+
+The browser/native symmetry project needs better measurements than it has now.
+
+Required browser metrics/events:
+
+- seed advertisement fetch success/failure
+- seed dial attempts by transport family
+- transport join success/failure
+- overlay join success/failure
+- head source transitions
+- assignment source transitions
+- artifact source transitions
+- reconnect/suspend-resume events
+
+Required deployment diagnostics:
+
+- signed seed advertisement validity
+- browser-capable multiaddr availability
+- active browser transport matrix
+- real artifact-head route health
+- assignment/head presence
+
+## Rollback Criteria
+
+The rollout should stop or roll back if any of these occur in staging or
+production:
+
+- browser peers cannot complete signed seed resolution
+- browser peers join only through fallback for the majority of sessions
+- browser peers lose head sync after direct transport join
+- artifact fetch becomes slower or less reliable than the edge-only baseline
+- deployment advertises browser-capable transport that cannot be joined
+
 ## Phase Plan
 
 ### Phase 0: Truthful Diagnostics

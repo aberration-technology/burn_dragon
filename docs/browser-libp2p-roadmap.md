@@ -824,6 +824,219 @@ Each issue should name:
 - acceptance test
 - rollback/degradation behavior
 
+## Concrete Rust API Sketch
+
+The roadmap should include one plausible Rust shape so implementers do not have
+to invent the API boundary during the first PR.
+
+### Core Bootstrap Types
+
+```rust
+pub struct BrowserSeedAdvertisement {
+    pub schema_version: u32,
+    pub network_id: NetworkId,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub transport_policy: BrowserTransportPolicy,
+    pub seeds: Vec<BrowserSeedRecord>,
+    pub signature: BrowserAdvertisementSignature,
+}
+
+pub struct BrowserSeedRecord {
+    pub peer_id: PeerId,
+    pub multiaddrs: Vec<Multiaddr>,
+}
+
+pub struct BrowserSwarmBootstrap {
+    pub session: BrowserSessionBinding,
+    pub trust_bundle: TrustBundle,
+    pub transport_policy: BrowserTransportPolicy,
+    pub seed_source: BrowserSeedSource,
+    pub signed_advertisement: Option<BrowserSeedAdvertisement>,
+    pub fallback_seed_urls: Vec<String>,
+    pub selected_experiment: Option<ExperimentId>,
+    pub selected_revision: Option<RevisionId>,
+}
+```
+
+### Runtime Status Types
+
+```rust
+pub enum BrowserSwarmPhase {
+    Unauthenticated,
+    AuthBootstrap,
+    SignedSeedResolved,
+    DialingSeed,
+    TransportConnected,
+    OverlayJoining,
+    OverlayJoined,
+    DirectorySynced,
+    HeadSynced,
+    ArtifactReady,
+    TrainingReady,
+    TrainingActive,
+    DegradedFallback,
+    Failed,
+}
+
+pub enum BrowserTransportFamily {
+    WebRtcDirect,
+    WebTransport,
+    WssFallback,
+}
+
+pub struct BrowserSwarmStatus {
+    pub phase: BrowserSwarmPhase,
+    pub bootstrap_source: BrowserBootstrapSource,
+    pub desired_transport: Option<BrowserTransportFamily>,
+    pub connected_transport: Option<BrowserTransportFamily>,
+    pub connected_peer_ids: Vec<PeerId>,
+    pub joined_overlays: Vec<OverlayTopic>,
+    pub assignment_source: BrowserAssignmentSource,
+    pub head_source: BrowserHeadSource,
+    pub artifact_source: BrowserArtifactSource,
+    pub last_error: Option<String>,
+}
+```
+
+### Runtime Trait Boundary
+
+```rust
+#[async_trait(?Send)]
+pub trait BrowserSwarmRuntime {
+    async fn connect(&mut self, bootstrap: BrowserSwarmBootstrap) -> Result<()>;
+    async fn disconnect(&mut self) -> Result<()>;
+    fn status(&self) -> BrowserSwarmStatus;
+    async fn subscribe_directory(&mut self) -> Result<()>;
+    async fn subscribe_heads(&mut self) -> Result<()>;
+    async fn subscribe_metrics(&mut self) -> Result<()>;
+    async fn fetch_artifact_manifest(
+        &mut self,
+        request: BrowserArtifactRequest,
+    ) -> Result<ArtifactManifest>;
+    async fn fetch_artifact_chunk(
+        &mut self,
+        request: BrowserArtifactChunkRequest,
+    ) -> Result<Vec<u8>>;
+}
+```
+
+This is not mandatory syntax, but the actual implementation should be this
+level of explicit.
+
+## File And Module Touch Map
+
+The roadmap should also show likely landing zones so work is not scattered
+randomly.
+
+### `burn_p2p_core`
+
+Likely files/modules:
+
+- new `browser_bootstrap.rs` or `schema/browser.rs`
+- transport/status enums in a schema module
+- signed advertisement schema + signature validation helpers
+
+### `burn_p2p_swarm`
+
+Likely files/modules:
+
+- new wasm/browser swarm backend module
+- transport backend abstraction
+- seed dial orchestration
+- overlay join state tracking
+
+### `burn_p2p_browser`
+
+Likely files/modules:
+
+- browser auth/bootstrap integration
+- UI binding/state projection
+- artifact transport policy integration
+- fallback orchestration
+
+### `burn_dragon`
+
+Likely files/modules:
+
+- wasm UI state rendering
+- deployment diagnostics/canary wiring
+- Pages config for browser seed bootstrap expectations
+
+## Test And Canary Scenario Catalog
+
+The testing matrix is good, but implementers also need named scenarios.
+
+### Scenario A: Browser Bootstrap Only
+
+- browser signs in
+- browser resolves signed seeds
+- browser dials bootstrap directly
+- browser receives head and assignment
+- browser trains with bootstrap-only topology
+
+### Scenario B: Browser + Native Trainer
+
+- native trainer publishes head updates
+- browser receives head changes over swarm
+- browser stays current without edge steady-state polling
+
+### Scenario C: Transport Downgrade
+
+- WebRTC unavailable
+- browser falls back to WebTransport
+- if WebTransport unavailable, browser falls back to WSS
+- diagnostics show actual family selected
+
+### Scenario D: Suspend And Resume
+
+- browser joins swarm
+- tab is backgrounded or suspended
+- browser resumes
+- browser reconnects and resynchronizes without stale “connected” UI
+
+### Scenario E: Artifact Provider Preference
+
+- peer providers available
+- browser fetches manifest/chunks from peers first
+- edge fallback remains unused
+- diagnostics prove peer-first behavior
+
+### Scenario F: Recovery Fallback
+
+- browser transport join fails
+- browser enters explicit `degraded_fallback`
+- edge bootstrap/recovery still works
+- UI and diagnostics do not misreport this as full symmetry
+
+## Performance And Resource Budgets
+
+Browser/native symmetry is also a performance problem, not only an API problem.
+
+The implementation should define budgets for:
+
+- maximum bootstrap latency from sign-in completion to transport connected
+- maximum artifact bootstrap latency to first checkpoint availability
+- reconnect latency after tab resume
+- acceptable edge fallback rate in staging and production
+
+Without budgets, “works” is too vague and the browser path will regress silently.
+
+## Operator Debug Requirements
+
+The debugging story for browser-native symmetry should be explicit.
+
+Operators should be able to answer:
+
+- did the browser receive a signed advertisement?
+- which transport family did it attempt?
+- which transport family did it actually connect with?
+- did it join overlays?
+- is it using swarm-fed state or edge fallback?
+- did artifact fetch come from peers or the edge?
+
+That means the browser runtime needs structured debug state, not just UI text.
+
 ## Migration Rules
 
 The browser path needs explicit migration semantics while both old and new

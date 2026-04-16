@@ -39,6 +39,7 @@ wasm-ui = [
   "dep:burn_p2p_views",
   "dep:dioxus",
   "dep:gloo-net",
+  "dep:gloo-timers",
   "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
@@ -89,6 +90,7 @@ burn_p2p_views = { workspace = true, optional = true }
 dioxus = { version = "0.7.4", optional = true, default-features = false, features = ["lib", "web"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 gloo-net = { version = "0.6", optional = true }
+gloo-timers = { version = "0.3", optional = true, features = ["futures"] }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }

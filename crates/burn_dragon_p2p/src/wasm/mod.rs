@@ -15,6 +15,8 @@ use burn_p2p_views::{
     RolloutPreviewView, RuntimeCapabilitySummaryView, TrainingResultSummaryView,
 };
 use dioxus::prelude::*;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use gloo_timers::future::TimeoutFuture;
 use url::form_urlencoded;
 
 use crate::admin::{fetch_directory_entries, rollout_directory_entries, upsert_directory_entry};
@@ -36,6 +38,9 @@ use crate::wasm::training::{
 
 #[cfg(feature = "wasm-peer")]
 pub mod training;
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const CHECKPOINT_WAIT_REFRESH_INTERVAL_MILLIS: u32 = 5_000;
 
 #[cfg(feature = "wasm-peer")]
 fn browser_backend_label(config: &crate::config::DragonBrowserTrainingConfig) -> &'static str {
@@ -469,8 +474,47 @@ pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<Brow
 }
 
 pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let mut controller = BrowserAppController::connect_with(connect_config(config)?).await?;
-    controller.refresh().await.map_err(Into::into)
+    connect_browser_app(config).await
+}
+
+fn browser_view_has_active_checkpoint(view: &BrowserAppClientView) -> bool {
+    view.training.latest_head_id.is_some() || view.training.last_artifact_id.is_some()
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn spawn_checkpoint_wait_refresh(
+    config: DragonBrowserAppConfig,
+    mut current_view: Signal<Option<BrowserAppClientView>>,
+    mut status: Signal<String>,
+    mut checkpoint_wait_generation: Signal<u64>,
+) {
+    let next_generation = (*checkpoint_wait_generation.read()).saturating_add(1);
+    checkpoint_wait_generation.set(next_generation);
+    spawn(async move {
+        loop {
+            TimeoutFuture::new(CHECKPOINT_WAIT_REFRESH_INTERVAL_MILLIS).await;
+            if *checkpoint_wait_generation.read() != next_generation {
+                break;
+            }
+            match refresh_browser_app(&config).await {
+                Ok(view) => {
+                    let has_checkpoint = browser_view_has_active_checkpoint(&view);
+                    current_view.set(Some(view));
+                    if has_checkpoint {
+                        let current_generation = *checkpoint_wait_generation.read();
+                        checkpoint_wait_generation.set(current_generation.saturating_add(1));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    status.set(error.to_string());
+                    let current_generation = *checkpoint_wait_generation.read();
+                    checkpoint_wait_generation.set(current_generation.saturating_add(1));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 pub async fn resume_or_complete_browser_auth(
@@ -568,6 +612,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
     let auth_bootstrap_started = use_signal(|| false);
     let auth_bootstrap_pending = use_signal(|| true);
+    let checkpoint_wait_generation = use_signal(|| 0_u64);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
 
@@ -579,6 +624,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut status = status;
         let mut auth_bootstrap_started = auth_bootstrap_started;
         let mut auth_bootstrap_pending = auth_bootstrap_pending;
+        let checkpoint_wait_generation = checkpoint_wait_generation;
         use_effect(move || {
             if *auth_bootstrap_started.read() {
                 return;
@@ -590,8 +636,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 match resume_or_complete_browser_auth(&config, release_manifest.as_ref()).await {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        if let Ok(view) = refresh_browser_app(&config).await {
+                        if let Ok(view) = connect_browser_app(&config).await {
+                            let has_checkpoint = browser_view_has_active_checkpoint(&view);
                             current_view.set(Some(view));
+                            if !has_checkpoint {
+                                spawn_checkpoint_wait_refresh(
+                                    config.clone(),
+                                    current_view,
+                                    status,
+                                    checkpoint_wait_generation,
+                                );
+                            }
                         }
                         if provider_code_from_window_location().is_some() {
                             status.set(String::new());
@@ -622,10 +677,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut current_view = current_view;
             let mut session_state = session_state;
+            let checkpoint_wait_generation = checkpoint_wait_generation;
             spawn(async move {
                 status.set("Connecting…".into());
                 match connect_browser_app(&next_config).await {
                     Ok(view) => {
+                        let has_checkpoint = browser_view_has_active_checkpoint(&view);
                         current_view.set(Some(view));
                         let session = match resolved_edge_base_url(&next_config) {
                             Ok(edge_base_url) => load_browser_session(&edge_base_url).await.ok(),
@@ -633,6 +690,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         };
                         session_state.set(session);
                         status.set(String::new());
+                        if !has_checkpoint {
+                            spawn_checkpoint_wait_refresh(
+                                next_config,
+                                current_view,
+                                status,
+                                checkpoint_wait_generation,
+                            );
+                        }
                     }
                     Err(error) => status.set(error.to_string()),
                 }

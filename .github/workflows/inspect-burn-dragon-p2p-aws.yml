@@ -301,13 +301,17 @@ jobs:
                 --output json || true
             fi
 
-            cat >/tmp/burn-dragon-inspect-commands.txt <<'EOF'
+            python3 - <<'PY'
+            import json
+            from pathlib import Path
+
+            commands = """
             set -eu
             date -Is
             uname -a
             cloud-init status --long || true
             echo "--- /etc/burn-dragon-p2p/bootstrap.env ---"
-            if [ -f /etc/burn-dragon-p2p/bootstrap.env ]; then awk -F= '{ value=$2; gsub(/^"|"$/, "", value); printf "%s=<set:%d chars>\n", $1, length(value) }' /etc/burn-dragon-p2p/bootstrap.env; else echo missing; fi
+            if [ -f /etc/burn-dragon-p2p/bootstrap.env ]; then awk -F= '{ value=$2; gsub(/^"|"$/, "", value); printf "%s=<set:%d chars>\\n", $1, length(value) }' /etc/burn-dragon-p2p/bootstrap.env; else echo missing; fi
             echo "--- /etc/burn-dragon-p2p/bootstrap auth connector ---"
             python3 -c 'from pathlib import Path; import json; p=Path("/etc/burn-dragon-p2p/bootstrap.json"); cfg=json.loads(p.read_text()) if p.exists() else {}; connector=((cfg.get("auth") or {}).get("connector") or {}); redacted=dict(connector); [redacted.__setitem__(key, "<redacted>") for key in ("client_secret",) if key in redacted]; print(json.dumps(redacted, indent=2, sort_keys=True))' || true
             echo "--- /etc/caddy/Caddyfile ---"
@@ -354,17 +358,7 @@ jobs:
             curl -v http://127.0.0.1/ || true
             curl -vkI https://127.0.0.1/portal/snapshot || true
             curl -v http://127.0.0.1:4000/portal/snapshot || true
-            EOF
-
-            python3 - <<'PY'
-            import json
-            from pathlib import Path
-
-            commands = [
-                line.rstrip("\n")
-                for line in Path("/tmp/burn-dragon-inspect-commands.txt").read_text().splitlines()
-                if line.strip()
-            ]
+            """.strip().splitlines()
             Path("/tmp/burn-dragon-inspect-params.json").write_text(json.dumps({"commands": commands}))
             PY
 

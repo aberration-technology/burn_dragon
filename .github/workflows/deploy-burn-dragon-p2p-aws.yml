@@ -1458,6 +1458,8 @@ jobs:
       - name: seed managed trainer auth bundle in ssm parameter store
         if: ${{ env.TF_VAR_managed_trainer_desired_capacity != '0' }}
         shell: bash
+        env:
+          DRAGON_NATIVE_BINARY: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
         run: |
           set -euo pipefail
           bundle_json="${TRAINER_AUTH_BUNDLE_JSON:-}"
@@ -1491,8 +1493,15 @@ jobs:
             bootstrap_addrs = []
             EOF
 
+            dragon_native_cmd=()
+            if [ -n "${DRAGON_NATIVE_BINARY:-}" ] && [ -x "${DRAGON_NATIVE_BINARY}" ]; then
+              dragon_native_cmd=("${DRAGON_NATIVE_BINARY}")
+            else
+              dragon_native_cmd=(cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native --)
+            fi
+
             for attempt in $(seq 1 10); do
-              if cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native -- \
+              if "${dragon_native_cmd[@]}" \
                 enroll-static-principal \
                 --config "$config_path" \
                 --experiment-kind "$TF_VAR_managed_trainer_experiment_kind" \
@@ -1517,12 +1526,15 @@ jobs:
           aws ssm put-parameter \
             --region "$AWS_REGION" \
             --type SecureString \
+            --tier Advanced \
             --overwrite \
             --name "$TF_VAR_managed_trainer_auth_bundle_parameter_name" \
             --value "$bundle_json"
 
       - name: seed bootstrap head mirror auth bundle in ssm parameter store
         shell: bash
+        env:
+          DRAGON_NATIVE_BINARY: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
         run: |
           set -euo pipefail
           tmpdir="$(mktemp -d)"
@@ -1553,8 +1565,15 @@ jobs:
           bootstrap_addrs = []
           EOF
 
+          dragon_native_cmd=()
+          if [ -n "${DRAGON_NATIVE_BINARY:-}" ] && [ -x "${DRAGON_NATIVE_BINARY}" ]; then
+            dragon_native_cmd=("${DRAGON_NATIVE_BINARY}")
+          else
+            dragon_native_cmd=(cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native --)
+          fi
+
           for attempt in $(seq 1 10); do
-            if cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native -- \
+            if "${dragon_native_cmd[@]}" \
               enroll-static-principal \
               --config "$config_path" \
               --experiment-kind nca \
@@ -1567,6 +1586,7 @@ jobs:
               aws ssm put-parameter \
                 --region "$AWS_REGION" \
                 --type SecureString \
+                --tier Advanced \
                 --overwrite \
                 --name "$TF_VAR_bootstrap_head_mirror_auth_bundle_parameter_name" \
                 --value "$(cat "$bundle_path")"

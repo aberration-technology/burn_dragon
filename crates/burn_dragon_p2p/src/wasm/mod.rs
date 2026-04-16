@@ -581,6 +581,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let mut show_live_details = use_signal(|| false);
     let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
     let auth_bootstrap_started = use_signal(|| false);
+    let auth_bootstrap_pending = use_signal(|| true);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
 
@@ -591,6 +592,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut current_view = current_view;
         let mut status = status;
         let mut auth_bootstrap_started = auth_bootstrap_started;
+        let mut auth_bootstrap_pending = auth_bootstrap_pending;
         use_effect(move || {
             if *auth_bootstrap_started.read() {
                 return;
@@ -618,6 +620,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                 }
+                auth_bootstrap_pending.set(false);
             });
         });
     }
@@ -1053,11 +1056,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 .or_else(|| view.training.last_artifact_id.clone())
         })
         .unwrap_or_else(|| "awaiting checkpoint".into());
+    let has_active_checkpoint = view.as_ref().is_some_and(|view| {
+        view.training.latest_head_id.is_some() || view.training.last_artifact_id.is_some()
+    });
     let peer_summary = view
         .as_ref()
         .map(|view| {
-            if view.network.estimated_network_size == 0 {
-                "awaiting sync".to_owned()
+            if !has_active_checkpoint {
+                "waiting for first checkpoint".to_owned()
+            } else if view.network.estimated_network_size == 0 {
+                "connected".to_owned()
             } else if view.network.direct_peers == 0 {
                 format!("~{} visible", view.network.estimated_network_size)
             } else {
@@ -1067,18 +1075,21 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 )
             }
         })
-        .unwrap_or_else(|| "awaiting sync".into());
+        .unwrap_or_else(|| "waiting for first checkpoint".into());
     let has_session = session_state
         .read()
         .as_ref()
         .and_then(|session| session.session.as_ref())
         .is_some();
+    let auth_bootstrap_pending_active = *auth_bootstrap_pending.read();
     let has_connected_view = view.is_some();
-    let public_landing = !has_session && !has_connected_view;
+    let public_landing = !auth_bootstrap_pending_active && !has_session && !has_connected_view;
     let needs_sign_in = auth_required && !has_session;
-    let ready_to_connect = !needs_sign_in && !has_connected_view;
+    let ready_to_connect = !auth_bootstrap_pending_active && !needs_sign_in && !has_connected_view;
     let hero_title = "train the dragon".to_owned();
-    let hero_subtitle = if needs_sign_in {
+    let hero_subtitle = if auth_bootstrap_pending_active {
+        "loading…".to_owned()
+    } else if needs_sign_in {
         "contribute training from your browser.".to_owned()
     } else if ready_to_connect {
         "connect this tab to start training.".to_owned()
@@ -1100,7 +1111,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     } else {
         raw_status_message
     };
-    let show_public_retry = callback_available && !status_message.is_empty();
+    let show_public_retry =
+        !auth_bootstrap_pending_active && callback_available && !status_message.is_empty();
+    let connected_panel_title = if has_active_checkpoint { "ready" } else { "syncing" };
+    let connected_panel_detail = if has_active_checkpoint {
+        ""
+    } else {
+        "waiting for the first checkpoint."
+    };
     #[cfg(feature = "wasm-peer")]
     let train_action = {
         let props = props.clone();
@@ -1171,6 +1189,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     #[cfg(feature = "wasm-peer")]
     let train_button = {
         let has_training_config = has_connected_view
+            && has_active_checkpoint
             && resolved_edge_base_url(&initial_config).is_ok()
             && browser_can_attempt_dynamic_training;
         rsx! {
@@ -1377,8 +1396,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     section { class: "panel primary-panel browser-focus-panel",
                         SectionHeader {
                             eyebrow: "live",
-                            title: "ready",
-                            detail: "",
+                            title: connected_panel_title,
+                            detail: connected_panel_detail,
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack",

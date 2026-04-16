@@ -396,73 +396,14 @@ jobs:
               --instance-id "$instance_id" \
               --output json | tee "$artifact_dir/inspect-command-output.json" || true
 
-            python3 - "$artifact_dir/inspect-command-output.json" "$artifact_dir/bootstrap-deployment-diagnostics.json" <<'PY'
-            import json
-            import sys
-            from pathlib import Path
-
-            source = Path(sys.argv[1])
-            target = Path(sys.argv[2])
-            if not source.exists():
-                raise SystemExit(0)
-            payload = json.loads(source.read_text())
-            stdout = payload.get("StandardOutputContent") or ""
-            begin = "--- deployment diagnostics json begin ---"
-            end = "--- deployment diagnostics json end ---"
-            if begin not in stdout or end not in stdout:
-                raise SystemExit(0)
-            start = stdout.index(begin) + len(begin)
-            finish = stdout.index(end, start)
-            body = stdout[start:finish].strip()
-            if not body:
-                raise SystemExit(0)
-            json.loads(body)
-            target.write_text(body + "\n")
-            PY
+            python3 scripts/extract_deployment_diagnostics_from_ssm_output.py \
+              "$artifact_dir/inspect-command-output.json" \
+              "$artifact_dir/bootstrap-deployment-diagnostics.json"
           fi
 
           printf '%s\n' "${ssm_status:-missing}" >"$artifact_dir/ssm-status.txt"
 
-          python3 - "$artifact_dir" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          artifact_dir = Path(sys.argv[1])
-          summary = {
-              "instance_id": None,
-              "ssm_status": None,
-              "deployment_ready": None,
-              "profile_source": None,
-              "matching_head_present": None,
-              "matching_head_id": None,
-              "blocking_issues": [],
-              "observed_warnings": [],
-          }
-
-          describe_path = artifact_dir / "instance-describe.json"
-          if describe_path.exists():
-              describe = json.loads(describe_path.read_text())
-              reservations = describe.get("Reservations") or []
-              if reservations and reservations[0].get("Instances"):
-                  summary["instance_id"] = reservations[0]["Instances"][0].get("InstanceId")
-
-          diagnostics_path = artifact_dir / "bootstrap-deployment-diagnostics.json"
-          if diagnostics_path.exists():
-              diagnostics = json.loads(diagnostics_path.read_text())
-              readiness = diagnostics.get("readiness") or {}
-              edge_snapshot = (diagnostics.get("edge_snapshot") or {}).get("value") or {}
-              profile_resolution = (diagnostics.get("profile_resolution") or {}).get("value") or {}
-              summary["deployment_ready"] = readiness.get("ready")
-              summary["profile_source"] = profile_resolution.get("source")
-              summary["matching_head_present"] = edge_snapshot.get("matching_head_present")
-              summary["matching_head_id"] = edge_snapshot.get("matching_head_id")
-              summary["blocking_issues"] = readiness.get("blocking_issues") or []
-              summary["observed_warnings"] = readiness.get("observed_warnings") or []
-
-          summary["ssm_status"] = Path(artifact_dir / "ssm-status.txt").read_text().strip() if (artifact_dir / "ssm-status.txt").exists() else None
-          (artifact_dir / "inspection-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-          PY
+          python3 scripts/write_inspection_summary.py "$artifact_dir"
 
       - name: summarize inspection
         if: ${{ always() && steps.inspect.outputs.artifact_dir != '' }}

@@ -347,7 +347,7 @@ jobs:
                 "echo \"--- likely storage files under /var/lib/burn_dragon_p2p ---\"",
                 "find /var/lib/burn_dragon_p2p -maxdepth 5 -type f | sort || true",
                 "echo \"--- likely publication files preview ---\"",
-                "find /var/lib/burn_dragon_p2p -maxdepth 6 -type f \\( -name '*.json' -o -name '*.jsonl' -o -name '*.toml' \\) -size -8192c -print -exec sh -c 'printf \"=== %s ===\\n\" \"$1\"; sed -n \"1,120p\" \"$1\"' _ {} \\; || true",
+                "find /var/lib/burn_dragon_p2p -maxdepth 6 -type f \\( -name '*.json' -o -name '*.jsonl' -o -name '*.toml' \\) -size -8192c -exec echo '=== file ===' \\; -exec ls -l {} \\; -exec sed -n '1,120p' {} \\; || true",
                 "tail -n 200 /var/log/cloud-init-output.log || true",
                 "ss -ltnup || true",
                 "echo \"--- localhost /login/github ---\"",

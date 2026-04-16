@@ -1656,17 +1656,7 @@ jobs:
               --connect-timeout 5 \
               --max-time 20 \
               "$edge_url/portal/snapshot")"
-            if python3 - "$snapshot_json" <<'PY'
-            import json
-            import sys
-
-            payload = json.loads(sys.argv[1])
-            heads = payload.get("heads") or []
-            for head in heads:
-                if head.get("experiment_id") == "nca-prepretraining":
-                    raise SystemExit(0)
-            raise SystemExit(1)
-            PY
+            if python3 -c 'import json, sys; payload = json.loads(sys.argv[1]); heads = payload.get("heads") or []; raise SystemExit(0 if any(head.get("experiment_id") == "nca-prepretraining" for head in heads) else 1)' "$snapshot_json"
             then
               exit 0
             fi

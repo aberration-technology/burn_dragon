@@ -219,6 +219,12 @@ The browser app also accepts network overrides from query params:
 
 The browser runtime still bootstraps through the edge today, but the seed URL list is carried through the config surface so hardcoded defaults can be added later without changing the shape.
 
+That does not yet mean the browser behaves like a first-class libp2p swarm
+peer. The current browser runtime is still edge-mediated for its steady-state
+directory/head/metrics flow. The implementation roadmap for making browser peers
+dial the bootstrap node directly and operate more like native peers is tracked
+in [../../docs/browser-libp2p-roadmap.md](../../docs/browser-libp2p-roadmap.md).
+
 If the selected directory entry includes Dragon profile metadata, browser training can run without a static embedded `training` config in the host app.
 
 ### Native Peer

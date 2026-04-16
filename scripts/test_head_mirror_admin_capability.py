@@ -24,7 +24,11 @@ def main() -> None:
         (RESTORE_WORKFLOW, restore_workflow),
     ):
         assert_contains(text, '"bootstrap_head_mirror": "true"', str(path))
-        assert_contains(text, '"admin_capabilities": "register_live_head"', str(path))
+        assert_contains(
+            text,
+            '"admin_capabilities": "register_live_head,rollout_auth_policy"',
+            str(path),
+        )
 
     print("head-mirror-admin-capability-ok")
 

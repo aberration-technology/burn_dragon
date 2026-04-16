@@ -75,12 +75,27 @@ def ensure_aws_cli_command() -> str:
     )
 
 
+def wait_for_runtime_sync_prereqs_command() -> str:
+    return (
+        "for attempt in $(seq 1 60); do "
+        "if [ -x /usr/local/bin/burn-dragon-p2p-sync-secrets ] && command -v aws >/dev/null 2>&1; then "
+        "exit 0; "
+        "fi; "
+        "sleep 5; "
+        "done; "
+        "echo 'timed out waiting for bootstrap runtime sync prerequisites' >&2; "
+        "exit 1"
+    )
+
+
 def generate_commands(env: Mapping[str, str]) -> list[str]:
     preamble = [
         "set -eu",
         "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH",
-        "cloud-init status --wait || true",
+        wait_for_runtime_sync_prereqs_command(),
         ensure_aws_cli_command(),
+        "install -d -m 0755 /etc/burn-dragon-p2p /etc/caddy /etc/burn_dragon_p2p /usr/local/bin",
+        "install -d -m 0700 /var/lib/burn_dragon_p2p",
     ]
     bootstrap_setup: list[str] = []
     head_mirror_setup: list[str] = []

@@ -1040,7 +1040,7 @@ jobs:
             --comment "ensure burn_dragon bootstrap edge service is active" \
             --parameters 'commands=[
               "set -eu",
-              "cloud-init status --wait || true",
+              "test -x /usr/local/bin/burn-dragon-p2p-sync-secrets",
               "test -x /usr/local/bin/burn-p2p-bootstrap",
               "systemctl daemon-reload",
               "systemctl enable caddy",

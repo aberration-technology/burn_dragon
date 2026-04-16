@@ -231,15 +231,15 @@ locals {
   # The head mirror is colocated with the bootstrap edge on the same EC2 host.
   # Seed it against the bootstrap's in-VPC listen address instead of the public
   # edge DNS so it does not self-dial the instance's own public endpoint.
-  bootstrap_head_mirror_seed_node_urls             = local.bootstrap_peer_internal_multiaddrs
-  managed_validator_enabled                        = var.managed_validator_enabled
-  managed_validator_experiment_kind                = lower(trimspace(var.managed_validator_experiment_kind))
-  managed_validator_features                       = "native"
-  managed_validator_enabled_features_label         = local.managed_validator_features
-  managed_validator_experiment_id                  = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
-  managed_validator_revision_id                    = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
-  managed_validator_auth_bundle_parameter_name     = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
-  managed_validator_seed_node_urls                 = local.managed_trainer_seed_node_urls
+  bootstrap_head_mirror_seed_node_urls         = local.bootstrap_peer_internal_multiaddrs
+  managed_validator_enabled                    = var.managed_validator_enabled
+  managed_validator_experiment_kind            = lower(trimspace(var.managed_validator_experiment_kind))
+  managed_validator_features                   = "native"
+  managed_validator_enabled_features_label     = local.managed_validator_features
+  managed_validator_experiment_id              = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
+  managed_validator_revision_id                = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_validator_auth_bundle_parameter_name = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
+  managed_validator_seed_node_urls             = local.managed_trainer_seed_node_urls
   auth_connector = local.auth_connector_kind == "github" ? merge(
     {
       kind          = "github"

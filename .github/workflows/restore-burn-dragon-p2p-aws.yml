@@ -213,11 +213,17 @@ jobs:
           VAR_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS: ${{ vars.BURN_DRAGON_P2P_DISASTER_RECOVERY_SNAPSHOT_RETENTION_DAYS }}
           VAR_ARTIFACT_BUCKET_FORCE_DESTROY: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_FORCE_DESTROY }}
           VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}
+          INPUT_CREATE_ARTIFACT_BUCKET: ${{ github.event.inputs.create_artifact_bucket }}
+          INPUT_ARTIFACT_BUCKET_NAME: ${{ github.event.inputs.artifact_bucket_name }}
+          INPUT_ARTIFACT_BUCKET_PATH_PREFIX: ${{ github.event.inputs.artifact_bucket_path_prefix }}
+          INPUT_CREATE_ARTIFACT_REPLICA_BUCKET: ${{ github.event.inputs.create_artifact_replica_bucket }}
+          INPUT_ARTIFACT_REPLICA_BUCKET_NAME: ${{ github.event.inputs.artifact_replica_bucket_name }}
           INPUT_SOURCE_SNAPSHOT_REGION: ${{ github.event.inputs.source_snapshot_region }}
           INPUT_RESTORE_FROM_LATEST_SNAPSHOTS: ${{ github.event.inputs.restore_from_latest_snapshots }}
           INPUT_BOOTSTRAP_PRIMARY_RESTORE_SNAPSHOT_ID: ${{ github.event.inputs.bootstrap_primary_restore_snapshot_id }}
           INPUT_NEXT_DISASTER_RECOVERY_REGION: ${{ github.event.inputs.next_disaster_recovery_region }}
           INPUT_PLAN_ONLY: ${{ github.event.inputs.plan_only }}
+          GITHUB_ACTOR_CONTEXT: ${{ github.actor }}
           GITHUB_REPOSITORY_OWNER_CONTEXT: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
@@ -299,21 +305,21 @@ jobs:
           enable_control_plane_operational_alarms="$VAR_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS"
           enable_control_plane_dashboard="$VAR_ENABLE_CONTROL_PLANE_DASHBOARD"
           enable_managed_control_plane_redis="$VAR_ENABLE_MANAGED_CONTROL_PLANE_REDIS"
-          create_artifact_bucket="${{ github.event.inputs.create_artifact_bucket }}"
-          artifact_bucket_name="${{ github.event.inputs.artifact_bucket_name }}"
-          artifact_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME }}"
-          artifact_bucket_path_prefix="${{ github.event.inputs.artifact_bucket_path_prefix }}"
-          artifact_bucket_path_prefix_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX }}"
-          create_artifact_replica_bucket="${{ github.event.inputs.create_artifact_replica_bucket }}"
-          artifact_replica_bucket_name="${{ github.event.inputs.artifact_replica_bucket_name }}"
-          artifact_replica_bucket_name_var="${{ vars.BURN_DRAGON_P2P_ARTIFACT_REPLICA_BUCKET_NAME }}"
+          create_artifact_bucket="$INPUT_CREATE_ARTIFACT_BUCKET"
+          artifact_bucket_name="$INPUT_ARTIFACT_BUCKET_NAME"
+          artifact_bucket_name_var="$VAR_ARTIFACT_BUCKET_NAME"
+          artifact_bucket_path_prefix="$INPUT_ARTIFACT_BUCKET_PATH_PREFIX"
+          artifact_bucket_path_prefix_var="$VAR_ARTIFACT_BUCKET_PATH_PREFIX"
+          create_artifact_replica_bucket="$INPUT_CREATE_ARTIFACT_REPLICA_BUCKET"
+          artifact_replica_bucket_name="$INPUT_ARTIFACT_REPLICA_BUCKET_NAME"
+          artifact_replica_bucket_name_var="$VAR_ARTIFACT_REPLICA_BUCKET_NAME"
           artifact_bucket_force_destroy="$VAR_ARTIFACT_BUCKET_FORCE_DESTROY"
           artifact_replica_bucket_force_destroy="$VAR_ARTIFACT_REPLICA_BUCKET_FORCE_DESTROY"
           artifact_bucket_server_side_encryption="$VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION"
-          restore_from_latest_snapshots="${{ github.event.inputs.restore_from_latest_snapshots }}"
+          restore_from_latest_snapshots="$INPUT_RESTORE_FROM_LATEST_SNAPSHOTS"
           source_snapshot_region_input="$INPUT_SOURCE_SNAPSHOT_REGION"
-          primary_restore_snapshot_id="${{ github.event.inputs.bootstrap_primary_restore_snapshot_id }}"
-          next_disaster_recovery_region="${{ github.event.inputs.next_disaster_recovery_region }}"
+          primary_restore_snapshot_id="$INPUT_BOOTSTRAP_PRIMARY_RESTORE_SNAPSHOT_ID"
+          next_disaster_recovery_region="$INPUT_NEXT_DISASTER_RECOVERY_REGION"
 
           aws_region="$aws_region_input"
           if [ -z "$aws_region" ]; then
@@ -402,7 +408,7 @@ jobs:
             auth_external_trusted_internal_only="true"
           fi
           if [ -z "$github_admin_logins" ] && [ "$auth_connector_kind" = "github" ]; then
-            github_admin_logins="${{ github.actor }}"
+            github_admin_logins="$GITHUB_ACTOR_CONTEXT"
           fi
           dataset_domain_name="$dataset_domain_name_var"
           if [ -z "$dataset_domain_name" ]; then
@@ -1442,6 +1448,29 @@ jobs:
           if-no-files-found: ignore
 
       - name: publish workflow summary
+        env:
+          INPUT_PLAN_ONLY: ${{ github.event.inputs.plan_only }}
+          OUTPUT_EDGE_URL: ${{ steps.outputs.outputs.edge_url }}
+          OUTPUT_BROWSER_APP_URL: ${{ steps.outputs.outputs.browser_app_url }}
+          OUTPUT_SEED_TCP: ${{ steps.outputs.outputs.seed_tcp }}
+          OUTPUT_SEED_QUIC: ${{ steps.outputs.outputs.seed_quic }}
+          OUTPUT_BOOTSTRAP_STATE_STORAGE_MODE: ${{ steps.outputs.outputs.bootstrap_state_storage_mode }}
+          OUTPUT_CONTROL_PLANE_STATE_BACKEND: ${{ steps.outputs.outputs.control_plane_state_backend }}
+          OUTPUT_REDIS_ENDPOINT: ${{ steps.outputs.outputs.redis_endpoint }}
+          OUTPUT_CONTROL_PLANE_DASHBOARD_NAME: ${{ steps.outputs.outputs.control_plane_dashboard_name }}
+          OUTPUT_CONTROL_PLANE_DASHBOARD_URL: ${{ steps.outputs.outputs.control_plane_dashboard_url }}
+          OUTPUT_ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
+          OUTPUT_ARTIFACT_BUCKET_URI: ${{ steps.outputs.outputs.artifact_bucket_uri }}
+          OUTPUT_DATASET_BUCKET_NAME: ${{ steps.outputs.outputs.dataset_bucket_name }}
+          OUTPUT_DATASET_BUCKET_URI: ${{ steps.outputs.outputs.dataset_bucket_uri }}
+          OUTPUT_DATASET_DISTRIBUTION_DOMAIN_NAME: ${{ steps.outputs.outputs.dataset_distribution_domain_name }}
+          OUTPUT_MANAGED_CLIMBMIX_BROWSER_DATASET_BASE_URL: ${{ steps.outputs.outputs.managed_climbmix_browser_dataset_base_url }}
+          OUTPUT_DISASTER_RECOVERY_REGION: ${{ steps.outputs.outputs.disaster_recovery_region }}
+          OUTPUT_ARTIFACT_REPLICA_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_replica_bucket_name }}
+          OUTPUT_ARTIFACT_REPLICA_BUCKET_URI: ${{ steps.outputs.outputs.artifact_replica_bucket_uri }}
+          OUTPUT_MANAGED_TRAINER_ASG_NAME: ${{ steps.outputs.outputs.managed_trainer_asg_name }}
+          OUTPUT_MANAGED_TRAINER_DESIRED_CAPACITY: ${{ steps.outputs.outputs.managed_trainer_desired_capacity }}
+          OUTPUT_BOOTSTRAP_HEAD_MIRROR_AUTH_BUNDLE_PARAMETER_NAME: ${{ steps.outputs.outputs.bootstrap_head_mirror_auth_bundle_parameter_name }}
         shell: bash
         run: |
           cat >>"$GITHUB_STEP_SUMMARY" <<EOF
@@ -1453,7 +1482,7 @@ jobs:
           - Snapshot search region: \`${SNAPSHOT_SEARCH_REGION}\`
           - Bootstrap state storage: \`${TF_VAR_use_retained_bootstrap_data_volume:-false}\`
           - Bootstrap restore snapshot: \`${PRIMARY_RESTORE_SNAPSHOT_ID:-disabled}\`
-          - Plan only: \`${{ github.event.inputs.plan_only }}\`
+          - Plan only: \`${INPUT_PLAN_ONLY}\`
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`
           - GitHub admin logins: \`${ADMIN_LOGINS_CSV:-n/a}\`
           - Secret prefix: \`${SECRET_PARAMETER_PREFIX}\`
@@ -1462,32 +1491,32 @@ jobs:
           - Bootstrap git ref override: \`${TF_VAR_bootstrap_git_ref:-n/a}\`
           EOF
 
-          if [ "${{ github.event.inputs.plan_only }}" != "true" ]; then
+          if [ "${INPUT_PLAN_ONLY}" != "true" ]; then
             cat >>"$GITHUB_STEP_SUMMARY" <<EOF
-          - Edge URL: ${{ steps.outputs.outputs.edge_url }}
-          - Browser App URL: \`${{ steps.outputs.outputs.browser_app_url || 'not-configured' }}\`
-          - Seed TCP: \`${{ steps.outputs.outputs.seed_tcp }}\`
-          - Seed QUIC: \`${{ steps.outputs.outputs.seed_quic }}\`
-          - Bootstrap state storage mode: \`${{ steps.outputs.outputs.bootstrap_state_storage_mode }}\`
-          - Control-plane state backend: \`${{ steps.outputs.outputs.control_plane_state_backend }}\`
-          - Redis endpoint: \`${{ steps.outputs.outputs.redis_endpoint || 'local-file-backed' }}\`
-          - Control plane dashboard: \`${{ steps.outputs.outputs.control_plane_dashboard_name || 'disabled' }}\`
-          - Control plane dashboard URL: \`${{ steps.outputs.outputs.control_plane_dashboard_url || 'disabled' }}\`
-          - Artifact bucket: \`${{ steps.outputs.outputs.artifact_bucket_name }}\`
-          - Artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_bucket_uri }}\`
-          - Dataset bucket: \`${{ steps.outputs.outputs.dataset_bucket_name }}\`
-          - Dataset S3 prefix: \`${{ steps.outputs.outputs.dataset_bucket_uri }}\`
-          - Dataset CDN hostname: \`${{ steps.outputs.outputs.dataset_distribution_domain_name }}\`
-          - Managed ClimbMix dataset URL: \`${{ steps.outputs.outputs.managed_climbmix_browser_dataset_base_url }}\`
-          - Next warm DR region: \`${{ steps.outputs.outputs.disaster_recovery_region || 'disabled' }}\`
-          - Next warm DR artifact bucket: \`${{ steps.outputs.outputs.artifact_replica_bucket_name || 'n/a' }}\`
-          - Next warm DR artifact S3 prefix: \`${{ steps.outputs.outputs.artifact_replica_bucket_uri || 'n/a' }}\`
-          - Managed trainer ASG: \`${{ steps.outputs.outputs.managed_trainer_asg_name || 'disabled' }}\`
-          - Managed trainer desired capacity: \`${{ steps.outputs.outputs.managed_trainer_desired_capacity }}\`
+          - Edge URL: ${OUTPUT_EDGE_URL}
+          - Browser App URL: \`${OUTPUT_BROWSER_APP_URL:-not-configured}\`
+          - Seed TCP: \`${OUTPUT_SEED_TCP}\`
+          - Seed QUIC: \`${OUTPUT_SEED_QUIC}\`
+          - Bootstrap state storage mode: \`${OUTPUT_BOOTSTRAP_STATE_STORAGE_MODE}\`
+          - Control-plane state backend: \`${OUTPUT_CONTROL_PLANE_STATE_BACKEND}\`
+          - Redis endpoint: \`${OUTPUT_REDIS_ENDPOINT:-local-file-backed}\`
+          - Control plane dashboard: \`${OUTPUT_CONTROL_PLANE_DASHBOARD_NAME:-disabled}\`
+          - Control plane dashboard URL: \`${OUTPUT_CONTROL_PLANE_DASHBOARD_URL:-disabled}\`
+          - Artifact bucket: \`${OUTPUT_ARTIFACT_BUCKET_NAME}\`
+          - Artifact S3 prefix: \`${OUTPUT_ARTIFACT_BUCKET_URI}\`
+          - Dataset bucket: \`${OUTPUT_DATASET_BUCKET_NAME}\`
+          - Dataset S3 prefix: \`${OUTPUT_DATASET_BUCKET_URI}\`
+          - Dataset CDN hostname: \`${OUTPUT_DATASET_DISTRIBUTION_DOMAIN_NAME}\`
+          - Managed ClimbMix dataset URL: \`${OUTPUT_MANAGED_CLIMBMIX_BROWSER_DATASET_BASE_URL}\`
+          - Next warm DR region: \`${OUTPUT_DISASTER_RECOVERY_REGION:-disabled}\`
+          - Next warm DR artifact bucket: \`${OUTPUT_ARTIFACT_REPLICA_BUCKET_NAME:-n/a}\`
+          - Next warm DR artifact S3 prefix: \`${OUTPUT_ARTIFACT_REPLICA_BUCKET_URI:-n/a}\`
+          - Managed trainer ASG: \`${OUTPUT_MANAGED_TRAINER_ASG_NAME:-disabled}\`
+          - Managed trainer desired capacity: \`${OUTPUT_MANAGED_TRAINER_DESIRED_CAPACITY}\`
           - Managed trainer auth mode: \`${MANAGED_TRAINER_AUTH_MODE}\`
           - Managed trainer principal id: \`${MANAGED_TRAINER_PRINCIPAL_ID:-n/a}\`
           - Managed trainer auth bundle parameter: \`${TF_VAR_managed_trainer_auth_bundle_parameter_name:-n/a}\`
           - Bootstrap head mirror principal id: \`${BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID}\`
-          - Bootstrap head mirror auth bundle parameter: \`${{ steps.outputs.outputs.bootstrap_head_mirror_auth_bundle_parameter_name || 'n/a' }}\`
+          - Bootstrap head mirror auth bundle parameter: \`${OUTPUT_BOOTSTRAP_HEAD_MIRROR_AUTH_BUNDLE_PARAMETER_NAME:-n/a}\`
           EOF
           fi

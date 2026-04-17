@@ -44,7 +44,7 @@ use crate::wasm::training::{
 pub mod training;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-const CHECKPOINT_WAIT_REFRESH_INTERVAL_MILLIS: u32 = 5_000;
+const BROWSER_APP_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };
@@ -505,7 +505,7 @@ pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<Brow
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-fn spawn_checkpoint_wait_refresh(
+fn spawn_browser_app_refresh_loop(
     config: DragonBrowserAppConfig,
     mut current_view: Signal<Option<BrowserAppClientView>>,
     mut status: Signal<String>,
@@ -515,7 +515,7 @@ fn spawn_checkpoint_wait_refresh(
     checkpoint_wait_generation.set(next_generation);
     spawn(async move {
         loop {
-            TimeoutFuture::new(CHECKPOINT_WAIT_REFRESH_INTERVAL_MILLIS).await;
+            TimeoutFuture::new(BROWSER_APP_REFRESH_INTERVAL_MILLIS).await;
             if *checkpoint_wait_generation.read() != next_generation {
                 break;
             }
@@ -654,7 +654,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         session_state.set(Some(session));
                         if let Ok(view) = connect_browser_app(&config).await {
                             current_view.set(Some(view));
-                            spawn_checkpoint_wait_refresh(
+                            spawn_browser_app_refresh_loop(
                                 config.clone(),
                                 current_view,
                                 status,
@@ -705,7 +705,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         };
                         session_state.set(session);
                         status.set(String::new());
-                        spawn_checkpoint_wait_refresh(
+                        spawn_browser_app_refresh_loop(
                             next_config,
                             current_view,
                             status,

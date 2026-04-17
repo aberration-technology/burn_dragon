@@ -408,6 +408,16 @@ fn dragon_live_notice(
             tone: "neutral",
         });
     }
+    if view.training.can_train
+        && view.network.swarm_status.connected_transport.is_none()
+        && view.network.swarm_status.desired_transport.is_some()
+    {
+        return Some(DragonLiveNotice {
+            label: "connecting",
+            detail: format!("waiting for {}", view.network.transport),
+            tone: "accent",
+        });
+    }
 
     match (
         view.training.can_train,
@@ -476,6 +486,131 @@ fn dragon_slice_progress_summary(view: Option<&BrowserAppClientView>) -> String 
         (Some(done), Some(target), None) => format!("{done}/{target}"),
         _ => view.training.slice_status.clone(),
     }
+}
+
+fn short_dragon_reference(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "pending".into();
+    }
+    if trimmed.chars().count() <= 40 {
+        return trimmed.to_owned();
+    }
+    let head = trimmed.chars().take(22).collect::<String>();
+    let tail = trimmed
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}…{tail}")
+}
+
+fn dragon_transport_summary(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "offline".into();
+    };
+    let transport = view.network.transport.trim();
+    if transport.is_empty() {
+        return "offline".into();
+    }
+    if view.network.direct_peers > 0 {
+        let peer_label = if view.network.direct_peers == 1 {
+            "peer"
+        } else {
+            "peers"
+        };
+        return format!("{transport} · {} {peer_label}", view.network.direct_peers);
+    }
+    transport.to_owned()
+}
+
+fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "edge snapshot only".into();
+    };
+    if view.network.direct_peers > 0 {
+        if view.network.estimated_network_size > view.network.direct_peers {
+            return format!(
+                "{} direct · ~{} visible",
+                view.network.direct_peers, view.network.estimated_network_size
+            );
+        }
+        let peer_label = if view.network.direct_peers == 1 {
+            "direct peer"
+        } else {
+            "direct peers"
+        };
+        return format!("{} {peer_label}", view.network.direct_peers);
+    }
+    if view.network.transport.starts_with("dialing ") {
+        return "awaiting direct peer handshake".into();
+    }
+    if view.network.estimated_network_size > 0 {
+        return format!(
+            "~{} visible from the current network view",
+            view.network.estimated_network_size
+        );
+    }
+    "edge snapshot only".into()
+}
+
+fn dragon_assignment_detail(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "waiting for work".into();
+    };
+    view.training
+        .active_training_lease
+        .clone()
+        .map(|lease| {
+            format!(
+                "lease {} · {} shards",
+                short_dragon_reference(&lease.lease_id),
+                lease.microshard_count
+            )
+        })
+        .unwrap_or_else(|| view.training.slice_status.clone())
+}
+
+fn dragon_progress_detail(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "waiting for checkpoint".into();
+    };
+    match (
+        view.training.slice_remaining_samples,
+        view.training.slice_target_samples,
+    ) {
+        (Some(remaining), Some(target)) => format!("{remaining} of {target} still queued"),
+        (Some(remaining), None) => format!("{remaining} still queued"),
+        _ => view.training.slice_status.clone(),
+    }
+}
+
+fn dragon_training_summary(
+    view: Option<&BrowserAppClientView>,
+    local_training_pending: bool,
+    window_summary: &str,
+) -> String {
+    if local_training_pending {
+        return "training…".into();
+    }
+    view.and_then(|view| view.training.throughput_summary.clone())
+        .unwrap_or_else(|| window_summary.to_owned())
+}
+
+fn dragon_training_detail(view: Option<&BrowserAppClientView>, window_summary: &str) -> String {
+    let Some(view) = view else {
+        return "local".into();
+    };
+    if let Some(loss) = view.training.last_loss.as_ref() {
+        return format!("loss {loss}");
+    }
+    if let Some(throughput) = view.training.throughput_summary.as_ref() {
+        return format!("window {window_summary} · {throughput}");
+    }
+    format!("window {window_summary}")
 }
 
 fn dragon_latest_output_summary(view: Option<&BrowserAppClientView>) -> String {
@@ -1262,27 +1397,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let has_active_checkpoint = view.as_ref().is_some_and(|view| {
         view.training.latest_head_id.is_some() || view.training.last_artifact_id.is_some()
     });
-    let network_summary = view
-        .as_ref()
-        .map(|view| {
-            if view.network.direct_peers > 0 {
-                if view.network.estimated_network_size == 0 {
-                    format!("{} direct", view.network.direct_peers)
-                } else {
-                    format!(
-                        "{} direct · ~{} visible",
-                        view.network.direct_peers, view.network.estimated_network_size
-                    )
-                }
-            } else if view.network.estimated_network_size > 0 {
-                format!("~{} visible", view.network.estimated_network_size)
-            } else if view.network.direct_peers == 0 {
-                "edge connected".to_owned()
-            } else {
-                "connected".to_owned()
-            }
-        })
-        .unwrap_or_else(|| "edge connected".into());
+    let network_summary = dragon_network_detail(view.as_ref());
+    let transport_summary = dragon_transport_summary(view.as_ref());
     let has_session = session_state
         .read()
         .as_ref()
@@ -1340,14 +1456,23 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             );
         });
     }
+    let transport_connected = view
+        .as_ref()
+        .is_some_and(|view| view.network.swarm_status.connected_transport.is_some());
     let connected_panel_title = "live peer";
     let connected_panel_detail = live_notice
         .as_ref()
         .map(|notice| notice.detail.clone())
-        .unwrap_or(if has_active_checkpoint {
-            "checkpoint synced. this tab can train when work is assigned.".into()
-        } else {
-            "connected to the network. waiting for the first checkpoint.".into()
+        .unwrap_or_else(|| {
+            if has_active_checkpoint && !transport_connected {
+                format!("{transport_summary} is still pending. checkpoint data is cached locally.")
+            } else if has_active_checkpoint {
+                "checkpoint synced. this tab can train when work is assigned.".into()
+            } else if !transport_connected {
+                format!("{transport_summary} is still pending.")
+            } else {
+                "connected to the network. waiting for the first checkpoint.".into()
+            }
         });
     let live_status_label = if local_training_pending_active {
         "training"
@@ -1402,6 +1527,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .and_then(|view| view.training.publish_latency_ms)
         .map(|value| format!("{value} ms"))
         .unwrap_or_else(|| "pending".into());
+    let assignment_detail = dragon_assignment_detail(view.as_ref());
+    let progress_detail = dragon_progress_detail(view.as_ref());
+    let training_summary = dragon_training_summary(
+        view.as_ref(),
+        local_training_pending_active,
+        &window_summary,
+    );
+    let training_detail = dragon_training_detail(view.as_ref(), &window_summary);
+    let checkpoint_detail = short_dragon_reference(&active_head_label);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     let hero_rattle_frame =
         HERO_RATTLE_FRAMES[*hero_rattle_index.read() % HERO_RATTLE_FRAMES.len()];
@@ -1724,44 +1858,39 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         detail: Some(view.runtime_detail.clone()),
                                     }
                                     StatTile {
-                                        label: "network",
-                                        value: network_summary.clone(),
-                                        detail: Some(view.network.transport.clone()),
+                                        label: "transport",
+                                        value: transport_summary.clone(),
+                                        detail: Some(network_summary.clone()),
                                     }
                                     StatTile {
-                                        label: "slice",
+                                        label: "assignment",
+                                        value: assignment_summary.clone(),
+                                        detail: Some(assignment_detail.clone()),
+                                    }
+                                    StatTile {
+                                        label: "progress",
                                         value: slice_progress_summary,
-                                        detail: Some(view.training.slice_status.clone()),
+                                        detail: Some(progress_detail.clone()),
                                     }
                                     StatTile {
-                                        label: "window",
-                                        value: window_summary,
-                                        detail: Some("local".into()),
-                                    }
-                                    StatTile {
-                                        label: "loss",
-                                        value: last_loss_summary,
-                                        detail: Some("latest".into()),
-                                    }
-                                    StatTile {
-                                        label: "throughput",
-                                        value: throughput_summary,
-                                        detail: Some("training".into()),
+                                        label: "training",
+                                        value: training_summary,
+                                        detail: Some(training_detail),
                                     }
                                     StatTile {
                                         label: "checkpoint",
                                         value: checkpoint_summary.to_owned(),
-                                        detail: Some(active_head_label.clone()),
+                                        detail: Some(checkpoint_detail.clone()),
                                     }
                                 }
                                 div { class: "keyvalue-list dragon-live-keyvalues",
                                     div { class: "keyvalue-row",
-                                        span { "assignment" }
-                                        strong { "{assignment_summary}" }
+                                        span { "loss" }
+                                        strong { "{last_loss_summary}" }
                                     }
                                     div { class: "keyvalue-row",
-                                        span { "latest output" }
-                                        strong { "{latest_output_summary}" }
+                                        span { "throughput" }
+                                        strong { "{throughput_summary}" }
                                     }
                                     div { class: "keyvalue-row",
                                         span { "publish" }
@@ -1770,6 +1899,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     div { class: "keyvalue-row",
                                         span { "peers" }
                                         strong { "{network_summary}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "latest output" }
+                                        strong { "{latest_output_summary}" }
                                     }
                                 }
                                 if has_active_checkpoint {

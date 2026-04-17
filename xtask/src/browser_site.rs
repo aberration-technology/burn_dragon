@@ -170,9 +170,19 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.55rem;
+  line-height: 1;
+}
+
+.dragon-eyebrow-row .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 0;
+  line-height: 1;
 }
 
 .dragon-eyebrow-rattle {
+  display: inline-flex;
+  align-items: center;
   min-width: 1.2ch;
   color: var(--accent);
   font-family: "Iosevka Etoile", "IBM Plex Mono", ui-monospace, monospace;
@@ -268,7 +278,9 @@ body {
   text-transform: lowercase;
 }
 
-.dragon-live-status-pill-syncing {
+.dragon-live-status-pill-syncing,
+.dragon-live-status-pill-connecting,
+.dragon-live-status-pill-training {
   border-color: rgba(216, 124, 124, 0.26);
   background: rgba(216, 124, 124, 0.08);
   color: var(--accent);
@@ -287,6 +299,7 @@ body {
 }
 
 .dragon-live-stats .stat-tile {
+  min-width: 0;
   min-height: 112px;
   justify-content: space-between;
   padding: 16px 18px;
@@ -304,8 +317,15 @@ body {
 }
 
 .dragon-live-stats .stat-tile strong {
-  font-size: 1.08rem;
-  line-height: 1.25;
+  font-size: 1.04rem;
+  line-height: 1.22;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.dragon-live-stats .stat-tile .stat-detail {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .dragon-live-actions {
@@ -314,6 +334,16 @@ body {
 
 .dragon-live-keyvalues {
   margin-top: 4px;
+}
+
+.dragon-live-keyvalues .keyvalue-row {
+  align-items: flex-start;
+}
+
+.dragon-live-keyvalues .keyvalue-row strong {
+  max-width: 64%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .dragon-live-shell .section-detail {

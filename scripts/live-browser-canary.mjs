@@ -374,6 +374,8 @@ async function runCanary() {
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     connect_clicked: false,
     training_button_visible: false,
+    live_status_label: null,
+    live_stat_tiles: [],
     quiet_window_ms: QUIET_WINDOW_MS,
     train_timeout_ms: TRAIN_TIMEOUT_MS,
     quiet_window_control_plane_requests: [],
@@ -500,6 +502,17 @@ async function runCanary() {
 
     await waitForVisible(trainButton, CONNECT_TIMEOUT_MS);
     report.training_button_visible = true;
+    report.live_status_label =
+      (await page.locator(".dragon-live-status-pill").first().textContent().catch(() => null)) ??
+      null;
+    report.live_stat_tiles = await page
+      .locator(".dragon-live-stats .stat-tile")
+      .evaluateAll((nodes) =>
+        nodes.map((node) =>
+          Array.from(node.children).map((child) => child.textContent?.trim() ?? ""),
+        ),
+      )
+      .catch(() => []);
 
     const quietWindowStartedAt = Date.now();
     await page.waitForTimeout(QUIET_WINDOW_MS);

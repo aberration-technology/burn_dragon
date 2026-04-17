@@ -16,6 +16,9 @@ https://${edge_domain_name} {
     @browser_shell_get {
         method GET HEAD
         path / /index.html /callback/github /callback/github/* /callback/oidc /callback/oidc/* /callback/oauth /callback/oauth/*
+        not {
+            header Upgrade websocket
+        }
     }
 
     handle @preflight {

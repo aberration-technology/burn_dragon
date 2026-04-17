@@ -37,6 +37,8 @@ def main() -> None:
                 'trusted_callback_args+=(--trusted-callback-token "$BROWSER_CANARY_CALLBACK_TOKEN")',
                 'rm -rf "$bootstrap_root"',
                 '--force \\',
+                'gh workflow run .github/workflows/deploy-pages.yml',
+                'gh run watch "$pages_run_id"',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (

@@ -107,6 +107,7 @@ on:
 
 permissions:
   id-token: write
+  actions: write
   contents: read
 
 concurrency:
@@ -1492,6 +1493,49 @@ jobs:
           name: burn-dragon-bootstrap-restore-diagnostics
           path: ${{ steps.deployment_diagnostics.outputs.report_path }}
           if-no-files-found: ignore
+
+      - name: deploy browser pages before live browser canary
+        id: deploy_pages
+        if: ${{ github.event.inputs.plan_only != 'true' && steps.outputs.outputs.browser_app_url != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dispatch_started_at="$(date -u +%s)"
+          gh workflow run .github/workflows/deploy-pages.yml \
+            --repo aberration-technology/burn_dragon \
+            --ref "${GITHUB_REF_NAME}" \
+            -f environment="${DEPLOY_ENVIRONMENT}" \
+            -f edge_base_url="${{ steps.outputs.outputs.edge_url }}" \
+            -f selected_experiment_id="${BROWSER_CANARY_EXPERIMENT_ID}" \
+            -f selected_revision_id="${BROWSER_CANARY_REVISION_ID}" \
+            -f require_edge_auth=true
+
+          pages_run_id=""
+          for _ in $(seq 1 30); do
+            pages_run_id="$(gh run list \
+              --repo aberration-technology/burn_dragon \
+              --workflow .github/workflows/deploy-pages.yml \
+              --limit 10 \
+              --json databaseId,createdAt,headSha \
+              | DISPATCH_STARTED_AT="$dispatch_started_at" GITHUB_SHA="$GITHUB_SHA" python3 -c 'import datetime, json, os, sys; runs = json.load(sys.stdin); after = int(os.environ["DISPATCH_STARTED_AT"]); sha = os.environ["GITHUB_SHA"]; matches = [run for run in runs if run.get("headSha") == sha and int(datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00")).timestamp()) >= after]; print(matches[0]["databaseId"] if matches else "")' )"
+            if [ -n "$pages_run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$pages_run_id" ]; then
+            echo "failed to discover deploy-pages run dispatched for $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          echo "run_id=$pages_run_id" >>"$GITHUB_OUTPUT"
+          gh run watch "$pages_run_id" \
+            --repo aberration-technology/burn_dragon \
+            --interval 15 \
+            --exit-status
 
       - name: setup node for live browser canary
         if: ${{ github.event.inputs.plan_only != 'true' }}

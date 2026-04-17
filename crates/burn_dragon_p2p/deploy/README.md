@@ -526,6 +526,8 @@ After the workflow finishes, use the outputs from the workflow summary:
 - `seed_node_tcp_multiaddr`
 - `seed_node_quic_multiaddr`
 
+For browser peers, do not use the deprecated Terraform `seed_node_webrtc_multiaddr` output. Dialable browser WebRTC and WebTransport addresses require runtime `certhash` material, so browser seed bootstrap should come from the signed edge advertisement (`/browser/seeds/signed`) or the generated `browser-app-config.json`, not from static Terraform outputs.
+
 Then run the native operator binary against that network, for example:
 
 ```bash

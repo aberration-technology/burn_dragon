@@ -113,12 +113,24 @@ jobs:
               seed_urls = []
               fetched_snapshot = False
 
+              def is_dialable_browser_seed(value: str) -> bool:
+                  segments = [segment for segment in value.split("/") if segment]
+                  if "webrtc-direct" in segments:
+                      return "certhash" in segments
+                  if "webtransport" in segments:
+                      return "quic-v1" in segments and "certhash" in segments
+                  return "wss" in segments or "ws" in segments
+
               try:
                   with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:
                       payload = json.load(response)
                   signed = payload.get("payload", {}).get("payload", {})
                   for record in signed.get("seeds") or []:
-                      seed_urls.extend(value for value in (record.get("multiaddrs") or []) if value)
+                      for value in record.get("multiaddrs") or []:
+                          if not value:
+                              continue
+                          if is_dialable_browser_seed(value):
+                              seed_urls.append(value)
               except Exception:
                   seed_urls = []
 
@@ -142,6 +154,22 @@ jobs:
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$seed_node_urls_from_env"
           fi
+          seed_node_urls="$(python3 - "$seed_node_urls" <<'PY'
+          import sys
+
+          seeds = [value.strip() for value in sys.argv[1].split(",") if value.strip()]
+
+          def is_dialable_browser_seed(value: str) -> bool:
+              segments = [segment for segment in value.split("/") if segment]
+              if "webrtc-direct" in segments:
+                  return "certhash" in segments
+              if "webtransport" in segments:
+                  return "quic-v1" in segments and "certhash" in segments
+              return "wss" in segments or "ws" in segments
+
+          print(",".join(dict.fromkeys(value for value in seeds if is_dialable_browser_seed(value))))
+          PY
+          )"
           IFS=',' read -r -a seed_node_url_array <<<"$seed_node_urls"
           browser_seed_count=0
           browser_capable_seed_count=0
@@ -153,7 +181,7 @@ jobs:
             fi
             browser_seed_count=$((browser_seed_count + 1))
             case "$seed" in
-              *webrtc-direct*|*webtransport*|*/wss*|*/ws*)
+              *webrtc-direct*certhash*|*quic-v1*webtransport*certhash*|*/wss|*/ws)
                 browser_capable_seed_count=$((browser_capable_seed_count + 1))
                 ;;
             esac

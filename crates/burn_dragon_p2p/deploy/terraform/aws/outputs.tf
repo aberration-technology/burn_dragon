@@ -184,8 +184,8 @@ output "seed_node_quic_multiaddr" {
 }
 
 output "seed_node_webrtc_multiaddr" {
-  description = "WebRTC-direct bootstrap multiaddr advertised to browser peers."
-  value       = "/dns4/${var.edge_domain_name}/udp/${local.p2p_webrtc_port}/webrtc-direct"
+  description = "Deprecated synthetic WebRTC hint. Use the signed browser seed advertisement endpoint instead because dialable browser WebRTC addresses require a runtime certhash."
+  value       = ""
 }
 
 output "secret_parameter_prefix" {

@@ -14,7 +14,11 @@ def main() -> None:
     required_snippets = [
         'with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:',
         'with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:',
-        'seed_urls.extend(value for value in (record.get("multiaddrs") or []) if value)',
+        'def is_dialable_browser_seed(value: str) -> bool:',
+        'if "webrtc-direct" in segments:',
+        'return "certhash" in segments',
+        'if "webtransport" in segments:',
+        'return "quic-v1" in segments and "certhash" in segments',
         'seed_urls.append(f"/dns4/{host}/tcp/443/wss")',
         'browser pages deploy requires at least one browser-capable seed multiaddr',
     ]

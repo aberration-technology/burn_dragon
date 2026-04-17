@@ -68,11 +68,20 @@ pub struct DeploymentEdgeSnapshotSummary {
     pub network_id: String,
     pub auth_enabled: bool,
     pub login_providers: Vec<DeploymentLoginProviderSummary>,
+    pub transports: DeploymentBrowserTransportSummary,
     pub directory_entries: usize,
     pub matching_directory_entry_present: bool,
     pub matching_head_present: bool,
     pub matching_head_id: Option<String>,
     pub captured_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Serialize)]
+pub struct DeploymentBrowserTransportSummary {
+    pub webrtc_direct: bool,
+    pub webtransport_gateway: bool,
+    pub wss_fallback: bool,
 }
 
 #[cfg(feature = "native")]
@@ -277,6 +286,11 @@ fn fetch_deployment_edge_snapshot(
                 device_path: provider.device_path,
             })
             .collect(),
+        transports: DeploymentBrowserTransportSummary {
+            webrtc_direct: snapshot.transports.webrtc_direct,
+            webtransport_gateway: snapshot.transports.webtransport_gateway,
+            wss_fallback: snapshot.transports.wss_fallback,
+        },
         directory_entries: snapshot.directory.entries.len(),
         matching_directory_entry_present: matching_directory_entry.is_some(),
         matching_head_present: matching_head.is_some(),
@@ -445,6 +459,9 @@ pub fn evaluate_deployment_readiness(
     if !edge_snapshot.ok {
         blocking_issues.push("edge_snapshot_unavailable".into());
     } else if let Some(snapshot) = edge_snapshot.value.as_ref() {
+        if snapshot.transports.webtransport_gateway {
+            blocking_issues.push("webtransport_gateway_advertised_without_runtime_support".into());
+        }
         if !snapshot.matching_directory_entry_present {
             if require_directory_entry_published {
                 blocking_issues.push("matching_directory_entry_missing".into());
@@ -583,6 +600,11 @@ mod tests {
                 callback_path: Some("/callback/github".into()),
                 device_path: None,
             }],
+            transports: DeploymentBrowserTransportSummary {
+                webrtc_direct: true,
+                webtransport_gateway: false,
+                wss_fallback: true,
+            },
             directory_entries: 1,
             matching_directory_entry_present: true,
             matching_head_present: head_present,
@@ -728,6 +750,34 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"artifact_head_view_probe_failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_blocks_on_webtransport_surface_until_runtime_support_exists() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.transports.webtransport_gateway = true;
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"webtransport_gateway_advertised_without_runtime_support".to_owned())
         );
     }
 }

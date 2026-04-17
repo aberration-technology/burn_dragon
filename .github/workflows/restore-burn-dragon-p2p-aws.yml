@@ -517,6 +517,10 @@ jobs:
           bootstrap_head_mirror_principal_id="bootstrap-head-mirror-${TF_WORKSPACE_NAME}-nca"
           bootstrap_head_mirror_auth_bundle_parameter_name="${secret_parameter_prefix}/bootstrap_head_mirror_auth_bundle_json"
           auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; stack_name = sys.argv[5]; environment = sys.argv[6]; principal = {"principal_id": principal_id, "display_name": "burn_dragon bootstrap nca head mirror", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": ["TrainerCpu", "Archive"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}, {"Archive": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "bootstrap_head_mirror": "true", "bootstrap_head_mirror_experiment_id": experiment_id, "admin_capabilities": "register_live_head,rollout_auth_policy"}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$bootstrap_head_mirror_principal_id" "$bootstrap_head_mirror_experiment_id" "$network_id" "$stack_name" "$DEPLOY_ENVIRONMENT")"
+          browser_canary_experiment_id="nca-prepretraining"
+          browser_canary_revision_id="nca-r1"
+          browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"
+          auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; stack_name = sys.argv[5]; environment = sys.argv[6]; principal = {"principal_id": principal_id, "display_name": "burn_dragon live browser canary", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": ["BrowserTrainerWgpu", "BrowserObserver"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "browser_canary": "true", "browser_canary_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$browser_canary_principal_id" "$browser_canary_experiment_id" "$network_id" "$stack_name" "$DEPLOY_ENVIRONMENT")"
 
           snapshot_search_region="$source_snapshot_region_input"
           if [ -z "$snapshot_search_region" ]; then
@@ -647,6 +651,9 @@ jobs:
             echo "BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID=$bootstrap_head_mirror_principal_id"
             echo "BOOTSTRAP_HEAD_MIRROR_EXPERIMENT_ID=$bootstrap_head_mirror_experiment_id"
             echo "BOOTSTRAP_HEAD_MIRROR_REVISION_ID=$bootstrap_head_mirror_revision_id"
+            echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"
+            echo "BROWSER_CANARY_EXPERIMENT_ID=$browser_canary_experiment_id"
+            echo "BROWSER_CANARY_REVISION_ID=$browser_canary_revision_id"
             echo "TF_VAR_create_artifact_bucket=$create_artifact_bucket"
             echo "DATASET_DOMAIN_NAME=$dataset_domain_name"
             echo "DATASET_BUCKET_PATH_PREFIX=$dataset_bucket_path_prefix"
@@ -1451,6 +1458,78 @@ jobs:
           path: ${{ steps.deployment_diagnostics.outputs.report_path }}
           if-no-files-found: ignore
 
+      - name: setup node for live browser canary
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: install chromium for live browser canary
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes playwright --version
+          npx --yes playwright install --with-deps chromium
+
+      - name: run live browser canary
+        id: live_browser_canary
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        env:
+          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ steps.outputs.outputs.browser_app_url }}
+          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
+          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ env.BROWSER_CANARY_PRINCIPAL_ID }}
+          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
+          BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
+          BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR"
+          echo "artifact_dir=$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR" >>"$GITHUB_OUTPUT"
+          echo "report_path=$BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON" >>"$GITHUB_OUTPUT"
+          node scripts/live-browser-canary.mjs
+
+      - name: summarize live browser canary
+        if: ${{ always() && steps.live_browser_canary.outputs.report_path != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="${{ steps.live_browser_canary.outputs.report_path }}"
+          if [ ! -f "$report_path" ]; then
+            exit 0
+          fi
+
+          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          receipt = report.get("receipt_submission") or {}
+          control_requests = report.get("quiet_window_control_plane_requests") or []
+          artifact_fallback = report.get("artifact_http_fallback_requests") or []
+
+          print("## live browser canary")
+          print()
+          print(f"- Success: `{report.get('success', False)}`")
+          print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
+          print(f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`")
+          print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
+          print(f"- Training button visible: `{report.get('training_button_visible', False)}`")
+          print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
+          print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
+          print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
+          print(f"- Error: `{report.get('error') or 'none'}`")
+          PY
+
+      - name: upload live browser canary artifact
+        if: ${{ always() && steps.live_browser_canary.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-live-browser-canary
+          path: ${{ steps.live_browser_canary.outputs.artifact_dir }}
+          if-no-files-found: ignore
+
       - name: publish workflow summary
         env:
           INPUT_PLAN_ONLY: ${{ github.event.inputs.plan_only }}
@@ -1522,5 +1601,6 @@ jobs:
           - Managed trainer auth bundle parameter: \`${TF_VAR_managed_trainer_auth_bundle_parameter_name:-n/a}\`
           - Bootstrap head mirror principal id: \`${BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID}\`
           - Bootstrap head mirror auth bundle parameter: \`${OUTPUT_BOOTSTRAP_HEAD_MIRROR_AUTH_BUNDLE_PARAMETER_NAME:-n/a}\`
+          - Browser canary principal id: \`${BROWSER_CANARY_PRINCIPAL_ID}\`
           EOF
           fi

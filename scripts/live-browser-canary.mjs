@@ -1,0 +1,510 @@
+#!/usr/bin/env node
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { pathToFileURL } from "node:url";
+
+const SITE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL");
+const EDGE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL");
+const PRINCIPAL_ID = requiredEnv("BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID");
+const EXPERIMENT_ID =
+  process.env.BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID ?? "nca-prepretraining";
+const QUIET_WINDOW_MS = parseIntegerEnv("BURN_DRAGON_BROWSER_CANARY_QUIET_WINDOW_MS", 8_000);
+const CONNECT_TIMEOUT_MS = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_CONNECT_TIMEOUT_MS",
+  90_000,
+);
+const TRAIN_TIMEOUT_MS = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS",
+  120_000,
+);
+const ARTIFACT_DIR =
+  process.env.BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR ??
+  path.join(os.tmpdir(), `burn-dragon-browser-canary-${Date.now()}`);
+const OUTPUT_JSON =
+  process.env.BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON ??
+  path.join(ARTIFACT_DIR, "canary-summary.json");
+const HEADLESS = process.env.BURN_DRAGON_BROWSER_CANARY_HEADED === "1" ? false : true;
+
+const WATCHED_CONTROL_PATHS = [
+  "/portal/snapshot",
+  "/directory",
+  "/directory/signed",
+  "/heads",
+  "/leaderboard",
+  "/leaderboard/signed",
+  "/metrics/catchup/",
+];
+const EDGE_ARTIFACT_PATH_PREFIXES = ["/artifacts/heads/", "/artifacts/tickets/"];
+
+function requiredEnv(name) {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`missing required environment variable ${name}`);
+  }
+  return value;
+}
+
+function parseIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`invalid integer environment variable ${name}=${raw}`);
+  }
+  return parsed;
+}
+
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+async function loadPlaywright() {
+  try {
+    return await import("playwright");
+  } catch {
+    const npxRoot = path.join(os.homedir(), ".npm", "_npx");
+    if (!fs.existsSync(npxRoot)) {
+      throw new Error(
+        "playwright package not found; run `npx --yes playwright --version` first",
+      );
+    }
+    const candidates = fs
+      .readdirSync(npxRoot)
+      .map((entry) => path.join(npxRoot, entry, "node_modules", "playwright", "index.mjs"))
+      .filter((candidate) => fs.existsSync(candidate))
+      .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+    if (candidates.length === 0) {
+      throw new Error(
+        "playwright package not found in npx cache; run `npx --yes playwright --version` first",
+      );
+    }
+    return await import(pathToFileURL(candidates[0]).href);
+  }
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      ...(options.headers ?? {}),
+    },
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText} for ${url}: ${trimPreview(text)}`);
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+function trimPreview(text) {
+  const normalized = String(text ?? "").trim();
+  if (normalized.length <= 240) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 240)}...`;
+}
+
+function endpoint(baseUrl, relativePath) {
+  return new URL(relativePath, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function requestedScopes(experimentId) {
+  return ["Connect", "Discover", { Train: { experiment_id: experimentId } }];
+}
+
+function firstApprovedTargetArtifactHash(snapshot) {
+  const allowed = snapshot.allowed_target_artifact_hashes ?? [];
+  if (allowed.length > 0) {
+    return allowed[0];
+  }
+  const trustAllowed = snapshot.trust_bundle?.allowed_target_artifact_hashes ?? [];
+  if (trustAllowed.length > 0) {
+    return trustAllowed[0];
+  }
+  throw new Error("edge snapshot did not expose any approved browser target artifact hashes");
+}
+
+function requiredReleaseTrainHash(snapshot) {
+  return (
+    snapshot.required_release_train_hash ??
+    snapshot.trust_bundle?.required_release_train_hash ??
+    fail("edge snapshot is missing a required release train hash")
+  );
+}
+
+function browserStorageSnapshot(networkId, sessionState) {
+  return {
+    metadata_version: 3,
+    session: sessionState,
+    cached_chunk_artifacts: [],
+    cached_head_artifact_heads: [],
+    last_head_artifact_transport: null,
+    cached_microshards: [],
+    stored_receipts: [],
+    pending_receipts: {
+      backend: "Snapshot",
+      receipts: [],
+    },
+    submitted_receipts: [],
+    last_directory_sync_at: null,
+    last_signed_directory_snapshot: null,
+    last_signed_leaderboard_snapshot: null,
+    metrics_catchup_bundles: [],
+    last_metrics_live_event: null,
+    last_metrics_sync_at: null,
+    last_head_id: null,
+    artifact_replay_checkpoint: null,
+    stored_certificate_peer_id:
+      sessionState?.certificate?.claims?.peer_id ??
+      sessionState?.certificate?.claims?.claims?.peer_id ??
+      null,
+    active_assignment: null,
+    active_training_lease: null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function emptyReceiptOutbox() {
+  return {
+    backend: "Snapshot",
+    receipts: [],
+  };
+}
+
+function classifyEdgeRequest(urlString, edgeHost) {
+  const url = new URL(urlString);
+  if (url.host !== edgeHost) {
+    return {
+      watchedControlPlane: false,
+      artifactFallback: false,
+    };
+  }
+  const watchedControlPlane = WATCHED_CONTROL_PATHS.some((prefix) =>
+    url.pathname.startsWith(prefix),
+  );
+  const artifactFallback = EDGE_ARTIFACT_PATH_PREFIXES.some((prefix) =>
+    url.pathname.startsWith(prefix),
+  );
+  return { watchedControlPlane, artifactFallback };
+}
+
+function fail(message) {
+  throw new Error(message);
+}
+
+async function waitForVisible(locator, timeoutMs) {
+  await locator.waitFor({ state: "visible", timeout: timeoutMs });
+}
+
+async function maybeClick(locator) {
+  if ((await locator.count()) > 0 && (await locator.first().isVisible())) {
+    await locator.first().click();
+    return true;
+  }
+  return false;
+}
+
+async function enrollBrowserCanary(snapshot) {
+  const provider = (snapshot.login_providers ?? []).find(
+    (candidate) => candidate?.login_path && candidate.login_path.trim().length > 0,
+  );
+  if (!provider) {
+    fail("edge snapshot did not expose a usable login provider");
+  }
+  const callbackPath = provider.callback_path ?? snapshot.paths?.callback_path;
+  if (!callbackPath) {
+    fail("edge snapshot did not expose a callback path");
+  }
+  const scopes = requestedScopes(EXPERIMENT_ID);
+  const login = await fetchJson(endpoint(EDGE_BASE_URL, provider.login_path), {
+    method: "POST",
+    body: JSON.stringify({
+      network_id: snapshot.network_id,
+      principal_hint: PRINCIPAL_ID,
+      requested_scopes: scopes,
+    }),
+  });
+  const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath), {
+    method: "POST",
+    body: JSON.stringify({
+      login_id: login.login_id,
+      state: login.state,
+      principal_id: PRINCIPAL_ID,
+    }),
+  });
+  const trustBundle = await fetchJson(
+    endpoint(EDGE_BASE_URL, snapshot.paths.trust_bundle_path),
+    { method: "GET", headers: {} },
+  );
+  const peerLabel = `browser-canary-${crypto.randomUUID()}`;
+  const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path), {
+    method: "POST",
+    body: JSON.stringify({
+      session_id: session.session_id,
+      release_train_hash: requiredReleaseTrainHash(snapshot),
+      target_artifact_hash: firstApprovedTargetArtifactHash(snapshot),
+      peer_id: peerLabel,
+      peer_public_key_hex: crypto.randomBytes(32).toString("hex"),
+      requested_scopes: scopes,
+      client_policy_hash: `browser-canary-policy-${Date.now()}`,
+      serial: 1,
+      ttl_seconds: 900,
+    }),
+  });
+  return {
+    login,
+    session,
+    trustBundle,
+    certificate,
+    requestedScopes: scopes,
+  };
+}
+
+async function runCanary() {
+  ensureDir(ARTIFACT_DIR);
+  const snapshot = await fetchJson(endpoint(EDGE_BASE_URL, "/portal/snapshot"), {
+    method: "GET",
+    headers: {},
+  });
+  const signedSeedsEnvelope = await fetchJson(
+    endpoint(
+      EDGE_BASE_URL,
+      snapshot.paths?.browser_seed_advertisement_path ?? "/browser/seeds/signed",
+    ),
+    { method: "GET", headers: {} },
+  );
+  const browserConfig = await fetchJson(endpoint(SITE_BASE_URL, "/browser-app-config.json"), {
+    method: "GET",
+    headers: {},
+  });
+
+  if (snapshot.transports?.webtransport_gateway) {
+    fail("live edge is advertising webtransport_gateway without validated native runtime support");
+  }
+
+  const signedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
+    (record) => record.multiaddrs ?? [],
+  ) ?? [];
+  if (!signedSeeds.some((value) => value.includes("/webrtc-direct"))) {
+    fail(`signed browser seeds are missing webrtc-direct: ${JSON.stringify(signedSeeds)}`);
+  }
+  if (!signedSeeds.some((value) => value.includes("/wss"))) {
+    fail(`signed browser seeds are missing wss fallback: ${JSON.stringify(signedSeeds)}`);
+  }
+  if (signedSeeds.some((value) => value.includes("/quic-v1") || value.includes("/tcp/4001"))) {
+    fail(`signed browser seeds still contain native-only addresses: ${JSON.stringify(signedSeeds)}`);
+  }
+
+  const enrollment = await enrollBrowserCanary(snapshot);
+  const sessionState = {
+    session: enrollment.session,
+    certificate: enrollment.certificate,
+    trust_bundle: enrollment.trustBundle,
+    enrolled_at: new Date().toISOString(),
+    reenrollment_required: Boolean(enrollment.trustBundle?.reenrollment),
+  };
+  const storageSnapshot = browserStorageSnapshot(snapshot.network_id, sessionState);
+
+  const { chromium } = await loadPlaywright();
+  const browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      "--enable-unsafe-webgpu",
+      "--use-angle=swiftshader",
+      "--enable-features=Vulkan,UseSkiaRenderer,WebGPU",
+    ],
+  });
+
+  const requests = [];
+  const consoleMessages = [];
+  const pageErrors = [];
+  let tracePath = null;
+  let screenshotPath = path.join(ARTIFACT_DIR, "canary.png");
+  const report = {
+    site_base_url: SITE_BASE_URL,
+    edge_base_url: EDGE_BASE_URL,
+    principal_id: PRINCIPAL_ID,
+    experiment_id: EXPERIMENT_ID,
+    network_id: snapshot.network_id,
+    transports: snapshot.transports,
+    browser_config_seed_node_urls: browserConfig.seed_node_urls ?? [],
+    signed_seed_multiaddrs: signedSeeds,
+    signed_seed_transport_preference:
+      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
+    connect_clicked: false,
+    training_button_visible: false,
+    quiet_window_ms: QUIET_WINDOW_MS,
+    quiet_window_control_plane_requests: [],
+    artifact_http_fallback_requests: [],
+    receipt_submission: null,
+    console_errors: [],
+    page_errors: [],
+    success: false,
+  };
+
+  const context = await browser.newContext();
+  try {
+    if (ARTIFACT_DIR) {
+      await context.tracing.start({ screenshots: true, snapshots: true });
+      tracePath = path.join(ARTIFACT_DIR, "trace.zip");
+    }
+
+    await context.addInitScript(
+      ({ networkId, storageJson, receiptJson }) => {
+        const storageKey = `burn-p2p.browser.storage.${networkId}`;
+        const receiptKey = `burn-p2p.browser.receipt-outbox.${networkId}`;
+        try {
+          window.localStorage.setItem(storageKey, storageJson);
+          window.localStorage.setItem(receiptKey, receiptJson);
+        } catch (error) {
+          console.error("burn-dragon-canary-init-storage-failed", String(error));
+        }
+      },
+      {
+        networkId: snapshot.network_id,
+        storageJson: JSON.stringify(storageSnapshot),
+        receiptJson: JSON.stringify(emptyReceiptOutbox()),
+      },
+    );
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(CONNECT_TIMEOUT_MS);
+    page.on("console", (message) => {
+      const entry = {
+        type: message.type(),
+        text: message.text(),
+      };
+      consoleMessages.push(entry);
+      if (entry.type === "error") {
+        report.console_errors.push(entry.text);
+      }
+    });
+    page.on("pageerror", (error) => {
+      const text = String(error);
+      pageErrors.push(text);
+      report.page_errors.push(text);
+    });
+    page.on("request", (request) => {
+      const url = request.url();
+      const { watchedControlPlane, artifactFallback } = classifyEdgeRequest(
+        url,
+        new URL(EDGE_BASE_URL).host,
+      );
+      requests.push({
+        ts: Date.now(),
+        method: request.method(),
+        url,
+        watchedControlPlane,
+        artifactFallback,
+      });
+    });
+
+    await page.goto(SITE_BASE_URL, { waitUntil: "domcontentloaded" });
+
+    const connectButton = page.locator('button:has-text("connect")').first();
+    const trainButton = page.locator('button:has-text("run browser training")').first();
+    const getStartedButton = page.locator('button:has-text("get started")').first();
+
+    const connectDeadline = Date.now() + CONNECT_TIMEOUT_MS;
+    const sessionResumeGraceDeadline = Date.now() + 5_000;
+    while (Date.now() < connectDeadline) {
+      if ((await trainButton.count()) > 0 && (await trainButton.isVisible())) {
+        report.training_button_visible = true;
+        break;
+      }
+      if ((await connectButton.count()) > 0 && (await connectButton.isVisible())) {
+        await connectButton.click();
+        report.connect_clicked = true;
+      }
+      if (
+        Date.now() >= sessionResumeGraceDeadline &&
+        (await getStartedButton.count()) > 0 &&
+        (await getStartedButton.isVisible()) &&
+        !(await connectButton.isVisible().catch(() => false))
+      ) {
+        fail("browser canary session did not resume; page returned to get started");
+      }
+      await page.waitForTimeout(500);
+    }
+
+    await waitForVisible(trainButton, CONNECT_TIMEOUT_MS);
+    report.training_button_visible = true;
+
+    const quietWindowStartedAt = Date.now();
+    await page.waitForTimeout(QUIET_WINDOW_MS);
+    report.quiet_window_control_plane_requests = requests.filter(
+      (entry) => entry.ts >= quietWindowStartedAt && entry.watchedControlPlane,
+    );
+    report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+    if (report.quiet_window_control_plane_requests.length > 0) {
+      fail(
+        `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,
+      );
+    }
+
+    const receiptResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).host === new URL(EDGE_BASE_URL).host &&
+        new URL(response.url()).pathname === "/receipts/browser" &&
+        response.status() >= 200 &&
+        response.status() < 300,
+      { timeout: TRAIN_TIMEOUT_MS },
+    );
+    await trainButton.click();
+    const receiptResponse = await receiptResponsePromise;
+    report.receipt_submission = {
+      url: receiptResponse.url(),
+      status: receiptResponse.status(),
+      body_preview: trimPreview(await receiptResponse.text()),
+    };
+    report.success = true;
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+  } catch (error) {
+    report.success = false;
+    report.error = String(error);
+    try {
+      const failurePage = context.pages()[0];
+      if (failurePage) {
+        await failurePage.screenshot({ path: screenshotPath, fullPage: true });
+      }
+    } catch {}
+    throw error;
+  } finally {
+    if (tracePath) {
+      await context.tracing.stop({ path: tracePath }).catch(() => {});
+    }
+    report.console_errors = report.console_errors.concat(
+      consoleMessages.filter((entry) => entry.type === "error").map((entry) => entry.text),
+    );
+    report.page_errors = pageErrors;
+    fs.writeFileSync(path.join(ARTIFACT_DIR, "requests.json"), JSON.stringify(requests, null, 2));
+    fs.writeFileSync(
+      path.join(ARTIFACT_DIR, "console.json"),
+      JSON.stringify(consoleMessages, null, 2),
+    );
+    fs.writeFileSync(OUTPUT_JSON, JSON.stringify(report, null, 2));
+    await browser.close().catch(() => {});
+  }
+
+  return report;
+}
+
+try {
+  const report = await runCanary();
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+} catch (error) {
+  const summaryPath = OUTPUT_JSON;
+  if (fs.existsSync(summaryPath)) {
+    process.stderr.write(`${fs.readFileSync(summaryPath, "utf8")}\n`);
+  }
+  process.stderr.write(`browser canary failed: ${error}\n`);
+  process.exitCode = 1;
+}

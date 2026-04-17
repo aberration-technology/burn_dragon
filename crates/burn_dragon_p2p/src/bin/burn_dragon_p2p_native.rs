@@ -43,6 +43,7 @@ use burn_p2p::{
     ExperimentId, ExperimentScope, HeadAnnouncement, PrincipalId, RuntimeStatus,
 };
 use burn_p2p_admin::AdminResult;
+use burn_p2p_core::operator_visible_last_error;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -1372,7 +1373,9 @@ where
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
-                snapshot.last_error.as_deref().unwrap_or("-"),
+                operator_visible_last_error(snapshot.last_error.as_deref())
+                    .as_deref()
+                    .unwrap_or("-"),
             );
             last_status = Instant::now();
         }
@@ -1603,7 +1606,9 @@ where
                     .as_ref()
                     .map(|head_id| head_id.as_str())
                     .unwrap_or("-"),
-                snapshot.last_error.as_deref().unwrap_or("-"),
+                operator_visible_last_error(snapshot.last_error.as_deref())
+                    .as_deref()
+                    .unwrap_or("-"),
             );
             last_status = Instant::now();
         }
@@ -1718,7 +1723,9 @@ where
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
-                snapshot.last_error.as_deref().unwrap_or("-"),
+                operator_visible_last_error(snapshot.last_error.as_deref())
+                    .as_deref()
+                    .unwrap_or("-"),
             );
             last_status = Instant::now();
         }

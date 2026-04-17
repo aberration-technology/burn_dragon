@@ -109,7 +109,38 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 -c 'from urllib.parse import urlparse; import sys; host=urlparse(sys.argv[1]).hostname or "edge.dragon.aberration.technology"; print(f"/dns4/{host}/udp/4001/webrtc-direct,/dns4/{host}/tcp/443/wss")' "$edge_base_url")"
+            seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
+from urllib.parse import urlparse
+import json
+import sys
+import urllib.request
+
+edge_base_url = sys.argv[1].rstrip("/")
+host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
+transports = {}
+fetched_snapshot = False
+
+try:
+    with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
+        transports = (json.load(response).get("transports") or {})
+        fetched_snapshot = True
+except Exception:
+    transports = {}
+
+seed_urls = []
+if transports.get("webrtc_direct"):
+    seed_urls.append(f"/dns4/{host}/udp/4001/webrtc-direct")
+if transports.get("webtransport_gateway"):
+    seed_urls.append(f"/dns4/{host}/udp/443/webtransport")
+if transports.get("wss_fallback"):
+    seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+
+if not seed_urls and not fetched_snapshot:
+    seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+
+print(",".join(seed_urls))
+PY
+)"
           fi
           IFS=',' read -r -a seed_node_url_array <<<"$seed_node_urls"
           browser_seed_count=0

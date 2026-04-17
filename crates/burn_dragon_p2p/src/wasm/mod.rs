@@ -412,6 +412,13 @@ fn dragon_live_notice(
         && view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
+        if let Some(error) = view.network.swarm_status.last_error.as_ref() {
+            return Some(DragonLiveNotice {
+                label: "waiting",
+                detail: format!("{} unavailable: {error}", view.network.transport),
+                tone: "neutral",
+            });
+        }
         return Some(DragonLiveNotice {
             label: "connecting",
             detail: format!("waiting for {}", view.network.transport),

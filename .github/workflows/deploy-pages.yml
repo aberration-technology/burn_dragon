@@ -107,7 +107,7 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 -c '
+            seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
               from urllib.parse import urlparse
               import json
               import sys
@@ -142,7 +142,8 @@ jobs:
                   seed_urls.append(f"/dns4/{host}/tcp/443/wss")
 
               print(",".join(dict.fromkeys(seed_urls)))
-              ' "$edge_base_url")"
+              PY
+            )"
           fi
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$seed_node_urls_from_env"

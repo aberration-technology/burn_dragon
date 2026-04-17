@@ -201,6 +201,24 @@ function fail(message) {
   throw new Error(message);
 }
 
+function statTileValue(tiles, label) {
+  const normalizedLabel = label.trim().toLowerCase();
+  for (const tile of tiles ?? []) {
+    if (!Array.isArray(tile) || tile.length === 0) {
+      continue;
+    }
+    if ((tile[0] ?? "").trim().toLowerCase() !== normalizedLabel) {
+      continue;
+    }
+    return tile
+      .slice(1)
+      .map((part) => part ?? "")
+      .join(" | ")
+      .trim();
+  }
+  return null;
+}
+
 function isDialableWebRtcSeed(seed) {
   return seed.includes("/webrtc-direct") && seed.includes("/certhash/");
 }
@@ -551,6 +569,16 @@ async function runCanary() {
         ),
       )
       .catch(() => []);
+    const liveTransportTile = statTileValue(report.live_stat_tiles, "transport");
+    if (
+      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
+      snapshot.transports?.webrtc_direct &&
+      !(liveTransportTile ?? "").startsWith("webrtc-direct")
+    ) {
+      fail(
+        `browser canary connected without using webrtc-direct despite advertised preference: ${liveTransportTile ?? "missing transport tile"}`,
+      );
+    }
 
     const quietWindowStartedAt = Date.now();
     await page.waitForTimeout(QUIET_WINDOW_MS);

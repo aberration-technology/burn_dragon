@@ -35,11 +35,16 @@ def main() -> None:
                 'echo "TF_VAR_github_browser_canary_callback_token=$BROWSER_CANARY_CALLBACK_TOKEN"',
                 'BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}',
                 'trusted_callback_args+=(--trusted-callback-token "$BROWSER_CANARY_CALLBACK_TOKEN")',
+                'rm -rf "$bootstrap_root"',
+                '--force \\',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (
                     f"{workflow_path} missing required deploy snippet: {snippet}"
                 )
+            assert (
+                "${{ runner.temp }}/bootstrap-install" not in workflow_text
+            ), f"{workflow_path} should not cache bootstrap-install"
         else:
             assert (
                 'BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}'

@@ -813,7 +813,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ${{ runner.temp }}/target-edge-binaries
-            ${{ runner.temp }}/bootstrap-install
           key: burn-dragon-edge-binaries-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.github/workflows/deploy-burn-dragon-p2p-aws.yml', '.github/workflows/restore-burn-dragon-p2p-aws.yml') }}
           restore-keys: |
             burn-dragon-edge-binaries-${{ runner.os }}-
@@ -838,7 +837,9 @@ jobs:
             esac
 
             bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
+            rm -rf "$bootstrap_root"
             CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="$edge_target_dir" cargo install \
+              --force \
               --locked \
               --root "$bootstrap_root" \
               --git "https://github.com/aberration-technology/burn_p2p.git" \

@@ -443,7 +443,7 @@ locals {
   browser_canary_trusted_callback = (
     trimspace(var.github_browser_canary_principal_id) != "" &&
     trimspace(var.github_browser_canary_callback_token) != ""
-  ) ? {
+    ) ? {
     principal_id = trimspace(var.github_browser_canary_principal_id)
     token_header = "x-burn-p2p-canary-token"
     token_value  = trimspace(var.github_browser_canary_callback_token)

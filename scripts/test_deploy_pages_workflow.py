@@ -13,12 +13,17 @@ def main() -> None:
     workflow_text = workflow_path.read_text()
     required_snippets = [
         'with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:',
+        'for attempt in range(3):',
+        'time.sleep(2)',
         'with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:',
         'def is_dialable_browser_seed(value: str) -> bool:',
+        'def is_direct_browser_seed(value: str) -> bool:',
+        'def snapshot_advertises_direct_transports(transports: dict[str, object]) -> bool:',
         'if "webrtc-direct" in segments:',
         'return "certhash" in segments',
         'if "webtransport" in segments:',
         'return "quic-v1" in segments and "certhash" in segments',
+        'browser pages deploy refusing to publish degraded WSS-only config while direct browser transports are advertised',
         'seed_urls.append(f"/dns4/{host}/tcp/443/wss")',
         'browser pages deploy requires at least one browser-capable seed multiaddr',
     ]

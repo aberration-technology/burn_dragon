@@ -107,49 +107,80 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 -c 'import json, sys, textwrap, urllib.request; from urllib.parse import urlparse; exec(textwrap.dedent("""
-              edge_base_url = sys.argv[1].rstrip("/")
-              host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
-              seed_urls = []
-              fetched_snapshot = False
+            seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
+          import json
+          import sys
+          import time
+          import urllib.request
+          from urllib.parse import urlparse
 
-              def is_dialable_browser_seed(value: str) -> bool:
-                  segments = [segment for segment in value.split("/") if segment]
-                  if "webrtc-direct" in segments:
-                      return "certhash" in segments
-                  if "webtransport" in segments:
-                      return "quic-v1" in segments and "certhash" in segments
-                  return "wss" in segments or "ws" in segments
+          edge_base_url = sys.argv[1].rstrip("/")
+          host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
+          seed_urls = []
+          signed_fetch_error = None
 
+          def is_dialable_browser_seed(value: str) -> bool:
+              segments = [segment for segment in value.split("/") if segment]
+              if "webrtc-direct" in segments:
+                  return "certhash" in segments
+              if "webtransport" in segments:
+                  return "quic-v1" in segments and "certhash" in segments
+              return "wss" in segments or "ws" in segments
+
+          def is_direct_browser_seed(value: str) -> bool:
+              segments = [segment for segment in value.split("/") if segment]
+              if "webrtc-direct" in segments:
+                  return "certhash" in segments
+              if "webtransport" in segments:
+                  return "quic-v1" in segments and "certhash" in segments
+              return False
+
+          def snapshot_advertises_direct_transports(transports: dict[str, object]) -> bool:
+              return bool(transports.get("webrtc_direct") or transports.get("webtransport_gateway"))
+
+          for attempt in range(3):
               try:
                   with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:
                       payload = json.load(response)
                   signed = payload.get("payload", {}).get("payload", {})
                   for record in signed.get("seeds") or []:
                       for value in record.get("multiaddrs") or []:
-                          if not value:
-                              continue
-                          if is_dialable_browser_seed(value):
+                          if value and is_dialable_browser_seed(value):
                               seed_urls.append(value)
-              except Exception:
+                  signed_fetch_error = None
+                  break
+              except Exception as exc:
                   seed_urls = []
+                  signed_fetch_error = exc
+                  if attempt < 2:
+                      time.sleep(2)
 
-              if not seed_urls:
-                  try:
-                      with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
-                          transports = (json.load(response).get("transports") or {})
-                          fetched_snapshot = True
-                  except Exception:
-                      transports = {}
+          fetched_snapshot = False
+          snapshot_transports = {}
+          if not seed_urls or not any(is_direct_browser_seed(value) for value in seed_urls):
+              try:
+                  with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
+                      snapshot_transports = (json.load(response).get("transports") or {})
+                      fetched_snapshot = True
+              except Exception:
+                  snapshot_transports = {}
 
-                  if transports.get("wss_fallback"):
-                      seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+          direct_transport_expected = snapshot_advertises_direct_transports(snapshot_transports)
+          direct_seed_available = any(is_direct_browser_seed(value) for value in seed_urls)
 
-              if not seed_urls and not fetched_snapshot:
-                  seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+          if direct_transport_expected and not direct_seed_available:
+              detail = f"signed_seed_fetch_error={signed_fetch_error!r}" if signed_fetch_error else "signed_browser_seeds_missing_direct_transport"
+              raise SystemExit(
+                  "browser pages deploy refusing to publish degraded WSS-only config while direct browser transports are advertised; "
+                  + detail
+              )
 
-              print(",".join(dict.fromkeys(seed_urls)))
-              """))' "$edge_base_url")"
+          if not seed_urls and fetched_snapshot and snapshot_transports.get("wss_fallback"):
+              seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+
+          print(",".join(dict.fromkeys(seed_urls)))
+          PY
+            )"
           fi
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$seed_node_urls_from_env"

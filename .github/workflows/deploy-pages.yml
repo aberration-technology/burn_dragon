@@ -107,12 +107,7 @@ jobs:
             selected_revision_id="nca-r1"
           fi
           if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
-              from urllib.parse import urlparse
-              import json
-              import sys
-              import urllib.request
-
+            seed_node_urls="$(python3 -c 'import json, sys, textwrap, urllib.request; from urllib.parse import urlparse; exec(textwrap.dedent("""
               edge_base_url = sys.argv[1].rstrip("/")
               host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
               seed_urls = []
@@ -142,8 +137,7 @@ jobs:
                   seed_urls.append(f"/dns4/{host}/tcp/443/wss")
 
               print(",".join(dict.fromkeys(seed_urls)))
-              PY
-            )"
+              """))' "$edge_base_url")"
           fi
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$seed_node_urls_from_env"

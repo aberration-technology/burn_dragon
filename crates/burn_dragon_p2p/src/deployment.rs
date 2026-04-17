@@ -430,6 +430,7 @@ fn probe_artifact_head_view(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_deployment_readiness(
     capability: &DeploymentCheck<DragonNativeCapabilityAssessment>,
     edge_snapshot: &DeploymentCheck<DeploymentEdgeSnapshotSummary>,
@@ -510,13 +511,13 @@ pub fn evaluate_deployment_readiness(
         }
     }
 
-    if let Some(artifact_head_view) = artifact_head_view {
-        if !artifact_head_view.ok {
-            if require_artifact_head_view {
-                blocking_issues.push("artifact_head_view_probe_failed".into());
-            } else {
-                observed_warnings.push("artifact_head_view_probe_failed".into());
-            }
+    if let Some(artifact_head_view) = artifact_head_view
+        && !artifact_head_view.ok
+    {
+        if require_artifact_head_view {
+            blocking_issues.push("artifact_head_view_probe_failed".into());
+        } else {
+            observed_warnings.push("artifact_head_view_probe_failed".into());
         }
     }
 

@@ -1476,6 +1476,7 @@ fn register_live_head_with_edge(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_prepared_head_mirror<B>(
     prepared: PreparedNativePeer<B>,
     config: &DragonNativePeerConfig,

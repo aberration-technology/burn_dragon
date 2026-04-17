@@ -31,6 +31,11 @@ on:
         required: true
         default: false
         type: boolean
+      restart_edge_services:
+        description: "Restart Caddy and burn-p2p-bootstrap over SSM before inspection. Use this for fast recovery when the edge is unhealthy."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -64,6 +69,7 @@ jobs:
           CLEANUP_LEGACY_BOOTSTRAP_INSTANCES: ${{ github.event.inputs.cleanup_legacy_bootstrap_instances }}
           REPAIR_EDGE_TLS: ${{ github.event.inputs.repair_edge_tls }}
           REPAIR_HEAD_MIRROR_SEED_URLS: ${{ github.event.inputs.repair_head_mirror_seed_urls }}
+          RESTART_EDGE_SERVICES: ${{ github.event.inputs.restart_edge_services }}
         run: |
           set -euo pipefail
           artifact_dir="${RUNNER_TEMP}/burn-dragon-inspect"
@@ -282,6 +288,50 @@ jobs:
           echo "ssm_status=${ssm_status:-missing}" >>"$GITHUB_OUTPUT"
 
           if [ "${ssm_status:-}" = "Online" ]; then
+            if [ "${RESTART_EDGE_SERVICES}" = "true" ]; then
+              restart_command_id="$(aws ssm send-command \
+                --region "$AWS_REGION" \
+                --instance-ids "$instance_id" \
+                --document-name AWS-RunShellScript \
+                --comment "restart burn_dragon bootstrap edge services" \
+                --parameters 'commands=[
+                  "set -eu",
+                  "systemctl daemon-reload",
+                  "systemctl enable caddy",
+                  "systemctl restart caddy",
+                  "systemctl reset-failed burn-p2p-bootstrap || true",
+                  "systemctl enable burn-p2p-bootstrap",
+                  "systemctl restart burn-p2p-bootstrap",
+                  "systemctl is-active caddy",
+                  "systemctl is-active burn-p2p-bootstrap",
+                  "curl -fsS https://127.0.0.1/portal/snapshot >/dev/null"
+                ]' \
+                --query 'Command.CommandId' \
+                --output text)"
+
+              for attempt in $(seq 1 30); do
+                restart_invocation_status="$(aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$restart_command_id" \
+                  --instance-id "$instance_id" \
+                  --query 'Status' \
+                  --output text 2>/dev/null || true)"
+                case "$restart_invocation_status" in
+                  Success|Cancelled|TimedOut|Failed|Cancelling)
+                    break
+                    ;;
+                esac
+                sleep 5
+              done
+
+              echo "restart edge services ssm command output"
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$restart_command_id" \
+                --instance-id "$instance_id" \
+                --output json | tee "$artifact_dir/restart-edge-services-command.json" || true
+            fi
+
             if [ "${REPAIR_EDGE_TLS}" = "true" ]; then
               repair_command_id="$(aws ssm send-command \
                 --region "$AWS_REGION" \

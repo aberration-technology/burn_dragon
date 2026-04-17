@@ -79,6 +79,8 @@ pub fn native_edge_enrollment_config(
         login_path: provider.login_path.clone(),
         device_path: provider.device_path.clone(),
         callback_path: provider.callback_path.clone().unwrap_or_default(),
+        trusted_callback_header: None,
+        trusted_callback_token: None,
         enroll_path: snapshot.paths.enroll_path.clone(),
         trust_bundle_path: snapshot.paths.trust_bundle_path.clone(),
         requested_scopes,
@@ -278,6 +280,7 @@ pub async fn enroll_native_static_principal(
     session_ttl_secs: i64,
     principal_hint: Option<String>,
     principal_id: burn_p2p::PrincipalId,
+    trusted_callback_token: Option<String>,
     client_manifest_id: Option<ContentId>,
 ) -> Result<DragonGitHubSession> {
     let snapshot = fetch_edge_snapshot(edge_base_url).await?;
@@ -287,7 +290,10 @@ pub async fn enroll_native_static_principal(
         requested_scopes,
         session_ttl_secs,
     )?;
-    let client = EdgeAuthClient::new(edge_base_url, enrollment.clone());
+    let mut client = EdgeAuthClient::new(edge_base_url, enrollment.clone());
+    if let Some(token) = trusted_callback_token.filter(|value| !value.trim().is_empty()) {
+        client = client.with_trusted_callback("x-burn-p2p-canary-token", token);
+    }
     let (_, identity) = edge_peer_identity_for_storage(storage_root, None)?;
     let enrolled = client
         .enroll_static_principal(principal_hint, principal_id, &identity)

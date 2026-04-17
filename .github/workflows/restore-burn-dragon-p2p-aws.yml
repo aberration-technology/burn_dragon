@@ -1200,6 +1200,10 @@ jobs:
             else
               dragon_native_cmd=(cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native --)
             fi
+            trusted_callback_args=()
+            if [ -n "${BROWSER_CANARY_CALLBACK_TOKEN:-}" ]; then
+              trusted_callback_args+=(--trusted-callback-token "$BROWSER_CANARY_CALLBACK_TOKEN")
+            fi
 
             for attempt in $(seq 1 10); do
               if "${dragon_native_cmd[@]}" \
@@ -1210,6 +1214,7 @@ jobs:
                 --principal-id "$MANAGED_TRAINER_PRINCIPAL_ID" \
                 --principal-hint "$MANAGED_TRAINER_PRINCIPAL_ID" \
                 --target-artifact-hash "$TF_VAR_native_target_artifact_hash" \
+                "${trusted_callback_args[@]}" \
                 --auth-bundle-out "$bundle_path" \
                 --output-format json; then
                 bundle_json="$(cat "$bundle_path")"
@@ -1273,6 +1278,10 @@ jobs:
           else
             dragon_native_cmd=(cargo run --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native --)
           fi
+          trusted_callback_args=()
+          if [ -n "${BROWSER_CANARY_CALLBACK_TOKEN:-}" ]; then
+            trusted_callback_args+=(--trusted-callback-token "$BROWSER_CANARY_CALLBACK_TOKEN")
+          fi
 
           for attempt in $(seq 1 10); do
             if "${dragon_native_cmd[@]}" \
@@ -1283,6 +1292,7 @@ jobs:
               --principal-id "$BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID" \
               --principal-hint "$BOOTSTRAP_HEAD_MIRROR_PRINCIPAL_ID" \
               --target-artifact-hash "$TF_VAR_native_target_artifact_hash" \
+              "${trusted_callback_args[@]}" \
               --auth-bundle-out "$bundle_path" \
               --output-format json; then
               aws ssm put-parameter \

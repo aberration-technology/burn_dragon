@@ -350,6 +350,8 @@ struct EnrollStaticPrincipalArgs {
     principal_id: String,
     #[arg(long)]
     principal_hint: Option<String>,
+    #[arg(long)]
+    trusted_callback_token: Option<String>,
     #[arg(long, value_enum, default_value = "trainer")]
     principal_kind: ManagedPrincipalKindArg,
     #[arg(long)]
@@ -763,6 +765,7 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
         args.session_ttl_secs,
         args.principal_hint,
         PrincipalId::new(args.principal_id),
+        args.trusted_callback_token,
         None,
     ))?;
     write_output(

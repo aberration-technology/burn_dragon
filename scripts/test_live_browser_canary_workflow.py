@@ -39,6 +39,9 @@ def main() -> None:
                 '--force \\',
                 'gh workflow run .github/workflows/deploy-pages.yml',
                 'gh run watch "$pages_run_id"',
+                '--json databaseId,createdAt,headBranch',
+                'GITHUB_REF_NAME="$GITHUB_REF_NAME"',
+                'run.get("headBranch") == branch',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (

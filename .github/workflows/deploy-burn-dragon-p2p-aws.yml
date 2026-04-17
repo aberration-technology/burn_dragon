@@ -1905,8 +1905,8 @@ jobs:
               --repo aberration-technology/burn_dragon \
               --workflow .github/workflows/deploy-pages.yml \
               --limit 10 \
-              --json databaseId,createdAt,headSha \
-              | DISPATCH_STARTED_AT="$dispatch_started_at" GITHUB_SHA="$GITHUB_SHA" python3 -c 'import datetime, json, os, sys; runs = json.load(sys.stdin); after = int(os.environ["DISPATCH_STARTED_AT"]); sha = os.environ["GITHUB_SHA"]; matches = [run for run in runs if run.get("headSha") == sha and int(datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00")).timestamp()) >= after]; print(matches[0]["databaseId"] if matches else "")' )"
+              --json databaseId,createdAt,headBranch \
+              | DISPATCH_STARTED_AT="$dispatch_started_at" GITHUB_REF_NAME="$GITHUB_REF_NAME" python3 -c 'import datetime, json, os, sys; runs = json.load(sys.stdin); after = int(os.environ["DISPATCH_STARTED_AT"]); branch = os.environ["GITHUB_REF_NAME"]; matches = [run for run in runs if run.get("headBranch") == branch and int(datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00")).timestamp()) >= after]; matches.sort(key=lambda run: run.get("databaseId", 0), reverse=True); print(matches[0]["databaseId"] if matches else "")' )"
             if [ -n "$pages_run_id" ]; then
               break
             fi
@@ -1914,7 +1914,7 @@ jobs:
           done
 
           if [ -z "$pages_run_id" ]; then
-            echo "failed to discover deploy-pages run dispatched for $GITHUB_SHA" >&2
+            echo "failed to discover deploy-pages run dispatched for branch $GITHUB_REF_NAME" >&2
             exit 1
           fi
 

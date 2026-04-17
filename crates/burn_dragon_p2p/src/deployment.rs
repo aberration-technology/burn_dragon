@@ -460,6 +460,9 @@ pub fn evaluate_deployment_readiness(
     if !edge_snapshot.ok {
         blocking_issues.push("edge_snapshot_unavailable".into());
     } else if let Some(snapshot) = edge_snapshot.value.as_ref() {
+        if snapshot.transports.webrtc_direct {
+            blocking_issues.push("webrtc_direct_advertised_without_runtime_support".into());
+        }
         if snapshot.transports.webtransport_gateway {
             blocking_issues.push("webtransport_gateway_advertised_without_runtime_support".into());
         }
@@ -602,7 +605,7 @@ mod tests {
                 device_path: None,
             }],
             transports: DeploymentBrowserTransportSummary {
-                webrtc_direct: true,
+                webrtc_direct: false,
                 webtransport_gateway: false,
                 wss_fallback: true,
             },
@@ -779,6 +782,34 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"webtransport_gateway_advertised_without_runtime_support".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_blocks_on_webrtc_surface_until_runtime_support_exists() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.transports.webrtc_direct = true;
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"webrtc_direct_advertised_without_runtime_support".to_owned())
         );
     }
 }

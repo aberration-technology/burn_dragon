@@ -16,6 +16,7 @@ bootstrap_crate_version="${BOOTSTRAP_CRATE_VERSION:-0.21.0-pre.15}"
 bootstrap_git_repository="${BOOTSTRAP_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_p2p.git}"
 bootstrap_git_ref="${BOOTSTRAP_GIT_REF:-}"
 bootstrap_binary_path="${BOOTSTRAP_BINARY_PATH:-}"
+bootstrap_binary_sha256="${BOOTSTRAP_BINARY_SHA256:-}"
 auth_connector_kind="${AUTH_CONNECTOR_KIND:-github}"
 bootstrap_auth_feature="${BOOTSTRAP_AUTH_FEATURE:-}"
 bootstrap_features="${BOOTSTRAP_FEATURES:-}"
@@ -23,6 +24,7 @@ bootstrap_reinstall="${BOOTSTRAP_REINSTALL:-false}"
 dragon_git_repository="${DRAGON_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_dragon.git}"
 dragon_git_ref="${DRAGON_GIT_REF:-main}"
 head_mirror_binary_path="${HEAD_MIRROR_BINARY_PATH:-}"
+head_mirror_binary_sha256="${HEAD_MIRROR_BINARY_SHA256:-}"
 head_mirror_reinstall="${HEAD_MIRROR_REINSTALL:-true}"
 
 if [ -z "$bootstrap_auth_feature" ]; then
@@ -117,11 +119,13 @@ params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" \
   BOOTSTRAP_GIT_REPOSITORY="$bootstrap_git_repository" \
   BOOTSTRAP_GIT_REF="$bootstrap_git_ref" \
   BOOTSTRAP_BINARY_OBJECT_URI="$bootstrap_binary_object_uri" \
+  BOOTSTRAP_BINARY_SHA256="$bootstrap_binary_sha256" \
   BOOTSTRAP_FEATURES="$bootstrap_features" \
   BOOTSTRAP_REINSTALL="$bootstrap_reinstall" \
   DRAGON_GIT_REPOSITORY="$dragon_git_repository" \
   DRAGON_GIT_REF="$dragon_git_ref" \
   HEAD_MIRROR_BINARY_OBJECT_URI="$head_mirror_binary_object_uri" \
+  HEAD_MIRROR_BINARY_SHA256="$head_mirror_binary_sha256" \
   HEAD_MIRROR_REINSTALL="$head_mirror_reinstall" \
   python3 "$(dirname "$0")/render_bootstrap_runtime_sync_commands.py"
 )"

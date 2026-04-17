@@ -920,6 +920,7 @@ jobs:
 
           edge_target_dir="${RUNNER_TEMP}/target-edge-binaries"
           bootstrap_binary_path=""
+          bootstrap_binary_sha256=""
           if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
             bootstrap_auth_feature="auth-static"
             case "${AUTH_CONNECTOR_KIND}" in
@@ -940,6 +941,7 @@ jobs:
               --no-default-features \
               --features "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
             bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"
+            bootstrap_binary_sha256="$(sha256sum "$bootstrap_binary_path" | awk '{print $1}')"
           fi
 
           CARGO_TARGET_DIR="$edge_target_dir" cargo build \
@@ -952,10 +954,13 @@ jobs:
             --release
 
           head_mirror_binary_path="${edge_target_dir}/release/burn_dragon_p2p_native"
+          head_mirror_binary_sha256="$(sha256sum "$head_mirror_binary_path" | awk '{print $1}')"
 
           {
             echo "bootstrap_binary_path=${bootstrap_binary_path}"
+            echo "bootstrap_binary_sha256=${bootstrap_binary_sha256}"
             echo "head_mirror_binary_path=${head_mirror_binary_path}"
+            echo "head_mirror_binary_sha256=${head_mirror_binary_sha256}"
           } >>"$GITHUB_OUTPUT"
 
       - name: setup terraform
@@ -1327,9 +1332,11 @@ jobs:
           BOOTSTRAP_GIT_REPOSITORY: https://github.com/aberration-technology/burn_p2p.git
           BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
           BOOTSTRAP_BINARY_PATH: ${{ steps.edge_binaries.outputs.bootstrap_binary_path }}
+          BOOTSTRAP_BINARY_SHA256: ${{ steps.edge_binaries.outputs.bootstrap_binary_sha256 }}
           DRAGON_GIT_REPOSITORY: ${{ env.TF_VAR_dragon_git_repository }}
           DRAGON_GIT_REF: ${{ env.TF_VAR_dragon_git_ref }}
           HEAD_MIRROR_BINARY_PATH: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
+          HEAD_MIRROR_BINARY_SHA256: ${{ steps.edge_binaries.outputs.head_mirror_binary_sha256 }}
           AUTH_CONNECTOR_KIND: ${{ env.AUTH_CONNECTOR_KIND }}
           BOOTSTRAP_REINSTALL: "false"
           HEAD_MIRROR_REINSTALL: "false"

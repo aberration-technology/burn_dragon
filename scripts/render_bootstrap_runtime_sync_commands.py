@@ -133,11 +133,19 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
     ]
 
     bootstrap_binary_object_uri = env.get("BOOTSTRAP_BINARY_OBJECT_URI", "")
+    bootstrap_binary_sha256 = env.get("BOOTSTRAP_BINARY_SHA256", "").strip()
     if bootstrap_binary_object_uri:
         bootstrap_setup = [
             f"aws s3 cp '{bootstrap_binary_object_uri}' /usr/local/bin/burn-p2p-bootstrap",
             "chmod 0755 /usr/local/bin/burn-p2p-bootstrap",
         ]
+        if bootstrap_binary_sha256:
+            bootstrap_setup.append(
+                "remote_sha=$(sha256sum /usr/local/bin/burn-p2p-bootstrap | awk '{print $1}'); "
+                f"if [ \"$remote_sha\" != '{bootstrap_binary_sha256}' ]; then "
+                "echo \"bootstrap binary checksum mismatch: "
+                f"expected {bootstrap_binary_sha256} got $remote_sha\" >&2; exit 1; fi"
+            )
     elif env.get("BOOTSTRAP_INSTALL_SOURCE") == "git" and not truthy(env.get("BOOTSTRAP_REINSTALL")):
         raise SystemExit(
             "BOOTSTRAP_BINARY_OBJECT_URI is required for git bootstrap sync when BOOTSTRAP_REINSTALL is false"
@@ -151,11 +159,19 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         ]
 
     head_mirror_binary_object_uri = env.get("HEAD_MIRROR_BINARY_OBJECT_URI", "")
+    head_mirror_binary_sha256 = env.get("HEAD_MIRROR_BINARY_SHA256", "").strip()
     if head_mirror_binary_object_uri:
         head_mirror_setup = [
             f"aws s3 cp '{head_mirror_binary_object_uri}' /usr/local/bin/burn_dragon_p2p_native",
             "chmod 0755 /usr/local/bin/burn_dragon_p2p_native",
         ]
+        if head_mirror_binary_sha256:
+            head_mirror_setup.append(
+                "remote_sha=$(sha256sum /usr/local/bin/burn_dragon_p2p_native | awk '{print $1}'); "
+                f"if [ \"$remote_sha\" != '{head_mirror_binary_sha256}' ]; then "
+                "echo \"head mirror binary checksum mismatch: "
+                f"expected {head_mirror_binary_sha256} got $remote_sha\" >&2; exit 1; fi"
+            )
     elif not truthy(env.get("HEAD_MIRROR_REINSTALL")):
         raise SystemExit(
             "HEAD_MIRROR_BINARY_OBJECT_URI is required when HEAD_MIRROR_REINSTALL is false"

@@ -92,13 +92,26 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
     def test_prebuilt_bootstrap_binary_skips_bootstrap_cargo_install(self) -> None:
         env = base_env()
         env["BOOTSTRAP_BINARY_OBJECT_URI"] = "s3://bucket/runtime/burn-p2p-bootstrap"
+        env["BOOTSTRAP_BINARY_SHA256"] = "bootstrapsha"
         commands = module.generate_commands(env)
         joined = "\n".join(commands)
         self.assertIn(
             "aws s3 cp 's3://bucket/runtime/burn-p2p-bootstrap' /usr/local/bin/burn-p2p-bootstrap",
             joined,
         )
+        self.assertIn("expected bootstrapsha got $remote_sha", joined)
         self.assertNotIn("cargo install --locked burn_p2p_bootstrap", joined)
+
+    def test_prebuilt_head_mirror_binary_verifies_checksum_when_provided(self) -> None:
+        env = base_env()
+        env["HEAD_MIRROR_BINARY_SHA256"] = "headmirrorsha"
+        commands = module.generate_commands(env)
+        joined = "\n".join(commands)
+        self.assertIn(
+            "aws s3 cp 's3://bucket/runtime/burn_dragon_p2p_native' /usr/local/bin/burn_dragon_p2p_native",
+            joined,
+        )
+        self.assertIn("expected headmirrorsha got $remote_sha", joined)
 
     def test_missing_prebuilt_bootstrap_binary_is_rejected_for_git_sync_without_reinstall(self) -> None:
         env = base_env()
@@ -158,6 +171,8 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
                 text,
                 path.name,
             )
+            self.assertIn("BOOTSTRAP_BINARY_SHA256", text, path.name)
+            self.assertIn("HEAD_MIRROR_BINARY_SHA256", text, path.name)
 
     def test_sync_script_times_out_when_ssm_command_never_succeeds(self) -> None:
         text = (REPO_ROOT / "scripts" / "sync-bootstrap-runtime-config.sh").read_text()

@@ -201,6 +201,14 @@ function fail(message) {
   throw new Error(message);
 }
 
+function isDialableWebRtcSeed(seed) {
+  return seed.includes("/webrtc-direct") && seed.includes("/certhash/");
+}
+
+function isDialableWebTransportSeed(seed) {
+  return seed.includes("/quic-v1/webtransport") && seed.includes("/certhash/");
+}
+
 function contentTypeForPath(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
@@ -327,12 +335,20 @@ async function runCanary() {
     (record) => record.multiaddrs ?? [],
   ) ?? [];
   const browserConfigSeeds = browserConfig.seed_node_urls ?? [];
-  const signedHasWebRtcDirect = signedSeeds.some((value) => value.includes("/webrtc-direct"));
-  const signedHasWebTransport = signedSeeds.some((value) => value.includes("/webtransport"));
+  const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
+  const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
   const browserCapableSeedCount = Number(signedHasWebRtcDirect) + Number(signedHasWebTransport) + Number(signedHasWss);
   if (!signedSeeds.length || browserCapableSeedCount === 0) {
     fail(`signed browser seeds are missing browser-capable addresses: ${JSON.stringify(signedSeeds)}`);
+  }
+  for (const seed of signedSeeds) {
+    if (seed.includes("/webrtc-direct") && !isDialableWebRtcSeed(seed)) {
+      fail(`signed browser seed advertises malformed webrtc-direct multiaddr: ${seed}`);
+    }
+    if (seed.includes("/webtransport") && !isDialableWebTransportSeed(seed)) {
+      fail(`signed browser seed advertises malformed webtransport multiaddr: ${seed}`);
+    }
   }
   if (signedSeeds.some((value) => value.includes("/quic-v1") || value.includes("/tcp/4001"))) {
     fail(`signed browser seeds still contain native-only addresses: ${JSON.stringify(signedSeeds)}`);

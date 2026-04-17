@@ -1647,6 +1647,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
                 metrics_retention: burn_p2p::MetricsRetentionConfig::default(),
                 bootstrap_peers: Vec::new(),
                 listen_addresses: vec![bootstrap_addr.clone()],
+                external_addresses: Vec::new(),
             },
         })
         .expect("spawn bootstrap peer daemon");
@@ -2178,6 +2179,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
                 metrics_retention: burn_p2p::MetricsRetentionConfig::default(),
                 bootstrap_peers: Vec::new(),
                 listen_addresses: vec![bootstrap_addr.clone()],
+                external_addresses: Vec::new(),
             },
         })
         .expect("spawn bootstrap peer daemon");

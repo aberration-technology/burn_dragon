@@ -661,6 +661,11 @@ locals {
           "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
           "/ip4/0.0.0.0/udp/${local.p2p_webrtc_port}/webrtc-direct",
         ]
+        external_addresses = [
+          "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
+          "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
+          "/dns4/${var.edge_domain_name}/udp/${local.p2p_webrtc_port}/webrtc-direct",
+        ]
       }
     }
     auth = {

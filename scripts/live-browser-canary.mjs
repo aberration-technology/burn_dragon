@@ -326,14 +326,36 @@ async function runCanary() {
   const signedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
     (record) => record.multiaddrs ?? [],
   ) ?? [];
-  if (!signedSeeds.some((value) => value.includes("/webrtc-direct"))) {
-    fail(`signed browser seeds are missing webrtc-direct: ${JSON.stringify(signedSeeds)}`);
-  }
-  if (!signedSeeds.some((value) => value.includes("/wss"))) {
-    fail(`signed browser seeds are missing wss fallback: ${JSON.stringify(signedSeeds)}`);
+  const browserConfigSeeds = browserConfig.seed_node_urls ?? [];
+  const signedHasWebRtcDirect = signedSeeds.some((value) => value.includes("/webrtc-direct"));
+  const signedHasWebTransport = signedSeeds.some((value) => value.includes("/webtransport"));
+  const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
+  const browserCapableSeedCount = Number(signedHasWebRtcDirect) + Number(signedHasWebTransport) + Number(signedHasWss);
+  if (!signedSeeds.length || browserCapableSeedCount === 0) {
+    fail(`signed browser seeds are missing browser-capable addresses: ${JSON.stringify(signedSeeds)}`);
   }
   if (signedSeeds.some((value) => value.includes("/quic-v1") || value.includes("/tcp/4001"))) {
     fail(`signed browser seeds still contain native-only addresses: ${JSON.stringify(signedSeeds)}`);
+  }
+  if (Boolean(snapshot.transports?.webrtc_direct) !== signedHasWebRtcDirect) {
+    fail(
+      `signed browser seeds disagree with snapshot webrtc_direct=${snapshot.transports?.webrtc_direct}: ${JSON.stringify(signedSeeds)}`,
+    );
+  }
+  if (Boolean(snapshot.transports?.webtransport_gateway) !== signedHasWebTransport) {
+    fail(
+      `signed browser seeds disagree with snapshot webtransport_gateway=${snapshot.transports?.webtransport_gateway}: ${JSON.stringify(signedSeeds)}`,
+    );
+  }
+  if (Boolean(snapshot.transports?.wss_fallback) !== signedHasWss) {
+    fail(
+      `signed browser seeds disagree with snapshot wss_fallback=${snapshot.transports?.wss_fallback}: ${JSON.stringify(signedSeeds)}`,
+    );
+  }
+  if (JSON.stringify(browserConfigSeeds) !== JSON.stringify(signedSeeds)) {
+    fail(
+      `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)}`,
+    );
   }
 
   const enrollment = await enrollBrowserCanary(snapshot);
@@ -368,7 +390,7 @@ async function runCanary() {
     experiment_id: EXPERIMENT_ID,
     network_id: snapshot.network_id,
     transports: snapshot.transports,
-    browser_config_seed_node_urls: browserConfig.seed_node_urls ?? [],
+    browser_config_seed_node_urls: browserConfigSeeds,
     signed_seed_multiaddrs: signedSeeds,
     signed_seed_transport_preference:
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],

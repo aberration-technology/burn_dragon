@@ -657,7 +657,7 @@ pub fn browser_training_config_from_profile(
             None => None,
         },
         live_participant: Some(DragonBrowserLiveParticipantConfig {
-            principal_id: "browser-live-participant".into(),
+            principal_id: None,
             study_id: entry.study_id.as_str().to_owned(),
             experiment_id: entry.experiment_id.as_str().to_owned(),
             revision_id: entry.current_revision_id.as_str().to_owned(),

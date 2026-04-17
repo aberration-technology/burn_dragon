@@ -18,9 +18,9 @@ use burn_p2p::{
 };
 use burn_p2p_browser::{
     BrowserCapabilityReport, BrowserEdgeClient, BrowserEnrollmentConfig, BrowserRuntimeConfig,
-    BrowserRuntimeRole, BrowserTrainingBudget, BrowserTrainingPlan, BrowserTransportPolicy,
-    BrowserTransportStatus, BrowserUiBindings, BrowserWorkerCommand, BrowserWorkerEvent,
-    BrowserWorkerRuntime,
+    BrowserRuntimeRole, BrowserSessionState, BrowserTrainingBudget, BrowserTrainingPlan,
+    BrowserTransportPolicy, BrowserTransportStatus, BrowserUiBindings, BrowserWorkerCommand,
+    BrowserWorkerEvent, BrowserWorkerRuntime,
 };
 use burn_p2p_core::codec::multihash_sha256;
 use burn_p2p_dataloader::ShardFetchManifest;
@@ -282,6 +282,15 @@ where
 {
     validate_browser_training_config(config)?;
     validate_live_training_backend(config, backend_kind)?;
+    let live_browser_session = if config.live_participant.is_some() {
+        Some(load_browser_session(edge_base_url).await?)
+    } else {
+        None
+    };
+    let live_session_principal_id = live_browser_session
+        .as_ref()
+        .and_then(|session| session.session.as_ref())
+        .map(|session| session.claims.principal_id.as_str());
 
     let total_started_at = Instant::now();
 
@@ -291,7 +300,12 @@ where
         config.block_size,
         TokenRecordLoadPolicy {
             record_limit: max_record_limit(config.batch_size, config.max_train_batches),
-            shard_selection_key: Some(browser_shard_selection_key(edge_base_url, config, "train")),
+            shard_selection_key: Some(browser_shard_selection_key(
+                edge_base_url,
+                config,
+                live_session_principal_id,
+                "train",
+            )),
             training_lease: config.training_lease.clone(),
         },
     )
@@ -310,6 +324,7 @@ where
                     shard_selection_key: Some(browser_shard_selection_key(
                         edge_base_url,
                         config,
+                        live_session_principal_id,
                         "eval",
                     )),
                     training_lease: None,
@@ -333,8 +348,13 @@ where
         eval_device,
     )?;
 
-    let mut live_participant =
-        start_live_browser_participant(edge_base_url, config, release_manifest).await?;
+    let mut live_participant = start_live_browser_participant(
+        edge_base_url,
+        config,
+        release_manifest,
+        live_browser_session.as_ref(),
+    )
+    .await?;
 
     let training_started_at = Instant::now();
     let mut model = DragonModel::<TrainB>::new(config.model_config.clone(), train_device);
@@ -446,13 +466,17 @@ fn max_record_limit(batch_size: usize, max_batches: Option<usize>) -> Option<usi
 fn browser_shard_selection_key(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
+    session_principal_id: Option<&str>,
     stage: &str,
 ) -> String {
     if let Some(live) = config.live_participant.as_ref() {
+        let participant_id = session_principal_id
+            .or(live.principal_id.as_deref())
+            .unwrap_or("browser-live-session");
         return format!(
             "live|{}|{}|{}|{}|{}|{}",
             edge_base_url.trim_end_matches('/'),
-            live.principal_id,
+            participant_id,
             live.study_id,
             live.experiment_id,
             live.revision_id,
@@ -807,6 +831,7 @@ async fn start_live_browser_participant(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
     release_manifest: &burn_p2p::ClientReleaseManifest,
+    preloaded_session: Option<&BrowserSessionState>,
 ) -> Result<Option<LiveBrowserParticipantHandle>> {
     let Some(live) = config.live_participant.as_ref() else {
         return Ok(None);
@@ -819,7 +844,10 @@ async fn start_live_browser_participant(
         },
     ]);
     let _ = browser_github_enrollment_config(&snapshot, release_manifest, requested_scopes, 900)?;
-    let session = load_browser_session(edge_base_url).await?;
+    let session = match preloaded_session {
+        Some(session) => session.clone(),
+        None => load_browser_session(edge_base_url).await?,
+    };
     let _claims = session
         .session
         .as_ref()
@@ -1044,6 +1072,55 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn browser_live_shard_selection_prefers_authenticated_session_principal() {
+        let mut config = sample_browser_training_config();
+        config.live_participant = Some(DragonBrowserLiveParticipantConfig {
+            principal_id: Some("configured-live-principal".into()),
+            study_id: "dragon-study".into(),
+            experiment_id: "dragon-experiment".into(),
+            revision_id: "dragon-revision".into(),
+            stage_name: "live".into(),
+            receipt_workload_id: "dragon-receipts".into(),
+        });
+
+        let shard_key = browser_shard_selection_key(
+            "https://edge.example.invalid",
+            &config,
+            Some("session-principal"),
+            "train",
+        );
+
+        assert!(shard_key.contains("session-principal"));
+        assert!(!shard_key.contains("configured-live-principal"));
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_live_shard_selection_falls_back_to_config_then_default() {
+        let mut config = sample_browser_training_config();
+        config.live_participant = Some(DragonBrowserLiveParticipantConfig {
+            principal_id: Some("configured-live-principal".into()),
+            study_id: "dragon-study".into(),
+            experiment_id: "dragon-experiment".into(),
+            revision_id: "dragon-revision".into(),
+            stage_name: "live".into(),
+            receipt_workload_id: "dragon-receipts".into(),
+        });
+
+        let configured_key =
+            browser_shard_selection_key("https://edge.example.invalid", &config, None, "train");
+        assert!(configured_key.contains("configured-live-principal"));
+
+        config
+            .live_participant
+            .as_mut()
+            .expect("live participant")
+            .principal_id = None;
+        let default_key =
+            browser_shard_selection_key("https://edge.example.invalid", &config, None, "train");
+        assert!(default_key.contains("browser-live-session"));
+    }
 
     #[wasm_bindgen_test(async)]
     async fn browser_training_smoke_generated_nca() {
@@ -1493,6 +1570,33 @@ mod tests {
             n_expert: 1,
             vocab_size,
             ..DragonConfig::default()
+        }
+    }
+
+    fn sample_browser_training_config() -> DragonBrowserTrainingConfig {
+        DragonBrowserTrainingConfig {
+            experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
+            model_config: tiny_model_config(256),
+            execution_backend: DragonBrowserExecutionBackend::Cpu,
+            block_size: 8,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 2,
+            max_train_batches: Some(1),
+            max_eval_batches: Some(1),
+            capability_policy: Default::default(),
+            training_lease: None,
+            train_source: DragonBrowserTokenSource::GeneratedNca {
+                corpus: tiny_nca_corpus_config(),
+                split: DragonBrowserDatasetSplit::Train,
+                max_documents: Some(1),
+            },
+            eval_source: Some(DragonBrowserTokenSource::GeneratedNca {
+                corpus: tiny_nca_corpus_config(),
+                split: DragonBrowserDatasetSplit::Validation,
+                max_documents: Some(1),
+            }),
+            live_participant: None,
         }
     }
 

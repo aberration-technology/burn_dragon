@@ -536,7 +536,8 @@ pub enum DragonBrowserTokenSource {
 #[cfg(feature = "wasm-peer")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonBrowserLiveParticipantConfig {
-    pub principal_id: String,
+    #[serde(default)]
+    pub principal_id: Option<String>,
     pub study_id: String,
     pub experiment_id: String,
     pub revision_id: String,

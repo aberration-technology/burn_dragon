@@ -287,10 +287,7 @@ where
     } else {
         None
     };
-    let live_session_principal_id = live_browser_session
-        .as_ref()
-        .and_then(|session| session.session.as_ref())
-        .map(|session| session.claims.principal_id.as_str());
+    let live_session_principal_id = live_session_principal_id(live_browser_session.as_ref());
 
     let total_started_at = Instant::now();
 
@@ -298,16 +295,14 @@ where
         edge_base_url,
         &config.train_source,
         config.block_size,
-        TokenRecordLoadPolicy {
-            record_limit: max_record_limit(config.batch_size, config.max_train_batches),
-            shard_selection_key: Some(browser_shard_selection_key(
-                edge_base_url,
-                config,
-                live_session_principal_id,
-                "train",
-            )),
-            training_lease: config.training_lease.clone(),
-        },
+        token_record_load_policy(
+            edge_base_url,
+            config,
+            live_session_principal_id,
+            "train",
+            max_record_limit(config.batch_size, config.max_train_batches),
+            config.training_lease.clone(),
+        ),
     )
     .await?;
     if train_records.is_empty() {
@@ -319,16 +314,14 @@ where
                 edge_base_url,
                 source,
                 config.block_size,
-                TokenRecordLoadPolicy {
-                    record_limit: max_record_limit(config.batch_size, config.max_eval_batches),
-                    shard_selection_key: Some(browser_shard_selection_key(
-                        edge_base_url,
-                        config,
-                        live_session_principal_id,
-                        "eval",
-                    )),
-                    training_lease: None,
-                },
+                token_record_load_policy(
+                    edge_base_url,
+                    config,
+                    live_session_principal_id,
+                    "eval",
+                    max_record_limit(config.batch_size, config.max_eval_batches),
+                    None,
+                ),
             )
             .await?
         }
@@ -463,6 +456,12 @@ fn max_record_limit(batch_size: usize, max_batches: Option<usize>) -> Option<usi
     max_batches.and_then(|max_batches| max_batches.checked_mul(batch_size.max(1)))
 }
 
+fn live_session_principal_id(session_state: Option<&BrowserSessionState>) -> Option<&str> {
+    session_state
+        .and_then(|session_state| session_state.session.as_ref())
+        .map(|session| session.claims.principal_id.as_str())
+}
+
 fn browser_shard_selection_key(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
@@ -493,6 +492,26 @@ fn browser_shard_selection_key(
         config.max_train_batches.unwrap_or(0),
         stage,
     )
+}
+
+fn token_record_load_policy(
+    edge_base_url: &str,
+    config: &DragonBrowserTrainingConfig,
+    session_principal_id: Option<&str>,
+    stage: &str,
+    record_limit: Option<usize>,
+    training_lease: Option<WorkloadTrainingLease>,
+) -> TokenRecordLoadPolicy {
+    TokenRecordLoadPolicy {
+        record_limit,
+        shard_selection_key: Some(browser_shard_selection_key(
+            edge_base_url,
+            config,
+            session_principal_id,
+            stage,
+        )),
+        training_lease,
+    }
 }
 
 async fn load_token_records(

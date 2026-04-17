@@ -581,6 +581,7 @@ jobs:
           browser_canary_experiment_id="nca-prepretraining"
           browser_canary_revision_id="nca-r1"
           browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"
+          auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; principals = [item for item in principals if item.get("principal_id") != principal_id]; print(json.dumps(principals))''' "$auth_principals_json" "$browser_canary_principal_id")"
 
           create_artifact_bucket="$create_artifact_bucket_input"
           artifact_bucket_name="$artifact_bucket_name_input"

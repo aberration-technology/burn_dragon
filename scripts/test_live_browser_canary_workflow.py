@@ -29,6 +29,7 @@ def main() -> None:
         if workflow_path.name != "live-browser-canary.yml":
             deploy_specific_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',
+                """auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; principals = [item for item in principals if item.get("principal_id") != principal_id]; print(json.dumps(principals))''' "$auth_principals_json" "$browser_canary_principal_id")" """.strip(),
                 'echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"',
                 'echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"',
                 'echo "TF_VAR_github_browser_canary_callback_token=$BROWSER_CANARY_CALLBACK_TOKEN"',

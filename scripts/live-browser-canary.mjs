@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 const SITE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL");
 const EDGE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL");
 const PRINCIPAL_ID = requiredEnv("BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID");
+const CALLBACK_TOKEN = requiredEnv("BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN");
 const EXPERIMENT_ID =
   process.env.BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID ?? "nca-prepretraining";
 const QUIET_WINDOW_MS = parseIntegerEnv("BURN_DRAGON_BROWSER_CANARY_QUIET_WINDOW_MS", 8_000);
@@ -264,10 +265,12 @@ async function enrollBrowserCanary(snapshot) {
   });
   const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath), {
     method: "POST",
+    headers: {
+      "x-burn-p2p-canary-token": CALLBACK_TOKEN,
+    },
     body: JSON.stringify({
       login_id: login.login_id,
       state: login.state,
-      principal_id: PRINCIPAL_ID,
     }),
   });
   const trustBundle = await fetchJson(

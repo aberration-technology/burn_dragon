@@ -343,6 +343,13 @@ variable "github_browser_canary_principal_id" {
   default     = ""
 }
 
+variable "github_browser_canary_callback_token" {
+  description = "Shared secret token that authorizes the live browser canary to complete a trusted GitHub callback without a public provider exchange."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "instance_type" {
   description = "EC2 instance type for the bootstrap edge."
   type        = string

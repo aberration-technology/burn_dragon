@@ -32,9 +32,9 @@ on:
         default: aberration.technology
         type: string
       bootstrap_install_source:
-        description: "How to install `burn_p2p_bootstrap` on the bootstrap host. Example: `crate` for the published crates.io package or `git` only when intentionally testing an unpublished burn_p2p revision."
+        description: "How to install `burn_p2p_bootstrap` on the bootstrap host. Use `git` for the live browser/auth deployment path so the bootstrap and browser stack stay pinned to the same reviewed burn_p2p revision."
         required: true
-        default: crate
+        default: git
         type: choice
         options:
           - crate
@@ -137,6 +137,7 @@ jobs:
       AUTH_CLIENT_SECRET: ${{ secrets.BURN_DRAGON_P2P_AUTH_CLIENT_SECRET }}
       GITHUB_CLIENT_ID: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_ID }}
       GITHUB_CLIENT_SECRET: ${{ secrets.BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET }}
+      BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
       TRAINER_AUTH_BUNDLE_JSON: ${{ secrets.BURN_DRAGON_P2P_TRAINER_AUTH_BUNDLE_JSON }}
       VALIDATOR_AUTH_BUNDLE_JSON: ${{ secrets.BURN_DRAGON_P2P_VALIDATOR_AUTH_BUNDLE_JSON }}
 
@@ -580,7 +581,6 @@ jobs:
           browser_canary_experiment_id="nca-prepretraining"
           browser_canary_revision_id="nca-r1"
           browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"
-          auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; stack_name = sys.argv[5]; environment = sys.argv[6]; principal = {"principal_id": principal_id, "display_name": "burn_dragon live browser canary", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": ["BrowserTrainerWgpu", "BrowserObserver"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "browser_canary": "true", "browser_canary_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$browser_canary_principal_id" "$browser_canary_experiment_id" "$network_id" "$stack_name" "$DEPLOY_ENVIRONMENT")"
 
           create_artifact_bucket="$create_artifact_bucket_input"
           artifact_bucket_name="$artifact_bucket_name_input"
@@ -626,6 +626,7 @@ jobs:
             : "${admin_logins_csv:?no admin logins resolved for github deployment}"
             : "${resolved_auth_client_id:?missing BURN_DRAGON_P2P_AUTH_CLIENT_ID or BURN_DRAGON_P2P_GITHUB_CLIENT_ID secret}"
             : "${resolved_auth_client_secret:?missing BURN_DRAGON_P2P_AUTH_CLIENT_SECRET or BURN_DRAGON_P2P_GITHUB_CLIENT_SECRET secret}"
+            : "${BROWSER_CANARY_CALLBACK_TOKEN:?missing BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN secret}"
           elif [ "$auth_connector_kind" = "oidc" ] || [ "$auth_connector_kind" = "oauth" ]; then
             : "${resolved_auth_client_id:?missing BURN_DRAGON_P2P_AUTH_CLIENT_ID secret}"
             : "${resolved_auth_client_secret:?missing BURN_DRAGON_P2P_AUTH_CLIENT_SECRET secret}"
@@ -719,6 +720,7 @@ jobs:
               echo "TF_VAR_github_required_team=$github_required_team"
               echo "TF_VAR_github_required_repo=$github_required_repo"
               echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"
+              echo "TF_VAR_github_browser_canary_callback_token=$BROWSER_CANARY_CALLBACK_TOKEN"
               echo "TF_VAR_github_admin_logins=$admin_logins_json"
               echo "ADMIN_LOGINS_CSV=$admin_logins_csv"
             } >>"$GITHUB_ENV"
@@ -1869,6 +1871,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ steps.outputs.outputs.browser_app_url }}
           BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
           BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ env.BROWSER_CANARY_PRINCIPAL_ID }}
+          BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ env.BROWSER_CANARY_CALLBACK_TOKEN }}
           BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json

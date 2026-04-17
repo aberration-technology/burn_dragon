@@ -29,16 +29,20 @@ def main() -> None:
         if workflow_path.name != "live-browser-canary.yml":
             deploy_specific_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',
-                '"display_name": "burn_dragon live browser canary"',
-                '"BrowserTrainerWgpu", "BrowserObserver"',
-                '"browser_canary": "true"',
                 'echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"',
                 'echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"',
+                'echo "TF_VAR_github_browser_canary_callback_token=$BROWSER_CANARY_CALLBACK_TOKEN"',
+                'BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (
                     f"{workflow_path} missing required deploy snippet: {snippet}"
                 )
+        else:
+            assert (
+                'BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}'
+                in workflow_text
+            ), f"{workflow_path} missing browser canary callback token secret"
 
     print("live-browser-canary-workflows-ok")
 

@@ -440,6 +440,14 @@ locals {
       }
     }
   ]
+  browser_canary_trusted_callback = (
+    trimspace(var.github_browser_canary_principal_id) != "" &&
+    trimspace(var.github_browser_canary_callback_token) != ""
+  ) ? {
+    principal_id = trimspace(var.github_browser_canary_principal_id)
+    token_header = "x-burn-p2p-canary-token"
+    token_value  = trimspace(var.github_browser_canary_callback_token)
+  } : null
 
   admin_rules = [
     for login in local.github_admin_logins : {
@@ -469,7 +477,8 @@ locals {
   ]
   auth_provider_policy = local.auth_connector_kind == "github" ? {
     github = {
-      rules = concat([local.contributor_rule], local.browser_canary_rules, local.admin_rules)
+      rules            = concat([local.contributor_rule], local.browser_canary_rules, local.admin_rules)
+      trusted_callback = local.browser_canary_trusted_callback
     }
   } : null
 

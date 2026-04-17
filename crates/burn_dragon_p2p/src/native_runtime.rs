@@ -13,8 +13,6 @@ use burn_p2p::{
     TelemetryHandle,
 };
 
-use crate::capability_state::persist_native_downgrade;
-use crate::config::DragonNativeTarget;
 use crate::experiments::common::{DragonProjectFamily, PreparedNativePeer};
 
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -144,17 +142,9 @@ where
     let running = prepared.builder.clone().spawn()?;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let monitor_thread = if prepared.target_decision.can_train {
+        let prepared_for_monitor = prepared.clone();
         let stop_flag_for_thread = Arc::clone(&stop_flag);
         let telemetry = running.telemetry();
-        let storage_root = prepared.storage_root.clone();
-        let experiment_kind = prepared.experiment_kind;
-        let backend_label = prepared.backend_label.clone();
-        let model_config = prepared.model_config.clone();
-        let batch_size = prepared.config.training.batch_size;
-        let block_size = prepared.config.training.block_size;
-        let footprint = prepared.footprint.clone();
-        let trainer_budget_bytes = prepared.target_decision.trainer_memory_budget_bytes;
-        let downgrade_to = downgrade_target(prepared.target_decision.effective_target);
         Some(
             thread::Builder::new()
                 .name("dragon-native-capability-monitor".into())
@@ -165,19 +155,11 @@ where
                         if let Some(error) = snapshot.last_error.as_deref()
                             && is_probable_training_fit_failure(error)
                         {
-                            let _ = persist_native_downgrade(
-                                &storage_root,
-                                experiment_kind,
-                                &backend_label,
-                                &model_config,
-                                batch_size,
-                                block_size,
-                                &footprint,
-                                trainer_budget_bytes,
-                                downgrade_to,
-                                error,
-                                "runtime-monitor",
-                            );
+                            let _ = prepared_for_monitor
+                                .persist_runtime_training_failure_with_source(
+                                    error,
+                                    "runtime-monitor",
+                                );
                             persisted = true;
                             break;
                         }
@@ -192,19 +174,11 @@ where
                         if let Some(error) = snapshot.last_error.as_deref()
                             && is_probable_training_fit_failure(error)
                         {
-                            let _ = persist_native_downgrade(
-                                &storage_root,
-                                experiment_kind,
-                                &backend_label,
-                                &model_config,
-                                batch_size,
-                                block_size,
-                                &footprint,
-                                trainer_budget_bytes,
-                                downgrade_to,
-                                error,
-                                "runtime-monitor-final",
-                            );
+                            let _ = prepared_for_monitor
+                                .persist_runtime_training_failure_with_source(
+                                    error,
+                                    "runtime-monitor-final",
+                                );
                         }
                     }
                 })?,
@@ -219,14 +193,6 @@ where
         stop_flag,
         monitor_thread,
     })
-}
-
-fn downgrade_target(target: DragonNativeTarget) -> &'static str {
-    match target {
-        DragonNativeTarget::Reducer => "reducer",
-        DragonNativeTarget::Validator => "validator",
-        DragonNativeTarget::Auto | DragonNativeTarget::Trainer => "trainer",
-    }
 }
 
 fn is_probable_training_fit_failure(message: &str) -> bool {

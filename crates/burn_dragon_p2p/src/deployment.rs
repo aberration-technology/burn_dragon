@@ -219,11 +219,7 @@ pub fn collect_deployment_diagnostics(
         metrics_catchup.as_ref(),
         auth_authorize.as_ref(),
         artifact_head_view.as_ref(),
-        options.require_head_published,
-        options.require_directory_entry_published,
-        options.require_metrics_catchup,
-        options.require_auth_authorize,
-        options.require_artifact_head_view,
+        &options,
     );
 
     DeploymentDiagnosticsReport {
@@ -440,7 +436,6 @@ fn probe_artifact_head_view(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn evaluate_deployment_readiness(
     capability: &DeploymentCheck<DragonNativeCapabilityAssessment>,
     edge_snapshot: &DeploymentCheck<DeploymentEdgeSnapshotSummary>,
@@ -448,11 +443,7 @@ pub fn evaluate_deployment_readiness(
     metrics_catchup: Option<&DeploymentCheck<DeploymentHttpProbe>>,
     auth_authorize: Option<&DeploymentCheck<DeploymentAuthorizeProbe>>,
     artifact_head_view: Option<&DeploymentCheck<DeploymentArtifactHeadProbe>>,
-    require_head_published: bool,
-    require_directory_entry_published: bool,
-    require_metrics_catchup: bool,
-    require_auth_authorize: bool,
-    require_artifact_head_view: bool,
+    options: &DeploymentDiagnosticsOptions,
 ) -> DeploymentReadinessReport {
     let mut blocking_issues = Vec::new();
     let mut observed_warnings = Vec::new();
@@ -479,14 +470,14 @@ pub fn evaluate_deployment_readiness(
             blocking_issues.push("webtransport_gateway_advertised_without_runtime_support".into());
         }
         if !snapshot.matching_directory_entry_present {
-            if require_directory_entry_published {
+            if options.require_directory_entry_published {
                 blocking_issues.push("matching_directory_entry_missing".into());
             } else {
                 observed_warnings.push("matching_directory_entry_missing".into());
             }
         }
         if !snapshot.matching_head_present {
-            if require_head_published {
+            if options.require_head_published {
                 blocking_issues.push("matching_experiment_head_missing".into());
             } else {
                 observed_warnings.push("matching_experiment_head_missing".into());
@@ -499,7 +490,7 @@ pub fn evaluate_deployment_readiness(
     }
 
     if let Some(metrics_catchup) = metrics_catchup {
-        if !metrics_catchup.ok && require_metrics_catchup {
+        if !metrics_catchup.ok && options.require_metrics_catchup {
             blocking_issues.push("metrics_catchup_probe_failed".into());
         } else if !metrics_catchup.ok {
             observed_warnings.push("metrics_catchup_probe_failed".into());
@@ -508,7 +499,7 @@ pub fn evaluate_deployment_readiness(
 
     if let Some(auth_authorize) = auth_authorize {
         if !auth_authorize.ok {
-            if require_auth_authorize {
+            if options.require_auth_authorize {
                 blocking_issues.push("auth_authorize_probe_failed".into());
             } else {
                 observed_warnings.push("auth_authorize_probe_failed".into());
@@ -518,7 +509,7 @@ pub fn evaluate_deployment_readiness(
             .as_ref()
             .is_some_and(|probe| !probe.missing_query_params.is_empty())
         {
-            if require_auth_authorize {
+            if options.require_auth_authorize {
                 blocking_issues.push("auth_authorize_query_incomplete".into());
             } else {
                 observed_warnings.push("auth_authorize_query_incomplete".into());
@@ -529,7 +520,7 @@ pub fn evaluate_deployment_readiness(
     if let Some(artifact_head_view) = artifact_head_view
         && !artifact_head_view.ok
     {
-        if require_artifact_head_view {
+        if options.require_artifact_head_view {
             blocking_issues.push("artifact_head_view_probe_failed".into());
         } else {
             observed_warnings.push("artifact_head_view_probe_failed".into());
@@ -639,6 +630,23 @@ mod tests {
         })
     }
 
+    fn readiness_options(
+        require_head_published: bool,
+        require_directory_entry_published: bool,
+        require_metrics_catchup: bool,
+        require_auth_authorize: bool,
+        require_artifact_head_view: bool,
+    ) -> DeploymentDiagnosticsOptions {
+        DeploymentDiagnosticsOptions {
+            require_head_published,
+            require_directory_entry_published,
+            require_metrics_catchup,
+            require_auth_authorize,
+            require_artifact_head_view,
+            ..DeploymentDiagnosticsOptions::default()
+        }
+    }
+
     #[test]
     fn deployment_readiness_requires_head_when_requested() {
         let readiness = evaluate_deployment_readiness(
@@ -648,11 +656,7 @@ mod tests {
             None,
             None,
             None,
-            true,
-            false,
-            false,
-            false,
-            false,
+            &readiness_options(true, false, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -672,11 +676,7 @@ mod tests {
             None,
             None,
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
+            &readiness_options(false, false, false, false, false),
         );
 
         assert!(readiness.ready);
@@ -701,11 +701,7 @@ mod tests {
                 missing_query_params: vec!["redirect_uri".into()],
             })),
             None,
-            false,
-            false,
-            false,
-            true,
-            false,
+            &readiness_options(false, false, false, true, false),
         );
 
         assert!(!readiness.ready);
@@ -730,11 +726,7 @@ mod tests {
             None,
             None,
             None,
-            true,
-            true,
-            false,
-            false,
-            false,
+            &readiness_options(true, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -754,11 +746,7 @@ mod tests {
             None,
             None,
             Some(&DeploymentCheck::err(anyhow!("502 bad gateway"))),
-            true,
-            true,
-            false,
-            false,
-            true,
+            &readiness_options(true, true, false, false, true),
         );
 
         assert!(!readiness.ready);
@@ -782,11 +770,7 @@ mod tests {
             None,
             None,
             None,
-            true,
-            true,
-            false,
-            false,
-            false,
+            &readiness_options(true, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -810,11 +794,7 @@ mod tests {
             None,
             None,
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
+            &readiness_options(false, false, false, false, false),
         );
 
         assert!(readiness.ready);

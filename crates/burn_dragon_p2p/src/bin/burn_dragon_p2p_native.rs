@@ -19,7 +19,10 @@ use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
     enroll_native_static_principal, fetch_edge_snapshot,
 };
-use burn_dragon_p2p::capability_state::{clear_native_downgrade, persist_native_downgrade};
+use burn_dragon_p2p::capability_state::{
+    NativeDowngradeObservation, NativeDowngradeScope, clear_native_downgrade,
+    persist_native_downgrade,
+};
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonNativeAuthBundle,
     DragonNativePeerConfig,
@@ -1145,17 +1148,21 @@ fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
         args.backend.as_label(),
     )?;
     let record = persist_native_downgrade(
-        &config.storage_root,
-        args.experiment_kind.into_config(),
-        args.backend.as_label(),
-        &assessment.model_config,
-        assessment.batch_size,
-        assessment.block_size,
-        &assessment.footprint,
-        assessment.target_decision.trainer_memory_budget_bytes,
-        "trainer",
-        &args.reason,
-        &args.source,
+        NativeDowngradeScope {
+            storage_root: &config.storage_root,
+            experiment_kind: args.experiment_kind.into_config(),
+            backend_label: args.backend.as_label(),
+            model_config: &assessment.model_config,
+            batch_size: assessment.batch_size,
+            block_size: assessment.block_size,
+        },
+        NativeDowngradeObservation {
+            footprint: &assessment.footprint,
+            trainer_budget_bytes: assessment.target_decision.trainer_memory_budget_bytes,
+            downgrade_to: "trainer",
+            reason: &args.reason,
+            source: &args.source,
+        },
     )?;
     write_output(None, OutputFormat::Json, &record)
 }
@@ -1167,14 +1174,14 @@ fn clear_downgrade(args: ClearDowngradeArgs) -> Result<()> {
         args.experiment_kind.into_config(),
         args.backend.as_label(),
     )?;
-    clear_native_downgrade(
-        &config.storage_root,
-        args.experiment_kind.into_config(),
-        args.backend.as_label(),
-        &assessment.model_config,
-        assessment.batch_size,
-        assessment.block_size,
-    )?;
+    clear_native_downgrade(NativeDowngradeScope {
+        storage_root: &config.storage_root,
+        experiment_kind: args.experiment_kind.into_config(),
+        backend_label: args.backend.as_label(),
+        model_config: &assessment.model_config,
+        batch_size: assessment.batch_size,
+        block_size: assessment.block_size,
+    })?;
     Ok(())
 }
 

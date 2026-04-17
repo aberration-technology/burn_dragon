@@ -134,6 +134,52 @@ struct LiveBrowserParticipantHandle {
     training_budget: BrowserTrainingBudget,
 }
 
+#[derive(Clone)]
+struct BrowserTrainingRunContext<'a> {
+    edge_base_url: &'a str,
+    config: &'a DragonBrowserTrainingConfig,
+    release_manifest: &'a burn_p2p::ClientReleaseManifest,
+    backend_label: &'a str,
+    backend_kind: BrowserTrainingBackendKind,
+    setup_time_ms: u64,
+    live_browser_session: Option<BrowserSessionState>,
+}
+
+impl<'a> BrowserTrainingRunContext<'a> {
+    fn live_session_principal_id(&self) -> Option<&str> {
+        live_session_principal_id(self.live_browser_session.as_ref())
+    }
+
+    fn token_record_load_policy(
+        &self,
+        stage: &str,
+        record_limit: Option<usize>,
+        training_lease: Option<WorkloadTrainingLease>,
+    ) -> TokenRecordLoadPolicy {
+        TokenRecordLoadPolicy {
+            record_limit,
+            shard_selection_key: Some(browser_shard_selection_key(
+                self.edge_base_url,
+                self.config,
+                self.live_session_principal_id(),
+                stage,
+            )),
+            training_lease,
+        }
+    }
+}
+
+struct ShardManifestLoadRequest<'a> {
+    manifest_url: &'a str,
+    edge_base_url: &'a str,
+    block_size: usize,
+    record_limit: Option<usize>,
+    selection: DragonBrowserShardSelectionPolicy,
+    max_shards_per_window: Option<usize>,
+    selection_key: Option<&'a str>,
+    training_lease: Option<&'a WorkloadTrainingLease>,
+}
+
 pub async fn run_browser_training_with_release_manifest(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
@@ -166,6 +212,11 @@ pub async fn run_browser_training_with_release_manifest(
                 )
         );
     }
+    let live_browser_session = if config.live_participant.is_some() {
+        Some(load_browser_session(edge_base_url).await?)
+    } else {
+        None
+    };
     let result = match backend_kind {
         BrowserTrainingBackendKind::Cpu => {
             let train_device = <BrowserCpuTrainBackend as Backend>::Device::default();
@@ -174,12 +225,15 @@ pub async fn run_browser_training_with_release_manifest(
             BrowserCpuEvalBackend::seed(&eval_device, 1337);
             let setup_time_ms = elapsed_ms(setup_started_at);
             run_browser_training_inner::<BrowserCpuTrainBackend, BrowserCpuEvalBackend>(
-                edge_base_url,
-                config,
-                release_manifest,
-                "burn-ndarray-wasm",
-                backend_kind,
-                setup_time_ms,
+                BrowserTrainingRunContext {
+                    edge_base_url,
+                    config,
+                    release_manifest,
+                    backend_label: "burn-ndarray-wasm",
+                    backend_kind,
+                    setup_time_ms,
+                    live_browser_session: live_browser_session.clone(),
+                },
                 &train_device,
                 &eval_device,
             )
@@ -194,12 +248,15 @@ pub async fn run_browser_training_with_release_manifest(
             BrowserWgpuEvalBackend::seed(&eval_device, 1337);
             let setup_time_ms = elapsed_ms(setup_started_at);
             run_browser_training_inner::<BrowserWgpuTrainBackend, BrowserWgpuEvalBackend>(
-                edge_base_url,
-                config,
-                release_manifest,
-                "burn-webgpu-wasm",
-                backend_kind,
-                setup_time_ms,
+                BrowserTrainingRunContext {
+                    edge_base_url,
+                    config,
+                    release_manifest,
+                    backend_label: "burn-webgpu-wasm",
+                    backend_kind,
+                    setup_time_ms,
+                    live_browser_session,
+                },
                 &train_device,
                 &eval_device,
             )
@@ -265,14 +322,8 @@ fn resolve_browser_training_backend(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_browser_training_inner<TrainB, EvalB>(
-    edge_base_url: &str,
-    config: &DragonBrowserTrainingConfig,
-    release_manifest: &burn_p2p::ClientReleaseManifest,
-    backend_label: &str,
-    backend_kind: BrowserTrainingBackendKind,
-    setup_time_ms: u64,
+    context: BrowserTrainingRunContext<'_>,
     train_device: &TrainB::Device,
     eval_device: &EvalB::Device,
 ) -> Result<DragonBrowserTrainingResult>
@@ -280,46 +331,34 @@ where
     TrainB: AutodiffBackend<InnerBackend = EvalB> + Clone,
     EvalB: Backend + Clone,
 {
-    validate_browser_training_config(config)?;
-    validate_live_training_backend(config, backend_kind)?;
-    let live_browser_session = if config.live_participant.is_some() {
-        Some(load_browser_session(edge_base_url).await?)
-    } else {
-        None
-    };
-    let live_session_principal_id = live_session_principal_id(live_browser_session.as_ref());
+    validate_browser_training_config(context.config)?;
+    validate_live_training_backend(context.config, context.backend_kind)?;
 
     let total_started_at = Instant::now();
 
     let train_records = load_token_records(
-        edge_base_url,
-        &config.train_source,
-        config.block_size,
-        token_record_load_policy(
-            edge_base_url,
-            config,
-            live_session_principal_id,
+        context.edge_base_url,
+        &context.config.train_source,
+        context.config.block_size,
+        context.token_record_load_policy(
             "train",
-            max_record_limit(config.batch_size, config.max_train_batches),
-            config.training_lease.clone(),
+            max_record_limit(context.config.batch_size, context.config.max_train_batches),
+            context.config.training_lease.clone(),
         ),
     )
     .await?;
     if train_records.is_empty() {
         bail!("browser training source produced no train records");
     }
-    let eval_records = match &config.eval_source {
+    let eval_records = match &context.config.eval_source {
         Some(source) => {
             load_token_records(
-                edge_base_url,
+                context.edge_base_url,
                 source,
-                config.block_size,
-                token_record_load_policy(
-                    edge_base_url,
-                    config,
-                    live_session_principal_id,
+                context.config.block_size,
+                context.token_record_load_policy(
                     "eval",
-                    max_record_limit(config.batch_size, config.max_eval_batches),
+                    max_record_limit(context.config.batch_size, context.config.max_eval_batches),
                     None,
                 ),
             )
@@ -330,35 +369,36 @@ where
 
     let train_batches = build_batches::<TrainB>(
         &train_records,
-        config.batch_size,
-        config.block_size,
+        context.config.batch_size,
+        context.config.block_size,
         train_device,
     )?;
     let eval_batches = build_batches::<EvalB>(
         &eval_records,
-        config.batch_size,
-        config.block_size,
+        context.config.batch_size,
+        context.config.block_size,
         eval_device,
     )?;
 
     let mut live_participant = start_live_browser_participant(
-        edge_base_url,
-        config,
-        release_manifest,
-        live_browser_session.as_ref(),
+        context.edge_base_url,
+        context.config,
+        context.release_manifest,
+        context.live_browser_session.as_ref(),
     )
     .await?;
 
     let training_started_at = Instant::now();
-    let mut model = DragonModel::<TrainB>::new(config.model_config.clone(), train_device);
+    let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
     let mut optimizer = AdamWConfig::new()
-        .with_weight_decay(config.weight_decay)
+        .with_weight_decay(context.config.weight_decay)
         .init();
     let mut train_loss_sum = 0.0;
     let mut train_batch_count = 0usize;
     let mut train_token_count = 0usize;
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
-        if config
+        if context
+            .config
             .max_train_batches
             .is_some_and(|max_batches| batch_index >= max_batches)
         {
@@ -370,7 +410,7 @@ where
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
         let grads = GradientsParams::from_grads(loss.backward(), &model);
-        model = optimizer.step(config.learning_rate, model, grads);
+        model = optimizer.step(context.config.learning_rate, model, grads);
     }
     let training_time_ms = elapsed_ms(training_started_at);
     let train_batch_count = train_batch_count.max(1);
@@ -384,7 +424,8 @@ where
         let mut total = 0.0;
         let mut count = 0usize;
         for (batch_index, batch) in eval_batches.into_iter().enumerate() {
-            if config
+            if context
+                .config
                 .max_eval_batches
                 .is_some_and(|max_batches| batch_index >= max_batches)
             {
@@ -399,22 +440,26 @@ where
     };
     let eval_time_ms = elapsed_ms(eval_started_at);
 
-    let live_participant =
-        finish_live_browser_participant(edge_base_url, config, live_participant.as_mut()).await?;
+    let live_participant = finish_live_browser_participant(
+        context.edge_base_url,
+        context.config,
+        live_participant.as_mut(),
+    )
+    .await?;
 
     Ok(DragonBrowserTrainingResult {
-        backend: backend_label.into(),
-        experiment_kind_label: config.experiment_kind.display_name().into(),
+        backend: context.backend_label.into(),
+        experiment_kind_label: context.config.experiment_kind.display_name().into(),
         train_batches: train_batch_count,
         train_examples: train_records.len(),
         train_tokens: train_token_count,
         train_loss_mean,
         eval_examples: eval_records.len(),
         eval_loss,
-        setup_time_ms,
+        setup_time_ms: context.setup_time_ms,
         training_time_ms,
         eval_time_ms,
-        total_time_ms: setup_time_ms + elapsed_ms(total_started_at),
+        total_time_ms: context.setup_time_ms + elapsed_ms(total_started_at),
         tokens_per_second: (training_time_ms > 0)
             .then_some(train_token_count as f64 / (training_time_ms as f64 / 1000.0)),
         live_participant,
@@ -494,26 +539,6 @@ fn browser_shard_selection_key(
     )
 }
 
-fn token_record_load_policy(
-    edge_base_url: &str,
-    config: &DragonBrowserTrainingConfig,
-    session_principal_id: Option<&str>,
-    stage: &str,
-    record_limit: Option<usize>,
-    training_lease: Option<WorkloadTrainingLease>,
-) -> TokenRecordLoadPolicy {
-    TokenRecordLoadPolicy {
-        record_limit,
-        shard_selection_key: Some(browser_shard_selection_key(
-            edge_base_url,
-            config,
-            session_principal_id,
-            stage,
-        )),
-        training_lease,
-    }
-}
-
 async fn load_token_records(
     edge_base_url: &str,
     source: &DragonBrowserTokenSource,
@@ -540,16 +565,16 @@ async fn load_token_records(
             selection,
             max_shards_per_window,
         } => {
-            load_shard_manifest_records(
+            load_shard_manifest_records(ShardManifestLoadRequest {
                 manifest_url,
                 edge_base_url,
                 block_size,
-                policy.record_limit,
-                *selection,
-                *max_shards_per_window,
-                policy.shard_selection_key.as_deref(),
-                policy.training_lease.as_ref(),
-            )
+                record_limit: policy.record_limit,
+                selection: *selection,
+                max_shards_per_window: *max_shards_per_window,
+                selection_key: policy.shard_selection_key.as_deref(),
+                training_lease: policy.training_lease.as_ref(),
+            })
             .await?
         }
         DragonBrowserTokenSource::GeneratedNca {
@@ -654,18 +679,10 @@ fn ordered_manifest_entries<'a>(
     entries
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn load_shard_manifest_records(
-    manifest_url: &str,
-    edge_base_url: &str,
-    block_size: usize,
-    record_limit: Option<usize>,
-    selection: DragonBrowserShardSelectionPolicy,
-    max_shards_per_window: Option<usize>,
-    selection_key: Option<&str>,
-    training_lease: Option<&WorkloadTrainingLease>,
+    request: ShardManifestLoadRequest<'_>,
 ) -> Result<Vec<TokenWindowRecord>> {
-    let manifest_url = resolve_browser_source_url(manifest_url, edge_base_url)?;
+    let manifest_url = resolve_browser_source_url(request.manifest_url, request.edge_base_url)?;
     let response = Request::get(&manifest_url)
         .send()
         .await
@@ -677,7 +694,7 @@ async fn load_shard_manifest_records(
     let manifest: ShardFetchManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| anyhow!("failed to decode shard manifest {manifest_url}: {error}"))?;
 
-    let leased_microshard_ids = training_lease.map(|lease| {
+    let leased_microshard_ids = request.training_lease.map(|lease| {
         lease
             .microshards
             .iter()
@@ -708,8 +725,9 @@ async fn load_shard_manifest_records(
         dataset_view_id: manifest.dataset_view_id.clone(),
         entries: filtered_entries,
     };
-    let ordered_entries = ordered_manifest_entries(&filtered_manifest, selection, selection_key);
-    let shard_limit = max_shards_per_window.unwrap_or(usize::MAX);
+    let ordered_entries =
+        ordered_manifest_entries(&filtered_manifest, request.selection, request.selection_key);
+    let shard_limit = request.max_shards_per_window.unwrap_or(usize::MAX);
     for entry in ordered_entries.into_iter().take(shard_limit) {
         let shard_url = resolve_shard_entry_url(&manifest_url, &entry.locator)?;
         let response = Request::get(&shard_url)
@@ -724,7 +742,7 @@ async fn load_shard_manifest_records(
         let mut shard_records = serde_json::from_slice::<Vec<TokenWindowRecord>>(&shard_bytes)
             .map_err(|error| anyhow!("failed to decode browser shard {shard_url}: {error}"))?;
         records.append(&mut shard_records);
-        if let Some(limit) = record_limit
+        if let Some(limit) = request.record_limit
             && records.len() >= limit
         {
             records.truncate(limit);
@@ -732,7 +750,7 @@ async fn load_shard_manifest_records(
         }
     }
 
-    validate_token_records(&records, block_size)?;
+    validate_token_records(&records, request.block_size)?;
     Ok(records)
 }
 

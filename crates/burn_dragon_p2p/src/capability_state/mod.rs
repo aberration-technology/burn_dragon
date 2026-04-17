@@ -11,8 +11,8 @@ mod web;
 
 #[cfg(feature = "native")]
 pub use native::{
-    apply_native_downgrade_state, clear_native_downgrade, load_matching_native_downgrade,
-    persist_native_downgrade,
+    NativeDowngradeObservation, NativeDowngradeScope, apply_native_downgrade_state,
+    clear_native_downgrade, load_matching_native_downgrade, persist_native_downgrade,
 };
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub use web::{

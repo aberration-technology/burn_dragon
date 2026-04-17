@@ -46,7 +46,8 @@ use crate::capability::{
     DragonTrainingFootprint, decide_native_target, estimate_language_training_footprint,
 };
 use crate::capability_state::{
-    apply_native_downgrade_state, clear_native_downgrade, persist_native_downgrade,
+    NativeDowngradeObservation, NativeDowngradeScope, apply_native_downgrade_state,
+    clear_native_downgrade, persist_native_downgrade,
 };
 use crate::config::{
     DragonExistingShardDatasetConfig, DragonExperimentKind, DragonManifestBundle,
@@ -86,38 +87,51 @@ impl<B> PreparedNativePeer<B>
 where
     B: AutodiffBackend + Clone + 'static,
 {
-    pub fn record_runtime_training_failure(&self, reason: &str) -> Result<()> {
-        let downgrade_to = match self.target_decision.effective_target {
+    fn runtime_downgrade_target(&self) -> &'static str {
+        match self.target_decision.effective_target {
             crate::config::DragonNativeTarget::Reducer => "reducer",
             crate::config::DragonNativeTarget::Validator => "validator",
             crate::config::DragonNativeTarget::Auto
             | crate::config::DragonNativeTarget::Trainer => "trainer",
-        };
+        }
+    }
+
+    fn downgrade_scope(&self) -> NativeDowngradeScope<'_, DragonConfig> {
+        NativeDowngradeScope {
+            storage_root: &self.storage_root,
+            experiment_kind: self.experiment_kind,
+            backend_label: &self.backend_label,
+            model_config: &self.model_config,
+            batch_size: self.config.training.batch_size,
+            block_size: self.config.training.block_size,
+        }
+    }
+
+    pub fn persist_runtime_training_failure_with_source(
+        &self,
+        reason: &str,
+        source: &str,
+    ) -> Result<()> {
         let _ = persist_native_downgrade(
-            &self.storage_root,
-            self.experiment_kind,
-            &self.backend_label,
-            &self.model_config,
-            self.config.training.batch_size,
-            self.config.training.block_size,
-            &self.footprint,
-            self.target_decision.trainer_memory_budget_bytes,
-            downgrade_to,
-            reason,
-            "runtime",
+            self.downgrade_scope(),
+            NativeDowngradeObservation {
+                footprint: &self.footprint,
+                trainer_budget_bytes: self.target_decision.trainer_memory_budget_bytes,
+                downgrade_to: self.runtime_downgrade_target(),
+                reason,
+                source,
+            },
         )?;
         Ok(())
     }
 
+    pub fn record_runtime_training_failure(&self, reason: &str) -> Result<()> {
+        self.persist_runtime_training_failure_with_source(reason, "runtime")?;
+        Ok(())
+    }
+
     pub fn clear_runtime_downgrade(&self) -> Result<()> {
-        clear_native_downgrade(
-            &self.storage_root,
-            self.experiment_kind,
-            &self.backend_label,
-            &self.model_config,
-            self.config.training.batch_size,
-            self.config.training.block_size,
-        )
+        clear_native_downgrade(self.downgrade_scope())
     }
 }
 

@@ -11,8 +11,8 @@ def main() -> None:
         "browser shell redirect must exempt websocket upgrades"
     )
     assert "@p2p_websocket" in template, "missing websocket matcher for swarm fallback"
-    assert "reverse_proxy 127.0.0.1:${p2p_port}" in template, (
-        "websocket upgrades must proxy to the native swarm port"
+    assert "reverse_proxy 127.0.0.1:${p2p_websocket_port}" in template, (
+        "websocket upgrades must proxy to the dedicated local websocket port"
     )
     assert "redir ${browser_app_base_url}{uri} 302" in template, (
         "browser shell redirect target changed unexpectedly"
@@ -20,8 +20,11 @@ def main() -> None:
     assert "p2p_port             = var.p2p_port" in main_tf, (
         "terraform must pass p2p_port into the edge caddy template"
     )
-    assert '"/ip4/0.0.0.0/tcp/${var.p2p_port}/ws"' in main_tf, (
-        "bootstrap native config must expose websocket listen addresses"
+    assert "p2p_websocket_port   = var.p2p_port + 1" in main_tf, (
+        "terraform must derive and pass the dedicated websocket port to caddy"
+    )
+    assert '"/ip4/127.0.0.1/tcp/${var.p2p_port + 1}/ws"' in main_tf, (
+        "bootstrap native config must bind websocket transport on a dedicated loopback port"
     )
     print("edge-caddyfile-ok")
 

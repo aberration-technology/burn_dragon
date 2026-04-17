@@ -37,7 +37,7 @@ https://${edge_domain_name} {
     }
 
     handle @p2p_websocket {
-        reverse_proxy 127.0.0.1:${p2p_port}
+        reverse_proxy 127.0.0.1:${p2p_websocket_port}
     }
 
     handle @browser_shell_get {
@@ -59,7 +59,7 @@ https://${edge_domain_name} {
         header Upgrade websocket
     }
     handle @p2p_websocket {
-        reverse_proxy 127.0.0.1:${p2p_port}
+        reverse_proxy 127.0.0.1:${p2p_websocket_port}
     }
     reverse_proxy 127.0.0.1:${http_port}
 %{ endif ~}

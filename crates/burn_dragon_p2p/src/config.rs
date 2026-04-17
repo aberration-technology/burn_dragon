@@ -157,6 +157,10 @@ pub struct DragonPeerNetworkConfig {
     pub edge_base_url: Option<String>,
     #[serde(default)]
     pub seed_node_urls: Option<Vec<String>>,
+    #[serde(default)]
+    pub listen_addresses: Vec<SwarmAddress>,
+    #[serde(default)]
+    pub external_addresses: Vec<SwarmAddress>,
 }
 
 impl DragonPeerNetworkConfig {
@@ -182,6 +186,14 @@ impl DragonPeerNetworkConfig {
         self.seed_node_urls.as_deref().unwrap_or(&[])
     }
 
+    pub fn listen_addresses(&self) -> &[SwarmAddress] {
+        &self.listen_addresses
+    }
+
+    pub fn external_addresses(&self) -> &[SwarmAddress] {
+        &self.external_addresses
+    }
+
     pub fn normalized(mut self) -> Self {
         self.edge_base_url = self
             .edge_base_url
@@ -205,6 +217,8 @@ impl DragonPeerNetworkConfig {
                 normalized
             })
             .filter(|urls| !urls.is_empty());
+        self.listen_addresses = dedupe_swarm_addresses(self.listen_addresses);
+        self.external_addresses = dedupe_swarm_addresses(self.external_addresses);
         self
     }
 
@@ -215,6 +229,16 @@ impl DragonPeerNetworkConfig {
 
     pub fn with_seed_node_urls(mut self, seed_node_urls: Option<Vec<String>>) -> Self {
         self.seed_node_urls = seed_node_urls;
+        self.normalized()
+    }
+
+    pub fn with_listen_addresses(mut self, listen_addresses: Vec<SwarmAddress>) -> Self {
+        self.listen_addresses = listen_addresses;
+        self.normalized()
+    }
+
+    pub fn with_external_addresses(mut self, external_addresses: Vec<SwarmAddress>) -> Self {
+        self.external_addresses = external_addresses;
         self.normalized()
     }
 
@@ -358,6 +382,16 @@ fn default_app_semver() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
 }
 
+fn dedupe_swarm_addresses(addresses: Vec<SwarmAddress>) -> Vec<SwarmAddress> {
+    let mut deduped = Vec::new();
+    for address in addresses {
+        if !deduped.contains(&address) {
+            deduped.push(address);
+        }
+    }
+    deduped
+}
+
 impl DragonNativePeerConfig {
     pub fn target_or_default(&self) -> DragonNativeTarget {
         self.target.unwrap_or(DragonNativeTarget::Auto)
@@ -372,6 +406,14 @@ impl DragonNativePeerConfig {
             return self.network.seed_node_urls().to_vec();
         }
         self.manifest.bootstrap_addrs.clone()
+    }
+
+    pub fn effective_listen_addresses(&self) -> &[SwarmAddress] {
+        self.network.listen_addresses()
+    }
+
+    pub fn effective_external_addresses(&self) -> &[SwarmAddress] {
+        self.network.external_addresses()
     }
 
     pub fn effective_bootstrap_peers(&self) -> anyhow::Result<Vec<SwarmAddress>> {
@@ -710,5 +752,21 @@ mod tests {
         };
 
         assert_eq!(config.target_or_default(), DragonNativeTarget::Auto);
+    }
+
+    #[test]
+    fn peer_network_normalizes_and_deduplicates_native_address_overrides() {
+        let listen = SwarmAddress::new("/ip4/0.0.0.0/udp/443/webrtc-direct").expect("listen");
+        let external =
+            SwarmAddress::new("/ip4/203.0.113.10/udp/443/webrtc-direct").expect("external");
+        let network = DragonPeerNetworkConfig::default()
+            .with_listen_addresses(vec![listen.clone(), listen.clone()])
+            .with_external_addresses(vec![external.clone(), external.clone()]);
+
+        assert_eq!(network.listen_addresses(), std::slice::from_ref(&listen));
+        assert_eq!(
+            network.external_addresses(),
+            std::slice::from_ref(&external)
+        );
     }
 }

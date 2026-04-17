@@ -35,6 +35,29 @@ install -d -m 0755 /etc/burn_dragon_p2p
 install -d -m 0700 /var/lib/burn_dragon_p2p
 install -d -m 0755 /var/lib/burn_dragon_p2p/storage
 
+IMDS_TOKEN="$(curl -fsSL -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' || true)"
+imds_get() {
+  local path="$1"
+  if [ -n "${IMDS_TOKEN}" ]; then
+    curl -fsSL -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" "http://169.254.169.254/latest/meta-data/${path}"
+  else
+    curl -fsSL "http://169.254.169.254/latest/meta-data/${path}"
+  fi
+}
+PUBLIC_IPV4="$(imds_get public-ipv4 || true)"
+if [ -n "${PUBLIC_IPV4}" ]; then
+  EXTERNAL_ADDRESSES_TOML=$(cat <<EOF_EXTERNAL
+external_addresses = [
+  "/ip4/${PUBLIC_IPV4}/tcp/${validator_p2p_port}",
+  "/ip4/${PUBLIC_IPV4}/udp/${validator_p2p_port}/quic-v1",
+  "/ip4/${PUBLIC_IPV4}/udp/${validator_webrtc_port}/webrtc-direct",
+]
+EOF_EXTERNAL
+)
+else
+  EXTERNAL_ADDRESSES_TOML="external_addresses = []"
+fi
+
 cat >/usr/local/bin/burn-dragon-p2p-fetch-validator-auth-bundle <<'EOF_AUTH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -58,7 +81,7 @@ exit 1
 EOF_AUTH
 chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-validator-auth-bundle
 
-cat >/etc/burn_dragon_p2p/native-validator.toml <<'EOF_CONFIG'
+cat >/etc/burn_dragon_p2p/native-validator.toml <<EOF_CONFIG
 training_config_paths = []
 storage_root = "/var/lib/burn_dragon_p2p/storage"
 target = "validator"
@@ -72,6 +95,12 @@ seed_node_urls = [
   "${url}",
 %{ endfor ~}
 ]
+listen_addresses = [
+  "/ip4/0.0.0.0/tcp/${validator_p2p_port}",
+  "/ip4/0.0.0.0/udp/${validator_p2p_port}/quic-v1",
+  "/ip4/0.0.0.0/udp/${validator_webrtc_port}/webrtc-direct",
+]
+${EXTERNAL_ADDRESSES_TOML}
 
 [manifest]
 project_family_id = "${validator_project_family_id}"

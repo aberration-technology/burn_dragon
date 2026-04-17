@@ -1107,6 +1107,12 @@ where
     for peer in native.effective_bootstrap_peers()? {
         node_builder = node_builder.with_bootstrap_peer(peer);
     }
+    for address in native.effective_listen_addresses().iter().cloned() {
+        node_builder = node_builder.with_listen_address(address);
+    }
+    for address in native.effective_external_addresses().iter().cloned() {
+        node_builder = node_builder.with_external_address(address);
+    }
     let auth_config = compose_auth_config(
         native.auth.clone(),
         auth_bundle,

@@ -8,6 +8,16 @@ enabled_features_label = "native,wgpu"
 # Fill these at deploy time or override them via CLI flags.
 edge_base_url = "https://MAINNET_EDGE_URL"
 seed_node_urls = []
+listen_addresses = [
+  "/ip4/0.0.0.0/tcp/4001",
+  "/ip4/0.0.0.0/udp/4001/quic-v1",
+  "/ip4/0.0.0.0/udp/443/webrtc-direct",
+]
+external_addresses = [
+  "/ip4/PUBLIC_IP/tcp/4001",
+  "/ip4/PUBLIC_IP/udp/4001/quic-v1",
+  "/ip4/PUBLIC_IP/udp/443/webrtc-direct",
+]
 
 [manifest]
 project_family_id = "burn-dragon-language"

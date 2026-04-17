@@ -222,6 +222,7 @@ locals {
   managed_trainer_seed_node_urls = [
     "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
     "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
+    "/dns4/${var.edge_domain_name}/udp/${local.p2p_webrtc_port}/webrtc-direct",
   ]
   bootstrap_head_mirror_backend                    = "cpu"
   bootstrap_head_mirror_experiment_kind            = "nca"
@@ -1081,6 +1082,27 @@ resource "aws_security_group" "managed_trainer" {
   description = "burn_dragon_p2p managed native trainer"
   vpc_id      = aws_vpc.bootstrap.id
 
+  ingress {
+    from_port   = var.p2p_port
+    to_port     = var.p2p_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = var.p2p_port
+    to_port     = var.p2p_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = local.p2p_webrtc_port
+    to_port     = local.p2p_webrtc_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   dynamic "ingress" {
     for_each = var.ssh_cidr_blocks
     content {
@@ -1200,6 +1222,8 @@ resource "aws_launch_template" "managed_trainer" {
     trainer_enabled_features_label     = local.managed_trainer_enabled_features_label
     trainer_edge_base_url              = "https://${var.edge_domain_name}"
     trainer_seed_node_urls             = local.managed_trainer_seed_node_urls
+    trainer_p2p_port                   = var.p2p_port
+    trainer_webrtc_port                = local.p2p_webrtc_port
     trainer_project_family_id          = var.project_family_id
     trainer_network_id                 = var.network_id
     trainer_study_id                   = var.study_id
@@ -1266,6 +1290,13 @@ resource "aws_security_group" "managed_validator" {
   ingress {
     from_port   = var.p2p_port
     to_port     = var.p2p_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = local.p2p_webrtc_port
+    to_port     = local.p2p_webrtc_port
     protocol    = "udp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -1381,6 +1412,8 @@ resource "aws_instance" "managed_validator" {
     validator_enabled_features_label     = local.managed_validator_enabled_features_label
     validator_edge_base_url              = "https://${var.edge_domain_name}"
     validator_seed_node_urls             = local.managed_validator_seed_node_urls
+    validator_p2p_port                   = var.p2p_port
+    validator_webrtc_port                = local.p2p_webrtc_port
     validator_project_family_id          = var.project_family_id
     validator_network_id                 = var.network_id
     validator_study_id                   = var.study_id

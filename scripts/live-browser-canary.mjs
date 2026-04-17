@@ -558,30 +558,27 @@ async function runCanary() {
 
     await waitForVisible(trainButton, CONNECT_TIMEOUT_MS);
     report.training_button_visible = true;
-    report.live_status_label =
-      (await page.locator(".dragon-live-status-pill").first().textContent().catch(() => null)) ??
-      null;
-    report.live_stat_tiles = await page
-      .locator(".dragon-live-stats .stat-tile")
-      .evaluateAll((nodes) =>
-        nodes.map((node) =>
-          Array.from(node.children).map((child) => child.textContent?.trim() ?? ""),
-        ),
-      )
-      .catch(() => []);
-    const liveTransportTile = statTileValue(report.live_stat_tiles, "transport");
-    if (
-      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
-      snapshot.transports?.webrtc_direct &&
-      !(liveTransportTile ?? "").startsWith("webrtc-direct")
-    ) {
-      fail(
-        `browser canary connected without using webrtc-direct despite advertised preference: ${liveTransportTile ?? "missing transport tile"}`,
-      );
-    }
+    const captureLiveStatus = async () => {
+      report.live_status_label =
+        (await page
+          .locator(".dragon-live-status-pill")
+          .first()
+          .textContent()
+          .catch(() => null)) ?? null;
+      report.live_stat_tiles = await page
+        .locator(".dragon-live-stats .stat-tile")
+        .evaluateAll((nodes) =>
+          nodes.map((node) =>
+            Array.from(node.children).map((child) => child.textContent?.trim() ?? ""),
+          ),
+        )
+        .catch(() => []);
+    };
+    await captureLiveStatus();
 
     const quietWindowStartedAt = Date.now();
     await page.waitForTimeout(QUIET_WINDOW_MS);
+    await captureLiveStatus();
     report.quiet_window_control_plane_requests = requests.filter(
       (entry) => entry.ts >= quietWindowStartedAt && entry.watchedControlPlane,
     );
@@ -589,6 +586,16 @@ async function runCanary() {
     if (report.quiet_window_control_plane_requests.length > 0) {
       fail(
         `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,
+      );
+    }
+    const liveTransportTile = statTileValue(report.live_stat_tiles, "transport");
+    if (
+      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
+      snapshot.transports?.webrtc_direct &&
+      !(liveTransportTile ?? "").startsWith("webrtc-direct")
+    ) {
+      fail(
+        `browser canary did not settle on webrtc-direct despite advertised preference: ${liveTransportTile ?? "missing transport tile"}`,
       );
     }
 

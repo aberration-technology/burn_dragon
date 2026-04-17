@@ -88,6 +88,7 @@ burn_p2p_browser = { workspace = true, optional = true }
 burn_p2p_core.workspace = true
 burn_p2p_dataloader.workspace = true
 burn_p2p_views = { workspace = true, optional = true }
+console_error_panic_hook = "0.1"
 dioxus = { version = "0.7.4", optional = true, default-features = false, features = ["lib", "web"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 gloo-net = { version = "0.6", optional = true }

@@ -6,7 +6,6 @@ use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
 use burn::backend::NdArray;
 use burn::module::AutodiffModule;
-use burn::nn::loss::CrossEntropyLossConfig;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
@@ -352,8 +351,8 @@ where
         {
             break;
         }
-        let logits = model.forward(batch.inputs);
-        let loss = language_model_loss(logits, batch.targets);
+        let hidden = model.forward_hidden(batch.inputs);
+        let loss = model.language_loss_from_hidden(hidden, batch.targets);
         train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
@@ -378,8 +377,8 @@ where
             {
                 break;
             }
-            let logits = eval_model.forward(batch.inputs);
-            let loss = language_model_loss(logits, batch.targets);
+            let hidden = eval_model.forward_hidden(batch.inputs);
+            let loss = eval_model.language_loss_from_hidden(hidden, batch.targets);
             total += scalar_from_loss_async(loss).await?;
             count = count.saturating_add(1);
         }
@@ -797,19 +796,6 @@ fn build_batches<B: Backend>(
     Ok(batches)
 }
 
-fn language_model_loss<B: Backend>(
-    logits: Tensor<B, 3>,
-    targets: Tensor<B, 2, Int>,
-) -> Tensor<B, 1> {
-    let [batch, time, vocab] = logits.shape().dims();
-    let logits_flat = logits.reshape([batch * time, vocab]);
-    let targets_flat = targets.reshape([batch * time]);
-    let device = logits_flat.device();
-    CrossEntropyLossConfig::new()
-        .init::<B>(&device)
-        .forward(logits_flat, targets_flat)
-}
-
 async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
     loss.into_scalar_async()
         .await
@@ -1042,7 +1028,7 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 #[cfg(all(test, target_arch = "wasm32", feature = "wasm-peer"))]
 mod tests {
     use super::*;
-    use burn_dragon_core::DragonConfig;
+    use burn_dragon_core::{DragonConfig, LanguageHeadConfig};
     use burn_dragon_universality::{
         NcaCorpusConfig, NcaFamilyConfig, NcaFamilyKind, NcaSerializationConfig,
         NcaTokenizationConfig, UsizeRangeConfig,
@@ -1101,6 +1087,52 @@ mod tests {
             _ => "burn-ndarray-wasm",
         };
         assert_eq!(result.backend, expected_backend);
+        assert!(result.train_batches >= 1);
+        assert!(result.train_examples >= 1);
+        assert!(result.train_loss_mean.is_finite());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn browser_training_supports_factorized_nca_language_head() {
+        let mut model_config = tiny_model_config(256);
+        model_config.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            frame_special_tokens: true,
+            eos_id: Some(255),
+        };
+        let config = DragonBrowserTrainingConfig {
+            experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
+            model_config,
+            execution_backend: DragonBrowserExecutionBackend::Cpu,
+            block_size: 8,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 2,
+            max_train_batches: Some(1),
+            max_eval_batches: Some(1),
+            capability_policy: Default::default(),
+            training_lease: None,
+            train_source: DragonBrowserTokenSource::GeneratedNca {
+                corpus: tiny_nca_corpus_config(),
+                split: DragonBrowserDatasetSplit::Train,
+                max_documents: Some(1),
+            },
+            eval_source: Some(DragonBrowserTokenSource::GeneratedNca {
+                corpus: tiny_nca_corpus_config(),
+                split: DragonBrowserDatasetSplit::Validation,
+                max_documents: Some(1),
+            }),
+            live_participant: None,
+        };
+        let result = run_browser_training_with_release_manifest(
+            "https://example.invalid",
+            &config,
+            &dummy_release_manifest(),
+        )
+        .await
+        .expect("factorized NCA browser training should succeed");
+        assert_eq!(result.backend, "burn-ndarray-wasm");
         assert!(result.train_batches >= 1);
         assert!(result.train_examples >= 1);
         assert!(result.train_loss_mean.is_finite());

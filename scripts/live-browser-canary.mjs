@@ -28,6 +28,7 @@ const OUTPUT_JSON =
   process.env.BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON ??
   path.join(ARTIFACT_DIR, "canary-summary.json");
 const HEADLESS = process.env.BURN_DRAGON_BROWSER_CANARY_HEADED === "1" ? false : true;
+const SITE_OVERRIDE_DIR = process.env.BURN_DRAGON_BROWSER_CANARY_SITE_OVERRIDE_DIR?.trim() || null;
 
 const WATCHED_CONTROL_PATHS = [
   "/portal/snapshot",
@@ -199,6 +200,36 @@ function fail(message) {
   throw new Error(message);
 }
 
+function contentTypeForPath(filePath) {
+  if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
+  if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
+  if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
+  if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".wasm")) return "application/wasm";
+  if (filePath.endsWith(".map")) return "application/json; charset=utf-8";
+  return "application/octet-stream";
+}
+
+function resolveOverrideAssetPath(overrideDir, requestUrl, siteBaseUrl) {
+  const request = new URL(requestUrl);
+  const siteBase = new URL(siteBaseUrl);
+  if (request.origin !== siteBase.origin) {
+    return null;
+  }
+  let pathname = request.pathname;
+  const siteBasePath = siteBase.pathname === "/" ? "" : siteBase.pathname.replace(/\/$/, "");
+  if (siteBasePath && pathname.startsWith(siteBasePath)) {
+    pathname = pathname.slice(siteBasePath.length) || "/";
+  }
+  const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const decoded = decodeURIComponent(relativePath);
+  const normalized = path.normalize(decoded);
+  if (normalized.startsWith("..")) {
+    return null;
+  }
+  return path.join(overrideDir, normalized);
+}
+
 async function waitForVisible(locator, timeoutMs) {
   await locator.waitFor({ state: "visible", timeout: timeoutMs });
 }
@@ -356,6 +387,32 @@ async function runCanary() {
       tracePath = path.join(ARTIFACT_DIR, "trace.zip");
     }
 
+    if (SITE_OVERRIDE_DIR) {
+      await context.route("**/*", async (route) => {
+        const overridePath = resolveOverrideAssetPath(
+          SITE_OVERRIDE_DIR,
+          route.request().url(),
+          SITE_BASE_URL,
+        );
+        if (!overridePath) {
+          await route.continue();
+          return;
+        }
+        if (!fs.existsSync(overridePath) || fs.statSync(overridePath).isDirectory()) {
+          await route.fallback();
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          body: fs.readFileSync(overridePath),
+          headers: {
+            "content-type": contentTypeForPath(overridePath),
+            "cache-control": "no-store",
+          },
+        });
+      });
+    }
+
     await context.addInitScript(
       ({ networkId, storageJson, receiptJson }) => {
         const storageKey = `burn-p2p.browser.storage.${networkId}`;
@@ -387,7 +444,10 @@ async function runCanary() {
       }
     });
     page.on("pageerror", (error) => {
-      const text = String(error);
+      const text =
+        error && typeof error === "object" && "stack" in error && error.stack
+          ? String(error.stack)
+          : String(error);
       pageErrors.push(text);
       report.page_errors.push(text);
     });

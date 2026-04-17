@@ -1892,6 +1892,7 @@ dependencies = [
  "burn_p2p_workload",
  "chrono",
  "clap 4.6.1",
+ "console_error_panic_hook",
  "ctrlc",
  "dioxus",
  "getrandom 0.4.2",

@@ -261,6 +261,14 @@ async function waitForVisible(locator, timeoutMs) {
   await locator.waitFor({ state: "visible", timeout: timeoutMs });
 }
 
+async function isVisible(locator) {
+  try {
+    return (await locator.count()) > 0 && (await locator.first().isVisible());
+  } catch {
+    return false;
+  }
+}
+
 async function maybeClick(locator) {
   if ((await locator.count()) > 0 && (await locator.first().isVisible())) {
     await locator.first().click();
@@ -430,8 +438,14 @@ async function runCanary() {
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     connect_clicked: false,
     training_button_visible: false,
+    connect_button_visible: false,
+    get_started_button_visible: false,
     live_status_label: null,
     live_stat_tiles: [],
+    live_panel_detail: null,
+    live_notice_label: null,
+    live_notice_detail: null,
+    transport_summary: null,
     quiet_window_ms: QUIET_WINDOW_MS,
     train_timeout_ms: TRAIN_TIMEOUT_MS,
     quiet_window_control_plane_requests: [],
@@ -533,35 +547,32 @@ async function runCanary() {
     const connectButton = page.locator('button:has-text("connect")').first();
     const trainButton = page.locator('button:has-text("run browser training")').first();
     const getStartedButton = page.locator('button:has-text("get started")').first();
-
-    const connectDeadline = Date.now() + CONNECT_TIMEOUT_MS;
-    const sessionResumeGraceDeadline = Date.now() + 5_000;
-    while (Date.now() < connectDeadline) {
-      if ((await trainButton.count()) > 0 && (await trainButton.isVisible())) {
-        report.training_button_visible = true;
-        break;
-      }
-      if ((await connectButton.count()) > 0 && (await connectButton.isVisible())) {
-        await connectButton.click();
-        report.connect_clicked = true;
-      }
-      if (
-        Date.now() >= sessionResumeGraceDeadline &&
-        (await getStartedButton.count()) > 0 &&
-        (await getStartedButton.isVisible()) &&
-        !(await connectButton.isVisible().catch(() => false))
-      ) {
-        fail("browser canary session did not resume; page returned to get started");
-      }
-      await page.waitForTimeout(500);
-    }
-
-    await waitForVisible(trainButton, CONNECT_TIMEOUT_MS);
-    report.training_button_visible = true;
+    let quietWindowStartedAt = null;
     const captureLiveStatus = async () => {
+      report.connect_button_visible = await isVisible(connectButton);
+      report.training_button_visible = await isVisible(trainButton);
+      report.get_started_button_visible = await isVisible(getStartedButton);
       report.live_status_label =
         (await page
           .locator(".dragon-live-status-pill")
+          .first()
+          .textContent()
+          .catch(() => null)) ?? null;
+      report.live_panel_detail =
+        (await page
+          .locator(".dragon-live-shell .section-detail")
+          .first()
+          .textContent()
+          .catch(() => null)) ?? null;
+      report.live_notice_label =
+        (await page
+          .locator(".activity-notice-label")
+          .first()
+          .textContent()
+          .catch(() => null)) ?? null;
+      report.live_notice_detail =
+        (await page
+          .locator(".activity-notice-detail")
           .first()
           .textContent()
           .catch(() => null)) ?? null;
@@ -573,10 +584,39 @@ async function runCanary() {
           ),
         )
         .catch(() => []);
+      report.transport_summary = statTileValue(report.live_stat_tiles, "transport");
     };
-    await captureLiveStatus();
 
-    const quietWindowStartedAt = Date.now();
+    const connectDeadline = Date.now() + CONNECT_TIMEOUT_MS;
+    const sessionResumeGraceDeadline = Date.now() + 5_000;
+    while (Date.now() < connectDeadline) {
+      await captureLiveStatus();
+      if (report.training_button_visible) {
+        break;
+      }
+      if (report.connect_button_visible) {
+        await connectButton.click();
+        report.connect_clicked = true;
+      }
+      if (
+        Date.now() >= sessionResumeGraceDeadline &&
+        report.get_started_button_visible &&
+        !report.connect_button_visible
+      ) {
+        fail("browser canary session did not resume; page returned to get started");
+      }
+      await page.waitForTimeout(500);
+    }
+
+    await captureLiveStatus();
+    if (!report.training_button_visible) {
+      report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+      fail(
+        `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
+      );
+    }
+
+    quietWindowStartedAt = Date.now();
     await page.waitForTimeout(QUIET_WINDOW_MS);
     await captureLiveStatus();
     report.quiet_window_control_plane_requests = requests.filter(
@@ -631,6 +671,7 @@ async function runCanary() {
     if (tracePath) {
       await context.tracing.stop({ path: tracePath }).catch(() => {});
     }
+    report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
     report.console_errors = report.console_errors.concat(
       consoleMessages.filter((entry) => entry.type === "error").map((entry) => entry.text),
     );

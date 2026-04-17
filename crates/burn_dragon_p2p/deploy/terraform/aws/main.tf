@@ -411,6 +411,36 @@ locals {
     }
   }
 
+  browser_canary_rules = trimspace(var.github_browser_canary_principal_id) == "" ? [] : [
+    {
+      principal_id   = trimspace(var.github_browser_canary_principal_id)
+      display_name   = "burn_dragon live browser canary"
+      required_orgs  = local.github_required_orgs
+      required_teams = local.github_required_teams
+      required_repo_access = [
+        {
+          repo               = var.github_required_repo
+          minimum_permission = "write"
+        },
+      ]
+      granted_roles = {
+        roles = ["BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]
+      }
+      granted_scopes = [
+        "Connect",
+        "Discover",
+        { "Train" = { experiment_id = "nca-prepretraining" } },
+        { "Archive" = { experiment_id = "nca-prepretraining" } },
+      ]
+      allowed_networks = [var.network_id]
+      custom_claims = {
+        deployment_profile = var.environment_name
+        stack              = var.stack_name
+        canary             = "browser-live"
+      }
+    }
+  ]
+
   admin_rules = [
     for login in local.github_admin_logins : {
       principal_id   = "github-admin-${login}"
@@ -439,7 +469,7 @@ locals {
   ]
   auth_provider_policy = local.auth_connector_kind == "github" ? {
     github = {
-      rules = concat([local.contributor_rule], local.admin_rules)
+      rules = concat([local.contributor_rule], local.browser_canary_rules, local.admin_rules)
     }
   } : null
 

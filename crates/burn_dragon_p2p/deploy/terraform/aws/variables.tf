@@ -337,6 +337,12 @@ variable "github_principal_id" {
   default     = "burn-dragon-contributor"
 }
 
+variable "github_browser_canary_principal_id" {
+  description = "Optional dedicated principal id used by the live browser canary when GitHub auth is enabled."
+  type        = string
+  default     = ""
+}
+
 variable "instance_type" {
   description = "EC2 instance type for the bootstrap edge."
   type        = string

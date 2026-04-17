@@ -33,6 +33,7 @@ def main() -> None:
                 '"BrowserTrainerWgpu", "BrowserObserver"',
                 '"browser_canary": "true"',
                 'echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"',
+                'echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (

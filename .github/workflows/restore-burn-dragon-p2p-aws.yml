@@ -673,6 +673,7 @@ jobs:
               echo "TF_VAR_github_required_org=$github_required_org"
               echo "TF_VAR_github_required_team=$github_required_team"
               echo "TF_VAR_github_required_repo=$github_required_repo"
+              echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"
               echo "TF_VAR_github_admin_logins=$admin_logins_json"
               echo "ADMIN_LOGINS_CSV=$admin_logins_csv"
             } >>"$GITHUB_ENV"

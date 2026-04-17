@@ -86,7 +86,9 @@ locals {
     trainer_auth_bundle               = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
     validator_auth_bundle             = "${var.secret_parameter_prefix}/validator_auth_bundle_json"
   }
-  p2p_webrtc_port              = var.p2p_port + 2
+  # Reserve UDP/443 for browser-direct transport instead of spending it on HTTP/3.
+  # Browser egress is materially more reliable on 443/udp than on a high custom port.
+  p2p_webrtc_port              = 443
   bootstrap_primary_private_ip = "10.42.1.10"
   bootstrap_peer_internal_multiaddrs = [
     "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",

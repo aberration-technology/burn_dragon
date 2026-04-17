@@ -2,6 +2,9 @@
 %{ if acme_contact_email != "" ~}
     email ${acme_contact_email}
 %{ endif ~}
+    servers {
+        protocols h1 h2
+    }
 }
 
 http://${edge_domain_name} {

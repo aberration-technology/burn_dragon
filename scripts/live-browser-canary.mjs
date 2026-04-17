@@ -20,7 +20,7 @@ const CONNECT_TIMEOUT_MS = parseIntegerEnv(
 );
 const TRAIN_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS",
-  120_000,
+  300_000,
 );
 const ARTIFACT_DIR =
   process.env.BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR ??
@@ -375,6 +375,7 @@ async function runCanary() {
     connect_clicked: false,
     training_button_visible: false,
     quiet_window_ms: QUIET_WINDOW_MS,
+    train_timeout_ms: TRAIN_TIMEOUT_MS,
     quiet_window_control_plane_requests: [],
     artifact_http_fallback_requests: [],
     receipt_submission: null,

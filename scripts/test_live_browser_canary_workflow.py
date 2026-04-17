@@ -45,6 +45,12 @@ def main() -> None:
                 'BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}'
                 in workflow_text
             ), f"{workflow_path} missing browser canary callback token secret"
+            assert (
+                "default: browser-canary-mainnet-nca" in workflow_text
+            ), f"{workflow_path} missing browser canary mainnet principal default"
+            assert (
+                'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"' in workflow_text
+            ), f"{workflow_path} missing extended browser canary train timeout"
 
     print("live-browser-canary-workflows-ok")
 

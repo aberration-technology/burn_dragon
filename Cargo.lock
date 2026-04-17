@@ -148,7 +148,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -159,7 +159,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1852,7 +1852,7 @@ dependencies = [
  "burn_dragon_kernel",
  "clap 4.6.1",
  "image",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -1904,7 +1904,7 @@ dependencies = [
  "indexmap 2.14.0",
  "memmap2",
  "parquet",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rayon",
  "rerun",
  "serde",
@@ -2010,7 +2010,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "image",
  "names",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -2027,7 +2027,7 @@ dependencies = [
  "anyhow",
  "burn_dragon_tokenizer",
  "flate2",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -2037,7 +2037,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -2066,7 +2066,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_admin"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p",
  "burn_p2p_core",
@@ -2081,7 +2081,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_app"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_browser",
  "burn_p2p_views",
@@ -2098,7 +2098,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_bootstrap"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "anyhow",
  "burn_p2p",
@@ -2124,7 +2124,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_browser"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "base64 0.22.1",
  "burn_p2p",
@@ -2150,7 +2150,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_checkpoint"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2164,7 +2164,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_core"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "chrono",
  "ciborium",
@@ -2178,7 +2178,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_dataloader"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_engine"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn 0.21.0-pre.3",
  "burn-store 0.21.0-pre.3",
@@ -2207,7 +2207,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_experiment"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2219,7 +2219,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_limits"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2230,7 +2230,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_metrics"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2242,7 +2242,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_publish"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
@@ -2255,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_security"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_swarm"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "async-trait",
  "burn_p2p_core",
@@ -2293,7 +2293,7 @@ dependencies = [
  "libp2p-swarm",
  "libp2p-webrtc",
  "libp2p-yamux",
- "rand 0.8.5",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -2305,7 +2305,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_views"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2320,7 +2320,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_workload"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=92b73922eb9e2d6576b6e620b330e5c343454847#92b73922eb9e2d6576b6e620b330e5c343454847"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=65bc6cb66401f0412386d23548fc6dc53cb125ae#65bc6cb66401f0412386d23548fc6dc53cb125ae"
 dependencies = [
  "anyhow",
  "burn_p2p_checkpoint",
@@ -2827,7 +2827,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3012,11 +3012,12 @@ checksum = "b0664d2867b4a32697dfe655557f5c3b187e9b605b38612a748e5ec99811d160"
 
 [[package]]
 name = "const_format"
-version = "0.2.35"
+version = "0.2.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7faa7469a93a566e9ccc1c73fe783b4a65c274c5ace346038dca9c39fe0030ad"
+checksum = "4481a617ad9a412be3b97c5d403fef8ed023103368908b9c50af598ff467cc1e"
 dependencies = [
  "const_format_proc_macros",
+ "konst",
 ]
 
 [[package]]
@@ -4426,9 +4427,9 @@ dependencies = [
 
 [[package]]
 name = "dary_heap"
-version = "0.3.8"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06d2e3287df1c007e74221c49ca10a95d557349e54b3a75dc2fb14712c751f04"
+checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 dependencies = [
  "serde",
 ]
@@ -5070,7 +5071,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5407,7 +5408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6179,7 +6180,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6600,7 +6601,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -6651,7 +6652,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6963,7 +6964,7 @@ dependencies = [
  "bytes",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rtcp",
  "rtp",
  "thiserror 1.0.69",
@@ -7019,7 +7020,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7075,7 +7076,7 @@ dependencies = [
  "portable-atomic-util",
  "serde_core",
  "wasm-bindgen",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7209,6 +7210,21 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "konst"
+version = "0.2.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "128133ed7824fcd73d6e7b17957c5eb7bacb885649bd8c69708b2331a10bcefb"
+dependencies = [
+ "konst_macro_rules",
+]
+
+[[package]]
+name = "konst_macro_rules"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lazy-js-bundle"
@@ -7416,7 +7432,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rand_core 0.6.4",
  "thiserror 2.0.18",
  "tracing",
@@ -7451,7 +7467,7 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "quick-protobuf",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rw-stream-sink",
  "thiserror 2.0.18",
  "tracing",
@@ -7520,7 +7536,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "regex",
  "sha2 0.10.9",
  "tracing",
@@ -7559,7 +7575,7 @@ dependencies = [
  "hkdf",
  "multihash",
  "quick-protobuf",
- "rand 0.8.5",
+ "rand 0.8.6",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
@@ -7584,7 +7600,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.18",
@@ -7605,7 +7621,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
- "rand 0.8.5",
+ "rand 0.8.6",
  "smallvec",
  "socket2 0.5.10",
  "tokio",
@@ -7647,7 +7663,7 @@ dependencies = [
  "multiaddr",
  "multihash",
  "quick-protobuf",
- "rand 0.8.5",
+ "rand 0.8.6",
  "snow",
  "static_assertions",
  "thiserror 2.0.18",
@@ -7667,7 +7683,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
- "rand 0.8.5",
+ "rand 0.8.6",
  "tracing",
  "web-time",
 ]
@@ -7685,7 +7701,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-tls",
  "quinn",
- "rand 0.8.5",
+ "rand 0.8.6",
  "ring",
  "rustls",
  "socket2 0.5.10",
@@ -7711,7 +7727,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "static_assertions",
  "thiserror 2.0.18",
  "tracing",
@@ -7736,7 +7752,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "thiserror 2.0.18",
  "tracing",
  "web-time",
@@ -7755,7 +7771,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "smallvec",
  "tracing",
@@ -7777,7 +7793,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-swarm-derive",
  "multistream-select",
- "rand 0.8.5",
+ "rand 0.8.6",
  "smallvec",
  "tokio",
  "tracing",
@@ -7862,7 +7878,7 @@ dependencies = [
  "libp2p-noise",
  "libp2p-webrtc-utils",
  "multihash",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rcgen",
  "stun",
  "thiserror 2.0.18",
@@ -7887,7 +7903,7 @@ dependencies = [
  "libp2p-noise",
  "quick-protobuf",
  "quick-protobuf-codec",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "sha2 0.10.9",
  "tinytemplate",
@@ -8598,7 +8614,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bddcd3bf5144b6392de80e04c347cd7fab2508f6df16a85fc496ecd5cec39bc"
 dependencies = [
  "clap 3.2.25",
- "rand 0.8.5",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -8817,7 +8833,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9376,7 +9392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
 dependencies = [
  "phf_shared 0.11.3",
- "rand 0.8.5",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -9582,9 +9598,9 @@ dependencies = [
 
 [[package]]
 name = "portable-atomic-util"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091397be61a01d4be58e7841595bd4bfedb15f1cd54977d79b8271e94ed799a3"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
 ]
@@ -9862,9 +9878,9 @@ checksum = "40e24eee682d89fb193496edf918a7f407d30175b2e785fe057e4392dfd182e0"
 
 [[package]]
 name = "pxfm"
-version = "0.1.28"
+version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
+checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
 name = "pyo3"
@@ -10039,9 +10055,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -11213,7 +11229,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -11388,7 +11404,7 @@ dependencies = [
  "bytes",
  "memchr",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "thiserror 1.0.69",
  "webrtc-util",
@@ -11440,7 +11456,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11620,7 +11636,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02a526161f474ae94b966ba622379d939a8fe46c930eebbadb73e339622599d5"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.8.6",
  "substring",
  "thiserror 1.0.69",
  "url",
@@ -12035,7 +12051,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12060,7 +12076,7 @@ dependencies = [
  "futures",
  "httparse",
  "log",
- "rand 0.8.5",
+ "rand 0.8.6",
  "sha1",
 ]
 
@@ -12214,7 +12230,7 @@ dependencies = [
  "crc",
  "lazy_static",
  "md-5 0.10.6",
- "rand 0.8.5",
+ "rand 0.8.6",
  "ring",
  "subtle",
  "thiserror 1.0.69",
@@ -12265,6 +12281,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
@@ -12424,7 +12446,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "ndarray 0.16.1",
- "rand 0.8.5",
+ "rand 0.8.6",
  "safetensors 0.3.3",
  "thiserror 1.0.69",
  "torch-sys",
@@ -12441,7 +12463,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12667,9 +12689,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.0"
+version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
+checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
  "bytes",
  "libc",
@@ -13127,11 +13149,12 @@ dependencies = [
 
 [[package]]
 name = "tracing-appender"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
+ "symlink",
  "thiserror 2.0.18",
  "time",
  "tracing-subscriber",
@@ -13255,7 +13278,7 @@ dependencies = [
  "log",
  "md-5 0.10.6",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "ring",
  "stun",
  "thiserror 1.0.69",
@@ -13888,14 +13911,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.6"
+version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -13916,7 +13939,7 @@ dependencies = [
  "log",
  "pem",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rcgen",
  "regex",
  "ring",
@@ -13981,7 +14004,7 @@ dependencies = [
  "p384",
  "pem",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rand_core 0.6.4",
  "rcgen",
  "ring",
@@ -14009,7 +14032,7 @@ dependencies = [
  "crc",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "stun",
@@ -14044,7 +14067,7 @@ checksum = "e153be16b8650021ad3e9e49ab6e5fa9fb7f6d1c23c213fd8bbd1a1135a4c704"
 dependencies = [
  "byteorder",
  "bytes",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rtp",
  "thiserror 1.0.69",
 ]
@@ -14061,7 +14084,7 @@ dependencies = [
  "crc",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "thiserror 1.0.69",
  "tokio",
  "webrtc-util",
@@ -14105,7 +14128,7 @@ dependencies = [
  "log",
  "nix 0.26.4",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "thiserror 1.0.69",
  "tokio",
  "winapi",
@@ -14468,7 +14491,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15215,7 +15238,7 @@ dependencies = [
  "nohash-hasher",
  "parking_lot",
  "pin-project",
- "rand 0.8.5",
+ "rand 0.8.6",
  "static_assertions",
 ]
 

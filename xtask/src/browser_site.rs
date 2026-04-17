@@ -166,6 +166,20 @@ body {
   max-width: 46rem;
 }
 
+.dragon-eyebrow-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.dragon-eyebrow-rattle {
+  min-width: 1.2ch;
+  color: var(--accent);
+  font-family: "Iosevka Etoile", "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.92em;
+  line-height: 1;
+}
+
 .dragon-browser-shell .browser-hero-bar {
   justify-content: flex-start;
   padding-top: 0;
@@ -296,6 +310,10 @@ body {
 
 .dragon-live-actions {
   padding-top: 2px;
+}
+
+.dragon-live-keyvalues {
+  margin-top: 4px;
 }
 
 .dragon-live-shell .section-detail {

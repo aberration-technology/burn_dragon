@@ -45,6 +45,9 @@ pub mod training;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const HERO_RATTLE_INTERVAL_MILLIS: u32 = 90;
+const HERO_RATTLE_FRAMES: &[&str] = &["⣾", "⣷", "⣯", "⣟", "⣻", "⣽"];
 
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };
@@ -364,6 +367,128 @@ fn rollout_result_view(result: &AdminResult) -> Option<DirectoryMutationResultVi
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonLiveNotice {
+    label: &'static str,
+    detail: String,
+    tone: &'static str,
+}
+
+fn dragon_live_notice(
+    view: Option<&BrowserAppClientView>,
+    local_training_pending: bool,
+) -> Option<DragonLiveNotice> {
+    if local_training_pending {
+        return Some(DragonLiveNotice {
+            label: "training",
+            detail: "running a local training window in this tab".into(),
+            tone: "accent",
+        });
+    }
+
+    let view = view?;
+    if view.runtime_label.starts_with("joining ") {
+        return Some(DragonLiveNotice {
+            label: "connecting",
+            detail: view.runtime_detail.clone(),
+            tone: "accent",
+        });
+    }
+    if view.runtime_label.starts_with("catchup ") {
+        return Some(DragonLiveNotice {
+            label: "syncing",
+            detail: view.runtime_detail.clone(),
+            tone: "neutral",
+        });
+    }
+    if view.runtime_label == "blocked" {
+        return Some(DragonLiveNotice {
+            label: "blocked",
+            detail: view.runtime_detail.clone(),
+            tone: "neutral",
+        });
+    }
+
+    match (
+        view.training.can_train,
+        view.training.active_assignment.as_ref(),
+        view.training.latest_head_id.as_ref(),
+        view.training.cached_microshards,
+        view.training.throughput_summary.as_ref(),
+    ) {
+        (true, None, _, _, _) => Some(DragonLiveNotice {
+            label: "waiting",
+            detail: "waiting for work".into(),
+            tone: "neutral",
+        }),
+        (true, Some(_), None, _, _) => Some(DragonLiveNotice {
+            label: "syncing",
+            detail: "waiting for checkpoint sync".into(),
+            tone: "neutral",
+        }),
+        (true, Some(_), Some(_), 0, _) => Some(DragonLiveNotice {
+            label: "syncing",
+            detail: "downloading assigned slice".into(),
+            tone: "accent",
+        }),
+        (true, Some(_), Some(_), _, None) => Some(DragonLiveNotice {
+            label: "waiting",
+            detail: "waiting for the first training window".into(),
+            tone: "neutral",
+        }),
+        _ => None,
+    }
+}
+
+fn dragon_window_summary(
+    view: Option<&BrowserAppClientView>,
+    local_training_pending: bool,
+) -> String {
+    if local_training_pending {
+        return "running".into();
+    }
+    let Some(view) = view else {
+        return "pending".into();
+    };
+    match (
+        view.training.last_window_secs,
+        view.training.max_window_secs,
+    ) {
+        (Some(last), Some(max)) => format!("{last}s of {max}s"),
+        (Some(last), None) => format!("{last}s last"),
+        (None, Some(max)) => format!("up to {max}s"),
+        (None, None) => "pending".into(),
+    }
+}
+
+fn dragon_slice_progress_summary(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "pending".into();
+    };
+    match (
+        view.training.accepted_samples,
+        view.training.slice_target_samples,
+        view.training.slice_remaining_samples,
+    ) {
+        (Some(done), Some(target), Some(remaining)) => {
+            format!("{done}/{target} · {remaining} left")
+        }
+        (Some(done), Some(target), None) => format!("{done}/{target}"),
+        _ => view.training.slice_status.clone(),
+    }
+}
+
+fn dragon_latest_output_summary(view: Option<&BrowserAppClientView>) -> String {
+    let Some(view) = view else {
+        return "pending".into();
+    };
+    view.training
+        .last_receipt_id
+        .clone()
+        .or_else(|| view.training.last_artifact_id.clone())
+        .unwrap_or_else(|| "pending".into())
+}
+
 fn runtime_capability_summary(view: &BrowserAppClientView) -> RuntimeCapabilitySummaryView {
     let backend_summary = if view.runtime_detail.is_empty() {
         view.capability_summary.clone()
@@ -532,6 +657,30 @@ fn spawn_browser_app_refresh_loop(
     });
 }
 
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn spawn_hero_rattle_loop(
+    active: bool,
+    mut hero_rattle_index: Signal<usize>,
+    mut hero_rattle_generation: Signal<u64>,
+) {
+    let next_generation = (*hero_rattle_generation.read()).saturating_add(1);
+    hero_rattle_generation.set(next_generation);
+    if !active {
+        hero_rattle_index.set(0);
+        return;
+    }
+    spawn(async move {
+        loop {
+            TimeoutFuture::new(HERO_RATTLE_INTERVAL_MILLIS).await;
+            if *hero_rattle_generation.read() != next_generation {
+                break;
+            }
+            let next_index = (*hero_rattle_index.read() + 1) % HERO_RATTLE_FRAMES.len();
+            hero_rattle_index.set(next_index);
+        }
+    });
+}
+
 pub async fn resume_or_complete_browser_auth(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
@@ -629,8 +778,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let auth_bootstrap_started = use_signal(|| false);
     let auth_bootstrap_pending = use_signal(|| true);
     let checkpoint_wait_generation = use_signal(|| 0_u64);
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    let hero_rattle_index = use_signal(|| 0_usize);
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    let hero_rattle_generation = use_signal(|| 0_u64);
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    let hero_rattle_state = use_signal(|| None::<bool>);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
+    #[cfg(feature = "wasm-peer")]
+    let local_training_pending = use_signal(|| false);
 
     {
         let config = initial_config.clone();
@@ -1155,22 +1312,101 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     let show_public_retry =
         !auth_bootstrap_pending_active && callback_available && !status_message.is_empty();
-    let connected_panel_title = "connected";
-    let connected_panel_detail = if has_active_checkpoint {
-        "checkpoint ready."
-    } else {
-        "syncing from the edge."
-    };
-    let live_status_label = if has_active_checkpoint {
+    #[cfg(feature = "wasm-peer")]
+    let local_training_pending_active = *local_training_pending.read();
+    #[cfg(not(feature = "wasm-peer"))]
+    let local_training_pending_active = false;
+    let live_notice = dragon_live_notice(view.as_ref(), local_training_pending_active);
+    let hero_rattle_active = auth_bootstrap_pending_active
+        || status_message.starts_with("Connecting")
+        || status_message.starts_with("Starting sign-in")
+        || live_notice
+            .as_ref()
+            .is_some_and(|notice| notice.label != "blocked");
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    {
+        let mut hero_rattle_state = hero_rattle_state;
+        let hero_rattle_index = hero_rattle_index;
+        let hero_rattle_generation = hero_rattle_generation;
+        use_effect(move || {
+            if *hero_rattle_state.read() == Some(hero_rattle_active) {
+                return;
+            }
+            hero_rattle_state.set(Some(hero_rattle_active));
+            spawn_hero_rattle_loop(
+                hero_rattle_active,
+                hero_rattle_index,
+                hero_rattle_generation,
+            );
+        });
+    }
+    let connected_panel_title = "live peer";
+    let connected_panel_detail = live_notice
+        .as_ref()
+        .map(|notice| notice.detail.clone())
+        .unwrap_or(if has_active_checkpoint {
+            "checkpoint synced. this tab can train when work is assigned.".into()
+        } else {
+            "connected to the network. waiting for the first checkpoint.".into()
+        });
+    let live_status_label = if local_training_pending_active {
+        "training"
+    } else if let Some(notice) = live_notice.as_ref() {
+        notice.label
+    } else if has_active_checkpoint {
         "ready"
     } else {
-        "syncing"
+        "connected"
     };
     let checkpoint_summary = if has_active_checkpoint {
-        "ready"
+        "synced"
     } else {
         "waiting"
     };
+    let runtime_mode_summary = view
+        .as_ref()
+        .map(|view| view.runtime_label.clone())
+        .unwrap_or_else(|| {
+            if auth_bootstrap_pending_active {
+                "bootstrapping".into()
+            } else {
+                "idle".into()
+            }
+        });
+    let slice_progress_summary = dragon_slice_progress_summary(view.as_ref());
+    let window_summary = dragon_window_summary(view.as_ref(), local_training_pending_active);
+    let latest_output_summary = dragon_latest_output_summary(view.as_ref());
+    let throughput_summary = if local_training_pending_active {
+        "measuring…".into()
+    } else {
+        view.as_ref()
+            .and_then(|view| view.training.throughput_summary.clone())
+            .unwrap_or_else(|| "pending".into())
+    };
+    let last_loss_summary = view
+        .as_ref()
+        .and_then(|view| view.training.last_loss.clone())
+        .unwrap_or_else(|| {
+            if local_training_pending_active {
+                "pending".into()
+            } else {
+                "—".into()
+            }
+        });
+    let assignment_summary = view
+        .as_ref()
+        .and_then(|view| view.training.active_assignment.clone())
+        .unwrap_or_else(|| "pending".into());
+    let publish_latency_summary = view
+        .as_ref()
+        .and_then(|view| view.training.publish_latency_ms)
+        .map(|value| format!("{value} ms"))
+        .unwrap_or_else(|| "pending".into());
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    let hero_rattle_frame =
+        HERO_RATTLE_FRAMES[*hero_rattle_index.read() % HERO_RATTLE_FRAMES.len()];
+    #[cfg(not(all(feature = "wasm-ui", target_arch = "wasm32")))]
+    let hero_rattle_frame = HERO_RATTLE_FRAMES[0];
     #[cfg(feature = "wasm-peer")]
     let train_action = {
         let props = props.clone();
@@ -1184,6 +1420,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut current_view = current_view;
             let mut local_training = local_training;
+            let mut local_training_pending = local_training_pending;
             spawn(async move {
                 let release_manifest =
                     match resolve_browser_release_manifest(&next_config, release_manifest.as_ref())
@@ -1202,10 +1439,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
+                local_training_pending.set(true);
                 status.set("Running browser training…".into());
                 let edge_base_url = match resolved_edge_base_url(&next_config) {
                     Ok(edge_base_url) => edge_base_url,
                     Err(error) => {
+                        local_training_pending.set(false);
                         status.set(error.to_string());
                         return;
                     }
@@ -1234,6 +1473,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                 }
+                local_training_pending.set(false);
             });
         }
     };
@@ -1249,8 +1489,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 button {
                     r#type: "button",
                     class: "action-button action-button-primary",
+                    disabled: local_training_pending_active,
                     onclick: train_action,
-                    "run browser training"
+                    if local_training_pending_active {
+                        "training…"
+                    } else {
+                        "run browser training"
+                    }
                 }
             }
         }
@@ -1339,7 +1584,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             section { class: "panel hero browser-hero",
                 div { class: "browser-hero-grid",
                     div { class: "browser-hero-copy",
-                        div { class: "eyebrow", "burn_dragon" }
+                        div { class: "dragon-eyebrow-row",
+                            div { class: "eyebrow", "burn_dragon" }
+                            if hero_rattle_active {
+                                span {
+                                    class: "dragon-eyebrow-rattle",
+                                    "{hero_rattle_frame}"
+                                }
+                            }
+                        }
                         h1 { class: "app-title", "{hero_title}" }
                         if !hero_subtitle.is_empty() {
                             p { class: "app-subtitle", "{hero_subtitle}" }
@@ -1451,6 +1704,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack dragon-live-summary",
+                                if let Some(notice) = live_notice.as_ref() {
+                                    ActivityNotice {
+                                        label: notice.label.to_owned(),
+                                        detail: notice.detail.clone(),
+                                        tone: notice.tone,
+                                    }
+                                }
                                 div { class: "dragon-live-status-row",
                                     span {
                                         class: "dragon-live-status-pill dragon-live-status-pill-{live_status_label}",
@@ -1459,28 +1719,57 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                                 div { class: "dragon-live-stats",
                                     StatTile {
+                                        label: "mode",
+                                        value: runtime_mode_summary,
+                                        detail: Some(view.runtime_detail.clone()),
+                                    }
+                                    StatTile {
                                         label: "network",
-                                        value: network_summary,
-                                        detail: None,
+                                        value: network_summary.clone(),
+                                        detail: Some(view.network.transport.clone()),
+                                    }
+                                    StatTile {
+                                        label: "slice",
+                                        value: slice_progress_summary,
+                                        detail: Some(view.training.slice_status.clone()),
+                                    }
+                                    StatTile {
+                                        label: "window",
+                                        value: window_summary,
+                                        detail: Some("local".into()),
+                                    }
+                                    StatTile {
+                                        label: "loss",
+                                        value: last_loss_summary,
+                                        detail: Some("latest".into()),
+                                    }
+                                    StatTile {
+                                        label: "throughput",
+                                        value: throughput_summary,
+                                        detail: Some("training".into()),
                                     }
                                     StatTile {
                                         label: "checkpoint",
-                                        value: checkpoint_summary,
-                                        detail: None,
+                                        value: checkpoint_summary.to_owned(),
+                                        detail: Some(active_head_label.clone()),
                                     }
-                                    if let Some(last_loss) = view.training.last_loss.clone() {
-                                        StatTile {
-                                            label: "last loss",
-                                            value: last_loss,
-                                            detail: None,
-                                        }
+                                }
+                                div { class: "keyvalue-list dragon-live-keyvalues",
+                                    div { class: "keyvalue-row",
+                                        span { "assignment" }
+                                        strong { "{assignment_summary}" }
                                     }
-                                    if let Some(throughput_summary) = view.training.throughput_summary.clone() {
-                                        StatTile {
-                                            label: "throughput",
-                                            value: throughput_summary,
-                                            detail: None,
-                                        }
+                                    div { class: "keyvalue-row",
+                                        span { "latest output" }
+                                        strong { "{latest_output_summary}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "publish" }
+                                        strong { "{publish_latency_summary}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "peers" }
+                                        strong { "{network_summary}" }
                                     }
                                 }
                                 if has_active_checkpoint {
@@ -1538,6 +1827,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
+            {local_training_section}
             if show_live_details_active {
                 div { class: "surface-layout browser-surface-layout",
                     section { class: "panel primary-panel browser-focus-panel",
@@ -1591,7 +1881,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        {local_training_section}
                     }
                 }
             }
@@ -1735,7 +2024,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
 }
 
 #[component]
-fn SectionHeader(eyebrow: &'static str, title: &'static str, detail: &'static str) -> Element {
+fn SectionHeader(eyebrow: &'static str, title: &'static str, detail: String) -> Element {
     rsx! {
         header { class: "section-header",
             div { class: "eyebrow", "{eyebrow}" }

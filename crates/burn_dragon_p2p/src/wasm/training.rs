@@ -1056,6 +1056,7 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 #[cfg(all(test, target_arch = "wasm32", feature = "wasm-peer"))]
 mod tests {
     use super::*;
+    use crate::config::DragonBrowserLiveParticipantConfig;
     use burn_dragon_core::{DragonConfig, LanguageHeadConfig};
     use burn_dragon_universality::{
         NcaCorpusConfig, NcaFamilyConfig, NcaFamilyKind, NcaSerializationConfig,
@@ -1081,8 +1082,7 @@ mod tests {
             study_id: "dragon-study".into(),
             experiment_id: "dragon-experiment".into(),
             revision_id: "dragon-revision".into(),
-            stage_name: "live".into(),
-            receipt_workload_id: "dragon-receipts".into(),
+            workload_id: "dragon-workload".into(),
         });
 
         let shard_key = browser_shard_selection_key(
@@ -1104,8 +1104,7 @@ mod tests {
             study_id: "dragon-study".into(),
             experiment_id: "dragon-experiment".into(),
             revision_id: "dragon-revision".into(),
-            stage_name: "live".into(),
-            receipt_workload_id: "dragon-receipts".into(),
+            workload_id: "dragon-workload".into(),
         });
 
         let configured_key =

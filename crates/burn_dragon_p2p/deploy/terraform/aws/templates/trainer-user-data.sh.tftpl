@@ -36,19 +36,19 @@ install -d -m 0755 /var/lib/burn_dragon_p2p/storage
 IMDS_TOKEN="$(curl -fsSL -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' || true)"
 imds_get() {
   local path="$1"
-  if [ -n "${IMDS_TOKEN}" ]; then
-    curl -fsSL -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" "http://169.254.169.254/latest/meta-data/${path}"
+  if [ -n "$${IMDS_TOKEN}" ]; then
+    curl -fsSL -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" "http://169.254.169.254/latest/meta-data/$${path}"
   else
-    curl -fsSL "http://169.254.169.254/latest/meta-data/${path}"
+    curl -fsSL "http://169.254.169.254/latest/meta-data/$${path}"
   fi
 }
 PUBLIC_IPV4="$(imds_get public-ipv4 || true)"
-if [ -n "${PUBLIC_IPV4}" ]; then
+if [ -n "$${PUBLIC_IPV4}" ]; then
   EXTERNAL_ADDRESSES_TOML=$(cat <<EOF_EXTERNAL
 external_addresses = [
-  "/ip4/${PUBLIC_IPV4}/tcp/${trainer_p2p_port}",
-  "/ip4/${PUBLIC_IPV4}/udp/${trainer_p2p_port}/quic-v1",
-  "/ip4/${PUBLIC_IPV4}/udp/${trainer_webrtc_port}/webrtc-direct",
+  "/ip4/$${PUBLIC_IPV4}/tcp/${trainer_p2p_port}",
+  "/ip4/$${PUBLIC_IPV4}/udp/${trainer_p2p_port}/quic-v1",
+  "/ip4/$${PUBLIC_IPV4}/udp/${trainer_webrtc_port}/webrtc-direct",
 ]
 EOF_EXTERNAL
 )
@@ -93,7 +93,7 @@ listen_addresses = [
   "/ip4/0.0.0.0/udp/${trainer_p2p_port}/quic-v1",
   "/ip4/0.0.0.0/udp/${trainer_webrtc_port}/webrtc-direct",
 ]
-${EXTERNAL_ADDRESSES_TOML}
+$${EXTERNAL_ADDRESSES_TOML}
 
 [manifest]
 project_family_id = "${trainer_project_family_id}"

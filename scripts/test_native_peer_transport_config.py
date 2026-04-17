@@ -23,9 +23,9 @@ for fragment in required_main_tf_fragments:
 
 required_template_fragments = [
     '"/ip4/0.0.0.0/udp/${trainer_webrtc_port}/webrtc-direct"',
-    '"/ip4/${PUBLIC_IPV4}/udp/${trainer_webrtc_port}/webrtc-direct"',
+    '"/ip4/$${PUBLIC_IPV4}/udp/${trainer_webrtc_port}/webrtc-direct"',
     '"/ip4/0.0.0.0/udp/${validator_webrtc_port}/webrtc-direct"',
-    '"/ip4/${PUBLIC_IPV4}/udp/${validator_webrtc_port}/webrtc-direct"',
+    '"/ip4/$${PUBLIC_IPV4}/udp/${validator_webrtc_port}/webrtc-direct"',
 ]
 
 for fragment in required_template_fragments[:2]:

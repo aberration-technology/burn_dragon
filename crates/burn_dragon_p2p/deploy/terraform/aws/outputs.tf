@@ -183,6 +183,11 @@ output "seed_node_quic_multiaddr" {
   value       = "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1"
 }
 
+output "seed_node_webrtc_multiaddr" {
+  description = "WebRTC-direct bootstrap multiaddr advertised to browser peers."
+  value       = "/dns4/${var.edge_domain_name}/udp/${local.p2p_webrtc_port}/webrtc-direct"
+}
+
 output "secret_parameter_prefix" {
   description = "SSM parameter prefix read by the bootstrap edge at runtime."
   value       = var.secret_parameter_prefix

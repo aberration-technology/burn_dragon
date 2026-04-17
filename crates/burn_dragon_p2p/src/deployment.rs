@@ -251,6 +251,16 @@ pub fn assert_deployment_ready(report: &DeploymentDiagnosticsReport) -> Result<(
 }
 
 #[cfg(feature = "native")]
+fn browser_webrtc_direct_runtime_supported() -> bool {
+    burn_p2p::native_browser_webrtc_direct_runtime_supported()
+}
+
+#[cfg(feature = "native")]
+fn browser_webtransport_gateway_runtime_supported() -> bool {
+    burn_p2p::native_browser_webtransport_gateway_runtime_supported()
+}
+
+#[cfg(feature = "native")]
 fn fetch_deployment_edge_snapshot(
     config: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
@@ -460,10 +470,12 @@ pub fn evaluate_deployment_readiness(
     if !edge_snapshot.ok {
         blocking_issues.push("edge_snapshot_unavailable".into());
     } else if let Some(snapshot) = edge_snapshot.value.as_ref() {
-        if snapshot.transports.webrtc_direct {
+        if snapshot.transports.webrtc_direct && !browser_webrtc_direct_runtime_supported() {
             blocking_issues.push("webrtc_direct_advertised_without_runtime_support".into());
         }
-        if snapshot.transports.webtransport_gateway {
+        if snapshot.transports.webtransport_gateway
+            && !browser_webtransport_gateway_runtime_supported()
+        {
             blocking_issues.push("webtransport_gateway_advertised_without_runtime_support".into());
         }
         if !snapshot.matching_directory_entry_present {
@@ -786,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_readiness_blocks_on_webrtc_surface_until_runtime_support_exists() {
+    fn deployment_readiness_allows_webrtc_surface_once_runtime_support_exists() {
         let mut edge = edge_check(true);
         if let Some(snapshot) = edge.value.as_mut() {
             snapshot.transports.webrtc_direct = true;
@@ -805,9 +817,9 @@ mod tests {
             false,
         );
 
-        assert!(!readiness.ready);
+        assert!(readiness.ready);
         assert!(
-            readiness
+            !readiness
                 .blocking_issues
                 .contains(&"webrtc_direct_advertised_without_runtime_support".to_owned())
         );

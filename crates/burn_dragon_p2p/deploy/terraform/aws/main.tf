@@ -86,6 +86,7 @@ locals {
     trainer_auth_bundle               = "${var.secret_parameter_prefix}/trainer_auth_bundle_json"
     validator_auth_bundle             = "${var.secret_parameter_prefix}/validator_auth_bundle_json"
   }
+  p2p_webrtc_port              = var.p2p_port + 2
   bootstrap_primary_private_ip = "10.42.1.10"
   bootstrap_peer_internal_multiaddrs = [
     "/ip4/${local.bootstrap_primary_private_ip}/tcp/${var.p2p_port}",
@@ -572,6 +573,7 @@ locals {
         "/ip4/0.0.0.0/tcp/${var.p2p_port}",
         "/ip4/127.0.0.1/tcp/${var.p2p_port + 1}/ws",
         "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
+        "/ip4/0.0.0.0/udp/${local.p2p_webrtc_port}/webrtc-direct",
       ]
       authority = null
       archive = {
@@ -657,6 +659,7 @@ locals {
           "/ip4/0.0.0.0/tcp/${var.p2p_port}",
           "/ip4/127.0.0.1/tcp/${var.p2p_port + 1}/ws",
           "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
+          "/ip4/0.0.0.0/udp/${local.p2p_webrtc_port}/webrtc-direct",
         ]
       }
     }
@@ -946,6 +949,13 @@ resource "aws_security_group" "bootstrap" {
   ingress {
     from_port   = var.p2p_port
     to_port     = var.p2p_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = local.p2p_webrtc_port
+    to_port     = local.p2p_webrtc_port
     protocol    = "udp"
     cidr_blocks = ["0.0.0.0/0"]
   }

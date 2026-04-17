@@ -12,7 +12,9 @@ def main() -> None:
 
     workflow_text = workflow_path.read_text()
     required_snippets = [
+        'with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:',
         'with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:',
+        'seed_urls.extend(value for value in (record.get("multiaddrs") or []) if value)',
         'seed_urls.append(f"/dns4/{host}/tcp/443/wss")',
         'browser pages deploy requires at least one browser-capable seed multiaddr',
     ]

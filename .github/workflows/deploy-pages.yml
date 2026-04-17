@@ -76,6 +76,7 @@ jobs:
 
           edge_base_url="${{ github.event.inputs.edge_base_url }}"
           seed_node_urls="${{ github.event.inputs.seed_node_urls }}"
+          seed_node_urls_from_env="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
           selected_experiment_id="${{ github.event.inputs.selected_experiment_id }}"
           selected_revision_id="${{ github.event.inputs.selected_revision_id }}"
           browser_app_base_url="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
@@ -92,9 +93,6 @@ jobs:
           fi
           if [ -z "$edge_base_url" ]; then
             edge_base_url="https://edge.dragon.aberration.technology"
-          fi
-          if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
           fi
           if [ -z "$selected_experiment_id" ]; then
             selected_experiment_id="${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID }}"
@@ -117,29 +115,37 @@ jobs:
 
               edge_base_url = sys.argv[1].rstrip("/")
               host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
-              transports = {}
+              seed_urls = []
               fetched_snapshot = False
 
               try:
-                  with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
-                      transports = (json.load(response).get("transports") or {})
-                      fetched_snapshot = True
+                  with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:
+                      payload = json.load(response)
+                  signed = payload.get("payload", {}).get("payload", {})
+                  for record in signed.get("seeds") or []:
+                      seed_urls.extend(value for value in (record.get("multiaddrs") or []) if value)
               except Exception:
-                  transports = {}
+                  seed_urls = []
 
-              seed_urls = []
-              if transports.get("webrtc_direct"):
-                  seed_urls.append(f"/dns4/{host}/udp/4001/webrtc-direct")
-              if transports.get("webtransport_gateway"):
-                  seed_urls.append(f"/dns4/{host}/udp/443/webtransport")
-              if transports.get("wss_fallback"):
-                  seed_urls.append(f"/dns4/{host}/tcp/443/wss")
+              if not seed_urls:
+                  try:
+                      with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
+                          transports = (json.load(response).get("transports") or {})
+                          fetched_snapshot = True
+                  except Exception:
+                      transports = {}
+
+                  if transports.get("wss_fallback"):
+                      seed_urls.append(f"/dns4/{host}/tcp/443/wss")
 
               if not seed_urls and not fetched_snapshot:
                   seed_urls.append(f"/dns4/{host}/tcp/443/wss")
 
-              print(",".join(seed_urls))
+              print(",".join(dict.fromkeys(seed_urls)))
               ' "$edge_base_url")"
+          fi
+          if [ -z "$seed_node_urls" ]; then
+            seed_node_urls="$seed_node_urls_from_env"
           fi
           IFS=',' read -r -a seed_node_url_array <<<"$seed_node_urls"
           browser_seed_count=0

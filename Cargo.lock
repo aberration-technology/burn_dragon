@@ -1984,7 +1984,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -2013,7 +2013,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_admin"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p",
  "burn_p2p_core",
@@ -2028,7 +2028,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_app"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_browser",
  "burn_p2p_views",
@@ -2045,7 +2045,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_bootstrap"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "anyhow",
  "burn_p2p",
@@ -2071,7 +2071,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_browser"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "base64 0.22.1",
  "burn_p2p",
@@ -2097,7 +2097,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_checkpoint"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2111,7 +2111,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_core"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "chrono",
  "ciborium",
@@ -2125,7 +2125,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_dataloader"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2140,7 +2140,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_engine"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn 0.21.0-pre.3",
  "burn-store 0.21.0-pre.3",
@@ -2154,7 +2154,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_experiment"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2166,7 +2166,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_limits"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2177,7 +2177,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_metrics"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2189,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_publish"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_security"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2218,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_swarm"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "async-trait",
  "burn_p2p_core",
@@ -2250,7 +2250,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_views"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2265,7 +2265,7 @@ dependencies = [
 [[package]]
 name = "burn_p2p_workload"
 version = "0.21.0-pre.15"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=c41bf6def78cb35fc0efe447dcf880be76f75d00#c41bf6def78cb35fc0efe447dcf880be76f75d00"
+source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=b4ddb619a43d04e250ff813637f4bd90d6aef1ca#b4ddb619a43d04e250ff813637f4bd90d6aef1ca"
 dependencies = [
  "anyhow",
  "burn_p2p_checkpoint",
@@ -7180,6 +7180,7 @@ dependencies = [
  "libp2p-tls",
  "libp2p-upnp",
  "libp2p-webrtc-websys",
+ "libp2p-websocket",
  "libp2p-websocket-websys",
  "libp2p-webtransport-websys",
  "libp2p-yamux",
@@ -7690,6 +7691,27 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "libp2p-websocket"
+version = "0.45.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520e29066a48674c007bc11defe5dce49908c24cafd8fad2f5e1a6a8726ced53"
+dependencies = [
+ "either",
+ "futures",
+ "futures-rustls",
+ "libp2p-core",
+ "libp2p-identity",
+ "parking_lot",
+ "pin-project-lite",
+ "rw-stream-sink",
+ "soketto",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -11640,6 +11662,21 @@ dependencies = [
  "byteorder",
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "soketto"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e859df029d160cb88608f5d7df7fb4753fd20fdfb4de5644f3d8b8440841721"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "httparse",
+ "log",
+ "rand 0.8.5",
+ "sha1",
 ]
 
 [[package]]

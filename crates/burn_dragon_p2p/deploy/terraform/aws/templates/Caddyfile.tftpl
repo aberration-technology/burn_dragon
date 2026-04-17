@@ -13,6 +13,11 @@ https://${edge_domain_name} {
 
 %{ if browser_app_base_url != "" ~}
     @preflight method OPTIONS
+    @p2p_websocket {
+        method GET
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
     @browser_shell_get {
         method GET HEAD
         path / /index.html /callback/github /callback/github/* /callback/oidc /callback/oidc/* /callback/oauth /callback/oauth/*
@@ -31,6 +36,10 @@ https://${edge_domain_name} {
         respond "" 204
     }
 
+    handle @p2p_websocket {
+        reverse_proxy 127.0.0.1:${p2p_port}
+    }
+
     handle @browser_shell_get {
         redir ${browser_app_base_url}{uri} 302
     }
@@ -44,6 +53,14 @@ https://${edge_domain_name} {
         reverse_proxy 127.0.0.1:${http_port}
     }
 %{ else ~}
+    @p2p_websocket {
+        method GET
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @p2p_websocket {
+        reverse_proxy 127.0.0.1:${p2p_port}
+    }
     reverse_proxy 127.0.0.1:${http_port}
 %{ endif ~}
 }

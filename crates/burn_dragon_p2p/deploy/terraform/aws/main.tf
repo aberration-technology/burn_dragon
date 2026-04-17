@@ -531,6 +531,7 @@ locals {
       bootstrap_addresses = local.bootstrap_peer_internal_multiaddrs
       listen_addresses = [
         "/ip4/0.0.0.0/tcp/${var.p2p_port}",
+        "/ip4/0.0.0.0/tcp/${var.p2p_port}/ws",
         "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
       ]
       authority = null
@@ -615,6 +616,7 @@ locals {
         bootstrap_peers = local.bootstrap_peer_internal_multiaddrs
         listen_addresses = [
           "/ip4/0.0.0.0/tcp/${var.p2p_port}",
+          "/ip4/0.0.0.0/tcp/${var.p2p_port}/ws",
           "/ip4/0.0.0.0/udp/${var.p2p_port}/quic-v1",
         ]
       }
@@ -650,6 +652,7 @@ locals {
     acme_contact_email   = local.acme_contact_email
     edge_domain_name     = var.edge_domain_name
     http_port            = var.http_port
+    p2p_port             = var.p2p_port
     browser_app_base_url = local.browser_app_base_url == null ? "" : local.browser_app_base_url
     browser_app_origin   = local.browser_app_origin
   })

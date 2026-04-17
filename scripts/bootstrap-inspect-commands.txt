@@ -11,6 +11,10 @@ systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
 echo "--- binary presence ---"
 ls -l /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native /usr/local/bin/burn-dragon-p2p-sync-secrets 2>&1 || true
+echo "--- binary fingerprints ---"
+sha256sum /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native 2>&1 || true
+echo "--- bootstrap binary transport strings ---"
+strings /usr/local/bin/burn-p2p-bootstrap 2>/dev/null | grep -E 'webrtc-direct|webtransport|wss|browser/seeds/signed|portal/snapshot' | sort -u || true
 echo "--- authenticated directory probe ---"
 auth_bundle_path="/var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json"
 if [ -f "$auth_bundle_path" ]; then
@@ -35,4 +39,5 @@ echo "--- recent journals ---"
 journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 160 || true
 echo "--- local edge probes ---"
 curl -fsS http://127.0.0.1:8787/portal/snapshot || true
+curl -fsS http://127.0.0.1:8787/browser/seeds/signed || true
 curl -fsS http://127.0.0.1:8787/heads || true

@@ -1466,6 +1466,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let transport_connected = view
         .as_ref()
         .is_some_and(|view| view.network.swarm_status.connected_transport.is_some());
+    #[cfg(feature = "wasm-peer")]
+    let direct_transport_ready = view
+        .as_ref()
+        .is_some_and(|view| view.network.direct_peers > 0);
     let connected_panel_title = "live peer";
     let connected_panel_detail = live_notice
         .as_ref()
@@ -1623,6 +1627,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let train_button = {
         let has_training_config = has_connected_view
             && has_active_checkpoint
+            && direct_transport_ready
             && resolved_edge_base_url(&initial_config).is_ok()
             && browser_can_attempt_dynamic_training;
         rsx! {

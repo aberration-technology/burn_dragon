@@ -47,15 +47,15 @@ burn_dragon_tokenizer = { version = "=0.21.0-pre.15", path = "crates/burn_dragon
 burn_dragon_train = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_train", default-features = false }
 burn_dragon_universality = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_universality", default-features = false }
 
-burn_p2p = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f", default-features = false }
-burn_p2p_admin = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_app = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f", default-features = false }
-burn_p2p_bootstrap = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_browser = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_core = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_dataloader = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_views = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
-burn_p2p_workload = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "58a4effddb2ebd832f10b6725033bd5a9761274f" }
+burn_p2p = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872", default-features = false }
+burn_p2p_admin = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_app = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872", default-features = false }
+burn_p2p_bootstrap = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_browser = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_core = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_dataloader = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_views = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
+burn_p2p_workload = { git = "https://github.com/aberration-technology/burn_p2p.git", rev = "8bd8387c5f58cf7c2efb2b2c9f74cc5fd6393872" }
 
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

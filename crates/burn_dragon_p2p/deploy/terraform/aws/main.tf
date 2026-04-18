@@ -2504,9 +2504,12 @@ resource "aws_eip" "bootstrap" {
 }
 
 resource "aws_route53_health_check" "edge_primary" {
-  ip_address        = aws_eip.bootstrap.public_ip
-  type              = "TCP"
+  fqdn              = var.edge_domain_name
+  type              = "HTTPS"
   port              = 443
+  resource_path     = "/portal/snapshot"
+  enable_sni        = true
+  measure_latency   = true
   request_interval  = 30
   failure_threshold = 3
 

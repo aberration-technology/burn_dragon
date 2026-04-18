@@ -43,6 +43,8 @@ impl BrowserBootstrapDocument {
             Self::Site(config) => DragonBrowserSiteBootstrap {
                 config: DragonBrowserAppConfig::from_site_config(config),
                 release_manifest: None,
+                edge_snapshot: None,
+                signed_seed_advertisement: None,
             },
         }
     }
@@ -53,6 +55,8 @@ fn default_bootstrap() -> DragonBrowserSiteBootstrap {
     DragonBrowserSiteBootstrap {
         config: DragonBrowserAppConfig::from_site_config(BrowserSiteBootstrapConfig::new(None)),
         release_manifest: None,
+        edge_snapshot: None,
+        signed_seed_advertisement: None,
     }
 }
 
@@ -108,6 +112,8 @@ fn App() -> Element {
                 DragonBrowserApp {
                     config: bootstrap.config,
                     release_manifest: bootstrap.release_manifest,
+                    edge_snapshot: bootstrap.edge_snapshot,
+                    signed_seed_advertisement: bootstrap.signed_seed_advertisement,
                 }
             }
         }

@@ -11,6 +11,7 @@ use burn_p2p_app::{
 use burn_p2p_browser::{
     BrowserAppConnectConfig, BrowserAppController, BrowserSessionState, browser_transport_kind,
 };
+use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
     DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
@@ -226,9 +227,13 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
 async fn resolve_browser_release_manifest(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
 ) -> Result<ClientReleaseManifest> {
     if let Some(release_manifest) = release_manifest {
         return Ok(release_manifest.clone());
+    }
+    if let Some(snapshot) = edge_snapshot {
+        return Ok(browser_release_manifest_from_snapshot(snapshot));
     }
 
     let edge_base_url = resolved_edge_base_url(config)?;
@@ -239,6 +244,7 @@ async fn resolve_browser_release_manifest(
 #[cfg(feature = "wasm-peer")]
 async fn resolve_browser_training_config(
     config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
 ) -> Result<crate::config::DragonBrowserTrainingConfig> {
     if let Some(mut training) = config.training.clone() {
         if training.training_lease.is_none() {
@@ -247,8 +253,12 @@ async fn resolve_browser_training_config(
         return Ok(training);
     }
 
-    let edge_base_url = resolved_edge_base_url(config)?;
-    let snapshot = fetch_edge_snapshot(&edge_base_url).await?;
+    let snapshot = if let Some(snapshot) = edge_snapshot {
+        snapshot.clone()
+    } else {
+        let edge_base_url = resolved_edge_base_url(config)?;
+        fetch_edge_snapshot(&edge_base_url).await?
+    };
     let entry = find_matching_entry(
         &snapshot.directory.entries,
         config.selected_experiment_id.as_deref(),
@@ -858,10 +868,12 @@ fn spawn_hero_rattle_loop(
 pub async fn resume_or_complete_browser_auth(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
 ) -> Result<Option<BrowserSessionState>> {
     let edge_base_url = resolved_edge_base_url(config)?;
     if let Some(provider_code) = provider_code_from_window_location() {
-        let release_manifest = resolve_browser_release_manifest(config, release_manifest).await?;
+        let release_manifest =
+            resolve_browser_release_manifest(config, release_manifest, edge_snapshot).await?;
         let session = complete_browser_github_login(
             &edge_base_url,
             &release_manifest,
@@ -883,10 +895,12 @@ pub async fn resume_or_complete_browser_auth(
 pub async fn start_browser_github_auth_with_scopes(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
     requested_scopes: std::collections::BTreeSet<ExperimentScope>,
 ) -> Result<()> {
     let edge_base_url = resolved_edge_base_url(config)?;
-    let release_manifest = resolve_browser_release_manifest(config, release_manifest).await?;
+    let release_manifest =
+        resolve_browser_release_manifest(config, release_manifest, edge_snapshot).await?;
     let login = begin_browser_github_login(
         &edge_base_url,
         &release_manifest,
@@ -909,15 +923,23 @@ pub async fn start_browser_github_auth_with_scopes(
 pub async fn start_browser_github_auth(
     config: &DragonBrowserAppConfig,
     release_manifest: Option<&ClientReleaseManifest>,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
 ) -> Result<()> {
-    start_browser_github_auth_with_scopes(config, release_manifest, config.requested_scopes.clone())
-        .await
+    start_browser_github_auth_with_scopes(
+        config,
+        release_manifest,
+        edge_snapshot,
+        config.requested_scopes.clone(),
+    )
+    .await
 }
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DragonBrowserAppProps {
     pub config: DragonBrowserAppConfig,
     pub release_manifest: Option<ClientReleaseManifest>,
+    pub edge_snapshot: Option<BrowserEdgeSnapshot>,
+    pub signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 }
 
 #[component]
@@ -965,6 +987,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     {
         let config = initial_config.clone();
         let release_manifest = props.release_manifest.clone();
+        let edge_snapshot = props.edge_snapshot.clone();
         let mut session_state = session_state;
         let mut current_view = current_view;
         let mut status = status;
@@ -977,8 +1000,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             auth_bootstrap_started.set(true);
             let config = config.clone();
             let release_manifest = release_manifest.clone();
+            let edge_snapshot = edge_snapshot.clone();
             spawn(async move {
-                match resume_or_complete_browser_auth(&config, release_manifest.as_ref()).await {
+                match resume_or_complete_browser_auth(
+                    &config,
+                    release_manifest.as_ref(),
+                    edge_snapshot.as_ref(),
+                )
+                .await
+                {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
                         if let Ok(view) = connect_browser_app(&config).await {
@@ -1056,11 +1086,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
             );
             let release_manifest = props.release_manifest.clone();
+            let edge_snapshot = props.edge_snapshot.clone();
             let mut status = status;
             spawn(async move {
                 status.set("Starting sign-in…".into());
-                if let Err(error) =
-                    start_browser_github_auth(&next_config, release_manifest.as_ref()).await
+                if let Err(error) = start_browser_github_auth(
+                    &next_config,
+                    release_manifest.as_ref(),
+                    edge_snapshot.as_ref(),
+                )
+                .await
                 {
                     status.set(error.to_string());
                 }
@@ -1079,12 +1114,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let requested_scopes =
                 admin_requested_scopes(&next_config, admin_study_id.read().as_str());
             let release_manifest = props.release_manifest.clone();
+            let edge_snapshot = props.edge_snapshot.clone();
             let mut admin_status = admin_status;
             spawn(async move {
                 admin_status.set("Starting admin sign-in…".into());
                 if let Err(error) = start_browser_github_auth_with_scopes(
                     &next_config,
                     release_manifest.as_ref(),
+                    edge_snapshot.as_ref(),
                     requested_scopes,
                 )
                 .await
@@ -1326,11 +1363,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
             );
             let release_manifest = props.release_manifest.clone();
+            let edge_snapshot = props.edge_snapshot.clone();
             let mut status = status;
             let mut session_state = session_state;
             spawn(async move {
                 status.set("Completing sign-in…".into());
-                match resume_or_complete_browser_auth(&next_config, release_manifest.as_ref()).await
+                match resume_or_complete_browser_auth(
+                    &next_config,
+                    release_manifest.as_ref(),
+                    edge_snapshot.as_ref(),
+                )
+                .await
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
@@ -1541,28 +1584,35 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
             );
             let release_manifest = props.release_manifest.clone();
+            let edge_snapshot = props.edge_snapshot.clone();
             let mut status = status;
             let mut current_view = current_view;
             let mut local_training = local_training;
             let mut local_training_pending = local_training_pending;
             spawn(async move {
-                let release_manifest =
-                    match resolve_browser_release_manifest(&next_config, release_manifest.as_ref())
-                        .await
-                    {
-                        Ok(release_manifest) => release_manifest,
-                        Err(error) => {
-                            status.set(error.to_string());
-                            return;
-                        }
-                    };
-                let training = match resolve_browser_training_config(&next_config).await {
-                    Ok(training) => training,
+                let release_manifest = match resolve_browser_release_manifest(
+                    &next_config,
+                    release_manifest.as_ref(),
+                    edge_snapshot.as_ref(),
+                )
+                .await
+                {
+                    Ok(release_manifest) => release_manifest,
                     Err(error) => {
                         status.set(error.to_string());
                         return;
                     }
                 };
+                let training =
+                    match resolve_browser_training_config(&next_config, edge_snapshot.as_ref())
+                        .await
+                    {
+                        Ok(training) => training,
+                        Err(error) => {
+                            status.set(error.to_string());
+                            return;
+                        }
+                    };
                 local_training_pending.set(true);
                 status.set("Running browser training…".into());
                 let edge_base_url = match resolved_edge_base_url(&next_config) {

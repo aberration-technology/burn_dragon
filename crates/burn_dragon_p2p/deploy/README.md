@@ -25,7 +25,7 @@ The AWS Terraform root deploys a single-region bootstrap plane for the Dragon ne
 - optional managed native trainer pool for always-on NCA or ClimbMix trainer capacity
 - managed browser dataset S3 bucket plus CloudFront hostname for ClimbMix shard-pool distribution
 - managed trainers are separate from the bootstrap nodes and default to disabled
-- EC2, Redis, dataset CDN, Route53, and managed-trainer CloudWatch alarms, optionally wired to SNS
+- EC2, Redis, dataset CDN, Route53 HTTPS app health, and managed-trainer CloudWatch alarms, optionally wired to SNS
 - shared CloudWatch dashboard for control-plane health and throughput
 - configurable browser/native auth flow through `burn-p2p-bootstrap`
 
@@ -153,7 +153,9 @@ The focused repo also ships a separate browser-shell workflow:
 
 Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`. Under the split-host production layout, use `dragon.aberration.technology` for the published Pages shell, `edge.dragon.aberration.technology` for the bootstrap API/auth edge, and `datasets.dragon.aberration.technology` for the managed shard CDN.
 
-That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static and is intended to live at `https://dragon.aberration.technology`; it still connects to the live bootstrap API/auth edge you configure. By default, the baked browser config points at `https://edge.dragon.aberration.technology` and derives the standard TCP and QUIC bootstrap multiaddrs from that host.
+That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static and is intended to live at `https://dragon.aberration.technology`; it still depends on the live bootstrap API/auth edge you configure for browser control-plane bootstrap, auth, signed browser seeds, and steady-state sync. By default, the baked browser config points at `https://edge.dragon.aberration.technology`, resolves browser-capable signed seeds from that edge, and refuses to publish a degraded WSS-only shell when the edge advertises direct browser transports.
+
+`deploy-pages.yml` now runs the live browser canary after the Pages publish completes. The workflow does not succeed unless the freshly deployed shell can boot, connect, and reach the expected browser peer path against the configured edge.
 
 The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Archive` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
 
@@ -166,7 +168,7 @@ Optional GitHub repository variables for the Pages workflow:
 - `BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID`
 - `BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID`
 
-None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, and derives `/dns4/<edge-host>/tcp/4001` plus `/dns4/<edge-host>/udp/4001/quic-v1` automatically. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
+None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, then derives browser-capable bootstrap material from the live edge before publishing. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
 
 ## Required GitHub Environment Configuration
 
@@ -216,6 +218,8 @@ The production workflow path is intentionally narrower than the full Terraform s
 - keep control-plane operational alarms enabled
 - keep the shared control-plane dashboard enabled
 - set `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN` so alarms route to a real pager or operator channel
+- keep the Route53 edge health check on `https://${BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}/portal/snapshot`, not a raw TCP 443 probe
+- keep the post-deploy Pages browser canary green before treating a browser publish as complete
 - keep the fixed recurring AWS profile under `$100`
 - keep `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` on the normal production path; scale first through browser peers and external native peers instead of an always-on managed trainer fleet
 

@@ -10,6 +10,7 @@ use burn_p2p::NetworkManifest;
 use burn_p2p::{AuthConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet, SwarmAddress};
 #[cfg(target_arch = "wasm32")]
 use burn_p2p_browser::BrowserSiteBootstrapConfig;
+use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use chrono::{DateTime, TimeZone, Utc};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -514,6 +515,10 @@ pub struct DragonBrowserSiteBootstrap {
     pub config: DragonBrowserAppConfig,
     #[serde(default)]
     pub release_manifest: Option<burn_p2p::ClientReleaseManifest>,
+    #[serde(default)]
+    pub edge_snapshot: Option<burn_p2p::BrowserEdgeSnapshot>,
+    #[serde(default)]
+    pub signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

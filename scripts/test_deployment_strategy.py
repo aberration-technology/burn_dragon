@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-burn-dragon-p2p-aws.yml"
 RESTORE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "restore-burn-dragon-p2p-aws.yml"
 README = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "README.md"
+MAIN_TF = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "terraform" / "aws" / "main.tf"
 
 
 def workflow_inputs(path: Path) -> dict[str, object]:
@@ -43,9 +44,18 @@ def main() -> None:
         "keep restore drills on `plan_only=true` until you are intentionally executing a failover",
         "The supported production bootstrap path is the published `burn_p2p_bootstrap` crate.",
         "use `git` only when validating an unpublished upstream `burn_p2p` revision.",
+        "deploy-pages.yml` now runs the live browser canary after the Pages publish completes",
+        "keep the Route53 edge health check on `https://${BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}/portal/snapshot`, not a raw TCP 443 probe",
+        "keep the post-deploy Pages browser canary green before treating a browser publish as complete",
     ]
     for snippet in required_snippets:
         assert snippet in readme, f"README missing required strategy snippet: {snippet}"
+
+    main_tf = MAIN_TF.read_text()
+    assert 'resource "aws_route53_health_check" "edge_primary"' in main_tf
+    assert 'type              = "HTTPS"' in main_tf
+    assert 'resource_path     = "/portal/snapshot"' in main_tf
+    assert 'enable_sni        = true' in main_tf
 
     print("deployment-strategy-ok")
 

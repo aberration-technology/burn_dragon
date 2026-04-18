@@ -1,11 +1,16 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
-use burn_p2p::{ExperimentId, RevisionId};
-use burn_p2p_browser::BrowserSiteBootstrapConfig;
+use burn_p2p::{
+    BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentId,
+    ExperimentScope, ProjectFamilyId,
+};
+use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use clap::{ArgAction, Args};
+use serde::Serialize;
 use wasm_bindgen_cli_support::Bindgen;
 
 const BROWSER_BIN: &str = "burn_dragon_p2p_browser";
@@ -432,6 +437,37 @@ body {
 }
 "#;
 
+#[derive(Clone, Debug, Serialize)]
+struct DragonPeerNetworkConfigDocument {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed_node_urls: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DragonBrowserAppConfigDocument {
+    network: DragonPeerNetworkConfigDocument,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_experiment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_revision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    requested_scopes: BTreeSet<ExperimentScope>,
+    require_edge_auth: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DragonBrowserSiteBootstrapDocument {
+    config: DragonBrowserAppConfigDocument,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_manifest: Option<ClientReleaseManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge_snapshot: Option<BrowserEdgeSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct BuildBrowserSiteArgs {
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
@@ -547,7 +583,7 @@ fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
     .with_context(|| format!("failed to write stylesheet in {}", out_dir.display()))?;
     fs::write(
         out_dir.join("browser-app-config.json"),
-        serde_json::to_vec_pretty(&browser_site_bootstrap_json(args))?,
+        serde_json::to_vec_pretty(&browser_site_bootstrap_json(args)?)?,
     )
     .with_context(|| format!("failed to write browser config in {}", out_dir.display()))?;
     Ok(())
@@ -565,7 +601,9 @@ fn write_html_page(out_dir: &Path, relative_path: &str, asset_prefix: &str) -> R
     Ok(())
 }
 
-fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> BrowserSiteBootstrapConfig {
+fn browser_site_bootstrap_json(
+    args: &BuildBrowserSiteArgs,
+) -> Result<DragonBrowserSiteBootstrapDocument> {
     let edge_url = args
         .edge_url
         .as_deref()
@@ -581,24 +619,149 @@ fn browser_site_bootstrap_json(args: &BuildBrowserSiteArgs) -> BrowserSiteBootst
         .map(ToOwned::to_owned)
         .collect();
 
-    let config = BrowserSiteBootstrapConfig::new(edge_url)
-        .with_seed_node_urls(seed_node_urls)
-        .with_edge_auth_requirement(args.require_edge_auth);
-    match args
+    let selected_experiment_id = args
         .selected_experiment_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let selected_revision_id = args
+        .selected_revision_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let edge_snapshot = edge_url
+        .as_deref()
+        .map(fetch_browser_edge_snapshot)
+        .transpose()?;
+    let signed_seed_advertisement = if let (Some(edge_url), Some(snapshot)) =
+        (edge_url.as_deref(), edge_snapshot.as_ref())
     {
-        Some(experiment_id) => config.with_selection(
-            ExperimentId::new(experiment_id),
-            args.selected_revision_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(RevisionId::new),
-        ),
-        None => config,
+        fetch_signed_seed_advertisement(edge_url, snapshot)?
+    } else {
+        None
+    };
+
+    Ok(DragonBrowserSiteBootstrapDocument {
+        config: DragonBrowserAppConfigDocument {
+            network: DragonPeerNetworkConfigDocument {
+                edge_base_url: edge_url,
+                seed_node_urls: (!seed_node_urls.is_empty()).then_some(seed_node_urls.clone()),
+            },
+            selected_experiment_id: selected_experiment_id.clone(),
+            selected_revision_id,
+            requested_scopes: browser_site_requested_scopes(selected_experiment_id.as_deref()),
+            require_edge_auth: args.require_edge_auth,
+        },
+        release_manifest: edge_snapshot
+            .as_ref()
+            .map(browser_release_manifest_from_snapshot),
+        edge_snapshot,
+        signed_seed_advertisement,
+    })
+}
+
+fn browser_site_requested_scopes(
+    selected_experiment_id: Option<&str>,
+) -> BTreeSet<ExperimentScope> {
+    let mut requested_scopes =
+        BTreeSet::from([ExperimentScope::Connect, ExperimentScope::Discover]);
+    if let Some(experiment_id) = selected_experiment_id {
+        let experiment_id = ExperimentId::new(experiment_id);
+        requested_scopes.insert(ExperimentScope::Train {
+            experiment_id: experiment_id.clone(),
+        });
+        requested_scopes.insert(ExperimentScope::Archive { experiment_id });
+    }
+    requested_scopes
+}
+
+fn fetch_browser_edge_snapshot(edge_url: &str) -> Result<BrowserEdgeSnapshot> {
+    let edge_url = edge_url.trim_end_matches('/');
+    reqwest::blocking::Client::new()
+        .get(format!("{edge_url}/portal/snapshot"))
+        .send()
+        .with_context(|| format!("fetch browser edge snapshot from {edge_url}/portal/snapshot"))?
+        .error_for_status()
+        .context("browser edge snapshot returned a non-success status")?
+        .json::<BrowserEdgeSnapshot>()
+        .context("decode browser edge snapshot JSON")
+}
+
+fn fetch_signed_seed_advertisement(
+    edge_url: &str,
+    snapshot: &BrowserEdgeSnapshot,
+) -> Result<Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>> {
+    let edge_url = edge_url.trim_end_matches('/');
+    let seed_path = snapshot.paths.browser_seed_advertisement_path.trim();
+    let seed_url = if seed_path.starts_with('/') {
+        format!("{edge_url}{seed_path}")
+    } else {
+        format!("{edge_url}/{seed_path}")
+    };
+    let response = reqwest::blocking::Client::new()
+        .get(&seed_url)
+        .send()
+        .with_context(|| format!("fetch signed browser seed advertisement from {seed_url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    response
+        .error_for_status()
+        .context("browser seed advertisement returned a non-success status")?
+        .json::<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>()
+        .map(Some)
+        .context("decode signed browser seed advertisement JSON")
+}
+
+fn current_app_semver() -> semver::Version {
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
+}
+
+fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> ClientReleaseManifest {
+    let target_artifact_hash = snapshot
+        .allowed_target_artifact_hashes
+        .iter()
+        .next()
+        .cloned()
+        .or_else(|| {
+            snapshot
+                .trust_bundle
+                .as_ref()
+                .and_then(|bundle| bundle.allowed_target_artifact_hashes.iter().next().cloned())
+        })
+        .unwrap_or_else(|| ContentId::new("dragon-browser-client-artifact"));
+    let release_train_hash = snapshot
+        .required_release_train_hash
+        .clone()
+        .or_else(|| {
+            snapshot
+                .trust_bundle
+                .as_ref()
+                .map(|bundle| bundle.required_release_train_hash.clone())
+        })
+        .unwrap_or_else(|| ContentId::new("dragon-browser-client-train"));
+    let project_family_id = snapshot
+        .trust_bundle
+        .as_ref()
+        .map(|bundle| bundle.project_family_id.clone())
+        .unwrap_or_else(|| ProjectFamilyId::new("burn-dragon-language"));
+
+    ClientReleaseManifest {
+        project_family_id,
+        release_train_hash,
+        target_artifact_id: "browser-wasm".into(),
+        target_artifact_hash,
+        target_platform: ClientPlatform::Browser,
+        app_semver: current_app_semver(),
+        git_commit: "browser-site".into(),
+        cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
+        burn_version_string: "0.21.0-pre.3".into(),
+        enabled_features_hash: ContentId::new("dragon-browser-site-features"),
+        protocol_major: 0,
+        supported_workloads: Vec::new(),
+        built_at: snapshot.captured_at,
     }
 }
 

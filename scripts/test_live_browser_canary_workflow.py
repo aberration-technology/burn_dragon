@@ -52,6 +52,14 @@ def main() -> None:
             ), f"{workflow_path} should not cache bootstrap-install"
         else:
             assert (
+                'environment:' in workflow_text
+                and 'burn-dragon-p2p-${{ github.event.inputs.environment || \'production\' }}'
+                in workflow_text
+            ), f"{workflow_path} missing environment-scoped canary execution"
+            assert (
+                "description: GitHub environment suffix to run against" in workflow_text
+            ), f"{workflow_path} missing canary environment selector"
+            assert (
                 'BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}'
                 in workflow_text
             ), f"{workflow_path} missing browser canary callback token secret"

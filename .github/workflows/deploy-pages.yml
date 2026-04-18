@@ -31,6 +31,11 @@ on:
         required: false
         default: nca-r1
         type: string
+      canary_principal_id:
+        description: Optional admitted principal id for the post-deploy live browser canary. Leave empty to use the environment default.
+        required: false
+        default: ""
+        type: string
       require_edge_auth:
         description: Require an authenticated edge session before joining from the published browser shell.
         required: true
@@ -50,6 +55,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
+    outputs:
+      edge_base_url: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}
+      site_base_url: ${{ steps.resolve_browser_shell_settings.outputs.browser_app_base_url }}
+      selected_experiment_id: ${{ steps.resolve_browser_shell_settings.outputs.selected_experiment_id }}
+      canary_principal_id: ${{ steps.resolve_browser_shell_settings.outputs.canary_principal_id }}
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -70,6 +80,7 @@ jobs:
         uses: actions/configure-pages@v5
 
       - name: resolve browser shell settings
+        id: resolve_browser_shell_settings
         shell: bash
         run: |
           set -euo pipefail
@@ -79,6 +90,7 @@ jobs:
           seed_node_urls_from_env="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
           selected_experiment_id="${{ github.event.inputs.selected_experiment_id }}"
           selected_revision_id="${{ github.event.inputs.selected_revision_id }}"
+          browser_canary_principal_id="${{ github.event.inputs.canary_principal_id }}"
           browser_app_base_url="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
           edge_domain_name="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
 
@@ -105,6 +117,16 @@ jobs:
           fi
           if [ -z "$selected_revision_id" ]; then
             selected_revision_id="nca-r1"
+          fi
+          if [ -z "$browser_canary_principal_id" ]; then
+            browser_canary_principal_id="${{ vars.BURN_DRAGON_P2P_BROWSER_CANARY_PRINCIPAL_ID }}"
+          fi
+          if [ -z "$browser_canary_principal_id" ]; then
+            if [ "${{ github.event.inputs.environment }}" = "production" ]; then
+              browser_canary_principal_id="browser-canary-mainnet-nca"
+            else
+              browser_canary_principal_id="browser-canary-${{ github.event.inputs.environment }}-nca"
+            fi
           fi
           if [ -z "$seed_node_urls" ]; then
             seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
@@ -232,9 +254,17 @@ jobs:
             echo "SEED_NODE_URLS=$seed_node_urls"
             echo "SELECTED_EXPERIMENT_ID=$selected_experiment_id"
             echo "SELECTED_REVISION_ID=$selected_revision_id"
+            echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"
             echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}"
             echo "SITE_HOST=$site_host"
           } >>"$GITHUB_ENV"
+
+          {
+            echo "edge_base_url=$edge_base_url"
+            echo "browser_app_base_url=$browser_app_base_url"
+            echo "selected_experiment_id=$selected_experiment_id"
+            echo "canary_principal_id=$browser_canary_principal_id"
+          } >>"$GITHUB_OUTPUT"
 
       - name: build browser site artifact
         shell: bash
@@ -278,3 +308,93 @@ jobs:
       - name: deploy to github pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  canary:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - deploy
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes playwright --version
+          npx --yes playwright install --with-deps chromium
+
+      - name: run live browser canary
+        id: live_browser_canary
+        shell: bash
+        env:
+          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ needs.build.outputs.site_base_url }}
+          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ needs.build.outputs.edge_base_url }}
+          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ needs.build.outputs.canary_principal_id }}
+          BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
+          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ needs.build.outputs.selected_experiment_id }}
+          BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
+          BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
+          BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR"
+          echo "artifact_dir=$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR" >>"$GITHUB_OUTPUT"
+          echo "report_path=$BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON" >>"$GITHUB_OUTPUT"
+          node scripts/live-browser-canary.mjs
+
+      - name: summarize live browser canary
+        if: ${{ always() && steps.live_browser_canary.outputs.report_path != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="${{ steps.live_browser_canary.outputs.report_path }}"
+          if [ ! -f "$report_path" ]; then
+            exit 0
+          fi
+
+          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          receipt = report.get("receipt_submission") or {}
+          control_requests = report.get("quiet_window_control_plane_requests") or []
+          artifact_fallback = report.get("artifact_http_fallback_requests") or []
+          live_status = report.get("live_status_label") or "n/a"
+          live_tiles = report.get("live_stat_tiles") or []
+          transport_tile = "n/a"
+          for tile in live_tiles:
+              if not tile:
+                  continue
+              if (tile[0] or "").strip().lower() == "transport":
+                  transport_tile = " | ".join(part for part in tile[1:] if part)
+                  break
+
+          print("## live browser canary")
+          print()
+          print(f"- Success: `{report.get('success', False)}`")
+          print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
+          print(f"- Live status: `{live_status}`")
+          print(f"- Transport tile: `{transport_tile}`")
+          print(f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`")
+          print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
+          print(f"- Training button visible: `{report.get('training_button_visible', False)}`")
+          print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
+          print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
+          print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
+          print(f"- Error: `{report.get('error') or 'none'}`")
+          PY
+
+      - name: upload live browser canary artifact
+        if: ${{ always() && steps.live_browser_canary.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-live-browser-canary
+          path: ${{ steps.live_browser_canary.outputs.artifact_dir }}
+          if-no-files-found: ignore

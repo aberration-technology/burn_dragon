@@ -26,6 +26,14 @@ def main() -> None:
         'browser pages deploy refusing to publish degraded WSS-only config while direct browser transports are advertised',
         'seed_urls.append(f"/dns4/{host}/tcp/443/wss")',
         'browser pages deploy requires at least one browser-capable seed multiaddr',
+        'canary_principal_id:',
+        'needs:\n      - build\n      - deploy',
+        'BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ needs.build.outputs.site_base_url }}',
+        'BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ needs.build.outputs.edge_base_url }}',
+        'BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ needs.build.outputs.canary_principal_id }}',
+        'BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}',
+        'node scripts/live-browser-canary.mjs',
+        'burn-dragon-live-browser-canary',
     ]
     for snippet in required_snippets:
         assert snippet in workflow_text, f"deploy-pages.yml missing required snippet: {snippet}"

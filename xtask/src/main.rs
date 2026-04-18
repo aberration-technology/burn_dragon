@@ -270,6 +270,7 @@ fn cargo_native_test(filter: Option<&str>, ignored: bool) -> Result<()> {
     if ignored {
         args.push("--ignored");
     }
+    args.push("--test-threads=1");
     args.push("--nocapture");
     run("cargo", &args)
 }

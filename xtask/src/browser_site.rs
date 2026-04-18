@@ -183,11 +183,13 @@ body {
 .dragon-eyebrow-rattle {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   min-width: 1.2ch;
   color: var(--accent);
   font-family: "Iosevka Etoile", "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.92em;
   line-height: 1;
+  transform: translateY(-0.08em);
 }
 
 .dragon-browser-shell .browser-hero-bar {

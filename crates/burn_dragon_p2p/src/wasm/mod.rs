@@ -48,8 +48,10 @@ pub mod training;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-const HERO_RATTLE_INTERVAL_MILLIS: u32 = 90;
-const HERO_RATTLE_FRAMES: &[&str] = &["⣾", "⣷", "⣯", "⣟", "⣻", "⣽"];
+const HERO_RATTLE_INTERVAL_MILLIS: u32 = 80;
+const HERO_RATTLE_FRAMES: &[&str] = &[
+    "⠉⠉", "⠈⠙", "⠀⠹", "⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁",
+];
 
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };

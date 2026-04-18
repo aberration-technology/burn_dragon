@@ -92,6 +92,31 @@ def wait_for_runtime_sync_prereqs_command() -> str:
     )
 
 
+def bootstrap_public_ip_rewrite_commands() -> list[str]:
+    return [
+        "IMDS_TOKEN=$(curl -fsSL -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' || true)",
+        "BOOTSTRAP_PUBLIC_IPV4=$(if [ -n \"$IMDS_TOKEN\" ]; then curl -fsSL -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" http://169.254.169.254/latest/meta-data/public-ipv4; else curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4; fi || true)",
+        """if [ -n "$BOOTSTRAP_PUBLIC_IPV4" ]; then python3 - "$BOOTSTRAP_PUBLIC_IPV4" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path("/etc/burn-dragon-p2p/bootstrap.json")
+config = json.loads(config_path.read_text())
+external_addresses = (
+    config.get("bootstrap_peer", {})
+    .get("node", {})
+    .get("external_addresses", [])
+)
+config["bootstrap_peer"]["node"]["external_addresses"] = [
+    address.replace("PUBLIC_IP", sys.argv[1]) for address in external_addresses
+]
+config_path.write_text(json.dumps(config, indent=2) + "\\n")
+PY
+fi""",
+    ]
+
+
 def generate_commands(env: Mapping[str, str]) -> list[str]:
     preamble = [
         "set -eu",
@@ -131,6 +156,8 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         "systemctl is-active burn-p2p-bootstrap",
         "journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 60 || true",
     ]
+
+    commands[7:7] = bootstrap_public_ip_rewrite_commands()
 
     bootstrap_binary_object_uri = env.get("BOOTSTRAP_BINARY_OBJECT_URI", "")
     bootstrap_binary_sha256 = env.get("BOOTSTRAP_BINARY_SHA256", "").strip()

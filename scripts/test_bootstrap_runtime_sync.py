@@ -77,6 +77,26 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         self.assertIn("systemctl enable burn-dragon-p2p-head-mirror", joined)
         self.assertNotIn("systemctl restart burn-dragon-p2p-head-mirror", joined)
 
+    def test_runtime_sync_rewrites_bootstrap_public_ip_placeholder_after_copy(self) -> None:
+        commands = module.generate_commands(base_env())
+        bootstrap_copy_index = commands.index(
+            "aws s3 cp 's3://bucket/runtime/bootstrap.json' /etc/burn-dragon-p2p/bootstrap.json"
+        )
+        public_ip_fetch_index = next(
+            index
+            for index, command in enumerate(commands)
+            if "latest/meta-data/public-ipv4" in command
+        )
+        rewrite_index = next(
+            index
+            for index, command in enumerate(commands)
+            if 'address.replace("PUBLIC_IP", sys.argv[1])' in command
+        )
+        restart_index = commands.index("systemctl restart burn-p2p-bootstrap")
+        self.assertLess(bootstrap_copy_index, public_ip_fetch_index)
+        self.assertLess(public_ip_fetch_index, rewrite_index)
+        self.assertLess(rewrite_index, restart_index)
+
     def test_git_path_requires_and_uses_bootstrap_git_ref(self) -> None:
         env = base_env()
         env["BOOTSTRAP_INSTALL_SOURCE"] = "git"

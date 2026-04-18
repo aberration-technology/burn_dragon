@@ -667,7 +667,7 @@ locals {
         external_addresses = [
           "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
           "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1",
-          "/dns4/${var.edge_domain_name}/udp/${local.p2p_webrtc_port}/webrtc-direct",
+          "/ip4/PUBLIC_IP/udp/${local.p2p_webrtc_port}/webrtc-direct",
         ]
       }
     }

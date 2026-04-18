@@ -260,7 +260,12 @@ function statTileValue(tiles, label) {
 }
 
 function isDialableWebRtcSeed(seed) {
-  return seed.includes("/webrtc-direct") && seed.includes("/certhash/");
+  const segments = seed.split("/").filter(Boolean);
+  return (
+    (segments[0] === "ip4" || segments[0] === "ip6") &&
+    segments.includes("webrtc-direct") &&
+    segments.includes("certhash")
+  );
 }
 
 function isDialableWebTransportSeed(seed) {

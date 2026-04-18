@@ -122,7 +122,7 @@ jobs:
           def is_dialable_browser_seed(value: str) -> bool:
               segments = [segment for segment in value.split("/") if segment]
               if "webrtc-direct" in segments:
-                  return "certhash" in segments
+                  return bool(segments) and segments[0] in {"ip4", "ip6"} and "certhash" in segments
               if "webtransport" in segments:
                   return "quic-v1" in segments and "certhash" in segments
               return "wss" in segments or "ws" in segments
@@ -130,7 +130,7 @@ jobs:
           def is_direct_browser_seed(value: str) -> bool:
               segments = [segment for segment in value.split("/") if segment]
               if "webrtc-direct" in segments:
-                  return "certhash" in segments
+                  return bool(segments) and segments[0] in {"ip4", "ip6"} and "certhash" in segments
               if "webtransport" in segments:
                   return "quic-v1" in segments and "certhash" in segments
               return False

@@ -20,7 +20,7 @@ def main() -> None:
         'def is_direct_browser_seed(value: str) -> bool:',
         'def snapshot_advertises_direct_transports(transports: dict[str, object]) -> bool:',
         'if "webrtc-direct" in segments:',
-        'return "certhash" in segments',
+        'segments[0] in {"ip4", "ip6"} and "certhash" in segments',
         'if "webtransport" in segments:',
         'return "quic-v1" in segments and "certhash" in segments',
         'browser pages deploy refusing to publish degraded WSS-only config while direct browser transports are advertised',

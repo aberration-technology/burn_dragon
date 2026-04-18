@@ -100,9 +100,40 @@ ${secret_sync_script}
 EOF_SYNC
 chmod 0755 /usr/local/bin/burn-dragon-p2p-sync-secrets
 
+IMDS_TOKEN="$(curl -fsSL -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' || true)"
+imds_get() {
+  local path="$1"
+  if [ -n "$${IMDS_TOKEN}" ]; then
+    curl -fsSL -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" "http://169.254.169.254/latest/meta-data/$${path}"
+  else
+    curl -fsSL "http://169.254.169.254/latest/meta-data/$${path}"
+  fi
+}
+
 cat >/etc/burn-dragon-p2p/bootstrap.json <<'EOF_CONFIG'
 ${bootstrap_config_json}
 EOF_CONFIG
+
+BOOTSTRAP_PUBLIC_IPV4="$(imds_get public-ipv4 || true)"
+if [ -n "$${BOOTSTRAP_PUBLIC_IPV4}" ]; then
+  python3 - "$${BOOTSTRAP_PUBLIC_IPV4}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path("/etc/burn-dragon-p2p/bootstrap.json")
+config = json.loads(config_path.read_text())
+external_addresses = (
+    config.get("bootstrap_peer", {})
+    .get("node", {})
+    .get("external_addresses", [])
+)
+config["bootstrap_peer"]["node"]["external_addresses"] = [
+    address.replace("PUBLIC_IP", sys.argv[1]) for address in external_addresses
+]
+config_path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+fi
 
 cat >/etc/caddy/Caddyfile <<'EOF_CADDY'
 ${caddyfile}

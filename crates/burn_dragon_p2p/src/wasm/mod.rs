@@ -55,6 +55,10 @@ thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };
 }
 
+fn current_app_semver() -> semver::Version {
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
+}
+
 #[cfg(feature = "wasm-peer")]
 fn browser_backend_label(config: &crate::config::DragonBrowserTrainingConfig) -> &'static str {
     config.execution_backend.backend_label()
@@ -194,9 +198,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         .as_ref()
         .map(|bundle| bundle.project_family_id.clone())
         .unwrap_or_else(|| ProjectFamilyId::new("burn-dragon-language"));
-    let app_semver = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| {
-        semver::Version::parse("0.21.0-pre.15").expect("valid burn_dragon version")
-    });
+    let app_semver = current_app_semver();
 
     ClientReleaseManifest {
         project_family_id,

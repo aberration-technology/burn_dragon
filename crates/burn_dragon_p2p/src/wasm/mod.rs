@@ -939,7 +939,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut status = status;
         let mut auth_bootstrap_started = auth_bootstrap_started;
         let mut auth_bootstrap_pending = auth_bootstrap_pending;
-        let checkpoint_wait_generation = checkpoint_wait_generation;
         use_effect(move || {
             if *auth_bootstrap_started.read() {
                 return;
@@ -1449,8 +1448,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     {
         let mut hero_rattle_state = hero_rattle_state;
-        let hero_rattle_index = hero_rattle_index;
-        let hero_rattle_generation = hero_rattle_generation;
         use_effect(move || {
             if *hero_rattle_state.read() == Some(hero_rattle_active) {
                 return;
@@ -1759,10 +1756,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         tone: "neutral",
                     }
                 }
-                if needs_sign_in
-                    || ready_to_connect
-                    || (debug_controls_enabled && (ready_to_connect || has_connected_view))
-                {
+                if needs_sign_in || ready_to_connect || (debug_controls_enabled && has_connected_view) {
                     div { class: "browser-hero-bar",
                         div { class: "dragon-connection-editor",
                             div { class: "browser-action-row",

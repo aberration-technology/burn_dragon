@@ -67,6 +67,7 @@ jobs:
       - run: python3 scripts/test_bootstrap_head_mirror_seed_urls.py
       - run: python3 scripts/test_head_mirror_admin_capability.py
       - run: python3 scripts/test_cleanup_workflow.py
+      - run: python3 scripts/test_deployment_strategy.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
       - run: python3 scripts/test_edge_caddyfile.py
       - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/live-browser-canary.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
@@ -140,3 +141,26 @@ jobs:
           terraform_version: 1.14.8
       - run: terraform -chdir="$TF_ROOT" init -backend=false -input=false
       - run: terraform -chdir="$TF_ROOT" validate
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - artifact-validation
+      - browser-site
+      - terraform-validate
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: dispatch production deploy workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f environment=production \
+            -f terraform_workspace=mainnet

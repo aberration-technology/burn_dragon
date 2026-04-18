@@ -10,6 +10,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-burn-dragon-p2p-aws.yml"
 RESTORE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "restore-burn-dragon-p2p-aws.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 README = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "README.md"
 MAIN_TF = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "terraform" / "aws" / "main.tf"
 
@@ -36,6 +37,24 @@ def main() -> None:
     assert deploy_inputs["managed_trainer_backend"]["default"] == "cpu"
     assert restore_inputs["plan_only"]["default"] is True
 
+    ci_workflow = yaml.safe_load(CI_WORKFLOW.read_text())
+    ci_on = ci_workflow.get("on", ci_workflow.get(True))
+    assert ci_on is not None, "ci workflow missing trigger block"
+    assert ci_on["push"]["branches"] == ["main"]
+    deploy_job = ci_workflow["jobs"]["deploy-production"]
+    assert deploy_job["if"] == "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+    assert deploy_job["needs"] == [
+        "test",
+        "artifact-validation",
+        "browser-site",
+        "terraform-validate",
+    ]
+    dispatch_step = deploy_job["steps"][0]
+    dispatch_run = dispatch_step["run"]
+    assert "gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml" in dispatch_run
+    assert "-f environment=production" in dispatch_run
+    assert "-f terraform_workspace=mainnet" in dispatch_run
+
     readme = README.read_text()
     required_snippets = [
         "keep `bootstrap_install_source=crate` for production deploys and restores",
@@ -47,6 +66,8 @@ def main() -> None:
         "deploy-pages.yml` now runs the live browser canary after the Pages publish completes",
         "keep the Route53 edge health check on `https://${BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}/portal/snapshot`, not a raw TCP 443 probe",
         "keep the post-deploy Pages browser canary green before treating a browser publish as complete",
+        "a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`",
+        "that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds",
     ]
     for snippet in required_snippets:
         assert snippet in readme, f"README missing required strategy snippet: {snippet}"

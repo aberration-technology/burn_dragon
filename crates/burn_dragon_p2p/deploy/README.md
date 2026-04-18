@@ -89,6 +89,8 @@ The intended operator entrypoint is:
 
 - `.github/workflows/deploy-burn-dragon-p2p-aws.yml`
 
+a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it.
+
 That workflow:
 
 - seeds auth client credentials into AWS SSM Parameter Store when the selected auth connector needs them

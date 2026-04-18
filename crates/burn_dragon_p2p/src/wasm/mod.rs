@@ -2288,14 +2288,98 @@ fn EditorTextareaField(
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_session_is_authenticated, normalized_browser_callback_url};
+    use super::{
+        browser_session_is_authenticated, dragon_live_notice, dragon_slice_progress_summary,
+        dragon_transport_summary, dragon_window_summary, normalized_browser_callback_url,
+    };
     use burn_p2p::{
         AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId,
         PrincipalSession,
     };
     use burn_p2p_browser::BrowserSessionState;
+    use burn_p2p_core::{BrowserSwarmStatus, BrowserTransportFamily};
+    use burn_p2p_views::{
+        BrowserAppClientView, BrowserAppNetworkView, BrowserAppSurface, BrowserAppTrainingView,
+        BrowserAppValidationView, BrowserAppViewerView,
+    };
     use chrono::Utc;
     use std::collections::{BTreeMap, BTreeSet};
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn sample_browser_view() -> BrowserAppClientView {
+        BrowserAppClientView {
+            network_id: "burn-dragon-mainnet".into(),
+            default_surface: BrowserAppSurface::Train,
+            runtime_label: "ready".into(),
+            runtime_detail: "browser runtime ready".into(),
+            capability_summary: "full".into(),
+            session_label: "authenticated".into(),
+            selected_experiment: None,
+            viewer: BrowserAppViewerView {
+                visible_experiments: 0,
+                visible_heads: 0,
+                leaderboard_entries: 0,
+                signed_directory_ready: false,
+                signed_leaderboard_ready: false,
+                experiments_preview: Vec::new(),
+                leaderboard_preview: Vec::new(),
+            },
+            validation: BrowserAppValidationView {
+                validate_available: false,
+                can_validate: false,
+                current_head_id: None,
+                metrics_sync_at: None,
+                pending_receipts: 0,
+                validation_status: None,
+                checked_chunks: None,
+                emitted_receipt_id: None,
+                evaluation_summary: None,
+                metric_preview: Vec::new(),
+            },
+            training: BrowserAppTrainingView {
+                train_available: true,
+                can_train: true,
+                active_assignment: None,
+                active_training_lease: None,
+                slice_status: "pending".into(),
+                latest_head_id: None,
+                cached_chunk_artifacts: 0,
+                cached_microshards: 0,
+                pending_receipts: 0,
+                max_window_secs: None,
+                last_window_secs: None,
+                optimizer_steps: None,
+                accepted_samples: None,
+                slice_target_samples: None,
+                slice_remaining_samples: None,
+                last_loss: None,
+                publish_latency_ms: None,
+                throughput_summary: None,
+                last_artifact_id: None,
+                last_receipt_id: None,
+            },
+            network: BrowserAppNetworkView {
+                edge_base_url: "https://edge.example".into(),
+                transport: "webrtc-direct".into(),
+                node_state: "IdleReady".into(),
+                direct_peers: 0,
+                observed_peers: 0,
+                estimated_network_size: 0,
+                accepted_receipts: 0,
+                certified_merges: 0,
+                in_flight_transfers: 0,
+                network_note: "test".into(),
+                swarm_status: BrowserSwarmStatus::default(),
+                metrics_live_ready: false,
+                last_directory_sync_at: None,
+                last_error: None,
+                performance: None,
+                diffusion: None,
+            },
+        }
+    }
 
     #[test]
     fn callback_url_normalizes_to_site_root() {
@@ -2344,5 +2428,68 @@ mod tests {
             ..BrowserSessionState::default()
         };
         assert!(browser_session_is_authenticated(&session));
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_live_notice_reports_direct_connecting_state_truthfully() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+
+        let notice = dragon_live_notice(Some(&view), false).expect("direct handoff notice");
+        assert_eq!(notice.label, "connecting");
+        assert_eq!(notice.detail, "waiting for webrtc-direct");
+        assert_eq!(notice.tone, "accent");
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_live_notice_reports_checkpoint_and_slice_wait_states() {
+        let mut view = sample_browser_view();
+        view.training.active_assignment = Some("assignment-1".into());
+
+        let checkpoint_notice = dragon_live_notice(Some(&view), false).expect("checkpoint notice");
+        assert_eq!(checkpoint_notice.label, "syncing");
+        assert_eq!(checkpoint_notice.detail, "waiting for checkpoint sync");
+
+        view.training.latest_head_id = Some("head-1".into());
+        let slice_notice = dragon_live_notice(Some(&view), false).expect("slice notice");
+        assert_eq!(slice_notice.label, "syncing");
+        assert_eq!(slice_notice.detail, "downloading assigned slice");
+
+        view.training.cached_microshards = 4;
+        let window_notice = dragon_live_notice(Some(&view), false).expect("window notice");
+        assert_eq!(window_notice.label, "waiting");
+        assert_eq!(
+            window_notice.detail,
+            "waiting for the first training window"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_live_notice_prefers_local_training_state() {
+        let notice = dragon_live_notice(Some(&sample_browser_view()), true).expect("training");
+        assert_eq!(notice.label, "training");
+        assert_eq!(notice.detail, "running a local training window in this tab");
+        assert_eq!(notice.tone, "accent");
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_transport_and_progress_summaries_reflect_truthful_runtime_state() {
+        let mut view = sample_browser_view();
+        view.network.direct_peers = 2;
+        view.training.last_window_secs = Some(9);
+        view.training.max_window_secs = Some(30);
+        view.training.accepted_samples = Some(96);
+        view.training.slice_target_samples = Some(128);
+        view.training.slice_remaining_samples = Some(32);
+
+        assert_eq!(
+            dragon_transport_summary(Some(&view)),
+            "webrtc-direct · 2 peers"
+        );
+        assert_eq!(dragon_window_summary(Some(&view), false), "9s of 30s");
+        assert_eq!(
+            dragon_slice_progress_summary(Some(&view)),
+            "96/128 · 32 left"
+        );
     }
 }

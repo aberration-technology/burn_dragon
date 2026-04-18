@@ -1188,9 +1188,12 @@ fn run_edge_drill_for_prepared<B>(
                 })
         );
 
-        let worker_identity = browser_worker_identity(label);
+        let trainer_worker_identity = browser_worker_identity(&format!("{label}-trainer"));
         let browser_certificate = browser_client
-            .enroll(&browser_client.build_enrollment_request(&browser_session, &worker_identity))
+            .enroll(
+                &browser_client
+                    .build_enrollment_request(&browser_session, &trainer_worker_identity),
+            )
             .await
             .expect("browser enroll");
         let trust_bundle = browser_client
@@ -1229,8 +1232,12 @@ fn run_edge_drill_for_prepared<B>(
                     experiment_id: entry.experiment_id.clone(),
                 })
         );
+        let verifier_worker_identity = browser_worker_identity(&format!("{label}-verifier"));
         let verifier_certificate = verifier_client
-            .enroll(&verifier_client.build_enrollment_request(&verifier_session, &worker_identity))
+            .enroll(
+                &verifier_client
+                    .build_enrollment_request(&verifier_session, &verifier_worker_identity),
+            )
             .await
             .expect("browser verifier enroll");
         let verifier_trust_bundle = verifier_client
@@ -1378,8 +1385,20 @@ fn run_edge_drill_for_prepared<B>(
     let state = edge.state.lock().expect("edge state");
     assert_eq!(
         state.enrolled_peer_ids.len(),
-        2,
-        "native and browser peers should both enroll against the same edge"
+        3,
+        "native plus two distinct browser peers should enroll against the same edge"
+    );
+    assert!(
+        state
+            .enrolled_peer_ids
+            .contains(&format!("{label}-trainer-browser-peer")),
+        "trainer browser peer should be enrolled"
+    );
+    assert!(
+        state
+            .enrolled_peer_ids
+            .contains(&format!("{label}-verifier-browser-peer")),
+        "verifier browser peer should be enrolled"
     );
     assert_eq!(
         state.authorized_directory_fetches, 1,

@@ -37,9 +37,9 @@ on:
         default: aberration.technology
         type: string
       bootstrap_install_source:
-        description: "How to install `burn_p2p_bootstrap` on the restored hosts. Use `git` for the live browser/auth deployment path so the restored bootstrap stays pinned to the reviewed burn_p2p revision."
+        description: "How to install `burn_p2p_bootstrap` on the restored hosts. Keep `crate` on the normal release path. Use `git` only when validating an unpublished burn_p2p revision against burn_dragon before publish."
         required: true
-        default: git
+        default: crate
         type: choice
         options:
           - crate

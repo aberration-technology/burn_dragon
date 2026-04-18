@@ -134,11 +134,10 @@ fn all() -> Result<()> {
 }
 
 fn deploy_check() -> Result<()> {
+    deployment_script_checks()?;
+    browser_site::build_browser_site_default()?;
     smoke()?;
     artifact_check()?;
-    browser_site::build_browser_site_default()?;
-    bootstrap_runtime_sync_check()?;
-    deployment_version_sync_check()?;
     downgrade_smoke()?;
     native_scale()?;
     mixed_fleet()?;
@@ -333,12 +332,22 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
     run_with_env(program, args, &[])
 }
 
-fn bootstrap_runtime_sync_check() -> Result<()> {
-    run("python3", &["scripts/test_bootstrap_runtime_sync.py"])
-}
-
-fn deployment_version_sync_check() -> Result<()> {
-    run("python3", &["scripts/test_deployment_version_sync.py"])
+fn deployment_script_checks() -> Result<()> {
+    for script in [
+        "scripts/test_bootstrap_runtime_sync.py",
+        "scripts/test_deployment_version_sync.py",
+        "scripts/test_deployment_strategy.py",
+        "scripts/test_bootstrap_instance_selection.py",
+        "scripts/test_head_mirror_admin_capability.py",
+        "scripts/test_deploy_pages_workflow.py",
+        "scripts/test_live_browser_canary_workflow.py",
+        "scripts/test_native_peer_transport_config.py",
+        "scripts/test_edge_caddyfile.py",
+        "scripts/test_cleanup_workflow.py",
+    ] {
+        run("python3", &[script])?;
+    }
+    Ok(())
 }
 
 fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> Result<()> {

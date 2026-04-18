@@ -48,6 +48,13 @@ The cheapest supported production topology is now:
 - zero managed trainers by default
 - zero GPU infrastructure by default
 
+Recommended operator defaults:
+
+- keep `bootstrap_install_source=crate` for production deploys and restores
+- use `bootstrap_install_source=git` only when validating an unpublished `burn_p2p` revision before release
+- leave the managed trainer pool at `0` until the control plane and browser path are stable under the intended traffic pattern
+- keep restore drills on `plan_only=true` until you are intentionally executing a failover
+
 Role split:
 
 - bootstrap: GitHub auth, API/auth edge, seed/discovery, operator API, S3 artifact publication
@@ -94,6 +101,8 @@ That workflow:
 - waits for the edge URL to answer over HTTPS
 - prints the bootstrap instance details, bootstrap state-storage mode, control-plane state backend, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
 - derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
+
+The supported production bootstrap path is the published `burn_p2p_bootstrap` crate. The `git` install path is still supported, but only as a deliberate pre-release validation path for unpublished upstream `burn_p2p` revisions.
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. By default that also replaces bootstrap-local root-volume state. If you enable retained bootstrap storage, Terraform reattaches the retained data volume so local peer/runtime/auth state survives a normal rebuild. Artifact publication remains externalized in S3 either way.
 
@@ -206,7 +215,7 @@ Recommended Midwest baseline:
 - leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` until you explicitly want an always-on trainer
 - if you do enable a trainer, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
-  - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
+  - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
   - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.16`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`

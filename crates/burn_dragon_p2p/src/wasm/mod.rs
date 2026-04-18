@@ -8,7 +8,9 @@ use burn_p2p_app::{
     AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
     RolloutSubmissionStatusPanel, RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
 };
-use burn_p2p_browser::{BrowserAppConnectConfig, BrowserAppController, BrowserSessionState};
+use burn_p2p_browser::{
+    BrowserAppConnectConfig, BrowserAppController, BrowserSessionState, browser_transport_kind,
+};
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
     DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
@@ -412,16 +414,17 @@ fn dragon_live_notice(
         && view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
+        let transport = dragon_transport_target_label(view);
         if let Some(error) = view.network.swarm_status.last_error.as_ref() {
             return Some(DragonLiveNotice {
                 label: "waiting",
-                detail: format!("{} unavailable: {error}", view.network.transport),
+                detail: format!("{transport} unavailable: {error}"),
                 tone: "neutral",
             });
         }
         return Some(DragonLiveNotice {
             label: "connecting",
-            detail: format!("waiting for {}", view.network.transport),
+            detail: format!("waiting for {transport}"),
             tone: "accent",
         });
     }
@@ -519,7 +522,7 @@ fn dragon_transport_summary(view: Option<&BrowserAppClientView>) -> String {
     let Some(view) = view else {
         return "offline".into();
     };
-    let transport = view.network.transport.trim();
+    let transport = dragon_transport_target_label(view);
     if transport.is_empty() {
         return "offline".into();
     }
@@ -531,7 +534,27 @@ fn dragon_transport_summary(view: Option<&BrowserAppClientView>) -> String {
         };
         return format!("{transport} · {} {peer_label}", view.network.direct_peers);
     }
+    if view.network.swarm_status.connected_transport.is_none()
+        && view.network.swarm_status.desired_transport.is_some()
+    {
+        return format!("dialing {transport}");
+    }
     transport.to_owned()
+}
+
+fn dragon_transport_target_label(view: &BrowserAppClientView) -> String {
+    if let Some(connected) = view.network.swarm_status.connected_transport.as_ref() {
+        return browser_transport_kind(connected).label().into();
+    }
+    if let Some(desired) = view.network.swarm_status.desired_transport.as_ref() {
+        return browser_transport_kind(desired).label().into();
+    }
+    let fallback = view.network.transport.trim();
+    if fallback.is_empty() {
+        "offline".into()
+    } else {
+        fallback.to_owned()
+    }
 }
 
 fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
@@ -552,7 +575,9 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
         };
         return format!("{} {peer_label}", view.network.direct_peers);
     }
-    if view.network.transport.starts_with("dialing ") {
+    if view.network.swarm_status.connected_transport.is_none()
+        && view.network.swarm_status.desired_transport.is_some()
+    {
         return "awaiting direct peer handshake".into();
     }
     if view.network.estimated_network_size > 0 {
@@ -2290,7 +2315,7 @@ mod tests {
         AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId,
         PrincipalSession,
     };
-    use burn_p2p_browser::BrowserSessionState;
+    use burn_p2p_browser::{BrowserSessionState, BrowserTransportKind};
     use burn_p2p_core::{BrowserSwarmStatus, BrowserTransportFamily};
     use burn_p2p_views::{
         BrowserAppClientView, BrowserAppNetworkView, BrowserAppSurface, BrowserAppTrainingView,
@@ -2356,7 +2381,7 @@ mod tests {
             },
             network: BrowserAppNetworkView {
                 edge_base_url: "https://edge.example".into(),
-                transport: "webrtc-direct".into(),
+                transport: BrowserTransportKind::WebRtcDirect.label().into(),
                 node_state: "IdleReady".into(),
                 direct_peers: 0,
                 observed_peers: 0,

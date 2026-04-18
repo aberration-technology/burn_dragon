@@ -350,6 +350,40 @@ fn advance_diffusion_with_retry(
     }
 }
 
+fn ensure_materialized_pinned_head<B>(
+    label: &str,
+    peer: &ManagedRunningNativePeer<B>,
+    experiment: &burn_p2p::ExperimentHandle,
+    head: &HeadDescriptor,
+    provider_peer_ids: &[PeerId],
+) where
+    B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+{
+    peer.wait_for_artifact_from_peers(
+        provider_peer_ids,
+        &head.artifact_id,
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{label} did not materialize pinned head artifact {}: {error:#}",
+            head.artifact_id.as_str(),
+        )
+    });
+    let store = peer.artifact_store().expect("artifact store");
+    assert!(
+        store
+            .has_complete_artifact(&head.artifact_id)
+            .expect("check pinned artifact"),
+        "{label} should have the pinned head artifact locally before the next pinned round",
+    );
+    assert!(
+        peer.adopt_known_head_if_present(experiment, head)
+            .expect("adopt known pinned head"),
+        "{label} should adopt the promoted pinned head locally once its artifact is present",
+    );
+}
+
 fn native_swarm_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -2036,6 +2070,39 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             metric_float_any(&trainer_c_window.report.stats, &["loss", "train_loss"]),
             merged_loss,
             promoted_head.global_step,
+        );
+
+        let provider_peer_ids = [
+            seed.snapshot().local_peer_id.expect("seed local peer id"),
+            trainer_b
+                .snapshot()
+                .local_peer_id
+                .expect("trainer b local peer id"),
+            trainer_c
+                .snapshot()
+                .local_peer_id
+                .expect("trainer c local peer id"),
+        ];
+        ensure_materialized_pinned_head(
+            "seed",
+            &seed,
+            &experiment,
+            &promoted_head,
+            &provider_peer_ids,
+        );
+        ensure_materialized_pinned_head(
+            "trainer-b",
+            &trainer_b,
+            &experiment,
+            &promoted_head,
+            &provider_peer_ids,
+        );
+        ensure_materialized_pinned_head(
+            "trainer-c",
+            &trainer_c,
+            &experiment,
+            &promoted_head,
+            &provider_peer_ids,
         );
 
         canonical_head = promoted_head;

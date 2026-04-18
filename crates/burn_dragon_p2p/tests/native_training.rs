@@ -2786,24 +2786,21 @@ fn browser_conformance_uses_native_dragon_manifests() {
         local_mock_verifier_scopes(&entry),
     );
     let mut harness = BrowserConformanceHarness::start(
-        BrowserRuntimeConfig {
-            role: BrowserRuntimeRole::BrowserTrainerWgpu,
-            ..BrowserRuntimeConfig::new(
-                "https://edge.example",
-                network_id.clone(),
-                prepared
-                    .manifests
-                    .release_manifest
-                    .release_train_hash
-                    .clone(),
-                "browser-wasm",
-                prepared
-                    .manifests
-                    .release_manifest
-                    .target_artifact_hash
-                    .clone(),
-            )
-        },
+        browser_runtime_for_edge(
+            "https://edge.example",
+            network_id.clone(),
+            prepared
+                .manifests
+                .release_manifest
+                .release_train_hash
+                .clone(),
+            prepared
+                .manifests
+                .release_manifest
+                .target_artifact_hash
+                .clone(),
+            BrowserRuntimeRole::BrowserTrainerWgpu,
+        ),
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserTrainerWgpu),
         browser_conformance_transport(),
         browser_conformance_directory(network_id.clone(), vec![entry.clone()]),
@@ -2844,24 +2841,21 @@ fn browser_conformance_uses_native_dragon_manifests() {
         .expect("training");
     assert_eq!(harness.active_training_lease(), Some(&training_lease));
     let mut verifier = BrowserConformanceHarness::start(
-        BrowserRuntimeConfig {
-            role: BrowserRuntimeRole::BrowserVerifier,
-            ..BrowserRuntimeConfig::new(
-                "https://edge.example",
-                network_id.clone(),
-                prepared
-                    .manifests
-                    .release_manifest
-                    .release_train_hash
-                    .clone(),
-                "browser-wasm",
-                prepared
-                    .manifests
-                    .release_manifest
-                    .target_artifact_hash
-                    .clone(),
-            )
-        },
+        browser_runtime_for_edge(
+            "https://edge.example",
+            network_id.clone(),
+            prepared
+                .manifests
+                .release_manifest
+                .release_train_hash
+                .clone(),
+            prepared
+                .manifests
+                .release_manifest
+                .target_artifact_hash
+                .clone(),
+            BrowserRuntimeRole::BrowserVerifier,
+        ),
         browser_conformance_capability_for_role(BrowserRuntimeRole::BrowserVerifier),
         browser_conformance_transport(),
         browser_conformance_directory(network_id, vec![entry.clone()]),

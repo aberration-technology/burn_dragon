@@ -317,6 +317,22 @@ async function maybeClick(locator) {
   return false;
 }
 
+async function optionalVisibleText(locator) {
+  try {
+    if ((await locator.count()) === 0) {
+      return null;
+    }
+    const node = locator.first();
+    if (!(await node.isVisible())) {
+      return null;
+    }
+    const text = await node.textContent({ timeout: 1_000 });
+    return text?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function enrollBrowserCanary(snapshot) {
   const provider = (snapshot.login_providers ?? []).find(
     (candidate) => candidate?.login_path && candidate.login_path.trim().length > 0,
@@ -592,30 +608,18 @@ async function runCanary() {
       report.connect_button_visible = await isVisible(connectButton);
       report.training_button_visible = await isVisible(trainButton);
       report.get_started_button_visible = await isVisible(getStartedButton);
-      report.live_status_label =
-        (await page
-          .locator(".dragon-live-status-pill")
-          .first()
-          .textContent()
-          .catch(() => null)) ?? null;
-      report.live_panel_detail =
-        (await page
-          .locator(".dragon-live-shell .section-detail")
-          .first()
-          .textContent()
-          .catch(() => null)) ?? null;
-      report.live_notice_label =
-        (await page
-          .locator(".activity-notice-label")
-          .first()
-          .textContent()
-          .catch(() => null)) ?? null;
-      report.live_notice_detail =
-        (await page
-          .locator(".activity-notice-detail")
-          .first()
-          .textContent()
-          .catch(() => null)) ?? null;
+      report.live_status_label = await optionalVisibleText(
+        page.locator(".dragon-live-status-pill"),
+      );
+      report.live_panel_detail = await optionalVisibleText(
+        page.locator(".dragon-live-shell .section-detail"),
+      );
+      report.live_notice_label = await optionalVisibleText(
+        page.locator(".activity-notice-label"),
+      );
+      report.live_notice_detail = await optionalVisibleText(
+        page.locator(".activity-notice-detail"),
+      );
       report.live_stat_tiles = await page
         .locator(".dragon-live-stats .stat-tile")
         .evaluateAll((nodes) =>

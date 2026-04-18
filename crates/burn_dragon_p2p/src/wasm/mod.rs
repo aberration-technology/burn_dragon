@@ -6,7 +6,7 @@ use burn_p2p::{
 use burn_p2p_admin::AdminResult;
 use burn_p2p_app::{
     AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
-    RolloutSubmissionStatusPanel, RuntimeCapabilityCard, TrainingResultPanel, TransportHealthPanel,
+    RolloutSubmissionStatusPanel,
 };
 use burn_p2p_browser::{
     BrowserAppConnectConfig, BrowserAppController, BrowserSessionState, browser_transport_kind,
@@ -14,7 +14,7 @@ use burn_p2p_browser::{
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
     DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
-    RolloutPreviewView, RuntimeCapabilitySummaryView, TrainingResultSummaryView,
+    RolloutPreviewView,
 };
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -483,6 +483,48 @@ fn dragon_window_summary(
     }
 }
 
+fn parse_leading_rate_per_second(summary: &str) -> Option<f64> {
+    summary.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+fn format_compact_duration(seconds: u64) -> String {
+    match seconds {
+        0 => "<1s".into(),
+        1..=59 => format!("{seconds}s"),
+        60..=3599 => {
+            let minutes = seconds / 60;
+            let remainder = seconds % 60;
+            if remainder == 0 {
+                format!("{minutes}m")
+            } else {
+                format!("{minutes}m {remainder}s")
+            }
+        }
+        _ => {
+            let hours = seconds / 3600;
+            let remainder = seconds % 3600;
+            let minutes = remainder / 60;
+            if minutes == 0 {
+                format!("{hours}h")
+            } else {
+                format!("{hours}h {minutes}m")
+            }
+        }
+    }
+}
+
+fn dragon_window_eta_summary(view: Option<&BrowserAppClientView>) -> Option<String> {
+    let view = view?;
+    let remaining = view.training.slice_remaining_samples?;
+    let throughput = view.training.throughput_summary.as_deref()?;
+    let rate = parse_leading_rate_per_second(throughput)?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    let eta_seconds = ((remaining as f64) / rate).ceil() as u64;
+    Some(format_compact_duration(eta_seconds))
+}
+
 fn dragon_slice_progress_summary(view: Option<&BrowserAppClientView>) -> String {
     let Some(view) = view else {
         return "pending".into();
@@ -498,26 +540,6 @@ fn dragon_slice_progress_summary(view: Option<&BrowserAppClientView>) -> String 
         (Some(done), Some(target), None) => format!("{done}/{target}"),
         _ => view.training.slice_status.clone(),
     }
-}
-
-fn short_dragon_reference(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return "pending".into();
-    }
-    if trimmed.chars().count() <= 40 {
-        return trimmed.to_owned();
-    }
-    let head = trimmed.chars().take(22).collect::<String>();
-    let tail = trimmed
-        .chars()
-        .rev()
-        .take(10)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{head}…{tail}")
 }
 
 fn dragon_transport_summary(view: Option<&BrowserAppClientView>) -> String {
@@ -591,38 +613,36 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
     "edge snapshot only".into()
 }
 
-fn dragon_assignment_detail(view: Option<&BrowserAppClientView>) -> String {
+fn dragon_window_progress_detail(
+    view: Option<&BrowserAppClientView>,
+    window_summary: &str,
+) -> String {
     let Some(view) = view else {
-        return "waiting for work".into();
-    };
-    view.training
-        .active_training_lease
-        .clone()
-        .map(|lease| {
-            format!(
-                "lease {} · {} shards",
-                short_dragon_reference(&lease.lease_id),
-                lease.microshard_count
-            )
-        })
-        .unwrap_or_else(|| view.training.slice_status.clone())
-}
-
-fn dragon_progress_detail(view: Option<&BrowserAppClientView>) -> String {
-    let Some(view) = view else {
-        return "waiting for checkpoint".into();
+        return window_summary.into();
     };
     match (
         view.training.slice_remaining_samples,
         view.training.slice_target_samples,
     ) {
-        (Some(remaining), Some(target)) => format!("{remaining} of {target} still queued"),
-        (Some(remaining), None) => format!("{remaining} still queued"),
-        _ => view.training.slice_status.clone(),
+        (Some(remaining), Some(_target)) => {
+            if let Some(eta) = dragon_window_eta_summary(Some(view)) {
+                format!("{remaining} left · eta {eta}")
+            } else {
+                format!("{remaining} left · {window_summary}")
+            }
+        }
+        (Some(remaining), None) => {
+            if let Some(eta) = dragon_window_eta_summary(Some(view)) {
+                format!("{remaining} left · eta {eta}")
+            } else {
+                format!("{remaining} left")
+            }
+        }
+        _ => window_summary.into(),
     }
 }
 
-fn dragon_training_summary(
+fn dragon_local_training_summary(
     view: Option<&BrowserAppClientView>,
     local_training_pending: bool,
     window_summary: &str,
@@ -634,41 +654,34 @@ fn dragon_training_summary(
         .unwrap_or_else(|| window_summary.to_owned())
 }
 
-fn dragon_training_detail(view: Option<&BrowserAppClientView>, window_summary: &str) -> String {
+fn dragon_local_training_detail(
+    view: Option<&BrowserAppClientView>,
+    window_summary: &str,
+) -> String {
     let Some(view) = view else {
-        return "local".into();
+        return window_summary.into();
     };
     if let Some(loss) = view.training.last_loss.as_ref() {
-        return format!("loss {loss}");
+        return format!("loss {loss} · {window_summary}");
     }
-    if let Some(throughput) = view.training.throughput_summary.as_ref() {
-        return format!("window {window_summary} · {throughput}");
-    }
-    format!("window {window_summary}")
+    window_summary.into()
 }
 
-fn dragon_latest_output_summary(view: Option<&BrowserAppClientView>) -> String {
-    let Some(view) = view else {
+fn dragon_global_training_summary(view: Option<&BrowserAppClientView>) -> String {
+    view.and_then(|view| {
+        view.network
+            .performance
+            .as_ref()
+            .map(|performance| performance.training_throughput.clone())
+    })
+    .unwrap_or_else(|| "pending".into())
+}
+
+fn dragon_global_training_detail(view: Option<&BrowserAppClientView>) -> String {
+    let Some(performance) = view.and_then(|view| view.network.performance.as_ref()) else {
         return "pending".into();
     };
-    view.training
-        .last_receipt_id
-        .clone()
-        .or_else(|| view.training.last_artifact_id.clone())
-        .unwrap_or_else(|| "pending".into())
-}
-
-fn runtime_capability_summary(view: &BrowserAppClientView) -> RuntimeCapabilitySummaryView {
-    let backend_summary = if view.runtime_detail.is_empty() {
-        view.capability_summary.clone()
-    } else {
-        format!("{} | {}", view.runtime_detail, view.capability_summary)
-    };
-    RuntimeCapabilitySummaryView {
-        preferred_role: view.runtime_label.clone(),
-        backend_summary,
-        can_train: view.training.train_available || view.training.can_train,
-    }
+    format!("validation {}", performance.validation_throughput)
 }
 
 fn browser_runtime_role_label(role: &burn_p2p_browser::BrowserRuntimeRole) -> &'static str {
@@ -679,16 +692,6 @@ fn browser_runtime_role_label(role: &burn_p2p_browser::BrowserRuntimeRole) -> &'
         burn_p2p_browser::BrowserRuntimeRole::BrowserFallback => "browser_fallback",
         burn_p2p_browser::BrowserRuntimeRole::Viewer => "viewer",
     }
-}
-
-fn latest_training_result_summary(
-    view: &BrowserAppClientView,
-) -> Option<TrainingResultSummaryView> {
-    Some(TrainingResultSummaryView {
-        artifact_id: view.training.last_artifact_id.clone()?,
-        receipt_id: view.training.last_receipt_id.clone(),
-        window_secs: view.training.last_window_secs.unwrap_or_default(),
-    })
 }
 
 const DEFAULT_ADMIN_STUDY_ID: &str = "burn-dragon-mainnet";
@@ -942,7 +945,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let admin_rollout_result = use_signal(|| None::<DirectoryMutationResultView>);
     let debug_controls_enabled = window_query_flag("debug");
     let mut show_connection_settings = use_signal(|| false);
-    let mut show_live_details = use_signal(|| false);
     let mut show_admin_tools = use_signal(|| window_query_flag("admin"));
     let auth_bootstrap_started = use_signal(|| false);
     let auth_bootstrap_pending = use_signal(|| true);
@@ -1372,7 +1374,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .map(|entries| rollout_preview_view(entries));
     let admin_rollout_status_view = admin_rollout_result.read().clone();
     let show_connection_settings_active = *show_connection_settings.read();
-    let show_live_details_active = *show_live_details.read();
     let show_admin_tools_active = *show_admin_tools.read();
     let browser_host_capabilities = detect_browser_host_capabilities();
     let browser_capability_decision = match (
@@ -1487,28 +1488,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             );
         });
     }
-    let transport_connected = view
-        .as_ref()
-        .is_some_and(|view| view.network.swarm_status.connected_transport.is_some());
     #[cfg(feature = "wasm-peer")]
     let direct_transport_ready = view
         .as_ref()
         .is_some_and(|view| view.network.direct_peers > 0);
-    let connected_panel_title = "live peer";
-    let connected_panel_detail = live_notice
-        .as_ref()
-        .map(|notice| notice.detail.clone())
-        .unwrap_or_else(|| {
-            if has_active_checkpoint && !transport_connected {
-                format!("{transport_summary} is still pending. checkpoint data is cached locally.")
-            } else if has_active_checkpoint {
-                "checkpoint synced. this tab can train when work is assigned.".into()
-            } else if !transport_connected {
-                format!("{transport_summary} is still pending.")
-            } else {
-                "connected to the network. waiting for the first checkpoint.".into()
-            }
-        });
+    let connected_panel_title = "connected";
+    let connected_panel_detail = "status, throughput, peers, and remaining work.".to_owned();
     let live_status_label = if local_training_pending_active {
         "training"
     } else if let Some(notice) = live_notice.as_ref() {
@@ -1517,11 +1502,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         "ready"
     } else {
         "connected"
-    };
-    let checkpoint_summary = if has_active_checkpoint {
-        "synced"
-    } else {
-        "waiting"
     };
     let runtime_mode_summary = view
         .as_ref()
@@ -1535,42 +1515,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         });
     let slice_progress_summary = dragon_slice_progress_summary(view.as_ref());
     let window_summary = dragon_window_summary(view.as_ref(), local_training_pending_active);
-    let latest_output_summary = dragon_latest_output_summary(view.as_ref());
-    let throughput_summary = if local_training_pending_active {
-        "measuring…".into()
-    } else {
-        view.as_ref()
-            .and_then(|view| view.training.throughput_summary.clone())
-            .unwrap_or_else(|| "pending".into())
-    };
-    let last_loss_summary = view
-        .as_ref()
-        .and_then(|view| view.training.last_loss.clone())
-        .unwrap_or_else(|| {
-            if local_training_pending_active {
-                "pending".into()
-            } else {
-                "—".into()
-            }
-        });
-    let assignment_summary = view
-        .as_ref()
-        .and_then(|view| view.training.active_assignment.clone())
-        .unwrap_or_else(|| "pending".into());
-    let publish_latency_summary = view
-        .as_ref()
-        .and_then(|view| view.training.publish_latency_ms)
-        .map(|value| format!("{value} ms"))
-        .unwrap_or_else(|| "pending".into());
-    let assignment_detail = dragon_assignment_detail(view.as_ref());
-    let progress_detail = dragon_progress_detail(view.as_ref());
-    let training_summary = dragon_training_summary(
+    let local_training_summary = dragon_local_training_summary(
         view.as_ref(),
         local_training_pending_active,
         &window_summary,
     );
-    let training_detail = dragon_training_detail(view.as_ref(), &window_summary);
-    let checkpoint_detail = short_dragon_reference(&active_head_label);
+    let local_training_detail = dragon_local_training_detail(view.as_ref(), &window_summary);
+    let global_training_summary = dragon_global_training_summary(view.as_ref());
+    let global_training_detail = dragon_global_training_detail(view.as_ref());
+    let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     let hero_rattle_frame =
         HERO_RATTLE_FRAMES[*hero_rattle_index.read() % HERO_RATTLE_FRAMES.len()];
@@ -1827,21 +1780,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         }
                                     }
                                 }
-                                if debug_controls_enabled && has_connected_view && show_live_details_active {
-                                    button {
-                                        r#type: "button",
-                                        class: "action-button action-button-secondary",
-                                        onclick: move |_| show_live_details.set(false),
-                                        "hide details"
-                                    }
-                                } else if debug_controls_enabled && has_connected_view {
-                                    button {
-                                        r#type: "button",
-                                        class: "action-button action-button-secondary",
-                                        onclick: move |_| show_live_details.set(true),
-                                        "details"
-                                    }
-                                }
                             }
                             if debug_controls_enabled && show_connection_settings_active {
                                 div { class: "edge-editor dragon-advanced-settings",
@@ -1886,56 +1824,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                                 div { class: "dragon-live-stats",
                                     StatTile {
-                                        label: "mode",
+                                        label: "status",
                                         value: runtime_mode_summary,
                                         detail: Some(view.runtime_detail.clone()),
                                     }
                                     StatTile {
-                                        label: "transport",
-                                        value: transport_summary.clone(),
-                                        detail: Some(network_summary.clone()),
+                                        label: "local train",
+                                        value: local_training_summary,
+                                        detail: Some(local_training_detail),
                                     }
                                     StatTile {
-                                        label: "assignment",
-                                        value: assignment_summary.clone(),
-                                        detail: Some(assignment_detail.clone()),
+                                        label: "global train",
+                                        value: global_training_summary,
+                                        detail: Some(global_training_detail),
                                     }
                                     StatTile {
-                                        label: "progress",
+                                        label: "window",
                                         value: slice_progress_summary,
-                                        detail: Some(progress_detail.clone()),
+                                        detail: Some(window_progress_detail),
                                     }
                                     StatTile {
-                                        label: "training",
-                                        value: training_summary,
-                                        detail: Some(training_detail),
-                                    }
-                                    StatTile {
-                                        label: "checkpoint",
-                                        value: checkpoint_summary.to_owned(),
-                                        detail: Some(checkpoint_detail.clone()),
-                                    }
-                                }
-                                div { class: "keyvalue-list dragon-live-keyvalues",
-                                    div { class: "keyvalue-row",
-                                        span { "loss" }
-                                        strong { "{last_loss_summary}" }
-                                    }
-                                    div { class: "keyvalue-row",
-                                        span { "throughput" }
-                                        strong { "{throughput_summary}" }
-                                    }
-                                    div { class: "keyvalue-row",
-                                        span { "publish" }
-                                        strong { "{publish_latency_summary}" }
-                                    }
-                                    div { class: "keyvalue-row",
-                                        span { "peers" }
-                                        strong { "{network_summary}" }
-                                    }
-                                    div { class: "keyvalue-row",
-                                        span { "latest output" }
-                                        strong { "{latest_output_summary}" }
+                                        label: "peers",
+                                        value: network_summary.clone(),
+                                        detail: Some(transport_summary.clone()),
                                     }
                                 }
                                 if has_active_checkpoint {
@@ -1994,62 +1905,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 }
             }
             {local_training_section}
-            if show_live_details_active {
-                div { class: "surface-layout browser-surface-layout",
-                    section { class: "panel primary-panel browser-focus-panel",
-                        SectionHeader {
-                            eyebrow: "details",
-                            title: "live peer details",
-                            detail: "runtime capability, network training, and the latest checkpoint state.",
-                        }
-                        if let Some(view) = view.clone() {
-                            div { class: "dragon-panel-stack",
-                                RuntimeCapabilityCard { summary: runtime_capability_summary(&view) }
-                                TrainingResultPanel { result: latest_training_result_summary(&view) }
-                            }
-                        } else {
-                            EmptyState {
-                                title: "connect first",
-                                detail: "the detailed runtime and training panels appear after the first successful connect or refresh.",
-                            }
-                        }
-                    }
-                    aside { class: "support-stack",
-                        if let Some(view) = view.clone() {
-                            section { class: "panel compact-panel",
-                                SectionHeader {
-                                    eyebrow: "transport",
-                                    title: "network",
-                                    detail: "edge connectivity, receipts, and peer visibility.",
-                                }
-                                TransportHealthPanel { network: view.network.clone() }
-                            }
-                            section { class: "panel compact-panel",
-                                SectionHeader {
-                                    eyebrow: "leaderboard",
-                                    title: "top participants",
-                                    detail: "current preview from the selected revision.",
-                                }
-                                if view.viewer.leaderboard_preview.is_empty() {
-                                    EmptyState {
-                                        title: "leaderboard pending",
-                                        detail: "leaderboard rows appear after the first synced viewer snapshot.",
-                                    }
-                                } else {
-                                    div { class: "keyvalue-list",
-                                        for entry in view.viewer.leaderboard_preview {
-                                            div { class: "keyvalue-row",
-                                                span { "{entry.label}" }
-                                                strong { "{entry.score} · {entry.receipts} receipts" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             if show_admin_tools_active {
                 div { class: "surface-layout browser-surface-layout dragon-admin-surface",
                     section { class: "panel primary-panel browser-focus-panel",
@@ -2310,8 +2165,11 @@ fn EditorTextareaField(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_session_is_authenticated, dragon_live_notice, dragon_slice_progress_summary,
-        dragon_transport_summary, dragon_window_summary, normalized_browser_callback_url,
+        browser_session_is_authenticated, dragon_global_training_detail,
+        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
+        dragon_local_training_summary, dragon_network_detail, dragon_slice_progress_summary,
+        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
+        normalized_browser_callback_url,
     };
     use burn_p2p::{
         AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId,
@@ -2320,8 +2178,8 @@ mod tests {
     use burn_p2p_browser::{BrowserSessionState, BrowserTransportKind};
     use burn_p2p_core::{BrowserSwarmStatus, BrowserTransportFamily};
     use burn_p2p_views::{
-        BrowserAppClientView, BrowserAppNetworkView, BrowserAppSurface, BrowserAppTrainingView,
-        BrowserAppValidationView, BrowserAppViewerView,
+        BrowserAppClientView, BrowserAppNetworkView, BrowserAppPerformanceView, BrowserAppSurface,
+        BrowserAppTrainingView, BrowserAppValidationView, BrowserAppViewerView,
     };
     use chrono::Utc;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2512,5 +2370,49 @@ mod tests {
             dragon_slice_progress_summary(Some(&view)),
             "96/128 · 32 left"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_connected_summary_prefers_high_signal_metrics() {
+        let mut view = sample_browser_view();
+        view.training.last_window_secs = Some(9);
+        view.training.max_window_secs = Some(30);
+        view.training.accepted_samples = Some(96);
+        view.training.slice_target_samples = Some(128);
+        view.training.slice_remaining_samples = Some(32);
+        view.training.throughput_summary = Some("8.0 sample/s".into());
+        view.training.last_loss = Some("0.421".into());
+        view.network.direct_peers = 3;
+        view.network.estimated_network_size = 9;
+        view.network.performance = Some(BrowserAppPerformanceView {
+            scope_summary: "visible peers".into(),
+            captured_at: "2026-04-18T00:00:00Z".into(),
+            training_throughput: "128.0 sample/s".into(),
+            validation_throughput: "16.0 sample/s".into(),
+            wait_time: "2s".into(),
+            idle_time: "1s".into(),
+        });
+
+        assert_eq!(
+            dragon_local_training_summary(Some(&view), false, "9s of 30s"),
+            "8.0 sample/s"
+        );
+        assert_eq!(
+            dragon_local_training_detail(Some(&view), "9s of 30s"),
+            "loss 0.421 · 9s of 30s"
+        );
+        assert_eq!(
+            dragon_global_training_summary(Some(&view)),
+            "128.0 sample/s"
+        );
+        assert_eq!(
+            dragon_global_training_detail(Some(&view)),
+            "validation 16.0 sample/s"
+        );
+        assert_eq!(
+            dragon_window_progress_detail(Some(&view), "9s of 30s"),
+            "32 left · eta 4s"
+        );
+        assert_eq!(dragon_network_detail(Some(&view)), "3 direct · ~9 visible");
     }
 }

@@ -138,6 +138,7 @@ fn deploy_check() -> Result<()> {
     artifact_check()?;
     browser_site::build_browser_site_default()?;
     bootstrap_runtime_sync_check()?;
+    deployment_version_sync_check()?;
     downgrade_smoke()?;
     native_scale()?;
     mixed_fleet()?;
@@ -334,6 +335,10 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 
 fn bootstrap_runtime_sync_check() -> Result<()> {
     run("python3", &["scripts/test_bootstrap_runtime_sync.py"])
+}
+
+fn deployment_version_sync_check() -> Result<()> {
+    run("python3", &["scripts/test_deployment_version_sync.py"])
 }
 
 fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> Result<()> {

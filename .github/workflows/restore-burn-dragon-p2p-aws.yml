@@ -45,9 +45,9 @@ on:
           - crate
           - git
       bootstrap_version:
-        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.15`."
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.16`."
         required: false
-        default: 0.21.0-pre.15
+        default: 0.21.0-pre.16
         type: string
       bootstrap_git_ref:
         description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
@@ -449,7 +449,7 @@ jobs:
             bootstrap_version="$bootstrap_version_var"
           fi
           if [ -z "$bootstrap_version" ]; then
-            bootstrap_version="0.21.0-pre.15"
+            bootstrap_version="0.21.0-pre.16"
           fi
 
           bootstrap_git_ref="$bootstrap_git_ref_input"
@@ -464,6 +464,12 @@ jobs:
             echo "burn_p2p_bootstrap 0.21.0-pre.15 is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate" >&2
             exit 1
           fi
+          dragon_crate_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              print(tomllib.load(handle)["workspace"]["package"]["version"])
+          PY
+          )"
           if [ -z "$managed_trainer_desired_capacity" ]; then
             managed_trainer_desired_capacity="0"
           fi
@@ -477,7 +483,7 @@ jobs:
             managed_trainer_target="trainer"
           fi
           if [ -z "$managed_trainer_crate_version" ]; then
-            managed_trainer_crate_version="0.21.0-pre.15"
+            managed_trainer_crate_version="$dragon_crate_version"
           fi
           if [ -z "$managed_trainer_auth_bundle_parameter_name" ]; then
             managed_trainer_auth_bundle_parameter_name="/${stack_name}/${TF_WORKSPACE_NAME}/bootstrap/trainer_auth_bundle_json"
@@ -506,12 +512,6 @@ jobs:
               auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; experiment_id = sys.argv[3]; network_id = sys.argv[4]; backend = sys.argv[5]; stack_name = sys.argv[6]; environment = sys.argv[7]; trainer_role = "TrainerCpu" if backend == "cpu" else "TrainerGpu"; principal = {"principal_id": principal_id, "display_name": f"burn_dragon managed {experiment_id} {backend} trainer", "org_memberships": [], "group_memberships": [], "granted_roles": {"roles": [trainer_role, "Archive"]}, "granted_scopes": ["Connect", "Discover", {"Train": {"experiment_id": experiment_id}}, {"Archive": {"experiment_id": experiment_id}}], "allowed_networks": [network_id], "custom_claims": {"deployment_profile": environment, "stack": stack_name, "managed_trainer": "true", "managed_trainer_backend": backend, "managed_trainer_experiment_id": experiment_id}}; principals = [item for item in principals if item.get("principal_id") != principal_id]; principals.append(principal); print(json.dumps(principals))''' "$auth_principals_json" "$managed_trainer_principal_id" "$managed_trainer_experiment_id" "$network_id" "$managed_trainer_backend" "$stack_name" "$DEPLOY_ENVIRONMENT")"
             fi
           fi
-          dragon_crate_version="$(python3 - <<'PY'
-          import tomllib
-          with open("Cargo.toml", "rb") as handle:
-              print(tomllib.load(handle)["workspace"]["package"]["version"])
-          PY
-          )"
           dragon_git_repository="https://github.com/${GITHUB_REPOSITORY}.git"
           dragon_git_ref="${GITHUB_SHA}"
           bootstrap_head_mirror_experiment_id="nca-prepretraining"

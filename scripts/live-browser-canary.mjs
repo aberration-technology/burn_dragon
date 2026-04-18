@@ -22,6 +22,14 @@ const TRAIN_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS",
   300_000,
 );
+const TRANSIENT_FETCH_RETRIES = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_TRANSIENT_FETCH_RETRIES",
+  6,
+);
+const TRANSIENT_FETCH_RETRY_DELAY_MS = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_TRANSIENT_FETCH_RETRY_DELAY_MS",
+  2_000,
+);
 const ARTIFACT_DIR =
   process.env.BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR ??
   path.join(os.tmpdir(), `burn-dragon-browser-canary-${Date.now()}`);
@@ -103,6 +111,38 @@ async function fetchJson(url, options = {}) {
     throw new Error(`${response.status} ${response.statusText} for ${url}: ${trimPreview(text)}`);
   }
   return text ? JSON.parse(text) : null;
+}
+
+function shouldRetryTransientFetch(error) {
+  const message = String(error?.message ?? error ?? "");
+  return (
+    /\b(502|503|504)\b/.test(message) ||
+    /\bECONNRESET\b/.test(message) ||
+    /\bETIMEDOUT\b/.test(message) ||
+    /\bfetch failed\b/i.test(message)
+  );
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJsonWithTransientRetry(url, options = {}) {
+  let attempt = 0;
+  let lastError = null;
+  while (attempt < TRANSIENT_FETCH_RETRIES) {
+    try {
+      return await fetchJson(url, options);
+    } catch (error) {
+      lastError = error;
+      attempt += 1;
+      if (attempt >= TRANSIENT_FETCH_RETRIES || !shouldRetryTransientFetch(error)) {
+        throw error;
+      }
+      await sleep(TRANSIENT_FETCH_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function trimPreview(text) {
@@ -337,18 +377,18 @@ async function enrollBrowserCanary(snapshot) {
 
 async function runCanary() {
   ensureDir(ARTIFACT_DIR);
-  const snapshot = await fetchJson(endpoint(EDGE_BASE_URL, "/portal/snapshot"), {
+  const snapshot = await fetchJsonWithTransientRetry(endpoint(EDGE_BASE_URL, "/portal/snapshot"), {
     method: "GET",
     headers: {},
   });
-  const signedSeedsEnvelope = await fetchJson(
+  const signedSeedsEnvelope = await fetchJsonWithTransientRetry(
     endpoint(
       EDGE_BASE_URL,
       snapshot.paths?.browser_seed_advertisement_path ?? "/browser/seeds/signed",
     ),
     { method: "GET", headers: {} },
   );
-  const browserConfig = await fetchJson(endpoint(SITE_BASE_URL, "/browser-app-config.json"), {
+  const browserConfig = await fetchJsonWithTransientRetry(endpoint(SITE_BASE_URL, "/browser-app-config.json"), {
     method: "GET",
     headers: {},
   });

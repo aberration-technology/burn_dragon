@@ -208,7 +208,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.15`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.16`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 

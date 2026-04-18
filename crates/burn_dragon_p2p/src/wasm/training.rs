@@ -1640,7 +1640,8 @@ mod tests {
             target_artifact_id: "browser-wasm".into(),
             target_artifact_hash: ContentId::new("browser-smoke-artifact"),
             target_platform: ClientPlatform::Browser,
-            app_semver: super::current_app_semver(),
+            app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
             git_commit: "smoke".into(),
             cargo_lock_hash: ContentId::new("browser-smoke-lock"),
             burn_version_string: "0.21.0-pre.3".into(),

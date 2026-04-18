@@ -873,7 +873,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2049,7 +2049,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22a3b7df699b9a99beefb4c41a9b3969b4e7fb3989a9d32cd77df63d75ad9791"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -2078,7 +2079,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_admin"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45f00bd96f3ee9400c083605283628c56ab9ece5e307a6eb3810da3f8f2b46fc"
 dependencies = [
  "burn_p2p",
  "burn_p2p_core",
@@ -2093,7 +2095,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_app"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13643328304236bb2122255c5bddd490def7b3a8a8a0aa118b6f429392187515"
 dependencies = [
  "burn_p2p_browser",
  "burn_p2p_views",
@@ -2110,7 +2113,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_bootstrap"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d20fef3fb850c5cc7d9e34114bb775cdcd558f18af02175a26be76c68d613c87"
 dependencies = [
  "anyhow",
  "burn_p2p",
@@ -2136,7 +2140,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_browser"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a09c51173cc3ea4efaedfbd1ae6db221c1ce201a402796df5f4b670bd3b2c0f1"
 dependencies = [
  "base64 0.22.1",
  "burn_p2p",
@@ -2163,7 +2168,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_checkpoint"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f9fad88e01373ab11db03f32b96ad7bd6bd81c203f3e949dc3f54fc251522ea"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2177,7 +2183,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_core"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d77db28de91d8d5e8f7188584f41c73edcdb631685867a857955bf7308e7ece"
 dependencies = [
  "chrono",
  "ciborium",
@@ -2192,7 +2199,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_dataloader"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d458ea2ab324e8c425300d51f2116c7743b077cb88bcc18924305c47e3b483"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2207,7 +2215,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_engine"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f42efa98e3aeb8b842b4741d875969411a78d183aa58812671966c1ec6fa9eeb"
 dependencies = [
  "burn 0.21.0-pre.3",
  "burn-store 0.21.0-pre.3",
@@ -2221,7 +2230,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_experiment"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "763781aac6319a65b9580aa08aac06e2a2e6c610ef08ac864f00890956b417ee"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2233,7 +2243,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_limits"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9aaf66ad8d184cb885a4227ddd53419b32d120428582171a16c45451df2550f8"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2244,7 +2255,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_metrics"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "598b14688bcfb6d719558f775b41c2c4d0b092f5804f8db2036d9b4816462a2c"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2256,7 +2268,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_publish"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e151da0899066b00e3d26c73f1fc30c0ac6dec005d35d068f9af96b400b9c026"
 dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
@@ -2269,7 +2282,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_security"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4af59ea647578e4e685053176983cda93bf70dfd1c049cfe894e347c35bb1cb5"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2285,7 +2299,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_swarm"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550f39c6b5f2b46f972d48673e4d04718803440de56f7428dc8f8b299d763ac1"
 dependencies = [
  "async-trait",
  "burn_p2p_core",
@@ -2319,7 +2334,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_views"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df26cf2e7883008ba92f4c22d0a1f2b2ea621f46432d501d4040525312ad86de"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2334,7 +2350,8 @@ dependencies = [
 [[package]]
 name = "burn_p2p_workload"
 version = "0.21.0-pre.16"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85e531693589d8a214850d4edbcdb8ad4a72345767a919fda516470c90b42408"
 dependencies = [
  "anyhow",
  "burn_p2p_checkpoint",
@@ -2476,9 +2493,9 @@ dependencies = [
 
 [[package]]
 name = "cargo-platform"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87a0c0e6148f11f01f32650a2ea02d532b2ad4e81d8bd41e6e565b5adc5e6082"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
 dependencies = [
  "serde",
  "serde_core",
@@ -2841,7 +2858,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4471,7 +4488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5085,7 +5102,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5422,7 +5439,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6194,7 +6211,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6666,7 +6683,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -7034,7 +7051,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7090,7 +7107,7 @@ dependencies = [
  "portable-atomic-util",
  "serde_core",
  "wasm-bindgen",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7927,7 +7944,8 @@ dependencies = [
 [[package]]
 name = "libp2p-webrtc-websys"
 version = "0.4.0"
-source = "git+https://github.com/aberration-technology/burn_p2p.git?rev=914e7e756a99e5bfecc26986dbb95738f5501026#914e7e756a99e5bfecc26986dbb95738f5501026"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3830f0bf6f0f16ded2c735599fe70baea43a8c1a2d76152216693329217301dd"
 dependencies = [
  "bytes",
  "futures",
@@ -8846,7 +8864,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9821,7 +9839,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10042,7 +10060,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11469,7 +11487,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12476,7 +12494,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14504,7 +14522,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

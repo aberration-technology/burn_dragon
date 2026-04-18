@@ -101,7 +101,11 @@ impl BrowserBuildTarget {
 fn smoke() -> Result<()> {
     native_smoke()?;
     wasm_smoke()?;
-    build_native_cuda()?;
+    if cuda_toolchain_available() {
+        build_native_cuda()?;
+    } else {
+        eprintln!("+ skipping CUDA smoke: `nvcc` was not found");
+    }
     Ok(())
 }
 
@@ -584,6 +588,30 @@ fn resolve_binary(env_var: &str, candidates: &[&str]) -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .find(|path| path.exists())
         })
+}
+
+fn cuda_toolchain_available() -> bool {
+    resolve_binary(
+        "CUDA_HOME",
+        &[
+            "/usr/local/cuda",
+            "/opt/cuda",
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA",
+        ],
+    )
+    .into_iter()
+    .map(|root| root.join("bin").join(binary_name("nvcc")))
+    .find(|path| path.is_file())
+    .or_else(|| {
+        ["CUDA_PATH", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .map(|root| root.join("bin").join(binary_name("nvcc")))
+            .find(|path| path.is_file())
+    })
+    .or_else(|| find_in_path(binary_name("nvcc")))
+    .is_some()
 }
 
 fn find_in_path(binary: impl AsRef<Path>) -> Option<PathBuf> {

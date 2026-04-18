@@ -90,7 +90,7 @@ on:
         default: ""
         type: string
       managed_trainer_desired_capacity:
-        description: "Desired instance count for the optional managed native trainer pool. Example: `1` to keep one managed trainer online. Keep `0` to disable the pool."
+        description: "Desired instance count for the optional managed native trainer pool. Keep `0` on the normal low-cost production path; any nonzero pool on the default `m7i.large` path exceeds the fixed-cost guardrail."
         required: false
         default: "0"
         type: string
@@ -119,7 +119,6 @@ on:
 
 permissions:
   id-token: write
-  actions: write
   contents: read
 
 concurrency:
@@ -212,6 +211,7 @@ jobs:
           INPUT_MANAGED_TRAINER_EXPERIMENT_KIND: ${{ github.event.inputs.managed_trainer_experiment_kind }}
           VAR_MANAGED_TRAINER_EXPERIMENT_KIND: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}
           VAR_MANAGED_TRAINER_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE }}
+          VAR_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB }}
           VAR_MANAGED_TRAINER_MIN_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE }}
           VAR_MANAGED_TRAINER_MAX_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE }}
           VAR_MANAGED_TRAINER_TARGET: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}
@@ -313,6 +313,7 @@ jobs:
           managed_trainer_experiment_kind_input="$INPUT_MANAGED_TRAINER_EXPERIMENT_KIND"
           managed_trainer_experiment_kind_var="$VAR_MANAGED_TRAINER_EXPERIMENT_KIND"
           managed_trainer_instance_type="$VAR_MANAGED_TRAINER_INSTANCE_TYPE"
+          managed_trainer_root_volume_size_gib="$VAR_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB"
           managed_trainer_min_size="$VAR_MANAGED_TRAINER_MIN_SIZE"
           managed_trainer_max_size="$VAR_MANAGED_TRAINER_MAX_SIZE"
           managed_trainer_target="$VAR_MANAGED_TRAINER_TARGET"
@@ -655,6 +656,7 @@ jobs:
           {
             echo "AWS_REGION=$aws_region"
             echo "AWS_ROLE_ARN=$aws_role_arn"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$aws_role_arn")"
             echo "STACK_NAME=$stack_name"
             echo "EDGE_DOMAIN_NAME=$edge_domain_name"
             echo "BROWSER_APP_BASE_URL=$browser_app_base_url"
@@ -770,6 +772,9 @@ jobs:
           if [ -n "$managed_trainer_instance_type" ]; then
             echo "TF_VAR_managed_trainer_instance_type=$managed_trainer_instance_type" >>"$GITHUB_ENV"
           fi
+          if [ -n "$managed_trainer_root_volume_size_gib" ]; then
+            echo "TF_VAR_managed_trainer_root_volume_size_gib=$managed_trainer_root_volume_size_gib" >>"$GITHUB_ENV"
+          fi
           if [ -n "$managed_trainer_min_size" ]; then
             echo "TF_VAR_managed_trainer_min_size=$managed_trainer_min_size" >>"$GITHUB_ENV"
           fi
@@ -828,11 +833,22 @@ jobs:
             echo "TF_VAR_artifact_bucket_server_side_encryption=$artifact_bucket_server_side_encryption" >>"$GITHUB_ENV"
           fi
 
+      - name: deployment guardrails
+        id: guardrails
+        shell: bash
+        env:
+          DEPLOYMENT_OPERATION: deploy
+        run: python3 scripts/check_deployment_guardrails.py
+
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+          role-session-name: burn-dragon-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
 
       - name: guard canonical bootstrap naming
         shell: bash
@@ -2043,4 +2059,6 @@ jobs:
           - Auth connector: \`${AUTH_CONNECTOR_KIND}\`
           - GitHub admin logins: \`${ADMIN_LOGINS_CSV:-n/a}\`
           - Secret prefix: \`${SECRET_PARAMETER_PREFIX}\`
+          - Estimated fixed AWS monthly cost: \`${{ steps.guardrails.outputs.fixed_monthly_cost_usd }} USD\`
+          - Alarm SNS topic: \`${TF_VAR_alarm_sns_topic_arn:-unset}\`
           EOF

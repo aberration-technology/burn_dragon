@@ -180,7 +180,9 @@ Configure the workflow to target one of those environments. Put the following va
 ### Required Environment Variables
 
 - `BURN_DRAGON_P2P_AWS_ROLE_ARN`
-  - AWS IAM role assumed through GitHub OIDC. This is the only required non-secret variable on the normal path.
+  - AWS IAM role assumed through GitHub OIDC for deploy, restore, inspect, and dataset publication workflows.
+- `BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN`
+  - separate AWS IAM role assumed through GitHub OIDC for the destructive cleanup workflow only. Keep this role distinct from `BURN_DRAGON_P2P_AWS_ROLE_ARN`.
 - `BURN_DRAGON_P2P_AWS_REGION`
   - Optional AWS region for the stack. Defaults to `us-east-2`, which is the sane Midwest default.
 - `BURN_DRAGON_P2P_STACK_NAME`
@@ -204,16 +206,30 @@ Configure the workflow to target one of those environments. Put the following va
 - `BURN_DRAGON_P2P_RELEASE_TRAIN_HASH`
   - Optional release-train hash enforced by the auth portal. Defaults to `burn-dragon-mainnet-train`.
 
+### Production Guardrails
+
+The production workflow path is intentionally narrower than the full Terraform surface:
+
+- use `terraform_workspace=mainnet`
+- keep `bootstrap_install_source=crate`
+- keep bootstrap status alarms enabled
+- keep control-plane operational alarms enabled
+- keep the shared control-plane dashboard enabled
+- set `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN` so alarms route to a real pager or operator channel
+- keep the fixed recurring AWS profile under `$100`
+- keep `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` on the normal production path; scale first through browser peers and external native peers instead of an always-on managed trainer fleet
+
 Recommended Midwest baseline:
 
 - `BURN_DRAGON_P2P_AWS_REGION=us-east-2`
+- `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN=arn:aws:sns:us-east-2:<account-id>:burn-dragon-p2p-alerts`
 - `BURN_DRAGON_P2P_EDGE_DOMAIN_NAME=edge.dragon.aberration.technology`
 - `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL=https://dragon.aberration.technology`
 - `BURN_DRAGON_P2P_AUTH_REDIRECT_BASE_URL=https://dragon.aberration.technology`
 - `BURN_DRAGON_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET=aberration-technology.github.io`
 - `BURN_DRAGON_P2P_ROUTE53_ZONE_NAME=aberration.technology`
-- leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` until you explicitly want an always-on trainer
-- if you do enable a trainer, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
+- leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` on the default production path to stay under `$100` fixed monthly AWS cost
+- if you intentionally exceed that budget later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu` and re-evaluate the fixed-cost estimate before apply
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
@@ -273,7 +289,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_USE_RETAINED_BOOTSTRAP_DATA_VOLUME`
   - whether Terraform should provision a separate retained bootstrap data volume. Defaults to `false`, which keeps bootstrap-local state on the root volume only.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY`
-  - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool.
+  - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool. Any nonzero production pool on the default `m7i.large` path exceeds the fixed-cost guardrail and is rejected.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND`
   - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`. Defaults to `cpu` so GPU trainers stay opt-in.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND`
@@ -303,13 +319,13 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_ENABLE_BOOTSTRAP_STATUS_ALARMS`
   - enable or disable EC2 status-check CloudWatch alarms for the bootstrap host. Defaults to `true`.
 - `BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN`
-  - optional SNS topic ARN used for CloudWatch operational alarms. Leave empty to create alarms without notifications.
+  - SNS topic ARN used for CloudWatch operational alarms. The production workflow guardrails require this to be non-empty so alarms route somewhere actionable.
 - `BURN_DRAGON_P2P_ENABLE_MANAGED_CONTROL_PLANE_REDIS`
   - whether Terraform should provision a managed Redis node for auth session and operator state. Defaults to `false`.
 - `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_OPERATIONAL_ALARMS`
-  - enable or disable control-plane alarms. With the cheap defaults this covers bootstrap EC2, dataset CDN, Route53 health-check, and managed-trainer alarms; Redis alarms appear only when managed Redis is enabled. Defaults to `true`.
+  - enable or disable control-plane alarms. With the cheap defaults this covers bootstrap EC2, dataset CDN, Route53 health-check, and managed-trainer alarms; Redis alarms appear only when managed Redis is enabled. Defaults to `true`, and the production path keeps it enabled.
 - `BURN_DRAGON_P2P_ENABLE_CONTROL_PLANE_DASHBOARD`
-  - enable or disable the shared CloudWatch dashboard for the Dragon control plane. Defaults to `true`.
+  - enable or disable the shared CloudWatch dashboard for the Dragon control plane. Defaults to `true`, and the production path keeps it enabled.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_NAME`
   - optional existing S3 bucket name for directly published checkpoints and metrics. Leave empty to let Terraform derive a stable unique bucket name.
 - `BURN_DRAGON_P2P_ARTIFACT_BUCKET_PATH_PREFIX`
@@ -348,21 +364,29 @@ The workflow writes auth client credentials into AWS SSM Parameter Store before 
 
 There is intentionally no shared bootstrap admin token in the production flow. Admin actions are authenticated with a short-lived session id. For GitHub auth, admin capability is granted only to explicitly listed GitHub username handles that also satisfy the org/team/repo policy. For non-GitHub auth, seed explicit admin principals through `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON`.
 
-## Required AWS IAM Permissions
+## GitHub Actions IAM
 
-The GitHub OIDC role must be able to:
+Do not run the GitHub workflows with `AdministratorAccess` or a single broad shared role.
 
-- manage the Terraform target resources in the selected AWS account
-- write and overwrite SSM parameters under the chosen secret prefix
-- read Route53 hosted zone metadata
-- manage the bootstrap EC2 host, optional retained EBS volume, optional DLM snapshot policies, and CloudWatch alarms for the bootstrap stack
-- create or update the artifact S3 bucket resources when you use the managed-bucket path, including optional warm-DR replica bucket resources
+Use the split-role policy in [aws/github-actions-iam.md](./aws/github-actions-iam.md):
 
-The deployed EC2 instance role is created by Terraform and needs to:
+- `BURN_DRAGON_P2P_AWS_ROLE_ARN`
+  - normal operations only: deploy, restore, inspect, dataset publication
+- `BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN`
+  - destructive cleanup only
 
-- read the SSM parameters that hold the auth client credentials when the selected auth connector uses them
-- list, upload, and delete objects in the configured artifact S3 bucket so the bootstrap host can publish and prune checkpoints and metrics without static AWS keys
-- when managed trainers are enabled, the managed trainer EC2 role additionally needs SSM read access for the trainer auth bundle parameter and KMS decrypt rights for the SSM key
+That document includes:
+
+- an OIDC trust policy pinned to the `burn-dragon-p2p-staging` and `burn-dragon-p2p-production` GitHub environments
+- a deploy-role policy covering the actual Terraform and workflow surface
+- a separate cleanup-role policy for legacy and orphan teardown
+- the minimal placeholder set you need to fill in before attaching the policies
+
+The deployed EC2 runtime roles are still created by Terraform. Those roles need:
+
+- SSM read access for auth client credentials when the selected auth connector uses them
+- S3 object access for artifact publication and pruning
+- when managed trainers are enabled, SSM read access for the trainer auth bundle parameter and KMS decrypt rights for the SSM key
 
 ## Managed Native Trainer Pool
 
@@ -379,9 +403,9 @@ Current behavior:
 Recommended first production setting:
 
 - leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` while you bring up the control plane
-- if you want a low-cost always-on trainer later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=1`
-- set `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu`
-- set `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
+- keep the managed trainer pool disabled on the normal production path so the fixed AWS spend stays under `$100`
+- add capacity first through browser peers and operator-run native peers before enabling an always-on managed trainer pool
+- if you intentionally move beyond the cheap profile later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu` and `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
 
 Operational constraint:
 

@@ -107,7 +107,6 @@ on:
 
 permissions:
   id-token: write
-  actions: write
   contents: read
 
 concurrency:
@@ -193,6 +192,7 @@ jobs:
           VAR_MANAGED_TRAINER_BACKEND: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND }}
           VAR_MANAGED_TRAINER_EXPERIMENT_KIND: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND }}
           VAR_MANAGED_TRAINER_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_INSTANCE_TYPE }}
+          VAR_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB }}
           VAR_MANAGED_TRAINER_MIN_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MIN_SIZE }}
           VAR_MANAGED_TRAINER_MAX_SIZE: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE }}
           VAR_MANAGED_TRAINER_TARGET: ${{ vars.BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET }}
@@ -293,6 +293,7 @@ jobs:
           managed_trainer_backend="$VAR_MANAGED_TRAINER_BACKEND"
           managed_trainer_experiment_kind="$VAR_MANAGED_TRAINER_EXPERIMENT_KIND"
           managed_trainer_instance_type="$VAR_MANAGED_TRAINER_INSTANCE_TYPE"
+          managed_trainer_root_volume_size_gib="$VAR_MANAGED_TRAINER_ROOT_VOLUME_SIZE_GIB"
           managed_trainer_min_size="$VAR_MANAGED_TRAINER_MIN_SIZE"
           managed_trainer_max_size="$VAR_MANAGED_TRAINER_MAX_SIZE"
           managed_trainer_target="$VAR_MANAGED_TRAINER_TARGET"
@@ -607,6 +608,7 @@ jobs:
           {
             echo "AWS_REGION=$aws_region"
             echo "AWS_ROLE_ARN=$aws_role_arn"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$aws_role_arn")"
             echo "STACK_NAME=$stack_name"
             echo "EDGE_DOMAIN_NAME=$edge_domain_name"
             echo "BROWSER_APP_BASE_URL=$browser_app_base_url"
@@ -702,6 +704,7 @@ jobs:
           if [ -n "$data_volume_size_gib" ]; then echo "TF_VAR_data_volume_size_gib=$data_volume_size_gib" >>"$GITHUB_ENV"; fi
           if [ -n "$use_retained_bootstrap_data_volume" ]; then echo "TF_VAR_use_retained_bootstrap_data_volume=$use_retained_bootstrap_data_volume" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_instance_type" ]; then echo "TF_VAR_managed_trainer_instance_type=$managed_trainer_instance_type" >>"$GITHUB_ENV"; fi
+          if [ -n "$managed_trainer_root_volume_size_gib" ]; then echo "TF_VAR_managed_trainer_root_volume_size_gib=$managed_trainer_root_volume_size_gib" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_min_size" ]; then echo "TF_VAR_managed_trainer_min_size=$managed_trainer_min_size" >>"$GITHUB_ENV"; fi
           if [ -n "$managed_trainer_max_size" ]; then echo "TF_VAR_managed_trainer_max_size=$managed_trainer_max_size" >>"$GITHUB_ENV"; fi
           if [ -n "$enable_data_volume_snapshots" ]; then echo "TF_VAR_enable_data_volume_snapshots=$enable_data_volume_snapshots" >>"$GITHUB_ENV"; fi
@@ -731,11 +734,22 @@ jobs:
             } >>"$GITHUB_ENV"
           fi
 
+      - name: deployment guardrails
+        id: guardrails
+        shell: bash
+        env:
+          DEPLOYMENT_OPERATION: restore
+        run: python3 scripts/check_deployment_guardrails.py
+
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+          role-session-name: burn-dragon-restore-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
 
       - name: guard canonical bootstrap naming
         shell: bash
@@ -1652,6 +1666,8 @@ jobs:
           - Bootstrap install source: \`${TF_VAR_bootstrap_install_source}\`
           - Bootstrap crate version: \`${TF_VAR_bootstrap_crate_version}\`
           - Bootstrap git ref override: \`${TF_VAR_bootstrap_git_ref:-n/a}\`
+          - Estimated fixed AWS monthly cost: \`${{ steps.guardrails.outputs.fixed_monthly_cost_usd }} USD\`
+          - Alarm SNS topic: \`${TF_VAR_alarm_sns_topic_arn:-unset}\`
           EOF
 
           if [ "${INPUT_PLAN_ONLY}" != "true" ]; then

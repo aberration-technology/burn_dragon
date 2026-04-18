@@ -51,7 +51,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: burn-dragon-p2p-${{ github.event.inputs.environment }}
     env:
-      AWS_REGION: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
       DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
       TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
       CLEANUP_LEGACY_STACK: ${{ github.event.inputs.cleanup_legacy_stack }}
@@ -61,11 +60,30 @@ jobs:
       CLEANUP_DUPLICATE_DATASET_CERTIFICATES: ${{ github.event.inputs.cleanup_duplicate_dataset_certificates }}
 
     steps:
+      - name: resolve aws session settings
+        shell: bash
+        env:
+          AWS_REGION_VAR: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+          AWS_ROLE_ARN_VAR: ${{ vars.BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          : "${AWS_REGION_VAR:?missing BURN_DRAGON_P2P_AWS_REGION}"
+          : "${AWS_ROLE_ARN_VAR:?missing BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN}"
+          {
+            echo "AWS_REGION=$AWS_REGION_VAR"
+            echo "AWS_ROLE_ARN=$AWS_ROLE_ARN_VAR"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$AWS_ROLE_ARN_VAR")"
+          } >>"$GITHUB_ENV"
+
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}
-          aws-region: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+          role-session-name: burn-dragon-cleanup-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
 
       - name: cleanup legacy and orphaned aws resources
         shell: bash

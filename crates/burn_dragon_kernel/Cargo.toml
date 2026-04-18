@@ -25,6 +25,7 @@ burn-fusion = { workspace = true, features = ["std"] }
 burn-ir.workspace = true
 burn-std.workspace = true
 burn-wgpu = { workspace = true, features = ["fusion", "std", "template"] }
+burn_dragon_time.workspace = true
 cudarc = { version = "0.17.8", features = ["cuda-version-from-build-system"], optional = true }
 pollster = "0.3"
 serde.workspace = true

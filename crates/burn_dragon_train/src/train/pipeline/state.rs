@@ -1,10 +1,9 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result};
+use burn_dragon_time::unix_timestamp_now as shared_unix_timestamp_now;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const BUNDLE_STATE_FILE_NAME: &str = "bundle_state.json";
 pub const STAGE_STATE_FILE_NAME: &str = "stage_state.json";
@@ -121,10 +120,7 @@ where
 }
 
 pub fn unix_timestamp_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    shared_unix_timestamp_now()
 }
 
 #[cfg(test)]

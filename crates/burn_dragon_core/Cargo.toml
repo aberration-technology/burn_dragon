@@ -54,6 +54,7 @@ burn-cuda = { workspace = true, optional = true, features = ["std"] }
 burn-ndarray = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true, features = ["fusion", "std"] }
 burn_dragon_kernel.workspace = true
+burn_dragon_time.workspace = true
 clap = { workspace = true, optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 rand.workspace = true

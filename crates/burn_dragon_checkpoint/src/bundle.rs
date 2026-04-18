@@ -1,9 +1,8 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use burn::module::Module;
 use burn::tensor::backend::Backend;
+use burn_dragon_time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::parts::{BurnpackPartsReport, ensure_burnpack_parts, save_model_to_burnpack};
 use crate::policy::BurnpackLoadPolicy;

@@ -1,10 +1,10 @@
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
+use burn_dragon_time::Instant;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicI8, Ordering};
-use std::time::Instant;
 
 use burn::tensor::backend::Backend as BackendTrait;
 use burn::tensor::{Int, Tensor, TensorPrimitive, activation};

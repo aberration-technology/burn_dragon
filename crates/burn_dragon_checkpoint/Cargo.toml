@@ -16,6 +16,7 @@ default = []
 [dependencies]
 anyhow.workspace = true
 burn = { workspace = true, features = ["std"] }
+burn_dragon_time.workspace = true
 burn-store = { workspace = true, features = ["std", "burnpack", "safetensors"] }
 ciborium = "0.2"
 serde.workspace = true

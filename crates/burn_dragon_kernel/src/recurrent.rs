@@ -1,6 +1,6 @@
+use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
-use std::time::Instant;
 
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::backend::Backend as BackendTrait;

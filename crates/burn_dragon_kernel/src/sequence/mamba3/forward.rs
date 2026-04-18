@@ -1,10 +1,10 @@
 #![allow(clippy::collapsible_if)]
+use burn_dragon_time::Instant;
 use std::any::Any;
 use std::sync::Once;
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicI8, Ordering};
-use std::time::Instant;
 
 use burn::tensor::TensorPrimitive;
 use burn::tensor::backend::AutodiffBackend;

@@ -2,10 +2,10 @@ use burn::nn::Dropout;
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
+use burn_dragon_time::Instant;
 #[cfg(any(feature = "benchmark", feature = "train", feature = "cuda"))]
 use std::any::Any;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 #[cfg(any(feature = "benchmark", feature = "train", feature = "cuda"))]
 use burn_cubecl::cubecl::Runtime;

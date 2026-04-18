@@ -1,8 +1,8 @@
 #![allow(clippy::type_complexity)]
+use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};

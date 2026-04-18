@@ -11,6 +11,7 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
 use burn_dragon_core::DragonModel;
+use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
     ContentId, ExperimentId, ExperimentScope, RevisionId, StudyId, WorkloadId,
@@ -27,11 +28,7 @@ use burn_p2p_dataloader::ShardFetchManifest;
 use burn_wgpu::{RuntimeOptions, graphics};
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 use url::Url;
-#[cfg(target_arch = "wasm32")]
-use web_time::Instant;
 
 use crate::auth::{browser_github_enrollment_config, fetch_edge_snapshot, load_browser_session};
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};

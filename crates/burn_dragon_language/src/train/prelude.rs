@@ -1,10 +1,10 @@
 #![allow(unused_imports)]
 
+pub(crate) use burn_dragon_time::{SystemTime, UNIX_EPOCH};
 pub(crate) use std::fs;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
-pub(crate) use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) use anyhow::{Context, Result, anyhow};
 pub(crate) use rand::{Rng, SeedableRng, rngs::StdRng, thread_rng};

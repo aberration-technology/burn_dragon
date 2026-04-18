@@ -11,7 +11,9 @@ use crate::train::{resolve_dragon_language_optimizer, validate_dragon_continual_
 use crate::write_training_snapshot;
 use burn_dragon_core::SequenceMemorySystem;
 use serde::Serialize;
-use std::{fs, time::Instant};
+use std::fs;
+
+use burn_dragon_time::Instant;
 use tracing::warn;
 
 const PROCESS_GROUP_RUN_DIR_ENV: &str = "BURN_DRAGON_PROCESS_GROUP_RUN_DIR";

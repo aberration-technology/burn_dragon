@@ -1,10 +1,10 @@
+use burn_dragon_time::Instant;
 use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 use burn::data::dataloader::{DataLoader, DataLoaderIterator, Progress};
 use burn::tensor::backend::Backend;

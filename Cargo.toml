@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "xtask",
+  "crates/burn_dragon_time",
   "crates/burn_dragon_checkpoint",
   "crates/burn_dragon_core",
   "crates/burn_dragon_kernel",
@@ -43,6 +44,7 @@ burn_dragon_core = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_core
 burn_dragon_kernel = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_kernel", default-features = false }
 burn_dragon_language = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_language", default-features = false }
 burn_dragon_p2p = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_p2p", default-features = false }
+burn_dragon_time = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_time", default-features = false }
 burn_dragon_tokenizer = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_tokenizer", default-features = false }
 burn_dragon_train = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_train", default-features = false }
 burn_dragon_universality = { version = "=0.21.0-pre.15", path = "crates/burn_dragon_universality", default-features = false }
@@ -70,6 +72,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3"
 wasm-bindgen-cli-support = "0.2"
+web-time = "1.1"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

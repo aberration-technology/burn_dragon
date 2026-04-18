@@ -52,6 +52,7 @@ burn-ndarray = { workspace = true, optional = true }
 burn-train = { workspace = true, optional = true }
 burn_dragon_checkpoint = { workspace = true, default-features = false, optional = true }
 burn_dragon_core = { workspace = true, default-features = false }
+burn_dragon_time.workspace = true
 burn_dragon_tokenizer.workspace = true
 burn_dragon_train = { workspace = true, default-features = false, optional = true }
 burn_dragon_universality = { workspace = true, default-features = false, optional = true }

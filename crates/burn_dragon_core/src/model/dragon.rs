@@ -34,12 +34,12 @@ use burn_dragon_kernel::api::recurrent::{
 use burn_dragon_kernel::kernels::sequence::mamba3::forward::{
     Mamba3TensorizedState, tensorized_mamba3_forward, use_tensorized_mamba3_forward_experimental,
 };
+use burn_dragon_time::Instant;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::time::Instant;
 
 use super::attention::Attention;
 use super::attention_residual::{

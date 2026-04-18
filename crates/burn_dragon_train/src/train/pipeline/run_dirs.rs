@@ -1,11 +1,10 @@
+use anyhow::{Context, Result, anyhow};
+use burn_dragon_time::unix_timestamp_now;
+use names::Generator;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use anyhow::{Context, Result, anyhow};
-use names::Generator;
-use serde::{Deserialize, Serialize};
 
 use crate::config::RunLayoutConfig;
 
@@ -155,10 +154,7 @@ pub fn create_run_dir(run_root: &Path) -> Result<(PathBuf, String)> {
         }
     }
 
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| anyhow!("failed to read system time: {err}"))?
-        .as_secs();
+    let suffix = unix_timestamp_now();
     let name = format!("run-{suffix}");
     Ok((run_root.join(&name), name))
 }

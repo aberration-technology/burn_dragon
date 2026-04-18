@@ -1,10 +1,10 @@
 use crate::train::prelude::*;
 use burn_dragon_core::ModelState;
+use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 type StreamingStateStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
 

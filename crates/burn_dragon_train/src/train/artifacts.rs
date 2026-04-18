@@ -4,10 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fmt};
 
 use anyhow::{Context, Result, anyhow};
+use burn_dragon_time::unique_timestamp_nanos;
 use image::RgbImage;
 
 use crate::config::VisionArtifactOutputMode;
@@ -234,10 +234,7 @@ fn resolve_ffmpeg(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
 
 fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
     let mut base = env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
+    let nanos = unique_timestamp_nanos();
     base.push(format!("{prefix}_{nanos}"));
     fs::create_dir_all(&base).context("create temp dir")?;
     Ok(base)

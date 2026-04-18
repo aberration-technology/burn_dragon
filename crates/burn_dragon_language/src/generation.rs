@@ -1,12 +1,12 @@
 use anyhow::{Result, anyhow};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+use burn_dragon_time::Instant;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 use burn_dragon_core::{DragonModel, ModelState};
 

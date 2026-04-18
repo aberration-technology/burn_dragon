@@ -1976,6 +1976,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             trainer_c_window.head.head_id.clone(),
         ];
         let convergence_deadline = Instant::now() + Duration::from_secs(90);
+        let expected_promoted_global_step = canonical_head.global_step + 1;
         let promoted_head = loop {
             advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
                 seed.advance_diffusion_steady_state(&experiment, None, None)
@@ -2006,6 +2007,12 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
                 && seed_head.head_id == trainer_c_head.head_id
                 && seed_head.head_id != base_head_id
                 && !local_head_ids.contains(&seed_head.head_id)
+                && seed_head.parent_head_id.as_ref() == Some(&base_head_id)
+                && trainer_b_head.parent_head_id.as_ref() == Some(&base_head_id)
+                && trainer_c_head.parent_head_id.as_ref() == Some(&base_head_id)
+                && seed_head.global_step == expected_promoted_global_step
+                && trainer_b_head.global_step == expected_promoted_global_step
+                && trainer_c_head.global_step == expected_promoted_global_step
             {
                 break seed_head;
             }
@@ -2020,7 +2027,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         merged_losses.push(merged_loss);
         assert!(merged_loss.is_finite());
         assert_eq!(promoted_head.parent_head_id, Some(base_head_id.clone()));
-        assert_eq!(promoted_head.global_step, canonical_head.global_step + 1);
+        assert_eq!(promoted_head.global_step, expected_promoted_global_step);
 
         wait_for(
             Duration::from_secs(40),
@@ -2489,6 +2496,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
         trainer_b_window.head.head_id.clone(),
         trainer_c_window.head.head_id.clone(),
     ];
+    let expected_promoted_global_step = genesis_head.global_step + 1;
     let promoted_head = loop {
         advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
             seed.advance_diffusion_steady_state(&experiment, None, None)
@@ -2515,6 +2523,12 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
             && seed_head.head_id == trainer_c_head.head_id
             && seed_head.head_id != genesis_head.head_id
             && !local_head_ids.contains(&seed_head.head_id)
+            && seed_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
+            && trainer_b_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
+            && trainer_c_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
+            && seed_head.global_step == expected_promoted_global_step
+            && trainer_b_head.global_step == expected_promoted_global_step
+            && trainer_c_head.global_step == expected_promoted_global_step
         {
             break seed_head;
         }
@@ -2525,7 +2539,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
         thread::sleep(Duration::from_millis(25));
     };
 
-    assert_eq!(promoted_head.global_step, 1);
+    assert_eq!(promoted_head.global_step, expected_promoted_global_step);
     assert_eq!(
         promoted_head.parent_head_id,
         Some(genesis_head.head_id.clone())

@@ -2346,27 +2346,127 @@ fn EditorTextareaField(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_session_is_authenticated, dragon_global_training_detail,
+        browser_session_is_authenticated, connect_config, dragon_global_training_detail,
         dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
         dragon_local_training_summary, dragon_network_detail, dragon_slice_progress_summary,
         dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
         normalized_browser_callback_url,
     };
+    use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
-        AuthProvider, ContentId, NetworkId, PeerRoleSet, PrincipalClaims, PrincipalId,
-        PrincipalSession,
+        AuthProvider, BrowserMode, ContentId, ExperimentScope, NetworkId, PeerId, PeerRoleSet,
+        PrincipalClaims, PrincipalId, PrincipalSession, ProfileMode, SocialMode,
     };
     use burn_p2p_browser::{BrowserSessionState, BrowserTransportKind};
-    use burn_p2p_core::{BrowserSwarmStatus, BrowserTransportFamily};
+    use burn_p2p_core::{
+        BrowserDirectorySnapshot, BrowserEdgeMode, BrowserEdgePaths, BrowserEdgeSnapshot,
+        BrowserLeaderboardSnapshot, BrowserSeedAdvertisement, BrowserSeedRecord,
+        BrowserSeedTransportKind, BrowserSeedTransportPolicy, BrowserSwarmStatus,
+        BrowserTransportFamily, BrowserTransportSurface, SchemaEnvelope, SignatureAlgorithm,
+        SignatureMetadata, SignedPayload,
+    };
     use burn_p2p_views::{
         BrowserAppClientView, BrowserAppNetworkView, BrowserAppPerformanceView, BrowserAppSurface,
         BrowserAppTrainingView, BrowserAppValidationView, BrowserAppViewerView,
     };
     use chrono::Utc;
+    use semver::Version;
     use std::collections::{BTreeMap, BTreeSet};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    fn sample_browser_app_config() -> DragonBrowserAppConfig {
+        DragonBrowserAppConfig {
+            network: DragonPeerNetworkConfig::default()
+                .with_edge_base_url(Some("https://edge.example".into()))
+                .with_seed_node_urls(Some(vec![
+                    "/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                    "/dns4/bootstrap.example/tcp/443/wss".into(),
+                ])),
+            selected_experiment_id: Some("nca-prepretraining".into()),
+            selected_revision_id: Some("rev-browser".into()),
+            requested_scopes: BTreeSet::from([
+                ExperimentScope::Connect,
+                ExperimentScope::Discover,
+            ]),
+            require_edge_auth: true,
+            #[cfg(feature = "wasm-peer")]
+            training: None,
+        }
+    }
+
+    fn sample_edge_snapshot() -> BrowserEdgeSnapshot {
+        BrowserEdgeSnapshot {
+            network_id: NetworkId::new("burn-dragon-mainnet"),
+            edge_mode: BrowserEdgeMode::Peer,
+            browser_mode: BrowserMode::Trainer,
+            social_mode: SocialMode::Public,
+            profile_mode: ProfileMode::Public,
+            transports: BrowserTransportSurface {
+                webrtc_direct: true,
+                webtransport_gateway: true,
+                wss_fallback: true,
+            },
+            paths: BrowserEdgePaths::default(),
+            auth_enabled: true,
+            login_providers: Vec::new(),
+            required_release_train_hash: Some(ContentId::new("train-browser")),
+            allowed_target_artifact_hashes: BTreeSet::from([ContentId::new("artifact-browser")]),
+            directory: BrowserDirectorySnapshot {
+                network_id: NetworkId::new("burn-dragon-mainnet"),
+                generated_at: Utc::now(),
+                entries: Vec::new(),
+            },
+            heads: Vec::new(),
+            leaderboard: BrowserLeaderboardSnapshot {
+                network_id: NetworkId::new("burn-dragon-mainnet"),
+                score_version: "leaderboard_score_v1".into(),
+                entries: Vec::new(),
+                captured_at: Utc::now(),
+            },
+            trust_bundle: None,
+            captured_at: Utc::now(),
+        }
+    }
+
+    fn sample_signed_seed_advertisement() -> SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>
+    {
+        SignedPayload::new(
+            SchemaEnvelope::new(
+                "burn_p2p.browser_seed_advertisement",
+                Version::new(0, 1, 0),
+                BrowserSeedAdvertisement {
+                    schema_version: u32::from(burn_p2p_core::SCHEMA_VERSION),
+                    network_id: NetworkId::new("burn-dragon-mainnet"),
+                    issued_at: Utc::now(),
+                    expires_at: Utc::now() + chrono::Duration::minutes(10),
+                    transport_policy: BrowserSeedTransportPolicy {
+                        preferred: vec![
+                            BrowserSeedTransportKind::WebRtcDirect,
+                            BrowserSeedTransportKind::WssFallback,
+                        ],
+                        allow_fallback_wss: true,
+                    },
+                    seeds: vec![BrowserSeedRecord {
+                        peer_id: Some(PeerId::new("seed-browser")),
+                        multiaddrs: vec![
+                            "/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                            "/dns4/bootstrap.example/tcp/443/wss".into(),
+                        ],
+                    }],
+                },
+            ),
+            SignatureMetadata {
+                signer: PeerId::new("bootstrap"),
+                key_id: "browser-seeds".into(),
+                algorithm: SignatureAlgorithm::Ed25519,
+                signed_at: Utc::now(),
+                signature_hex: "deadbeef".into(),
+            },
+        )
+        .expect("signed browser seed advertisement")
+    }
 
     fn sample_browser_view() -> BrowserAppClientView {
         BrowserAppClientView {
@@ -2595,5 +2695,53 @@ mod tests {
             "32 left · eta 4s"
         );
         assert_eq!(dragon_network_detail(Some(&view)), "3 direct · ~9 visible");
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_connect_config_reuses_embedded_bootstrap_when_network_matches() {
+        let config = sample_browser_app_config();
+        let snapshot = sample_edge_snapshot();
+        let signed_seed_advertisement = sample_signed_seed_advertisement();
+
+        let connect = connect_config(
+            &config,
+            &config,
+            Some(&snapshot),
+            Some(&signed_seed_advertisement),
+        )
+        .expect("connect config");
+
+        assert_eq!(connect.seed_node_urls, config.effective_seed_node_urls());
+        assert_eq!(connect.bootstrap_snapshot, Some(snapshot));
+        assert_eq!(
+            connect.bootstrap_signed_seed_advertisement,
+            Some(signed_seed_advertisement)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_connect_config_discards_embedded_bootstrap_when_overrides_diverge() {
+        let config = sample_browser_app_config();
+        let override_config = config.clone().with_network_overrides(
+            Some("https://override-edge.example".into()),
+            Some(vec!["/dns4/override.example/tcp/443/wss".into()]),
+        );
+        let snapshot = sample_edge_snapshot();
+        let signed_seed_advertisement = sample_signed_seed_advertisement();
+
+        let connect = connect_config(
+            &config,
+            &override_config,
+            Some(&snapshot),
+            Some(&signed_seed_advertisement),
+        )
+        .expect("connect config");
+
+        assert_eq!(
+            connect.seed_node_urls,
+            vec!["/dns4/override.example/tcp/443/wss".to_owned()]
+        );
+        assert_eq!(connect.bootstrap_snapshot, None);
+        assert_eq!(connect.bootstrap_signed_seed_advertisement, None);
     }
 }

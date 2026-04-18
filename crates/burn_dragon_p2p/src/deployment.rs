@@ -116,8 +116,11 @@ pub struct DeploymentHttpProbe {
 pub struct DeploymentAuthorizeProbe {
     pub provider_label: String,
     pub login_path: String,
+    pub authorize_url: String,
     pub redirect_uri: Option<String>,
     pub missing_query_params: Vec<String>,
+    pub authorize_url_secure: bool,
+    pub redirect_uri_secure: bool,
 }
 
 #[cfg(feature = "native")]
@@ -387,13 +390,19 @@ fn probe_auth_authorize(config: &DragonNativePeerConfig) -> Result<DeploymentAut
             })
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let redirect_uri = query
+            .iter()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.clone());
         Ok(DeploymentAuthorizeProbe {
             provider_label: provider.label,
             login_path: provider.login_path,
-            redirect_uri: query
-                .iter()
-                .find(|(key, _)| key == "redirect_uri")
-                .map(|(_, value)| value.clone()),
+            authorize_url: authorize_url.to_owned(),
+            redirect_uri_secure: redirect_uri
+                .as_deref()
+                .is_none_or(url_uses_secure_or_local_scheme),
+            authorize_url_secure: url_uses_secure_or_local_scheme(authorize_url),
+            redirect_uri,
             missing_query_params,
         })
     })
@@ -461,6 +470,15 @@ pub fn evaluate_deployment_readiness(
     if !edge_snapshot.ok {
         blocking_issues.push("edge_snapshot_unavailable".into());
     } else if let Some(snapshot) = edge_snapshot.value.as_ref() {
+        if snapshot.auth_enabled && snapshot.login_providers.is_empty() {
+            blocking_issues.push("auth_enabled_without_login_provider".into());
+        }
+        if !snapshot.transports.webrtc_direct
+            && !snapshot.transports.webtransport_gateway
+            && !snapshot.transports.wss_fallback
+        {
+            blocking_issues.push("browser_transport_unavailable".into());
+        }
         if snapshot.transports.webrtc_direct && !browser_webrtc_direct_runtime_supported() {
             blocking_issues.push("webrtc_direct_advertised_without_runtime_support".into());
         }
@@ -514,6 +532,26 @@ pub fn evaluate_deployment_readiness(
             } else {
                 observed_warnings.push("auth_authorize_query_incomplete".into());
             }
+        } else if auth_authorize
+            .value
+            .as_ref()
+            .is_some_and(|probe| !probe.authorize_url_secure)
+        {
+            if options.require_auth_authorize {
+                blocking_issues.push("auth_authorize_url_insecure".into());
+            } else {
+                observed_warnings.push("auth_authorize_url_insecure".into());
+            }
+        } else if auth_authorize
+            .value
+            .as_ref()
+            .is_some_and(|probe| !probe.redirect_uri_secure)
+        {
+            if options.require_auth_authorize {
+                blocking_issues.push("auth_redirect_uri_insecure".into());
+            } else {
+                observed_warnings.push("auth_redirect_uri_insecure".into());
+            }
         }
     }
 
@@ -538,10 +576,26 @@ pub fn evaluate_deployment_readiness(
 fn trim_preview(body: &str) -> String {
     const LIMIT: usize = 240;
     let trimmed = body.trim();
-    if trimmed.len() <= LIMIT {
-        trimmed.to_owned()
+    let preview = trimmed.chars().take(LIMIT).collect::<String>();
+    if preview.len() == trimmed.len() {
+        preview
     } else {
-        format!("{}...", &trimmed[..LIMIT])
+        format!("{preview}...")
+    }
+}
+
+#[cfg(feature = "native")]
+fn url_uses_secure_or_local_scheme(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => matches!(
+            parsed.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1")
+        ),
+        _ => false,
     }
 }
 
@@ -697,8 +751,11 @@ mod tests {
             Some(&DeploymentCheck::ok(DeploymentAuthorizeProbe {
                 provider_label: "github".into(),
                 login_path: "/login/github".into(),
+                authorize_url: "https://github.example/authorize".into(),
                 redirect_uri: None,
                 missing_query_params: vec!["redirect_uri".into()],
+                authorize_url_secure: true,
+                redirect_uri_secure: false,
             })),
             None,
             &readiness_options(false, false, false, true, false),
@@ -754,6 +811,82 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"artifact_head_view_probe_failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_a_browser_transport_surface() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.transports.wss_fallback = false;
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &readiness_options(true, true, false, false, false),
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"browser_transport_unavailable".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_login_provider_when_auth_enabled() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.login_providers.clear();
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &readiness_options(true, true, false, false, false),
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"auth_enabled_without_login_provider".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_blocks_on_insecure_auth_redirects_when_required() {
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge_check(true),
+            &profile_check(),
+            None,
+            Some(&DeploymentCheck::ok(DeploymentAuthorizeProbe {
+                provider_label: "github".into(),
+                login_path: "/login/github".into(),
+                authorize_url: "http://localhost:9999/authorize".into(),
+                redirect_uri: Some("http://example.com/callback".into()),
+                missing_query_params: Vec::new(),
+                authorize_url_secure: true,
+                redirect_uri_secure: false,
+            })),
+            None,
+            &readiness_options(false, false, false, true, false),
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"auth_redirect_uri_insecure".to_owned())
         );
     }
 

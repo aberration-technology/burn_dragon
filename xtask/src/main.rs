@@ -135,6 +135,9 @@ fn all() -> Result<()> {
 
 fn deploy_check() -> Result<()> {
     smoke()?;
+    artifact_check()?;
+    browser_site::build_browser_site_default()?;
+    bootstrap_runtime_sync_check()?;
     downgrade_smoke()?;
     native_scale()?;
     mixed_fleet()?;
@@ -327,6 +330,10 @@ fn cargo_p2p_wasm_check(features: &str) -> Result<()> {
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
     run_with_env(program, args, &[])
+}
+
+fn bootstrap_runtime_sync_check() -> Result<()> {
+    run("python3", &["scripts/test_bootstrap_runtime_sync.py"])
 }
 
 fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> Result<()> {

@@ -544,9 +544,14 @@ async fn load_token_records(
         DragonBrowserTokenSource::Inline { records } => records.clone(),
         DragonBrowserTokenSource::HttpJson { url } => {
             let resolved_url = resolve_browser_source_url(url, edge_base_url)?;
-            let response = Request::get(&resolved_url).send().await.map_err(|error| {
-                anyhow!("failed to fetch browser shard {resolved_url}: {error}")
-            })?;
+            let response = ensure_browser_success_response(
+                Request::get(&resolved_url).send().await.map_err(|error| {
+                    anyhow!("failed to fetch browser shard {resolved_url}: {error}")
+                })?,
+                &resolved_url,
+                "browser shard",
+            )
+            .await?;
             let payload = response
                 .json::<TokenWindowPayload>()
                 .await
@@ -595,6 +600,34 @@ fn resolve_browser_source_url(url_or_path: &str, edge_base_url: &str) -> Result<
         .join(url_or_path)
         .with_context(|| format!("failed to resolve browser source {url_or_path}"))?
         .into())
+}
+
+fn trim_preview(body: &str) -> String {
+    const LIMIT: usize = 240;
+    let trimmed = body.trim();
+    let preview = trimmed.chars().take(LIMIT).collect::<String>();
+    if preview.len() == trimmed.len() {
+        preview
+    } else {
+        format!("{preview}...")
+    }
+}
+
+async fn ensure_browser_success_response(
+    response: gloo_net::http::Response,
+    url: &str,
+    label: &str,
+) -> Result<gloo_net::http::Response> {
+    if response.ok() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!(
+        "failed to fetch {label} {url}: http {} {}",
+        status,
+        trim_preview(&body)
+    );
 }
 
 fn resolve_shard_entry_url(manifest_url: &str, locator: &str) -> Result<String> {
@@ -678,10 +711,15 @@ async fn load_shard_manifest_records(
     request: ShardManifestLoadRequest<'_>,
 ) -> Result<Vec<TokenWindowRecord>> {
     let manifest_url = resolve_browser_source_url(request.manifest_url, request.edge_base_url)?;
-    let response = Request::get(&manifest_url)
-        .send()
-        .await
-        .map_err(|error| anyhow!("failed to fetch shard manifest {manifest_url}: {error}"))?;
+    let response = ensure_browser_success_response(
+        Request::get(&manifest_url)
+            .send()
+            .await
+            .map_err(|error| anyhow!("failed to fetch shard manifest {manifest_url}: {error}"))?,
+        &manifest_url,
+        "shard manifest",
+    )
+    .await?;
     let manifest_bytes = response
         .binary()
         .await
@@ -725,10 +763,15 @@ async fn load_shard_manifest_records(
     let shard_limit = request.max_shards_per_window.unwrap_or(usize::MAX);
     for entry in ordered_entries.into_iter().take(shard_limit) {
         let shard_url = resolve_shard_entry_url(&manifest_url, &entry.locator)?;
-        let response = Request::get(&shard_url)
-            .send()
-            .await
-            .map_err(|error| anyhow!("failed to fetch browser shard {shard_url}: {error}"))?;
+        let response = ensure_browser_success_response(
+            Request::get(&shard_url)
+                .send()
+                .await
+                .map_err(|error| anyhow!("failed to fetch browser shard {shard_url}: {error}"))?,
+            &shard_url,
+            "browser shard",
+        )
+        .await?;
         let shard_bytes = response
             .binary()
             .await

@@ -22,6 +22,8 @@ use burn_p2p_browser::{
     BrowserEdgeClient, BrowserEnrollmentConfig, BrowserSessionState, BrowserUiBindings,
 };
 use chrono::Utc;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use chrono::{DateTime, Duration};
 #[cfg(feature = "native")]
 use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
@@ -204,16 +206,25 @@ pub async fn fetch_edge_snapshot(edge_base_url: &str) -> Result<BrowserEdgeSnaps
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub async fn fetch_edge_snapshot(edge_base_url: &str) -> Result<BrowserEdgeSnapshot> {
-    gloo_net::http::Request::get(&format!(
-        "{}/portal/snapshot",
-        edge_base_url.trim_end_matches('/')
-    ))
-    .send()
-    .await
-    .map_err(|error| anyhow!("failed to fetch edge snapshot: {error}"))?
-    .json::<BrowserEdgeSnapshot>()
-    .await
-    .map_err(|error| anyhow!("failed to decode edge snapshot: {error}"))
+    let url = format!("{}/portal/snapshot", edge_base_url.trim_end_matches('/'));
+    let response = gloo_net::http::Request::get(&url)
+        .send()
+        .await
+        .map_err(|error| anyhow!("failed to fetch edge snapshot: {error}"))?;
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "failed to fetch edge snapshot {}: http {} {}",
+            url,
+            status,
+            trim_preview(&body)
+        );
+    }
+    response
+        .json::<BrowserEdgeSnapshot>()
+        .await
+        .map_err(|error| anyhow!("failed to decode edge snapshot: {error}"))
 }
 
 pub async fn begin_native_github_login(
@@ -355,12 +366,79 @@ pub fn browser_github_enrollment_config(
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_KEY: &str = "burn-dragon-p2p.pending-github-login";
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const PENDING_GITHUB_LOGIN_TTL_SECS: i64 = 15 * 60;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingBrowserGitHubLogin {
+    edge_base_url: String,
+    created_at: DateTime<Utc>,
     login: LoginStart,
     requested_scopes: BTreeSet<ExperimentScope>,
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredPendingBrowserGitHubLogin {
+    Current(PendingBrowserGitHubLogin),
+    Legacy {
+        login: LoginStart,
+        requested_scopes: BTreeSet<ExperimentScope>,
+    },
+    LegacyLoginStart(LoginStart),
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn normalize_edge_base_url(edge_base_url: &str) -> String {
+    edge_base_url.trim_end_matches('/').to_owned()
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn pending_browser_login_is_expired(created_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(created_at) > Duration::seconds(PENDING_GITHUB_LOGIN_TTL_SECS)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn parse_stored_pending_browser_login(
+    raw: &str,
+    edge_base_url: &str,
+    requested_scopes: BTreeSet<ExperimentScope>,
+    now: DateTime<Utc>,
+) -> Result<PendingBrowserGitHubLogin> {
+    Ok(
+        match serde_json::from_str::<StoredPendingBrowserGitHubLogin>(raw)? {
+            StoredPendingBrowserGitHubLogin::Current(pending) => pending,
+            StoredPendingBrowserGitHubLogin::Legacy {
+                login,
+                requested_scopes,
+            } => PendingBrowserGitHubLogin {
+                edge_base_url: normalize_edge_base_url(edge_base_url),
+                created_at: now,
+                login,
+                requested_scopes,
+            },
+            StoredPendingBrowserGitHubLogin::LegacyLoginStart(login) => PendingBrowserGitHubLogin {
+                edge_base_url: normalize_edge_base_url(edge_base_url),
+                created_at: now,
+                login,
+                requested_scopes,
+            },
+        },
+    )
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn trim_preview(body: &str) -> String {
+    const LIMIT: usize = 240;
+    let trimmed = body.trim();
+    let preview = trimmed.chars().take(LIMIT).collect::<String>();
+    if preview.len() == trimmed.len() {
+        preview
+    } else {
+        format!("{preview}...")
+    }
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -395,6 +473,8 @@ pub async fn begin_browser_github_login(
     let client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
     let login = client.begin_login(principal_hint).await?;
     let pending = PendingBrowserGitHubLogin {
+        edge_base_url: normalize_edge_base_url(edge_base_url),
+        created_at: Utc::now(),
         login: login.clone(),
         requested_scopes,
     };
@@ -417,14 +497,26 @@ pub async fn complete_browser_github_login(
         .get_item(PENDING_GITHUB_LOGIN_KEY)
         .map_err(|error| anyhow!("failed to read pending login: {error:?}"))?
         .ok_or_else(|| anyhow!("missing pending GitHub login state"))?;
-    let (login, requested_scopes) =
-        match serde_json::from_str::<PendingBrowserGitHubLogin>(&pending) {
-            Ok(pending) => (pending.login, pending.requested_scopes),
-            Err(_) => (
-                serde_json::from_str::<LoginStart>(&pending)?,
-                requested_scopes,
-            ),
+    let now = Utc::now();
+    let pending =
+        match parse_stored_pending_browser_login(&pending, edge_base_url, requested_scopes, now) {
+            Ok(pending) => pending,
+            Err(error) => {
+                let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
+                return Err(anyhow!("invalid pending GitHub login state: {error}"));
+            }
         };
+    if pending.edge_base_url != normalize_edge_base_url(edge_base_url) {
+        let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
+        bail!(
+            "pending GitHub login state belongs to a different edge; restart sign-in for {}",
+            edge_base_url
+        );
+    }
+    if pending_browser_login_is_expired(pending.created_at, now) {
+        let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
+        bail!("pending GitHub login state expired; restart sign-in");
+    }
     let snapshot = BrowserEdgeClient::new(
         BrowserUiBindings::new(edge_base_url),
         BrowserEnrollmentConfig::for_runtime_sync(&fetch_edge_snapshot(edge_base_url).await?),
@@ -434,12 +526,12 @@ pub async fn complete_browser_github_login(
     let enrollment = browser_github_enrollment_config(
         &snapshot,
         release_manifest,
-        requested_scopes,
+        pending.requested_scopes,
         session_ttl_secs,
     )?;
     let client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
     let session = client
-        .complete_provider_login(&login, provider_code.to_owned())
+        .complete_provider_login(&pending.login, provider_code.to_owned())
         .await?;
     let trust_bundle = client.fetch_trust_bundle().await.ok();
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
@@ -479,4 +571,52 @@ pub fn provider_code_from_window_location() -> Option<String> {
     let query = search.strip_prefix('?').unwrap_or(&search);
     url::form_urlencoded::parse(query.as_bytes())
         .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+}
+
+#[cfg(all(test, feature = "wasm-ui", target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_browser_login_parser_preserves_current_record() {
+        let now = Utc::now();
+        let raw = serde_json::to_string(&PendingBrowserGitHubLogin {
+            edge_base_url: "https://edge.example".into(),
+            created_at: now,
+            login: LoginStart {
+                login_id: burn_p2p::ContentId::new("login-1"),
+                provider: burn_p2p::AuthProvider::GitHub,
+                state: "state-1".into(),
+                authorize_url: Some("https://github.example/auth".into()),
+                expires_at: now + Duration::minutes(5),
+            },
+            requested_scopes: BTreeSet::from([ExperimentScope::Connect]),
+        })
+        .expect("serialize pending login");
+
+        let parsed =
+            parse_stored_pending_browser_login(&raw, "https://edge.example", BTreeSet::new(), now)
+                .expect("parse current pending login");
+
+        assert_eq!(parsed.edge_base_url, "https://edge.example");
+        assert_eq!(parsed.login.state, "state-1");
+        assert_eq!(
+            parsed.requested_scopes,
+            BTreeSet::from([ExperimentScope::Connect])
+        );
+    }
+
+    #[test]
+    fn pending_browser_login_expiration_is_enforced() {
+        let now = Utc::now();
+
+        assert!(pending_browser_login_is_expired(
+            now - Duration::seconds(PENDING_GITHUB_LOGIN_TTL_SECS + 1),
+            now
+        ));
+        assert!(!pending_browser_login_is_expired(
+            now - Duration::seconds(PENDING_GITHUB_LOGIN_TTL_SECS),
+            now
+        ));
+    }
 }

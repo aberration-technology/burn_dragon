@@ -635,13 +635,12 @@ fn browser_site_bootstrap_json(
         .as_deref()
         .map(fetch_browser_edge_snapshot)
         .transpose()?;
-    let signed_seed_advertisement = if let (Some(edge_url), Some(snapshot)) =
-        (edge_url.as_deref(), edge_snapshot.as_ref())
-    {
-        fetch_signed_seed_advertisement(edge_url, snapshot)?
-    } else {
-        None
-    };
+    let signed_seed_advertisement =
+        if let (Some(edge_url), Some(snapshot)) = (edge_url.as_deref(), edge_snapshot.as_ref()) {
+            fetch_signed_seed_advertisement(edge_url, snapshot)?
+        } else {
+            None
+        };
 
     Ok(DragonBrowserSiteBootstrapDocument {
         config: DragonBrowserAppConfigDocument {

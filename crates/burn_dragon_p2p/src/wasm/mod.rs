@@ -150,8 +150,21 @@ fn resolved_edge_base_url(config: &DragonBrowserAppConfig) -> Result<String> {
         .ok_or_else(|| anyhow!("no edge base URL configured"))
 }
 
-fn connect_config(config: &DragonBrowserAppConfig) -> Result<BrowserAppConnectConfig> {
-    let config = config_with_window_network_overrides(config)?;
+fn can_use_embedded_browser_bootstrap(
+    bootstrap_config: &DragonBrowserAppConfig,
+    connect_config: &DragonBrowserAppConfig,
+) -> bool {
+    bootstrap_config.effective_edge_base_url() == connect_config.effective_edge_base_url()
+        && bootstrap_config.effective_seed_node_urls() == connect_config.effective_seed_node_urls()
+}
+
+fn connect_config(
+    bootstrap_config: &DragonBrowserAppConfig,
+    connect_config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+) -> Result<BrowserAppConnectConfig> {
+    let config = connect_config.clone();
     let capability_decision = match config.training.as_ref() {
         Some(training) => apply_browser_downgrade_state(
             &resolved_edge_base_url(&config)?,
@@ -161,16 +174,20 @@ fn connect_config(config: &DragonBrowserAppConfig) -> Result<BrowserAppConnectCo
         ),
         None => decide_browser_capability(None, &detect_browser_host_capabilities()),
     };
-    let connect = BrowserAppConnectConfig::new(
+    let mut connect = BrowserAppConnectConfig::new(
         resolved_edge_base_url(&config)?,
         capability_decision.capability,
         capability_decision.connect_target,
-    );
-    if let Some((experiment_id, revision_id)) = config.selected_experiment() {
-        Ok(connect.with_selection(experiment_id, revision_id))
-    } else {
-        Ok(connect)
+    )
+    .with_seed_node_urls(config.effective_seed_node_urls().to_vec());
+    if can_use_embedded_browser_bootstrap(bootstrap_config, &config) {
+        connect = connect
+            .with_bootstrap_material(edge_snapshot.cloned(), signed_seed_advertisement.cloned());
     }
+    if let Some((experiment_id, revision_id)) = config.selected_experiment() {
+        connect = connect.with_selection(experiment_id, revision_id);
+    }
+    Ok(connect)
 }
 
 fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> ClientReleaseManifest {
@@ -243,12 +260,20 @@ async fn resolve_browser_release_manifest(
 
 #[cfg(feature = "wasm-peer")]
 async fn resolve_browser_training_config(
+    bootstrap_config: &DragonBrowserAppConfig,
     config: &DragonBrowserAppConfig,
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<crate::config::DragonBrowserTrainingConfig> {
     if let Some(mut training) = config.training.clone() {
         if training.training_lease.is_none() {
-            training.training_lease = active_training_lease(config).await?;
+            training.training_lease = active_training_lease(
+                bootstrap_config,
+                config,
+                edge_snapshot,
+                signed_seed_advertisement,
+            )
+            .await?;
         }
         return Ok(training);
     }
@@ -271,15 +296,30 @@ async fn resolve_browser_training_config(
     let mut training = browser_training_config_from_profile(entry, &profile)?.ok_or_else(|| {
         anyhow!("selected experiment does not publish a browser training profile")
     })?;
-    training.training_lease = active_training_lease(config).await?;
+    training.training_lease = active_training_lease(
+        bootstrap_config,
+        config,
+        edge_snapshot,
+        signed_seed_advertisement,
+    )
+    .await?;
     Ok(training)
 }
 
 #[cfg(feature = "wasm-peer")]
 async fn active_training_lease(
+    bootstrap_config: &DragonBrowserAppConfig,
     config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<Option<burn_p2p::WorkloadTrainingLease>> {
-    let controller = BrowserAppController::connect_with(connect_config(config)?).await?;
+    let controller = BrowserAppController::connect_with(connect_config(
+        bootstrap_config,
+        config,
+        edge_snapshot,
+        signed_seed_advertisement,
+    )?)
+    .await?;
     Ok(controller.active_training_lease().cloned())
 }
 
@@ -789,8 +829,19 @@ fn find_directory_entry(
         .cloned()
 }
 
-pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
-    let controller = BrowserAppController::connect_with(connect_config(config)?).await?;
+pub async fn connect_browser_app(
+    bootstrap_config: &DragonBrowserAppConfig,
+    config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+) -> Result<BrowserAppClientView> {
+    let controller = BrowserAppController::connect_with(connect_config(
+        bootstrap_config,
+        config,
+        edge_snapshot,
+        signed_seed_advertisement,
+    )?)
+    .await?;
     let view = controller.view();
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         *slot.borrow_mut() = Some(controller);
@@ -798,13 +849,24 @@ pub async fn connect_browser_app(config: &DragonBrowserAppConfig) -> Result<Brow
     Ok(view)
 }
 
-pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<BrowserAppClientView> {
+pub async fn refresh_browser_app(
+    bootstrap_config: &DragonBrowserAppConfig,
+    config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+) -> Result<BrowserAppClientView> {
     let mut controller = if let Some(controller) =
         DRAGON_BROWSER_APP_CONTROLLER.with(|slot| slot.borrow_mut().take())
     {
         controller
     } else {
-        BrowserAppController::connect_with(connect_config(config)?).await?
+        BrowserAppController::connect_with(connect_config(
+            bootstrap_config,
+            config,
+            edge_snapshot,
+            signed_seed_advertisement,
+        )?)
+        .await?
     };
     let refresh_result = controller.refresh().await.map(|_| controller.view());
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
@@ -815,7 +877,10 @@ pub async fn refresh_browser_app(config: &DragonBrowserAppConfig) -> Result<Brow
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 fn spawn_browser_app_refresh_loop(
+    bootstrap_config: DragonBrowserAppConfig,
     config: DragonBrowserAppConfig,
+    edge_snapshot: Option<BrowserEdgeSnapshot>,
+    signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
     mut current_view: Signal<Option<BrowserAppClientView>>,
     mut status: Signal<String>,
     mut checkpoint_wait_generation: Signal<u64>,
@@ -828,7 +893,14 @@ fn spawn_browser_app_refresh_loop(
             if *checkpoint_wait_generation.read() != next_generation {
                 break;
             }
-            match refresh_browser_app(&config).await {
+            match refresh_browser_app(
+                &bootstrap_config,
+                &config,
+                edge_snapshot.as_ref(),
+                signed_seed_advertisement.as_ref(),
+            )
+            .await
+            {
                 Ok(view) => {
                     current_view.set(Some(view));
                     status.set(String::new());
@@ -986,8 +1058,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
 
     {
         let config = initial_config.clone();
+        let bootstrap_config = props.config.clone();
         let release_manifest = props.release_manifest.clone();
         let edge_snapshot = props.edge_snapshot.clone();
+        let signed_seed_advertisement = props.signed_seed_advertisement.clone();
         let mut session_state = session_state;
         let mut current_view = current_view;
         let mut status = status;
@@ -999,8 +1073,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             }
             auth_bootstrap_started.set(true);
             let config = config.clone();
+            let bootstrap_config = bootstrap_config.clone();
             let release_manifest = release_manifest.clone();
             let edge_snapshot = edge_snapshot.clone();
+            let signed_seed_advertisement = signed_seed_advertisement.clone();
             spawn(async move {
                 match resume_or_complete_browser_auth(
                     &config,
@@ -1011,10 +1087,20 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        if let Ok(view) = connect_browser_app(&config).await {
+                        if let Ok(view) = connect_browser_app(
+                            &bootstrap_config,
+                            &config,
+                            edge_snapshot.as_ref(),
+                            signed_seed_advertisement.as_ref(),
+                        )
+                        .await
+                        {
                             current_view.set(Some(view));
                             spawn_browser_app_refresh_loop(
+                                bootstrap_config.clone(),
                                 config.clone(),
+                                edge_snapshot.clone(),
+                                signed_seed_advertisement.clone(),
                                 current_view,
                                 status,
                                 checkpoint_wait_generation,
@@ -1046,13 +1132,23 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 Some(edge_url.read().clone()),
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
             );
+            let bootstrap_config = props.config.clone();
             let mut status = status;
             let mut current_view = current_view;
             let mut session_state = session_state;
             let checkpoint_wait_generation = checkpoint_wait_generation;
+            let edge_snapshot = props.edge_snapshot.clone();
+            let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             spawn(async move {
                 status.set("Connecting…".into());
-                match connect_browser_app(&next_config).await {
+                match connect_browser_app(
+                    &bootstrap_config,
+                    &next_config,
+                    edge_snapshot.as_ref(),
+                    signed_seed_advertisement.as_ref(),
+                )
+                .await
+                {
                     Ok(view) => {
                         current_view.set(Some(view));
                         let session = match resolved_edge_base_url(&next_config) {
@@ -1065,7 +1161,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         session_state.set(session);
                         status.set(String::new());
                         spawn_browser_app_refresh_loop(
+                            bootstrap_config.clone(),
                             next_config,
+                            edge_snapshot.clone(),
+                            signed_seed_advertisement.clone(),
                             current_view,
                             status,
                             checkpoint_wait_generation,
@@ -1261,6 +1360,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut admin_entry_json = admin_entry_json;
             let mut admin_rollout_result = admin_rollout_result;
             let mut current_view = current_view;
+            let bootstrap_config = props.config.clone();
+            let edge_snapshot = props.edge_snapshot.clone();
+            let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             spawn(async move {
                 admin_status.set("Rolling out directory…".into());
                 if selected_study.trim().is_empty() {
@@ -1343,7 +1445,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        if let Ok(view) = refresh_browser_app(&next_config).await {
+                        if let Ok(view) = refresh_browser_app(
+                            &bootstrap_config,
+                            &next_config,
+                            edge_snapshot.as_ref(),
+                            signed_seed_advertisement.as_ref(),
+                        )
+                        .await
+                        {
                             current_view.set(Some(view));
                         }
                         admin_status.set(format!("Rolled out {} directory entries", entries.len()));
@@ -1583,8 +1692,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 Some(edge_url.read().clone()),
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
             );
+            let bootstrap_config = props.config.clone();
             let release_manifest = props.release_manifest.clone();
             let edge_snapshot = props.edge_snapshot.clone();
+            let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             let mut status = status;
             let mut current_view = current_view;
             let mut local_training = local_training;
@@ -1603,16 +1714,20 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
-                let training =
-                    match resolve_browser_training_config(&next_config, edge_snapshot.as_ref())
-                        .await
-                    {
-                        Ok(training) => training,
-                        Err(error) => {
-                            status.set(error.to_string());
-                            return;
-                        }
-                    };
+                let training = match resolve_browser_training_config(
+                    &bootstrap_config,
+                    &next_config,
+                    edge_snapshot.as_ref(),
+                    signed_seed_advertisement.as_ref(),
+                )
+                .await
+                {
+                    Ok(training) => training,
+                    Err(error) => {
+                        status.set(error.to_string());
+                        return;
+                    }
+                };
                 local_training_pending.set(true);
                 status.set("Running browser training…".into());
                 let edge_base_url = match resolved_edge_base_url(&next_config) {
@@ -1636,13 +1751,27 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             result.train_loss_mean
                         ));
                         local_training.set(Some(result));
-                        if let Ok(view) = refresh_browser_app(&next_config).await {
+                        if let Ok(view) = refresh_browser_app(
+                            &bootstrap_config,
+                            &next_config,
+                            edge_snapshot.as_ref(),
+                            signed_seed_advertisement.as_ref(),
+                        )
+                        .await
+                        {
                             current_view.set(Some(view));
                         }
                     }
                     Err(error) => {
                         status.set(error.to_string());
-                        if let Ok(view) = refresh_browser_app(&next_config).await {
+                        if let Ok(view) = refresh_browser_app(
+                            &bootstrap_config,
+                            &next_config,
+                            edge_snapshot.as_ref(),
+                            signed_seed_advertisement.as_ref(),
+                        )
+                        .await
+                        {
                             current_view.set(Some(view));
                         }
                     }

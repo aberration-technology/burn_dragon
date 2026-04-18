@@ -111,3 +111,17 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[patch.crates-io]
+burn_p2p = { path = "../burn_p2p/crates/burn_p2p" }
+burn_p2p_admin = { path = "../burn_p2p/crates/burn_p2p_admin" }
+burn_p2p_app = { path = "../burn_p2p/crates/burn_p2p_app" }
+burn_p2p_bootstrap = { path = "../burn_p2p/crates/burn_p2p_bootstrap" }
+burn_p2p_browser = { path = "../burn_p2p/crates/burn_p2p_browser" }
+burn_p2p_core = { path = "../burn_p2p/crates/burn_p2p_core" }
+burn_p2p_dataloader = { path = "../burn_p2p/crates/burn_p2p_dataloader" }
+burn_p2p_metrics = { path = "../burn_p2p/crates/burn_p2p_metrics" }
+burn_p2p_publish = { path = "../burn_p2p/crates/burn_p2p_publish" }
+burn_p2p_swarm = { path = "../burn_p2p/crates/burn_p2p_swarm" }
+burn_p2p_views = { path = "../burn_p2p/crates/burn_p2p_views" }
+burn_p2p_workload = { path = "../burn_p2p/crates/burn_p2p_workload" }

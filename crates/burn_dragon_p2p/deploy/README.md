@@ -311,7 +311,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.17`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.18`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`

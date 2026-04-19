@@ -25,7 +25,7 @@ use burn_dragon_p2p::capability_state::{
 };
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonNativeAuthBundle,
-    DragonNativePeerConfig,
+    DragonNativePeerConfig, DragonNativeTarget,
 };
 use burn_dragon_p2p::deployment::{
     DeploymentDiagnosticsOptions, assert_deployment_ready, collect_deployment_diagnostics,
@@ -79,6 +79,7 @@ enum CommandKind {
     #[command(alias = "complete-login")]
     CompleteGithubLogin(CompleteGithubLoginArgs),
     EnrollStaticPrincipal(EnrollStaticPrincipalArgs),
+    TrainWindowOnce(TrainWindowOnceArgs),
     RunPeer(RunPeerArgs),
     RunHeadMirror(RunHeadMirrorArgs),
     RunValidatorDaemon(RunValidatorDaemonArgs),
@@ -398,6 +399,36 @@ struct RunPeerArgs {
 }
 
 #[derive(Debug, Parser)]
+struct TrainWindowOnceArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum)]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    auth_bundle: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    auth_bundle_format: ConfigFormat,
+    #[arg(long, default_value_t = true)]
+    initialize_head_on_start: bool,
+    #[arg(long, default_value_t = true)]
+    restore_head_on_start: bool,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+    #[command(flatten)]
+    capability_policy: CapabilityPolicyArgs,
+}
+
+#[derive(Debug, Parser)]
 struct RunHeadMirrorArgs {
     #[arg(long)]
     config: PathBuf,
@@ -511,6 +542,27 @@ struct AdminRolloutReport {
     result: AdminResult,
 }
 
+#[derive(Debug, Serialize)]
+struct TrainWindowOnceTimingReport {
+    data_fetch_time_ms: u64,
+    publish_latency_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TrainWindowOnceReport {
+    experiment_kind: DragonExperimentKind,
+    backend: String,
+    local_peer_id: String,
+    base_head_id: String,
+    published_head_id: String,
+    published_global_step: u64,
+    artifact_id: String,
+    contribution_receipt_id: String,
+    lease_window_id: String,
+    lease_microshard_count: usize,
+    timing: TrainWindowOnceTimingReport,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -523,6 +575,7 @@ fn main() -> Result<()> {
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
         CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
+        CommandKind::TrainWindowOnce(args) => train_window_once(args),
         CommandKind::RunPeer(args) => run_peer(args),
         CommandKind::RunHeadMirror(args) => run_head_mirror(args),
         CommandKind::RunValidatorDaemon(args) => run_validator_daemon(args),
@@ -779,6 +832,95 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
         args.output_format,
         &session.auth,
     )
+}
+
+fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        Some(args.capability_policy),
+    )?;
+    let auth_bundle: DragonNativeAuthBundle =
+        load_typed(&args.auth_bundle, args.auth_bundle_format)?;
+
+    match (args.experiment_kind.into_config(), args.backend) {
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
+            run_prepared_train_window_once(
+                prepare_nca_native_cpu(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
+            run_prepared_train_window_once(
+                prepare_climbmix_native_cpu(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
+            run_prepared_train_window_once(
+                prepare_nca_native_wgpu(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        #[cfg(feature = "wgpu")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
+            run_prepared_train_window_once(
+                prepare_climbmix_native_wgpu(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
+            run_prepared_train_window_once(
+                prepare_nca_native_cuda(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        #[cfg(feature = "cuda")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
+            run_prepared_train_window_once(
+                prepare_climbmix_native_cuda(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+                args.output.as_deref(),
+                args.output_format,
+            )
+        }
+        #[cfg(not(feature = "wgpu"))]
+        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
+        #[cfg(not(feature = "cuda"))]
+        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+    }
 }
 
 fn native_target_artifact_id(backend: BackendArg) -> &'static str {
@@ -1412,6 +1554,112 @@ where
 
         thread::sleep(STATUS_POLL_INTERVAL);
     }
+}
+
+fn run_prepared_train_window_once<B>(
+    prepared: PreparedNativePeer<B>,
+    config: &DragonNativePeerConfig,
+    backend: BackendArg,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+    output: Option<&Path>,
+    output_format: OutputFormat,
+) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let experiment_entry = prepared
+        .manifests
+        .experiment_directory
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("prepared native peer is missing an experiment"))?;
+    eprintln!(
+        "starting burn_dragon train-window-once: experiment={} backend={} target={:?} can_train={} edge={} seeds={} storage_root={}",
+        prepared.experiment_kind.workload_slug(),
+        backend.as_label(),
+        prepared.target_decision.effective_target,
+        prepared.target_decision.can_train,
+        config.effective_edge_base_url().unwrap_or("<none>"),
+        config.effective_seed_node_urls().len(),
+        config.storage_root.display(),
+    );
+    if let Some(reason) = prepared.target_decision.downgrade_reason.as_deref() {
+        eprintln!("capability decision: {reason}");
+    }
+    if !prepared.target_decision.can_train
+        || !matches!(
+            prepared.target_decision.effective_target,
+            DragonNativeTarget::Auto | DragonNativeTarget::Trainer
+        )
+    {
+        bail!(
+            "train-window-once requires a trainer-capable target; resolved {:?}",
+            prepared.target_decision.effective_target
+        );
+    }
+
+    let mut running = spawn_prepared_native_peer(prepared)?;
+    let report_result = (|| -> Result<TrainWindowOnceReport> {
+        wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
+        let local_peer_id = running
+            .snapshot()
+            .local_peer_id
+            .ok_or_else(|| anyhow!("peer runtime did not report a local peer id"))?;
+        let experiment = running.mainnet().experiment(
+            experiment_entry.study_id,
+            experiment_entry.experiment_id,
+            experiment_entry.current_revision_id,
+        );
+        let mut mirrored_head_id = None;
+        let base_head = sync_or_initialize_head_provider(
+            &mut running,
+            &experiment,
+            initialize_head_on_start,
+            restore_head_on_start,
+            &mut mirrored_head_id,
+            "trainer",
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "no experiment head is available; rerun with --initialize-head-on-start or seed a head first"
+            )
+        })?;
+        let mut trainer = running.continuous_trainer(&experiment)?;
+        let outcome = trainer.train_next_window()?;
+        Ok(TrainWindowOnceReport {
+            experiment_kind: running.prepared().experiment_kind,
+            backend: backend.as_label().into(),
+            local_peer_id: local_peer_id.as_str().to_owned(),
+            base_head_id: base_head.head_id.as_str().to_owned(),
+            published_head_id: outcome.head.head_id.as_str().to_owned(),
+            published_global_step: outcome.head.global_step,
+            artifact_id: outcome.artifact.artifact_id.as_str().to_owned(),
+            contribution_receipt_id: outcome.contribution.receipt_id.as_str().to_owned(),
+            lease_window_id: outcome.lease.window_id.0.to_string(),
+            lease_microshard_count: outcome.lease.microshards.len(),
+            timing: TrainWindowOnceTimingReport {
+                data_fetch_time_ms: outcome.timing.data_fetch_time_ms,
+                publish_latency_ms: outcome.timing.publish_latency_ms,
+            },
+        })
+    })();
+
+    let shutdown_result = running.shutdown();
+    let termination_result = running.await_termination_timeout(SHUTDOWN_TIMEOUT);
+
+    if let Err(error) = shutdown_result {
+        eprintln!("train-window-once shutdown error: {error}");
+    }
+    if let Err(error) = termination_result {
+        match &report_result {
+            Ok(_) => return Err(error),
+            Err(_) => eprintln!("train-window-once termination error: {error}"),
+        }
+    }
+
+    let report = report_result?;
+    write_output(output, output_format, &report)
 }
 
 fn sync_or_initialize_head_provider<B>(

@@ -13,6 +13,12 @@ fn streaming_state_store() -> &'static Mutex<StreamingStateStore> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn lock_streaming_state_store() -> std::sync::MutexGuard<'static, StreamingStateStore> {
+    streaming_state_store()
+        .lock()
+        .expect("streaming tbptt runtime lock poisoned")
+}
+
 fn next_streaming_runtime_key() -> usize {
     static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
     NEXT_KEY.fetch_add(1, Ordering::Relaxed)
@@ -342,9 +348,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return self.model.init_state_ephemeral();
         }
         let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = streaming_state_store()
-            .lock()
-            .expect("streaming tbptt runtime lock poisoned");
+        let mut runtime = lock_streaming_state_store();
         if reset_stream_state {
             runtime.remove(&key);
         }
@@ -360,17 +364,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         state.detach_in_place();
         let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = streaming_state_store()
-            .lock()
-            .expect("streaming tbptt runtime lock poisoned");
+        let mut runtime = lock_streaming_state_store();
         runtime.insert(key, Box::new(state));
     }
 
     #[cfg(test)]
     fn peek_step_state_for_test(&self) -> Option<ModelState<B>> {
-        streaming_state_store()
-            .lock()
-            .expect("streaming tbptt runtime lock poisoned")
+        lock_streaming_state_store()
             .get(&(self.streaming_runtime_key, TypeId::of::<B>()))
             .and_then(|state| {
                 state

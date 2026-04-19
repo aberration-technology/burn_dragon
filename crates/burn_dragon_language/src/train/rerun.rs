@@ -75,21 +75,18 @@ pub fn initialize_training_rerun(config: &TrainingRerunConfig) -> Result<Trainin
         viewer_url,
     };
 
-    active_session()
-        .lock()
-        .expect("rerun session lock")
-        .replace(TrainingRerunSession {
-            recording,
-            shutdown,
-            telemetry_thread,
-            info: info.clone(),
-        });
+    lock_active_session().replace(TrainingRerunSession {
+        recording,
+        shutdown,
+        telemetry_thread,
+        info: info.clone(),
+    });
 
     Ok(info)
 }
 
 pub fn shutdown_training_rerun() {
-    let Some(session) = active_session().lock().expect("rerun session lock").take() else {
+    let Some(session) = lock_active_session().take() else {
         return;
     };
 
@@ -221,10 +218,12 @@ fn active_session() -> &'static Mutex<Option<TrainingRerunSession>> {
     ACTIVE_SESSION.get_or_init(|| Mutex::new(None))
 }
 
+fn lock_active_session() -> std::sync::MutexGuard<'static, Option<TrainingRerunSession>> {
+    active_session().lock().expect("rerun session lock")
+}
+
 fn active_recording() -> Option<RecordingStream> {
-    active_session()
-        .lock()
-        .expect("rerun session lock")
+    lock_active_session()
         .as_ref()
         .map(|session| session.recording.clone())
 }

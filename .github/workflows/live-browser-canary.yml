@@ -93,21 +93,14 @@ jobs:
           control_requests = report.get("quiet_window_control_plane_requests") or []
           artifact_fallback = report.get("artifact_http_fallback_requests") or []
           live_status = report.get("live_status_label") or "n/a"
-          live_tiles = report.get("live_stat_tiles") or []
-          transport_tile = "n/a"
-          for tile in live_tiles:
-              if not tile:
-                  continue
-              if (tile[0] or "").strip().lower() == "transport":
-                  transport_tile = " | ".join(part for part in tile[1:] if part)
-                  break
+          transport_summary = report.get("transport_summary") or "n/a"
 
           print("## live browser canary")
           print()
           print(f"- Success: `{report.get('success', False)}`")
           print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
           print(f"- Live status: `{live_status}`")
-          print(f"- Transport tile: `{transport_tile}`")
+          print(f"- Transport signal: `{transport_summary}`")
           print(f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`")
           print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
           print(f"- Training button visible: `{report.get('training_button_visible', False)}`")

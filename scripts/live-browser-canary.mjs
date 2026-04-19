@@ -259,6 +259,18 @@ function statTileValue(tiles, label) {
   return null;
 }
 
+function inferTransportSummary(tiles) {
+  const directTransportTile = statTileValue(tiles, "transport");
+  if (directTransportTile) {
+    return directTransportTile;
+  }
+  const peersTile = statTileValue(tiles, "peers");
+  if (/\b(webrtc-direct|webtransport|wss|ws)\b/i.test(peersTile ?? "")) {
+    return peersTile;
+  }
+  return null;
+}
+
 function browserConfigSeedNodeUrls(browserConfig) {
   if (!browserConfig || typeof browserConfig !== "object") {
     return [];
@@ -648,7 +660,7 @@ async function runCanary() {
           ),
         )
         .catch(() => []);
-      report.transport_summary = statTileValue(report.live_stat_tiles, "transport");
+      report.transport_summary = inferTransportSummary(report.live_stat_tiles);
     };
 
     const connectDeadline = Date.now() + CONNECT_TIMEOUT_MS;
@@ -692,14 +704,13 @@ async function runCanary() {
         `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,
       );
     }
-    const liveTransportTile = statTileValue(report.live_stat_tiles, "transport");
     if (
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
       snapshot.transports?.webrtc_direct &&
-      !(liveTransportTile ?? "").startsWith("webrtc-direct")
+      !(report.transport_summary ?? "").startsWith("webrtc-direct")
     ) {
       fail(
-        `browser canary did not settle on webrtc-direct despite advertised preference: ${liveTransportTile ?? "missing transport tile"}`,
+        `browser canary did not settle on webrtc-direct despite advertised preference: ${report.transport_summary ?? "missing transport signal"}`,
       );
     }
 

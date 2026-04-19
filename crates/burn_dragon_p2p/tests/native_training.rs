@@ -1870,6 +1870,39 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
         );
     }
 
+    let genesis_provider_peer_ids = [
+        seed.snapshot().local_peer_id.expect("seed local peer id"),
+        trainer_b
+            .snapshot()
+            .local_peer_id
+            .expect("trainer b local peer id"),
+        trainer_c
+            .snapshot()
+            .local_peer_id
+            .expect("trainer c local peer id"),
+    ];
+    ensure_materialized_pinned_head(
+        "seed",
+        &seed,
+        &experiment,
+        &genesis_head,
+        &genesis_provider_peer_ids,
+    );
+    ensure_materialized_pinned_head(
+        "trainer-b",
+        &trainer_b,
+        &experiment,
+        &genesis_head,
+        &genesis_provider_peer_ids,
+    );
+    ensure_materialized_pinned_head(
+        "trainer-c",
+        &trainer_c,
+        &experiment,
+        &genesis_head,
+        &genesis_provider_peer_ids,
+    );
+
     let mut trainer_losses = Vec::new();
     let mut merged_losses = Vec::new();
     let mut canonical_head = genesis_head.clone();

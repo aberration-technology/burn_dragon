@@ -387,7 +387,6 @@ fn ensure_materialized_pinned_head<B>(
 fn select_promoted_head_candidate(
     heads: [&Option<HeadDescriptor>; 3],
     base_head_id: &burn_p2p::HeadId,
-    local_head_ids: &[burn_p2p::HeadId],
     expected_global_step: u64,
 ) -> Option<HeadDescriptor> {
     heads
@@ -395,7 +394,6 @@ fn select_promoted_head_candidate(
         .filter_map(|head| head.as_ref())
         .find(|head| {
             head.head_id != *base_head_id
-                && !local_head_ids.contains(&head.head_id)
                 && head.parent_head_id.as_ref() == Some(base_head_id)
                 && head.global_step == expected_global_step
         })
@@ -2018,11 +2016,6 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             "runtime diffusion cluster did not observe the trainer-only update frontier",
         );
 
-        let local_head_ids = [
-            seed_window.head.head_id.clone(),
-            trainer_b_window.head.head_id.clone(),
-            trainer_c_window.head.head_id.clone(),
-        ];
         let convergence_deadline = Instant::now() + Duration::from_secs(120);
         let expected_promoted_global_step = canonical_head.global_step + 1;
         let promoted_head = loop {
@@ -2052,7 +2045,6 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             if let Some(candidate) = select_promoted_head_candidate(
                 [&seed_head, &trainer_b_head, &trainer_c_head],
                 &base_head_id,
-                &local_head_ids,
                 expected_promoted_global_step,
             ) {
                 break candidate;
@@ -2579,11 +2571,6 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
     );
 
     let convergence_deadline = Instant::now() + Duration::from_secs(20);
-    let local_head_ids = [
-        seed_window.head.head_id.clone(),
-        trainer_b_window.head.head_id.clone(),
-        trainer_c_window.head.head_id.clone(),
-    ];
     let expected_promoted_global_step = genesis_head.global_step + 1;
     let promoted_head = loop {
         advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
@@ -2608,7 +2595,6 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
         if let Some(candidate) = select_promoted_head_candidate(
             [&seed_head, &trainer_b_head, &trainer_c_head],
             &genesis_head.head_id,
-            &local_head_ids,
             expected_promoted_global_step,
         ) {
             break candidate;

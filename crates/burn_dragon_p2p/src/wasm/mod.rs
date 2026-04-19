@@ -1613,6 +1613,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
         && (raw_status_message.contains("failed to fetch edge snapshot")
+            || raw_status_message.contains("failed to decode edge snapshot")
+            || raw_status_message.contains("empty response body")
             || raw_status_message.contains("Failed to fetch")
             || raw_status_message.contains("tls")
             || raw_status_message.contains("connection"))

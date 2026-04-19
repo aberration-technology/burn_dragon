@@ -24,6 +24,8 @@ use burn_p2p_browser::{
 use chrono::Utc;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use chrono::{DateTime, Duration};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use gloo_timers::future::TimeoutFuture;
 #[cfg(feature = "native")]
 use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
@@ -207,24 +209,43 @@ pub async fn fetch_edge_snapshot(edge_base_url: &str) -> Result<BrowserEdgeSnaps
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub async fn fetch_edge_snapshot(edge_base_url: &str) -> Result<BrowserEdgeSnapshot> {
     let url = format!("{}/portal/snapshot", edge_base_url.trim_end_matches('/'));
-    let response = gloo_net::http::Request::get(&url)
-        .send()
-        .await
-        .map_err(|error| anyhow!("failed to fetch edge snapshot: {error}"))?;
-    if !response.ok() {
+    const EDGE_SNAPSHOT_FETCH_ATTEMPTS: usize = 3;
+    const EDGE_SNAPSHOT_RETRY_DELAY_MILLIS: u32 = 300;
+
+    let mut last_error = None;
+    for attempt in 0..EDGE_SNAPSHOT_FETCH_ATTEMPTS {
+        let response = match gloo_net::http::Request::get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(anyhow!("failed to fetch edge snapshot: {error}"));
+                if attempt + 1 < EDGE_SNAPSHOT_FETCH_ATTEMPTS {
+                    TimeoutFuture::new(EDGE_SNAPSHOT_RETRY_DELAY_MILLIS * (attempt as u32 + 1))
+                        .await;
+                    continue;
+                }
+                break;
+            }
+        };
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        bail!(
-            "failed to fetch edge snapshot {}: http {} {}",
-            url,
-            status,
-            trim_preview(&body)
-        );
+        if !response.ok() {
+            last_error = Some(anyhow!(
+                "failed to fetch edge snapshot {}: http {} {}",
+                url,
+                status,
+                trim_preview(&body)
+            ));
+        } else {
+            match parse_edge_snapshot_body(&body) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if attempt + 1 < EDGE_SNAPSHOT_FETCH_ATTEMPTS {
+            TimeoutFuture::new(EDGE_SNAPSHOT_RETRY_DELAY_MILLIS * (attempt as u32 + 1)).await;
+        }
     }
-    response
-        .json::<BrowserEdgeSnapshot>()
-        .await
-        .map_err(|error| anyhow!("failed to decode edge snapshot: {error}"))
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to fetch edge snapshot: unknown error")))
 }
 
 pub async fn begin_native_github_login(
@@ -442,6 +463,21 @@ fn trim_preview(body: &str) -> String {
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn parse_edge_snapshot_body(body: &str) -> Result<BrowserEdgeSnapshot> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("failed to decode edge snapshot: empty response body");
+    }
+    serde_json::from_str(trimmed).map_err(|error| {
+        anyhow!(
+            "failed to decode edge snapshot: {} ({})",
+            error,
+            trim_preview(trimmed)
+        )
+    })
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 fn browser_storage() -> Result<web_sys::Storage> {
     web_sys::window()
         .ok_or_else(|| anyhow!("window unavailable"))?
@@ -576,6 +612,10 @@ pub fn provider_code_from_window_location() -> Option<String> {
 #[cfg(all(test, feature = "wasm-ui", target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use burn_p2p_core::{
+        BrowserDirectorySnapshot, BrowserEdgeMode, BrowserEdgePaths, BrowserLeaderboardSnapshot,
+        BrowserTransportSurface,
+    };
 
     #[test]
     fn pending_browser_login_parser_preserves_current_record() {
@@ -618,5 +658,59 @@ mod tests {
             now - Duration::seconds(PENDING_GITHUB_LOGIN_TTL_SECS),
             now
         ));
+    }
+
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    #[test]
+    fn parse_edge_snapshot_body_rejects_empty_payload() {
+        let error = parse_edge_snapshot_body("").expect_err("empty snapshot should fail");
+        assert!(error.to_string().contains("empty response body"));
+    }
+
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    #[test]
+    fn parse_edge_snapshot_body_trims_valid_json() {
+        let raw = format!(
+            "  \n{}\n ",
+            serde_json::to_string(&sample_edge_snapshot()).unwrap()
+        );
+        let snapshot = parse_edge_snapshot_body(&raw).expect("valid snapshot");
+        assert_eq!(snapshot.network_id.as_str(), "burn-dragon-mainnet");
+    }
+
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    fn sample_edge_snapshot() -> BrowserEdgeSnapshot {
+        let now = Utc::now();
+        BrowserEdgeSnapshot {
+            network_id: burn_p2p::NetworkId::new("burn-dragon-mainnet"),
+            edge_mode: BrowserEdgeMode::Peer,
+            browser_mode: burn_p2p::BrowserMode::Trainer,
+            social_mode: burn_p2p::SocialMode::Public,
+            profile_mode: burn_p2p::ProfileMode::Public,
+            transports: BrowserTransportSurface {
+                webrtc_direct: true,
+                webtransport_gateway: false,
+                wss_fallback: true,
+            },
+            paths: BrowserEdgePaths::default(),
+            auth_enabled: false,
+            login_providers: Vec::new(),
+            required_release_train_hash: None,
+            allowed_target_artifact_hashes: Default::default(),
+            directory: BrowserDirectorySnapshot {
+                network_id: burn_p2p::NetworkId::new("burn-dragon-mainnet"),
+                generated_at: now,
+                entries: Vec::new(),
+            },
+            heads: Vec::new(),
+            leaderboard: BrowserLeaderboardSnapshot {
+                network_id: burn_p2p::NetworkId::new("burn-dragon-mainnet"),
+                score_version: "v1".into(),
+                entries: Vec::new(),
+                captured_at: now,
+            },
+            trust_bundle: None,
+            captured_at: now,
+        }
     }
 }

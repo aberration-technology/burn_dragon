@@ -526,6 +526,7 @@ async function runCanary() {
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     connect_clicked: false,
     training_button_visible: false,
+    training_button_enabled: false,
     connect_button_visible: false,
     get_started_button_visible: false,
     live_status_label: null,
@@ -636,9 +637,20 @@ async function runCanary() {
     const trainButton = page.locator('button:has-text("run browser training")').first();
     const getStartedButton = page.locator('button:has-text("get started")').first();
     let quietWindowStartedAt = null;
+    const canStartTraining = () => {
+      const blockingNotice =
+        report.live_notice_label &&
+        ["connecting", "syncing", "blocked"].includes(
+          report.live_notice_label.toLowerCase(),
+        );
+      return report.training_button_visible && report.training_button_enabled && !blockingNotice;
+    };
     const captureLiveStatus = async () => {
-      report.connect_button_visible = await isVisible(connectButton);
       report.training_button_visible = await isVisible(trainButton);
+      report.training_button_enabled = report.training_button_visible
+        ? await trainButton.isEnabled().catch(() => false)
+        : false;
+      report.connect_button_visible = await isVisible(connectButton);
       report.get_started_button_visible = await isVisible(getStartedButton);
       report.live_status_label = await optionalVisibleText(
         page.locator(".dragon-live-status-pill"),
@@ -667,7 +679,7 @@ async function runCanary() {
     const sessionResumeGraceDeadline = Date.now() + 5_000;
     while (Date.now() < connectDeadline) {
       await captureLiveStatus();
-      if (report.training_button_visible) {
+      if (canStartTraining()) {
         break;
       }
       if (report.connect_button_visible) {
@@ -685,10 +697,10 @@ async function runCanary() {
     }
 
     await captureLiveStatus();
-    if (!report.training_button_visible) {
+    if (!canStartTraining()) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
-        `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
+        `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
       );
     }
 

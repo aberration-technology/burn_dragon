@@ -525,6 +525,24 @@ fn dragon_live_notice(
     }
 }
 
+fn dragon_browser_training_action_ready(
+    view: Option<&BrowserAppClientView>,
+    direct_transport_ready: bool,
+) -> bool {
+    let Some(view) = view else {
+        return false;
+    };
+    if !direct_transport_ready || !view.training.can_train {
+        return false;
+    }
+    if view.runtime_label.starts_with("joining ") || view.runtime_label == "blocked" {
+        return false;
+    }
+    view.training.active_assignment.is_some()
+        && view.training.latest_head_id.is_some()
+        && view.training.cached_microshards > 0
+}
+
 fn dragon_window_summary(
     view: Option<&BrowserAppClientView>,
     local_training_pending: bool,
@@ -1798,9 +1816,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let train_button = {
         let has_training_config = has_connected_view
             && has_active_checkpoint
-            && direct_transport_ready
             && resolved_edge_base_url(&initial_config).is_ok()
-            && browser_can_attempt_dynamic_training;
+            && browser_can_attempt_dynamic_training
+            && dragon_browser_training_action_ready(view.as_ref(), direct_transport_ready);
         rsx! {
             if has_training_config {
                 button {
@@ -2359,11 +2377,11 @@ fn EditorTextareaField(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_session_is_authenticated, connect_config, dragon_global_training_detail,
-        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
-        dragon_local_training_summary, dragon_network_detail, dragon_slice_progress_summary,
-        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
-        normalized_browser_callback_url,
+        browser_session_is_authenticated, connect_config, dragon_browser_training_action_ready,
+        dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
+        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
+        dragon_slice_progress_summary, dragon_transport_summary, dragon_window_progress_detail,
+        dragon_window_summary, normalized_browser_callback_url,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -2643,6 +2661,39 @@ mod tests {
         assert_eq!(notice.label, "training");
         assert_eq!(notice.detail, "running a local training window in this tab");
         assert_eq!(notice.tone, "accent");
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_browser_training_action_ready_requires_settled_trainer_state() {
+        let mut view = sample_browser_view();
+        assert!(!dragon_browser_training_action_ready(Some(&view), true));
+
+        view.training.active_assignment = Some("assignment-1".into());
+        assert!(!dragon_browser_training_action_ready(Some(&view), true));
+
+        view.training.latest_head_id = Some("head-1".into());
+        assert!(!dragon_browser_training_action_ready(Some(&view), true));
+
+        view.training.cached_microshards = 4;
+        assert!(dragon_browser_training_action_ready(Some(&view), true));
+        assert!(dragon_live_notice(Some(&view), false).is_some());
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_browser_training_action_ready_blocks_joining_or_missing_transport() {
+        let mut view = sample_browser_view();
+        view.training.active_assignment = Some("assignment-1".into());
+        view.training.latest_head_id = Some("head-1".into());
+        view.training.cached_microshards = 2;
+        view.runtime_label = "joining train".into();
+        view.runtime_detail = "syncing checkpoint before training".into();
+
+        assert!(!dragon_browser_training_action_ready(Some(&view), true));
+
+        view.runtime_label = "train".into();
+        view.runtime_detail = "2 microshards cached · training ready".into();
+        assert!(!dragon_browser_training_action_ready(Some(&view), false));
+        assert!(dragon_browser_training_action_ready(Some(&view), true));
     }
 
     #[wasm_bindgen_test]

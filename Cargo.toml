@@ -74,6 +74,9 @@ tempfile = "3"
 wasm-bindgen-cli-support = "0.2"
 web-time = "1.1"
 
+[patch.crates-io]
+libp2p-webrtc-websys = { path = "vendor/libp2p-webrtc-websys" }
+
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"

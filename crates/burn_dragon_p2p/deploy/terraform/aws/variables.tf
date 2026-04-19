@@ -100,7 +100,7 @@ variable "bootstrap_git_ref" {
 variable "dragon_crate_version" {
   description = "burn_dragon_p2p version label written into bootstrap-side native mirror configs."
   type        = string
-  default     = "0.21.0-pre.16"
+  default     = "0.21.0-pre.17"
 }
 
 variable "dragon_git_repository" {
@@ -579,7 +579,7 @@ variable "managed_trainer_target" {
 variable "managed_trainer_crate_version" {
   description = "Published burn_dragon_p2p crate version installed on managed trainer instances."
   type        = string
-  default     = "0.21.0-pre.16"
+  default     = "0.21.0-pre.17"
 }
 
 variable "managed_trainer_auth_bundle_parameter_name" {
@@ -626,7 +626,7 @@ variable "managed_validator_experiment_kind" {
 variable "managed_validator_crate_version" {
   description = "Deprecated manual-only validator crate version. Ignored by the standard trainer-only workflow."
   type        = string
-  default     = "0.21.0-pre.16"
+  default     = "0.21.0-pre.17"
 }
 
 variable "managed_validator_auth_bundle_parameter_name" {

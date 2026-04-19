@@ -204,6 +204,9 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
             require(env, "BOOTSTRAP_OBJECT_URI")
         ),
         "aws s3 cp '{}' /etc/caddy/Caddyfile".format(require(env, "CADDY_OBJECT_URI")),
+        "aws s3 cp '{}' /etc/systemd/system/burn-p2p-bootstrap.service".format(
+            require(env, "BOOTSTRAP_SERVICE_UNIT_OBJECT_URI")
+        ),
         "aws s3 cp '{}' /etc/burn_dragon_p2p/bootstrap-head-mirror.toml".format(
             require(env, "HEAD_MIRROR_CONFIG_OBJECT_URI")
         ),
@@ -213,7 +216,7 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         "aws s3 cp '{}' /etc/systemd/system/burn-dragon-p2p-head-mirror.service".format(
             require(env, "HEAD_MIRROR_SERVICE_OBJECT_URI")
         ),
-        "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/burn_dragon_p2p/bootstrap-head-mirror.toml /etc/systemd/system/burn-dragon-p2p-head-mirror.service",
+        "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/systemd/system/burn-p2p-bootstrap.service /etc/burn_dragon_p2p/bootstrap-head-mirror.toml /etc/systemd/system/burn-dragon-p2p-head-mirror.service",
         "chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle",
         "/usr/local/bin/burn-dragon-p2p-sync-secrets",
         "systemctl stop burn-dragon-p2p-head-mirror || true",

@@ -722,6 +722,14 @@ locals {
     control_plane_redis_port            = local.managed_control_plane_redis_enabled ? aws_elasticache_replication_group.control_plane[0].port : 0
     edge_domain_name                    = var.edge_domain_name
   })
+  bootstrap_service_unit = templatefile("${path.module}/templates/burn-p2p-bootstrap.service.tftpl", {
+    working_directory  = "/var/lib/burn-p2p"
+    bootstrap_env_path = "/etc/burn-dragon-p2p/bootstrap.env"
+    sync_secrets_path  = "/usr/local/bin/burn-dragon-p2p-sync-secrets"
+    binary_path        = "/usr/local/bin/burn-p2p-bootstrap"
+    config_path        = "/etc/burn-dragon-p2p/bootstrap.json"
+    limit_nofile       = 262144
+  })
   bootstrap_head_mirror_config = templatefile("${path.module}/templates/bootstrap-head-mirror.toml.tftpl", {
     dragon_crate_version   = var.dragon_crate_version
     enabled_features_label = local.bootstrap_head_mirror_enabled_features_label
@@ -2073,6 +2081,7 @@ resource "aws_instance" "bootstrap" {
     bootstrap_auth_feature                           = local.bootstrap_auth_feature
     bootstrap_auth_root                              = local.bootstrap_auth_root
     bootstrap_config_json                            = local.bootstrap_config_json
+    bootstrap_service_unit                           = local.bootstrap_service_unit
     bootstrap_data_device_name                       = var.data_volume_device_name
     bootstrap_data_mount_path                        = local.bootstrap_data_mount_path
     bootstrap_data_volume_id                         = local.use_retained_bootstrap_data_volume ? aws_ebs_volume.bootstrap_data[0].id : ""

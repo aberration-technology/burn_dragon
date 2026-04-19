@@ -2,8 +2,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use burn_p2p::{
     BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentId,
     ExperimentScope, ProjectFamilyId,
@@ -15,6 +17,7 @@ use wasm_bindgen_cli_support::Bindgen;
 
 const BROWSER_BIN: &str = "burn_dragon_p2p_browser";
 const DEFAULT_OUT_DIR: &str = "target/xtask/browser-site";
+const EDGE_FETCH_MAX_ATTEMPTS: usize = 5;
 const BROWSER_APP_LOADER: &str = r#"import init from "./burn_dragon_p2p_browser.js";
 
 await init({ module_or_path: new URL("./burn_dragon_p2p_browser_bg.wasm", import.meta.url) });
@@ -678,10 +681,8 @@ fn browser_site_requested_scopes(
 
 fn fetch_browser_edge_snapshot(edge_url: &str) -> Result<BrowserEdgeSnapshot> {
     let edge_url = edge_url.trim_end_matches('/');
-    reqwest::blocking::Client::new()
-        .get(format!("{edge_url}/portal/snapshot"))
-        .send()
-        .with_context(|| format!("fetch browser edge snapshot from {edge_url}/portal/snapshot"))?
+    let snapshot_url = format!("{edge_url}/portal/snapshot");
+    edge_get_with_retry(&snapshot_url, "browser edge snapshot")?
         .error_for_status()
         .context("browser edge snapshot returned a non-success status")?
         .json::<BrowserEdgeSnapshot>()
@@ -699,10 +700,7 @@ fn fetch_signed_seed_advertisement(
     } else {
         format!("{edge_url}/{seed_path}")
     };
-    let response = reqwest::blocking::Client::new()
-        .get(&seed_url)
-        .send()
-        .with_context(|| format!("fetch signed browser seed advertisement from {seed_url}"))?;
+    let response = edge_get_with_retry(&seed_url, "signed browser seed advertisement")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -712,6 +710,44 @@ fn fetch_signed_seed_advertisement(
         .json::<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>()
         .map(Some)
         .context("decode signed browser seed advertisement JSON")
+}
+
+fn edge_get_with_retry(url: &str, resource_name: &str) -> Result<reqwest::blocking::Response> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build browser site HTTP client")?;
+    let mut last_error = None;
+
+    for attempt in 1..=EDGE_FETCH_MAX_ATTEMPTS {
+        match client.get(url).send() {
+            Ok(response) if should_retry_edge_status(response.status()) => {
+                last_error = Some(anyhow!(
+                    "{resource_name} returned transient status {}",
+                    response.status()
+                ));
+            }
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_error = Some(anyhow!(
+                    "fetch {resource_name} from {url} (attempt {attempt}): {error}"
+                ));
+            }
+        }
+
+        if attempt < EDGE_FETCH_MAX_ATTEMPTS {
+            thread::sleep(Duration::from_secs(attempt as u64));
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("fetch {resource_name} from {url} failed")))
+}
+
+fn should_retry_edge_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 fn current_app_semver() -> semver::Version {
@@ -788,7 +824,7 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{INDEX_HTML_TEMPLATE, write_html_page};
+    use super::{INDEX_HTML_TEMPLATE, should_retry_edge_status, write_html_page};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -809,5 +845,24 @@ mod tests {
         let html = std::fs::read_to_string(temp.join("index.html")).expect("read html");
         assert!(html.contains("<div id=\"main\"></div>"));
         std::fs::remove_dir_all(&temp).expect("remove temp dir");
+    }
+
+    #[test]
+    fn transient_edge_statuses_retry() {
+        assert!(should_retry_edge_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(should_retry_edge_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(should_retry_edge_status(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        ));
+        assert!(should_retry_edge_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(should_retry_edge_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!should_retry_edge_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!should_retry_edge_status(reqwest::StatusCode::UNAUTHORIZED));
     }
 }

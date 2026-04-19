@@ -491,4 +491,4 @@ this role is intentionally destructive and should only be used by `.github/workf
 - if you use pre-existing buckets instead of the managed-bucket path, add those exact bucket arns to the deploy-role `ArtifactAndDatasetBuckets` statement.
 - if you use a different hosted zone, replace `${ROUTE53_ZONE_ID}` with the exact zone id. do not grant broad `route53:*` over all hosted zones when one zone is enough.
 - some actions remain on `Resource: "*"` because AWS does not support useful resource scoping for them, especially create/list/describe APIs across EC2, CloudFront, CloudWatch alarms, and ElastiCache.
-- the workflows now pin the assumed-account id through `allowed-account-ids` and should be run only from the `burn-dragon-p2p-staging` and `burn-dragon-p2p-production` github environments.
+- the workflows now verify the assumed aws account explicitly with `aws sts get-caller-identity` and should be run only from the `burn-dragon-p2p-staging` and `burn-dragon-p2p-production` github environments.

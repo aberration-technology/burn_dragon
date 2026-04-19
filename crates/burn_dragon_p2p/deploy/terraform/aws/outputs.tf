@@ -20,6 +20,12 @@ output "bootstrap_caddyfile" {
   sensitive   = true
 }
 
+output "bootstrap_service_unit" {
+  description = "Rendered bootstrap systemd unit written to the edge host."
+  value       = local.bootstrap_service_unit
+  sensitive   = true
+}
+
 output "bootstrap_head_mirror_config" {
   description = "Rendered bootstrap native head-mirror config written to the edge host."
   value       = local.bootstrap_head_mirror_config

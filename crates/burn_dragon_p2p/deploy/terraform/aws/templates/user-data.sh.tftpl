@@ -153,25 +153,7 @@ ${bootstrap_head_mirror_service_unit}
 EOF_HEAD_MIRROR_SERVICE
 
 cat >/etc/systemd/system/burn-p2p-bootstrap.service <<'EOF_SERVICE'
-[Unit]
-Description=burn_dragon P2P bootstrap edge
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/var/lib/burn-p2p
-EnvironmentFile=-/etc/burn-dragon-p2p/bootstrap.env
-ExecStartPre=/usr/local/bin/burn-dragon-p2p-sync-secrets
-ExecStart=/usr/local/bin/burn-p2p-bootstrap /etc/burn-dragon-p2p/bootstrap.json
-Restart=always
-RestartSec=5
-KillSignal=SIGINT
-TimeoutStopSec=30
-
-[Install]
-WantedBy=multi-user.target
+${bootstrap_service_unit}
 EOF_SERVICE
 
 if [ "${bootstrap_install_source}" = "crate" ]; then

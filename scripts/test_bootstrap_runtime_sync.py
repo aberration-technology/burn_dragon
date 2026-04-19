@@ -24,6 +24,7 @@ def base_env() -> dict[str, str]:
     return {
         "BOOTSTRAP_OBJECT_URI": "s3://bucket/runtime/bootstrap.json",
         "CADDY_OBJECT_URI": "s3://bucket/runtime/Caddyfile",
+        "BOOTSTRAP_SERVICE_UNIT_OBJECT_URI": "s3://bucket/runtime/burn-p2p-bootstrap.service",
         "HEAD_MIRROR_CONFIG_OBJECT_URI": "s3://bucket/runtime/bootstrap-head-mirror.toml",
         "HEAD_MIRROR_AUTH_SCRIPT_OBJECT_URI": "s3://bucket/runtime/fetch-head-mirror-auth",
         "HEAD_MIRROR_SERVICE_OBJECT_URI": "s3://bucket/runtime/head-mirror.service",
@@ -82,6 +83,9 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         bootstrap_copy_index = commands.index(
             "aws s3 cp 's3://bucket/runtime/bootstrap.json' /etc/burn-dragon-p2p/bootstrap.json"
         )
+        bootstrap_service_copy_index = commands.index(
+            "aws s3 cp 's3://bucket/runtime/burn-p2p-bootstrap.service' /etc/systemd/system/burn-p2p-bootstrap.service"
+        )
         public_ip_fetch_index = next(
             index
             for index, command in enumerate(commands)
@@ -94,8 +98,21 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         )
         restart_index = commands.index("systemctl restart burn-p2p-bootstrap")
         self.assertLess(bootstrap_copy_index, public_ip_fetch_index)
+        self.assertLess(bootstrap_service_copy_index, restart_index)
         self.assertLess(public_ip_fetch_index, rewrite_index)
         self.assertLess(rewrite_index, restart_index)
+
+    def test_runtime_sync_updates_bootstrap_service_unit_permissions(self) -> None:
+        commands = module.generate_commands(base_env())
+        joined = "\n".join(commands)
+        self.assertIn(
+            "aws s3 cp 's3://bucket/runtime/burn-p2p-bootstrap.service' /etc/systemd/system/burn-p2p-bootstrap.service",
+            joined,
+        )
+        self.assertIn(
+            "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/systemd/system/burn-p2p-bootstrap.service",
+            joined,
+        )
 
     def test_runtime_sync_waits_for_systemd_services_to_turn_active(self) -> None:
         commands = module.generate_commands(base_env())

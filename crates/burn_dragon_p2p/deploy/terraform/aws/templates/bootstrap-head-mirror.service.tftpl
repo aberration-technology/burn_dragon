@@ -13,6 +13,7 @@ Restart=always
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=30
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

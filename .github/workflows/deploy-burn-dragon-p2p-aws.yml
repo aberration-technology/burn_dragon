@@ -846,10 +846,19 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
           role-session-name: burn-dragon-deploy-${{ github.run_id }}
           mask-aws-account-id: true
           unset-current-credentials: true
+
+      - name: verify aws account
+        shell: bash
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then
+            echo "assumed aws account mismatch: expected $AWS_ACCOUNT_ID got $account_id" >&2
+            exit 1
+          fi
 
       - name: guard canonical bootstrap naming
         shell: bash
@@ -1251,6 +1260,7 @@ jobs:
           browser_app_url="$(terraform -chdir="$TF_ROOT" output -raw browser_app_url)"
           bootstrap_config_json_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_config_json | base64 -w0)"
           caddyfile_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_caddyfile | base64 -w0)"
+          bootstrap_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_service_unit | base64 -w0)"
           bootstrap_head_mirror_config_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_config | base64 -w0)"
           bootstrap_head_mirror_auth_script_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_fetch_auth_script | base64 -w0)"
           bootstrap_head_mirror_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_service_unit | base64 -w0)"
@@ -1306,6 +1316,7 @@ jobs:
             echo "browser_app_url=$browser_app_url"
             echo "bootstrap_config_json_b64=$bootstrap_config_json_b64"
             echo "caddyfile_b64=$caddyfile_b64"
+            echo "bootstrap_service_unit_b64=$bootstrap_service_unit_b64"
             echo "bootstrap_head_mirror_config_b64=$bootstrap_head_mirror_config_b64"
             echo "bootstrap_head_mirror_auth_script_b64=$bootstrap_head_mirror_auth_script_b64"
             echo "bootstrap_head_mirror_service_unit_b64=$bootstrap_head_mirror_service_unit_b64"
@@ -1344,6 +1355,7 @@ jobs:
           ARTIFACT_BUCKET_NAME: ${{ steps.outputs.outputs.artifact_bucket_name }}
           BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
           CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
+          BOOTSTRAP_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_service_unit_b64 }}
           BOOTSTRAP_HEAD_MIRROR_CONFIG_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_config_b64 }}
           BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_auth_script_b64 }}
           BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_service_unit_b64 }}

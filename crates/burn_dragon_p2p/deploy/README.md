@@ -91,6 +91,8 @@ The intended operator entrypoint is:
 
 a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it.
 
+the bootstrap runtime sync now updates the bootstrap systemd unit itself, not just `bootstrap.json` and caddy config. that keeps the live edge aligned with the repo-managed fd limit and service settings without depending on instance replacement.
+
 That workflow:
 
 - seeds auth client credentials into AWS SSM Parameter Store when the selected auth connector needs them

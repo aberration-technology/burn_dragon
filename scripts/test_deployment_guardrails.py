@@ -112,11 +112,20 @@ class DeploymentGuardrailTests(unittest.TestCase):
             wf = workflow(path)
             self.assertEqual(
                 wf["permissions"],
-                {"id-token": "write", "contents": "read"},
+                {"id-token": "write", "contents": "read", "actions": "write"},
                 path.name,
             )
-            self.assertIn("allowed-account-ids", text, path.name)
             self.assertIn("mask-aws-account-id: true", text, path.name)
+            self.assertIn(
+                'account_id="$(aws sts get-caller-identity --query Account --output text)"',
+                text,
+                path.name,
+            )
+            self.assertIn(
+                'if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then',
+                text,
+                path.name,
+            )
 
         cleanup_text = CLEANUP_WORKFLOW.read_text()
         self.assertIn("BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN", cleanup_text)

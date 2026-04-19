@@ -20,7 +20,8 @@ def main() -> None:
 
     required_snippets = [
         "BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN",
-        "allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}",
+        'account_id="$(aws sts get-caller-identity --query Account --output text)"',
+        'if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then',
         'legacy_stack_name="dragon-p2p-prod"',
         'force_delete_buckets_by_prefix "$legacy_stack_name"',
         'cleanup_duplicate_dataset_certificates()',

@@ -7,6 +7,7 @@ instance_id="${BOOTSTRAP_INSTANCE_ID:?BOOTSTRAP_INSTANCE_ID is required}"
 artifact_bucket_name="${ARTIFACT_BUCKET_NAME:?ARTIFACT_BUCKET_NAME is required}"
 bootstrap_config_json_b64="${BOOTSTRAP_CONFIG_JSON_B64:?BOOTSTRAP_CONFIG_JSON_B64 is required}"
 caddyfile_b64="${CADDYFILE_B64:?CADDYFILE_B64 is required}"
+bootstrap_service_unit_b64="${BOOTSTRAP_SERVICE_UNIT_B64:?BOOTSTRAP_SERVICE_UNIT_B64 is required}"
 bootstrap_head_mirror_config_b64="${BOOTSTRAP_HEAD_MIRROR_CONFIG_B64:?BOOTSTRAP_HEAD_MIRROR_CONFIG_B64 is required}"
 bootstrap_head_mirror_auth_script_b64="${BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64:?BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64 is required}"
 bootstrap_head_mirror_service_unit_b64="${BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64:?BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64 is required}"
@@ -44,6 +45,7 @@ fi
 tmpdir="$(mktemp -d)"
 bootstrap_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/bootstrap.json"
 caddy_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/Caddyfile"
+bootstrap_service_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-p2p-bootstrap.service"
 head_mirror_config_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/bootstrap-head-mirror.toml"
 head_mirror_auth_script_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-dragon-p2p-fetch-head-mirror-auth-bundle"
 head_mirror_service_object_uri="s3://${artifact_bucket_name}/${runtime_config_prefix}/burn-dragon-p2p-head-mirror.service"
@@ -60,6 +62,7 @@ fi
 cleanup() {
   aws s3 rm "$bootstrap_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$caddy_object_uri" >/dev/null 2>&1 || true
+  aws s3 rm "$bootstrap_service_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$head_mirror_config_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$head_mirror_auth_script_object_uri" >/dev/null 2>&1 || true
   aws s3 rm "$head_mirror_service_object_uri" >/dev/null 2>&1 || true
@@ -75,12 +78,14 @@ trap cleanup EXIT
 
 printf '%s' "$bootstrap_config_json_b64" | base64 -d >"$tmpdir/bootstrap.json"
 printf '%s' "$caddyfile_b64" | base64 -d >"$tmpdir/Caddyfile"
+printf '%s' "$bootstrap_service_unit_b64" | base64 -d >"$tmpdir/burn-p2p-bootstrap.service"
 printf '%s' "$bootstrap_head_mirror_config_b64" | base64 -d >"$tmpdir/bootstrap-head-mirror.toml"
 printf '%s' "$bootstrap_head_mirror_auth_script_b64" | base64 -d >"$tmpdir/burn-dragon-p2p-fetch-head-mirror-auth-bundle"
 printf '%s' "$bootstrap_head_mirror_service_unit_b64" | base64 -d >"$tmpdir/burn-dragon-p2p-head-mirror.service"
 
 aws s3 cp "$tmpdir/bootstrap.json" "$bootstrap_object_uri" >/dev/null
 aws s3 cp "$tmpdir/Caddyfile" "$caddy_object_uri" >/dev/null
+aws s3 cp "$tmpdir/burn-p2p-bootstrap.service" "$bootstrap_service_object_uri" >/dev/null
 aws s3 cp "$tmpdir/bootstrap-head-mirror.toml" "$head_mirror_config_object_uri" >/dev/null
 aws s3 cp "$tmpdir/burn-dragon-p2p-fetch-head-mirror-auth-bundle" "$head_mirror_auth_script_object_uri" >/dev/null
 aws s3 cp "$tmpdir/burn-dragon-p2p-head-mirror.service" "$head_mirror_service_object_uri" >/dev/null
@@ -111,6 +116,7 @@ fi
 
 params_json="$(BOOTSTRAP_OBJECT_URI="$bootstrap_object_uri" \
   CADDY_OBJECT_URI="$caddy_object_uri" \
+  BOOTSTRAP_SERVICE_UNIT_OBJECT_URI="$bootstrap_service_object_uri" \
   HEAD_MIRROR_CONFIG_OBJECT_URI="$head_mirror_config_object_uri" \
   HEAD_MIRROR_AUTH_SCRIPT_OBJECT_URI="$head_mirror_auth_script_object_uri" \
   HEAD_MIRROR_SERVICE_OBJECT_URI="$head_mirror_service_object_uri" \

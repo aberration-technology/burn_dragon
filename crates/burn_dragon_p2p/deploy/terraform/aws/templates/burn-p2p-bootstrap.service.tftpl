@@ -1,0 +1,20 @@
+[Unit]
+Description=burn_dragon P2P bootstrap edge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${working_directory}
+EnvironmentFile=-${bootstrap_env_path}
+ExecStartPre=${sync_secrets_path}
+ExecStart=${binary_path} ${config_path}
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+LimitNOFILE=${limit_nofile}
+
+[Install]
+WantedBy=multi-user.target

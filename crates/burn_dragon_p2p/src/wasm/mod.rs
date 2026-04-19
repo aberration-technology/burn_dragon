@@ -31,6 +31,7 @@ use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
     load_browser_session, provider_code_from_window_location,
 };
+use crate::build_info;
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 use crate::capability_state::apply_browser_downgrade_state;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -233,7 +234,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         target_artifact_hash,
         target_platform: ClientPlatform::Browser,
         app_semver,
-        git_commit: "browser-site".into(),
+        git_commit: build_info::embedded_git_commit_or_unknown(),
         cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new("dragon-browser-site-features"),
@@ -2243,6 +2244,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
     #[cfg(not(feature = "wasm-peer"))]
     let local_training_section = rsx! {};
+    let footer_build_rev = build_info::footer_build_rev(props.release_manifest.as_ref());
 
     rsx! {
         main { class: "browser-app-shell dragon-browser-shell",
@@ -2566,6 +2568,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 }
             }
             footer { class: "dragon-site-footer",
+                span { class: "dragon-site-footer-build", "rev {footer_build_rev}" }
                 ul { class: "dragon-site-footer-links",
                     li {
                         a {

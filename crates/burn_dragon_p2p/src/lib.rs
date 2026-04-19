@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod build_info;
 pub mod capability;
 pub mod capability_state;
 pub mod config;

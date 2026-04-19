@@ -2,6 +2,7 @@
 name = "burn_dragon_p2p"
 description = "Peer-to-peer experiment integration for burn_dragon language training"
 version.workspace = true
+build = "build.rs"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

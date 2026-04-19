@@ -19,6 +19,7 @@ use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
     enroll_native_static_principal, fetch_edge_snapshot,
 };
+use burn_dragon_p2p::build_info;
 use burn_dragon_p2p::capability_state::{
     NativeDowngradeObservation, NativeDowngradeScope, clear_native_downgrade,
     persist_native_downgrade,
@@ -47,7 +48,7 @@ use burn_p2p::{
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 
 const MIB: u64 = 1024 * 1024;
@@ -564,7 +565,7 @@ struct TrainWindowOnceReport {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     match cli.command {
         CommandKind::ResolveConfig(args) => resolve_config(args),
         CommandKind::AssessCapability(args) => assess_capability(args),
@@ -582,6 +583,12 @@ fn main() -> Result<()> {
         CommandKind::MarkRuntimeFailure(args) => mark_runtime_failure(args),
         CommandKind::ClearDowngrade(args) => clear_downgrade(args),
     }
+}
+
+fn parse_cli() -> Cli {
+    let long_version: &'static str = Box::leak(build_info::cli_long_version().into_boxed_str());
+    let matches = Cli::command().long_version(long_version).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
 fn build_profile(args: BuildProfileArgs) -> Result<()> {
@@ -1000,7 +1007,8 @@ fn native_release_manifest_for_snapshot(
         git_commit: config
             .git_commit
             .clone()
-            .unwrap_or_else(|| "native-static-enroll".into()),
+            .or_else(build_info::embedded_git_commit_owned)
+            .unwrap_or_else(|| "unknown".into()),
         cargo_lock_hash: ContentId::new("dragon-native-auth-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new(

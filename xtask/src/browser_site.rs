@@ -147,7 +147,20 @@ body {
   margin-top: auto;
   display: flex;
   justify-content: center;
-  padding: 4px 0 2px;
+  align-items: center;
+  position: relative;
+  padding: 6px 0 2px;
+}
+
+.dragon-site-footer-build {
+  position: absolute;
+  left: 0;
+  bottom: 2px;
+  color: rgba(255, 255, 255, 0.14);
+  font-family: ui-monospace, monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  user-select: text;
 }
 
 .dragon-site-footer-links {
@@ -731,6 +744,25 @@ fn current_app_semver() -> semver::Version {
     semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
 }
 
+fn current_git_commit() -> String {
+    let workspace_root = workspace_root();
+    let output = Command::new("git")
+        .current_dir(&workspace_root)
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if commit.is_empty() {
+                "unknown".into()
+            } else {
+                commit
+            }
+        }
+        _ => "unknown".into(),
+    }
+}
+
 fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> ClientReleaseManifest {
     let target_artifact_hash = snapshot
         .allowed_target_artifact_hashes
@@ -767,7 +799,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         target_artifact_hash,
         target_platform: ClientPlatform::Browser,
         app_semver: current_app_semver(),
-        git_commit: "browser-site".into(),
+        git_commit: current_git_commit(),
         cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new("dragon-browser-site-features"),

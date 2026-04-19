@@ -704,10 +704,11 @@ async function runCanary() {
         `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,
       );
     }
+    const normalizedTransportSummary = (report.transport_summary ?? "").toLowerCase();
     if (
       signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
       snapshot.transports?.webrtc_direct &&
-      !(report.transport_summary ?? "").startsWith("webrtc-direct")
+      !normalizedTransportSummary.includes("webrtc-direct")
     ) {
       fail(
         `browser canary did not settle on webrtc-direct despite advertised preference: ${report.transport_summary ?? "missing transport signal"}`,

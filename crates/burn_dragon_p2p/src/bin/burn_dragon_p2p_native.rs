@@ -687,6 +687,13 @@ fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
         .effective_edge_base_url()
         .ok_or_else(|| anyhow!("no edge base URL configured"))?
         .to_owned();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build async runtime for GitHub login")?;
+    let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
+    let release_manifest =
+        native_release_manifest_for_snapshot(&config, &snapshot, args.backend, None)?;
     let manifests = prepared_manifests(&config, args.experiment_kind.into_config(), args.backend)?;
     let requested_scopes = requested_scopes(
         manifests
@@ -694,13 +701,9 @@ fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
             .first()
             .ok_or_else(|| anyhow!("manifest bundle is missing an experiment directory entry"))?,
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build async runtime for GitHub login")?;
     let pending = runtime.block_on(begin_native_github_login(
         &edge_base_url,
-        &manifests.release_manifest,
+        &release_manifest,
         requested_scopes,
         args.session_ttl_secs,
         args.principal_hint,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -9,9 +9,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use burn::tensor::backend::Backend;
-use memmap2::{Mmap, MmapOptions};
+use memmap2::Mmap;
 
 use super::DatasetSplit;
+use super::prepared_chunks::{ChunkRuntimeCache, load_cached_chunk_from_mutex, mmap_as_u32_slice};
 use super::scheduler::{SequenceBatch, TokenSequenceDataset};
 use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
 
@@ -53,17 +54,6 @@ struct ChunkedTokenFile {
     path: PathBuf,
     token_offset: usize,
     token_count: usize,
-}
-
-#[derive(Default)]
-struct ChunkRuntimeCache {
-    tick: u64,
-    entries: HashMap<usize, CachedChunk>,
-}
-
-struct CachedChunk {
-    mmap: Arc<Mmap>,
-    last_used_tick: u64,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -744,58 +734,15 @@ impl ChunkedTokens {
     }
 
     fn chunk_data(&self, chunk_idx: usize) -> Arc<Mmap> {
-        let mut cache = self
-            .cache
-            .lock()
-            .expect("universality chunk cache poisoned");
-        cache.tick = cache.tick.wrapping_add(1);
-        let tick = cache.tick;
-        if let Some(entry) = cache.entries.get_mut(&chunk_idx) {
-            entry.last_used_tick = tick;
-            return Arc::clone(&entry.mmap);
-        }
-
         let chunk = &self.chunks[chunk_idx];
-        let file = fs::File::open(&chunk.path).unwrap_or_else(|err| {
-            panic!(
-                "failed to open universality chunk {}: {err}",
-                chunk.path.display()
-            )
-        });
-        let mmap = unsafe { MmapOptions::new().map(&file) }.unwrap_or_else(|err| {
-            panic!(
-                "failed to mmap universality chunk {}: {err}",
-                chunk.path.display()
-            )
-        });
-        let len = mmap.len() / 4;
-        if mmap.len() % 4 != 0 || len != chunk.token_count {
-            panic!(
-                "universality chunk {} size mismatch: bytes={} tokens={} expected_tokens={}",
-                chunk.path.display(),
-                mmap.len(),
-                len,
-                chunk.token_count
-            );
-        }
-        let mmap = Arc::new(mmap);
-        cache.entries.insert(
+        load_cached_chunk_from_mutex(
+            &self.cache,
+            self.cache_limit,
             chunk_idx,
-            CachedChunk {
-                mmap: Arc::clone(&mmap),
-                last_used_tick: tick,
-            },
-        );
-        while cache.entries.len() > self.cache_limit {
-            let evict_key = cache
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used_tick)
-                .map(|(idx, _)| *idx)
-                .expect("universality chunk cache should not be empty");
-            cache.entries.remove(&evict_key);
-        }
-        mmap
+            &chunk.path,
+            chunk.token_count,
+            "universality",
+        )
     }
 }
 
@@ -914,13 +861,6 @@ fn fixed_manifest_logical_document_tokens(
         Some(count) => Ok(Some(count.saturating_sub(1))),
         None => Ok(None),
     }
-}
-
-fn mmap_as_u32_slice(mmap: &Mmap, len: usize) -> &[u32] {
-    debug_assert_eq!(mmap.len(), len * 4);
-    #[cfg(not(target_endian = "little"))]
-    compile_error!("universality mmap currently assumes little-endian hosts");
-    unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, len) }
 }
 
 #[cfg(test)]

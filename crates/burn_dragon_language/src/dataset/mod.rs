@@ -1,5 +1,6 @@
 mod factory;
 mod huggingface;
+mod prepared_chunks;
 pub mod scheduler;
 mod universality;
 

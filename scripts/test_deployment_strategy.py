@@ -23,6 +23,9 @@ def workflow_inputs(path: Path) -> dict[str, object]:
 
 
 def main() -> None:
+    deploy_workflow = yaml.safe_load(DEPLOY_WORKFLOW.read_text())
+    restore_workflow = yaml.safe_load(RESTORE_WORKFLOW.read_text())
+
     for path in (DEPLOY_WORKFLOW, RESTORE_WORKFLOW):
         inputs = workflow_inputs(path)
         assert inputs["bootstrap_install_source"]["default"] == "crate", path.name
@@ -30,6 +33,9 @@ def main() -> None:
             "Use `git` only when validating an unpublished burn_p2p revision"
             in inputs["bootstrap_install_source"]["description"]
         ), path.name
+
+    assert deploy_workflow["permissions"]["actions"] == "write"
+    assert restore_workflow["permissions"]["actions"] == "write"
 
     deploy_inputs = workflow_inputs(DEPLOY_WORKFLOW)
     restore_inputs = workflow_inputs(RESTORE_WORKFLOW)

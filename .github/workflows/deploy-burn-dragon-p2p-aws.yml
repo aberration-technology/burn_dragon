@@ -120,6 +120,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions: write
 
 concurrency:
   group: deploy-burn-dragon-p2p-${{ github.event.inputs.environment }}

@@ -33,6 +33,8 @@ use crate::auth::{
 };
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 use crate::capability_state::apply_browser_downgrade_state;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use crate::capability_state::clear_browser_downgrade;
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
 #[cfg(feature = "wasm-peer")]
 use crate::profile::{
@@ -532,6 +534,7 @@ fn dragon_training_action_state(
     edge_configured: bool,
     direct_transport_ready: bool,
     local_training_pending: bool,
+    downgrade_reason: Option<&str>,
 ) -> Option<DragonTrainingActionState> {
     if !browser_can_attempt_dynamic_training {
         return None;
@@ -552,13 +555,6 @@ fn dragon_training_action_state(
             enabled: false,
         });
     }
-    if !direct_transport_ready {
-        return Some(DragonTrainingActionState {
-            label: "waiting for peers",
-            detail: "browser training turns on after a direct webrtc peer connects".into(),
-            enabled: false,
-        });
-    }
     if view.runtime_label.starts_with("joining ") || view.runtime_label.starts_with("catchup ") {
         return Some(DragonTrainingActionState {
             label: "syncing before training",
@@ -575,8 +571,27 @@ fn dragon_training_action_state(
     }
     if !view.training.can_train {
         return Some(DragonTrainingActionState {
-            label: "observe mode",
-            detail: "this tab is connected and watching the network. training turns on after the browser receives trainer work.".into(),
+            label: if downgrade_reason.is_some() {
+                "trainer downgraded"
+            } else {
+                "observe mode"
+            },
+            detail: downgrade_reason
+                .map(|reason| {
+                    format!(
+                        "{reason}. clear local trainer state and reconnect to retry browser training."
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "this tab is connected and watching the network. training turns on after the browser receives trainer work.".into()
+                }),
+            enabled: false,
+        });
+    }
+    if !direct_transport_ready {
+        return Some(DragonTrainingActionState {
+            label: "waiting for peers",
+            detail: "browser training turns on after a direct webrtc peer connects".into(),
             enabled: false,
         });
     }
@@ -944,6 +959,7 @@ fn dragon_runtime_mode_detail(
     direct_transport_ready: bool,
     training_action_state: Option<&DragonTrainingActionState>,
     local_training_pending: bool,
+    downgrade_reason: Option<&str>,
 ) -> String {
     let Some(view) = view else {
         return "browser runtime not connected".into();
@@ -952,6 +968,11 @@ fn dragon_runtime_mode_detail(
         return "running a local browser training window in this tab".into();
     }
     if view.runtime_label == "observe" {
+        if let Some(reason) = downgrade_reason {
+            return format!(
+                "{reason}. clear local trainer state and reconnect to retry browser training."
+            );
+        }
         return if direct_transport_ready {
             "connected to direct peers and following network state. browser training turns on when trainer work becomes available.".into()
         } else {
@@ -1107,6 +1128,12 @@ pub async fn connect_browser_app(
         *slot.borrow_mut() = Some(controller);
     });
     Ok(view)
+}
+
+fn clear_live_browser_app_controller() {
+    DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
+        let _ = slot.borrow_mut().take();
+    });
 }
 
 pub async fn refresh_browser_app(
@@ -1809,6 +1836,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         || (browser_host_capabilities.navigator_gpu_exposed
             && browser_host_capabilities.worker_gpu_exposed
             && browser_host_capabilities.dedicated_worker_exposed);
+    let browser_downgrade_reason = browser_capability_decision.downgrade_reason.clone();
     let capability_budget_label = browser_capability_decision
         .trainer_memory_budget_bytes
         .map(|bytes| format!("{} MiB", bytes / (1024 * 1024)))
@@ -1911,6 +1939,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         edge_configured,
         direct_transport_ready,
         local_training_pending_active,
+        browser_downgrade_reason.as_deref(),
     );
     let connected_panel_title = "connected";
     let connected_panel_detail =
@@ -1933,6 +1962,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         direct_transport_ready,
         training_action_state.as_ref(),
         local_training_pending_active,
+        browser_downgrade_reason.as_deref(),
     );
     let slice_progress_summary = dragon_slice_progress_summary(view.as_ref());
     let window_summary = dragon_window_summary(view.as_ref(), local_training_pending_active);
@@ -2046,9 +2076,58 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         }
     };
 
+    #[cfg(all(feature = "wasm-peer", feature = "wasm-ui", target_arch = "wasm32"))]
+    let clear_trainer_state_action = {
+        let props = props.clone();
+        move |_| {
+            let mut next_config = props.config.clone();
+            next_config = next_config.with_network_overrides(
+                Some(edge_url.read().clone()),
+                DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
+            );
+            let mut status = status;
+            let mut current_view = current_view;
+            let mut checkpoint_wait_generation = checkpoint_wait_generation;
+            spawn(async move {
+                let Some(training) = next_config.training.as_ref() else {
+                    status.set("no browser training config is available for this page".into());
+                    return;
+                };
+                let edge_base_url = match resolved_edge_base_url(&next_config) {
+                    Ok(edge_base_url) => edge_base_url,
+                    Err(error) => {
+                        status.set(error.to_string());
+                        return;
+                    }
+                };
+                match clear_browser_downgrade(
+                    &edge_base_url,
+                    training,
+                    browser_backend_label(training),
+                ) {
+                    Ok(()) => {
+                        clear_live_browser_app_controller();
+                        let next_generation =
+                            (*checkpoint_wait_generation.read()).saturating_add(1);
+                        checkpoint_wait_generation.set(next_generation);
+                        current_view.set(None);
+                        status.set(
+                            "cleared local browser trainer state. reconnect to retry training."
+                                .into(),
+                        );
+                    }
+                    Err(error) => status.set(error.to_string()),
+                }
+            });
+        }
+    };
+    #[cfg(not(all(feature = "wasm-peer", feature = "wasm-ui", target_arch = "wasm32")))]
+    let clear_trainer_state_action = move |_| {};
+
     #[cfg(feature = "wasm-peer")]
     let train_button = {
         let training_action_state = training_action_state.clone();
+        let browser_downgrade_reason = browser_downgrade_reason.clone();
         if has_connected_view {
             if let Some(training_action_state) = training_action_state {
                 let button_label = training_action_state.label;
@@ -2062,6 +2141,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         "{button_label}"
                     }
                     p { class: "dragon-live-action-note", "{button_detail}" }
+                    if browser_downgrade_reason.is_some() {
+                        button {
+                            r#type: "button",
+                            class: "action-button action-button-secondary",
+                            onclick: clear_trainer_state_action,
+                            "clear trainer state"
+                        }
+                    }
                 }
             } else {
                 rsx! {}
@@ -2261,6 +2348,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         label: notice.label.to_owned(),
                                         detail: notice.detail.clone(),
                                         tone: notice.tone,
+                                    }
+                                }
+                                if let Some(reason) = browser_downgrade_reason.as_ref() {
+                                    ActivityNotice {
+                                        label: String::from("trainer state"),
+                                        detail: format!("{reason}. clear local trainer state and reconnect to retry browser training."),
+                                        tone: "neutral",
                                     }
                                 }
                                 div { class: "dragon-live-status-row",
@@ -3004,7 +3098,7 @@ mod tests {
             idle_time: "1s".into(),
         });
         let training_action_state =
-            dragon_training_action_state(Some(&view), true, true, true, false);
+            dragon_training_action_state(Some(&view), true, true, true, false, None);
 
         assert_eq!(
             dragon_local_training_summary(Some(&view), false),
@@ -3037,7 +3131,7 @@ mod tests {
         view.network.direct_peers = 2;
         view.training.can_train = false;
 
-        let observe = dragon_training_action_state(Some(&view), true, true, true, false)
+        let observe = dragon_training_action_state(Some(&view), true, true, true, false, None)
             .expect("observe training state");
         assert!(!observe.enabled);
         assert_eq!(observe.label, "observe mode");
@@ -3048,10 +3142,31 @@ mod tests {
         view.training.latest_head_id = Some("head-1".into());
         view.training.cached_microshards = 2;
 
-        let ready = dragon_training_action_state(Some(&view), true, true, true, false)
+        let ready = dragon_training_action_state(Some(&view), true, true, true, false, None)
             .expect("ready training state");
         assert!(ready.enabled);
         assert_eq!(ready.label, "run browser training");
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_training_action_state_prioritizes_persisted_downgrade_reason() {
+        let mut view = sample_browser_view();
+        view.runtime_label = "observe".into();
+        view.runtime_detail = "watching heads and standings".into();
+        view.training.can_train = false;
+
+        let blocked = dragon_training_action_state(
+            Some(&view),
+            true,
+            true,
+            false,
+            false,
+            Some("persisted trainer failure for this workload fingerprint"),
+        )
+        .expect("downgraded training state");
+        assert!(!blocked.enabled);
+        assert_eq!(blocked.label, "trainer downgraded");
+        assert!(blocked.detail.contains("clear local trainer state"));
     }
 
     #[wasm_bindgen_test]
@@ -3062,7 +3177,7 @@ mod tests {
         view.network.direct_peers = 2;
         view.training.can_train = false;
         let observe_training_action =
-            dragon_training_action_state(Some(&view), true, true, true, false);
+            dragon_training_action_state(Some(&view), true, true, true, false, None);
 
         assert_eq!(
             dragon_runtime_mode_summary(
@@ -3075,7 +3190,13 @@ mod tests {
             "watching"
         );
         assert_eq!(
-            dragon_runtime_mode_detail(Some(&view), true, observe_training_action.as_ref(), false),
+            dragon_runtime_mode_detail(
+                Some(&view),
+                true,
+                observe_training_action.as_ref(),
+                false,
+                None
+            ),
             "connected to direct peers and following network state. browser training turns on when trainer work becomes available."
         );
 
@@ -3084,7 +3205,7 @@ mod tests {
         view.training.latest_head_id = Some("head-1".into());
         view.training.cached_microshards = 2;
         let ready_training_action =
-            dragon_training_action_state(Some(&view), true, true, true, false);
+            dragon_training_action_state(Some(&view), true, true, true, false, None);
 
         assert_eq!(
             dragon_live_status_label(None, ready_training_action.as_ref(), true, false),

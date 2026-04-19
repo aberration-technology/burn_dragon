@@ -1,0 +1,18 @@
+from pathlib import Path
+
+
+def main() -> None:
+    script = Path("scripts/live-browser-canary.mjs").read_text()
+    required_snippets = [
+        "function browserConfigSeedNodeUrls(browserConfig)",
+        "browserConfig.config?.network?.seed_node_urls",
+        "browserConfig.seed_node_urls",
+        "const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);",
+    ]
+    for snippet in required_snippets:
+        assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"
+    print("live-browser-canary-script-ok")
+
+
+if __name__ == "__main__":
+    main()

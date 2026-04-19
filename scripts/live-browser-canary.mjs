@@ -259,6 +259,21 @@ function statTileValue(tiles, label) {
   return null;
 }
 
+function browserConfigSeedNodeUrls(browserConfig) {
+  if (!browserConfig || typeof browserConfig !== "object") {
+    return [];
+  }
+  const nested = browserConfig.config?.network?.seed_node_urls;
+  if (Array.isArray(nested)) {
+    return nested;
+  }
+  const legacy = browserConfig.seed_node_urls;
+  if (Array.isArray(legacy)) {
+    return legacy;
+  }
+  return [];
+}
+
 function isDialableWebRtcSeed(seed) {
   const segments = seed.split("/").filter(Boolean);
   return (
@@ -421,7 +436,7 @@ async function runCanary() {
   const signedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
     (record) => record.multiaddrs ?? [],
   ) ?? [];
-  const browserConfigSeeds = browserConfig.seed_node_urls ?? [];
+  const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
   const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));

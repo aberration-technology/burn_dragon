@@ -119,6 +119,39 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         self.assertLess(restart_index, caddy_wait_index)
         self.assertLess(caddy_wait_index, bootstrap_wait_index)
 
+    def test_runtime_sync_quarantines_corrupt_bootstrap_state_before_restart(self) -> None:
+        commands = module.generate_commands(base_env())
+        joined = "\n".join(commands)
+        self.assertIn(
+            'bootstrap_root = Path("/var/lib/burn-p2p/bootstrap-peer")',
+            joined,
+        )
+        self.assertIn(
+            'bootstrap_root / "state" / "security-state.json"',
+            joined,
+        )
+        self.assertIn(
+            'sorted((bootstrap_root / "state" / "transfers").glob("*.json"))',
+            joined,
+        )
+        self.assertIn(
+            'sorted((bootstrap_root / "leases").glob("*.json"))',
+            joined,
+        )
+        self.assertIn(
+            "quarantining corrupt persisted bootstrap state",
+            joined,
+        )
+        stop_index = commands.index("systemctl stop burn-p2p-bootstrap || true")
+        quarantine_index = next(
+            index
+            for index, command in enumerate(commands)
+            if 'bootstrap_root = Path("/var/lib/burn-p2p/bootstrap-peer")' in command
+        )
+        restart_index = commands.index("systemctl restart burn-p2p-bootstrap")
+        self.assertLess(stop_index, quarantine_index)
+        self.assertLess(quarantine_index, restart_index)
+
     def test_git_path_requires_and_uses_bootstrap_git_ref(self) -> None:
         env = base_env()
         env["BOOTSTRAP_INSTALL_SOURCE"] = "git"

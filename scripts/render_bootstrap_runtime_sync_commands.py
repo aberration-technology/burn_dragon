@@ -140,6 +140,52 @@ def wait_for_systemd_service_active_command(service_name: str) -> str:
     )
 
 
+def quarantine_corrupt_bootstrap_state_command() -> str:
+    return """python3 - <<'PY'
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+bootstrap_root = Path("/var/lib/burn-p2p/bootstrap-peer")
+candidate_paths = [
+    bootstrap_root / "state" / "known-peers.json",
+    bootstrap_root / "state" / "slot-assignment-primary.json",
+    bootstrap_root / "state" / "slot-assignments.json",
+    bootstrap_root / "state" / "security-state.json",
+    bootstrap_root / "state" / "control-plane-state.json",
+]
+candidate_paths.extend(
+    sorted((bootstrap_root / "state" / "transfers").glob("*.json"))
+)
+candidate_paths.extend(sorted((bootstrap_root / "leases").glob("*.json")))
+
+
+def quarantine(path: Path, reason: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = path.with_name(f"{path.name}.corrupt-{stamp}")
+    suffix = 0
+    while destination.exists():
+        suffix += 1
+        destination = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+    print(
+        f"quarantining corrupt persisted bootstrap state {path} -> {destination}: {reason}",
+        flush=True,
+    )
+    path.rename(destination)
+
+
+for path in candidate_paths:
+    if not path.exists():
+        continue
+    try:
+        json.loads(path.read_text())
+    except Exception as error:
+        quarantine(path, str(error))
+PY"""
+
+
 def generate_commands(env: Mapping[str, str]) -> list[str]:
     preamble = [
         "set -eu",
@@ -170,6 +216,9 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/burn_dragon_p2p/bootstrap-head-mirror.toml /etc/systemd/system/burn-dragon-p2p-head-mirror.service",
         "chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle",
         "/usr/local/bin/burn-dragon-p2p-sync-secrets",
+        "systemctl stop burn-dragon-p2p-head-mirror || true",
+        "systemctl stop burn-p2p-bootstrap || true",
+        quarantine_corrupt_bootstrap_state_command(),
         "systemctl daemon-reload",
         "systemctl restart caddy",
         "systemctl enable burn-dragon-p2p-head-mirror",

@@ -552,22 +552,16 @@ fn dragon_live_notice(
         view.training.can_train,
         view.training.active_assignment.as_ref(),
         view.training.latest_head_id.as_ref(),
-        view.training.cached_microshards,
     ) {
-        (true, None, _, _) => Some(DragonLiveNotice {
+        (true, None, _) => Some(DragonLiveNotice {
             label: "waiting",
             detail: "waiting for work".into(),
             tone: "neutral",
         }),
-        (true, Some(_), None, _) => Some(DragonLiveNotice {
+        (true, Some(_), None) => Some(DragonLiveNotice {
             label: "syncing",
             detail: "syncing checkpoint".into(),
             tone: "neutral",
-        }),
-        (true, Some(_), Some(_), 0) => Some(DragonLiveNotice {
-            label: "syncing",
-            detail: "loading assigned slice".into(),
-            tone: "accent",
         }),
         _ => None,
     }
@@ -600,7 +594,7 @@ fn dragon_training_action_state(
             enabled: false,
         });
     }
-    if view.runtime_label.starts_with("joining ") || view.runtime_label.starts_with("catchup ") {
+    if view.runtime_label.starts_with("joining ") {
         return Some(DragonTrainingActionState {
             label: "syncing before training",
             detail: view.runtime_detail.clone(),
@@ -654,19 +648,16 @@ fn dragon_training_action_state(
             enabled: false,
         });
     }
-    if view.training.cached_microshards == 0 {
-        return Some(DragonTrainingActionState {
-            label: "loading slice",
-            detail: "downloading assigned microshards before browser training can start".into(),
-            enabled: false,
-        });
-    }
 
     if dragon_browser_training_action_ready(Some(view), direct_transport_ready) {
         Some(DragonTrainingActionState {
             label: "run browser training",
-            detail: "manual in this tab. run one local browser training window when you are ready."
-                .into(),
+            detail: if view.training.cached_microshards > 0 {
+                "manual in this tab. the assigned slice is already cached for this browser peer."
+                    .into()
+            } else {
+                "manual in this tab. the assigned slice downloads when the run starts.".into()
+            },
             enabled: true,
         })
     } else {
@@ -691,9 +682,7 @@ fn dragon_browser_training_action_ready(
     if view.runtime_label.starts_with("joining ") || view.runtime_label == "blocked" {
         return false;
     }
-    view.training.active_assignment.is_some()
-        && view.training.latest_head_id.is_some()
-        && view.training.cached_microshards > 0
+    view.training.active_assignment.is_some() && view.training.latest_head_id.is_some()
 }
 
 fn dragon_window_summary(
@@ -770,7 +759,7 @@ fn dragon_slice_progress_summary(view: Option<&BrowserAppClientView>) -> String 
         return "syncing checkpoint".into();
     }
     if view.training.cached_microshards == 0 {
-        return "loading slice".into();
+        return "loads on run".into();
     }
     match (
         view.training.accepted_samples,
@@ -1025,7 +1014,7 @@ fn dragon_runtime_mode_detail(
         };
     }
     if training_action_state.is_some_and(|state| state.enabled) {
-        return "direct peers connected and the assigned slice is cached. browser training is manual in this tab.".into();
+        return "direct peers connected and checkpoint synced. browser training is manual in this tab.".into();
     }
     if matches!(
         view.runtime_label.as_str(),
@@ -3022,11 +3011,6 @@ mod tests {
         assert_eq!(checkpoint_notice.detail, "syncing checkpoint");
 
         view.training.latest_head_id = Some("head-1".into());
-        let slice_notice = dragon_live_notice(Some(&view), false).expect("slice notice");
-        assert_eq!(slice_notice.label, "syncing");
-        assert_eq!(slice_notice.detail, "loading assigned slice");
-
-        view.training.cached_microshards = 4;
         assert!(dragon_live_notice(Some(&view), false).is_none());
     }
 
@@ -3047,9 +3031,6 @@ mod tests {
         assert!(!dragon_browser_training_action_ready(Some(&view), true));
 
         view.training.latest_head_id = Some("head-1".into());
-        assert!(!dragon_browser_training_action_ready(Some(&view), true));
-
-        view.training.cached_microshards = 4;
         assert!(dragon_browser_training_action_ready(Some(&view), true));
         assert!(dragon_live_notice(Some(&view), false).is_none());
     }
@@ -3059,14 +3040,13 @@ mod tests {
         let mut view = sample_browser_view();
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
-        view.training.cached_microshards = 2;
         view.runtime_label = "joining train".into();
         view.runtime_detail = "syncing checkpoint before training".into();
 
         assert!(!dragon_browser_training_action_ready(Some(&view), true));
 
         view.runtime_label = "train".into();
-        view.runtime_detail = "2 microshards cached · training ready".into();
+        view.runtime_detail = "slice loads when training starts".into();
         assert!(!dragon_browser_training_action_ready(Some(&view), false));
         assert!(dragon_browser_training_action_ready(Some(&view), true));
     }
@@ -3121,7 +3101,7 @@ mod tests {
 
         view.training.latest_head_id = Some("head-1".into());
         view.training.max_window_secs = Some(30);
-        assert_eq!(dragon_slice_progress_summary(Some(&view)), "loading slice");
+        assert_eq!(dragon_slice_progress_summary(Some(&view)), "loads on run");
         assert_eq!(dragon_window_summary(Some(&view), false), "30s max");
         assert_eq!(
             dragon_window_progress_detail(Some(&view), "30s max"),
@@ -3232,12 +3212,12 @@ mod tests {
         view.training.can_train = true;
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
-        view.training.cached_microshards = 2;
 
         let ready = dragon_training_action_state(Some(&view), true, true, true, false, None)
             .expect("ready training state");
         assert!(ready.enabled);
         assert_eq!(ready.label, "run browser training");
+        assert!(ready.detail.contains("downloads when the run starts"));
     }
 
     #[wasm_bindgen_test]
@@ -3295,7 +3275,6 @@ mod tests {
         view.training.can_train = true;
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
-        view.training.cached_microshards = 2;
         let ready_training_action =
             dragon_training_action_state(Some(&view), true, true, true, false, None);
 

@@ -46,12 +46,10 @@ pub(crate) struct PollDataChannel {
     /// cause the application developer to drop the stream which resets it.
     overloaded: Rc<AtomicBool>,
 
-    // Store the closures for proper garbage collection.
-    // These are wrapped in an [`Rc`] so we can implement [`Clone`].
-    _on_open_closure: Rc<Closure<dyn FnMut(RtcDataChannelEvent)>>,
-    _on_write_closure: Rc<Closure<dyn FnMut(Event)>>,
-    _on_close_closure: Rc<Closure<dyn FnMut(Event)>>,
-    _on_message_closure: Rc<Closure<dyn FnMut(MessageEvent)>>,
+    // Store the callbacks behind one shared handle so clones keep them alive until the final
+    // clone is dropped. Dropping the last handle clears the JS callbacks before the closures
+    // themselves are released.
+    _event_handlers: Rc<EventHandlers>,
 }
 
 impl PollDataChannel {
@@ -128,6 +126,14 @@ impl PollDataChannel {
         });
         inner.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 
+        let event_handlers = Rc::new(EventHandlers {
+            inner: inner.clone(),
+            _on_open_closure: on_open_closure,
+            _on_write_closure: on_write_closure,
+            _on_close_closure: on_close_closure,
+            _on_message_closure: on_message_closure,
+        });
+
         Self {
             inner,
             new_data_waker,
@@ -136,10 +142,7 @@ impl PollDataChannel {
             write_waker,
             close_waker,
             overloaded,
-            _on_open_closure: Rc::new(on_open_closure),
-            _on_write_closure: Rc::new(on_write_closure),
-            _on_close_closure: Rc::new(on_close_closure),
-            _on_message_closure: Rc::new(on_message_closure),
+            _event_handlers: event_handlers,
         }
     }
 
@@ -175,6 +178,26 @@ impl PollDataChannel {
         }
 
         Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Debug)]
+struct EventHandlers {
+    inner: RtcDataChannel,
+    _on_open_closure: Closure<dyn FnMut(RtcDataChannelEvent)>,
+    _on_write_closure: Closure<dyn FnMut(Event)>,
+    _on_close_closure: Closure<dyn FnMut(Event)>,
+    _on_message_closure: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl Drop for EventHandlers {
+    fn drop(&mut self) {
+        // Clear browser callbacks before releasing the wasm closures. Otherwise a pending event on
+        // the JS side can invoke a freed closure and trap the runtime.
+        self.inner.set_onopen(None);
+        self.inner.set_onbufferedamountlow(None);
+        self.inner.set_onclose(None);
+        self.inner.set_onmessage(None);
     }
 }
 

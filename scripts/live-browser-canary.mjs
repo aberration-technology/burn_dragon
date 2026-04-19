@@ -665,9 +665,6 @@ async function runCanary() {
       );
       report.connect_button_visible = await isVisible(connectButton);
       report.get_started_button_visible = await isVisible(getStartedButton);
-      report.live_status_label = await optionalVisibleText(
-        page.locator(".dragon-live-status-pill"),
-      );
       report.live_panel_detail = await optionalVisibleText(
         page.locator(".dragon-live-shell .section-detail"),
       );
@@ -685,6 +682,7 @@ async function runCanary() {
           ),
         )
         .catch(() => []);
+      report.live_status_label = statTileValue(report.live_stat_tiles, "status");
       report.transport_summary = inferTransportSummary(report.live_stat_tiles);
     };
 

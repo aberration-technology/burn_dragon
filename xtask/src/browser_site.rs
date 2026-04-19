@@ -264,44 +264,6 @@ body {
   gap: 18px;
 }
 
-.dragon-live-status-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: flex-start;
-}
-
-.dragon-live-status-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 2rem;
-  padding: 0 0.9rem;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--muted);
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: lowercase;
-}
-
-.dragon-live-status-pill-syncing,
-.dragon-live-status-pill-connecting,
-.dragon-live-status-pill-training {
-  border-color: rgba(216, 124, 124, 0.26);
-  background: rgba(216, 124, 124, 0.08);
-  color: var(--accent);
-}
-
-.dragon-live-status-pill-ready {
-  border-color: rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--ink);
-}
-
 .dragon-live-stats {
   display: grid;
   gap: 12px;

@@ -1029,28 +1029,6 @@ fn dragon_runtime_mode_detail(
         .unwrap_or_else(|| view.runtime_detail.clone())
 }
 
-fn dragon_live_status_label(
-    live_notice: Option<&DragonLiveNotice>,
-    training_action_state: Option<&DragonTrainingActionState>,
-    direct_transport_ready: bool,
-    local_training_pending: bool,
-) -> &'static str {
-    if local_training_pending {
-        return "training";
-    }
-    if let Some(notice) = live_notice {
-        return notice.label;
-    }
-    if training_action_state.is_some_and(|state| state.enabled) {
-        return "ready";
-    }
-    if direct_transport_ready {
-        "watching"
-    } else {
-        "connected"
-    }
-}
-
 fn browser_runtime_role_label(role: &burn_p2p_browser::BrowserRuntimeRole) -> &'static str {
     match role {
         burn_p2p_browser::BrowserRuntimeRole::BrowserTrainerWgpu => "browser_trainer_wgpu",
@@ -1980,14 +1958,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         browser_downgrade_reason.as_deref(),
     );
     let connected_panel_title = "connected";
-    let connected_panel_detail =
-        "one honest state, live throughput, peer reachability, and training control.".to_owned();
-    let live_status_label = dragon_live_status_label(
-        live_notice.as_ref(),
-        training_action_state.as_ref(),
-        direct_transport_ready,
-        local_training_pending_active,
-    );
     let runtime_mode_summary = dragon_runtime_mode_summary(
         view.as_ref(),
         direct_transport_ready,
@@ -2377,7 +2347,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         SectionHeader {
                             eyebrow: "live",
                             title: connected_panel_title,
-                            detail: connected_panel_detail,
+                            detail: String::new(),
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack dragon-live-summary",
@@ -2393,12 +2363,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         label: String::from("trainer state"),
                                         detail: format!("{reason}. clear local trainer state and reconnect to retry browser training."),
                                         tone: "neutral",
-                                    }
-                                }
-                                div { class: "dragon-live-status-row",
-                                    span {
-                                        class: "dragon-live-status-pill dragon-live-status-pill-{live_status_label}",
-                                        "{live_status_label}"
                                     }
                                 }
                                 div { class: "dragon-live-stats",
@@ -2627,7 +2591,9 @@ fn SectionHeader(eyebrow: &'static str, title: &'static str, detail: String) -> 
         header { class: "section-header",
             div { class: "eyebrow", "{eyebrow}" }
             h2 { class: "browser-focus-title", "{title}" }
-            p { class: "section-detail", "{detail}" }
+            if !detail.trim().is_empty() {
+                p { class: "section-detail", "{detail}" }
+            }
         }
     }
 }
@@ -2746,11 +2712,11 @@ mod tests {
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
         browser_app_refresh_interval_millis, browser_session_is_authenticated, connect_config,
         dragon_browser_training_action_ready, dragon_global_training_detail,
-        dragon_global_training_summary, dragon_live_notice, dragon_live_status_label,
-        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
-        dragon_runtime_mode_detail, dragon_runtime_mode_summary, dragon_slice_progress_summary,
-        dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
-        dragon_window_summary, normalized_browser_callback_url,
+        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
+        dragon_local_training_summary, dragon_network_detail, dragon_runtime_mode_detail,
+        dragon_runtime_mode_summary, dragon_slice_progress_summary, dragon_training_action_state,
+        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
+        normalized_browser_callback_url,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3278,10 +3244,6 @@ mod tests {
         let ready_training_action =
             dragon_training_action_state(Some(&view), true, true, true, false, None);
 
-        assert_eq!(
-            dragon_live_status_label(None, ready_training_action.as_ref(), true, false),
-            "ready"
-        );
         assert_eq!(
             dragon_runtime_mode_summary(
                 Some(&view),

@@ -339,7 +339,22 @@ body {
 }
 
 .dragon-live-actions {
+  display: grid;
+  gap: 8px;
   padding-top: 2px;
+  justify-items: start;
+}
+
+.dragon-live-actions .action-button[disabled] {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.dragon-live-action-note {
+  margin: 0;
+  max-width: 34rem;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .dragon-live-keyvalues {

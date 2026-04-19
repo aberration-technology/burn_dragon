@@ -527,6 +527,8 @@ async function runCanary() {
     connect_clicked: false,
     training_button_visible: false,
     training_button_enabled: false,
+    training_button_label: null,
+    training_action_detail: null,
     connect_button_visible: false,
     get_started_button_visible: false,
     live_status_label: null,
@@ -634,7 +636,7 @@ async function runCanary() {
     await page.goto(SITE_BASE_URL, { waitUntil: "domcontentloaded" });
 
     const connectButton = page.locator('button:has-text("connect")').first();
-    const trainButton = page.locator('button:has-text("run browser training")').first();
+    const trainActionButton = page.locator(".dragon-live-actions button").first();
     const getStartedButton = page.locator('button:has-text("get started")').first();
     let quietWindowStartedAt = null;
     const canStartTraining = () => {
@@ -643,13 +645,24 @@ async function runCanary() {
         ["connecting", "syncing", "blocked"].includes(
           report.live_notice_label.toLowerCase(),
         );
-      return report.training_button_visible && report.training_button_enabled && !blockingNotice;
+      return (
+        report.training_button_visible &&
+        report.training_button_enabled &&
+        report.training_button_label === "run browser training" &&
+        !blockingNotice
+      );
     };
     const captureLiveStatus = async () => {
-      report.training_button_visible = await isVisible(trainButton);
+      report.training_button_visible = await isVisible(trainActionButton);
       report.training_button_enabled = report.training_button_visible
-        ? await trainButton.isEnabled().catch(() => false)
+        ? await trainActionButton.isEnabled().catch(() => false)
         : false;
+      report.training_button_label = report.training_button_visible
+        ? await optionalVisibleText(trainActionButton)
+        : null;
+      report.training_action_detail = await optionalVisibleText(
+        page.locator(".dragon-live-action-note"),
+      );
       report.connect_button_visible = await isVisible(connectButton);
       report.get_started_button_visible = await isVisible(getStartedButton);
       report.live_status_label = await optionalVisibleText(
@@ -700,7 +713,7 @@ async function runCanary() {
     if (!canStartTraining()) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
-        `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
+        `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} action=${report.training_button_label ?? "missing"} action_detail=${report.training_action_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
       );
     }
 

@@ -97,6 +97,28 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         self.assertLess(public_ip_fetch_index, rewrite_index)
         self.assertLess(rewrite_index, restart_index)
 
+    def test_runtime_sync_waits_for_systemd_services_to_turn_active(self) -> None:
+        commands = module.generate_commands(base_env())
+        joined = "\n".join(commands)
+        self.assertIn("timed out waiting for caddy to reach active state", joined)
+        self.assertIn(
+            "timed out waiting for burn-p2p-bootstrap to reach active state",
+            joined,
+        )
+        restart_index = commands.index("systemctl restart burn-p2p-bootstrap")
+        caddy_wait_index = next(
+            index
+            for index, command in enumerate(commands)
+            if "timed out waiting for caddy to reach active state" in command
+        )
+        bootstrap_wait_index = next(
+            index
+            for index, command in enumerate(commands)
+            if "timed out waiting for burn-p2p-bootstrap to reach active state" in command
+        )
+        self.assertLess(restart_index, caddy_wait_index)
+        self.assertLess(caddy_wait_index, bootstrap_wait_index)
+
     def test_git_path_requires_and_uses_bootstrap_git_ref(self) -> None:
         env = base_env()
         env["BOOTSTRAP_INSTALL_SOURCE"] = "git"

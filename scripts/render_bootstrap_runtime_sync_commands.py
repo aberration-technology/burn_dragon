@@ -117,6 +117,29 @@ fi""",
     ]
 
 
+def wait_for_systemd_service_active_command(service_name: str) -> str:
+    return (
+        "service_state=''; "
+        "for attempt in $(seq 1 30); do "
+        f"service_state=$(systemctl is-active {service_name} 2>/dev/null || true); "
+        "if [ \"$service_state\" = 'active' ]; then break; fi; "
+        "if [ \"$service_state\" = 'failed' ]; then "
+        f"systemctl status {service_name} --no-pager || true; "
+        f"journalctl -u {service_name} --no-pager -n 200 || true; "
+        f"echo '{service_name} failed to reach active state' >&2; "
+        "exit 1; "
+        "fi; "
+        "sleep 2; "
+        "done; "
+        "if [ \"$service_state\" != 'active' ]; then "
+        f"systemctl status {service_name} --no-pager || true; "
+        f"journalctl -u {service_name} --no-pager -n 200 || true; "
+        f"echo \"timed out waiting for {service_name} to reach active state (last state: $service_state)\" >&2; "
+        "exit 1; "
+        "fi"
+    )
+
+
 def generate_commands(env: Mapping[str, str]) -> list[str]:
     preamble = [
         "set -eu",
@@ -152,8 +175,8 @@ def generate_commands(env: Mapping[str, str]) -> list[str]:
         "systemctl enable burn-dragon-p2p-head-mirror",
         "systemctl enable burn-p2p-bootstrap",
         "systemctl restart burn-p2p-bootstrap",
-        "systemctl is-active caddy",
-        "systemctl is-active burn-p2p-bootstrap",
+        wait_for_systemd_service_active_command("caddy"),
+        wait_for_systemd_service_active_command("burn-p2p-bootstrap"),
         "journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 60 || true",
     ]
 

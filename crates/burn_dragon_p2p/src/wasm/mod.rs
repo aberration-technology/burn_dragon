@@ -51,6 +51,10 @@ pub mod training;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS: u32 = 4_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS: u32 = 8_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const HERO_RATTLE_INTERVAL_MILLIS: u32 = 80;
 const HERO_RATTLE_FRAMES: &[&str] = &[
     "⠉⠉", "⠈⠙", "⠀⠹", "⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁",
@@ -450,6 +454,47 @@ struct DragonTrainingActionState {
     enabled: bool,
 }
 
+fn dragon_status_error_summary(error: &str) -> String {
+    let trimmed = error.trim();
+    let mut chars = trimmed.chars();
+    let abbreviated: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        format!("{abbreviated}...")
+    } else {
+        abbreviated
+    }
+}
+
+fn dragon_direct_transport_wait_detail(view: &BrowserAppClientView) -> String {
+    let transport = dragon_transport_target_label(view);
+    if let Some(error) = view.network.swarm_status.last_error.as_ref() {
+        return format!(
+            "{transport} unavailable: {}",
+            dragon_status_error_summary(error)
+        );
+    }
+    "connecting to direct peers".into()
+}
+
+fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u32 {
+    let Some(view) = view else {
+        return BROWSER_APP_REFRESH_INTERVAL_MILLIS;
+    };
+    let direct_connect_pending = view.network.swarm_status.connected_transport.is_none()
+        && view.network.swarm_status.desired_transport.is_some();
+    if direct_connect_pending {
+        return if view.network.swarm_status.last_error.is_some() {
+            BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS
+        } else {
+            BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS
+        };
+    }
+    if view.runtime_label.starts_with("joining ") || view.runtime_label.starts_with("catchup ") {
+        return BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS;
+    }
+    BROWSER_APP_REFRESH_INTERVAL_MILLIS
+}
+
 fn dragon_live_notice(
     view: Option<&BrowserAppClientView>,
     local_training_pending: bool,
@@ -488,18 +533,18 @@ fn dragon_live_notice(
         && view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
-        let transport = dragon_transport_target_label(view);
-        if let Some(error) = view.network.swarm_status.last_error.as_ref() {
-            return Some(DragonLiveNotice {
-                label: "waiting",
-                detail: format!("{transport} unavailable: {error}"),
-                tone: "neutral",
-            });
-        }
         return Some(DragonLiveNotice {
-            label: "connecting",
-            detail: "connecting to direct peers".into(),
-            tone: "accent",
+            label: if view.network.swarm_status.last_error.is_some() {
+                "waiting"
+            } else {
+                "connecting"
+            },
+            detail: dragon_direct_transport_wait_detail(view),
+            tone: if view.network.swarm_status.last_error.is_some() {
+                "neutral"
+            } else {
+                "accent"
+            },
         });
     }
 
@@ -806,7 +851,7 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
     if view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
-        return "connecting to direct peers".into();
+        return dragon_direct_transport_wait_detail(view);
     }
     if view.network.estimated_network_size > 0 {
         return format!(
@@ -1176,7 +1221,11 @@ fn spawn_browser_app_refresh_loop(
     checkpoint_wait_generation.set(next_generation);
     spawn(async move {
         loop {
-            TimeoutFuture::new(BROWSER_APP_REFRESH_INTERVAL_MILLIS).await;
+            let refresh_interval_millis = {
+                let view = current_view.read();
+                browser_app_refresh_interval_millis(view.as_ref())
+            };
+            TimeoutFuture::new(refresh_interval_millis).await;
             if *checkpoint_wait_generation.read() != next_generation {
                 break;
             }
@@ -2704,12 +2753,15 @@ fn EditorTextareaField(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_session_is_authenticated, connect_config, dragon_browser_training_action_ready,
-        dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
-        dragon_live_status_label, dragon_local_training_detail, dragon_local_training_summary,
-        dragon_network_detail, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
-        dragon_slice_progress_summary, dragon_training_action_state, dragon_transport_summary,
-        dragon_window_progress_detail, dragon_window_summary, normalized_browser_callback_url,
+        BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
+        BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
+        browser_app_refresh_interval_millis, browser_session_is_authenticated, connect_config,
+        dragon_browser_training_action_ready, dragon_global_training_detail,
+        dragon_global_training_summary, dragon_live_notice, dragon_live_status_label,
+        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
+        dragon_runtime_mode_detail, dragon_runtime_mode_summary, dragon_slice_progress_summary,
+        dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
+        dragon_window_summary, normalized_browser_callback_url,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3074,6 +3126,46 @@ mod tests {
         assert_eq!(
             dragon_window_progress_detail(Some(&view), "30s max"),
             "window cap 30s"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_network_detail_surfaces_direct_transport_error() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+
+        assert_eq!(
+            dragon_network_detail(Some(&view)),
+            "webrtc-direct unavailable: direct dial timeout"
+        );
+        let notice = dragon_live_notice(Some(&view), false).expect("direct wait notice");
+        assert_eq!(notice.label, "waiting");
+        assert_eq!(
+            notice.detail,
+            "webrtc-direct unavailable: direct dial timeout"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_refresh_interval_slows_when_direct_transport_is_stuck() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        assert_eq!(
+            browser_app_refresh_interval_millis(Some(&view)),
+            BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS
+        );
+
+        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+        assert_eq!(
+            browser_app_refresh_interval_millis(Some(&view)),
+            BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS
+        );
+
+        view.network.swarm_status.desired_transport = None;
+        assert_eq!(
+            browser_app_refresh_interval_millis(Some(&view)),
+            BROWSER_APP_REFRESH_INTERVAL_MILLIS
         );
     }
 

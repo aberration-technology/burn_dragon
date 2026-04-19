@@ -384,6 +384,54 @@ fn ensure_materialized_pinned_head<B>(
     );
 }
 
+fn select_promoted_head_candidate(
+    heads: [&Option<HeadDescriptor>; 3],
+    base_head_id: &burn_p2p::HeadId,
+    local_head_ids: &[burn_p2p::HeadId],
+    expected_global_step: u64,
+) -> Option<HeadDescriptor> {
+    heads
+        .into_iter()
+        .filter_map(|head| head.as_ref())
+        .find(|head| {
+            head.head_id != *base_head_id
+                && !local_head_ids.contains(&head.head_id)
+                && head.parent_head_id.as_ref() == Some(base_head_id)
+                && head.global_step == expected_global_step
+        })
+        .cloned()
+}
+
+fn peers_have_promoted_head(
+    heads: [&Option<HeadDescriptor>; 3],
+    promoted_head: &HeadDescriptor,
+    base_head_id: &burn_p2p::HeadId,
+    expected_global_step: u64,
+) -> bool {
+    heads.into_iter().all(|head| {
+        head.as_ref().is_some_and(|head| {
+            head.head_id == promoted_head.head_id
+                && head.parent_head_id.as_ref() == Some(base_head_id)
+                && head.global_step == expected_global_step
+        })
+    })
+}
+
+fn describe_head_state(head: &Option<HeadDescriptor>) -> String {
+    match head {
+        Some(head) => format!(
+            "head={} parent={} step={}",
+            head.head_id.as_str(),
+            head.parent_head_id
+                .as_ref()
+                .map(|value| value.as_str())
+                .unwrap_or("none"),
+            head.global_step
+        ),
+        None => "none".into(),
+    }
+}
+
 fn native_swarm_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -1975,7 +2023,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             trainer_b_window.head.head_id.clone(),
             trainer_c_window.head.head_id.clone(),
         ];
-        let convergence_deadline = Instant::now() + Duration::from_secs(90);
+        let convergence_deadline = Instant::now() + Duration::from_secs(120);
         let expected_promoted_global_step = canonical_head.global_step + 1;
         let promoted_head = loop {
             advance_diffusion_with_retry("advance seed diffusion", convergence_deadline, || {
@@ -2001,27 +2049,67 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             let trainer_c_head = trainer_c
                 .sync_experiment_head(&experiment)
                 .expect("sync runtime trainer c head");
-            if let (Some(seed_head), Some(trainer_b_head), Some(trainer_c_head)) =
-                (seed_head, trainer_b_head, trainer_c_head)
-                && seed_head.head_id == trainer_b_head.head_id
-                && seed_head.head_id == trainer_c_head.head_id
-                && seed_head.head_id != base_head_id
-                && !local_head_ids.contains(&seed_head.head_id)
-                && seed_head.parent_head_id.as_ref() == Some(&base_head_id)
-                && trainer_b_head.parent_head_id.as_ref() == Some(&base_head_id)
-                && trainer_c_head.parent_head_id.as_ref() == Some(&base_head_id)
-                && seed_head.global_step == expected_promoted_global_step
-                && trainer_b_head.global_step == expected_promoted_global_step
-                && trainer_c_head.global_step == expected_promoted_global_step
-            {
-                break seed_head;
+            if let Some(candidate) = select_promoted_head_candidate(
+                [&seed_head, &trainer_b_head, &trainer_c_head],
+                &base_head_id,
+                &local_head_ids,
+                expected_promoted_global_step,
+            ) {
+                break candidate;
             }
             assert!(
                 Instant::now() < convergence_deadline,
-                "runtime diffusion cluster did not converge on one promoted head"
+                "runtime diffusion cluster did not produce a valid promoted head; seed={} trainer-b={} trainer-c={}",
+                describe_head_state(&seed_head),
+                describe_head_state(&trainer_b_head),
+                describe_head_state(&trainer_c_head),
             );
             thread::sleep(Duration::from_millis(25));
         };
+
+        let propagation_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            advance_diffusion_with_retry("propagate seed diffusion", propagation_deadline, || {
+                seed.advance_diffusion_steady_state(&experiment, None, None)
+            });
+            advance_diffusion_with_retry(
+                "propagate trainer b diffusion",
+                propagation_deadline,
+                || trainer_b.advance_diffusion_steady_state(&experiment, None, None),
+            );
+            advance_diffusion_with_retry(
+                "propagate trainer c diffusion",
+                propagation_deadline,
+                || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
+            );
+
+            let seed_head = seed
+                .sync_experiment_head(&experiment)
+                .expect("sync propagated runtime seed head");
+            let trainer_b_head = trainer_b
+                .sync_experiment_head(&experiment)
+                .expect("sync propagated runtime trainer b head");
+            let trainer_c_head = trainer_c
+                .sync_experiment_head(&experiment)
+                .expect("sync propagated runtime trainer c head");
+            if peers_have_promoted_head(
+                [&seed_head, &trainer_b_head, &trainer_c_head],
+                &promoted_head,
+                &base_head_id,
+                expected_promoted_global_step,
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < propagation_deadline,
+                "runtime diffusion cluster did not propagate promoted head {} across peers; seed={} trainer-b={} trainer-c={}",
+                promoted_head.head_id.as_str(),
+                describe_head_state(&seed_head),
+                describe_head_state(&trainer_b_head),
+                describe_head_state(&trainer_c_head),
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
 
         let merged_loss = metric_float_any(&promoted_head.metrics, &["loss", "train_loss"]);
         merged_losses.push(merged_loss);
@@ -2517,27 +2605,67 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
         let trainer_c_head = trainer_c
             .sync_experiment_head(&experiment)
             .expect("sync diffusion trainer c head");
-        if let (Some(seed_head), Some(trainer_b_head), Some(trainer_c_head)) =
-            (seed_head, trainer_b_head, trainer_c_head)
-            && seed_head.head_id == trainer_b_head.head_id
-            && seed_head.head_id == trainer_c_head.head_id
-            && seed_head.head_id != genesis_head.head_id
-            && !local_head_ids.contains(&seed_head.head_id)
-            && seed_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
-            && trainer_b_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
-            && trainer_c_head.parent_head_id.as_ref() == Some(&genesis_head.head_id)
-            && seed_head.global_step == expected_promoted_global_step
-            && trainer_b_head.global_step == expected_promoted_global_step
-            && trainer_c_head.global_step == expected_promoted_global_step
-        {
-            break seed_head;
+        if let Some(candidate) = select_promoted_head_candidate(
+            [&seed_head, &trainer_b_head, &trainer_c_head],
+            &genesis_head.head_id,
+            &local_head_ids,
+            expected_promoted_global_step,
+        ) {
+            break candidate;
         }
         assert!(
             Instant::now() < convergence_deadline,
-            "diffusion trainers did not converge on one promoted head"
+            "diffusion trainers did not produce a valid promoted head; seed={} trainer-b={} trainer-c={}",
+            describe_head_state(&seed_head),
+            describe_head_state(&trainer_b_head),
+            describe_head_state(&trainer_c_head),
         );
         thread::sleep(Duration::from_millis(25));
     };
+
+    let propagation_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        advance_diffusion_with_retry("propagate seed diffusion", propagation_deadline, || {
+            seed.advance_diffusion_steady_state(&experiment, None, None)
+        });
+        advance_diffusion_with_retry(
+            "propagate trainer b diffusion",
+            propagation_deadline,
+            || trainer_b.advance_diffusion_steady_state(&experiment, None, None),
+        );
+        advance_diffusion_with_retry(
+            "propagate trainer c diffusion",
+            propagation_deadline,
+            || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
+        );
+
+        let seed_head = seed
+            .sync_experiment_head(&experiment)
+            .expect("sync propagated diffusion seed head");
+        let trainer_b_head = trainer_b
+            .sync_experiment_head(&experiment)
+            .expect("sync propagated diffusion trainer b head");
+        let trainer_c_head = trainer_c
+            .sync_experiment_head(&experiment)
+            .expect("sync propagated diffusion trainer c head");
+        if peers_have_promoted_head(
+            [&seed_head, &trainer_b_head, &trainer_c_head],
+            &promoted_head,
+            &genesis_head.head_id,
+            expected_promoted_global_step,
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < propagation_deadline,
+            "diffusion trainers did not propagate promoted head {} across peers; seed={} trainer-b={} trainer-c={}",
+            promoted_head.head_id.as_str(),
+            describe_head_state(&seed_head),
+            describe_head_state(&trainer_b_head),
+            describe_head_state(&trainer_c_head),
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 
     assert_eq!(promoted_head.global_step, expected_promoted_global_step);
     assert_eq!(

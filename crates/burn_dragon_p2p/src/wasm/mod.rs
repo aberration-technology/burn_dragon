@@ -313,6 +313,17 @@ async fn active_training_lease(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<Option<burn_p2p::WorkloadTrainingLease>> {
+    let live_controller_present =
+        DRAGON_BROWSER_APP_CONTROLLER.with(|slot| slot.borrow().as_ref().is_some());
+    let live_training_lease = DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|controller| controller.active_training_lease().cloned())
+    });
+    if live_controller_present {
+        return Ok(live_training_lease);
+    }
+
     let controller = BrowserAppController::connect_with(connect_config(
         bootstrap_config,
         config,

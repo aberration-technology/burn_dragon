@@ -21,7 +21,7 @@ use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
 use log::{error, info, warn};
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeSet};
 use url::form_urlencoded;
 
 use crate::admin::{
@@ -30,10 +30,13 @@ use crate::admin::{
 };
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
-    load_browser_session, provider_code_from_window_location,
+    load_browser_session, provider_code_from_window_location, reset_browser_runtime_state,
 };
 use crate::build_info;
-use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
+use crate::capability::{
+    DragonBrowserCapabilityDecision, DragonBrowserHostCapabilityProbe, decide_browser_capability,
+    detect_browser_host_capabilities,
+};
 use crate::capability_state::apply_browser_downgrade_state;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use crate::capability_state::clear_browser_downgrade;
@@ -83,6 +86,82 @@ fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
         view.training.latest_head_id.is_some(),
         view.training.cached_microshards,
     )
+}
+
+fn browser_scope_summary(scopes: &BTreeSet<ExperimentScope>) -> String {
+    if scopes.is_empty() {
+        return "none".into();
+    }
+    scopes
+        .iter()
+        .map(|scope| format!("{scope:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn browser_host_capability_summary(probe: &DragonBrowserHostCapabilityProbe) -> String {
+    format!(
+        "navigator_gpu={} worker_gpu={} dedicated_worker={} persistent_storage={} web_rtc={} web_transport={} system_memory_mib={}",
+        probe.navigator_gpu_exposed,
+        probe.worker_gpu_exposed,
+        probe.dedicated_worker_exposed,
+        probe.persistent_storage_exposed,
+        probe.web_rtc_exposed,
+        probe.web_transport_exposed,
+        probe.system_memory_bytes.unwrap_or_default() / (1024 * 1024),
+    )
+}
+
+fn browser_capability_decision_summary(decision: &DragonBrowserCapabilityDecision) -> String {
+    let trainer_budget_mib = decision
+        .trainer_memory_budget_bytes
+        .map(|bytes| (bytes / (1024 * 1024)).to_string())
+        .unwrap_or_else(|| "n/a".into());
+    let estimated_training_mib = decision
+        .footprint
+        .as_ref()
+        .map(|footprint| (footprint.estimated_training_bytes / (1024 * 1024)).to_string())
+        .unwrap_or_else(|| "n/a".into());
+    format!(
+        "recommended_role={} connect_target={:?} can_train={} trainer_budget_mib={} estimated_training_mib={} downgrade_reason={}",
+        browser_runtime_role_label(&decision.capability.recommended_role),
+        decision.connect_target,
+        decision.can_train,
+        trainer_budget_mib,
+        estimated_training_mib,
+        decision.downgrade_reason.as_deref().unwrap_or("none"),
+    )
+}
+
+fn browser_capability_decision_for_config(
+    config: &DragonBrowserAppConfig,
+) -> (
+    DragonBrowserHostCapabilityProbe,
+    DragonBrowserCapabilityDecision,
+) {
+    let browser_host_capabilities = detect_browser_host_capabilities();
+    let browser_capability_decision =
+        match (config.training.as_ref(), resolved_edge_base_url(config)) {
+            (Some(training), Ok(edge_base_url)) => apply_browser_downgrade_state(
+                &edge_base_url,
+                training,
+                browser_backend_label(training),
+                decide_browser_capability(Some(training), &browser_host_capabilities),
+            ),
+            (Some(training), Err(_)) => {
+                decide_browser_capability(Some(training), &browser_host_capabilities)
+            }
+            (None, _) => decide_browser_capability(None, &browser_host_capabilities),
+        };
+    (browser_host_capabilities, browser_capability_decision)
+}
+
+fn browser_session_scope_summary(session: &BrowserSessionState) -> String {
+    session
+        .session
+        .as_ref()
+        .map(|session| browser_scope_summary(&session.claims.granted_scopes))
+        .unwrap_or_else(|| "none".into())
 }
 
 #[cfg(feature = "wasm-peer")]
@@ -188,15 +267,7 @@ fn connect_config(
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppConnectConfig> {
     let config = connect_config.clone();
-    let capability_decision = match config.training.as_ref() {
-        Some(training) => apply_browser_downgrade_state(
-            &resolved_edge_base_url(&config)?,
-            training,
-            browser_backend_label(training),
-            decide_browser_capability(Some(training), &detect_browser_host_capabilities()),
-        ),
-        None => decide_browser_capability(None, &detect_browser_host_capabilities()),
-    };
+    let (_capability_probe, capability_decision) = browser_capability_decision_for_config(&config);
     let mut connect = BrowserAppConnectConfig::new(
         resolved_edge_base_url(&config)?,
         capability_decision.capability,
@@ -633,7 +704,7 @@ fn dragon_training_action_state(
             detail: downgrade_reason
                 .map(|reason| {
                     format!(
-                        "{reason}. clear local trainer state and reconnect to retry browser training."
+                        "{reason}. reset browser state and reconnect to retry browser training."
                     )
                 })
                 .unwrap_or_else(|| {
@@ -1019,7 +1090,7 @@ fn dragon_runtime_mode_detail(
     if view.runtime_label == "observe" {
         if let Some(reason) = downgrade_reason {
             return format!(
-                "{reason}. clear local trainer state and reconnect to retry browser training."
+                "{reason}. reset browser state and reconnect to retry browser training."
             );
         }
         return if direct_transport_ready {
@@ -1143,16 +1214,26 @@ pub async fn connect_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
-    let edge_base_url = resolved_edge_base_url(config)?;
+    let effective_config = config_with_window_network_overrides(config)?;
+    let edge_base_url = resolved_edge_base_url(&effective_config)?;
+    let (browser_host_capabilities, browser_capability_decision) =
+        browser_capability_decision_for_config(&effective_config);
+    info!(
+        "browser capability assessment: edge_url={} requested_scopes=[{}] {} {}",
+        edge_base_url,
+        browser_scope_summary(&effective_config.requested_scopes),
+        browser_host_capability_summary(&browser_host_capabilities),
+        browser_capability_decision_summary(&browser_capability_decision),
+    );
     info!(
         "browser app connect: edge_url={} seed_count={} auth_required={}",
         edge_base_url,
-        config.effective_seed_node_urls().len(),
-        config.require_edge_auth
+        effective_config.effective_seed_node_urls().len(),
+        effective_config.require_edge_auth
     );
     let controller = BrowserAppController::connect_with(connect_config(
         bootstrap_config,
-        config,
+        &effective_config,
         edge_snapshot,
         signed_seed_advertisement,
     )?)
@@ -1285,11 +1366,33 @@ pub async fn resume_or_complete_browser_auth(
             &provider_code,
         )
         .await?;
+        info!(
+            "browser auth completed: principal={} reenrollment_required={} granted_scopes=[{}]",
+            session
+                .session
+                .as_ref()
+                .map(|session| session.claims.principal_id.as_str())
+                .unwrap_or("anonymous"),
+            session.reenrollment_required,
+            browser_session_scope_summary(&session),
+        );
         let _ = normalize_provider_callback_window_location();
         return Ok(Some(session));
     }
     if config.require_edge_auth {
         let session = load_browser_session(&edge_base_url).await?;
+        if browser_session_is_authenticated(&session) {
+            info!(
+                "browser auth resumed: principal={} reenrollment_required={} granted_scopes=[{}]",
+                session
+                    .session
+                    .as_ref()
+                    .map(|session| session.claims.principal_id.as_str())
+                    .unwrap_or("anonymous"),
+                session.reenrollment_required,
+                browser_session_scope_summary(&session),
+            );
+        }
         return Ok(browser_session_is_authenticated(&session).then_some(session));
     }
     Ok(None)
@@ -1492,6 +1595,18 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 .filter(browser_session_is_authenticated),
                             Err(_) => None,
                         };
+                        if let Some(session) = session.as_ref() {
+                            info!(
+                                "browser auth loaded for connect: principal={} reenrollment_required={} granted_scopes=[{}]",
+                                session
+                                    .session
+                                    .as_ref()
+                                    .map(|session| session.claims.principal_id.as_str())
+                                    .unwrap_or("anonymous"),
+                                session.reenrollment_required,
+                                browser_session_scope_summary(session),
+                            );
+                        }
                         session_state.set(session);
                         status.set(String::new());
                         spawn_browser_app_refresh_loop(
@@ -1863,22 +1978,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let admin_rollout_status_view = admin_rollout_result.read().clone();
     let show_connection_settings_active = *show_connection_settings.read();
     let show_admin_tools_active = *show_admin_tools.read();
-    let browser_host_capabilities = detect_browser_host_capabilities();
-    let browser_capability_decision = match (
-        props.config.training.as_ref(),
-        resolved_edge_base_url(&initial_config),
-    ) {
-        (Some(training), Ok(edge_base_url)) => apply_browser_downgrade_state(
-            &edge_base_url,
-            training,
-            browser_backend_label(training),
-            decide_browser_capability(Some(training), &browser_host_capabilities),
-        ),
-        (Some(training), Err(_)) => {
-            decide_browser_capability(Some(training), &browser_host_capabilities)
-        }
-        (None, _) => decide_browser_capability(None, &browser_host_capabilities),
-    };
+    let (browser_host_capabilities, browser_capability_decision) =
+        browser_capability_decision_for_config(&initial_config);
     let browser_can_attempt_dynamic_training = props.config.training.is_some()
         || (browser_host_capabilities.navigator_gpu_exposed
             && browser_host_capabilities.worker_gpu_exposed
@@ -2155,7 +2256,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     };
 
     #[cfg(all(feature = "wasm-peer", feature = "wasm-ui", target_arch = "wasm32"))]
-    let clear_trainer_state_action = {
+    let reset_browser_state_action = {
         let props = props.clone();
         move |_| {
             let mut next_config = props.config.clone();
@@ -2165,12 +2266,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             );
             let mut status = status;
             let mut current_view = current_view;
+            let mut session_state = session_state;
             let mut checkpoint_wait_generation = checkpoint_wait_generation;
             spawn(async move {
-                let Some(training) = next_config.training.as_ref() else {
-                    status.set("no browser training config is available for this page".into());
-                    return;
-                };
                 let edge_base_url = match resolved_edge_base_url(&next_config) {
                     Ok(edge_base_url) => edge_base_url,
                     Err(error) => {
@@ -2178,34 +2276,38 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
-                match clear_browser_downgrade(
-                    &edge_base_url,
-                    training,
-                    browser_backend_label(training),
-                ) {
-                    Ok(()) => {
+                let downgrade_clear_result = next_config.training.as_ref().map(|training| {
+                    clear_browser_downgrade(
+                        &edge_base_url,
+                        training,
+                        browser_backend_label(training),
+                    )
+                });
+                let runtime_reset_result = reset_browser_runtime_state(&edge_base_url).await;
+                match (downgrade_clear_result.transpose(), runtime_reset_result) {
+                    (Ok(_), Ok(())) => {
                         clear_live_browser_app_controller();
                         let next_generation =
                             (*checkpoint_wait_generation.read()).saturating_add(1);
                         checkpoint_wait_generation.set(next_generation);
                         current_view.set(None);
+                        session_state.set(None);
                         status.set(
-                            "cleared local browser trainer state. reconnect to retry training."
+                            "reset local browser state. reconnect to retry browser training."
                                 .into(),
                         );
                     }
-                    Err(error) => status.set(error.to_string()),
+                    (Err(error), _) | (_, Err(error)) => status.set(error.to_string()),
                 }
             });
         }
     };
     #[cfg(not(all(feature = "wasm-peer", feature = "wasm-ui", target_arch = "wasm32")))]
-    let clear_trainer_state_action = move |_| {};
+    let reset_browser_state_action = move |_| {};
 
     #[cfg(feature = "wasm-peer")]
     let train_button = {
         let training_action_state = training_action_state.clone();
-        let browser_downgrade_reason = browser_downgrade_reason.clone();
         if has_connected_view {
             if let Some(training_action_state) = training_action_state {
                 let button_label = training_action_state.label;
@@ -2219,12 +2321,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         "{button_label}"
                     }
                     p { class: "dragon-live-action-note", "{button_detail}" }
-                    if browser_downgrade_reason.is_some() {
+                    if !training_action_state.enabled {
                         button {
                             r#type: "button",
                             class: "action-button action-button-secondary",
-                            onclick: clear_trainer_state_action,
-                            "clear trainer state"
+                            onclick: reset_browser_state_action,
+                            "reset browser state"
                         }
                     }
                 }
@@ -2432,7 +2534,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 if let Some(reason) = browser_downgrade_reason.as_ref() {
                                     ActivityNotice {
                                         label: String::from("trainer state"),
-                                        detail: format!("{reason}. clear local trainer state and reconnect to retry browser training."),
+                                        detail: format!("{reason}. reset browser state and reconnect to retry browser training."),
                                         tone: "neutral",
                                     }
                                 }
@@ -3276,7 +3378,7 @@ mod tests {
         .expect("downgraded training state");
         assert!(!blocked.enabled);
         assert_eq!(blocked.label, "trainer downgraded");
-        assert!(blocked.detail.contains("clear local trainer state"));
+        assert!(blocked.detail.contains("reset browser state"));
     }
 
     #[wasm_bindgen_test]

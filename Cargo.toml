@@ -49,15 +49,15 @@ burn_dragon_tokenizer = { version = "=0.21.0-pre.20", path = "crates/burn_dragon
 burn_dragon_train = { version = "=0.21.0-pre.20", path = "crates/burn_dragon_train", default-features = false }
 burn_dragon_universality = { version = "=0.21.0-pre.20", path = "crates/burn_dragon_universality", default-features = false }
 
-burn_p2p = { version = "=0.21.0-pre.23", default-features = false }
-burn_p2p_admin = { version = "=0.21.0-pre.23" }
-burn_p2p_app = { version = "=0.21.0-pre.23", default-features = false }
-burn_p2p_bootstrap = { version = "=0.21.0-pre.23" }
-burn_p2p_browser = { version = "=0.21.0-pre.23" }
-burn_p2p_core = { version = "=0.21.0-pre.23" }
-burn_p2p_dataloader = { version = "=0.21.0-pre.23" }
-burn_p2p_views = { version = "=0.21.0-pre.23" }
-burn_p2p_workload = { version = "=0.21.0-pre.23" }
+burn_p2p = { version = "=0.21.0-pre.24", default-features = false }
+burn_p2p_admin = { version = "=0.21.0-pre.24" }
+burn_p2p_app = { version = "=0.21.0-pre.24", default-features = false }
+burn_p2p_bootstrap = { version = "=0.21.0-pre.24" }
+burn_p2p_browser = { version = "=0.21.0-pre.24" }
+burn_p2p_core = { version = "=0.21.0-pre.24" }
+burn_p2p_dataloader = { version = "=0.21.0-pre.24" }
+burn_p2p_views = { version = "=0.21.0-pre.24" }
+burn_p2p_workload = { version = "=0.21.0-pre.24" }
 
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

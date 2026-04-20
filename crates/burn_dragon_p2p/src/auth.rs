@@ -16,7 +16,10 @@ use burn_p2p::{
 #[cfg(feature = "native")]
 use burn_p2p::{ContentId, EdgePeerIdentity, create_peer_auth_envelope};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use burn_p2p_browser::durability::{load_durable_browser_storage, persist_durable_browser_storage};
+use burn_p2p_browser::durability::{
+    clear_durable_browser_storage, clear_durable_receipt_outbox, load_durable_browser_storage,
+    persist_durable_browser_storage,
+};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p_browser::{
     BrowserEdgeClient, BrowserEnrollmentConfig, BrowserSessionState, BrowserUiBindings,
@@ -390,6 +393,10 @@ const PENDING_GITHUB_LOGIN_KEY: &str = "burn-dragon-p2p.pending-github-login";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const TRUSTED_CALLBACK_TOKEN_KEY: &str = "burn-dragon-p2p.canary-callback-token";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const DURABLE_BROWSER_STORAGE_PREFIX: &str = "burn-p2p.browser.storage.";
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const DURABLE_BROWSER_RECEIPT_OUTBOX_PREFIX: &str = "burn-p2p.browser.receipt-outbox.";
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_TTL_SECS: i64 = 15 * 60;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -518,6 +525,60 @@ fn clear_trusted_callback_token() -> Result<()> {
     browser_session_storage()?
         .remove_item(TRUSTED_CALLBACK_TOKEN_KEY)
         .map_err(|error| anyhow!("failed to clear trusted callback token: {error:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn clear_pending_browser_login_state() -> Result<()> {
+    browser_storage()?
+        .remove_item(PENDING_GITHUB_LOGIN_KEY)
+        .map_err(|error| anyhow!("failed to clear pending login: {error:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn clear_browser_local_storage_prefix(prefix: &str) -> Result<()> {
+    let storage = browser_storage()?;
+    let mut matching_keys = Vec::new();
+    let storage_len = storage
+        .length()
+        .map_err(|error| anyhow!("failed to inspect browser storage length: {error:?}"))?;
+    for index in 0..storage_len {
+        if let Some(key) = storage
+            .key(index)
+            .map_err(|error| anyhow!("failed to inspect browser storage key: {error:?}"))?
+            .filter(|key| key.starts_with(prefix))
+        {
+            matching_keys.push(key);
+        }
+    }
+    for key in matching_keys {
+        storage
+            .remove_item(&key)
+            .map_err(|error| anyhow!("failed to clear browser storage key {key}: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub async fn reset_browser_runtime_state(edge_base_url: &str) -> Result<()> {
+    let _ = clear_pending_browser_login_state();
+    let _ = clear_trusted_callback_token();
+    let _ = clear_browser_local_storage_prefix(DURABLE_BROWSER_STORAGE_PREFIX);
+    let _ = clear_browser_local_storage_prefix(DURABLE_BROWSER_RECEIPT_OUTBOX_PREFIX);
+
+    let snapshot = BrowserEdgeClient::new(
+        BrowserUiBindings::new(edge_base_url),
+        BrowserEnrollmentConfig::for_runtime_sync(&fetch_edge_snapshot(edge_base_url).await?),
+    )
+    .fetch_browser_edge_snapshot()
+    .await?;
+    clear_durable_receipt_outbox(&snapshot.network_id)
+        .await
+        .map_err(|error| anyhow!("failed to clear durable browser receipt outbox: {error}"))?;
+    clear_durable_browser_storage(&snapshot.network_id)
+        .await
+        .map_err(|error| anyhow!("failed to clear durable browser storage: {error}"))?;
     Ok(())
 }
 

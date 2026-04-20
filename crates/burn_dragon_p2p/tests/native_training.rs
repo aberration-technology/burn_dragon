@@ -350,6 +350,36 @@ fn advance_diffusion_with_retry(
     }
 }
 
+fn is_transient_head_sync_error(message: &str) -> bool {
+    ["trailing characters", "EOF while parsing", "expected value"]
+        .iter()
+        .any(|pattern| message.contains(pattern))
+}
+
+fn sync_experiment_head_with_retry<B>(
+    label: &str,
+    peer: &ManagedRunningNativePeer<B>,
+    experiment: &burn_p2p::ExperimentHandle,
+    deadline: Instant,
+) -> Option<HeadDescriptor>
+where
+    B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+{
+    loop {
+        match peer.sync_experiment_head(experiment) {
+            Ok(head) => return head,
+            Err(error)
+                if Instant::now() < deadline
+                    && is_transient_head_sync_error(&error.to_string()) =>
+            {
+                eprintln!("{label}: transient head sync retry: {error}");
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("{label}: {error:#}"),
+        }
+    }
+}
+
 fn ensure_materialized_pinned_head<B>(
     label: &str,
     peer: &ManagedRunningNativePeer<B>,
@@ -2118,15 +2148,24 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
                 || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
             );
 
-            let seed_head = seed
-                .sync_experiment_head(&experiment)
-                .expect("sync runtime seed head");
-            let trainer_b_head = trainer_b
-                .sync_experiment_head(&experiment)
-                .expect("sync runtime trainer b head");
-            let trainer_c_head = trainer_c
-                .sync_experiment_head(&experiment)
-                .expect("sync runtime trainer c head");
+            let seed_head = sync_experiment_head_with_retry(
+                "sync runtime seed head",
+                &seed,
+                &experiment,
+                convergence_deadline,
+            );
+            let trainer_b_head = sync_experiment_head_with_retry(
+                "sync runtime trainer b head",
+                &trainer_b,
+                &experiment,
+                convergence_deadline,
+            );
+            let trainer_c_head = sync_experiment_head_with_retry(
+                "sync runtime trainer c head",
+                &trainer_c,
+                &experiment,
+                convergence_deadline,
+            );
             if let Some(candidate) = select_promoted_head_candidate(
                 [&seed_head, &trainer_b_head, &trainer_c_head],
                 &base_head_id,
@@ -2160,15 +2199,24 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
                 || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
             );
 
-            let seed_head = seed
-                .sync_experiment_head(&experiment)
-                .expect("sync propagated runtime seed head");
-            let trainer_b_head = trainer_b
-                .sync_experiment_head(&experiment)
-                .expect("sync propagated runtime trainer b head");
-            let trainer_c_head = trainer_c
-                .sync_experiment_head(&experiment)
-                .expect("sync propagated runtime trainer c head");
+            let seed_head = sync_experiment_head_with_retry(
+                "sync propagated runtime seed head",
+                &seed,
+                &experiment,
+                propagation_deadline,
+            );
+            let trainer_b_head = sync_experiment_head_with_retry(
+                "sync propagated runtime trainer b head",
+                &trainer_b,
+                &experiment,
+                propagation_deadline,
+            );
+            let trainer_c_head = sync_experiment_head_with_retry(
+                "sync propagated runtime trainer c head",
+                &trainer_c,
+                &experiment,
+                propagation_deadline,
+            );
             if peers_have_promoted_head(
                 [&seed_head, &trainer_b_head, &trainer_c_head],
                 &promoted_head,
@@ -2657,15 +2705,24 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
             trainer_c.advance_diffusion_steady_state(&experiment, None, None)
         });
 
-        let seed_head = seed
-            .sync_experiment_head(&experiment)
-            .expect("sync diffusion seed head");
-        let trainer_b_head = trainer_b
-            .sync_experiment_head(&experiment)
-            .expect("sync diffusion trainer b head");
-        let trainer_c_head = trainer_c
-            .sync_experiment_head(&experiment)
-            .expect("sync diffusion trainer c head");
+        let seed_head = sync_experiment_head_with_retry(
+            "sync diffusion seed head",
+            &seed,
+            &experiment,
+            convergence_deadline,
+        );
+        let trainer_b_head = sync_experiment_head_with_retry(
+            "sync diffusion trainer b head",
+            &trainer_b,
+            &experiment,
+            convergence_deadline,
+        );
+        let trainer_c_head = sync_experiment_head_with_retry(
+            "sync diffusion trainer c head",
+            &trainer_c,
+            &experiment,
+            convergence_deadline,
+        );
         if let Some(candidate) = select_promoted_head_candidate(
             [&seed_head, &trainer_b_head, &trainer_c_head],
             &genesis_head.head_id,
@@ -2699,15 +2756,24 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
             || trainer_c.advance_diffusion_steady_state(&experiment, None, None),
         );
 
-        let seed_head = seed
-            .sync_experiment_head(&experiment)
-            .expect("sync propagated diffusion seed head");
-        let trainer_b_head = trainer_b
-            .sync_experiment_head(&experiment)
-            .expect("sync propagated diffusion trainer b head");
-        let trainer_c_head = trainer_c
-            .sync_experiment_head(&experiment)
-            .expect("sync propagated diffusion trainer c head");
+        let seed_head = sync_experiment_head_with_retry(
+            "sync propagated diffusion seed head",
+            &seed,
+            &experiment,
+            propagation_deadline,
+        );
+        let trainer_b_head = sync_experiment_head_with_retry(
+            "sync propagated diffusion trainer b head",
+            &trainer_b,
+            &experiment,
+            propagation_deadline,
+        );
+        let trainer_c_head = sync_experiment_head_with_retry(
+            "sync propagated diffusion trainer c head",
+            &trainer_c,
+            &experiment,
+            propagation_deadline,
+        );
         if peers_have_promoted_head(
             [&seed_head, &trainer_b_head, &trainer_c_head],
             &promoted_head,

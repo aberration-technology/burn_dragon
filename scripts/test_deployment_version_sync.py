@@ -11,6 +11,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-burn-dragon-p2p-aws.yml"
 RESTORE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "restore-burn-dragon-p2p-aws.yml"
+BOOTSTRAP_SETTINGS_SCRIPT = REPO_ROOT / "scripts" / "resolve_bootstrap_stack_settings.sh"
 README = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "README.md"
 NATIVE_PEER_EXAMPLE = (
     REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "native-peer.toml.example"
@@ -51,6 +52,7 @@ def terraform_variable_default(text: str, variable_name: str) -> str:
 class DeploymentVersionSyncTests(unittest.TestCase):
     def test_workflow_bootstrap_defaults_track_workspace_burn_p2p_version(self) -> None:
         expected = workspace_dependency_version("burn_p2p_bootstrap")
+        resolver_script = BOOTSTRAP_SETTINGS_SCRIPT.read_text()
         for path in (DEPLOY_WORKFLOW, RESTORE_WORKFLOW):
             text = path.read_text()
             self.assertIn(
@@ -63,20 +65,13 @@ class DeploymentVersionSyncTests(unittest.TestCase):
                 text,
                 path.name,
             )
-            self.assertIn(
-                f'bootstrap_version="{expected}"',
-                text,
-                path.name,
-            )
+        self.assertIn(f'bootstrap_version="{expected}"', resolver_script)
 
     def test_workflow_managed_trainer_default_follows_workspace_version(self) -> None:
-        for path in (DEPLOY_WORKFLOW, RESTORE_WORKFLOW):
-            text = path.read_text()
-            self.assertIn(
-                'managed_trainer_crate_version="$dragon_crate_version"',
-                text,
-                path.name,
-            )
+        self.assertIn(
+            'managed_trainer_crate_version="$dragon_crate_version"',
+            BOOTSTRAP_SETTINGS_SCRIPT.read_text(),
+        )
 
     def test_terraform_defaults_match_current_versions(self) -> None:
         text = TERRAFORM_VARIABLES.read_text()

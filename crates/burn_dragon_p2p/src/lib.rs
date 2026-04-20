@@ -19,6 +19,7 @@ pub mod admin;
 pub mod native;
 #[cfg(feature = "native")]
 pub mod native_runtime;
+pub mod p2p_adapter;
 
 #[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
 pub mod wasm;

@@ -8,9 +8,7 @@ use burn_p2p_app::{
     AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
     RolloutSubmissionStatusPanel,
 };
-use burn_p2p_browser::{
-    BrowserAppConnectConfig, BrowserAppController, BrowserSessionState, browser_transport_kind,
-};
+use burn_p2p_browser::{BrowserAppController, BrowserSessionState, browser_transport_kind};
 use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
@@ -41,6 +39,7 @@ use crate::capability_state::apply_browser_downgrade_state;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use crate::capability_state::clear_browser_downgrade;
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
+use crate::p2p_adapter::{browser_runtime_role_label, build_browser_app_connect_config};
 #[cfg(feature = "wasm-peer")]
 use crate::profile::{
     DragonExperimentProfile, browser_training_config_from_profile, find_matching_entry,
@@ -265,23 +264,23 @@ fn connect_config(
     connect_config: &DragonBrowserAppConfig,
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
-) -> Result<BrowserAppConnectConfig> {
+) -> Result<burn_p2p_browser::BrowserAppConnectConfig> {
     let config = connect_config.clone();
     let (_capability_probe, capability_decision) = browser_capability_decision_for_config(&config);
-    let mut connect = BrowserAppConnectConfig::new(
+    let bootstrap_material = if can_use_embedded_browser_bootstrap(bootstrap_config, &config) {
+        (edge_snapshot.cloned(), signed_seed_advertisement.cloned())
+    } else {
+        (None, None)
+    };
+    Ok(build_browser_app_connect_config(
         resolved_edge_base_url(&config)?,
         capability_decision.capability,
         capability_decision.connect_target,
-    )
-    .with_seed_node_urls(config.effective_seed_node_urls().to_vec());
-    if can_use_embedded_browser_bootstrap(bootstrap_config, &config) {
-        connect = connect
-            .with_bootstrap_material(edge_snapshot.cloned(), signed_seed_advertisement.cloned());
-    }
-    if let Some((experiment_id, revision_id)) = config.selected_experiment() {
-        connect = connect.with_selection(experiment_id, revision_id);
-    }
-    Ok(connect)
+        config.effective_seed_node_urls().to_vec(),
+        config.selected_experiment(),
+        bootstrap_material.0,
+        bootstrap_material.1,
+    ))
 }
 
 fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> ClientReleaseManifest {
@@ -1113,16 +1112,6 @@ fn dragon_runtime_mode_detail(
     training_action_state
         .map(|state| state.detail.clone())
         .unwrap_or_else(|| view.runtime_detail.clone())
-}
-
-fn browser_runtime_role_label(role: &burn_p2p_browser::BrowserRuntimeRole) -> &'static str {
-    match role {
-        burn_p2p_browser::BrowserRuntimeRole::BrowserTrainerWgpu => "browser_trainer_wgpu",
-        burn_p2p_browser::BrowserRuntimeRole::BrowserVerifier => "browser_verifier",
-        burn_p2p_browser::BrowserRuntimeRole::BrowserObserver => "browser_observer",
-        burn_p2p_browser::BrowserRuntimeRole::BrowserFallback => "browser_fallback",
-        burn_p2p_browser::BrowserRuntimeRole::Viewer => "viewer",
-    }
 }
 
 const DEFAULT_ADMIN_STUDY_ID: &str = "burn-dragon-mainnet";

@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
-#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use burn_p2p::ProjectFamilyId;
 use burn_p2p::{
     AuthConfig, BrowserEdgeSnapshot, ClientReleaseManifest, EdgeAuthClient, EdgeEnrollmentConfig,
     ExperimentDirectoryEntry, ExperimentScope, LoginStart, PrincipalSession,
@@ -34,6 +32,8 @@ use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
 
 use crate::config::DragonNativeAuthBundle;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use crate::p2p_adapter::browser_enrollment_config_from_snapshot;
 
 fn login_provider_for_snapshot(
     snapshot: &BrowserEdgeSnapshot,
@@ -365,27 +365,12 @@ pub fn browser_github_enrollment_config(
     requested_scopes: BTreeSet<ExperimentScope>,
     session_ttl_secs: i64,
 ) -> Result<BrowserEnrollmentConfig> {
-    let trust_bundle = snapshot
-        .trust_bundle
-        .as_ref()
-        .ok_or_else(|| anyhow!("edge snapshot is missing a trust bundle"))?;
-    let provider = login_provider_for_snapshot(snapshot)?;
-    Ok(BrowserEnrollmentConfig {
-        network_id: snapshot.network_id.clone(),
-        project_family_id: ProjectFamilyId::new(trust_bundle.project_family_id.as_str()),
-        release_train_hash: snapshot
-            .required_release_train_hash
-            .clone()
-            .unwrap_or_else(|| trust_bundle.required_release_train_hash.clone()),
-        target_artifact_id: release_manifest.target_artifact_id.clone(),
-        target_artifact_hash: release_manifest.target_artifact_hash.clone(),
-        login_path: provider.login_path.clone(),
-        callback_path: provider.callback_path.clone().unwrap_or_default(),
-        enroll_path: snapshot.paths.enroll_path.clone(),
-        trust_bundle_path: snapshot.paths.trust_bundle_path.clone(),
+    browser_enrollment_config_from_snapshot(
+        snapshot,
+        release_manifest,
         requested_scopes,
         session_ttl_secs,
-    })
+    )
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]

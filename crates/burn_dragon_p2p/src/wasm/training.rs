@@ -41,6 +41,7 @@ use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
     DragonBrowserTokenSource, DragonBrowserTrainingConfig, TokenWindowRecord,
 };
+use crate::p2p_adapter::browser_runtime_role_label;
 
 type BrowserCpuEvalBackend = NdArray<f32>;
 type BrowserCpuTrainBackend = Autodiff<BrowserCpuEvalBackend>;
@@ -988,13 +989,7 @@ async fn start_live_browser_participant(
     if capability.recommended_role != BrowserRuntimeRole::BrowserTrainerWgpu {
         bail!(
             "browser live training capability downgraded to {}; reconnect as verifier instead of trainer",
-            match capability.recommended_role {
-                BrowserRuntimeRole::BrowserVerifier => "browser_verifier",
-                BrowserRuntimeRole::BrowserObserver => "browser_observer",
-                BrowserRuntimeRole::BrowserFallback => "browser_fallback",
-                BrowserRuntimeRole::Viewer => "viewer",
-                BrowserRuntimeRole::BrowserTrainerWgpu => "browser_trainer_wgpu",
-            }
+            browser_runtime_role_label(&capability.recommended_role)
         );
     }
     let session_runtime = BrowserSessionRuntimeHandle::start(

@@ -19,6 +19,8 @@ use wasm_bindgen::JsValue;
 #[cfg(feature = "wasm-peer")]
 use crate::config::DragonBrowserTrainingConfig;
 use crate::config::{DragonCapabilityPolicy, DragonNativeTarget};
+#[cfg(feature = "wasm-ui")]
+use crate::p2p_adapter::{browser_app_target_for_role, browser_non_trainer_role_target};
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -335,18 +337,12 @@ pub fn decide_browser_capability(
         } else {
             BrowserGpuSupport::Unavailable("webgpu unavailable".into())
         };
-        capability.recommended_role = if host.dedicated_worker_exposed {
-            BrowserRuntimeRole::BrowserVerifier
-        } else {
-            BrowserRuntimeRole::BrowserObserver
-        };
+        let (recommended_role, connect_target) =
+            browser_non_trainer_role_target(host.dedicated_worker_exposed);
+        capability.recommended_role = recommended_role;
         return DragonBrowserCapabilityDecision {
             capability,
-            connect_target: if host.dedicated_worker_exposed {
-                BrowserAppTarget::Validate
-            } else {
-                BrowserAppTarget::Observe
-            },
+            connect_target,
             can_train: false,
             trainer_memory_budget_bytes: None,
             training_budget: None,
@@ -403,18 +399,11 @@ pub fn decide_browser_capability(
     } else {
         BrowserGpuSupport::Unavailable("webgpu unavailable".into())
     };
-    capability.recommended_role =
-        if worker_ready && config.capability_policy.allow_browser_verifier_fallback {
-            BrowserRuntimeRole::BrowserVerifier
-        } else {
-            BrowserRuntimeRole::BrowserObserver
-        };
-
-    let connect_target = match capability.recommended_role {
-        BrowserRuntimeRole::BrowserVerifier => BrowserAppTarget::Validate,
-        BrowserRuntimeRole::BrowserTrainerWgpu => BrowserAppTarget::Train,
-        _ => BrowserAppTarget::Observe,
-    };
+    let (recommended_role, _connect_target) = browser_non_trainer_role_target(
+        worker_ready && config.capability_policy.allow_browser_verifier_fallback,
+    );
+    capability.recommended_role = recommended_role;
+    let connect_target = browser_app_target_for_role(&capability.recommended_role);
     let downgrade_reason = Some(if !gpu_ready {
         "webgpu unavailable; downgrading browser peer to verifier/observer".into()
     } else if !worker_ready {

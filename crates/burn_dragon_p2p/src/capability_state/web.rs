@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use burn_p2p_browser::{BrowserAppTarget, BrowserRuntimeRole, BrowserWorkerSupport};
+use burn_p2p_browser::BrowserWorkerSupport;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -7,6 +7,7 @@ use super::{
 };
 use crate::capability::DragonBrowserCapabilityDecision;
 use crate::config::DragonBrowserTrainingConfig;
+use crate::p2p_adapter::browser_non_trainer_role_target;
 
 const BROWSER_STATE_PREFIX: &str = "burn-dragon-p2p.capability-downgrade.v1";
 
@@ -141,16 +142,9 @@ pub fn apply_browser_downgrade_state(
         );
     decision.can_train = false;
     decision.training_budget = None;
-    decision.capability.recommended_role = if can_verifier {
-        BrowserRuntimeRole::BrowserVerifier
-    } else {
-        BrowserRuntimeRole::BrowserObserver
-    };
-    decision.connect_target = if can_verifier {
-        BrowserAppTarget::Validate
-    } else {
-        BrowserAppTarget::Observe
-    };
+    let (recommended_role, connect_target) = browser_non_trainer_role_target(can_verifier);
+    decision.capability.recommended_role = recommended_role;
+    decision.connect_target = connect_target;
     decision.downgrade_reason = Some(format!(
         "persisted trainer failure for this workload fingerprint at {}: {}; holding browser verifier/observer role until the trainer budget increases or the workload changes",
         record.observed_at, record.reason

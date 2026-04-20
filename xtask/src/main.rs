@@ -1,4 +1,5 @@
 mod browser_site;
+mod deploy_settings;
 
 use std::ffi::OsString;
 use std::fs;
@@ -24,6 +25,7 @@ enum CommandKind {
     BuildBrowserCpu,
     BuildBrowser,
     BuildBrowserSite(browser_site::BuildBrowserSiteArgs),
+    ResolvePagesDeploySettings(deploy_settings::ResolvePagesDeploySettingsArgs),
     BuildMatrix,
     NativeSmoke,
     NativeScale,
@@ -47,6 +49,9 @@ fn main() -> Result<()> {
         CommandKind::BuildBrowserCpu => build_browser_cpu(),
         CommandKind::BuildBrowser => build_browser(),
         CommandKind::BuildBrowserSite(args) => browser_site::build_browser_site(&args),
+        CommandKind::ResolvePagesDeploySettings(args) => {
+            deploy_settings::resolve_pages_deploy_settings(&args)
+        }
         CommandKind::BuildMatrix => build_matrix(),
         CommandKind::ArtifactCheck => artifact_check(),
         CommandKind::NativeSmoke => native_smoke(),

@@ -18,9 +18,9 @@ def main() -> None:
         assert jobs, f"{workflow_path} missing jobs"
 
         required_snippets = [
-            'node scripts/live-browser-canary.mjs',
-            "npx --yes playwright install --with-deps chromium",
-            "## live browser canary",
+            "bash scripts/install_playwright_chromium.sh",
+            "bash scripts/run_live_browser_canary.sh",
+            'python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"',
             "burn-dragon-live-browser-canary",
         ]
         for snippet in required_snippets:
@@ -37,15 +37,25 @@ def main() -> None:
                 'trusted_callback_args+=(--trusted-callback-token "$BROWSER_CANARY_CALLBACK_TOKEN")',
                 'rm -rf "$bootstrap_root"',
                 '--force \\',
-                'gh workflow run .github/workflows/deploy-pages.yml',
-                'gh run watch "$pages_run_id"',
-                '--json databaseId,createdAt,headBranch',
-                'GITHUB_REF_NAME="$GITHUB_REF_NAME"',
-                'run.get("headBranch") == branch',
+                'bash scripts/dispatch_pages_deploy_and_wait.sh',
+                'BURN_DRAGON_DEPLOY_PAGES_ENVIRONMENT: ${{ env.DEPLOY_ENVIRONMENT }}',
+                'BURN_DRAGON_DEPLOY_PAGES_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}',
+                'BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}',
+                'BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}',
             ]
             for snippet in deploy_specific_snippets:
                 assert snippet in workflow_text, (
                     f"{workflow_path} missing required deploy snippet: {snippet}"
+                )
+            forbidden_snippets = [
+                'gh workflow run .github/workflows/deploy-pages.yml',
+                'gh run watch "$pages_run_id"',
+                '--json databaseId,createdAt,headBranch',
+                'run.get("headBranch") == branch',
+            ]
+            for snippet in forbidden_snippets:
+                assert snippet not in workflow_text, (
+                    f"{workflow_path} should use shared deploy-pages dispatch helper: {snippet}"
                 )
             assert (
                 "${{ runner.temp }}/bootstrap-install" not in workflow_text

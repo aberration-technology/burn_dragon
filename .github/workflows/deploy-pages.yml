@@ -59,6 +59,7 @@ jobs:
       edge_base_url: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}
       site_base_url: ${{ steps.resolve_browser_shell_settings.outputs.browser_app_base_url }}
       selected_experiment_id: ${{ steps.resolve_browser_shell_settings.outputs.selected_experiment_id }}
+      selected_revision_id: ${{ steps.resolve_browser_shell_settings.outputs.selected_revision_id }}
       canary_principal_id: ${{ steps.resolve_browser_shell_settings.outputs.canary_principal_id }}
     env:
       CARGO_TERM_COLOR: always
@@ -84,187 +85,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          edge_base_url="${{ github.event.inputs.edge_base_url }}"
-          seed_node_urls="${{ github.event.inputs.seed_node_urls }}"
-          seed_node_urls_from_env="${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"
-          selected_experiment_id="${{ github.event.inputs.selected_experiment_id }}"
-          selected_revision_id="${{ github.event.inputs.selected_revision_id }}"
-          browser_canary_principal_id="${{ github.event.inputs.canary_principal_id }}"
-          browser_app_base_url="${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}"
-          edge_domain_name="${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
-
-          if [ -z "$browser_app_base_url" ]; then
-            browser_app_base_url="https://dragon.aberration.technology"
-          fi
-          if [ -z "$edge_base_url" ]; then
-            edge_base_url="${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}"
-          fi
-          if [ -z "$edge_base_url" ] && [ -n "$edge_domain_name" ]; then
-            edge_base_url="https://${edge_domain_name}"
-          fi
-          if [ -z "$edge_base_url" ]; then
-            edge_base_url="https://edge.dragon.aberration.technology"
-          fi
-          if [ -z "$selected_experiment_id" ]; then
-            selected_experiment_id="${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID }}"
-          fi
-          if [ -z "$selected_experiment_id" ]; then
-            selected_experiment_id="nca-prepretraining"
-          fi
-          if [ -z "$selected_revision_id" ]; then
-            selected_revision_id="${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID }}"
-          fi
-          if [ -z "$selected_revision_id" ]; then
-            selected_revision_id="nca-r1"
-          fi
-          if [ -z "$browser_canary_principal_id" ]; then
-            browser_canary_principal_id="${{ vars.BURN_DRAGON_P2P_BROWSER_CANARY_PRINCIPAL_ID }}"
-          fi
-          if [ -z "$browser_canary_principal_id" ]; then
-            if [ "${{ github.event.inputs.environment }}" = "production" ]; then
-              browser_canary_principal_id="browser-canary-mainnet-nca"
-            else
-              browser_canary_principal_id="browser-canary-${{ github.event.inputs.environment }}-nca"
-            fi
-          fi
-          if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$(python3 - "$edge_base_url" <<'PY'
-          import json
-          import sys
-          import time
-          import urllib.request
-          from urllib.parse import urlparse
-
-          edge_base_url = sys.argv[1].rstrip("/")
-          host = urlparse(edge_base_url).hostname or "edge.dragon.aberration.technology"
-          seed_urls = []
-          signed_fetch_error = None
-
-          def is_dialable_browser_seed(value: str) -> bool:
-              segments = [segment for segment in value.split("/") if segment]
-              if "webrtc-direct" in segments:
-                  return bool(segments) and segments[0] in {"ip4", "ip6"} and "certhash" in segments
-              if "webtransport" in segments:
-                  return "quic-v1" in segments and "certhash" in segments
-              return "wss" in segments or "ws" in segments
-
-          def is_direct_browser_seed(value: str) -> bool:
-              segments = [segment for segment in value.split("/") if segment]
-              if "webrtc-direct" in segments:
-                  return bool(segments) and segments[0] in {"ip4", "ip6"} and "certhash" in segments
-              if "webtransport" in segments:
-                  return "quic-v1" in segments and "certhash" in segments
-              return False
-
-          def snapshot_advertises_direct_transports(transports: dict[str, object]) -> bool:
-              return bool(transports.get("webrtc_direct") or transports.get("webtransport_gateway"))
-
-          for attempt in range(3):
-              try:
-                  with urllib.request.urlopen(f"{edge_base_url}/browser/seeds/signed", timeout=10) as response:
-                      payload = json.load(response)
-                  signed = payload.get("payload", {}).get("payload", {})
-                  for record in signed.get("seeds") or []:
-                      for value in record.get("multiaddrs") or []:
-                          if value and is_dialable_browser_seed(value):
-                              seed_urls.append(value)
-                  signed_fetch_error = None
-                  break
-              except Exception as exc:
-                  seed_urls = []
-                  signed_fetch_error = exc
-                  if attempt < 2:
-                      time.sleep(2)
-
-          fetched_snapshot = False
-          snapshot_transports = {}
-          if not seed_urls or not any(is_direct_browser_seed(value) for value in seed_urls):
-              try:
-                  with urllib.request.urlopen(f"{edge_base_url}/portal/snapshot", timeout=10) as response:
-                      snapshot_transports = (json.load(response).get("transports") or {})
-                      fetched_snapshot = True
-              except Exception:
-                  snapshot_transports = {}
-
-          direct_transport_expected = snapshot_advertises_direct_transports(snapshot_transports)
-          direct_seed_available = any(is_direct_browser_seed(value) for value in seed_urls)
-
-          if direct_transport_expected and not direct_seed_available:
-              detail = f"signed_seed_fetch_error={signed_fetch_error!r}" if signed_fetch_error else "signed_browser_seeds_missing_direct_transport"
-              raise SystemExit(
-                  "browser pages deploy refusing to publish degraded WSS-only config while direct browser transports are advertised; "
-                  + detail
-              )
-
-          if not seed_urls and fetched_snapshot and snapshot_transports.get("wss_fallback"):
-              seed_urls.append(f"/dns4/{host}/tcp/443/wss")
-
-          print(",".join(dict.fromkeys(seed_urls)))
-          PY
-            )"
-          fi
-          if [ -z "$seed_node_urls" ]; then
-            seed_node_urls="$seed_node_urls_from_env"
-          fi
-          seed_node_urls="$(python3 - "$seed_node_urls" <<'PY'
-          import sys
-
-          seeds = [value.strip() for value in sys.argv[1].split(",") if value.strip()]
-
-          def is_dialable_browser_seed(value: str) -> bool:
-              segments = [segment for segment in value.split("/") if segment]
-              if "webrtc-direct" in segments:
-                  return "certhash" in segments
-              if "webtransport" in segments:
-                  return "quic-v1" in segments and "certhash" in segments
-              return "wss" in segments or "ws" in segments
-
-          print(",".join(dict.fromkeys(value for value in seeds if is_dialable_browser_seed(value))))
-          PY
-          )"
-          IFS=',' read -r -a seed_node_url_array <<<"$seed_node_urls"
-          browser_seed_count=0
-          browser_capable_seed_count=0
-          for seed in "${seed_node_url_array[@]}"; do
-            seed="${seed#"${seed%%[![:space:]]*}"}"
-            seed="${seed%"${seed##*[![:space:]]}"}"
-            if [ -z "$seed" ]; then
-              continue
-            fi
-            browser_seed_count=$((browser_seed_count + 1))
-            case "$seed" in
-              *webrtc-direct*certhash*|*quic-v1*webtransport*certhash*|*/wss|*/ws)
-                browser_capable_seed_count=$((browser_capable_seed_count + 1))
-                ;;
-            esac
-          done
-          if [ "$browser_seed_count" -eq 0 ]; then
-            echo "browser pages deploy requires at least one seed multiaddr" >&2
-            exit 1
-          fi
-          if [ "$browser_capable_seed_count" -eq 0 ]; then
-            echo "browser pages deploy requires at least one browser-capable seed multiaddr (expected webrtc-direct, webtransport, or wss/ws); got: $seed_node_urls" >&2
-            exit 1
-          fi
-          site_host="$(python3 -c 'from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or "")' "$browser_app_base_url")"
-
-          {
-            echo "EDGE_BASE_URL=$edge_base_url"
-            echo "SEED_NODE_URLS=$seed_node_urls"
-            echo "SELECTED_EXPERIMENT_ID=$selected_experiment_id"
-            echo "SELECTED_REVISION_ID=$selected_revision_id"
-            echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"
-            echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}"
-            echo "SITE_HOST=$site_host"
-          } >>"$GITHUB_ENV"
-
-          {
-            echo "edge_base_url=$edge_base_url"
-            echo "browser_app_base_url=$browser_app_base_url"
-            echo "selected_experiment_id=$selected_experiment_id"
-            echo "canary_principal_id=$browser_canary_principal_id"
-          } >>"$GITHUB_OUTPUT"
+          settings_path="$(mktemp)"
+          cargo run -q -p xtask -- resolve-pages-deploy-settings \
+            --environment "${{ github.event.inputs.environment }}" \
+            --edge-base-url-input "${{ github.event.inputs.edge_base_url }}" \
+            --edge-base-url-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}" \
+            --seed-node-urls-input "${{ github.event.inputs.seed_node_urls }}" \
+            --seed-node-urls-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}" \
+            --selected-experiment-id-input "${{ github.event.inputs.selected_experiment_id }}" \
+            --selected-experiment-id-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID }}" \
+            --selected-revision-id-input "${{ github.event.inputs.selected_revision_id }}" \
+            --selected-revision-id-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID }}" \
+            --canary-principal-id-input "${{ github.event.inputs.canary_principal_id }}" \
+            --canary-principal-id-from-env "${{ vars.BURN_DRAGON_P2P_BROWSER_CANARY_PRINCIPAL_ID }}" \
+            --browser-app-base-url-from-env "${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}" \
+            --edge-domain-name-from-env "${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}" \
+            >"$settings_path"
+          python3 scripts/write_pages_deploy_settings_outputs.py "$settings_path"
+          echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}" >>"$GITHUB_ENV"
 
       - name: build browser site artifact
         shell: bash
@@ -324,10 +162,7 @@ jobs:
 
       - name: install chromium
         shell: bash
-        run: |
-          set -euo pipefail
-          npx --yes playwright --version
-          npx --yes playwright install --with-deps chromium
+        run: bash scripts/install_playwright_chromium.sh
 
       - name: run live browser canary
         id: live_browser_canary
@@ -341,12 +176,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json
-        run: |
-          set -euo pipefail
-          mkdir -p "$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR"
-          echo "artifact_dir=$BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR" >>"$GITHUB_OUTPUT"
-          echo "report_path=$BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON" >>"$GITHUB_OUTPUT"
-          node scripts/live-browser-canary.mjs
+        run: bash scripts/run_live_browser_canary.sh
 
       - name: summarize live browser canary
         if: ${{ always() && steps.live_browser_canary.outputs.report_path != '' }}
@@ -357,32 +187,7 @@ jobs:
           if [ ! -f "$report_path" ]; then
             exit 0
           fi
-
-          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import sys
-
-          report = json.load(open(sys.argv[1]))
-          receipt = report.get("receipt_submission") or {}
-          control_requests = report.get("quiet_window_control_plane_requests") or []
-          artifact_fallback = report.get("artifact_http_fallback_requests") or []
-          live_status = report.get("live_status_label") or "n/a"
-          transport_summary = report.get("transport_summary") or "n/a"
-
-          print("## live browser canary")
-          print()
-          print(f"- Success: `{report.get('success', False)}`")
-          print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
-          print(f"- Live status: `{live_status}`")
-          print(f"- Transport signal: `{transport_summary}`")
-          print(f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`")
-          print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
-          print(f"- Training button visible: `{report.get('training_button_visible', False)}`")
-          print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
-          print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
-          print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
-          print(f"- Error: `{report.get('error') or 'none'}`")
-          PY
+          python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload live browser canary artifact
         if: ${{ always() && steps.live_browser_canary.outputs.artifact_dir != '' }}

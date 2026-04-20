@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: summarize_live_browser_canary.py <report_path>")
+
+    report_path = Path(sys.argv[1])
+    if not report_path.is_file():
+        raise SystemExit(0)
+
+    report = json.loads(report_path.read_text())
+    receipt = report.get("receipt_submission") or {}
+    control_requests = report.get("quiet_window_control_plane_requests") or []
+    artifact_fallback = report.get("artifact_http_fallback_requests") or []
+    live_status = report.get("live_status_label") or "n/a"
+    transport_summary = report.get("transport_summary") or "n/a"
+
+    print("## live browser canary")
+    print()
+    print(f"- Success: `{report.get('success', False)}`")
+    print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
+    print(f"- Live status: `{live_status}`")
+    print(f"- Transport signal: `{transport_summary}`")
+    print(
+        f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`"
+    )
+    print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
+    print(f"- Training button visible: `{report.get('training_button_visible', False)}`")
+    print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
+    print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
+    print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
+    print(f"- Error: `{report.get('error') or 'none'}`")
+
+
+if __name__ == "__main__":
+    main()

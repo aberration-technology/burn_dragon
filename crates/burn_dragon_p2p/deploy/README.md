@@ -159,6 +159,13 @@ Before the workflow can publish, set the repository Pages source to `GitHub Acti
 
 That workflow builds the standalone `burn_dragon_p2p_browser` wasm client through `xtask build-browser-site`, uploads the generated static bundle, and deploys it to GitHub Pages. The published shell is static and is intended to live at `https://dragon.aberration.technology`; it still depends on the live bootstrap API/auth edge you configure for browser control-plane bootstrap, auth, signed browser seeds, and steady-state sync. By default, the baked browser config points at `https://edge.dragon.aberration.technology`, resolves browser-capable signed seeds from that edge, and refuses to publish a degraded WSS-only shell when the edge advertises direct browser transports.
 
+The deploy path is now split more cleanly:
+
+- `xtask resolve-pages-deploy-settings` is the authoritative resolver for Pages defaults, signed browser seed derivation, and the "refuse degraded WSS-only publish when direct browser transports are advertised" guardrail
+- `xtask build-browser-site` is the authoritative browser bundle generator
+- `scripts/dispatch_pages_deploy_and_wait.sh` owns the child-workflow dispatch/watch logic used by deploy and restore
+- `scripts/run_live_browser_canary.sh` and `scripts/summarize_live_browser_canary.py` own the shared canary execution and summary path used by Pages, deploy, restore, and the standalone live-canary workflow
+
 `deploy-pages.yml` now runs the live browser canary after the Pages publish completes. The workflow does not succeed unless the freshly deployed shell can boot, connect, and reach the expected browser peer path against the configured edge.
 
 The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Archive` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.

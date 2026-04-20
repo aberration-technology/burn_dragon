@@ -738,17 +738,18 @@ async function runCanary() {
       );
     }
 
-    const receiptResponsePromise = page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        new URL(response.url()).host === new URL(EDGE_BASE_URL).host &&
-        new URL(response.url()).pathname === "/receipts/browser" &&
-        response.status() >= 200 &&
-        response.status() < 300,
-      { timeout: TRAIN_TIMEOUT_MS },
-    );
-    await trainButton.click();
-    const receiptResponse = await receiptResponsePromise;
+    const receiptResponse = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).host === new URL(EDGE_BASE_URL).host &&
+          new URL(response.url()).pathname === "/receipts/browser" &&
+          response.status() >= 200 &&
+          response.status() < 300,
+        { timeout: TRAIN_TIMEOUT_MS },
+      ),
+      trainActionButton.click(),
+    ]).then(([response]) => response);
     report.receipt_submission = {
       url: receiptResponse.url(),
       status: receiptResponse.status(),

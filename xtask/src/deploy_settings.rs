@@ -194,7 +194,7 @@ fn fetch_browser_seed_urls(edge_base_url: &str) -> Result<Vec<String>> {
 
     let direct_transport_expected = snapshot_transports
         .as_ref()
-        .map(|snapshot| snapshot_advertises_direct_transports(snapshot))
+        .map(snapshot_advertises_direct_transports)
         .unwrap_or(false);
     let direct_seed_available = seed_urls.iter().any(|value| is_direct_browser_seed(value));
 
@@ -333,15 +333,14 @@ fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
 
 fn is_dialable_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
-    if segments.iter().any(|segment| *segment == "webrtc-direct") {
+    if segments.contains(&"webrtc-direct") {
         return segments
             .first()
             .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
-            && segments.iter().any(|segment| *segment == "certhash");
+            && segments.contains(&"certhash");
     }
-    if segments.iter().any(|segment| *segment == "webtransport") {
-        return segments.iter().any(|segment| *segment == "quic-v1")
-            && segments.iter().any(|segment| *segment == "certhash");
+    if segments.contains(&"webtransport") {
+        return segments.contains(&"quic-v1") && segments.contains(&"certhash");
     }
     segments
         .iter()
@@ -350,15 +349,14 @@ fn is_dialable_browser_seed(value: &str) -> bool {
 
 fn is_direct_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
-    if segments.iter().any(|segment| *segment == "webrtc-direct") {
+    if segments.contains(&"webrtc-direct") {
         return segments
             .first()
             .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
-            && segments.iter().any(|segment| *segment == "certhash");
+            && segments.contains(&"certhash");
     }
-    if segments.iter().any(|segment| *segment == "webtransport") {
-        return segments.iter().any(|segment| *segment == "quic-v1")
-            && segments.iter().any(|segment| *segment == "certhash");
+    if segments.contains(&"webtransport") {
+        return segments.contains(&"quic-v1") && segments.contains(&"certhash");
     }
     false
 }

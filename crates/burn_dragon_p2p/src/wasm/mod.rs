@@ -457,8 +457,12 @@ struct DragonTrainingActionState {
 
 fn dragon_status_error_summary(error: &str) -> String {
     let trimmed = error.trim();
-    let mut chars = trimmed.chars();
-    let abbreviated: String = chars.by_ref().take(120).collect();
+    let preferred = trimmed
+        .strip_prefix("browser direct swarm could not dial any supported seed candidate: ")
+        .unwrap_or(trimmed);
+    let budget = if preferred == trimmed { 220 } else { 320 };
+    let mut chars = preferred.chars();
+    let abbreviated: String = chars.by_ref().take(budget).collect();
     if chars.next().is_some() {
         format!("{abbreviated}...")
     } else {

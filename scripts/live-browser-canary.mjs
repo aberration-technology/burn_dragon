@@ -276,6 +276,17 @@ function browserConfigSeedNodeUrls(browserConfig) {
   return [];
 }
 
+function browserConfigTrainingConfig(browserConfig) {
+  if (!browserConfig || typeof browserConfig !== "object") {
+    return null;
+  }
+  const nested = browserConfig.config?.training;
+  if (nested && typeof nested === "object") {
+    return nested;
+  }
+  return null;
+}
+
 function isDialableWebRtcSeed(seed) {
   const segments = seed.split("/").filter(Boolean);
   return (
@@ -407,6 +418,7 @@ async function runCanary() {
     (record) => record.multiaddrs ?? [],
   ) ?? [];
   const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);
+  const browserTrainingConfig = browserConfigTrainingConfig(browserConfig);
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
   const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
@@ -443,6 +455,11 @@ async function runCanary() {
   if (JSON.stringify(browserConfigSeeds) !== JSON.stringify(signedSeeds)) {
     fail(
       `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)}`,
+    );
+  }
+  if (SELECTED_EXPERIMENT_ID && !browserTrainingConfig) {
+    fail(
+      `browser config is missing training payload for selected experiment ${SELECTED_EXPERIMENT_ID}`,
     );
   }
 

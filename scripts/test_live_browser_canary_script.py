@@ -5,9 +5,13 @@ def main() -> None:
     script = Path("scripts/live-browser-canary.mjs").read_text()
     required_snippets = [
         "function browserConfigSeedNodeUrls(browserConfig)",
+        "function browserConfigTrainingConfig(browserConfig)",
         "browserConfig.config?.network?.seed_node_urls",
+        "browserConfig.config?.training",
         "browserConfig.seed_node_urls",
         "const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);",
+        "const browserTrainingConfig = browserConfigTrainingConfig(browserConfig);",
+        'browser config is missing training payload for selected experiment ${SELECTED_EXPERIMENT_ID}',
         'const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";',
         'const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";',
         "const callbackUrl = endpoint(SITE_BASE_URL, `${provider.callback_path}?code=browser-canary-provider-code`);",

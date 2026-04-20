@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(all(not(feature = "native"), feature = "wasm-peer"))]
 use burn_dragon_core::DragonConfig;
-#[cfg(feature = "wasm-peer")]
+#[cfg(feature = "native")]
+use burn_dragon_language::DragonConfig;
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 use burn_dragon_universality::NcaCorpusConfig;
 #[cfg(feature = "native")]
 use burn_p2p::NetworkManifest;
@@ -555,7 +557,7 @@ pub enum DragonBrowserShardSelectionPolicy {
     DeterministicPeer,
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DragonBrowserTokenSource {
@@ -580,7 +582,7 @@ pub enum DragonBrowserTokenSource {
     },
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonBrowserLiveParticipantConfig {
     #[serde(default)]
@@ -616,7 +618,7 @@ impl DragonBrowserExecutionBackend {
     }
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserTrainingConfig {
     pub experiment_kind: DragonExperimentKind,
@@ -646,17 +648,17 @@ pub struct DragonBrowserTrainingConfig {
     pub live_participant: Option<DragonBrowserLiveParticipantConfig>,
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 fn default_browser_learning_rate() -> f64 {
     1.0e-3
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 fn default_browser_block_size() -> usize {
     128
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 fn default_browser_batch_size() -> usize {
     4
 }

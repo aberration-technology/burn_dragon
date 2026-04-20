@@ -15262,6 +15262,7 @@ name = "xtask"
 version = "0.21.0-pre.20"
 dependencies = [
  "anyhow",
+ "burn_dragon_p2p",
  "burn_p2p",
  "burn_p2p_app",
  "burn_p2p_browser",

@@ -341,6 +341,7 @@ fn deployment_script_checks() -> Result<()> {
         "scripts/test_bootstrap_instance_selection.py",
         "scripts/test_head_mirror_admin_capability.py",
         "scripts/test_deploy_pages_workflow.py",
+        "scripts/test_browser_site_training_config.py",
         "scripts/test_live_browser_canary_script.py",
         "scripts/test_live_browser_canary_workflow.py",
         "scripts/test_browser_profile_budget.py",

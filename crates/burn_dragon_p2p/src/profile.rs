@@ -35,7 +35,7 @@ use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
     DragonCapabilityPolicy, DragonExperimentKind, TokenWindowRecord,
 };
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 use crate::config::{
     DragonBrowserLiveParticipantConfig, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
 };
@@ -599,7 +599,7 @@ pub fn resolve_native_training_profile(
     })
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 fn browser_source_from_profile(
     source: DragonBrowserProfileTokenSource,
 ) -> Result<DragonBrowserTokenSource> {
@@ -631,7 +631,7 @@ fn browser_source_from_profile(
     }
 }
 
-#[cfg(feature = "wasm-peer")]
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 pub fn browser_training_config_from_profile(
     entry: &ExperimentDirectoryEntry,
     profile: &DragonExperimentProfile,
@@ -664,6 +664,35 @@ pub fn browser_training_config_from_profile(
             workload_id: entry.workload_id.as_str().to_owned(),
         }),
     }))
+}
+
+#[cfg(feature = "native")]
+pub fn browser_training_config_from_directory_entries(
+    entries: &[ExperimentDirectoryEntry],
+    selected_experiment_id: Option<&str>,
+    selected_revision_id: Option<&str>,
+) -> Result<Option<DragonBrowserTrainingConfig>> {
+    let Some(entry) =
+        find_matching_entry(entries, selected_experiment_id, selected_revision_id, None)?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(profile) = DragonExperimentProfile::from_entry_metadata(entry)? {
+        return browser_training_config_from_profile(entry, &profile);
+    }
+
+    match (
+        entry.experiment_id.as_str(),
+        entry.current_revision_id.as_str(),
+    ) {
+        ("nca-prepretraining", "nca-r1") => {
+            let profile: DragonExperimentProfile =
+                serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?;
+            browser_training_config_from_profile(entry, &profile)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

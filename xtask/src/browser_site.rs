@@ -6,6 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use burn_dragon_p2p::config::DragonBrowserTrainingConfig;
+use burn_dragon_p2p::profile::browser_training_config_from_directory_entries;
 use burn_p2p::{
     BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentId,
     ExperimentScope, ProjectFamilyId,
@@ -448,6 +450,8 @@ struct DragonBrowserAppConfigDocument {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     requested_scopes: BTreeSet<ExperimentScope>,
     require_edge_auth: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    training: Option<DragonBrowserTrainingConfig>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -634,6 +638,11 @@ fn browser_site_bootstrap_json(
         } else {
             None
         };
+    let training = resolve_browser_training_config(
+        edge_snapshot.as_ref(),
+        selected_experiment_id.as_deref(),
+        selected_revision_id.as_deref(),
+    )?;
 
     Ok(DragonBrowserSiteBootstrapDocument {
         config: DragonBrowserAppConfigDocument {
@@ -645,6 +654,7 @@ fn browser_site_bootstrap_json(
             selected_revision_id,
             requested_scopes: browser_site_requested_scopes(selected_experiment_id.as_deref()),
             require_edge_auth: args.require_edge_auth,
+            training,
         },
         release_manifest: edge_snapshot
             .as_ref()
@@ -652,6 +662,34 @@ fn browser_site_bootstrap_json(
         edge_snapshot,
         signed_seed_advertisement,
     })
+}
+
+fn resolve_browser_training_config(
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+    selected_experiment_id: Option<&str>,
+    selected_revision_id: Option<&str>,
+) -> Result<Option<DragonBrowserTrainingConfig>> {
+    let Some(selected_experiment_id) = selected_experiment_id else {
+        return Ok(None);
+    };
+
+    let Some(snapshot) = edge_snapshot else {
+        return Err(anyhow!(
+            "selected experiment `{selected_experiment_id}` requires an edge snapshot so the browser training profile can be embedded"
+        ));
+    };
+
+    let training = browser_training_config_from_directory_entries(
+        &snapshot.directory.entries,
+        Some(selected_experiment_id),
+        selected_revision_id,
+    )?;
+    training.ok_or_else(|| {
+        anyhow!(
+            "selected experiment `{selected_experiment_id}` does not publish a browser training profile"
+        )
+    })
+    .map(Some)
 }
 
 fn browser_site_requested_scopes(

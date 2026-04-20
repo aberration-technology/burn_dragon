@@ -388,6 +388,8 @@ pub fn browser_github_enrollment_config(
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_KEY: &str = "burn-dragon-p2p.pending-github-login";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const TRUSTED_CALLBACK_TOKEN_KEY: &str = "burn-dragon-p2p.canary-callback-token";
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_TTL_SECS: i64 = 15 * 60;
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -487,6 +489,39 @@ fn browser_storage() -> Result<web_sys::Storage> {
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_session_storage() -> Result<web_sys::Storage> {
+    web_sys::window()
+        .ok_or_else(|| anyhow!("window unavailable"))?
+        .session_storage()
+        .map_err(|error| anyhow!("sessionStorage unavailable: {error:?}"))?
+        .ok_or_else(|| anyhow!("sessionStorage unavailable"))
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn load_trusted_callback_token() -> Result<Option<String>> {
+    let Some(raw) = browser_session_storage()?
+        .get_item(TRUSTED_CALLBACK_TOKEN_KEY)
+        .map_err(|error| anyhow!("failed to read trusted callback token: {error:?}"))?
+    else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_owned()))
+    }
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn clear_trusted_callback_token() -> Result<()> {
+    browser_session_storage()?
+        .remove_item(TRUSTED_CALLBACK_TOKEN_KEY)
+        .map_err(|error| anyhow!("failed to clear trusted callback token: {error:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub async fn begin_browser_github_login(
     edge_base_url: &str,
     release_manifest: &ClientReleaseManifest,
@@ -565,7 +600,10 @@ pub async fn complete_browser_github_login(
         pending.requested_scopes,
         session_ttl_secs,
     )?;
-    let client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
+    let mut client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
+    if let Some(token) = load_trusted_callback_token()? {
+        client = client.with_trusted_callback("x-burn-p2p-canary-token", token);
+    }
     let session = client
         .complete_provider_login(&pending.login, provider_code.to_owned())
         .await?;
@@ -584,6 +622,7 @@ pub async fn complete_browser_github_login(
         .await
         .map_err(|error| anyhow!("failed to persist durable browser storage: {error}"))?;
     let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
+    let _ = clear_trusted_callback_token();
     Ok(durable.session)
 }
 

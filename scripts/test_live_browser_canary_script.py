@@ -8,6 +8,11 @@ def main() -> None:
         "browserConfig.config?.network?.seed_node_urls",
         "browserConfig.seed_node_urls",
         "const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);",
+        'const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";',
+        'const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";',
+        "const callbackUrl = endpoint(SITE_BASE_URL, `${provider.callback_path}?code=browser-canary-provider-code`);",
+        "window.sessionStorage.setItem(trustedCallbackTokenKey, callbackToken);",
+        'document.body.innerText.includes("Browser training complete:")',
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"

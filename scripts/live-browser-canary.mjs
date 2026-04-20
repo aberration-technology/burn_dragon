@@ -38,6 +38,8 @@ const OUTPUT_JSON =
   path.join(ARTIFACT_DIR, "canary-summary.json");
 const HEADLESS = process.env.BURN_DRAGON_BROWSER_CANARY_HEADED === "1" ? false : true;
 const SITE_OVERRIDE_DIR = process.env.BURN_DRAGON_BROWSER_CANARY_SITE_OVERRIDE_DIR?.trim() || null;
+const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";
+const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";
 
 const WATCHED_CONTROL_PATHS = [
   "/portal/snapshot",
@@ -210,6 +212,15 @@ function browserStorageSnapshot(networkId, sessionState) {
     active_assignment: null,
     active_training_lease: null,
     updated_at: new Date().toISOString(),
+  };
+}
+
+function pendingBrowserLoginState(edgeBaseUrl, login, requestedScopes) {
+  return {
+    edge_base_url: edgeBaseUrl.replace(/\/+$/, ""),
+    created_at: new Date().toISOString(),
+    login,
+    requested_scopes: requestedScopes,
   };
 }
 
@@ -489,14 +500,18 @@ async function runCanary() {
   }
 
   const enrollment = await enrollBrowserCanary(snapshot);
-  const sessionState = {
-    session: enrollment.session,
-    certificate: enrollment.certificate,
-    trust_bundle: enrollment.trustBundle,
-    enrolled_at: new Date().toISOString(),
-    reenrollment_required: Boolean(enrollment.trustBundle?.reenrollment),
-  };
-  const storageSnapshot = browserStorageSnapshot(snapshot.network_id, sessionState);
+  const provider = (snapshot.login_providers ?? []).find(
+    (candidate) => candidate?.callback_path && candidate.callback_path.trim().length > 0,
+  );
+  if (!provider?.callback_path) {
+    fail("edge snapshot did not expose a usable callback path");
+  }
+  const callbackUrl = endpoint(SITE_BASE_URL, `${provider.callback_path}?code=browser-canary-provider-code`);
+  const pendingLoginState = pendingBrowserLoginState(
+    EDGE_BASE_URL,
+    enrollment.login,
+    enrollment.requestedScopes,
+  );
 
   const { chromium } = await loadPlaywright();
   const browser = await chromium.launch({
@@ -581,20 +596,26 @@ async function runCanary() {
     }
 
     await context.addInitScript(
-      ({ networkId, storageJson, receiptJson }) => {
-        const storageKey = `burn-p2p.browser.storage.${networkId}`;
+      ({ networkId, receiptJson, pendingLoginJson, callbackToken, pendingLoginKey, trustedCallbackTokenKey }) => {
         const receiptKey = `burn-p2p.browser.receipt-outbox.${networkId}`;
         try {
-          window.localStorage.setItem(storageKey, storageJson);
           window.localStorage.setItem(receiptKey, receiptJson);
+          window.localStorage.setItem(
+            pendingLoginKey,
+            pendingLoginJson,
+          );
+          window.sessionStorage.setItem(trustedCallbackTokenKey, callbackToken);
         } catch (error) {
           console.error("burn-dragon-canary-init-storage-failed", String(error));
         }
       },
       {
         networkId: snapshot.network_id,
-        storageJson: JSON.stringify(storageSnapshot),
         receiptJson: JSON.stringify(emptyReceiptOutbox()),
+        pendingLoginJson: JSON.stringify(pendingLoginState),
+        callbackToken: CALLBACK_TOKEN,
+        pendingLoginKey: PENDING_GITHUB_LOGIN_KEY,
+        trustedCallbackTokenKey: TRUSTED_CALLBACK_TOKEN_KEY,
       },
     );
 
@@ -633,7 +654,7 @@ async function runCanary() {
       });
     });
 
-    await page.goto(SITE_BASE_URL, { waitUntil: "domcontentloaded" });
+    await page.goto(callbackUrl, { waitUntil: "domcontentloaded" });
 
     const connectButton = page.locator('button:has-text("connect")').first();
     const trainActionButton = page.locator(".dragon-live-actions button").first();
@@ -755,6 +776,12 @@ async function runCanary() {
       status: receiptResponse.status(),
       body_preview: trimPreview(await receiptResponse.text()),
     };
+    await page.waitForFunction(
+      () =>
+        document.body.innerText.includes("Browser training complete:") ||
+        document.body.innerText.includes("train loss"),
+      { timeout: TRAIN_TIMEOUT_MS },
+    );
     report.success = true;
     await page.screenshot({ path: screenshotPath, fullPage: true });
   } catch (error) {

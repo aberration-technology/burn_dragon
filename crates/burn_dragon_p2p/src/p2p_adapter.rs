@@ -3,13 +3,17 @@ use anyhow::{Result, anyhow};
 
 #[cfg(feature = "wasm-ui")]
 use burn_p2p::{BrowserEdgeSnapshot, ClientReleaseManifest, ExperimentScope};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use burn_p2p::{PeerRole, PeerRoleSet, RuntimeTransportPolicy, WorkloadTrainingLease};
 #[cfg(feature = "wasm-ui")]
 use burn_p2p_browser::{
-    BrowserAppConnectConfig, BrowserAppTarget, BrowserCapabilityReport, BrowserEnrollmentConfig,
-    BrowserRuntimeRole,
+    BrowserAppConnectConfig, BrowserAppController, BrowserAppTarget, BrowserCapabilityReport,
+    BrowserEnrollmentConfig, BrowserRuntimeRole, BrowserTransportPolicy,
 };
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
+#[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+use burn_p2p_views::BrowserAppClientView;
 
 #[cfg(feature = "wasm-ui")]
 use std::collections::BTreeSet;
@@ -66,6 +70,42 @@ pub fn browser_enrollment_config_from_snapshot(
         session_ttl_secs,
     )
     .map_err(|error| anyhow!("failed to build browser enrollment config: {error}"))
+}
+
+#[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+pub struct DragonBrowserAppHandle(BrowserAppController);
+
+#[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+impl DragonBrowserAppHandle {
+    pub async fn connect(connect: BrowserAppConnectConfig) -> Result<Self> {
+        BrowserAppController::connect_with(connect)
+            .await
+            .map(Self)
+            .map_err(|error| anyhow!("failed to connect browser app controller: {error}"))
+    }
+
+    pub async fn refresh(&mut self) -> Result<BrowserAppClientView> {
+        self.0
+            .refresh()
+            .await
+            .map(|_| self.0.view())
+            .map_err(|error| anyhow!("failed to refresh browser app controller: {error}"))
+    }
+
+    pub fn view(&self) -> BrowserAppClientView {
+        self.0.view()
+    }
+
+    pub fn active_training_lease(&self) -> Option<&WorkloadTrainingLease> {
+        self.0.active_training_lease()
+    }
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub fn browser_trainer_transport_policy() -> BrowserTransportPolicy {
+    BrowserTransportPolicy::from(RuntimeTransportPolicy::browser_for_roles(
+        &PeerRoleSet::new([PeerRole::BrowserTrainerWgpu]),
+    ))
 }
 
 #[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]

@@ -8,7 +8,7 @@ use burn_p2p_app::{
     AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
     RolloutSubmissionStatusPanel,
 };
-use burn_p2p_browser::{BrowserAppController, BrowserSessionState, browser_transport_kind};
+use burn_p2p_browser::{BrowserSessionState, browser_transport_kind};
 use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use burn_p2p_views::{
     AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
@@ -39,7 +39,9 @@ use crate::capability_state::apply_browser_downgrade_state;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use crate::capability_state::clear_browser_downgrade;
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
-use crate::p2p_adapter::{browser_runtime_role_label, build_browser_app_connect_config};
+use crate::p2p_adapter::{
+    DragonBrowserAppHandle, browser_runtime_role_label, build_browser_app_connect_config,
+};
 #[cfg(feature = "wasm-peer")]
 use crate::profile::{
     DragonExperimentProfile, browser_training_config_from_profile, find_matching_entry,
@@ -65,7 +67,7 @@ const HERO_RATTLE_FRAMES: &[&str] = &[
 ];
 
 thread_local! {
-    static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<BrowserAppController>> = const { RefCell::new(None) };
+    static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<DragonBrowserAppHandle>> = const { RefCell::new(None) };
 }
 
 fn current_app_semver() -> semver::Version {
@@ -417,7 +419,7 @@ async fn active_training_lease(
         return Ok(live_training_lease);
     }
 
-    let controller = BrowserAppController::connect_with(connect_config(
+    let controller = DragonBrowserAppHandle::connect(connect_config(
         bootstrap_config,
         config,
         edge_snapshot,
@@ -1220,7 +1222,7 @@ pub async fn connect_browser_app(
         effective_config.effective_seed_node_urls().len(),
         effective_config.require_edge_auth
     );
-    let controller = BrowserAppController::connect_with(connect_config(
+    let controller = DragonBrowserAppHandle::connect(connect_config(
         bootstrap_config,
         &effective_config,
         edge_snapshot,
@@ -1252,7 +1254,7 @@ pub async fn refresh_browser_app(
     {
         controller
     } else {
-        BrowserAppController::connect_with(connect_config(
+        DragonBrowserAppHandle::connect(connect_config(
             bootstrap_config,
             config,
             edge_snapshot,
@@ -1260,7 +1262,7 @@ pub async fn refresh_browser_app(
         )?)
         .await?
     };
-    let refresh_result = controller.refresh().await.map(|_| controller.view());
+    let refresh_result = controller.refresh().await;
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         *slot.borrow_mut() = Some(controller);
     });

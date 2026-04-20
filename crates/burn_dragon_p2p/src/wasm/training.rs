@@ -41,7 +41,7 @@ use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
     DragonBrowserTokenSource, DragonBrowserTrainingConfig, TokenWindowRecord,
 };
-use crate::p2p_adapter::browser_runtime_role_label;
+use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_policy};
 
 type BrowserCpuEvalBackend = NdArray<f32>;
 type BrowserCpuTrainBackend = Autodiff<BrowserCpuEvalBackend>;
@@ -1000,11 +1000,7 @@ async fn start_live_browser_participant(
             target_artifact_id: release_manifest.target_artifact_id.clone(),
             target_artifact_hash: release_manifest.target_artifact_hash.clone(),
             role: BrowserRuntimeRole::BrowserTrainerWgpu,
-            transport: burn_p2p_browser::BrowserTransportPolicy::from(
-                burn_p2p::RuntimeTransportPolicy::browser_for_roles(&burn_p2p::PeerRoleSet::new([
-                    burn_p2p::PeerRole::BrowserTrainerWgpu,
-                ])),
-            ),
+            transport: browser_trainer_transport_policy(),
             selected_experiment: Some(ExperimentId::new(live.experiment_id.clone())),
             selected_revision: Some(RevisionId::new(live.revision_id.clone())),
             capability,

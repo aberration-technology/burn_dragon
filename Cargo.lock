@@ -2051,9 +2051,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a959b725d5e7c4c7515a0543266f821dc540055ccde0fc1282a9ff0002ef32"
+checksum = "1745da18ce49776b4abb474dcccf21aff4c5cf1315bbafc0703d34bf2830756f"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -2081,9 +2081,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_admin"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5dce30bcbe5aa0e3fbcf0b48029fdfcf434f9c3b76482147e389cef140912df"
+checksum = "f2d39702a286f2a39956e806ca451facfd78a7b7eb9a79ffabbd308d8424bfcb"
 dependencies = [
  "burn_p2p",
  "burn_p2p_core",
@@ -2097,9 +2097,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_app"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cda39f6367b4eb3d76c13b933ac1be52b1a0aa2ebf7bc938e173790b8fcda269"
+checksum = "f901748f94184b0160ad3372bf2ca41979871a0185447e6c0c5c3d013f8bcde5"
 dependencies = [
  "burn_p2p_browser",
  "burn_p2p_views",
@@ -2115,9 +2115,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_bootstrap"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1b5c2541806729cd7dd4934fb73ded72d7a876064333e228b2d78b96ffb1339"
+checksum = "556353526910c65305f86170f368147d4ece873dd825e298ce9a49a8e93ee34a"
 dependencies = [
  "anyhow",
  "burn_p2p",
@@ -2142,9 +2142,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_browser"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3982c6c16a51eaa7eba3623f27494242758e06dc8ef1a5450772c9f7aecd8460"
+checksum = "dfb7e88b28292b001a347bbf2c773147d24c32dafb0e1c2ff221d26aa27246c4"
 dependencies = [
  "base64 0.22.1",
  "burn_p2p",
@@ -2170,9 +2170,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_checkpoint"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a24d4683eee3e0433de36df3c3bd1332bf5d6b9757e3545ef754822f1f93187"
+checksum = "441f8f3f48518f64490de249133ef0f88ee87b4491ab44981cd2f921d760d97b"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2185,9 +2185,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_core"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e86223258498c2bedc4c672e8e6c16d0527df5ed82f1adf4f6c99576e9ca4f31"
+checksum = "ee0fdfcda08f08b8db9e8a24bc4fd47b290e880ee7f688e7bff81b9b065792c2"
 dependencies = [
  "chrono",
  "ciborium",
@@ -2201,9 +2201,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_dataloader"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ec29f607e1562675cfd8c3620f7999104bd7157c12997e60226362830eeabba"
+checksum = "9e1f6022e93f74e4317a8f479b0d37ea1968c928497287a5fa83662a6209a7bc"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2217,9 +2217,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_engine"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b8448cdf317c01a620e132a59a58c2bf212f0c2c29fdccd41a4984a1d9cdb0b"
+checksum = "6c1f5b78e04b4b25683f2c396a2cb938715263c447b055032d2b4dbb6fe46da0"
 dependencies = [
  "burn 0.21.0-pre.3",
  "burn-store 0.21.0-pre.3",
@@ -2232,9 +2232,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_experiment"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2818704960ccae3be77b549df64478531c3ea742bacb265b9065ba68023e289b"
+checksum = "6268b81902fc7318d3eb1ed3228fcc19c4708cb66500e8c22fba9a47217c9b13"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2245,9 +2245,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_limits"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40711d8deafe4868fbaf7a20e62f8f2f0c8f18c615f94940c5c86e3359a4a56f"
+checksum = "dba676bde8b795a054d091e8d54ac2f435d097bfedaf5933e44b4933d53606af"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2257,9 +2257,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_metrics"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f457265d5180c70878ebf44d4f70345258e67943912eb8537efd6237a863d2"
+checksum = "949255cd0556abefeb40d45e0dc0476eaacd7523007ec60613f26732273bd48b"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2270,9 +2270,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_publish"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54f7a53b5eafd309691434db3e589410e23d85d7ae2877b235d484a3b00b4071"
+checksum = "4d4b746b0172ec743253b8ea3bb1c96b4f93b143a2a5050d3cd5024a1a86c1a0"
 dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
@@ -2284,9 +2284,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_security"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "213fb38c4243d1176ca2dbf3291912242abf296b56ad363a7d43d4b4be6b4270"
+checksum = "50d033c247d85f7fa7c0af0ef252c824737c9bed23c78202cb0b519efd81633d"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2301,9 +2301,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_swarm"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8b4ece3c2688b990cd2d5a8ca77daf4b226b4e7133d8376712ecd10d63dfb5"
+checksum = "eb0ee0fc5cac09a23096370f6a935a57e3e37585dbcb472b82a247b0c102fa8e"
 dependencies = [
  "async-trait",
  "burn_p2p_core",
@@ -2336,9 +2336,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_views"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89168131f9def08fc9215a8b6d97ce9b2db3209954c92292056bdc7728d85eb3"
+checksum = "411666fb3a4b9eed283dcb8bd5f8cdca82cdf767e5c4d610105387ff2ddfdd00"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2352,9 +2352,9 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_workload"
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8028fc32b0a48612b5f4d02928d62ed8045635483beda3f39bf5a1d805d7225e"
+checksum = "20af9ff45165b51668a468ae190db45f57798869383d733d72942fde4cb0adc1"
 dependencies = [
  "anyhow",
  "burn_p2p_checkpoint",

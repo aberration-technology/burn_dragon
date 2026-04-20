@@ -20,6 +20,9 @@ def main() -> None:
     assert "redir ${browser_app_base_url}{uri} 302" in template, (
         "browser shell redirect target changed unexpectedly"
     )
+    assert "x-burn-p2p-canary-token" in template, (
+        "edge caddy config must allow the trusted browser canary callback header"
+    )
     assert "p2p_port             = var.p2p_port" in main_tf, (
         "terraform must pass p2p_port into the edge caddy template"
     )

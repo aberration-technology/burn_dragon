@@ -32,7 +32,7 @@ https://${edge_domain_name} {
     handle @preflight {
         header Access-Control-Allow-Origin "${browser_app_origin}"
         header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id, x-burn-p2p-canary-token"
         header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
         header Access-Control-Max-Age "3600"
         header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
@@ -50,7 +50,7 @@ https://${edge_domain_name} {
     handle {
         header Access-Control-Allow-Origin "${browser_app_origin}"
         header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin, X-Session-Id, x-burn-p2p-canary-token"
         header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
         header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
         reverse_proxy 127.0.0.1:${http_port}

@@ -359,28 +359,45 @@ fn ensure_materialized_pinned_head<B>(
 ) where
     B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
 {
-    peer.wait_for_artifact_from_peers(
+    ensure_materialized_artifact(
+        label,
+        peer,
         provider_peer_ids,
         &head.artifact_id,
+        "pinned head",
         Duration::from_secs(30),
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{label} did not materialize pinned head artifact {}: {error:#}",
-            head.artifact_id.as_str(),
-        )
-    });
-    let store = peer.artifact_store().expect("artifact store");
-    assert!(
-        store
-            .has_complete_artifact(&head.artifact_id)
-            .expect("check pinned artifact"),
-        "{label} should have the pinned head artifact locally before the next pinned round",
     );
     assert!(
         peer.adopt_known_head_if_present(experiment, head)
             .expect("adopt known pinned head"),
         "{label} should adopt the promoted pinned head locally once its artifact is present",
+    );
+}
+
+fn ensure_materialized_artifact<B>(
+    label: &str,
+    peer: &ManagedRunningNativePeer<B>,
+    provider_peer_ids: &[PeerId],
+    artifact_id: &burn_p2p::ArtifactId,
+    artifact_kind: &str,
+    timeout: Duration,
+) where
+    B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+{
+    peer.wait_for_artifact_from_peers(provider_peer_ids, artifact_id, timeout)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{label} did not materialize {artifact_kind} artifact {}: {error:#}",
+                artifact_id.as_str(),
+            )
+        });
+    let store = peer.artifact_store().expect("artifact store");
+    assert!(
+        store
+            .has_complete_artifact(artifact_id)
+            .expect("check materialized artifact"),
+        "{label} should have the {artifact_kind} artifact {} locally",
+        artifact_id.as_str(),
     );
 }
 
@@ -1999,6 +2016,41 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             );
         }
 
+        let provider_peer_ids = [
+            seed.snapshot().local_peer_id.expect("seed local peer id"),
+            trainer_b
+                .snapshot()
+                .local_peer_id
+                .expect("trainer b local peer id"),
+            trainer_c
+                .snapshot()
+                .local_peer_id
+                .expect("trainer c local peer id"),
+        ];
+        for (label, peer) in [
+            ("seed", &seed),
+            ("trainer-b", &trainer_b),
+            ("trainer-c", &trainer_c),
+        ] {
+            for (artifact_label, artifact_id) in [
+                ("seed update", &seed_window.artifact.artifact_id),
+                ("seed head", &seed_window.head.artifact_id),
+                ("trainer-b update", &trainer_b_window.artifact.artifact_id),
+                ("trainer-b head", &trainer_b_window.head.artifact_id),
+                ("trainer-c update", &trainer_c_window.artifact.artifact_id),
+                ("trainer-c head", &trainer_c_window.head.artifact_id),
+            ] {
+                ensure_materialized_artifact(
+                    label,
+                    peer,
+                    &provider_peer_ids,
+                    artifact_id,
+                    artifact_label,
+                    Duration::from_secs(45),
+                );
+            }
+        }
+
         eprintln!(
             "nca_runtime_cluster_round_{round}_artifacts: seed_bytes={} seed_chunks={} trainer_b_bytes={} trainer_b_chunks={} trainer_c_bytes={} trainer_c_chunks={}",
             seed_window.artifact.bytes_len,
@@ -2192,17 +2244,6 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             promoted_head.global_step,
         );
 
-        let provider_peer_ids = [
-            seed.snapshot().local_peer_id.expect("seed local peer id"),
-            trainer_b
-                .snapshot()
-                .local_peer_id
-                .expect("trainer b local peer id"),
-            trainer_c
-                .snapshot()
-                .local_peer_id
-                .expect("trainer c local peer id"),
-        ];
         ensure_materialized_pinned_head(
             "seed",
             &seed,

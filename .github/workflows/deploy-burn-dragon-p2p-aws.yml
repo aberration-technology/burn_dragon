@@ -1332,50 +1332,6 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
         run: bash scripts/dispatch_pages_deploy_and_wait.sh
 
-      - name: setup node for live browser canary
-        if: ${{ github.event.inputs.plan_only != 'true' }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: install chromium for live browser canary
-        if: ${{ github.event.inputs.plan_only != 'true' }}
-        shell: bash
-        run: bash scripts/install_playwright_chromium.sh
-
-      - name: run live browser canary
-        id: live_browser_canary
-        if: ${{ github.event.inputs.plan_only != 'true' }}
-        shell: bash
-        env:
-          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ steps.outputs.outputs.browser_app_url }}
-          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
-          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ env.BROWSER_CANARY_PRINCIPAL_ID }}
-          BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ env.BROWSER_CANARY_CALLBACK_TOKEN }}
-          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
-          BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
-          BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json
-        run: bash scripts/run_live_browser_canary.sh
-
-      - name: summarize live browser canary
-        if: ${{ always() && steps.live_browser_canary.outputs.report_path != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          report_path="${{ steps.live_browser_canary.outputs.report_path }}"
-          if [ ! -f "$report_path" ]; then
-            exit 0
-          fi
-          python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: upload live browser canary artifact
-        if: ${{ always() && steps.live_browser_canary.outputs.artifact_dir != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: burn-dragon-live-browser-canary
-          path: ${{ steps.live_browser_canary.outputs.artifact_dir }}
-          if-no-files-found: ignore
-
       - name: publish workflow summary
         if: ${{ always() }}
         shell: bash

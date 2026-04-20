@@ -1,6 +1,31 @@
 name: Live Browser Canary
 
 on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        default: production
+        type: string
+      site_base_url:
+        required: false
+        default: https://dragon.aberration.technology
+        type: string
+      edge_base_url:
+        required: false
+        default: https://edge.dragon.aberration.technology
+        type: string
+      principal_id:
+        required: false
+        default: browser-canary-mainnet-nca
+        type: string
+      experiment_id:
+        required: false
+        default: nca-prepretraining
+        type: string
+    secrets:
+      BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       environment:
@@ -40,7 +65,7 @@ permissions:
 jobs:
   canary:
     runs-on: ubuntu-latest
-    environment: burn-dragon-p2p-${{ github.event.inputs.environment || 'production' }}
+    environment: burn-dragon-p2p-${{ inputs.environment || github.event.inputs.environment || 'production' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,11 +81,11 @@ jobs:
         id: live_browser_canary
         shell: bash
         env:
-          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ github.event.inputs.site_base_url || 'https://dragon.aberration.technology' }}
-          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ github.event.inputs.edge_base_url || 'https://edge.dragon.aberration.technology' }}
-          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'browser-canary-mainnet-nca' }}
+          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ inputs.site_base_url || github.event.inputs.site_base_url || 'https://dragon.aberration.technology' }}
+          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ inputs.edge_base_url || github.event.inputs.edge_base_url || 'https://edge.dragon.aberration.technology' }}
+          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ inputs.principal_id || github.event.inputs.principal_id || 'browser-canary-mainnet-nca' }}
           BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
-          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id || 'nca-prepretraining' }}
+          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ inputs.experiment_id || github.event.inputs.experiment_id || 'nca-prepretraining' }}
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary/canary-summary.json

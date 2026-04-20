@@ -11,7 +11,7 @@ def main() -> None:
         "browserConfig.seed_node_urls",
         "const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);",
         "const browserTrainingConfig = browserConfigTrainingConfig(browserConfig);",
-        'browser config is missing training payload for selected experiment ${SELECTED_EXPERIMENT_ID}',
+        'browser config is missing training payload for selected experiment ${EXPERIMENT_ID}',
         'const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";',
         'const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";',
         "const callbackUrl = endpoint(SITE_BASE_URL, `${provider.callback_path}?code=browser-canary-provider-code`);",
@@ -24,6 +24,7 @@ def main() -> None:
     forbidden_snippets = [
         'const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath)',
         'const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path)',
+        "SELECTED_EXPERIMENT_ID",
     ]
     for snippet in forbidden_snippets:
         assert snippet not in script, (

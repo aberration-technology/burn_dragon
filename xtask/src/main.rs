@@ -343,6 +343,7 @@ fn deployment_script_checks() -> Result<()> {
         "scripts/test_deploy_pages_workflow.py",
         "scripts/test_live_browser_canary_script.py",
         "scripts/test_live_browser_canary_workflow.py",
+        "scripts/test_browser_profile_budget.py",
         "scripts/test_native_peer_transport_config.py",
         "scripts/test_edge_caddyfile.py",
         "scripts/test_cleanup_workflow.py",

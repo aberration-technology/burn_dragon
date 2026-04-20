@@ -27,6 +27,7 @@ use burn_p2p_dataloader::ShardFetchManifest;
 #[cfg(feature = "wgpu")]
 use burn_wgpu::{RuntimeOptions, graphics};
 use gloo_net::http::Request;
+use log::info;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -191,6 +192,16 @@ pub async fn run_browser_training_with_release_manifest(
         #[cfg(feature = "wgpu")]
         BrowserTrainingBackendKind::Wgpu => true,
     };
+    info!(
+        "browser training start: experiment={} backend={} block_size={} batch_size={} max_train_batches={:?} max_eval_batches={:?} live_participant={}",
+        config.experiment_kind.workload_slug(),
+        backend_label,
+        config.block_size,
+        config.batch_size,
+        config.max_train_batches,
+        config.max_eval_batches,
+        config.live_participant.is_some(),
+    );
     let browser_capability_decision = apply_browser_downgrade_state(
         edge_base_url,
         config,
@@ -361,6 +372,11 @@ where
         }
         None => Vec::new(),
     };
+    info!(
+        "browser training records loaded: train_examples={} eval_examples={}",
+        train_records.len(),
+        eval_records.len(),
+    );
 
     let train_batches = build_batches::<TrainB>(
         &train_records,
@@ -374,6 +390,12 @@ where
         context.config.block_size,
         eval_device,
     )?;
+    let train_batches_len = train_batches.len();
+    let eval_batches_len = eval_batches.len();
+    info!(
+        "browser training batches built: train_batches={} eval_batches={}",
+        train_batches_len, eval_batches_len,
+    );
 
     let mut live_participant = start_live_browser_participant(
         context.edge_base_url,
@@ -384,6 +406,7 @@ where
     .await?;
 
     let training_started_at = Instant::now();
+    info!("browser training loop starting");
     let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
@@ -410,6 +433,10 @@ where
     let training_time_ms = elapsed_ms(training_started_at);
     let train_batch_count = train_batch_count.max(1);
     let train_loss_mean = train_loss_sum / train_batch_count as f64;
+    info!(
+        "browser training loop complete: train_batches={} train_loss_mean={:.4} training_time_ms={}",
+        train_batch_count, train_loss_mean, training_time_ms,
+    );
 
     let eval_started_at = Instant::now();
     let eval_loss = if eval_batches.is_empty() {
@@ -434,15 +461,31 @@ where
         (count > 0).then_some(total / count as f64)
     };
     let eval_time_ms = elapsed_ms(eval_started_at);
+    info!(
+        "browser training eval complete: eval_batches={} eval_loss={:?} eval_time_ms={}",
+        eval_batches_len, eval_loss, eval_time_ms,
+    );
 
+    info!("browser live participant flush starting");
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
         context.config,
         live_participant.as_mut(),
     )
     .await?;
+    if let Some(live) = live_participant.as_ref() {
+        info!(
+            "browser live participant flush complete: receipt_submission_accepted={} accepted_receipts={} transport={:?} runtime_state={:?}",
+            live.receipt_submission_accepted,
+            live.accepted_receipt_ids.len(),
+            live.transport,
+            live.runtime_state,
+        );
+    } else {
+        info!("browser local-only training complete");
+    }
 
-    Ok(DragonBrowserTrainingResult {
+    let result = DragonBrowserTrainingResult {
         backend: context.backend_label.into(),
         experiment_kind_label: context.config.experiment_kind.display_name().into(),
         train_batches: train_batch_count,
@@ -458,7 +501,12 @@ where
         tokens_per_second: (training_time_ms > 0)
             .then_some(train_token_count as f64 / (training_time_ms as f64 / 1000.0)),
         live_participant,
-    })
+    };
+    info!(
+        "browser training finished: total_time_ms={} tokens_per_second={:?}",
+        result.total_time_ms, result.tokens_per_second,
+    );
+    Ok(result)
 }
 
 fn validate_live_training_backend(

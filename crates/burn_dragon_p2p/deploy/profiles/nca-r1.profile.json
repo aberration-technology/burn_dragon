@@ -195,8 +195,8 @@
     "learning_rate": 0.001,
     "weight_decay": 0.0,
     "batch_size": 4,
-    "max_train_batches": 24,
-    "max_eval_batches": 8,
+    "max_train_batches": 4,
+    "max_eval_batches": 1,
     "capability_policy": {
       "native_cpu_memory_budget_bytes": 8589934592,
       "native_wgpu_memory_budget_bytes": 4294967296,
@@ -209,13 +209,13 @@
       "type": "generated_nca",
       "corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n",
       "split": "train",
-      "max_documents": null
+      "max_documents": 16
     },
     "eval_source": {
       "type": "generated_nca",
       "corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n",
       "split": "validation",
-      "max_documents": null
+      "max_documents": 4
     }
   }
 }

@@ -69,6 +69,7 @@ jobs:
       - run: python3 scripts/test_cleanup_workflow.py
       - run: python3 scripts/test_deployment_strategy.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
+      - run: python3 scripts/test_browser_profile_budget.py
       - run: python3 scripts/test_edge_caddyfile.py
       - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/live-browser-canary.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
       - run: node --check scripts/live-browser-canary.mjs

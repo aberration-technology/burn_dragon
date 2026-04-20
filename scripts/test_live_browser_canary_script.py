@@ -13,9 +13,18 @@ def main() -> None:
         "const callbackUrl = endpoint(SITE_BASE_URL, `${provider.callback_path}?code=browser-canary-provider-code`);",
         "window.sessionStorage.setItem(trustedCallbackTokenKey, callbackToken);",
         'document.body.innerText.includes("Browser training complete:")',
+        "async function beginBrowserCanaryLogin(snapshot) {",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"
+    forbidden_snippets = [
+        'const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath)',
+        'const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path)',
+    ]
+    for snippet in forbidden_snippets:
+        assert snippet not in script, (
+            f"live-browser-canary.mjs should not pre-consume browser callback flow: {snippet}"
+        )
     print("live-browser-canary-script-ok")
 
 

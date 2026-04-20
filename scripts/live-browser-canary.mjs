@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -161,26 +160,6 @@ function endpoint(baseUrl, relativePath) {
 
 function requestedScopes(experimentId) {
   return ["Connect", "Discover", { Train: { experiment_id: experimentId } }];
-}
-
-function firstApprovedTargetArtifactHash(snapshot) {
-  const allowed = snapshot.allowed_target_artifact_hashes ?? [];
-  if (allowed.length > 0) {
-    return allowed[0];
-  }
-  const trustAllowed = snapshot.trust_bundle?.allowed_target_artifact_hashes ?? [];
-  if (trustAllowed.length > 0) {
-    return trustAllowed[0];
-  }
-  throw new Error("edge snapshot did not expose any approved browser target artifact hashes");
-}
-
-function requiredReleaseTrainHash(snapshot) {
-  return (
-    snapshot.required_release_train_hash ??
-    snapshot.trust_bundle?.required_release_train_hash ??
-    fail("edge snapshot is missing a required release train hash")
-  );
 }
 
 function browserStorageSnapshot(networkId, sessionState) {
@@ -376,7 +355,7 @@ async function optionalVisibleText(locator) {
   }
 }
 
-async function enrollBrowserCanary(snapshot) {
+async function beginBrowserCanaryLogin(snapshot) {
   const provider = (snapshot.login_providers ?? []).find(
     (candidate) => candidate?.login_path && candidate.login_path.trim().length > 0,
   );
@@ -396,40 +375,8 @@ async function enrollBrowserCanary(snapshot) {
       requested_scopes: scopes,
     }),
   });
-  const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath), {
-    method: "POST",
-    headers: {
-      "x-burn-p2p-canary-token": CALLBACK_TOKEN,
-    },
-    body: JSON.stringify({
-      login_id: login.login_id,
-      state: login.state,
-    }),
-  });
-  const trustBundle = await fetchJson(
-    endpoint(EDGE_BASE_URL, snapshot.paths.trust_bundle_path),
-    { method: "GET", headers: {} },
-  );
-  const peerLabel = `browser-canary-${crypto.randomUUID()}`;
-  const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path), {
-    method: "POST",
-    body: JSON.stringify({
-      session_id: session.session_id,
-      release_train_hash: requiredReleaseTrainHash(snapshot),
-      target_artifact_hash: firstApprovedTargetArtifactHash(snapshot),
-      peer_id: peerLabel,
-      peer_public_key_hex: crypto.randomBytes(32).toString("hex"),
-      requested_scopes: scopes,
-      client_policy_hash: `browser-canary-policy-${Date.now()}`,
-      serial: 1,
-      ttl_seconds: 900,
-    }),
-  });
   return {
     login,
-    session,
-    trustBundle,
-    certificate,
     requestedScopes: scopes,
   };
 }
@@ -499,7 +446,7 @@ async function runCanary() {
     );
   }
 
-  const enrollment = await enrollBrowserCanary(snapshot);
+  const enrollment = await beginBrowserCanaryLogin(snapshot);
   const provider = (snapshot.login_providers ?? []).find(
     (candidate) => candidate?.callback_path && candidate.callback_path.trim().length > 0,
   );

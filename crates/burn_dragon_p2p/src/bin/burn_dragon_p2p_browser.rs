@@ -150,6 +150,7 @@ fn App() -> Element {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     console_error_panic_hook::set_once();
+    burn_dragon_p2p::logging::init_browser_logging();
     dioxus::launch(App);
 }
 

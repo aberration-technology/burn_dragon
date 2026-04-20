@@ -20,6 +20,7 @@ use burn_p2p_views::{
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
+use log::{error, info, warn};
 use std::cell::RefCell;
 use url::form_urlencoded;
 
@@ -67,6 +68,21 @@ thread_local! {
 
 fn current_app_semver() -> semver::Version {
     semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
+}
+
+fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
+    format!(
+        "runtime={} detail={} desired_transport={:?} connected_transport={:?} direct_peers={} can_train={} assignment={} head_present={} cached_microshards={}",
+        view.runtime_label,
+        view.runtime_detail,
+        view.network.swarm_status.desired_transport,
+        view.network.swarm_status.connected_transport,
+        view.network.direct_peers,
+        view.training.can_train,
+        view.training.active_assignment.is_some(),
+        view.training.latest_head_id.is_some(),
+        view.training.cached_microshards,
+    )
 }
 
 #[cfg(feature = "wasm-peer")]
@@ -456,18 +472,7 @@ struct DragonTrainingActionState {
 }
 
 fn dragon_status_error_summary(error: &str) -> String {
-    let trimmed = error.trim();
-    let preferred = trimmed
-        .strip_prefix("browser direct swarm could not dial any supported seed candidate: ")
-        .unwrap_or(trimmed);
-    let budget = if preferred == trimmed { 220 } else { 320 };
-    let mut chars = preferred.chars();
-    let abbreviated: String = chars.by_ref().take(budget).collect();
-    if chars.next().is_some() {
-        format!("{abbreviated}...")
-    } else {
-        abbreviated
-    }
+    error.trim().to_owned()
 }
 
 fn dragon_direct_transport_wait_detail(view: &BrowserAppClientView) -> String {
@@ -544,7 +549,12 @@ fn dragon_live_notice(
             } else {
                 "connecting"
             },
-            detail: dragon_direct_transport_wait_detail(view),
+            detail: if view.network.swarm_status.last_error.is_some() {
+                "direct peer connection failed. see peers and console for the full dial error."
+                    .into()
+            } else {
+                "connecting to direct peers".into()
+            },
             tone: if view.network.swarm_status.last_error.is_some() {
                 "neutral"
             } else {
@@ -1015,7 +1025,7 @@ fn dragon_runtime_mode_detail(
         return if direct_transport_ready {
             "connected to direct peers and following network state. browser training turns on when trainer work becomes available.".into()
         } else {
-            "connecting to direct peers".into()
+            "waiting for a direct peer connection".into()
         };
     }
     if training_action_state.is_some_and(|state| state.enabled) {
@@ -1133,6 +1143,13 @@ pub async fn connect_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
+    let edge_base_url = resolved_edge_base_url(config)?;
+    info!(
+        "browser app connect: edge_url={} seed_count={} auth_required={}",
+        edge_base_url,
+        config.effective_seed_node_urls().len(),
+        config.require_edge_auth
+    );
     let controller = BrowserAppController::connect_with(connect_config(
         bootstrap_config,
         config,
@@ -1141,6 +1158,7 @@ pub async fn connect_browser_app(
     )?)
     .await?;
     let view = controller.view();
+    info!("browser app connected: {}", browser_view_log_summary(&view));
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         *slot.borrow_mut() = Some(controller);
     });
@@ -1176,7 +1194,11 @@ pub async fn refresh_browser_app(
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         *slot.borrow_mut() = Some(controller);
     });
-    Ok(refresh_result?)
+    let view = refresh_result?;
+    if let Some(error) = view.network.swarm_status.last_error.as_deref() {
+        warn!("browser app refresh retained transport error: {error}");
+    }
+    Ok(view)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -1214,6 +1236,7 @@ fn spawn_browser_app_refresh_loop(
                     status.set(String::new());
                 }
                 Err(error) => {
+                    warn!("browser app refresh failed: {error}");
                     status.set(error.to_string());
                 }
             }
@@ -1336,6 +1359,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let status = use_signal(String::new);
     let current_view = use_signal(|| None::<BrowserAppClientView>);
     let session_state = use_signal(|| None::<BrowserSessionState>);
+    let last_logged_browser_status = use_signal(String::new);
+    let last_logged_transport_error = use_signal(|| None::<String>);
+    let last_logged_runtime_summary = use_signal(|| None::<String>);
     let mut admin_study_id = use_signal(|| DEFAULT_ADMIN_STUDY_ID.to_owned());
     let mut admin_experiment_id = use_signal(|| {
         initial_config
@@ -1986,6 +2012,45 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let global_training_summary = dragon_global_training_summary(view.as_ref());
     let global_training_detail = dragon_global_training_detail(view.as_ref());
     let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    {
+        let mut last_logged_browser_status = last_logged_browser_status;
+        let status_message = status_message.clone();
+        use_effect(move || {
+            let previous = last_logged_browser_status.read().clone();
+            if previous == status_message {
+                return;
+            }
+            last_logged_browser_status.set(status_message.clone());
+            if !status_message.is_empty() {
+                warn!("browser ui status: {status_message}");
+            }
+        });
+    }
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    {
+        let mut last_logged_transport_error = last_logged_transport_error;
+        let mut last_logged_runtime_summary = last_logged_runtime_summary;
+        let view = view.clone();
+        use_effect(move || {
+            let runtime_summary = view.as_ref().map(browser_view_log_summary);
+            if *last_logged_runtime_summary.read() != runtime_summary {
+                last_logged_runtime_summary.set(runtime_summary.clone());
+                if let Some(runtime_summary) = runtime_summary {
+                    info!("browser runtime state: {runtime_summary}");
+                }
+            }
+            let transport_error = view
+                .as_ref()
+                .and_then(|view| view.network.swarm_status.last_error.clone());
+            if *last_logged_transport_error.read() != transport_error {
+                last_logged_transport_error.set(transport_error.clone());
+                if let Some(transport_error) = transport_error {
+                    error!("browser direct transport error: {transport_error}");
+                }
+            }
+        });
+    }
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     let hero_rattle_frame =
         HERO_RATTLE_FRAMES[*hero_rattle_index.read() % HERO_RATTLE_FRAMES.len()];
@@ -3086,17 +3151,17 @@ mod tests {
     fn dragon_network_detail_surfaces_direct_transport_error() {
         let mut view = sample_browser_view();
         view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
-        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+        view.network.swarm_status.last_error = Some("browser direct swarm could not dial any supported seed candidate: /ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiCZZAGOMSXZiiWY2Mi8hejsmqxCPWT3Qs3uZ9EO5uxbrA: Failed to negotiate transport protocol(s)".into());
 
         assert_eq!(
             dragon_network_detail(Some(&view)),
-            "webrtc-direct unavailable: direct dial timeout"
+            "webrtc-direct unavailable: browser direct swarm could not dial any supported seed candidate: /ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiCZZAGOMSXZiiWY2Mi8hejsmqxCPWT3Qs3uZ9EO5uxbrA: Failed to negotiate transport protocol(s)"
         );
         let notice = dragon_live_notice(Some(&view), false).expect("direct wait notice");
         assert_eq!(notice.label, "waiting");
         assert_eq!(
             notice.detail,
-            "webrtc-direct unavailable: direct dial timeout"
+            "direct peer connection failed. see peers and console for the full dial error."
         );
     }
 

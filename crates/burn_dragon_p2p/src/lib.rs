@@ -9,6 +9,7 @@ pub mod config;
 pub mod deployment;
 #[cfg(feature = "native")]
 pub mod experiments;
+pub mod logging;
 #[cfg(feature = "native")]
 pub mod manifests;
 pub mod profile;

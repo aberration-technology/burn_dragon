@@ -566,6 +566,11 @@ struct TrainWindowOnceReport {
 
 fn main() -> Result<()> {
     let cli = parse_cli();
+    burn_dragon_p2p::logging::init_native_logging();
+    log::info!(
+        "burn_dragon_p2p_native starting command={}",
+        command_label(&cli.command)
+    );
     match cli.command {
         CommandKind::ResolveConfig(args) => resolve_config(args),
         CommandKind::AssessCapability(args) => assess_capability(args),
@@ -582,6 +587,26 @@ fn main() -> Result<()> {
         CommandKind::RunValidatorDaemon(args) => run_validator_daemon(args),
         CommandKind::MarkRuntimeFailure(args) => mark_runtime_failure(args),
         CommandKind::ClearDowngrade(args) => clear_downgrade(args),
+    }
+}
+
+fn command_label(command: &CommandKind) -> &'static str {
+    match command {
+        CommandKind::ResolveConfig(_) => "resolve-config",
+        CommandKind::AssessCapability(_) => "assess-capability",
+        CommandKind::DeploymentDiagnostics(_) => "deployment-diagnostics",
+        CommandKind::BuildProfile(_) => "build-profile",
+        CommandKind::AdminExportDirectory(_) => "admin-export-directory",
+        CommandKind::AdminRolloutProfile(_) => "admin-rollout-profile",
+        CommandKind::BeginGithubLogin(_) => "begin-github-login",
+        CommandKind::CompleteGithubLogin(_) => "complete-github-login",
+        CommandKind::EnrollStaticPrincipal(_) => "enroll-static-principal",
+        CommandKind::TrainWindowOnce(_) => "train-window-once",
+        CommandKind::RunPeer(_) => "run-peer",
+        CommandKind::RunHeadMirror(_) => "run-head-mirror",
+        CommandKind::RunValidatorDaemon(_) => "run-validator-daemon",
+        CommandKind::MarkRuntimeFailure(_) => "mark-runtime-failure",
+        CommandKind::ClearDowngrade(_) => "clear-downgrade",
     }
 }
 

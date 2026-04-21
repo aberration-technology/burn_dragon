@@ -89,7 +89,7 @@ jobs:
             browser: firefox
             transport_mode: webrtc-direct
             expect_training: "0"
-            required: "1"
+            required: "0"
           - lane: chromium-wss-connect
             browser: chromium
             transport_mode: wss

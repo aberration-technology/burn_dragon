@@ -43,6 +43,14 @@ const TRANSIENT_FETCH_RETRY_DELAY_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRANSIENT_FETCH_RETRY_DELAY_MS",
   2_000,
 );
+const SITE_ASSET_RETRIES = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_SITE_ASSET_RETRIES",
+  20,
+);
+const SITE_ASSET_RETRY_DELAY_MS = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_SITE_ASSET_RETRY_DELAY_MS",
+  3_000,
+);
 const ARTIFACT_DIR =
   process.env.BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR ??
   path.join(os.tmpdir(), `burn-dragon-browser-canary-${Date.now()}`);
@@ -204,6 +212,53 @@ async function fetchJsonWithTransientRetry(url, options = {}) {
         throw error;
       }
       await sleep(TRANSIENT_FETCH_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function fetchOk(url, options = {}) {
+  const response = await fetch(url, {
+    cache: "no-store",
+    ...options,
+    headers: {
+      "cache-control": "no-cache",
+      pragma: "no-cache",
+      ...(options.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`${response.status} ${response.statusText} for ${url}: ${trimPreview(text)}`);
+  }
+  return {
+    url,
+    status: response.status,
+    content_type: response.headers.get("content-type") ?? null,
+    content_length: response.headers.get("content-length") ?? null,
+  };
+}
+
+async function waitForSiteRuntimeAssets() {
+  const relativePaths = [
+    "/",
+    "/browser-app-config.json",
+    "/release-manifest.json",
+    "/burn_dragon_p2p_browser.js",
+    "/burn_dragon_p2p_browser_bg.wasm",
+  ];
+  let lastError = null;
+  for (let attempt = 1; attempt <= SITE_ASSET_RETRIES; attempt += 1) {
+    try {
+      return await Promise.all(
+        relativePaths.map((relativePath) => fetchOk(endpoint(SITE_BASE_URL, relativePath))),
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt >= SITE_ASSET_RETRIES || !shouldRetryTransientFetch(error)) {
+        throw error;
+      }
+      await sleep(SITE_ASSET_RETRY_DELAY_MS * attempt);
     }
   }
   throw lastError;
@@ -379,7 +434,11 @@ function expectedConnectedTransport(mode, envelope) {
   if (EXPECT_CONNECTED_TRANSPORT) {
     return normalizeTransportLabel(EXPECT_CONNECTED_TRANSPORT);
   }
-  return expectedTransportLabel(mode) ?? preferredAdvertisedTransport(envelope);
+  const explicitTransport = expectedTransportLabel(mode);
+  if (explicitTransport || mode === "auto") {
+    return explicitTransport;
+  }
+  return preferredAdvertisedTransport(envelope);
 }
 
 function expectedMinimumDirectPeers(expectedTransport) {
@@ -638,6 +697,7 @@ async function beginBrowserCanaryLogin(snapshot) {
 async function runCanary() {
   validateCanaryMode();
   ensureDir(ARTIFACT_DIR);
+  const siteRuntimeAssets = SITE_OVERRIDE_DIR ? [] : await waitForSiteRuntimeAssets();
   const snapshot = await fetchJsonWithTransientRetry(endpoint(EDGE_BASE_URL, "/portal/snapshot"), {
     method: "GET",
     headers: {},
@@ -781,6 +841,7 @@ async function runCanary() {
     signed_seed_multiaddrs: signedSeeds,
     signed_seed_transport_preference:
       filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
+    site_runtime_assets: siteRuntimeAssets,
     connect_clicked: false,
     training_button_visible: false,
     training_button_enabled: false,

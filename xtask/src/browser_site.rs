@@ -862,13 +862,9 @@ fn cargo_bin() -> String {
 }
 
 fn run_step(command: &mut Command, label: &str) -> Result<()> {
-    let output = command.output().with_context(|| format!("run {label}"))?;
-    ensure!(
-        output.status.success(),
-        "{label} failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    println!("running {label}");
+    let status = command.status().with_context(|| format!("run {label}"))?;
+    ensure!(status.success(), "{label} failed with status {status}");
     Ok(())
 }
 

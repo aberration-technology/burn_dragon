@@ -26,6 +26,9 @@ def main() -> None:
     print()
     print(f"- Success: `{report.get('success', False)}`")
     print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
+    print(f"- Browser: `{report.get('browser_name', 'n/a')}`")
+    print(f"- Transport mode: `{report.get('transport_mode', 'n/a')}`")
+    print(f"- Expect training: `{report.get('expect_training', 'n/a')}`")
     print(f"- Live status: `{live_status}`")
     print(f"- Transport signal: `{transport_summary}`")
     print(

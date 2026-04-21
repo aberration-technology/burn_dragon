@@ -21,6 +21,13 @@ const TRAIN_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS",
   300_000,
 );
+const BROWSER_NAME = (
+  process.env.BURN_DRAGON_BROWSER_CANARY_BROWSER ?? "chromium"
+).trim().toLowerCase();
+const TRANSPORT_MODE = (
+  process.env.BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE ?? "auto"
+).trim().toLowerCase();
+const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);
 const TRANSIENT_FETCH_RETRIES = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRANSIENT_FETCH_RETRIES",
   6,
@@ -69,6 +76,35 @@ function parseIntegerEnv(name, fallback) {
     throw new Error(`invalid integer environment variable ${name}=${raw}`);
   }
   return parsed;
+}
+
+function parseBooleanEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") {
+    return fallback;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "y"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "n"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`invalid boolean environment variable ${name}=${raw}`);
+}
+
+function validateCanaryMode() {
+  if (!["chromium", "firefox", "webkit"].includes(BROWSER_NAME)) {
+    throw new Error(`unsupported browser ${BROWSER_NAME}; expected chromium, firefox, or webkit`);
+  }
+  if (!["auto", "webrtc-direct", "webtransport", "wss"].includes(TRANSPORT_MODE)) {
+    throw new Error(
+      `unsupported transport mode ${TRANSPORT_MODE}; expected auto, webrtc-direct, webtransport, or wss`,
+    );
+  }
+  if (EXPECT_TRAINING && BROWSER_NAME !== "chromium") {
+    throw new Error("training canary currently requires chromium; use EXPECT_TRAINING=0 for connect-only browser lanes");
+  }
 }
 
 function ensureDir(dirPath) {
@@ -261,6 +297,25 @@ function inferTransportSummary(tiles) {
   return null;
 }
 
+function expectedTransportLabel(mode) {
+  if (mode === "webrtc-direct") return "webrtc-direct";
+  if (mode === "webtransport") return "webtransport";
+  if (mode === "wss") return "wss";
+  return null;
+}
+
+function transportConnectedForMode(summary, mode) {
+  const normalized = (summary ?? "").toLowerCase();
+  if (!normalized || /\b(target|unavailable|connecting|waiting)\b/.test(normalized)) {
+    return false;
+  }
+  const expected = expectedTransportLabel(mode);
+  if (!expected) {
+    return /\b(webrtc-direct|webtransport|wss|ws)\b/.test(normalized);
+  }
+  return normalized.includes(expected);
+}
+
 function browserConfigSeedNodeUrls(browserConfig) {
   if (!browserConfig || typeof browserConfig !== "object") {
     return [];
@@ -285,6 +340,85 @@ function browserConfigTrainingConfig(browserConfig) {
     return nested;
   }
   return null;
+}
+
+function seedTransportMode(seed) {
+  if (isDialableWebRtcSeed(seed)) {
+    return "webrtc-direct";
+  }
+  if (isDialableWebTransportSeed(seed)) {
+    return "webtransport";
+  }
+  if (seed.includes("/wss") || seed.includes("/ws")) {
+    return "wss";
+  }
+  return null;
+}
+
+function seedMatchesTransportMode(seed, mode) {
+  return mode === "auto" || seedTransportMode(seed) === mode;
+}
+
+function transportPolicyForMode(mode) {
+  if (mode === "webrtc-direct") {
+    return { preferred: ["WebRtcDirect"], allow_fallback_wss: false };
+  }
+  if (mode === "webtransport") {
+    return { preferred: ["WebTransport"], allow_fallback_wss: false };
+  }
+  if (mode === "wss") {
+    return { preferred: ["WssFallback"], allow_fallback_wss: true };
+  }
+  return null;
+}
+
+function filterSignedSeedAdvertisementForTransport(envelope, mode) {
+  if (mode === "auto") {
+    return envelope;
+  }
+  const filtered = JSON.parse(JSON.stringify(envelope));
+  const payload = filtered?.payload?.payload;
+  if (!payload || !Array.isArray(payload.seeds)) {
+    return filtered;
+  }
+  payload.seeds = payload.seeds
+    .map((record) => ({
+      ...record,
+      multiaddrs: (record.multiaddrs ?? []).filter((seed) =>
+        seedMatchesTransportMode(seed, mode),
+      ),
+    }))
+    .filter((record) => record.multiaddrs.length > 0);
+  const policy = transportPolicyForMode(mode);
+  if (policy) {
+    payload.transport_policy = policy;
+  }
+  return filtered;
+}
+
+function filterBrowserConfigForTransport(browserConfig, mode) {
+  if (mode === "auto") {
+    return browserConfig;
+  }
+  const filtered = JSON.parse(JSON.stringify(browserConfig));
+  const nested = filtered.config?.network?.seed_node_urls;
+  if (Array.isArray(nested)) {
+    filtered.config.network.seed_node_urls = nested.filter((seed) =>
+      seedMatchesTransportMode(seed, mode),
+    );
+  }
+  if (Array.isArray(filtered.seed_node_urls)) {
+    filtered.seed_node_urls = filtered.seed_node_urls.filter((seed) =>
+      seedMatchesTransportMode(seed, mode),
+    );
+  }
+  if (filtered.signed_seed_advertisement) {
+    filtered.signed_seed_advertisement = filterSignedSeedAdvertisementForTransport(
+      filtered.signed_seed_advertisement,
+      mode,
+    );
+  }
+  return filtered;
 }
 
 function isDialableWebRtcSeed(seed) {
@@ -393,6 +527,7 @@ async function beginBrowserCanaryLogin(snapshot) {
 }
 
 async function runCanary() {
+  validateCanaryMode();
   ensureDir(ARTIFACT_DIR);
   const snapshot = await fetchJsonWithTransientRetry(endpoint(EDGE_BASE_URL, "/portal/snapshot"), {
     method: "GET",
@@ -409,22 +544,33 @@ async function runCanary() {
     method: "GET",
     headers: {},
   });
+  const filteredSignedSeedsEnvelope = filterSignedSeedAdvertisementForTransport(
+    signedSeedsEnvelope,
+    TRANSPORT_MODE,
+  );
+  const filteredBrowserConfig = filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE);
 
   if (snapshot.transports?.webtransport_gateway) {
     fail("live edge is advertising webtransport_gateway without validated native runtime support");
   }
 
-  const signedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
+  const signedSeeds = filteredSignedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
     (record) => record.multiaddrs ?? [],
   ) ?? [];
-  const browserConfigSeeds = browserConfigSeedNodeUrls(browserConfig);
-  const browserTrainingConfig = browserConfigTrainingConfig(browserConfig);
+  const browserConfigSeeds = browserConfigSeedNodeUrls(filteredBrowserConfig);
+  const browserTrainingConfig = browserConfigTrainingConfig(filteredBrowserConfig);
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
   const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
   const browserCapableSeedCount = Number(signedHasWebRtcDirect) + Number(signedHasWebTransport) + Number(signedHasWss);
   if (!signedSeeds.length || browserCapableSeedCount === 0) {
     fail(`signed browser seeds are missing browser-capable addresses: ${JSON.stringify(signedSeeds)}`);
+  }
+  if (
+    TRANSPORT_MODE !== "auto" &&
+    signedSeeds.some((seed) => !seedMatchesTransportMode(seed, TRANSPORT_MODE))
+  ) {
+    fail(`transport mode ${TRANSPORT_MODE} left unrelated signed seeds: ${JSON.stringify(signedSeeds)}`);
   }
   for (const seed of signedSeeds) {
     if (seed.includes("/webrtc-direct") && !isDialableWebRtcSeed(seed)) {
@@ -437,17 +583,20 @@ async function runCanary() {
   if (signedSeeds.some((value) => value.includes("/quic-v1") || value.includes("/tcp/4001"))) {
     fail(`signed browser seeds still contain native-only addresses: ${JSON.stringify(signedSeeds)}`);
   }
-  if (Boolean(snapshot.transports?.webrtc_direct) !== signedHasWebRtcDirect) {
+  if (TRANSPORT_MODE === "auto" && Boolean(snapshot.transports?.webrtc_direct) !== signedHasWebRtcDirect) {
     fail(
       `signed browser seeds disagree with snapshot webrtc_direct=${snapshot.transports?.webrtc_direct}: ${JSON.stringify(signedSeeds)}`,
     );
   }
-  if (Boolean(snapshot.transports?.webtransport_gateway) !== signedHasWebTransport) {
+  if (
+    TRANSPORT_MODE === "auto" &&
+    Boolean(snapshot.transports?.webtransport_gateway) !== signedHasWebTransport
+  ) {
     fail(
       `signed browser seeds disagree with snapshot webtransport_gateway=${snapshot.transports?.webtransport_gateway}: ${JSON.stringify(signedSeeds)}`,
     );
   }
-  if (Boolean(snapshot.transports?.wss_fallback) !== signedHasWss) {
+  if (TRANSPORT_MODE === "auto" && Boolean(snapshot.transports?.wss_fallback) !== signedHasWss) {
     fail(
       `signed browser seeds disagree with snapshot wss_fallback=${snapshot.transports?.wss_fallback}: ${JSON.stringify(signedSeeds)}`,
     );
@@ -477,15 +626,25 @@ async function runCanary() {
     enrollment.requestedScopes,
   );
 
-  const { chromium } = await loadPlaywright();
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    args: [
-      "--enable-unsafe-webgpu",
-      "--use-angle=swiftshader",
-      "--enable-features=Vulkan,UseSkiaRenderer,WebGPU",
-    ],
-  });
+  const playwright = await loadPlaywright();
+  const browserType = playwright[BROWSER_NAME];
+  if (!browserType) {
+    fail(`playwright browser type ${BROWSER_NAME} is not available`);
+  }
+  const launchOptions =
+    BROWSER_NAME === "chromium"
+      ? {
+          headless: HEADLESS,
+          args: [
+            "--enable-unsafe-webgpu",
+            "--use-angle=swiftshader",
+            "--enable-features=Vulkan,UseSkiaRenderer,WebGPU",
+          ],
+        }
+      : {
+          headless: HEADLESS,
+        };
+  const browser = await browserType.launch(launchOptions);
 
   const requests = [];
   const consoleMessages = [];
@@ -497,12 +656,15 @@ async function runCanary() {
     edge_base_url: EDGE_BASE_URL,
     principal_id: PRINCIPAL_ID,
     experiment_id: EXPERIMENT_ID,
+    browser_name: BROWSER_NAME,
+    transport_mode: TRANSPORT_MODE,
+    expect_training: EXPECT_TRAINING,
     network_id: snapshot.network_id,
     transports: snapshot.transports,
     browser_config_seed_node_urls: browserConfigSeeds,
     signed_seed_multiaddrs: signedSeeds,
     signed_seed_transport_preference:
-      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
+      filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     connect_clicked: false,
     training_button_visible: false,
     training_button_enabled: false,
@@ -533,13 +695,50 @@ async function runCanary() {
       tracePath = path.join(ARTIFACT_DIR, "trace.zip");
     }
 
-    if (SITE_OVERRIDE_DIR) {
+    if (SITE_OVERRIDE_DIR || TRANSPORT_MODE !== "auto") {
+      const filteredBrowserConfigJson = JSON.stringify(filteredBrowserConfig);
+      const filteredSignedSeedsJson = JSON.stringify(filteredSignedSeedsEnvelope);
+      const signedSeedPath = snapshot.paths?.browser_seed_advertisement_path ?? "/browser/seeds/signed";
       await context.route("**/*", async (route) => {
-        const overridePath = resolveOverrideAssetPath(
-          SITE_OVERRIDE_DIR,
-          route.request().url(),
-          SITE_BASE_URL,
-        );
+        const requestUrl = route.request().url();
+        const request = new URL(requestUrl);
+        const siteBase = new URL(SITE_BASE_URL);
+        const edgeBase = new URL(EDGE_BASE_URL);
+        if (
+          TRANSPORT_MODE !== "auto" &&
+          request.origin === siteBase.origin &&
+          request.pathname.endsWith("/browser-app-config.json")
+        ) {
+          await route.fulfill({
+            status: 200,
+            body: filteredBrowserConfigJson,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+            },
+          });
+          return;
+        }
+        if (
+          TRANSPORT_MODE !== "auto" &&
+          request.origin === edgeBase.origin &&
+          request.pathname === signedSeedPath
+        ) {
+          await route.fulfill({
+            status: 200,
+            body: filteredSignedSeedsJson,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+            },
+          });
+          return;
+        }
+        if (!SITE_OVERRIDE_DIR) {
+          await route.continue();
+          return;
+        }
+        const overridePath = resolveOverrideAssetPath(SITE_OVERRIDE_DIR, requestUrl, SITE_BASE_URL);
         if (!overridePath) {
           await route.continue();
           return;
@@ -675,7 +874,10 @@ async function runCanary() {
     const sessionResumeGraceDeadline = Date.now() + 5_000;
     while (Date.now() < connectDeadline) {
       await captureLiveStatus();
-      if (canStartTraining()) {
+      if (
+        (EXPECT_TRAINING && canStartTraining()) ||
+        (!EXPECT_TRAINING && transportConnectedForMode(report.transport_summary, TRANSPORT_MODE))
+      ) {
         break;
       }
       if (report.connect_button_visible) {
@@ -693,10 +895,16 @@ async function runCanary() {
     }
 
     await captureLiveStatus();
-    if (!canStartTraining()) {
+    if (EXPECT_TRAINING && !canStartTraining()) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
         `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} action=${report.training_button_label ?? "missing"} action_detail=${report.training_action_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
+      );
+    }
+    if (!EXPECT_TRAINING && !transportConnectedForMode(report.transport_summary, TRANSPORT_MODE)) {
+      report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+      fail(
+        `browser canary did not connect with expected transport ${TRANSPORT_MODE}: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
       );
     }
 
@@ -714,13 +922,20 @@ async function runCanary() {
     }
     const normalizedTransportSummary = (report.transport_summary ?? "").toLowerCase();
     if (
-      signedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
+      EXPECT_TRAINING &&
+      filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
       snapshot.transports?.webrtc_direct &&
       !normalizedTransportSummary.includes("webrtc-direct")
     ) {
       fail(
         `browser canary did not settle on webrtc-direct despite advertised preference: ${report.transport_summary ?? "missing transport signal"}`,
       );
+    }
+
+    if (!EXPECT_TRAINING) {
+      report.success = true;
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      return report;
     }
 
     const receiptResponse = await Promise.all([

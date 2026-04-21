@@ -14,6 +14,7 @@ use burn_p2p_browser::{
     BrowserAppClientView, BrowserEdgeSnapshot, BrowserSeedAdvertisement, BrowserSessionState,
     SchemaEnvelope, SignedPayload, browser_transport_kind,
 };
+use burn_p2p_core::BrowserSeedTransportKind;
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
@@ -186,6 +187,123 @@ fn window_query_flag(name: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragonBrowserTransportOverride {
+    WebRtcDirect,
+    WebTransport,
+    Wss,
+}
+
+impl DragonBrowserTransportOverride {
+    fn matches_seed(self, seed: &str) -> bool {
+        match self {
+            Self::WebRtcDirect => seed.contains("/webrtc-direct/"),
+            Self::WebTransport => seed.contains("/webtransport"),
+            Self::Wss => seed.contains("/wss") || seed.contains("/ws"),
+        }
+    }
+
+    fn transport_policy_preference(self) -> Vec<BrowserSeedTransportKind> {
+        match self {
+            Self::WebRtcDirect => vec![BrowserSeedTransportKind::WebRtcDirect],
+            Self::WebTransport => vec![BrowserSeedTransportKind::WebTransport],
+            Self::Wss => vec![BrowserSeedTransportKind::WssFallback],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WebRtcDirect => "webrtc-direct",
+            Self::WebTransport => "webtransport",
+            Self::Wss => "wss",
+        }
+    }
+}
+
+fn browser_transport_override_from_label(label: &str) -> Option<DragonBrowserTransportOverride> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "webrtc" | "webrtc-direct" | "direct" => Some(DragonBrowserTransportOverride::WebRtcDirect),
+        "webtransport" | "web-transport" => Some(DragonBrowserTransportOverride::WebTransport),
+        "wss" | "ws" | "websocket" | "websocket-fallback" => {
+            Some(DragonBrowserTransportOverride::Wss)
+        }
+        "auto" | "" => None,
+        _ => None,
+    }
+}
+
+fn browser_transport_override_from_query(query: &str) -> Option<DragonBrowserTransportOverride> {
+    for (key, value) in form_urlencoded::parse(query.trim_start_matches('?').as_bytes()) {
+        if matches!(
+            key.as_ref(),
+            "transport" | "transport_mode" | "peer_transport" | "browser_transport"
+        ) {
+            return browser_transport_override_from_label(&value);
+        }
+    }
+    None
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_user_agent() -> String {
+    let Some(window) = web_sys::window() else {
+        return String::new();
+    };
+    let window_value = wasm_bindgen::JsValue::from(window);
+    let Ok(navigator) =
+        js_sys::Reflect::get(&window_value, &wasm_bindgen::JsValue::from_str("navigator"))
+    else {
+        return String::new();
+    };
+    js_sys::Reflect::get(&navigator, &wasm_bindgen::JsValue::from_str("userAgent"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_default()
+}
+
+#[cfg(not(all(feature = "wasm-ui", target_arch = "wasm32")))]
+fn browser_user_agent() -> String {
+    String::new()
+}
+
+fn browser_transport_override() -> Option<DragonBrowserTransportOverride> {
+    if let Ok(query) = window_query_string()
+        && let Some(transport) = browser_transport_override_from_query(&query)
+    {
+        return Some(transport);
+    }
+    let user_agent = browser_user_agent().to_ascii_lowercase();
+    if user_agent.contains("firefox/") || user_agent.contains("focus/") {
+        return Some(DragonBrowserTransportOverride::Wss);
+    }
+    None
+}
+
+fn filter_seed_urls_for_transport(
+    seeds: Vec<String>,
+    transport: DragonBrowserTransportOverride,
+) -> Vec<String> {
+    seeds
+        .into_iter()
+        .filter(|seed| transport.matches_seed(seed))
+        .collect()
+}
+
+fn filter_signed_seed_advertisement_for_transport(
+    signed_seed_advertisement: &mut SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>,
+    transport: DragonBrowserTransportOverride,
+) {
+    let payload = &mut signed_seed_advertisement.payload.payload;
+    for seed in &mut payload.seeds {
+        seed.multiaddrs
+            .retain(|multiaddr| transport.matches_seed(multiaddr));
+    }
+    payload.seeds.retain(|seed| !seed.multiaddrs.is_empty());
+    payload.transport_policy.preferred = transport.transport_policy_preference();
+    payload.transport_policy.allow_fallback_wss =
+        matches!(transport, DragonBrowserTransportOverride::Wss);
+}
+
 fn callback_site_root_pathname(pathname: &str) -> Option<String> {
     let (prefix, _) = pathname.split_once("/callback/")?;
     let prefix = prefix.trim_end_matches('/');
@@ -268,19 +386,48 @@ fn connect_config(
 ) -> Result<burn_p2p_browser::BrowserAppConnectConfig> {
     let config = connect_config.clone();
     let (_capability_probe, capability_decision) = browser_capability_decision_for_config(&config);
-    let bootstrap_material = if can_use_embedded_browser_bootstrap(bootstrap_config, &config) {
-        (edge_snapshot.cloned(), signed_seed_advertisement.cloned())
-    } else {
-        (None, None)
-    };
+    let transport_override = browser_transport_override();
+    let (bootstrap_snapshot, mut signed_seed_advertisement) =
+        if can_use_embedded_browser_bootstrap(bootstrap_config, &config)
+            || (transport_override.is_some()
+                && bootstrap_config.effective_edge_base_url() == config.effective_edge_base_url())
+        {
+            (edge_snapshot.cloned(), signed_seed_advertisement.cloned())
+        } else {
+            (None, None)
+        };
+    let mut seed_node_urls = config.effective_seed_node_urls().to_vec();
+    if let Some(transport_override) = transport_override {
+        let filtered_seed_node_urls =
+            filter_seed_urls_for_transport(seed_node_urls.clone(), transport_override);
+        if filtered_seed_node_urls.is_empty() {
+            warn!(
+                "browser transport override {} matched no configured seed addrs; keeping default seed set",
+                transport_override.label()
+            );
+        } else {
+            seed_node_urls = filtered_seed_node_urls;
+            if let Some(signed_seed_advertisement) = signed_seed_advertisement.as_mut() {
+                filter_signed_seed_advertisement_for_transport(
+                    signed_seed_advertisement,
+                    transport_override,
+                );
+            }
+            info!(
+                "browser transport override active: {} seed_count={}",
+                transport_override.label(),
+                seed_node_urls.len()
+            );
+        }
+    }
     Ok(build_browser_app_connect_config(
         resolved_edge_base_url(&config)?,
         capability_decision.capability,
         capability_decision.connect_target,
-        config.effective_seed_node_urls().to_vec(),
+        seed_node_urls,
         config.selected_experiment(),
-        bootstrap_material.0,
-        bootstrap_material.1,
+        bootstrap_snapshot,
+        signed_seed_advertisement,
     ))
 }
 
@@ -2874,13 +3021,14 @@ mod tests {
     use super::{
         BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
-        browser_app_refresh_interval_millis, browser_session_is_authenticated, connect_config,
-        dragon_browser_training_action_ready, dragon_global_training_detail,
-        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
-        dragon_local_training_summary, dragon_network_detail, dragon_runtime_mode_detail,
-        dragon_runtime_mode_summary, dragon_slice_progress_summary, dragon_training_action_state,
-        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
-        normalized_browser_callback_url,
+        DragonBrowserTransportOverride, browser_app_refresh_interval_millis,
+        browser_session_is_authenticated, connect_config, dragon_browser_training_action_ready,
+        dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
+        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
+        dragon_runtime_mode_detail, dragon_runtime_mode_summary, dragon_slice_progress_summary,
+        dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
+        dragon_window_summary, filter_seed_urls_for_transport,
+        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3084,6 +3232,34 @@ mod tests {
                 "#frag",
             ),
             "/repo/?edge=https%3A%2F%2Fedge.example#frag"
+        );
+    }
+
+    #[test]
+    fn browser_transport_filter_keeps_only_selected_seed_family() {
+        let seeds = vec![
+            "/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "/dns4/bootstrap.example/tcp/443/wss".to_owned(),
+        ];
+        assert_eq!(
+            filter_seed_urls_for_transport(seeds.clone(), DragonBrowserTransportOverride::Wss),
+            vec!["/dns4/bootstrap.example/tcp/443/wss".to_owned()]
+        );
+
+        let mut advertisement = sample_signed_seed_advertisement();
+        filter_signed_seed_advertisement_for_transport(
+            &mut advertisement,
+            DragonBrowserTransportOverride::Wss,
+        );
+        let payload = advertisement.payload.payload;
+        assert_eq!(
+            payload.transport_policy.preferred,
+            vec![BrowserSeedTransportKind::WssFallback]
+        );
+        assert!(payload.transport_policy.allow_fallback_wss);
+        assert_eq!(
+            payload.seeds[0].multiaddrs,
+            vec!["/dns4/bootstrap.example/tcp/443/wss".to_owned()]
         );
     }
 

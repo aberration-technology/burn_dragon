@@ -28,6 +28,11 @@ def main() -> None:
                 "burn-dragon-live-browser-canary",
                 "default: browser-canary-mainnet-nca",
                 'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"',
+                "chromium-wss-connect",
+                "firefox-wss-connect",
+                "BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}",
+                "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
+                "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",
                 'BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN:',
             ]
             for snippet in required_snippets:

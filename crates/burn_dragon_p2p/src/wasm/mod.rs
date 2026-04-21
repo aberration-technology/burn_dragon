@@ -1,19 +1,18 @@
 use anyhow::{Result, anyhow};
 use burn_p2p::{
-    AuthProvider, BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId,
-    ExperimentDirectoryEntry, ExperimentScope, ProjectFamilyId, StudyId,
+    AuthProvider, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
+    ExperimentScope, ProjectFamilyId, StudyId,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_app::{
-    AdminSessionCard, DirectoryEntryDraftPanel, ExperimentDirectoryListPanel, RolloutPreviewPanel,
+    AdminSessionCard, AdminSessionSummaryView, DirectoryEntryDraftPanel, DirectoryEntryDraftView,
+    DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListPanel,
+    ExperimentDirectoryListView, RolloutPreviewPanel, RolloutPreviewView,
     RolloutSubmissionStatusPanel,
 };
-use burn_p2p_browser::{BrowserSessionState, browser_transport_kind};
-use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
-use burn_p2p_views::{
-    AdminSessionSummaryView, BrowserAppClientView, DirectoryEntryDraftView,
-    DirectoryMutationResultView, ExperimentDirectoryEntryView, ExperimentDirectoryListView,
-    RolloutPreviewView,
+use burn_p2p_browser::{
+    BrowserAppClientView, BrowserEdgeSnapshot, BrowserSeedAdvertisement, BrowserSessionState,
+    SchemaEnvelope, SignedPayload, browser_transport_kind,
 };
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -2888,17 +2887,17 @@ mod tests {
         AuthProvider, BrowserMode, ContentId, ExperimentScope, NetworkId, PeerId, PeerRoleSet,
         PrincipalClaims, PrincipalId, PrincipalSession, ProfileMode, SocialMode,
     };
-    use burn_p2p_browser::{BrowserSessionState, BrowserTransportKind};
+    use burn_p2p_browser::{
+        BrowserAppClientView, BrowserAppNetworkView, BrowserAppPerformanceView, BrowserAppSurface,
+        BrowserAppTrainingView, BrowserAppValidationView, BrowserAppViewerView,
+        BrowserSessionState, BrowserTransportKind,
+    };
     use burn_p2p_core::{
         BrowserDirectorySnapshot, BrowserEdgeMode, BrowserEdgePaths, BrowserEdgeSnapshot,
         BrowserLeaderboardSnapshot, BrowserSeedAdvertisement, BrowserSeedRecord,
         BrowserSeedTransportKind, BrowserSeedTransportPolicy, BrowserSwarmStatus,
         BrowserTransportFamily, BrowserTransportSurface, SchemaEnvelope, SignatureAlgorithm,
         SignatureMetadata, SignedPayload,
-    };
-    use burn_p2p_views::{
-        BrowserAppClientView, BrowserAppNetworkView, BrowserAppPerformanceView, BrowserAppSurface,
-        BrowserAppTrainingView, BrowserAppValidationView, BrowserAppViewerView,
     };
     use chrono::Utc;
     use semver::Version;

@@ -32,6 +32,7 @@ const INDEX_HTML_TEMPLATE: &str = r##"<!doctype html>
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#000000" />
     <title>burn_dragon</title>
+    <link rel="icon" href="__ASSET_PREFIX__/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="__ASSET_PREFIX__/browser-app.css" />
   </head>
   <body>
@@ -39,6 +40,11 @@ const INDEX_HTML_TEMPLATE: &str = r##"<!doctype html>
     <script type="module" src="__ASSET_PREFIX__/browser-app-loader.js"></script>
   </body>
 </html>
+"##;
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#000000"/>
+  <path fill="#d87c7c" d="M15 46V18h17c10 0 17 5 17 14s-7 14-17 14H15Zm10-8h7c5 0 8-2 8-6s-3-6-8-6h-7v12Z"/>
+</svg>
 "##;
 const EXTRA_STYLESHEET: &str = r#"
 :root {
@@ -569,6 +575,10 @@ fn write_site_shell(out_dir: &Path, args: &BuildBrowserSiteArgs) -> Result<()> {
         .with_context(|| format!("failed to write {}/.nojekyll", out_dir.display()))?;
     fs::write(out_dir.join("browser-app-loader.js"), BROWSER_APP_LOADER)
         .with_context(|| format!("failed to write loader in {}", out_dir.display()))?;
+    fs::write(out_dir.join("favicon.svg"), FAVICON_SVG)
+        .with_context(|| format!("failed to write favicon.svg in {}", out_dir.display()))?;
+    fs::write(out_dir.join("favicon.ico"), FAVICON_SVG)
+        .with_context(|| format!("failed to write favicon.ico in {}", out_dir.display()))?;
     fs::write(
         out_dir.join("browser-app.css"),
         format!(
@@ -871,13 +881,15 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{INDEX_HTML_TEMPLATE, should_retry_edge_status, write_html_page};
+    use super::{INDEX_HTML_TEMPLATE, should_retry_edge_status, write_html_page, write_site_shell};
+    use crate::browser_site::BuildBrowserSiteArgs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn browser_shell_template_includes_main_mount_node() {
         assert!(INDEX_HTML_TEMPLATE.contains("id=\"main\""));
+        assert!(INDEX_HTML_TEMPLATE.contains("favicon.svg"));
     }
 
     #[test]
@@ -891,6 +903,21 @@ mod tests {
         write_html_page(&temp, "index.html", ".").expect("write html page");
         let html = std::fs::read_to_string(temp.join("index.html")).expect("read html");
         assert!(html.contains("<div id=\"main\"></div>"));
+        assert!(html.contains("favicon.svg"));
+        std::fs::remove_dir_all(&temp).expect("remove temp dir");
+    }
+
+    #[test]
+    fn generated_site_shell_writes_favicon_fallbacks() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        let temp: PathBuf = std::env::temp_dir().join(format!("burn-dragon-browser-site-{unique}"));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        write_site_shell(&temp, &BuildBrowserSiteArgs::default()).expect("write site shell");
+        assert!(temp.join("favicon.svg").is_file());
+        assert!(temp.join("favicon.ico").is_file());
         std::fs::remove_dir_all(&temp).expect("remove temp dir");
     }
 

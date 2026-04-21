@@ -23,7 +23,8 @@ def main() -> None:
         'const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);',
         "function filterSignedSeedAdvertisementForTransport(envelope, mode)",
         "function filterBrowserConfigForTransport(browserConfig, mode)",
-        "transportConnectedForMode(report.transport_summary, TRANSPORT_MODE)",
+        "function reportConnectedForMode(report, mode)",
+        "return transportConnectedForMode(report.transport_summary, mode);",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"
@@ -31,6 +32,7 @@ def main() -> None:
         'const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath)',
         'const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path)',
         "SELECTED_EXPERIMENT_ID",
+        "/release-manifest.json",
     ]
     for snippet in forbidden_snippets:
         assert snippet not in script, (

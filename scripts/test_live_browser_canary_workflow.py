@@ -50,6 +50,27 @@ def main() -> None:
                 'environment: burn-dragon-p2p-${{ inputs.environment || github.event.inputs.environment || \'production\' }}'
                 in workflow_text
             ), f"{workflow_path} missing reusable environment resolution"
+            lanes = {
+                item["lane"]: item
+                for item in jobs["canary"]["strategy"]["matrix"]["include"]
+            }
+            expected_required = {
+                "chromium-auto-training": "1",
+                "chromium-webrtc-direct-training": "1",
+                "firefox-auto-connect": "0",
+                "firefox-webrtc-direct-connect": "0",
+                "chromium-wss-connect": "0",
+                "firefox-wss-connect": "0",
+            }
+            assert set(lanes) == set(expected_required), (
+                f"{workflow_path} live canary lanes drifted: {sorted(lanes)}"
+            )
+            for lane, required in expected_required.items():
+                assert lanes[lane]["required"] == required, (
+                    f"{workflow_path} lane {lane} required={lanes[lane]['required']} expected {required}"
+                )
+            assert lanes["chromium-auto-training"]["expect_training"] == "1"
+            assert lanes["chromium-webrtc-direct-training"]["expect_training"] == "1"
         else:
             resolver_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',

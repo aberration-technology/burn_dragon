@@ -3,13 +3,13 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 use futures::channel::oneshot;
 
 use libp2p_identity::{Keypair, PeerId};
-use libp2p_webrtc_utils::{noise, Fingerprint};
+use libp2p_webrtc_utils::{Fingerprint, noise};
 use send_wrapper::SendWrapper;
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Event, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelState};
 
 use super::Error;
-use crate::{connection::RtcPeerConnection, error::AuthenticationError, sdp, Connection, Stream};
+use crate::{Connection, Stream, connection::RtcPeerConnection, error::AuthenticationError, sdp};
 
 fn console_debug(message: impl AsRef<str>) {
     web_sys::console::debug_1(&JsValue::from_str(message.as_ref()));
@@ -138,12 +138,12 @@ async fn outbound_inner(
         "libp2p webrtc-direct: created browser offer bytes={}",
         offer.len()
     ));
-    let munged_offer = sdp::offer(offer, &ufrag);
+    let munged_offer = sdp::offer(&offer, &ufrag);
     rtc_peer_connection
         .set_local_description(munged_offer)
         .await?;
 
-    let answer = sdp::answer(sock_addr, remote_fingerprint, &ufrag);
+    let answer = sdp::answer(sock_addr, remote_fingerprint, &ufrag, &offer);
     rtc_peer_connection.set_remote_description(answer).await?;
 
     let local_fingerprint = rtc_peer_connection.local_fingerprint()?;

@@ -54,10 +54,20 @@ def multiaddr_segments(value: str) -> list[str]:
     return [segment for segment in value.split("/") if segment]
 
 
+def is_webrtc_direct_browser_seed(value: str) -> bool:
+    segments = multiaddr_segments(value)
+    return (
+        "webrtc-direct" in segments
+        and bool(segments)
+        and segments[0] in {"ip4", "ip6"}
+        and "certhash" in segments
+    )
+
+
 def is_direct_browser_seed(value: str) -> bool:
     segments = multiaddr_segments(value)
-    if "webrtc-direct" in segments:
-        return bool(segments) and segments[0] in {"ip4", "ip6"} and "certhash" in segments
+    if is_webrtc_direct_browser_seed(value):
+        return True
     if "webtransport" in segments:
         return "quic-v1" in segments and "certhash" in segments
     return False
@@ -66,6 +76,12 @@ def is_direct_browser_seed(value: str) -> bool:
 def is_dialable_browser_seed(value: str) -> bool:
     segments = multiaddr_segments(value)
     return is_direct_browser_seed(value) or any(segment in {"wss", "ws"} for segment in segments)
+
+
+def prefer_validated_browser_seed_urls(seed_urls: list[str]) -> list[str]:
+    if any(is_webrtc_direct_browser_seed(value) for value in seed_urls):
+        return [value for value in seed_urls if is_webrtc_direct_browser_seed(value)]
+    return seed_urls
 
 
 def fetch_json(url: str, resource_name: str) -> Any:
@@ -139,6 +155,8 @@ def resolve_seed_node_urls(
 
     if not seed_urls:
         seed_urls = dedupe_csv_seed_urls(seed_node_urls_from_env)
+
+    seed_urls = prefer_validated_browser_seed_urls(seed_urls)
 
     if not seed_urls or not any(is_direct_browser_seed(value) for value in seed_urls):
         snapshot = fetch_browser_edge_snapshot(edge_base_url)

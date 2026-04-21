@@ -12,7 +12,9 @@ use burn_p2p::{
     BrowserEdgeSnapshot, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentId,
     ExperimentScope, ProjectFamilyId,
 };
-use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
+use burn_p2p_core::{
+    BrowserSeedAdvertisement, BrowserSeedTransportKind, SchemaEnvelope, SignedPayload,
+};
 use clap::{ArgAction, Args};
 use serde::Serialize;
 use wasm_bindgen_cli_support::Bindgen;
@@ -617,14 +619,15 @@ fn browser_site_bootstrap_json(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let seed_node_urls: Vec<String> = args
-        .seed_node_urls
-        .iter()
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
+    let seed_node_urls = prefer_validated_browser_seed_urls(
+        args.seed_node_urls
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    );
 
     let selected_experiment_id = args
         .selected_experiment_id
@@ -642,12 +645,15 @@ fn browser_site_bootstrap_json(
         .as_deref()
         .map(fetch_browser_edge_snapshot)
         .transpose()?;
-    let signed_seed_advertisement =
+    let mut signed_seed_advertisement =
         if let (Some(edge_url), Some(snapshot)) = (edge_url.as_deref(), edge_snapshot.as_ref()) {
             fetch_signed_seed_advertisement(edge_url, snapshot)?
         } else {
             None
         };
+    if let Some(advertisement) = signed_seed_advertisement.as_mut() {
+        prefer_validated_browser_seed_advertisement(advertisement);
+    }
     let training = resolve_browser_training_config(
         edge_snapshot.as_ref(),
         selected_experiment_id.as_deref(),
@@ -725,6 +731,53 @@ fn fetch_browser_edge_snapshot(edge_url: &str) -> Result<BrowserEdgeSnapshot> {
         .context("browser edge snapshot returned a non-success status")?
         .json::<BrowserEdgeSnapshot>()
         .context("decode browser edge snapshot JSON")
+}
+
+fn is_webrtc_direct_browser_seed(value: &str) -> bool {
+    let segments = value
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    segments.contains(&"webrtc-direct")
+        && segments
+            .first()
+            .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
+        && segments.contains(&"certhash")
+}
+
+fn prefer_validated_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
+    if seed_urls
+        .iter()
+        .any(|value| is_webrtc_direct_browser_seed(value))
+    {
+        return seed_urls
+            .into_iter()
+            .filter(|value| is_webrtc_direct_browser_seed(value))
+            .collect();
+    }
+    seed_urls
+}
+
+fn prefer_validated_browser_seed_advertisement(
+    advertisement: &mut SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>,
+) {
+    let payload = &mut advertisement.payload.payload;
+    let has_webrtc_direct = payload
+        .seeds
+        .iter()
+        .flat_map(|record| record.multiaddrs.iter())
+        .any(|value| is_webrtc_direct_browser_seed(value));
+    if !has_webrtc_direct {
+        return;
+    }
+
+    for seed in &mut payload.seeds {
+        seed.multiaddrs
+            .retain(|value| is_webrtc_direct_browser_seed(value));
+    }
+    payload.seeds.retain(|seed| !seed.multiaddrs.is_empty());
+    payload.transport_policy.preferred = vec![BrowserSeedTransportKind::WebRtcDirect];
+    payload.transport_policy.allow_fallback_wss = false;
 }
 
 fn fetch_signed_seed_advertisement(
@@ -877,7 +930,10 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{INDEX_HTML_TEMPLATE, should_retry_edge_status, write_html_page, write_site_shell};
+    use super::{
+        INDEX_HTML_TEMPLATE, prefer_validated_browser_seed_urls, should_retry_edge_status,
+        write_html_page, write_site_shell,
+    };
     use crate::browser_site::BuildBrowserSiteArgs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -915,6 +971,17 @@ mod tests {
         assert!(temp.join("favicon.svg").is_file());
         assert!(temp.join("favicon.ico").is_file());
         std::fs::remove_dir_all(&temp).expect("remove temp dir");
+    }
+
+    #[test]
+    fn validated_browser_seed_preference_strips_unvalidated_wss_fallback() {
+        assert_eq!(
+            prefer_validated_browser_seed_urls(vec![
+                "/dns4/edge.dragon.aberration.technology/tcp/443/wss".to_owned(),
+                "/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+            ]),
+            vec!["/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned()]
+        );
     }
 
     #[test]

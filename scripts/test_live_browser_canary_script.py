@@ -22,6 +22,8 @@ def main() -> None:
         'const TRANSPORT_MODE = (',
         'const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);',
         "function filterSignedSeedAdvertisementForTransport(envelope, mode)",
+        "function preferValidatedSignedSeedAdvertisement(envelope, mode)",
+        'payload.transport_policy = { preferred: ["WebRtcDirect"], allow_fallback_wss: false };',
         "function filterBrowserConfigForTransport(browserConfig, mode)",
         "function reportConnectedForMode(report, mode)",
         "return transportConnectedForMode(report.transport_summary, mode);",

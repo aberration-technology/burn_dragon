@@ -143,6 +143,7 @@ fn resolve_seed_node_urls(
     if seed_urls.is_empty() {
         seed_urls = dedupe_csv_seed_urls(seed_node_urls_from_env);
     }
+    seed_urls = prefer_validated_browser_seed_urls(seed_urls);
 
     let browser_capable_seed_urls = seed_urls
         .into_iter()
@@ -333,32 +334,43 @@ fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
 
 fn is_dialable_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
-    if segments.contains(&"webrtc-direct") {
-        return segments
+    is_direct_browser_seed(value)
+        || segments
+            .iter()
+            .any(|segment| matches!(*segment, "wss" | "ws"))
+}
+
+fn is_webrtc_direct_browser_seed(value: &str) -> bool {
+    let segments = multiaddr_segments(value);
+    segments.contains(&"webrtc-direct")
+        && segments
             .first()
             .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
-            && segments.contains(&"certhash");
-    }
-    if segments.contains(&"webtransport") {
-        return segments.contains(&"quic-v1") && segments.contains(&"certhash");
-    }
-    segments
-        .iter()
-        .any(|segment| matches!(*segment, "wss" | "ws"))
+        && segments.contains(&"certhash")
 }
 
 fn is_direct_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
-    if segments.contains(&"webrtc-direct") {
-        return segments
-            .first()
-            .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
-            && segments.contains(&"certhash");
+    if is_webrtc_direct_browser_seed(value) {
+        return true;
     }
     if segments.contains(&"webtransport") {
         return segments.contains(&"quic-v1") && segments.contains(&"certhash");
     }
     false
+}
+
+fn prefer_validated_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
+    if seed_urls
+        .iter()
+        .any(|value| is_webrtc_direct_browser_seed(value))
+    {
+        return seed_urls
+            .into_iter()
+            .filter(|value| is_webrtc_direct_browser_seed(value))
+            .collect();
+    }
+    seed_urls
 }
 
 fn snapshot_advertises_direct_transports(snapshot: &BrowserEdgeSnapshot) -> bool {
@@ -403,7 +415,8 @@ mod tests {
     use super::{
         ResolvePagesDeploySettingsArgs, browser_requested_scopes, dedupe_csv_seed_urls,
         default_canary_principal_id, edge_base_url_from_domain, first_nonempty,
-        is_dialable_browser_seed, is_direct_browser_seed, resolve_pages_deploy_settings_inner,
+        is_dialable_browser_seed, is_direct_browser_seed, is_webrtc_direct_browser_seed,
+        prefer_validated_browser_seed_urls, resolve_pages_deploy_settings_inner,
     };
     use burn_p2p::ExperimentScope;
 
@@ -442,6 +455,20 @@ mod tests {
         assert!(!is_direct_browser_seed(
             "/dns4/edge.dragon.aberration.technology/tcp/443/wss"
         ));
+        assert!(is_webrtc_direct_browser_seed(
+            "/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc"
+        ));
+    }
+
+    #[test]
+    fn validated_browser_seed_preference_strips_unvalidated_wss_fallback() {
+        assert_eq!(
+            prefer_validated_browser_seed_urls(vec![
+                "/dns4/edge.dragon.aberration.technology/tcp/443/wss".to_owned(),
+                "/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+            ]),
+            vec!["/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned()]
+        );
     }
 
     #[test]

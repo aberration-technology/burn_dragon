@@ -1,15 +1,16 @@
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use anyhow::{Result, anyhow};
 
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use burn_p2p::WorkloadTrainingLease;
 #[cfg(feature = "wasm-ui")]
 use burn_p2p::{ClientReleaseManifest, ExperimentScope};
-#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use burn_p2p::{PeerRole, PeerRoleSet, RuntimeTransportPolicy, WorkloadTrainingLease};
 #[cfg(feature = "wasm-ui")]
 use burn_p2p_browser::{
     BrowserAppClientView, BrowserAppConnectConfig, BrowserAppController, BrowserAppTarget,
     BrowserCapabilityReport, BrowserEdgeSnapshot, BrowserEnrollmentConfig, BrowserRuntimeRole,
-    BrowserSeedAdvertisement, BrowserTransportPolicy, SchemaEnvelope, SignedPayload,
+    BrowserSeedAdvertisement, BrowserTransportKind, BrowserTransportPolicy, SchemaEnvelope,
+    SignedPayload,
 };
 
 #[cfg(feature = "wasm-ui")]
@@ -100,9 +101,11 @@ impl DragonBrowserAppHandle {
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub fn browser_trainer_transport_policy() -> BrowserTransportPolicy {
-    BrowserTransportPolicy::from(RuntimeTransportPolicy::browser_for_roles(
-        &PeerRoleSet::new([PeerRole::BrowserTrainerWgpu]),
-    ))
+    BrowserTransportPolicy {
+        preferred: vec![BrowserTransportKind::WebRtcDirect],
+        observer_fallback: BrowserTransportKind::WebRtcDirect,
+        allow_suspend_resume: true,
+    }
 }
 
 #[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]

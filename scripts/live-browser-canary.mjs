@@ -551,6 +551,31 @@ function filterSignedSeedAdvertisementForTransport(envelope, mode) {
   return filtered;
 }
 
+function preferValidatedSignedSeedAdvertisement(envelope, mode) {
+  if (mode !== "auto") {
+    return envelope;
+  }
+  const filtered = JSON.parse(JSON.stringify(envelope));
+  const payload = filtered?.payload?.payload;
+  if (!payload || !Array.isArray(payload.seeds)) {
+    return filtered;
+  }
+  const hasWebRtcDirect = payload.seeds.some((record) =>
+    (record.multiaddrs ?? []).some(isDialableWebRtcSeed),
+  );
+  if (!hasWebRtcDirect) {
+    return filtered;
+  }
+  payload.seeds = payload.seeds
+    .map((record) => ({
+      ...record,
+      multiaddrs: (record.multiaddrs ?? []).filter(isDialableWebRtcSeed),
+    }))
+    .filter((record) => record.multiaddrs.length > 0);
+  payload.transport_policy = { preferred: ["WebRtcDirect"], allow_fallback_wss: false };
+  return filtered;
+}
+
 function filterBrowserConfigForTransport(browserConfig, mode) {
   if (mode === "auto") {
     return browserConfig;
@@ -712,8 +737,11 @@ async function runCanary() {
     method: "GET",
     headers: {},
   });
-  const filteredSignedSeedsEnvelope = filterSignedSeedAdvertisementForTransport(
-    signedSeedsEnvelope,
+  const liveSignedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
+    (record) => record.multiaddrs ?? [],
+  ) ?? [];
+  const filteredSignedSeedsEnvelope = preferValidatedSignedSeedAdvertisement(
+    filterSignedSeedAdvertisementForTransport(signedSeedsEnvelope, TRANSPORT_MODE),
     TRANSPORT_MODE,
   );
   const filteredBrowserConfig = filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE);
@@ -769,9 +797,9 @@ async function runCanary() {
       `signed browser seeds disagree with snapshot webtransport_gateway=${snapshot.transports?.webtransport_gateway}: ${JSON.stringify(signedSeeds)}`,
     );
   }
-  if (TRANSPORT_MODE === "auto" && Boolean(snapshot.transports?.wss_fallback) !== signedHasWss) {
+  if (TRANSPORT_MODE === "auto" && signedHasWebRtcDirect && signedHasWss) {
     fail(
-      `signed browser seeds disagree with snapshot wss_fallback=${snapshot.transports?.wss_fallback}: ${JSON.stringify(signedSeeds)}`,
+      `auto browser config retained unvalidated WSS fallback despite a WebRTC-direct seed: ${JSON.stringify(signedSeeds)}`,
     );
   }
   if (JSON.stringify(browserConfigSeeds) !== JSON.stringify(signedSeeds)) {
@@ -838,6 +866,7 @@ async function runCanary() {
     transports: snapshot.transports,
     browser_config_seed_node_urls: browserConfigSeeds,
     signed_seed_multiaddrs: signedSeeds,
+    live_signed_seed_multiaddrs: liveSignedSeeds,
     signed_seed_transport_preference:
       filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     site_runtime_assets: siteRuntimeAssets,

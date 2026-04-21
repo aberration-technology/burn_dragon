@@ -13,7 +13,8 @@ from collections import OrderedDict
 from typing import Any
 
 
-EDGE_FETCH_MAX_ATTEMPTS = 3
+EDGE_FETCH_MAX_ATTEMPTS = 20
+EDGE_FETCH_RETRY_DELAY_SECONDS = 3
 DEFAULT_BROWSER_APP_BASE_URL = "https://dragon.aberration.technology"
 DEFAULT_EDGE_BASE_URL = "https://edge.dragon.aberration.technology"
 DEFAULT_EXPERIMENT_ID = "nca-prepretraining"
@@ -82,7 +83,7 @@ def fetch_json(url: str, resource_name: str) -> Any:
             last_error = error
 
         if attempt < EDGE_FETCH_MAX_ATTEMPTS:
-            time.sleep(2)
+            time.sleep(EDGE_FETCH_RETRY_DELAY_SECONDS)
 
     raise RuntimeError(f"fetch {resource_name} from {url} failed: {last_error}")
 

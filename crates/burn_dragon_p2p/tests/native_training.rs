@@ -1723,6 +1723,7 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
 }
 
 #[test]
+#[ignore = "covered by the explicit nca-runtime-cluster validation rung"]
 fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3548,6 +3549,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
 }
 
 #[test]
+#[ignore = "covered by the explicit mixed-fleet medium validation rung"]
 fn nca_mixed_fleet_browser_and_native_same_net_medium() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3662,6 +3664,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
 }
 
 #[test]
+#[ignore = "covered by the explicit mixed-fleet medium validation rung"]
 fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3788,6 +3791,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
 }
 
 #[test]
+#[ignore = "covered by the explicit native-scale validation rung"]
 fn nca_native_peer_medium_model_converges_over_more_windows() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3838,6 +3842,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
 }
 
 #[test]
+#[ignore = "covered by the explicit native-scale validation rung"]
 fn climbmix_native_three_peers_medium_model_stays_consistent() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3895,6 +3900,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
 }
 
 #[test]
+#[ignore = "covered by the explicit native-large validation rung"]
 fn nca_native_peer_large_model_converges_over_more_windows() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3941,6 +3947,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
 }
 
 #[test]
+#[ignore = "covered by the explicit native-large validation rung"]
 fn climbmix_native_three_peers_large_model_stays_consistent() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -3998,6 +4005,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
 }
 
 #[test]
+#[ignore = "covered by the explicit edge-drill validation rung"]
 fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");
@@ -4037,6 +4045,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
 }
 
 #[test]
+#[ignore = "covered by the explicit edge-drill validation rung"]
 fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");

@@ -244,39 +244,21 @@ fn browser_transport_override_from_query(query: &str) -> Option<DragonBrowserTra
     None
 }
 
-#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-fn browser_user_agent() -> String {
-    let Some(window) = web_sys::window() else {
-        return String::new();
-    };
-    let window_value = wasm_bindgen::JsValue::from(window);
-    let Ok(navigator) =
-        js_sys::Reflect::get(&window_value, &wasm_bindgen::JsValue::from_str("navigator"))
-    else {
-        return String::new();
-    };
-    js_sys::Reflect::get(&navigator, &wasm_bindgen::JsValue::from_str("userAgent"))
-        .ok()
-        .and_then(|value| value.as_string())
-        .unwrap_or_default()
-}
-
-#[cfg(not(all(feature = "wasm-ui", target_arch = "wasm32")))]
-fn browser_user_agent() -> String {
-    String::new()
-}
-
 fn browser_transport_override() -> Option<DragonBrowserTransportOverride> {
     if let Ok(query) = window_query_string()
         && let Some(transport) = browser_transport_override_from_query(&query)
     {
         return Some(transport);
     }
-    let user_agent = browser_user_agent().to_ascii_lowercase();
-    if user_agent.contains("firefox/") || user_agent.contains("focus/") {
-        return Some(DragonBrowserTransportOverride::Wss);
-    }
     None
+}
+
+fn browser_seed_is_wss(seed: &str) -> bool {
+    seed.contains("/wss") || seed.contains("/ws")
+}
+
+fn browser_seed_is_direct(seed: &str) -> bool {
+    seed.contains("/webrtc-direct/") || seed.contains("/webtransport")
 }
 
 fn filter_seed_urls_for_transport(
@@ -286,6 +268,16 @@ fn filter_seed_urls_for_transport(
     seeds
         .into_iter()
         .filter(|seed| transport.matches_seed(seed))
+        .collect()
+}
+
+fn filter_wss_seed_urls_when_direct_available(seeds: Vec<String>) -> Vec<String> {
+    if !seeds.iter().any(|seed| browser_seed_is_direct(seed)) {
+        return seeds;
+    }
+    seeds
+        .into_iter()
+        .filter(|seed| !browser_seed_is_wss(seed))
         .collect()
 }
 
@@ -302,6 +294,30 @@ fn filter_signed_seed_advertisement_for_transport(
     payload.transport_policy.preferred = transport.transport_policy_preference();
     payload.transport_policy.allow_fallback_wss =
         matches!(transport, DragonBrowserTransportOverride::Wss);
+}
+
+fn filter_signed_seed_advertisement_wss_when_direct_available(
+    signed_seed_advertisement: &mut SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>,
+) {
+    let payload = &mut signed_seed_advertisement.payload.payload;
+    if !payload
+        .seeds
+        .iter()
+        .flat_map(|seed| seed.multiaddrs.iter())
+        .any(|multiaddr| browser_seed_is_direct(multiaddr))
+    {
+        return;
+    }
+    for seed in &mut payload.seeds {
+        seed.multiaddrs
+            .retain(|multiaddr| !browser_seed_is_wss(multiaddr));
+    }
+    payload.seeds.retain(|seed| !seed.multiaddrs.is_empty());
+    payload
+        .transport_policy
+        .preferred
+        .retain(|transport| *transport != BrowserSeedTransportKind::WssFallback);
+    payload.transport_policy.allow_fallback_wss = false;
 }
 
 fn callback_site_root_pathname(pathname: &str) -> Option<String> {
@@ -416,6 +432,21 @@ fn connect_config(
             info!(
                 "browser transport override active: {} seed_count={}",
                 transport_override.label(),
+                seed_node_urls.len()
+            );
+        }
+    } else {
+        let filtered_seed_node_urls =
+            filter_wss_seed_urls_when_direct_available(seed_node_urls.clone());
+        if filtered_seed_node_urls.len() != seed_node_urls.len() {
+            seed_node_urls = filtered_seed_node_urls;
+            if let Some(signed_seed_advertisement) = signed_seed_advertisement.as_mut() {
+                filter_signed_seed_advertisement_wss_when_direct_available(
+                    signed_seed_advertisement,
+                );
+            }
+            info!(
+                "browser wss fallback pruned while direct seed is available: seed_count={}",
                 seed_node_urls.len()
             );
         }
@@ -3028,7 +3059,9 @@ mod tests {
         dragon_runtime_mode_detail, dragon_runtime_mode_summary, dragon_slice_progress_summary,
         dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
         dragon_window_summary, filter_seed_urls_for_transport,
-        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
+        filter_signed_seed_advertisement_for_transport,
+        filter_signed_seed_advertisement_wss_when_direct_available,
+        filter_wss_seed_urls_when_direct_available, normalized_browser_callback_url,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3260,6 +3293,41 @@ mod tests {
         assert_eq!(
             payload.seeds[0].multiaddrs,
             vec!["/dns4/bootstrap.example/tcp/443/wss".to_owned()]
+        );
+    }
+
+    #[test]
+    fn browser_transport_filter_prunes_wss_when_direct_seed_exists() {
+        let seeds = vec![
+            "/ip4/203.0.113.10/udp/443/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "/dns4/bootstrap.example/tcp/443/wss".to_owned(),
+        ];
+        assert_eq!(
+            filter_wss_seed_urls_when_direct_available(seeds),
+            vec![
+                "/ip4/203.0.113.10/udp/443/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()
+            ]
+        );
+        assert_eq!(
+            filter_wss_seed_urls_when_direct_available(vec![
+                "/dns4/bootstrap.example/tcp/443/wss".to_owned()
+            ]),
+            vec!["/dns4/bootstrap.example/tcp/443/wss".to_owned()]
+        );
+
+        let mut advertisement = sample_signed_seed_advertisement();
+        filter_signed_seed_advertisement_wss_when_direct_available(&mut advertisement);
+        let payload = advertisement.payload.payload;
+        assert_eq!(
+            payload.transport_policy.preferred,
+            vec![BrowserSeedTransportKind::WebRtcDirect]
+        );
+        assert!(!payload.transport_policy.allow_fallback_wss);
+        assert_eq!(
+            payload.seeds[0].multiaddrs,
+            vec![
+                "/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()
+            ]
         );
     }
 

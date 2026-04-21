@@ -30,6 +30,7 @@ def main() -> None:
                 'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"',
                 "chromium-wss-connect",
                 "firefox-wss-connect",
+                "continue-on-error: ${{ matrix.required == '0' }}",
                 "BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}",
                 "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
                 "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",

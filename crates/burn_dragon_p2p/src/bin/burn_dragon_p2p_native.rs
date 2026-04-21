@@ -44,7 +44,9 @@ use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
-    ExperimentId, ExperimentScope, HeadAnnouncement, PrincipalId, RuntimeStatus,
+    ExperimentId, ExperimentScope, HeadAnnouncement, LiveControlPlaneEvent,
+    NativeControlPlaneShell, NetworkId, PeerRoleSet, PrincipalId, ProtocolSet, RuntimeStatus,
+    RuntimeTransportPolicy, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -72,6 +74,7 @@ enum CommandKind {
     ResolveConfig(ResolveConfigArgs),
     AssessCapability(AssessCapabilityArgs),
     DeploymentDiagnostics(DeploymentDiagnosticsArgs),
+    ProbeSwarm(ProbeSwarmArgs),
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
@@ -247,6 +250,20 @@ struct DeploymentDiagnosticsArgs {
     require_artifact_head_view: bool,
     #[arg(long, default_value_t = false)]
     assert_ready: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProbeSwarmArgs {
+    #[arg(long, default_value = "burn-dragon-mainnet")]
+    network_id: String,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 15)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 64)]
+    max_events: usize,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
 }
 
 #[derive(Debug, Parser)]
@@ -575,6 +592,7 @@ fn main() -> Result<()> {
         CommandKind::ResolveConfig(args) => resolve_config(args),
         CommandKind::AssessCapability(args) => assess_capability(args),
         CommandKind::DeploymentDiagnostics(args) => deployment_diagnostics(args),
+        CommandKind::ProbeSwarm(args) => probe_swarm(args),
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
@@ -595,6 +613,7 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::ResolveConfig(_) => "resolve-config",
         CommandKind::AssessCapability(_) => "assess-capability",
         CommandKind::DeploymentDiagnostics(_) => "deployment-diagnostics",
+        CommandKind::ProbeSwarm(_) => "probe-swarm",
         CommandKind::BuildProfile(_) => "build-profile",
         CommandKind::AdminExportDirectory(_) => "admin-export-directory",
         CommandKind::AdminRolloutProfile(_) => "admin-rollout-profile",
@@ -614,6 +633,87 @@ fn parse_cli() -> Cli {
     let long_version: &'static str = Box::leak(build_info::cli_long_version().into_boxed_str());
     let matches = Cli::command().long_version(long_version).get_matches();
     Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeSwarmReport {
+    network_id: String,
+    address: String,
+    local_peer_id: String,
+    connected: bool,
+    connected_peer_id: Option<String>,
+    elapsed_millis: u64,
+    events: Vec<LiveControlPlaneEvent>,
+    last_error: Option<String>,
+}
+
+fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
+    let timeout = Duration::from_secs(args.timeout_secs);
+    let started = Instant::now();
+    let network_id = NetworkId::new(args.network_id.clone());
+    let protocols = ProtocolSet::for_network(&network_id)
+        .with_context(|| format!("failed to build protocol set for {}", args.network_id))?;
+    let transport_policy =
+        RuntimeTransportPolicy::native_for_roles(&PeerRoleSet::default_trainer());
+    let mut shell = NativeControlPlaneShell::new(protocols.control, transport_policy)
+        .context("failed to initialize native control-plane swarm")?;
+    let local_peer_id = shell.local_peer_id().to_string();
+    let address = SwarmAddress::new(args.address.clone())
+        .with_context(|| format!("invalid swarm address {}", args.address))?;
+    shell
+        .dial(address)
+        .with_context(|| format!("failed to enqueue swarm dial to {}", args.address))?;
+
+    let deadline = Instant::now() + timeout;
+    let mut connected_peer_id = None;
+    let mut events = Vec::new();
+    let mut last_error = None;
+
+    while connected_peer_id.is_none() && events.len() < args.max_events {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait_for = deadline.duration_since(now).min(Duration::from_millis(500));
+        let Some(event) = shell.wait_event(wait_for) else {
+            continue;
+        };
+        match &event {
+            LiveControlPlaneEvent::ConnectionEstablished { peer_id } => {
+                connected_peer_id = Some(peer_id.clone());
+            }
+            LiveControlPlaneEvent::OutgoingConnectionError { message, .. }
+            | LiveControlPlaneEvent::IncomingConnectionError { message }
+            | LiveControlPlaneEvent::InboundFailure { message, .. }
+            | LiveControlPlaneEvent::ResponseSendFailure { message, .. }
+            | LiveControlPlaneEvent::RequestFailure { message, .. } => {
+                last_error = Some(message.clone());
+            }
+            _ => {}
+        }
+        events.push(event);
+    }
+
+    let elapsed_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let connected = connected_peer_id.is_some();
+    let report = ProbeSwarmReport {
+        network_id: args.network_id,
+        address: args.address,
+        local_peer_id,
+        connected,
+        connected_peer_id,
+        elapsed_millis,
+        events,
+        last_error,
+    };
+    write_output(None, args.output_format, &report)?;
+    if !connected {
+        bail!(
+            "swarm probe did not establish a connection within {:?}",
+            timeout
+        );
+    }
+    Ok(())
 }
 
 fn build_profile(args: BuildProfileArgs) -> Result<()> {

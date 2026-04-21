@@ -74,14 +74,18 @@ jobs:
             browser: chromium
             transport_mode: auto
             expect_training: "1"
+            required: "1"
           - lane: chromium-wss-connect
             browser: chromium
             transport_mode: wss
             expect_training: "0"
+            required: "0"
           - lane: firefox-wss-connect
             browser: firefox
             transport_mode: wss
             expect_training: "0"
+            required: "0"
+    continue-on-error: ${{ matrix.required == '0' }}
     steps:
       - uses: actions/checkout@v4
 

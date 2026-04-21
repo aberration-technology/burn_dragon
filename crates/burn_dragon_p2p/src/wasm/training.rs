@@ -1005,6 +1005,7 @@ async fn start_live_browser_participant(
             selected_revision: Some(RevisionId::new(live.revision_id.clone())),
             capability,
             include_leaderboard: true,
+            enable_direct_swarm: true,
         },
         session,
     )

@@ -82,7 +82,7 @@ variable "bootstrap_install_source" {
 variable "bootstrap_crate_version" {
   description = "Published burn_p2p_bootstrap crate version installed on the bootstrap host when bootstrap_install_source = crate."
   type        = string
-  default     = "0.21.0-pre.25"
+  default     = "0.21.0-pre.26"
 }
 
 variable "bootstrap_git_repository" {

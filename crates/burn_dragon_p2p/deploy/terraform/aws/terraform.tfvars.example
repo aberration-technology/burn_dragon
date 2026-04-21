@@ -7,7 +7,7 @@ browser_app_base_url     = "https://dragon.aberration.technology"
 auth_redirect_base_url  = "https://dragon.aberration.technology"
 browser_app_pages_domain_target = "aberration-technology.github.io"
 bootstrap_install_source = "crate"
-bootstrap_crate_version  = "0.21.0-pre.26"
+bootstrap_crate_version  = "0.21.0-pre.27"
 # bootstrap_git_ref      = "main"
 secret_parameter_prefix = "/burn-dragon-p2p/mainnet/bootstrap"
 

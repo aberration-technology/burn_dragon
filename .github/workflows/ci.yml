@@ -68,11 +68,12 @@ jobs:
       - run: python3 scripts/test_head_mirror_admin_capability.py
       - run: python3 scripts/test_cleanup_workflow.py
       - run: python3 scripts/test_deployment_strategy.py
+      - run: python3 scripts/test_deployment_version_sync.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
       - run: python3 scripts/test_browser_transport_terraform.py
       - run: python3 scripts/test_browser_profile_budget.py
       - run: python3 scripts/test_edge_caddyfile.py
-      - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/live-browser-canary.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
+      - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/deploy-pages.yml',\n  '.github/workflows/live-browser-canary.yml',\n  '.github/workflows/p2p-validation.yml',\n  '.github/workflows/publish-crates.yml',\n  '.github/workflows/publish-readiness.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
       - run: node --check scripts/live-browser-canary.mjs
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings

@@ -3678,11 +3678,18 @@ mod tests {
         )
         .expect("connect config");
 
-        assert_eq!(connect.seed_node_urls, config.effective_seed_node_urls());
+        assert_eq!(
+            connect.seed_node_urls,
+            filter_wss_seed_urls_when_direct_available(config.effective_seed_node_urls().to_vec())
+        );
         assert_eq!(connect.bootstrap_snapshot, Some(snapshot));
+        let mut expected_signed_seed_advertisement = signed_seed_advertisement.clone();
+        filter_signed_seed_advertisement_wss_when_direct_available(
+            &mut expected_signed_seed_advertisement,
+        );
         assert_eq!(
             connect.bootstrap_signed_seed_advertisement,
-            Some(signed_seed_advertisement)
+            Some(expected_signed_seed_advertisement)
         );
     }
 

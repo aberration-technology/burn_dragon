@@ -28,6 +28,13 @@ const TRANSPORT_MODE = (
   process.env.BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE ?? "auto"
 ).trim().toLowerCase();
 const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);
+const EXPECT_CONNECTED_TRANSPORT =
+  process.env.BURN_DRAGON_BROWSER_CANARY_EXPECT_CONNECTED_TRANSPORT?.trim().toLowerCase() ||
+  null;
+const EXPECT_MIN_DIRECT_PEERS = parseNonnegativeIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_EXPECT_MIN_DIRECT_PEERS",
+  null,
+);
 const TRANSIENT_FETCH_RETRIES = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRANSIENT_FETCH_RETRIES",
   6,
@@ -78,6 +85,18 @@ function parseIntegerEnv(name, fallback) {
   return parsed;
 }
 
+function parseNonnegativeIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`invalid non-negative integer environment variable ${name}=${raw}`);
+  }
+  return parsed;
+}
+
 function parseBooleanEnv(name, fallback) {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") {
@@ -100,6 +119,14 @@ function validateCanaryMode() {
   if (!["auto", "webrtc-direct", "webtransport", "wss"].includes(TRANSPORT_MODE)) {
     throw new Error(
       `unsupported transport mode ${TRANSPORT_MODE}; expected auto, webrtc-direct, webtransport, or wss`,
+    );
+  }
+  if (
+    EXPECT_CONNECTED_TRANSPORT != null &&
+    !["webrtc-direct", "webtransport", "wss", "ws"].includes(EXPECT_CONNECTED_TRANSPORT)
+  ) {
+    throw new Error(
+      `unsupported expected connected transport ${EXPECT_CONNECTED_TRANSPORT}; expected webrtc-direct, webtransport, wss, or ws`,
     );
   }
   if (EXPECT_TRAINING && BROWSER_NAME !== "chromium") {
@@ -304,6 +331,24 @@ function expectedTransportLabel(mode) {
   return null;
 }
 
+function normalizeTransportLabel(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes("webrtc-direct") || normalized.includes("webrtcdirect")) {
+    return "webrtc-direct";
+  }
+  if (normalized.includes("webtransport")) {
+    return "webtransport";
+  }
+  if (/\bwss\b/.test(normalized) || normalized.includes("wssfallback")) {
+    return "wss";
+  }
+  if (/\bws\b/.test(normalized)) {
+    return "ws";
+  }
+  return normalized;
+}
+
 function transportConnectedForMode(summary, mode) {
   const normalized = (summary ?? "").toLowerCase();
   if (!normalized || /\b(target|unavailable|connecting|waiting)\b/.test(normalized)) {
@@ -314,6 +359,58 @@ function transportConnectedForMode(summary, mode) {
     return /\b(webrtc-direct|webtransport|wss|ws)\b/.test(normalized);
   }
   return normalized.includes(expected);
+}
+
+function preferredAdvertisedTransport(envelope) {
+  const preferred = envelope?.payload?.payload?.transport_policy?.preferred;
+  if (!Array.isArray(preferred) || preferred.length === 0) {
+    return null;
+  }
+  for (const value of preferred) {
+    const normalized = normalizeTransportLabel(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function expectedConnectedTransport(mode, envelope) {
+  if (EXPECT_CONNECTED_TRANSPORT) {
+    return normalizeTransportLabel(EXPECT_CONNECTED_TRANSPORT);
+  }
+  return expectedTransportLabel(mode) ?? preferredAdvertisedTransport(envelope);
+}
+
+function expectedMinimumDirectPeers(expectedTransport) {
+  if (EXPECT_MIN_DIRECT_PEERS != null) {
+    return EXPECT_MIN_DIRECT_PEERS;
+  }
+  return ["webrtc-direct", "webtransport"].includes(expectedTransport) ? 1 : 0;
+}
+
+function machineStateConnected(report) {
+  const state = report.browser_machine_state;
+  if (!state || typeof state !== "object") {
+    return false;
+  }
+  const expectedTransport = report.expected_connected_transport;
+  const connectedTransport = normalizeTransportLabel(state.connected_transport);
+  if (!connectedTransport) {
+    return false;
+  }
+  if (expectedTransport && connectedTransport !== expectedTransport) {
+    return false;
+  }
+  const directPeers = Number(state.direct_peers ?? 0);
+  return directPeers >= report.expected_min_direct_peers;
+}
+
+function reportConnectedForMode(report, mode) {
+  if (report.browser_machine_state) {
+    return machineStateConnected(report);
+  }
+  return transportConnectedForMode(report.transport_summary, mode);
 }
 
 function browserConfigSeedNodeUrls(browserConfig) {
@@ -500,6 +597,18 @@ async function optionalVisibleText(locator) {
   }
 }
 
+async function optionalText(locator) {
+  try {
+    if ((await locator.count()) === 0) {
+      return null;
+    }
+    const text = await locator.first().textContent({ timeout: 1_000 });
+    return text?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function beginBrowserCanaryLogin(snapshot) {
   const provider = (snapshot.login_providers ?? []).find(
     (candidate) => candidate?.login_path && candidate.login_path.trim().length > 0,
@@ -549,6 +658,11 @@ async function runCanary() {
     TRANSPORT_MODE,
   );
   const filteredBrowserConfig = filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE);
+  const expectedTransport = expectedConnectedTransport(
+    TRANSPORT_MODE,
+    filteredSignedSeedsEnvelope,
+  );
+  const expectedMinDirectPeers = expectedMinimumDirectPeers(expectedTransport);
 
   if (snapshot.transports?.webtransport_gateway) {
     fail("live edge is advertising webtransport_gateway without validated native runtime support");
@@ -659,6 +773,8 @@ async function runCanary() {
     browser_name: BROWSER_NAME,
     transport_mode: TRANSPORT_MODE,
     expect_training: EXPECT_TRAINING,
+    expected_connected_transport: expectedTransport,
+    expected_min_direct_peers: expectedMinDirectPeers,
     network_id: snapshot.network_id,
     transports: snapshot.transports,
     browser_config_seed_node_urls: browserConfigSeeds,
@@ -678,6 +794,7 @@ async function runCanary() {
     live_notice_label: null,
     live_notice_detail: null,
     transport_summary: null,
+    browser_machine_state: null,
     quiet_window_ms: QUIET_WINDOW_MS,
     train_timeout_ms: TRAIN_TIMEOUT_MS,
     quiet_window_control_plane_requests: [],
@@ -868,6 +985,14 @@ async function runCanary() {
         .catch(() => []);
       report.live_status_label = statTileValue(report.live_stat_tiles, "status");
       report.transport_summary = inferTransportSummary(report.live_stat_tiles);
+      const machineStateText = await optionalText(page.locator(".dragon-live-machine-state"));
+      if (machineStateText) {
+        try {
+          report.browser_machine_state = JSON.parse(machineStateText);
+        } catch (error) {
+          fail(`browser machine state was not valid JSON: ${String(error)}: ${machineStateText}`);
+        }
+      }
     };
 
     const connectDeadline = Date.now() + CONNECT_TIMEOUT_MS;
@@ -876,7 +1001,7 @@ async function runCanary() {
       await captureLiveStatus();
       if (
         (EXPECT_TRAINING && canStartTraining()) ||
-        (!EXPECT_TRAINING && transportConnectedForMode(report.transport_summary, TRANSPORT_MODE))
+        (!EXPECT_TRAINING && reportConnectedForMode(report, TRANSPORT_MODE))
       ) {
         break;
       }
@@ -901,10 +1026,10 @@ async function runCanary() {
         `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} action=${report.training_button_label ?? "missing"} action_detail=${report.training_action_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
       );
     }
-    if (!EXPECT_TRAINING && !transportConnectedForMode(report.transport_summary, TRANSPORT_MODE)) {
+    if (!EXPECT_TRAINING && !reportConnectedForMode(report, TRANSPORT_MODE)) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
-        `browser canary did not connect with expected transport ${TRANSPORT_MODE}: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
+        `browser canary did not connect with expected transport ${report.expected_connected_transport ?? TRANSPORT_MODE}: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} machine=${JSON.stringify(report.browser_machine_state)} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
       );
     }
 
@@ -920,15 +1045,17 @@ async function runCanary() {
         `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,
       );
     }
-    const normalizedTransportSummary = (report.transport_summary ?? "").toLowerCase();
+    if (EXPECT_TRAINING && report.expected_connected_transport && !reportConnectedForMode(report, TRANSPORT_MODE)) {
+      fail(
+        `browser canary became training-ready without expected transport ${report.expected_connected_transport}: transport=${report.transport_summary ?? "missing transport signal"} machine=${JSON.stringify(report.browser_machine_state)}`,
+      );
+    }
     if (
-      EXPECT_TRAINING &&
-      filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred?.[0] === "WebRtcDirect" &&
-      snapshot.transports?.webrtc_direct &&
-      !normalizedTransportSummary.includes("webrtc-direct")
+      ["webrtc-direct", "webtransport"].includes(report.expected_connected_transport) &&
+      report.browser_machine_state?.last_error
     ) {
       fail(
-        `browser canary did not settle on webrtc-direct despite advertised preference: ${report.transport_summary ?? "missing transport signal"}`,
+        `browser canary retained a direct transport error after connect: ${report.browser_machine_state.last_error}`,
       );
     }
 

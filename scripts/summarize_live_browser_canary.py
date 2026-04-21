@@ -21,6 +21,7 @@ def main() -> None:
     artifact_fallback = report.get("artifact_http_fallback_requests") or []
     live_status = report.get("live_status_label") or "n/a"
     transport_summary = report.get("transport_summary") or "n/a"
+    machine_state = report.get("browser_machine_state") or {}
 
     print("## live browser canary")
     print()
@@ -28,9 +29,14 @@ def main() -> None:
     print(f"- Principal id: `{report.get('principal_id', 'n/a')}`")
     print(f"- Browser: `{report.get('browser_name', 'n/a')}`")
     print(f"- Transport mode: `{report.get('transport_mode', 'n/a')}`")
+    print(f"- Expected connected transport: `{report.get('expected_connected_transport') or 'n/a'}`")
+    print(f"- Expected minimum direct peers: `{report.get('expected_min_direct_peers', 'n/a')}`")
     print(f"- Expect training: `{report.get('expect_training', 'n/a')}`")
     print(f"- Live status: `{live_status}`")
     print(f"- Transport signal: `{transport_summary}`")
+    print(f"- Machine connected transport: `{machine_state.get('connected_transport') or 'n/a'}`")
+    print(f"- Machine direct peers: `{machine_state.get('direct_peers', 'n/a')}`")
+    print(f"- Machine last error: `{machine_state.get('last_error') or 'none'}`")
     print(
         f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`"
     )

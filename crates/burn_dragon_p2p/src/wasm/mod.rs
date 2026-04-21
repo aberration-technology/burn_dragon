@@ -89,6 +89,30 @@ fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
     )
 }
 
+fn browser_transport_family_label(
+    family: Option<&burn_p2p_core::BrowserTransportFamily>,
+) -> Option<String> {
+    family.map(|transport| browser_transport_kind(transport).label().to_owned())
+}
+
+fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
+    serde_json::json!({
+        "runtime_label": &view.runtime_label,
+        "runtime_detail": &view.runtime_detail,
+        "desired_transport": browser_transport_family_label(view.network.swarm_status.desired_transport.as_ref()),
+        "connected_transport": browser_transport_family_label(view.network.swarm_status.connected_transport.as_ref()),
+        "direct_peers": view.network.direct_peers,
+        "connected_peer_ids": &view.network.swarm_status.connected_peer_ids,
+        "can_train": view.training.can_train,
+        "assignment": view.training.active_assignment.is_some(),
+        "head_present": view.training.latest_head_id.is_some(),
+        "cached_microshards": view.training.cached_microshards,
+        "last_error": &view.network.swarm_status.last_error,
+        "network_transport": &view.network.transport,
+    })
+    .to_string()
+}
+
 fn browser_scope_summary(scopes: &BTreeSet<ExperimentScope>) -> String {
     if scopes.is_empty() {
         return "none".into();
@@ -412,6 +436,18 @@ fn connect_config(
         } else {
             (None, None)
         };
+    if signed_seed_advertisement
+        .as_ref()
+        .is_some_and(|advertisement| {
+            advertisement.payload.payload.expires_at
+                <= chrono::Utc::now() + chrono::Duration::seconds(30)
+        })
+    {
+        warn!(
+            "embedded browser seed advertisement expired or near expiry; fetching fresh signed seeds from edge"
+        );
+        signed_seed_advertisement = None;
+    }
     let mut seed_node_urls = config.effective_seed_node_urls().to_vec();
     if let Some(transport_override) = transport_override {
         let filtered_seed_node_urls =
@@ -2281,6 +2317,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let global_training_summary = dragon_global_training_summary(view.as_ref());
     let global_training_detail = dragon_global_training_detail(view.as_ref());
     let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
+    let browser_machine_state_json = view.as_ref().map(browser_view_machine_state_json);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     {
         let mut last_logged_browser_status = last_logged_browser_status;
@@ -2689,6 +2726,13 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             eyebrow: "live",
                             title: connected_panel_title,
                             detail: String::new(),
+                        }
+                        if let Some(machine_state) = browser_machine_state_json {
+                            pre {
+                                class: "dragon-live-machine-state",
+                                hidden: true,
+                                "{machine_state}"
+                            }
                         }
                         if let Some(view) = view.clone() {
                             div { class: "dragon-panel-stack dragon-live-summary",

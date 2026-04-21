@@ -75,6 +75,21 @@ jobs:
             transport_mode: auto
             expect_training: "1"
             required: "1"
+          - lane: chromium-webrtc-direct-training
+            browser: chromium
+            transport_mode: webrtc-direct
+            expect_training: "1"
+            required: "1"
+          - lane: firefox-auto-connect
+            browser: firefox
+            transport_mode: auto
+            expect_training: "0"
+            required: "1"
+          - lane: firefox-webrtc-direct-connect
+            browser: firefox
+            transport_mode: webrtc-direct
+            expect_training: "0"
+            required: "1"
           - lane: chromium-wss-connect
             browser: chromium
             transport_mode: wss

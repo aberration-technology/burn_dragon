@@ -243,7 +243,6 @@ async function waitForSiteRuntimeAssets() {
   const relativePaths = [
     "/",
     "/browser-app-config.json",
-    "/release-manifest.json",
     "/burn_dragon_p2p_browser.js",
     "/burn_dragon_p2p_browser_bg.wasm",
   ];

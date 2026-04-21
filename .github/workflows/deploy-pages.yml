@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           settings_path="$(mktemp)"
-          cargo run -p xtask -- resolve-pages-deploy-settings \
+          python3 scripts/resolve_pages_deploy_settings.py \
             --environment "${{ github.event.inputs.environment }}" \
             --edge-base-url-input "${{ github.event.inputs.edge_base_url }}" \
             --edge-base-url-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}" \

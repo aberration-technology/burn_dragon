@@ -161,7 +161,8 @@ That workflow builds the standalone `burn_dragon_p2p_browser` wasm client throug
 
 The deploy path is now split more cleanly:
 
-- `xtask resolve-pages-deploy-settings` is the authoritative resolver for Pages defaults, signed browser seed derivation, and the "refuse degraded WSS-only publish when direct browser transports are advertised" guardrail
+- `scripts/resolve_pages_deploy_settings.py` resolves Pages defaults, signed browser seed derivation, and the "refuse degraded WSS-only publish when direct browser transports are advertised" guardrail without cold-compiling `xtask` before every Pages deploy
+- `xtask resolve-pages-deploy-settings` remains the Rust parity path for local and CI validation of the same settings contract
 - `xtask build-browser-site` is the authoritative browser bundle generator
 - `scripts/dispatch_pages_deploy_and_wait.sh` owns the child-workflow dispatch/watch logic used by deploy and restore
 - `scripts/run_live_browser_canary.sh` and `scripts/summarize_live_browser_canary.py` own the shared canary execution and summary path used by Pages, deploy, restore, and the standalone live-canary workflow

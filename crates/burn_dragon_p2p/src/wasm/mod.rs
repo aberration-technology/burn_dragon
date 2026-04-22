@@ -302,6 +302,33 @@ fn filter_signed_seed_advertisement_for_transport(
         matches!(transport, DragonBrowserTransportOverride::Wss);
 }
 
+fn prefer_webrtc_direct_bootstrap_when_configured(
+    seed_node_urls: &mut Vec<String>,
+    signed_seed_advertisement: &mut Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+) {
+    let direct = DragonBrowserTransportOverride::WebRtcDirect;
+    if !seed_node_urls.iter().any(|seed| direct.matches_seed(seed)) {
+        return;
+    }
+
+    let filtered_seed_node_urls = filter_seed_urls_for_transport(seed_node_urls.clone(), direct);
+    if !filtered_seed_node_urls.is_empty() {
+        *seed_node_urls = filtered_seed_node_urls;
+    }
+
+    let mut signed_seed_retained = true;
+    if let Some(advertisement) = signed_seed_advertisement.as_mut() {
+        filter_signed_seed_advertisement_for_transport(advertisement, direct);
+        signed_seed_retained = !advertisement.payload.payload.seeds.is_empty();
+    }
+    if !signed_seed_retained {
+        warn!(
+            "signed browser seed advertisement contained no webrtc-direct seeds; using site-config seed bootstrap only"
+        );
+        *signed_seed_advertisement = None;
+    }
+}
+
 fn callback_site_root_pathname(pathname: &str) -> Option<String> {
     let (prefix, _) = pathname.split_once("/callback/")?;
     let prefix = prefix.trim_end_matches('/');
@@ -407,7 +434,12 @@ fn connect_config(
         signed_seed_advertisement = None;
     }
     let mut seed_node_urls = config.effective_seed_node_urls().to_vec();
-    if let Some(transport_override) = transport_override {
+    if transport_override.is_none() {
+        prefer_webrtc_direct_bootstrap_when_configured(
+            &mut seed_node_urls,
+            &mut signed_seed_advertisement,
+        );
+    } else if let Some(transport_override) = transport_override {
         let filtered_seed_node_urls =
             filter_seed_urls_for_transport(seed_node_urls.clone(), transport_override);
         if filtered_seed_node_urls.is_empty() {
@@ -3279,6 +3311,22 @@ mod tests {
             payload.seeds[0].multiaddrs,
             vec!["/dns4/bootstrap.example/tcp/443/wss".to_owned()]
         );
+
+        let mut direct_advertisement = sample_signed_seed_advertisement();
+        filter_signed_seed_advertisement_for_transport(
+            &mut direct_advertisement,
+            DragonBrowserTransportOverride::WebRtcDirect,
+        );
+        let direct_payload = direct_advertisement.payload.payload;
+        assert_eq!(
+            direct_payload.transport_policy.preferred,
+            vec![BrowserSeedTransportKind::WebRtcDirect]
+        );
+        assert!(!direct_payload.transport_policy.allow_fallback_wss);
+        assert_eq!(
+            direct_payload.seeds[0].multiaddrs,
+            vec!["/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()]
+        );
     }
 
     #[test]
@@ -3630,12 +3678,17 @@ mod tests {
 
         assert_eq!(
             connect.seed_node_urls,
-            config.effective_seed_node_urls().to_vec()
+            vec!["/dns4/bootstrap.example/udp/4001/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()]
         );
         assert_eq!(connect.bootstrap_snapshot, Some(snapshot));
+        let mut expected_signed_seed_advertisement = signed_seed_advertisement;
+        filter_signed_seed_advertisement_for_transport(
+            &mut expected_signed_seed_advertisement,
+            DragonBrowserTransportOverride::WebRtcDirect,
+        );
         assert_eq!(
             connect.bootstrap_signed_seed_advertisement,
-            Some(signed_seed_advertisement)
+            Some(expected_signed_seed_advertisement)
         );
     }
 

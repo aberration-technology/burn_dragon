@@ -1455,10 +1455,18 @@ pub async fn refresh_browser_app(
         *slot.borrow_mut() = Some(controller);
     });
     let view = refresh_result?;
-    if let Some(error) = view.network.swarm_status.last_error.as_deref() {
+    if let Some(error) = retained_refresh_transport_warning(&view) {
         warn!("browser app refresh retained transport error: {error}");
     }
     Ok(view)
+}
+
+fn retained_refresh_transport_warning(view: &BrowserAppClientView) -> Option<&str> {
+    let error = view.network.swarm_status.last_error.as_deref()?;
+    if view.network.swarm_status.connected_transport.is_some() || view.network.direct_peers > 0 {
+        return None;
+    }
+    Some(error)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -3079,6 +3087,7 @@ mod tests {
         dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
         dragon_window_summary, filter_seed_urls_for_transport,
         filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
+        retained_refresh_transport_warning,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3497,6 +3506,24 @@ mod tests {
             notice.detail,
             "direct peer connection failed. see peers and console for the full dial error."
         );
+    }
+
+    #[test]
+    fn retained_refresh_transport_warning_ignores_stale_errors_after_direct_connect() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+        assert_eq!(
+            retained_refresh_transport_warning(&view),
+            Some("direct dial timeout")
+        );
+
+        view.network.swarm_status.connected_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        assert!(retained_refresh_transport_warning(&view).is_none());
+
+        view.network.swarm_status.connected_transport = None;
+        view.network.direct_peers = 1;
+        assert!(retained_refresh_transport_warning(&view).is_none());
     }
 
     #[wasm_bindgen_test]

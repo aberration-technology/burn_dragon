@@ -51,7 +51,6 @@ def main() -> None:
     assert deploy_job["if"] == "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
     assert deploy_job["needs"] == [
         "test",
-        "artifact-validation",
         "browser-site",
         "terraform-validate",
     ]

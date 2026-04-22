@@ -260,6 +260,7 @@ fn wasm_smoke() -> Result<()> {
             "--features",
             BrowserBuildTarget::Wgpu.features(),
             "--lib",
+            "browser_training_smoke",
             "--",
             "--nocapture",
         ],

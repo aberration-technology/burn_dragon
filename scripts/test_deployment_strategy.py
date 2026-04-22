@@ -56,6 +56,9 @@ def main() -> None:
     ]
     dispatch_step = deploy_job["steps"][0]
     dispatch_run = dispatch_step["run"]
+    assert 'current_main_sha="$(gh api' in dispatch_run
+    assert "skipping production deploy:" in dispatch_run
+    assert '[[ "${current_main_sha}" != "${GITHUB_SHA}" ]]' in dispatch_run
     assert "gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml" in dispatch_run
     assert "-f environment=production" in dispatch_run
     assert "-f terraform_workspace=mainnet" in dispatch_run

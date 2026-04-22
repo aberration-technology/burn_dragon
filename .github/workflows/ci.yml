@@ -149,6 +149,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          current_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq '.object.sha')"
+          if [[ "${current_main_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "skipping production deploy: ${GITHUB_REF_NAME} advanced to ${current_main_sha}; ci validated ${GITHUB_SHA}"
+            exit 0
+          fi
           gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${GITHUB_REF_NAME}" \

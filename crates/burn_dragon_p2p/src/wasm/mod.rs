@@ -739,21 +739,6 @@ struct DragonTrainingActionState {
     enabled: bool,
 }
 
-fn dragon_status_error_summary(error: &str) -> String {
-    error.trim().to_owned()
-}
-
-fn dragon_direct_transport_wait_detail(view: &BrowserAppClientView) -> String {
-    let transport = dragon_transport_target_label(view);
-    if let Some(error) = active_direct_transport_error(view) {
-        return format!(
-            "{transport} unavailable: {}",
-            dragon_status_error_summary(error)
-        );
-    }
-    "connecting to direct peers".into()
-}
-
 fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u32 {
     let Some(view) = view else {
         return BROWSER_APP_REFRESH_INTERVAL_MILLIS;
@@ -787,20 +772,6 @@ fn dragon_live_notice(
     }
 
     let view = view?;
-    if view.runtime_label.starts_with("joining ") {
-        return Some(DragonLiveNotice {
-            label: "connecting",
-            detail: view.runtime_detail.clone(),
-            tone: "accent",
-        });
-    }
-    if view.runtime_label.starts_with("catchup ") {
-        return Some(DragonLiveNotice {
-            label: "syncing",
-            detail: view.runtime_detail.clone(),
-            tone: "neutral",
-        });
-    }
     if view.runtime_label == "blocked" {
         return Some(DragonLiveNotice {
             label: "blocked",
@@ -813,25 +784,14 @@ fn dragon_live_notice(
         && view.network.direct_peers == 0
         && view.network.swarm_status.desired_transport.is_some()
     {
-        let active_transport_error = active_direct_transport_error(view).is_some();
-        return Some(DragonLiveNotice {
-            label: if active_transport_error {
-                "waiting"
-            } else {
-                "connecting"
-            },
-            detail: if active_transport_error {
-                "direct peer connection failed. see peers and console for the full dial error."
-                    .into()
-            } else {
-                "connecting to direct peers".into()
-            },
-            tone: if active_transport_error {
-                "neutral"
-            } else {
-                "accent"
-            },
-        });
+        if active_direct_transport_error(view).is_some() {
+            return Some(DragonLiveNotice {
+                label: "peer connection",
+                detail: "direct peer connection failed. full dial error is logged in the browser console.".into(),
+                tone: "neutral",
+            });
+        }
+        return None;
     }
 
     match (
@@ -882,8 +842,8 @@ fn dragon_training_action_state(
     }
     if view.runtime_label.starts_with("joining ") {
         return Some(DragonTrainingActionState {
-            label: "syncing before training",
-            detail: view.runtime_detail.clone(),
+            label: "preparing",
+            detail: "connecting to the peer network".into(),
             enabled: false,
         });
     }
@@ -902,13 +862,9 @@ fn dragon_training_action_state(
                 "observe mode"
             },
             detail: downgrade_reason
-                .map(|reason| {
-                    format!(
-                        "{reason}. reset browser state and reconnect to retry browser training."
-                    )
-                })
+                .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    "this tab is connected and watching the network. training turns on after the browser receives trainer work.".into()
+                    "this tab is connected and watching the network. training turns on after trainer work is available.".into()
                 }),
             enabled: false,
         });
@@ -916,7 +872,7 @@ fn dragon_training_action_state(
     if !direct_transport_ready {
         return Some(DragonTrainingActionState {
             label: "waiting for peers",
-            detail: "browser training turns on after a direct webrtc peer connects".into(),
+            detail: "training unlocks after a direct webrtc peer connects".into(),
             enabled: false,
         });
     }
@@ -1085,7 +1041,10 @@ fn dragon_transport_summary(view: Option<&BrowserAppClientView>) -> String {
     if view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
-        return format!("{transport} target");
+        if active_direct_transport_error(view).is_some() {
+            return format!("{transport} failed");
+        }
+        return format!("{transport} pending");
     }
     transport.to_owned()
 }
@@ -1126,7 +1085,10 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
     if view.network.swarm_status.connected_transport.is_none()
         && view.network.swarm_status.desired_transport.is_some()
     {
-        return dragon_direct_transport_wait_detail(view);
+        if active_direct_transport_error(view).is_some() {
+            return "connection issue".into();
+        }
+        return "connecting".into();
     }
     if view.network.estimated_network_size > 0 {
         return format!(
@@ -1289,26 +1251,28 @@ fn dragon_runtime_mode_detail(
     }
     if view.runtime_label == "observe" {
         if let Some(reason) = downgrade_reason {
-            return format!(
-                "{reason}. reset browser state and reconnect to retry browser training."
-            );
+            return reason.to_owned();
         }
         return if direct_transport_ready {
-            "connected to direct peers and following network state. browser training turns on when trainer work becomes available.".into()
+            "watching network state. training turns on when trainer work is available.".into()
         } else {
             "waiting for a direct peer connection".into()
         };
     }
     if training_action_state.is_some_and(|state| state.enabled) {
-        return "direct peers connected and checkpoint synced. browser training is manual in this tab.".into();
+        return "direct peers connected and checkpoint synced. run training when ready.".into();
     }
     if matches!(
         view.runtime_label.as_str(),
         "train" | "validate" | "blocked"
-    ) || view.runtime_label.starts_with("joining ")
-        || view.runtime_label.starts_with("catchup ")
-    {
+    ) {
         return view.runtime_detail.clone();
+    }
+    if view.runtime_label.starts_with("joining ") {
+        return "connecting to the peer network".into();
+    }
+    if view.runtime_label.starts_with("catchup ") {
+        return "syncing the current checkpoint".into();
     }
     training_action_state
         .map(|state| state.detail.clone())
@@ -2307,6 +2271,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let global_training_summary = dragon_global_training_summary(view.as_ref());
     let global_training_detail = dragon_global_training_detail(view.as_ref());
     let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
+    let direct_transport_error = view
+        .as_ref()
+        .and_then(|view| active_direct_transport_error(view).map(str::to_owned));
+    let show_reset_browser_state_button = debug_controls_enabled
+        && (direct_transport_error.is_some() || browser_downgrade_reason.is_some());
     let browser_machine_state_json = view.as_ref().map(browser_view_machine_state_json);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     {
@@ -2328,6 +2297,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut last_logged_transport_error = last_logged_transport_error;
         let mut last_logged_runtime_summary = last_logged_runtime_summary;
         let view = view.clone();
+        let logged_direct_transport_error = direct_transport_error.clone();
         use_effect(move || {
             let runtime_summary = view.as_ref().map(browser_view_log_summary);
             if *last_logged_runtime_summary.read() != runtime_summary {
@@ -2336,9 +2306,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     info!("browser runtime state: {runtime_summary}");
                 }
             }
-            let transport_error = view
-                .as_ref()
-                .and_then(|view| active_direct_transport_error(view).map(str::to_owned));
+            let transport_error = logged_direct_transport_error.clone();
             if *last_logged_transport_error.read() != transport_error {
                 last_logged_transport_error.set(transport_error.clone());
                 if let Some(transport_error) = transport_error {
@@ -2508,20 +2476,26 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 let button_label = training_action_state.label;
                 let button_detail = training_action_state.detail.clone();
                 rsx! {
-                    button {
-                        r#type: "button",
-                        class: "action-button action-button-primary",
-                        disabled: !training_action_state.enabled,
-                        onclick: train_action,
-                        "{button_label}"
-                    }
-                    p { class: "dragon-live-action-note", "{button_detail}" }
-                    if !training_action_state.enabled {
+                    if training_action_state.enabled {
                         button {
                             r#type: "button",
-                            class: "action-button action-button-secondary",
-                            onclick: reset_browser_state_action,
-                            "reset browser state"
+                            class: "action-button action-button-primary",
+                            onclick: train_action,
+                            "{button_label}"
+                        }
+                        p { class: "dragon-live-action-note", "{button_detail}" }
+                    } else {
+                        div { class: "dragon-live-action-status",
+                            span { "{button_label}" }
+                            p { "{button_detail}" }
+                        }
+                        if show_reset_browser_state_button {
+                            button {
+                                r#type: "button",
+                                class: "action-button action-button-secondary dragon-live-reset-button",
+                                onclick: reset_browser_state_action,
+                                "reset local state"
+                            }
                         }
                     }
                 }
@@ -2733,11 +2707,19 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                         tone: notice.tone,
                                     }
                                 }
-                                if let Some(reason) = browser_downgrade_reason.as_ref() {
-                                    ActivityNotice {
-                                        label: String::from("trainer state"),
-                                        detail: format!("{reason}. reset browser state and reconnect to retry browser training."),
-                                        tone: "neutral",
+                                if debug_controls_enabled {
+                                    if let Some(reason) = browser_downgrade_reason.as_ref() {
+                                        ActivityNotice {
+                                            label: String::from("capability"),
+                                            detail: reason.clone(),
+                                            tone: "neutral",
+                                        }
+                                    }
+                                    if let Some(error) = direct_transport_error.as_ref() {
+                                        details { class: "dragon-debug-transport-error",
+                                            summary { "transport error" }
+                                            pre { "{error}" }
+                                        }
                                     }
                                 }
                                 div { class: "dragon-live-stats",
@@ -3379,14 +3361,11 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn dragon_live_notice_reports_direct_connecting_state_truthfully() {
+    fn dragon_live_notice_keeps_plain_connecting_state_quiet() {
         let mut view = sample_browser_view();
         view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
 
-        let notice = dragon_live_notice(Some(&view), false).expect("direct handoff notice");
-        assert_eq!(notice.label, "connecting");
-        assert_eq!(notice.detail, "connecting to direct peers");
-        assert_eq!(notice.tone, "accent");
+        assert!(dragon_live_notice(Some(&view), false).is_none());
     }
 
     #[wasm_bindgen_test]
@@ -3470,12 +3449,9 @@ mod tests {
 
         assert_eq!(
             dragon_transport_summary(Some(&view)),
-            "webrtc-direct target"
+            "webrtc-direct pending"
         );
-        assert_eq!(
-            dragon_network_detail(Some(&view)),
-            "connecting to direct peers"
-        );
+        assert_eq!(dragon_network_detail(Some(&view)), "connecting");
         assert_eq!(
             dragon_slice_progress_summary(Some(&view)),
             "waiting for work"
@@ -3503,15 +3479,16 @@ mod tests {
         view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
         view.network.swarm_status.last_error = Some("browser direct swarm could not dial any supported seed candidate: /ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiCZZAGOMSXZiiWY2Mi8hejsmqxCPWT3Qs3uZ9EO5uxbrA: Failed to negotiate transport protocol(s)".into());
 
+        assert_eq!(dragon_network_detail(Some(&view)), "connection issue");
         assert_eq!(
-            dragon_network_detail(Some(&view)),
-            "webrtc-direct unavailable: browser direct swarm could not dial any supported seed candidate: /ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiCZZAGOMSXZiiWY2Mi8hejsmqxCPWT3Qs3uZ9EO5uxbrA: Failed to negotiate transport protocol(s)"
+            dragon_transport_summary(Some(&view)),
+            "webrtc-direct failed"
         );
         let notice = dragon_live_notice(Some(&view), false).expect("direct wait notice");
-        assert_eq!(notice.label, "waiting");
+        assert_eq!(notice.label, "peer connection");
         assert_eq!(
             notice.detail,
-            "direct peer connection failed. see peers and console for the full dial error."
+            "direct peer connection failed. full dial error is logged in the browser console."
         );
     }
 
@@ -3660,7 +3637,10 @@ mod tests {
         .expect("downgraded training state");
         assert!(!blocked.enabled);
         assert_eq!(blocked.label, "trainer downgraded");
-        assert!(blocked.detail.contains("reset browser state"));
+        assert_eq!(
+            blocked.detail,
+            "persisted trainer failure for this workload fingerprint"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -3691,7 +3671,7 @@ mod tests {
                 false,
                 None
             ),
-            "connected to direct peers and following network state. browser training turns on when trainer work becomes available."
+            "watching network state. training turns on when trainer work is available."
         );
 
         view.training.can_train = true;

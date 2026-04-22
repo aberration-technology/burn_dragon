@@ -316,23 +316,54 @@ body {
   line-height: 1.22;
   overflow-wrap: anywhere;
   word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .dragon-live-stats .stat-tile .stat-detail {
+  margin-bottom: 0;
+  color: var(--muted);
+  line-height: 1.35;
   overflow-wrap: anywhere;
   word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .dragon-live-actions {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   padding-top: 2px;
   justify-items: start;
 }
 
-.dragon-live-actions .action-button[disabled] {
-  opacity: 0.58;
-  cursor: not-allowed;
+.dragon-live-action-status {
+  display: grid;
+  gap: 4px;
+  max-width: 34rem;
+  padding: 0;
+  color: var(--muted);
+}
+
+.dragon-live-action-status span {
+  color: var(--ink);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+.dragon-live-action-status p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.dragon-live-reset-button {
+  opacity: 0.74;
 }
 
 .dragon-live-action-note {
@@ -340,6 +371,33 @@ body {
   max-width: 34rem;
   color: var(--muted);
   line-height: 1.45;
+}
+
+.dragon-debug-transport-error {
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--muted);
+}
+
+.dragon-debug-transport-error summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+.dragon-debug-transport-error pre {
+  max-height: 12rem;
+  margin: 0;
+  padding: 0 12px 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: rgba(255, 255, 255, 0.68);
 }
 
 .dragon-live-keyvalues {

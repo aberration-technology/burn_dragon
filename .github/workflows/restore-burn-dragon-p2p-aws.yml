@@ -344,19 +344,17 @@ jobs:
           set -euo pipefail
 
           edge_target_dir="${RUNNER_TEMP}/target-edge-binaries"
-          bootstrap_binary_path=""
-          bootstrap_binary_sha256=""
-          if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
-            bootstrap_auth_feature="auth-static"
-            case "${AUTH_CONNECTOR_KIND}" in
-              github) bootstrap_auth_feature="auth-github" ;;
-              oidc) bootstrap_auth_feature="auth-oidc" ;;
-              oauth) bootstrap_auth_feature="auth-oauth" ;;
-              external) bootstrap_auth_feature="auth-external" ;;
-            esac
+          bootstrap_auth_feature="auth-static"
+          case "${AUTH_CONNECTOR_KIND}" in
+            github) bootstrap_auth_feature="auth-github" ;;
+            oidc) bootstrap_auth_feature="auth-oidc" ;;
+            oauth) bootstrap_auth_feature="auth-oauth" ;;
+            external) bootstrap_auth_feature="auth-external" ;;
+          esac
 
-            bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
-            rm -rf "$bootstrap_root"
+          bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
+          rm -rf "$bootstrap_root"
+          if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
             CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="$edge_target_dir" cargo install \
               --force \
               --locked \
@@ -367,9 +365,19 @@ jobs:
               --bin burn-p2p-bootstrap \
               --no-default-features \
               --features "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
-            bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"
-            bootstrap_binary_sha256="$(sha256sum "$bootstrap_binary_path" | awk '{print $1}')"
+          else
+            CARGO_TARGET_DIR="$edge_target_dir" cargo install \
+              --force \
+              --locked \
+              --root "$bootstrap_root" \
+              burn_p2p_bootstrap \
+              --version "${TF_VAR_bootstrap_crate_version}" \
+              --bin burn-p2p-bootstrap \
+              --no-default-features \
+              --features "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
           fi
+          bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"
+          bootstrap_binary_sha256="$(sha256sum "$bootstrap_binary_path" | awk '{print $1}')"
 
           CARGO_TARGET_DIR="$edge_target_dir" cargo build \
             --manifest-path "${GITHUB_WORKSPACE}/Cargo.toml" \

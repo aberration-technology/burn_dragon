@@ -249,6 +249,16 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
                 path.name,
             )
             self.assertIn(
+                "burn_p2p_bootstrap \\\n              --version \"${TF_VAR_bootstrap_crate_version}\"",
+                text,
+                path.name,
+            )
+            self.assertIn(
+                'bootstrap_binary_path="${bootstrap_root}/bin/burn-p2p-bootstrap"',
+                text,
+                path.name,
+            )
+            self.assertIn(
                 "timed out waiting for bootstrap edge enable/start",
                 text,
                 path.name,

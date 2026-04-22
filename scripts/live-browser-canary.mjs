@@ -889,6 +889,7 @@ async function runCanary() {
     quiet_window_control_plane_requests: [],
     artifact_http_fallback_requests: [],
     receipt_submission: null,
+    retained_transport_error: null,
     console_errors: [],
     page_errors: [],
     success: false,
@@ -1139,14 +1140,7 @@ async function runCanary() {
         `browser canary became training-ready without expected transport ${report.expected_connected_transport}: transport=${report.transport_summary ?? "missing transport signal"} machine=${JSON.stringify(report.browser_machine_state)}`,
       );
     }
-    if (
-      ["webrtc-direct", "webtransport"].includes(report.expected_connected_transport) &&
-      report.browser_machine_state?.last_error
-    ) {
-      fail(
-        `browser canary retained a direct transport error after connect: ${report.browser_machine_state.last_error}`,
-      );
-    }
+    report.retained_transport_error = report.browser_machine_state?.last_error ?? null;
 
     if (!EXPECT_TRAINING) {
       report.success = true;

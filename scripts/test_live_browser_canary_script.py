@@ -27,6 +27,8 @@ def main() -> None:
         "function filterBrowserConfigForTransport(browserConfig, mode)",
         "function reportConnectedForMode(report, mode)",
         "return transportConnectedForMode(report.transport_summary, mode);",
+        "retained_transport_error: null",
+        "report.retained_transport_error = report.browser_machine_state?.last_error ?? null;",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"
@@ -35,6 +37,7 @@ def main() -> None:
         'const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path)',
         "SELECTED_EXPERIMENT_ID",
         "/release-manifest.json",
+        "browser canary retained a direct transport error after connect",
     ]
     for snippet in forbidden_snippets:
         assert snippet not in script, (

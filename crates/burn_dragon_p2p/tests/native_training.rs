@@ -16,8 +16,8 @@ use burn_dragon_p2p::auth::{
 };
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExistingShardDatasetConfig, DragonManifestSeed,
-    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonShardExportConfig,
-    TokenWindowRecord,
+    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonPeerNetworkConfig,
+    DragonShardExportConfig, TokenWindowRecord,
 };
 use burn_dragon_p2p::native::{
     ManagedRunningNativePeer, prepare_climbmix_native_cpu, prepare_nca_native_cpu,
@@ -1632,7 +1632,8 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
     let native = DragonNativePeerConfig {
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-runtime-artifacts"),
-        network: Default::default(),
+        network: DragonPeerNetworkConfig::default()
+            .with_listen_addresses(vec![loopback_swarm_address()]),
         target: Some(DragonNativeTarget::Trainer),
         identity: Default::default(),
         bootstrap_peers: Vec::new(),

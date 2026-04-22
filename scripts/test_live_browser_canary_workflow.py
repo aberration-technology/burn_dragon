@@ -31,8 +31,6 @@ def main() -> None:
                 "chromium-webrtc-direct-training",
                 "firefox-auto-connect",
                 "firefox-webrtc-direct-connect",
-                "chromium-wss-connect",
-                "firefox-wss-connect",
                 "continue-on-error: ${{ matrix.required == '0' }}",
                 "BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}",
                 "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
@@ -57,10 +55,8 @@ def main() -> None:
             expected_required = {
                 "chromium-auto-training": "1",
                 "chromium-webrtc-direct-training": "1",
-                "firefox-auto-connect": "0",
-                "firefox-webrtc-direct-connect": "0",
-                "chromium-wss-connect": "0",
-                "firefox-wss-connect": "0",
+                "firefox-auto-connect": "1",
+                "firefox-webrtc-direct-connect": "1",
             }
             assert set(lanes) == set(expected_required), (
                 f"{workflow_path} live canary lanes drifted: {sorted(lanes)}"

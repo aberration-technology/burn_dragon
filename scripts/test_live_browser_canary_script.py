@@ -28,7 +28,12 @@ def main() -> None:
         "function reportConnectedForMode(report, mode)",
         "return transportConnectedForMode(report.transport_summary, mode);",
         "retained_transport_error: null",
-        "report.retained_transport_error = report.browser_machine_state?.last_error ?? null;",
+        "report.page_errors = uniqueStrings(pageErrors);",
+        "report.console_errors = uniqueStrings(",
+        "function uniqueStrings(values)",
+        "report.retained_transport_error = reportConnectedForMode(report, TRANSPORT_MODE)",
+        "? null",
+        ": (report.browser_machine_state?.last_error ?? null);",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"

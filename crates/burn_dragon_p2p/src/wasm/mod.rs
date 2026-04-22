@@ -95,6 +95,14 @@ fn browser_transport_family_label(
     family.map(|transport| browser_transport_kind(transport).label().to_owned())
 }
 
+fn active_direct_transport_error(view: &BrowserAppClientView) -> Option<&str> {
+    let error = view.network.swarm_status.last_error.as_deref()?;
+    if view.network.swarm_status.connected_transport.is_some() || view.network.direct_peers > 0 {
+        return None;
+    }
+    Some(error)
+}
+
 fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
     serde_json::json!({
         "runtime_label": &view.runtime_label,
@@ -107,7 +115,7 @@ fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
         "assignment": view.training.active_assignment.is_some(),
         "head_present": view.training.latest_head_id.is_some(),
         "cached_microshards": view.training.cached_microshards,
-        "last_error": &view.network.swarm_status.last_error,
+        "last_error": active_direct_transport_error(view),
         "network_transport": &view.network.transport,
     })
     .to_string()
@@ -737,7 +745,7 @@ fn dragon_status_error_summary(error: &str) -> String {
 
 fn dragon_direct_transport_wait_detail(view: &BrowserAppClientView) -> String {
     let transport = dragon_transport_target_label(view);
-    if let Some(error) = view.network.swarm_status.last_error.as_ref() {
+    if let Some(error) = active_direct_transport_error(view) {
         return format!(
             "{transport} unavailable: {}",
             dragon_status_error_summary(error)
@@ -751,9 +759,10 @@ fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u
         return BROWSER_APP_REFRESH_INTERVAL_MILLIS;
     };
     let direct_connect_pending = view.network.swarm_status.connected_transport.is_none()
+        && view.network.direct_peers == 0
         && view.network.swarm_status.desired_transport.is_some();
     if direct_connect_pending {
-        return if view.network.swarm_status.last_error.is_some() {
+        return if active_direct_transport_error(view).is_some() {
             BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS
         } else {
             BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS
@@ -801,21 +810,23 @@ fn dragon_live_notice(
     }
     if view.training.can_train
         && view.network.swarm_status.connected_transport.is_none()
+        && view.network.direct_peers == 0
         && view.network.swarm_status.desired_transport.is_some()
     {
+        let active_transport_error = active_direct_transport_error(view).is_some();
         return Some(DragonLiveNotice {
-            label: if view.network.swarm_status.last_error.is_some() {
+            label: if active_transport_error {
                 "waiting"
             } else {
                 "connecting"
             },
-            detail: if view.network.swarm_status.last_error.is_some() {
+            detail: if active_transport_error {
                 "direct peer connection failed. see peers and console for the full dial error."
                     .into()
             } else {
                 "connecting to direct peers".into()
             },
-            tone: if view.network.swarm_status.last_error.is_some() {
+            tone: if active_transport_error {
                 "neutral"
             } else {
                 "accent"
@@ -1462,11 +1473,7 @@ pub async fn refresh_browser_app(
 }
 
 fn retained_refresh_transport_warning(view: &BrowserAppClientView) -> Option<&str> {
-    let error = view.network.swarm_status.last_error.as_deref()?;
-    if view.network.swarm_status.connected_transport.is_some() || view.network.direct_peers > 0 {
-        return None;
-    }
-    Some(error)
+    active_direct_transport_error(view)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -2331,7 +2338,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             }
             let transport_error = view
                 .as_ref()
-                .and_then(|view| view.network.swarm_status.last_error.clone());
+                .and_then(|view| active_direct_transport_error(view).map(str::to_owned));
             if *last_logged_transport_error.read() != transport_error {
                 last_logged_transport_error.set(transport_error.clone());
                 if let Some(transport_error) = transport_error {
@@ -3524,6 +3531,22 @@ mod tests {
         view.network.swarm_status.connected_transport = None;
         view.network.direct_peers = 1;
         assert!(retained_refresh_transport_warning(&view).is_none());
+    }
+
+    #[test]
+    fn browser_machine_state_suppresses_stale_errors_after_direct_connect() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+
+        let pending_state: serde_json::Value =
+            serde_json::from_str(&browser_view_machine_state_json(&view)).expect("machine state");
+        assert_eq!(pending_state["last_error"], "direct dial timeout");
+
+        view.network.direct_peers = 1;
+        let connected_state: serde_json::Value =
+            serde_json::from_str(&browser_view_machine_state_json(&view)).expect("machine state");
+        assert!(connected_state["last_error"].is_null());
     }
 
     #[wasm_bindgen_test]

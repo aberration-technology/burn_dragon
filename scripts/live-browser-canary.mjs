@@ -271,6 +271,10 @@ function trimPreview(text) {
   return `${normalized.slice(0, 240)}...`;
 }
 
+function uniqueStrings(values) {
+  return Array.from(new Set(values.filter((value) => value != null).map(String)));
+}
+
 function endpoint(baseUrl, relativePath) {
   return new URL(relativePath, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 }
@@ -997,9 +1001,6 @@ async function runCanary() {
         text: message.text(),
       };
       consoleMessages.push(entry);
-      if (entry.type === "error") {
-        report.console_errors.push(entry.text);
-      }
     });
     page.on("pageerror", (error) => {
       const text =
@@ -1140,7 +1141,9 @@ async function runCanary() {
         `browser canary became training-ready without expected transport ${report.expected_connected_transport}: transport=${report.transport_summary ?? "missing transport signal"} machine=${JSON.stringify(report.browser_machine_state)}`,
       );
     }
-    report.retained_transport_error = report.browser_machine_state?.last_error ?? null;
+    report.retained_transport_error = reportConnectedForMode(report, TRANSPORT_MODE)
+      ? null
+      : (report.browser_machine_state?.last_error ?? null);
 
     if (!EXPECT_TRAINING) {
       report.success = true;
@@ -1188,10 +1191,10 @@ async function runCanary() {
       await context.tracing.stop({ path: tracePath }).catch(() => {});
     }
     report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
-    report.console_errors = report.console_errors.concat(
+    report.console_errors = uniqueStrings(
       consoleMessages.filter((entry) => entry.type === "error").map((entry) => entry.text),
     );
-    report.page_errors = pageErrors;
+    report.page_errors = uniqueStrings(pageErrors);
     fs.writeFileSync(path.join(ARTIFACT_DIR, "requests.json"), JSON.stringify(requests, null, 2));
     fs.writeFileSync(
       path.join(ARTIFACT_DIR, "console.json"),

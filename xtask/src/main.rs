@@ -184,15 +184,7 @@ fn build_matrix() -> Result<()> {
 }
 
 fn native_smoke() -> Result<()> {
-    for filter in [
-        "nca_native_peer_exports_shards_and_executes_training_windows",
-        "nca_native_runtime_persists_and_publishes_artifacts",
-        "nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles",
-        "browser_conformance_uses_native_dragon_manifests",
-    ] {
-        cargo_native_test(Some(filter), false)?;
-    }
-    Ok(())
+    cargo_native_test(Some("ci_native_smoke_suite"), false)
 }
 
 fn native_integration() -> Result<()> {

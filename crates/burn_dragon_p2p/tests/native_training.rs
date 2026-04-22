@@ -1546,6 +1546,14 @@ fn run_edge_drill_for_prepared<B>(
 }
 
 #[test]
+fn ci_native_smoke_suite() {
+    nca_native_peer_exports_shards_and_executes_training_windows();
+    nca_native_runtime_persists_and_publishes_artifacts();
+    nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles();
+    browser_conformance_uses_native_dragon_manifests();
+}
+
+#[test]
 fn nca_native_peer_exports_shards_and_executes_training_windows() {
     let _guard = native_swarm_test_guard();
     let root = tempdir().expect("root");

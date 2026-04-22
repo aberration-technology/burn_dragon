@@ -89,6 +89,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: lint
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -99,7 +100,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --manifest-path Cargo.toml --workspace --all-targets --exclude burn_dragon_p2p --exclude xtask -- --test-threads=1
-      - run: cargo run --manifest-path Cargo.toml -p xtask -- smoke
+      - run: cargo run --manifest-path Cargo.toml -p xtask -- native-smoke
+        timeout-minutes: 45
+      - run: cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke
+        timeout-minutes: 45
 
 
   browser-site:

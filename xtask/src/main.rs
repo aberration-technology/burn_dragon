@@ -507,6 +507,13 @@ fn ensure_chromedriver(chrome: &Path) -> Result<PathBuf> {
         "curl",
         &[
             "-fsSL",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "180",
+            "--retry",
+            "3",
+            "--retry-all-errors",
             &url,
             "-o",
             zip_path.to_str().context("zip path was not valid utf-8")?,

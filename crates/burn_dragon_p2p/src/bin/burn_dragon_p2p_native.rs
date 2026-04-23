@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,10 +20,11 @@ use burn_dragon_p2p::admin::{
     rollout_directory_entries, upsert_directory_entry, upsert_directory_entry_current_head,
 };
 use burn_dragon_p2p::auth::{
-    DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
-    default_native_auth_bundle_path, enroll_native_static_principal, fetch_edge_snapshot,
-    load_cached_native_auth_bundle, native_auth_bundle_is_fresh, native_cli_bridge_url,
-    refresh_native_auth_bundle,
+    DragonPendingGitHubLogin, NativeCliBridgeAuthResult, NativeCliBridgeBootstrap,
+    begin_native_github_login, complete_native_github_login, default_native_auth_bundle_path,
+    edge_peer_identity_for_storage, enroll_native_static_principal, fetch_edge_snapshot,
+    finalize_native_auth_session_from_bridge_result, load_cached_native_auth_bundle,
+    native_auth_bundle_is_fresh, native_cli_browser_auth_url, refresh_native_auth_bundle,
 };
 use burn_dragon_p2p::build_info;
 use burn_dragon_p2p::capability_state::{
@@ -910,9 +911,12 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct NativeBrowserAuthCallback {
-    provider_code: String,
-    state: String,
+enum NativeBrowserAuthCallback {
+    ProviderCode {
+        provider_code: String,
+        state: String,
+    },
+    AuthResult(Box<NativeCliBridgeAuthResult>),
 }
 
 struct NativeBrowserAuthListener {
@@ -981,13 +985,13 @@ fn parse_native_browser_auth_callback(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
-    if method != "GET" {
+    if !matches!(method, "GET" | "POST") {
         let _ = write_browser_auth_response(
             stream,
             "405 Method Not Allowed",
             &browser_auth_response_html(
                 "login failed",
-                "the local auth callback only accepts GET requests.",
+                "the local auth callback only accepts GET or POST requests.",
             ),
         );
         bail!("browser auth callback used unsupported method {method}");
@@ -1003,17 +1007,50 @@ fn parse_native_browser_auth_callback(
         bail!("browser auth callback used unexpected path {}", url.path());
     }
 
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some(value) = header.split_once(':')
+            && value.0.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.1.trim().parse::<usize>().unwrap_or_default();
+        }
+    }
+
     let mut nonce = None;
     let mut provider_code = None;
     let mut state = None;
+    let mut auth_result_json = None;
+    let mut error_message = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "native_nonce" => nonce = Some(value.into_owned()),
             "provider_code" => provider_code = Some(value.into_owned()),
             "state" => state = Some(value.into_owned()),
+            "auth_result_json" => auth_result_json = Some(value.into_owned()),
+            "error_message" => error_message = Some(value.into_owned()),
             _ => {}
         }
     }
+    if method == "POST" && content_length > 0 {
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body)?;
+        for (key, value) in url::form_urlencoded::parse(&body) {
+            match key.as_ref() {
+                "native_nonce" => nonce = Some(value.into_owned()),
+                "provider_code" => provider_code = Some(value.into_owned()),
+                "state" => state = Some(value.into_owned()),
+                "auth_result_json" => auth_result_json = Some(value.into_owned()),
+                "error_message" => error_message = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+    }
+
     if nonce.as_deref() != Some(expected_nonce) {
         let _ = write_browser_auth_response(
             stream,
@@ -1022,6 +1059,30 @@ fn parse_native_browser_auth_callback(
         );
         bail!("browser auth callback nonce mismatch");
     }
+
+    if let Some(message) = error_message.filter(|value| !value.trim().is_empty()) {
+        let _ = write_browser_auth_response(
+            stream,
+            "200 OK",
+            &browser_auth_response_html("login failed", &message),
+        );
+        bail!("browser auth bridge failed: {message}");
+    }
+
+    if let Some(auth_result_json) = auth_result_json.filter(|value| !value.trim().is_empty()) {
+        let auth_result = serde_json::from_str::<NativeCliBridgeAuthResult>(&auth_result_json)
+            .context("failed to decode native auth bridge result")?;
+        write_browser_auth_response(
+            stream,
+            "200 OK",
+            &browser_auth_response_html(
+                "login complete",
+                "GitHub login completed. You can return to the CLI.",
+            ),
+        )?;
+        return Ok(NativeBrowserAuthCallback::AuthResult(Box::new(auth_result)));
+    }
+
     let provider_code = provider_code
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("browser auth callback is missing provider_code"))?;
@@ -1036,7 +1097,7 @@ fn parse_native_browser_auth_callback(
             "GitHub login completed. You can return to the CLI.",
         ),
     )?;
-    Ok(NativeBrowserAuthCallback {
+    Ok(NativeBrowserAuthCallback::ProviderCode {
         provider_code,
         state,
     })
@@ -1155,6 +1216,61 @@ fn write_auth_bundle(
     write_output(Some(path), auth_bundle_output_format(path, format)?, value)
 }
 
+fn infer_browser_site_base_url(edge_base_url: &str) -> Result<String> {
+    let mut url = Url::parse(edge_base_url)
+        .with_context(|| format!("failed to parse edge base URL {edge_base_url}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("edge base URL {edge_base_url} is missing a host"))?
+        .to_owned();
+    let site_host = host.strip_prefix("edge.").unwrap_or(&host).to_owned();
+    url.set_host(Some(&site_host)).map_err(|error| {
+        anyhow!("failed to derive browser site host from {edge_base_url}: {error}")
+    })?;
+    Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn build_native_cli_browser_auth_bootstrap(
+    config: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+    backend: BackendArg,
+    principal_hint: Option<String>,
+    session_ttl_secs: i64,
+) -> Result<NativeCliBridgeBootstrap> {
+    let edge_base_url = config
+        .effective_edge_base_url()
+        .ok_or_else(|| anyhow!("no edge base URL configured"))?
+        .to_owned();
+    let site_base_url = infer_browser_site_base_url(&edge_base_url)?;
+    let manifests = prepared_manifests(config, experiment_kind, backend)?;
+    let requested_scopes = requested_scopes(
+        manifests
+            .experiment_directory
+            .first()
+            .ok_or_else(|| anyhow!("manifest bundle is missing an experiment directory entry"))?,
+    );
+    let (_, identity) = edge_peer_identity_for_storage(config.storage_root.as_path(), None)?;
+    Ok(NativeCliBridgeBootstrap {
+        edge_base_url: edge_base_url.trim_end_matches('/').to_owned(),
+        site_base_url,
+        target_artifact_id: native_target_artifact_id(backend).into(),
+        app_semver: config.app_semver.to_string(),
+        git_commit: config
+            .git_commit
+            .clone()
+            .or_else(build_info::embedded_git_commit_owned)
+            .unwrap_or_else(|| "unknown".into()),
+        enabled_features_label: config
+            .enabled_features_label
+            .clone()
+            .unwrap_or_else(|| backend.as_label().into()),
+        requested_scopes,
+        session_ttl_secs,
+        principal_hint,
+        identity,
+    })
+}
+
 fn build_pending_native_login(
     config: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
@@ -1199,34 +1315,63 @@ fn perform_interactive_native_login(
     session_ttl_secs: i64,
     callback_timeout_secs: u64,
 ) -> Result<DragonNativeAuthBundle> {
-    let (runtime, pending) = build_pending_native_login(
+    let bootstrap = build_native_cli_browser_auth_bootstrap(
         config,
         experiment_kind,
         backend,
-        principal_hint,
+        principal_hint.clone(),
         session_ttl_secs,
-        false,
     )?;
     let listener = start_native_browser_auth_listener()?;
-    let bridge_url = native_cli_bridge_url(&pending, &listener.callback_url, &listener.nonce)?;
+    let bridge_url =
+        native_cli_browser_auth_url(&bootstrap, &listener.callback_url, &listener.nonce)?;
     match open_url_in_system_browser(&bridge_url) {
         Ok(()) => eprintln!("launched browser for GitHub login"),
         Err(error) => {
             eprintln!("automatic browser launch failed: {error}");
-            eprintln!("Open this URL to continue GitHub login:\n{bridge_url}");
+            eprintln!(
+                "Open this URL to continue GitHub login:
+{bridge_url}"
+            );
         }
     }
     let callback = listener.wait(Duration::from_secs(callback_timeout_secs))?;
-    if callback.state != pending.login.state {
-        bail!("browser auth callback state mismatch");
+    match callback {
+        NativeBrowserAuthCallback::AuthResult(result) => {
+            let session = finalize_native_auth_session_from_bridge_result(
+                &config.storage_root,
+                &result,
+                None,
+            )?;
+            Ok(session.auth)
+        }
+        NativeBrowserAuthCallback::ProviderCode {
+            provider_code,
+            state,
+        } => {
+            eprintln!(
+                "browser returned provider code only; falling back to native edge completion"
+            );
+            let (runtime, pending) = build_pending_native_login(
+                config,
+                experiment_kind,
+                backend,
+                principal_hint,
+                session_ttl_secs,
+                false,
+            )?;
+            if state != pending.login.state {
+                bail!("browser auth callback state mismatch");
+            }
+            let session = runtime.block_on(complete_native_github_login(
+                &config.storage_root,
+                &pending,
+                &provider_code,
+                None,
+            ))?;
+            Ok(session.auth)
+        }
     }
-    let session = runtime.block_on(complete_native_github_login(
-        &config.storage_root,
-        &pending,
-        &callback.provider_code,
-        None,
-    ))?;
-    Ok(session.auth)
 }
 
 #[derive(Clone, Debug)]

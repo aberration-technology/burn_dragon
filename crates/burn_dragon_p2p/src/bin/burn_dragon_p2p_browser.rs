@@ -119,7 +119,7 @@ fn NativeCliBridgeApp() -> Element {
             }
             started.set(true);
             spawn(async move {
-                match resume_or_complete_native_cli_bridge() {
+                match resume_or_complete_native_cli_bridge().await {
                     Ok(true) => {
                         status.set("continuing GitHub sign-in for the native CLI.".into());
                     }

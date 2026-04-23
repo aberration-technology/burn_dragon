@@ -78,7 +78,7 @@ jobs:
       - run: node --check scripts/live-browser-canary.mjs
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings
-      - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings
+      - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_time -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_train -p burn_dragon_language --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --target wasm32-unknown-unknown --no-default-features --features wasm-ui,wasm-peer,wgpu --bin burn_dragon_p2p_browser --no-deps -- -D warnings

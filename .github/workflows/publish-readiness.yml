@@ -36,6 +36,7 @@ jobs:
           crates=(
             burn_dragon_tokenizer
             burn_dragon_universality
+            burn_dragon_time
             burn_dragon_kernel
             burn_dragon_core
             burn_dragon_checkpoint

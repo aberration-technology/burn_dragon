@@ -9,7 +9,7 @@ use burn_p2p::{
     ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadPromotionMode,
     HeadPromotionPolicy, MergeStrategy, MergeTopologyPolicy, NetworkId, NetworkManifest, PeerRole,
     PeerRoleSet, Precision, ProjectFamilyId, RevisionId, RevisionManifest, StudyId,
-    SupportedWorkload, WindowActivation, WindowId, WorkloadId,
+    SupportedWorkload, TrainingProtocol, WindowActivation, WindowId, WorkloadId,
 };
 use sha2::{Digest, Sha256};
 
@@ -288,6 +288,7 @@ pub fn build_manifest_bundle(
             "dragon-merge-topology",
             &merge_topology_policy,
         ),
+        training_protocol: TrainingProtocol::default(),
         slot_requirements: experiment_directory_entry.resource_requirements.clone(),
         activation_window: WindowActivation {
             activation_window: WindowId(0),

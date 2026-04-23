@@ -5,5 +5,12 @@
 *.safetensors
 *.bin
 .DS_Store
+.codex
+__pycache__/
+*.pyc
+*.pyo
+scripts/__pycache__/
+/upstream_burn_p2p
+/upstream_burn_p2p*/
 /crates/burn_dragon_core/data/
 /crates/burn_dragon_core/runs/

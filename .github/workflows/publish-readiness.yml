@@ -27,6 +27,7 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
+      - run: scripts/ensure-burn-p2p-sibling.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: verify publish readiness chain

@@ -134,6 +134,9 @@ jobs:
       - name: checkout repository
         uses: actions/checkout@v4
 
+      - name: checkout burn_p2p sibling
+        run: scripts/ensure-burn-p2p-sibling.sh
+
       - name: resolve restore settings
         shell: bash
         env:

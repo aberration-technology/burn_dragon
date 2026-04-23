@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::thread;
 use std::time::Duration;
 
@@ -144,6 +145,7 @@ fn resolve_seed_node_urls(
         seed_urls = dedupe_csv_seed_urls(seed_node_urls_from_env);
     }
     seed_urls = prefer_validated_browser_seed_urls(seed_urls);
+    seed_urls = canonicalize_browser_seed_urls(edge_base_url, seed_urls);
 
     let browser_capable_seed_urls = seed_urls
         .into_iter()
@@ -332,6 +334,36 @@ fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn canonicalize_browser_seed_urls(edge_base_url: &str, seed_urls: Vec<String>) -> Vec<String> {
+    let Some(edge_host) = browser_seed_dns_host(edge_base_url) else {
+        return dedupe_seed_urls(seed_urls);
+    };
+    dedupe_seed_urls(
+        seed_urls
+            .into_iter()
+            .map(|value| canonicalize_browser_seed_url(&edge_host, value))
+            .collect(),
+    )
+}
+
+fn browser_seed_dns_host(edge_base_url: &str) -> Option<String> {
+    reqwest::Url::parse(edge_base_url)
+        .ok()
+        .and_then(|value| value.host_str().map(ToOwned::to_owned))
+        .filter(|host| host.parse::<IpAddr>().is_err())
+}
+
+fn canonicalize_browser_seed_url(edge_host: &str, seed_url: String) -> String {
+    let segments = multiaddr_segments(&seed_url);
+    if segments.len() < 3
+        || !matches!(segments.first().copied(), Some("ip4" | "ip6"))
+        || !is_dialable_browser_seed(&seed_url)
+    {
+        return seed_url;
+    }
+    format!("/dns4/{edge_host}/{}", segments[2..].join("/"))
+}
+
 fn is_dialable_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
     is_direct_browser_seed(value)
@@ -345,7 +377,7 @@ fn is_webrtc_direct_browser_seed(value: &str) -> bool {
     segments.contains(&"webrtc-direct")
         && segments
             .first()
-            .is_some_and(|segment| matches!(*segment, "ip4" | "ip6"))
+            .is_some_and(|segment| matches!(*segment, "ip4" | "ip6" | "dns4" | "dns6"))
         && segments.contains(&"certhash")
 }
 
@@ -413,10 +445,11 @@ fn normalized_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolvePagesDeploySettingsArgs, browser_requested_scopes, dedupe_csv_seed_urls,
-        default_canary_principal_id, edge_base_url_from_domain, first_nonempty,
-        is_dialable_browser_seed, is_direct_browser_seed, is_webrtc_direct_browser_seed,
-        prefer_validated_browser_seed_urls, resolve_pages_deploy_settings_inner,
+        ResolvePagesDeploySettingsArgs, browser_requested_scopes, canonicalize_browser_seed_urls,
+        dedupe_csv_seed_urls, default_canary_principal_id, edge_base_url_from_domain,
+        first_nonempty, is_dialable_browser_seed, is_direct_browser_seed,
+        is_webrtc_direct_browser_seed, prefer_validated_browser_seed_urls,
+        resolve_pages_deploy_settings_inner,
     };
     use burn_p2p::ExperimentScope;
 
@@ -468,6 +501,32 @@ mod tests {
                 "/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
             ]),
             vec!["/ip4/1.2.3.4/udp/443/webrtc-direct/certhash/uEiAbc".to_owned()]
+        );
+    }
+
+    #[test]
+    fn dns_webrtc_direct_seed_is_treated_as_direct() {
+        let seed = "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc";
+        assert!(is_dialable_browser_seed(seed));
+        assert!(is_direct_browser_seed(seed));
+        assert!(is_webrtc_direct_browser_seed(seed));
+    }
+
+    #[test]
+    fn canonicalize_browser_seed_urls_rewrites_ip_based_browser_seeds_to_edge_dns_host() {
+        assert_eq!(
+            canonicalize_browser_seed_urls(
+                "https://edge.dragon.aberration.technology",
+                vec![
+                    "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+                    "/ip4/3.149.166.58/tcp/443/wss".to_owned(),
+                ],
+            ),
+            vec![
+                "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
+                    .to_owned(),
+                "/dns4/edge.dragon.aberration.technology/tcp/443/wss".to_owned(),
+            ]
         );
     }
 

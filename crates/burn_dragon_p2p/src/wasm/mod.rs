@@ -840,12 +840,8 @@ fn dragon_training_action_state(
             enabled: false,
         });
     }
-    if view.runtime_label.starts_with("joining ") {
-        return Some(DragonTrainingActionState {
-            label: "preparing",
-            detail: "connecting to the peer network".into(),
-            enabled: false,
-        });
+    if view.runtime_label.starts_with("joining ") || view.runtime_label.starts_with("catchup ") {
+        return None;
     }
     if view.runtime_label == "blocked" {
         return Some(DragonTrainingActionState {
@@ -1071,7 +1067,7 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
     if view.network.direct_peers > 0 {
         if view.network.estimated_network_size > view.network.direct_peers {
             return format!(
-                "{} direct · ~{} visible",
+                "{} direct · ~{} recently seen",
                 view.network.direct_peers, view.network.estimated_network_size
             );
         }
@@ -1092,7 +1088,7 @@ fn dragon_network_detail(view: Option<&BrowserAppClientView>) -> String {
     }
     if view.network.estimated_network_size > 0 {
         return format!(
-            "~{} visible from the current network view",
+            "~{} recently seen from the current network view",
             view.network.estimated_network_size
         );
     }
@@ -1172,6 +1168,12 @@ fn dragon_local_training_detail(
             );
         }
         return format!("loss {loss}");
+    }
+    if view.runtime_label.starts_with("joining ") || view.runtime_label.starts_with("catchup ") {
+        let detail = view.runtime_detail.trim();
+        if !detail.is_empty() {
+            return detail.to_owned();
+        }
     }
     training_action_state
         .map(|state| state.detail.clone())
@@ -1269,10 +1271,20 @@ fn dragon_runtime_mode_detail(
         return view.runtime_detail.clone();
     }
     if view.runtime_label.starts_with("joining ") {
-        return "connecting to the peer network".into();
+        let detail = view.runtime_detail.trim();
+        return if detail.is_empty() {
+            "connecting to the peer network".into()
+        } else {
+            detail.to_owned()
+        };
     }
     if view.runtime_label.starts_with("catchup ") {
-        return "syncing the current checkpoint".into();
+        let detail = view.runtime_detail.trim();
+        return if detail.is_empty() {
+            "syncing the current checkpoint".into()
+        } else {
+            detail.to_owned()
+        };
     }
     training_action_state
         .map(|state| state.detail.clone())
@@ -3591,7 +3603,10 @@ mod tests {
             dragon_window_progress_detail(Some(&view), "9s of 30s"),
             "32 left · eta 4s"
         );
-        assert_eq!(dragon_network_detail(Some(&view)), "3 direct · ~9 visible");
+        assert_eq!(
+            dragon_network_detail(Some(&view)),
+            "3 direct · ~9 recently seen"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -3617,6 +3632,25 @@ mod tests {
         assert!(ready.enabled);
         assert_eq!(ready.label, "run browser training");
         assert!(ready.detail.contains("downloads when the run starts"));
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_joining_state_uses_runtime_detail_without_redundant_action_status() {
+        let mut view = sample_browser_view();
+        view.runtime_label = "joining train".into();
+        view.runtime_detail = "connecting peer transport".into();
+        view.training.can_train = true;
+
+        let action = dragon_training_action_state(Some(&view), true, true, false, false, None);
+        assert!(action.is_none());
+        assert_eq!(
+            dragon_local_training_detail(Some(&view), action.as_ref()),
+            "connecting peer transport"
+        );
+        assert_eq!(
+            dragon_runtime_mode_detail(Some(&view), false, action.as_ref(), false, None),
+            "connecting peer transport"
+        );
     }
 
     #[wasm_bindgen_test]

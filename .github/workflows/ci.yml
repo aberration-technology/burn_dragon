@@ -99,7 +99,22 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --manifest-path Cargo.toml --workspace --all-targets --exclude burn_dragon_p2p --exclude xtask -- --test-threads=1
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_checkpoint --all-targets -- --test-threads=1
+        timeout-minutes: 15
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_core --all-targets -- --test-threads=1
+        timeout-minutes: 20
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_kernel --all-targets -- --test-threads=1
+        timeout-minutes: 25
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_language --all-targets -- --test-threads=1
+        timeout-minutes: 15
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_time --all-targets -- --test-threads=1
+        timeout-minutes: 5
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_tokenizer --all-targets -- --test-threads=1
+        timeout-minutes: 5
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_train --all-targets -- --test-threads=1
+        timeout-minutes: 15
+      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets -- --test-threads=1
+        timeout-minutes: 15
       - run: cargo run --manifest-path Cargo.toml -p xtask -- native-smoke
         timeout-minutes: 45
       - run: cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke

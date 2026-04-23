@@ -11,8 +11,8 @@ def main() -> None:
         "training,",
         "fn resolve_browser_training_config(",
         "snapshot.directory.entries",
-        "selected experiment `{selected_experiment_id}` requires an edge snapshot so the browser training profile can be embedded",
         "selected experiment `{selected_experiment_id}` does not publish a browser training profile",
+        "warning: continuing without embedded snapshot because explicit browser seed URLs were provided; the browser app will fetch live edge state at runtime",
     ]
     for snippet in required_snippets:
         assert snippet in source, f"browser_site.rs missing required training-config snippet: {snippet}"

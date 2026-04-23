@@ -699,10 +699,8 @@ fn browser_site_bootstrap_json(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let edge_snapshot = edge_url
-        .as_deref()
-        .map(fetch_browser_edge_snapshot)
-        .transpose()?;
+    let edge_snapshot =
+        fetch_optional_browser_edge_snapshot(edge_url.as_deref(), seed_node_urls.as_slice())?;
     let mut signed_seed_advertisement =
         if let (Some(edge_url), Some(snapshot)) = (edge_url.as_deref(), edge_snapshot.as_ref()) {
             fetch_signed_seed_advertisement(edge_url, snapshot)?
@@ -748,9 +746,7 @@ fn resolve_browser_training_config(
     };
 
     let Some(snapshot) = edge_snapshot else {
-        return Err(anyhow!(
-            "selected experiment `{selected_experiment_id}` requires an edge snapshot so the browser training profile can be embedded"
-        ));
+        return Ok(None);
     };
 
     let training = browser_training_config_from_directory_entries(
@@ -789,6 +785,27 @@ fn fetch_browser_edge_snapshot(edge_url: &str) -> Result<BrowserEdgeSnapshot> {
         .context("browser edge snapshot returned a non-success status")?
         .json::<BrowserEdgeSnapshot>()
         .context("decode browser edge snapshot JSON")
+}
+
+fn fetch_optional_browser_edge_snapshot(
+    edge_url: Option<&str>,
+    seed_node_urls: &[String],
+) -> Result<Option<BrowserEdgeSnapshot>> {
+    let Some(edge_url) = edge_url else {
+        return Ok(None);
+    };
+
+    match fetch_browser_edge_snapshot(edge_url) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if !seed_node_urls.is_empty() => {
+            eprintln!("warning: failed to embed browser edge snapshot from {edge_url}: {error:#}");
+            eprintln!(
+                "warning: continuing without embedded snapshot because explicit browser seed URLs were provided; the browser app will fetch live edge state at runtime"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn is_webrtc_direct_browser_seed(value: &str) -> bool {
@@ -989,8 +1006,9 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_HTML_TEMPLATE, prefer_validated_browser_seed_urls, should_retry_edge_status,
-        write_html_page, write_site_shell,
+        INDEX_HTML_TEMPLATE, fetch_optional_browser_edge_snapshot,
+        prefer_validated_browser_seed_urls, resolve_browser_training_config,
+        should_retry_edge_status, write_html_page, write_site_shell,
     };
     use crate::browser_site::BuildBrowserSiteArgs;
     use std::path::PathBuf;
@@ -1059,5 +1077,23 @@ mod tests {
         ));
         assert!(!should_retry_edge_status(reqwest::StatusCode::NOT_FOUND));
         assert!(!should_retry_edge_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn selected_experiment_without_snapshot_uses_runtime_training_resolution() {
+        let training =
+            resolve_browser_training_config(None, Some("nca-prepretraining"), Some("nca-r1"))
+                .expect("resolve training config");
+        assert!(training.is_none());
+    }
+
+    #[test]
+    fn explicit_seed_urls_allow_runtime_snapshot_fallback() {
+        let snapshot = fetch_optional_browser_edge_snapshot(
+            Some("https://127.0.0.1:9"),
+            &["/ip4/127.0.0.1/udp/443/webrtc-direct/certhash/uEiAbc".to_owned()],
+        )
+        .expect("runtime fallback should not fail site generation");
+        assert!(snapshot.is_none());
     }
 }

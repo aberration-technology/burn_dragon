@@ -852,11 +852,13 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         &config,
         args.experiment_kind.into_config(),
         args.backend,
-        Some(args.auth_bundle.as_path()),
-        args.auth_bundle_format,
-        None,
-        DEFAULT_SESSION_TTL_SECS,
-        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        NativeAuthResolutionOptions {
+            auth_bundle_path: Some(args.auth_bundle.as_path()),
+            auth_bundle_format: args.auth_bundle_format,
+            principal_hint: None,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        },
     )?;
     let edge_base_url = args
         .edge_url
@@ -1227,21 +1229,26 @@ fn perform_interactive_native_login(
     Ok(session.auth)
 }
 
-fn resolve_or_login_native_auth_bundle(
-    config: &DragonNativePeerConfig,
-    experiment_kind: DragonExperimentKind,
-    backend: BackendArg,
-    auth_bundle_path: Option<&Path>,
+#[derive(Clone, Debug)]
+struct NativeAuthResolutionOptions<'a> {
+    auth_bundle_path: Option<&'a Path>,
     auth_bundle_format: ConfigFormat,
     principal_hint: Option<String>,
     session_ttl_secs: i64,
     callback_timeout_secs: u64,
+}
+
+fn resolve_or_login_native_auth_bundle(
+    config: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+    backend: BackendArg,
+    options: NativeAuthResolutionOptions<'_>,
 ) -> Result<DragonNativeAuthBundle> {
-    let mut loaded = if let Some(path) = auth_bundle_path {
+    let mut loaded = if let Some(path) = options.auth_bundle_path {
         if path.is_file() {
             Some(load_typed::<DragonNativeAuthBundle>(
                 path,
-                auth_bundle_format,
+                options.auth_bundle_format,
             )?)
         } else {
             None
@@ -1252,8 +1259,8 @@ fn resolve_or_login_native_auth_bundle(
 
     if let Some(bundle) = loaded.take() {
         if native_auth_bundle_is_fresh(&bundle) {
-            if let Some(path) = auth_bundle_path {
-                write_auth_bundle(path, auth_bundle_format, &bundle)?;
+            if let Some(path) = options.auth_bundle_path {
+                write_auth_bundle(path, options.auth_bundle_format, &bundle)?;
             }
             return Ok(bundle);
         }
@@ -1267,8 +1274,8 @@ fn resolve_or_login_native_auth_bundle(
                 None,
             )) {
             Ok(refreshed) => {
-                if let Some(path) = auth_bundle_path {
-                    write_auth_bundle(path, auth_bundle_format, &refreshed)?;
+                if let Some(path) = options.auth_bundle_path {
+                    write_auth_bundle(path, options.auth_bundle_format, &refreshed)?;
                 }
                 return Ok(refreshed);
             }
@@ -1283,12 +1290,12 @@ fn resolve_or_login_native_auth_bundle(
         config,
         experiment_kind,
         backend,
-        principal_hint,
-        session_ttl_secs,
-        callback_timeout_secs,
+        options.principal_hint,
+        options.session_ttl_secs,
+        options.callback_timeout_secs,
     )?;
-    if let Some(path) = auth_bundle_path {
-        write_auth_bundle(path, auth_bundle_format, &authenticated)?;
+    if let Some(path) = options.auth_bundle_path {
+        write_auth_bundle(path, options.auth_bundle_format, &authenticated)?;
     }
     Ok(authenticated)
 }
@@ -1419,11 +1426,13 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         &config,
         args.experiment_kind.into_config(),
         args.backend,
-        args.auth_bundle.as_deref(),
-        args.auth_bundle_format,
-        None,
-        DEFAULT_SESSION_TTL_SECS,
-        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        NativeAuthResolutionOptions {
+            auth_bundle_path: args.auth_bundle.as_deref(),
+            auth_bundle_format: args.auth_bundle_format,
+            principal_hint: None,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        },
     )?;
 
     match (args.experiment_kind.into_config(), args.backend) {
@@ -1609,11 +1618,13 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
         &config,
         args.experiment_kind.into_config(),
         args.backend,
-        args.auth_bundle.as_deref(),
-        args.auth_bundle_format,
-        None,
-        DEFAULT_SESSION_TTL_SECS,
-        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        NativeAuthResolutionOptions {
+            auth_bundle_path: args.auth_bundle.as_deref(),
+            auth_bundle_format: args.auth_bundle_format,
+            principal_hint: None,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        },
     )?);
 
     match (args.experiment_kind.into_config(), args.backend) {
@@ -1694,11 +1705,13 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         &config,
         args.experiment_kind.into_config(),
         args.backend,
-        args.auth_bundle.as_deref(),
-        args.auth_bundle_format,
-        None,
-        DEFAULT_SESSION_TTL_SECS,
-        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        NativeAuthResolutionOptions {
+            auth_bundle_path: args.auth_bundle.as_deref(),
+            auth_bundle_format: args.auth_bundle_format,
+            principal_hint: None,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        },
     )?);
 
     match (args.experiment_kind.into_config(), args.backend) {
@@ -1785,11 +1798,13 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
         &config,
         args.experiment_kind.into_config(),
         args.backend,
-        args.auth_bundle.as_deref(),
-        args.auth_bundle_format,
-        None,
-        DEFAULT_SESSION_TTL_SECS,
-        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        NativeAuthResolutionOptions {
+            auth_bundle_path: args.auth_bundle.as_deref(),
+            auth_bundle_format: args.auth_bundle_format,
+            principal_hint: None,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+        },
     )?);
 
     match (args.experiment_kind.into_config(), args.backend) {

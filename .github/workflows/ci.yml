@@ -69,6 +69,8 @@ jobs:
       - run: python3 scripts/test_cleanup_workflow.py
       - run: python3 scripts/test_deployment_strategy.py
       - run: python3 scripts/test_deployment_version_sync.py
+      - run: python3 scripts/test_deploy_pages_workflow.py
+      - run: python3 scripts/test_resolve_pages_deploy_settings.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
       - run: python3 scripts/test_live_browser_canary_script.py
       - run: python3 scripts/test_browser_transport_terraform.py

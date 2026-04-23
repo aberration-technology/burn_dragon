@@ -292,19 +292,27 @@ Provision GitHub auth:
 
 ```bash
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
+  login \
+  --config path/to/peer.toml \
+  --experiment-kind nca \
+  --backend wgpu \
+  --edge-url "$MAINNET_EDGE_URL" \
+  --auth-bundle-out /var/lib/burn_dragon_p2p/auth-bundle.json
+```
+
+That launches the deployed browser callback bridge, completes GitHub SSO in the browser, relays the provider callback back into the local CLI over a loopback listener, and writes a refreshable auth bundle. The same bundle is also cached under the peer storage root, and `run-peer`, `run-head-mirror`, `run-validator-daemon`, and `train-window-once` now reuse that cache and attempt session refresh automatically before falling back to another browser login.
+
+The manual two-step path remains available for headless or debugging workflows:
+
+```bash
+cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
   begin-github-login \
   --config path/to/peer.toml \
   --experiment-kind nca \
   --backend wgpu \
   --edge-url "$MAINNET_EDGE_URL" \
   --pending-out /var/lib/burn_dragon_p2p/pending-login.json
-```
 
-That prints the authorize URL when the edge is using the interactive flow and writes the pending login state to disk.
-
-Complete the login after you have the provider code:
-
-```bash
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
   complete-github-login \
   --config path/to/peer.toml \

@@ -11,8 +11,12 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+
 use burn_dragon_p2p::auth::{
     begin_native_github_login, complete_native_github_login, fetch_edge_snapshot,
+    load_cached_native_auth_bundle, native_auth_bundle_is_fresh, native_cli_bridge_url,
+    refresh_native_auth_bundle, store_cached_native_auth_bundle,
 };
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExistingShardDatasetConfig, DragonManifestSeed,
@@ -97,6 +101,9 @@ fn dummy_auth_bundle() -> DragonNativeAuthBundle {
         edge_base_url: None,
         session_id: None,
         principal_id: None,
+        enrollment: None,
+        session: None,
+        certificate_not_after: None,
     }
 }
 
@@ -756,6 +763,7 @@ struct MockEdgeState {
     authorized_directory_fetches: usize,
     unauthorized_directory_fetches: usize,
     receipt_submission_batches: usize,
+    refresh_requests: usize,
     submitted_receipt_ids: Vec<String>,
     enrolled_peer_ids: BTreeSet<String>,
     sessions: BTreeMap<String, PrincipalSession>,
@@ -1057,7 +1065,7 @@ fn spawn_local_edge(snapshot: BrowserEdgeSnapshot) -> LocalEdgeMock {
                             login_id,
                             provider: AuthProvider::GitHub,
                             state: state_token,
-                            authorize_url: Some("https://github.example/authorize".into()),
+                            authorize_url: Some("https://github.example/authorize?redirect_uri=https%3A%2F%2Fdragon.example%2Fcallback%2Fgithub".into()),
                             expires_at: Utc::now() + chrono::Duration::minutes(5),
                         },
                     );
@@ -1107,6 +1115,41 @@ fn spawn_local_edge(snapshot: BrowserEdgeSnapshot) -> LocalEdgeMock {
                         .sessions
                         .insert(session.session_id.as_str().to_owned(), session.clone());
                     respond_json(request, 200, &session);
+                }
+                (&Method::Post, "/refresh") => {
+                    #[derive(Deserialize)]
+                    struct RefreshRequest {
+                        session_id: ContentId,
+                    }
+
+                    let refresh: RefreshRequest = read_json(&mut request);
+                    let mut state = state_for_thread.lock().expect("state");
+                    let Some(session) = state.sessions.get(refresh.session_id.as_str()).cloned()
+                    else {
+                        respond_text(request, 401, r#"{"error":"unknown session"}"#);
+                        continue;
+                    };
+                    let refreshed = PrincipalSession {
+                        session_id: ContentId::new(format!(
+                            "refreshed-{}-{}",
+                            session.session_id.as_str(),
+                            state.refresh_requests + 1
+                        )),
+                        network_id: session.network_id.clone(),
+                        claims: PrincipalClaims {
+                            expires_at: Utc::now() + chrono::Duration::minutes(30),
+                            issued_at: Utc::now(),
+                            ..session.claims.clone()
+                        },
+                        issued_at: Utc::now(),
+                        expires_at: Utc::now() + chrono::Duration::minutes(30),
+                    };
+                    state.refresh_requests += 1;
+                    state
+                        .sessions
+                        .insert(refreshed.session_id.as_str().to_owned(), refreshed.clone());
+                    drop(state);
+                    respond_json(request, 200, &refreshed);
                 }
                 (&Method::Post, "/enroll") => {
                     let enrollment: EdgePeerEnrollmentRequest = read_json(&mut request);
@@ -4011,6 +4054,131 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
     assert!(losses_a.iter().copied().fold(f64::INFINITY, f64::min) <= losses_a[0] + 0.5);
     assert!(losses_b.iter().copied().fold(f64::INFINITY, f64::min) <= losses_b[0] + 0.5);
     assert!(losses_c.iter().copied().fold(f64::INFINITY, f64::min) <= losses_c[0] + 0.5);
+}
+
+#[test]
+fn native_auth_refresh_reenrolls_and_updates_cached_bundle() {
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca-refresh.toml");
+    let training_config_path = root.path().join("nca-refresh-train.toml");
+    let shard_root = root.path().join("nca-refresh-shards");
+    fs::create_dir_all(&shard_root).expect("mkdir shards");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(
+            &root.path().join("nca-refresh-cache"),
+            &nca_config_path,
+            SMALL_SPEC,
+        ),
+    );
+
+    let native = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path],
+        storage_root: root.path().join("storage-refresh-native"),
+        network: Default::default(),
+        target: None,
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.22").expect("valid burn_dragon version"),
+        git_commit: Some("auth-refresh".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: shard_root,
+            dataset_name: Some("dragon-nca-refresh".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+    let edge = spawn_local_edge(edge_snapshot_for_manifests(
+        &prepared.manifests,
+        BrowserMode::Trainer,
+    ));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    runtime.block_on(async {
+        let requested_scopes = prepared.manifests.experiment_directory[0]
+            .allowed_scopes
+            .clone();
+        let pending = begin_native_github_login(
+            &edge.base_url,
+            &prepared.manifests.release_manifest,
+            requested_scopes,
+            1800,
+            Some("refresh-native".into()),
+            false,
+        )
+        .await
+        .expect("begin native github login");
+
+        let bridge_url =
+            native_cli_bridge_url(&pending, "http://127.0.0.1:43123/callback", "nonce-refresh")
+                .expect("native bridge url");
+        assert!(bridge_url.starts_with("https://dragon.example/callback/github"));
+
+        let native_session = complete_native_github_login(
+            native.storage_root.as_path(),
+            &pending,
+            "native-provider-code",
+            None,
+        )
+        .await
+        .expect("complete native github login");
+        assert!(
+            native_session.auth.enrollment.is_some(),
+            "completed auth should persist enrollment metadata"
+        );
+        assert!(
+            native_session.auth.session.is_some(),
+            "completed auth should persist session metadata"
+        );
+        assert!(
+            load_cached_native_auth_bundle(native.storage_root.as_path())
+                .expect("load cached auth")
+                .is_some(),
+            "completed auth should write the default cache file"
+        );
+
+        let mut stale = native_session.auth.clone();
+        stale.certificate_not_after = Some(Utc::now() - chrono::Duration::seconds(5));
+        if let Some(session) = stale.session.as_mut() {
+            session.expires_at = Utc::now() - chrono::Duration::seconds(5);
+        }
+        assert!(
+            !native_auth_bundle_is_fresh(&stale),
+            "expired session metadata should force refresh"
+        );
+        store_cached_native_auth_bundle(native.storage_root.as_path(), &stale)
+            .expect("store stale auth cache");
+
+        let refreshed = refresh_native_auth_bundle(native.storage_root.as_path(), &stale, None)
+            .await
+            .expect("refresh native auth");
+        assert!(
+            native_auth_bundle_is_fresh(&refreshed),
+            "refreshed bundle should be reusable"
+        );
+        assert_ne!(refreshed.session_id, stale.session_id);
+        assert_eq!(
+            edge.state.lock().expect("state").refresh_requests,
+            1,
+            "refresh endpoint should be exercised once"
+        );
+        let cached = load_cached_native_auth_bundle(native.storage_root.as_path())
+            .expect("load refreshed cache")
+            .expect("cached bundle");
+        assert_eq!(cached.session_id, refreshed.session_id);
+    });
 }
 
 #[test]

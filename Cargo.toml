@@ -49,15 +49,15 @@ burn_dragon_tokenizer = { version = "=0.21.0-pre.22", path = "crates/burn_dragon
 burn_dragon_train = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_train", default-features = false }
 burn_dragon_universality = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_universality", default-features = false }
 
-burn_p2p = { version = "=0.21.0-pre.34", default-features = false }
-burn_p2p_admin = { version = "=0.21.0-pre.34" }
-burn_p2p_app = { version = "=0.21.0-pre.34", default-features = false }
-burn_p2p_bootstrap = { version = "=0.21.0-pre.34" }
-burn_p2p_browser = { version = "=0.21.0-pre.34" }
-burn_p2p_core = { version = "=0.21.0-pre.34" }
-burn_p2p_dataloader = { version = "=0.21.0-pre.34" }
-burn_p2p_views = { version = "=0.21.0-pre.34" }
-burn_p2p_workload = { version = "=0.21.0-pre.34" }
+burn_p2p = { version = "=0.21.0-pre.35", default-features = false }
+burn_p2p_admin = { version = "=0.21.0-pre.35" }
+burn_p2p_app = { version = "=0.21.0-pre.35", default-features = false }
+burn_p2p_bootstrap = { version = "=0.21.0-pre.35" }
+burn_p2p_browser = { version = "=0.21.0-pre.35" }
+burn_p2p_core = { version = "=0.21.0-pre.35" }
+burn_p2p_dataloader = { version = "=0.21.0-pre.35" }
+burn_p2p_views = { version = "=0.21.0-pre.35" }
+burn_p2p_workload = { version = "=0.21.0-pre.35" }
 
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -74,8 +74,6 @@ tempfile = "3"
 wasm-bindgen-cli-support = "0.2"
 web-time = "1.1"
 
-[patch.crates-io]
-libp2p-webrtc-websys = { path = "vendor/libp2p-webrtc-websys" }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

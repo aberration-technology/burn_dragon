@@ -9,7 +9,10 @@ use burn_dragon_language::DragonConfig;
 use burn_dragon_universality::NcaCorpusConfig;
 #[cfg(feature = "native")]
 use burn_p2p::NetworkManifest;
-use burn_p2p::{AuthConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet, SwarmAddress};
+use burn_p2p::{
+    AuthConfig, EdgeEnrollmentConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet,
+    PrincipalSession, SwarmAddress,
+};
 #[cfg(target_arch = "wasm32")]
 use burn_p2p_browser::BrowserSiteBootstrapConfig;
 use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
@@ -533,6 +536,12 @@ pub struct DragonNativeAuthBundle {
     pub session_id: Option<String>,
     #[serde(default)]
     pub principal_id: Option<String>,
+    #[serde(default)]
+    pub enrollment: Option<EdgeEnrollmentConfig>,
+    #[serde(default)]
+    pub session: Option<PrincipalSession>,
+    #[serde(default)]
+    pub certificate_not_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

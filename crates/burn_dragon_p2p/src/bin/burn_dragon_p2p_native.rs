@@ -1,9 +1,13 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +21,9 @@ use burn_dragon_p2p::admin::{
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, begin_native_github_login, complete_native_github_login,
-    enroll_native_static_principal, fetch_edge_snapshot,
+    default_native_auth_bundle_path, enroll_native_static_principal, fetch_edge_snapshot,
+    load_cached_native_auth_bundle, native_auth_bundle_is_fresh, native_cli_bridge_url,
+    refresh_native_auth_bundle,
 };
 use burn_dragon_p2p::build_info;
 use burn_dragon_p2p::capability_state::{
@@ -51,10 +57,13 @@ use burn_p2p::{
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Serialize, de::DeserializeOwned};
+use url::Url;
 
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_SESSION_TTL_SECS: i64 = 1800;
+const DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STATUS_INTERVAL_SECS: u64 = 30;
 const DEFAULT_VALIDATION_INTERVAL_MILLIS: u64 = 250;
 const DEFAULT_HEAD_SYNC_INTERVAL_SECS: u64 = 15;
@@ -78,6 +87,8 @@ enum CommandKind {
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
+    #[command(alias = "github-login")]
+    Login(LoginArgs),
     #[command(alias = "begin-login")]
     BeginGithubLogin(BeginGithubLoginArgs),
     #[command(alias = "complete-login")]
@@ -337,6 +348,32 @@ struct AdminRolloutProfileArgs {
 }
 
 #[derive(Debug, Parser)]
+struct LoginArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum)]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    principal_hint: Option<String>,
+    #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+    session_ttl_secs: i64,
+    #[arg(long, default_value_t = DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS)]
+    callback_timeout_secs: u64,
+    #[arg(long)]
+    auth_bundle_out: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
 struct CompleteGithubLoginArgs {
     #[arg(long)]
     config: PathBuf,
@@ -431,7 +468,7 @@ struct TrainWindowOnceArgs {
     #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
     seed_node_urls: Vec<String>,
     #[arg(long)]
-    auth_bundle: PathBuf,
+    auth_bundle: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     auth_bundle_format: ConfigFormat,
     #[arg(long, default_value_t = true)]
@@ -596,6 +633,7 @@ fn main() -> Result<()> {
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
+        CommandKind::Login(args) => login(args),
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
         CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
@@ -617,6 +655,7 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::BuildProfile(_) => "build-profile",
         CommandKind::AdminExportDirectory(_) => "admin-export-directory",
         CommandKind::AdminRolloutProfile(_) => "admin-rollout-profile",
+        CommandKind::Login(_) => "login",
         CommandKind::BeginGithubLogin(_) => "begin-github-login",
         CommandKind::CompleteGithubLogin(_) => "complete-github-login",
         CommandKind::EnrollStaticPrincipal(_) => "enroll-static-principal",
@@ -809,8 +848,16 @@ fn admin_export_directory(args: AdminExportDirectoryArgs) -> Result<()> {
 
 fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
     let config = load_native_config(&args.config, args.config_format)?;
-    let auth_bundle: DragonNativeAuthBundle =
-        load_typed(&args.auth_bundle, args.auth_bundle_format)?;
+    let auth_bundle = resolve_or_login_native_auth_bundle(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        Some(args.auth_bundle.as_path()),
+        args.auth_bundle_format,
+        None,
+        DEFAULT_SESSION_TTL_SECS,
+        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+    )?;
     let edge_base_url = args
         .edge_url
         .or_else(|| auth_bundle.edge_base_url.clone())
@@ -860,14 +907,260 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
     )
 }
 
-fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
-    let config = resolved_config(
-        &args.config,
-        args.config_format,
-        args.edge_url,
-        args.seed_node_urls,
-        None,
+#[derive(Debug)]
+struct NativeBrowserAuthCallback {
+    provider_code: String,
+    state: String,
+}
+
+struct NativeBrowserAuthListener {
+    callback_url: String,
+    nonce: String,
+    receiver: mpsc::Receiver<Result<NativeBrowserAuthCallback>>,
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl NativeBrowserAuthListener {
+    fn wait(mut self, timeout: Duration) -> Result<NativeBrowserAuthCallback> {
+        let callback = match self.receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!(
+                    "timed out waiting for browser auth callback after {:?}",
+                    timeout
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("browser auth listener terminated before delivering a callback")
+            }
+        }?;
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            join.join().expect("browser auth listener thread");
+        }
+        Ok(callback)
+    }
+}
+
+impl Drop for NativeBrowserAuthListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn browser_auth_response_html(title: &str, message: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body style=\"font-family: ui-monospace, monospace; background: #111; color: #f3f3f3; padding: 2rem;\"><h1 style=\"font-size: 1.1rem; margin-bottom: 1rem;\">{title}</h1><p>{message}</p><script>setTimeout(() => window.close(), 250);</script></body></html>"
+    )
+}
+
+fn write_browser_auth_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
     )?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn parse_native_browser_auth_callback(
+    stream: &mut TcpStream,
+    expected_nonce: &str,
+) -> Result<NativeBrowserAuthCallback> {
+    let mut request_line = String::new();
+    let mut reader = BufReader::new(stream.try_clone()?);
+    reader.read_line(&mut request_line)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if method != "GET" {
+        let _ = write_browser_auth_response(
+            stream,
+            "405 Method Not Allowed",
+            &browser_auth_response_html(
+                "login failed",
+                "the local auth callback only accepts GET requests.",
+            ),
+        );
+        bail!("browser auth callback used unsupported method {method}");
+    }
+    let url = Url::parse(&format!("http://127.0.0.1{target}"))
+        .with_context(|| format!("failed to parse browser auth callback target {target}"))?;
+    if url.path() != "/callback" {
+        let _ = write_browser_auth_response(
+            stream,
+            "404 Not Found",
+            &browser_auth_response_html("login failed", "unexpected local callback path."),
+        );
+        bail!("browser auth callback used unexpected path {}", url.path());
+    }
+
+    let mut nonce = None;
+    let mut provider_code = None;
+    let mut state = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "native_nonce" => nonce = Some(value.into_owned()),
+            "provider_code" => provider_code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if nonce.as_deref() != Some(expected_nonce) {
+        let _ = write_browser_auth_response(
+            stream,
+            "400 Bad Request",
+            &browser_auth_response_html("login failed", "the local auth nonce did not match."),
+        );
+        bail!("browser auth callback nonce mismatch");
+    }
+    let provider_code = provider_code
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("browser auth callback is missing provider_code"))?;
+    let state = state
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("browser auth callback is missing state"))?;
+    write_browser_auth_response(
+        stream,
+        "200 OK",
+        &browser_auth_response_html(
+            "login complete",
+            "GitHub login completed. You can return to the CLI.",
+        ),
+    )?;
+    Ok(NativeBrowserAuthCallback {
+        provider_code,
+        state,
+    })
+}
+
+fn random_browser_auth_nonce() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn start_native_browser_auth_listener() -> Result<NativeBrowserAuthListener> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to bind browser auth callback listener")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure browser auth callback listener")?;
+    let callback_url = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr()?.port()
+    );
+    let nonce = random_browser_auth_nonce();
+    let expected_nonce = nonce.clone();
+    let (sender, receiver) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let join = thread::spawn(move || {
+        loop {
+            if stop_for_thread.load(Ordering::SeqCst) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = parse_native_browser_auth_callback(&mut stream, &expected_nonce);
+                    let _ = sender.send(result);
+                    stop_for_thread.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(anyhow!(
+                        "failed to accept browser auth callback: {error}"
+                    )));
+                    stop_for_thread.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    });
+    Ok(NativeBrowserAuthListener {
+        callback_url,
+        nonce,
+        receiver,
+        stop,
+        join: Some(join),
+    })
+}
+
+fn open_url_in_system_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open").arg(url).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("open exited with status {status}");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("start exited with status {status}");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for (program, args) in [("xdg-open", vec![url]), ("gio", vec!["open", url])] {
+            match Command::new(program).args(args).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) | Err(_) => continue,
+            }
+        }
+        bail!("failed to launch a system browser via xdg-open or gio open");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        bail!("automatic browser launch is not implemented on this platform");
+    }
+}
+
+fn auth_bundle_output_format(path: &Path, format: ConfigFormat) -> Result<OutputFormat> {
+    let format = match format {
+        ConfigFormat::Auto => infer_format(path)?,
+        explicit => explicit,
+    };
+    match format {
+        ConfigFormat::Toml => Ok(OutputFormat::Toml),
+        ConfigFormat::Json => Ok(OutputFormat::Json),
+        ConfigFormat::Auto => unreachable!(),
+    }
+}
+
+fn write_auth_bundle(
+    path: &Path,
+    format: ConfigFormat,
+    value: &DragonNativeAuthBundle,
+) -> Result<()> {
+    write_output(Some(path), auth_bundle_output_format(path, format)?, value)
+}
+
+fn build_pending_native_login(
+    config: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+    backend: BackendArg,
+    principal_hint: Option<String>,
+    session_ttl_secs: i64,
+    use_device_flow: bool,
+) -> Result<(tokio::runtime::Runtime, DragonPendingGitHubLogin)> {
     let edge_base_url = config
         .effective_edge_base_url()
         .ok_or_else(|| anyhow!("no edge base URL configured"))?
@@ -877,9 +1170,8 @@ fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
         .build()
         .context("failed to build async runtime for GitHub login")?;
     let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
-    let release_manifest =
-        native_release_manifest_for_snapshot(&config, &snapshot, args.backend, None)?;
-    let manifests = prepared_manifests(&config, args.experiment_kind.into_config(), args.backend)?;
+    let release_manifest = native_release_manifest_for_snapshot(config, &snapshot, backend, None)?;
+    let manifests = prepared_manifests(config, experiment_kind, backend)?;
     let requested_scopes = requested_scopes(
         manifests
             .experiment_directory
@@ -890,10 +1182,159 @@ fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
         &edge_base_url,
         &release_manifest,
         requested_scopes,
-        args.session_ttl_secs,
-        args.principal_hint,
-        args.device_flow,
+        session_ttl_secs,
+        principal_hint,
+        use_device_flow,
     ))?;
+    Ok((runtime, pending))
+}
+
+fn perform_interactive_native_login(
+    config: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+    backend: BackendArg,
+    principal_hint: Option<String>,
+    session_ttl_secs: i64,
+    callback_timeout_secs: u64,
+) -> Result<DragonNativeAuthBundle> {
+    let (runtime, pending) = build_pending_native_login(
+        config,
+        experiment_kind,
+        backend,
+        principal_hint,
+        session_ttl_secs,
+        false,
+    )?;
+    let listener = start_native_browser_auth_listener()?;
+    let bridge_url = native_cli_bridge_url(&pending, &listener.callback_url, &listener.nonce)?;
+    match open_url_in_system_browser(&bridge_url) {
+        Ok(()) => eprintln!("launched browser for GitHub login"),
+        Err(error) => {
+            eprintln!("automatic browser launch failed: {error}");
+            eprintln!("Open this URL to continue GitHub login:\n{bridge_url}");
+        }
+    }
+    let callback = listener.wait(Duration::from_secs(callback_timeout_secs))?;
+    if callback.state != pending.login.state {
+        bail!("browser auth callback state mismatch");
+    }
+    let session = runtime.block_on(complete_native_github_login(
+        &config.storage_root,
+        &pending,
+        &callback.provider_code,
+        None,
+    ))?;
+    Ok(session.auth)
+}
+
+fn resolve_or_login_native_auth_bundle(
+    config: &DragonNativePeerConfig,
+    experiment_kind: DragonExperimentKind,
+    backend: BackendArg,
+    auth_bundle_path: Option<&Path>,
+    auth_bundle_format: ConfigFormat,
+    principal_hint: Option<String>,
+    session_ttl_secs: i64,
+    callback_timeout_secs: u64,
+) -> Result<DragonNativeAuthBundle> {
+    let mut loaded = if let Some(path) = auth_bundle_path {
+        if path.is_file() {
+            Some(load_typed::<DragonNativeAuthBundle>(
+                path,
+                auth_bundle_format,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        load_cached_native_auth_bundle(&config.storage_root)?
+    };
+
+    if let Some(bundle) = loaded.take() {
+        if native_auth_bundle_is_fresh(&bundle) {
+            if let Some(path) = auth_bundle_path {
+                write_auth_bundle(path, auth_bundle_format, &bundle)?;
+            }
+            return Ok(bundle);
+        }
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build async runtime for auth refresh")?
+            .block_on(refresh_native_auth_bundle(
+                &config.storage_root,
+                &bundle,
+                None,
+            )) {
+            Ok(refreshed) => {
+                if let Some(path) = auth_bundle_path {
+                    write_auth_bundle(path, auth_bundle_format, &refreshed)?;
+                }
+                return Ok(refreshed);
+            }
+            Err(error) => {
+                eprintln!("native auth refresh failed: {error}");
+                eprintln!("falling back to interactive browser login");
+            }
+        }
+    }
+
+    let authenticated = perform_interactive_native_login(
+        config,
+        experiment_kind,
+        backend,
+        principal_hint,
+        session_ttl_secs,
+        callback_timeout_secs,
+    )?;
+    if let Some(path) = auth_bundle_path {
+        write_auth_bundle(path, auth_bundle_format, &authenticated)?;
+    }
+    Ok(authenticated)
+}
+
+fn login(args: LoginArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        None,
+    )?;
+    let auth = perform_interactive_native_login(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.principal_hint,
+        args.session_ttl_secs,
+        args.callback_timeout_secs,
+    )?;
+    eprintln!(
+        "native auth cache updated: {}",
+        default_native_auth_bundle_path(&config.storage_root).display()
+    );
+    if let Some(path) = args.auth_bundle_out.as_deref() {
+        write_auth_bundle(path, ConfigFormat::Auto, &auth)?;
+    }
+    write_output(None, args.output_format, &auth)
+}
+
+fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
+    let config = resolved_config(
+        &args.config,
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        None,
+    )?;
+    let (_runtime, pending) = build_pending_native_login(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.principal_hint,
+        args.session_ttl_secs,
+        args.device_flow,
+    )?;
     if let Some(authorize_url) = pending.login.authorize_url.as_deref() {
         eprintln!("Open this URL to continue GitHub login:\n{authorize_url}");
     }
@@ -974,8 +1415,16 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
-    let auth_bundle: DragonNativeAuthBundle =
-        load_typed(&args.auth_bundle, args.auth_bundle_format)?;
+    let auth_bundle = resolve_or_login_native_auth_bundle(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.auth_bundle.as_deref(),
+        args.auth_bundle_format,
+        None,
+        DEFAULT_SESSION_TTL_SECS,
+        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+    )?;
 
     match (args.experiment_kind.into_config(), args.backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
@@ -1156,13 +1605,16 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
-    let auth_bundle = match args.auth_bundle {
-        Some(path) => Some(load_typed::<DragonNativeAuthBundle>(
-            &path,
-            args.auth_bundle_format,
-        )?),
-        None => None,
-    };
+    let auth_bundle = Some(resolve_or_login_native_auth_bundle(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.auth_bundle.as_deref(),
+        args.auth_bundle_format,
+        None,
+        DEFAULT_SESSION_TTL_SECS,
+        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+    )?);
 
     match (args.experiment_kind.into_config(), args.backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_peer(
@@ -1238,13 +1690,16 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
-    let auth_bundle = match args.auth_bundle {
-        Some(path) => Some(load_typed::<DragonNativeAuthBundle>(
-            &path,
-            args.auth_bundle_format,
-        )?),
-        None => None,
-    };
+    let auth_bundle = Some(resolve_or_login_native_auth_bundle(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.auth_bundle.as_deref(),
+        args.auth_bundle_format,
+        None,
+        DEFAULT_SESSION_TTL_SECS,
+        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+    )?);
 
     match (args.experiment_kind.into_config(), args.backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_head_mirror(
@@ -1326,13 +1781,16 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
-    let auth_bundle = match args.auth_bundle {
-        Some(path) => Some(load_typed::<DragonNativeAuthBundle>(
-            &path,
-            args.auth_bundle_format,
-        )?),
-        None => None,
-    };
+    let auth_bundle = Some(resolve_or_login_native_auth_bundle(
+        &config,
+        args.experiment_kind.into_config(),
+        args.backend,
+        args.auth_bundle.as_deref(),
+        args.auth_bundle_format,
+        None,
+        DEFAULT_SESSION_TTL_SECS,
+        DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
+    )?);
 
     match (args.experiment_kind.into_config(), args.backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
@@ -1493,6 +1951,9 @@ fn prepared_manifests(
         edge_base_url: None,
         session_id: None,
         principal_id: None,
+        enrollment: None,
+        session: None,
+        certificate_not_after: None,
     };
     match (experiment_kind, backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {

@@ -249,7 +249,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.34`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.35`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
@@ -544,17 +544,11 @@ Example native fallback:
 
 ```bash
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
-  begin-github-login \
+  login \
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --edge-url https://edge.dragon.aberration.technology
-
-cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
-  complete-github-login \
-  --config /path/to/native-peer.toml \
-  --pending /path/to/pending-login.json \
-  --provider-code '<github-code>' \
+  --edge-url https://edge.dragon.aberration.technology \
   --auth-bundle-out /path/to/admin-auth.json
 
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
@@ -564,6 +558,8 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --backend wgpu \
   --auth-bundle /path/to/admin-auth.json
 ```
+
+The older `begin-github-login` + `complete-github-login` path still exists for manual or headless debugging, but the primary native operator flow is now the browser-launched loopback callback path above.
 
 `admin-rollout-profile` uses the current local Dragon config and manifest metadata as the source of truth and pushes a replacement directory entry through `RolloutAuthPolicy`. Peers that rely on network-published Dragon profiles will pick up the new config from the directory instead of requiring a matching static local training config.
 

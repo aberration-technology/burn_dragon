@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_arch = "wasm32")]
+use burn_dragon_p2p::auth::{native_cli_bridge_mode_active, resume_or_complete_native_cli_bridge};
+#[cfg(target_arch = "wasm32")]
 use burn_dragon_p2p::config::{DragonBrowserAppConfig, DragonBrowserSiteBootstrap};
 #[cfg(target_arch = "wasm32")]
 use burn_dragon_p2p::wasm::DragonBrowserApp;
@@ -102,7 +104,62 @@ async fn load_browser_site_bootstrap() -> Result<DragonBrowserSiteBootstrap, Str
 
 #[cfg(target_arch = "wasm32")]
 #[component]
-fn App() -> Element {
+fn NativeCliBridgeApp() -> Element {
+    let status = use_signal(|| "preparing native CLI login.".to_owned());
+    let error = use_signal(|| None::<String>);
+    let started = use_signal(|| false);
+
+    {
+        let mut status = status;
+        let mut error = error;
+        let mut started = started;
+        use_effect(move || {
+            if *started.read() {
+                return;
+            }
+            started.set(true);
+            spawn(async move {
+                match resume_or_complete_native_cli_bridge() {
+                    Ok(true) => {
+                        status.set("continuing GitHub sign-in for the native CLI.".into());
+                    }
+                    Ok(false) => {
+                        error.set(Some(
+                            "native CLI auth bridge was not armed for this page load.".into(),
+                        ));
+                    }
+                    Err(bridge_error) => {
+                        error.set(Some(bridge_error.to_string()));
+                    }
+                }
+            });
+        });
+    }
+
+    rsx! {
+        main { class: "browser-app-shell burn-dragon-p2p-native-cli-bridge",
+            section { class: "panel hero browser-hero",
+                div { class: "browser-hero-grid",
+                    div { class: "browser-hero-copy",
+                        div { class: "eyebrow", "burn_dragon" }
+                        h1 { class: "app-title", "cli login" }
+                        p { class: "app-subtitle", "relaying GitHub auth back to the native CLI." }
+                    }
+                }
+                if let Some(error) = &*error.read() {
+                    pre { "{error}" }
+                } else {
+                    p { class: "app-subtitle", "{status}" }
+                    p { class: "app-subtitle", "this page does not start the browser peer." }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn BrowserBootstrapApp() -> Element {
     let bootstrap = use_resource(|| async move { load_browser_site_bootstrap().await });
 
     match &*bootstrap.read_unchecked() {
@@ -144,6 +201,16 @@ fn App() -> Element {
                 }
             }
         },
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn App() -> Element {
+    if native_cli_bridge_mode_active() {
+        rsx! { NativeCliBridgeApp {} }
+    } else {
+        rsx! { BrowserBootstrapApp {} }
     }
 }
 

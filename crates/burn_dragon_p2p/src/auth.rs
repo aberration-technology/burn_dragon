@@ -22,14 +22,14 @@ use burn_p2p_browser::durability::{
 use burn_p2p_browser::{
     BrowserEdgeClient, BrowserEnrollmentConfig, BrowserSessionState, BrowserUiBindings,
 };
-use chrono::Utc;
-#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use chrono::{DateTime, Duration};
+use chrono::{DateTime, Duration, Utc};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
 #[cfg(feature = "native")]
 use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "native")]
+use url::Url;
 
 use crate::config::DragonNativeAuthBundle;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -109,6 +109,131 @@ pub struct DragonGitHubSession {
 }
 
 #[cfg(feature = "native")]
+const NATIVE_AUTH_CACHE_RELATIVE_PATH: &str = "state/native-github-auth.json";
+#[cfg(feature = "native")]
+const NATIVE_AUTH_REFRESH_SKEW_SECS: i64 = 60;
+
+#[cfg(feature = "native")]
+pub fn default_native_auth_bundle_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(NATIVE_AUTH_CACHE_RELATIVE_PATH)
+}
+
+#[cfg(feature = "native")]
+pub fn load_cached_native_auth_bundle(
+    storage_root: &Path,
+) -> Result<Option<DragonNativeAuthBundle>> {
+    let path = default_native_auth_bundle_path(storage_root);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+#[cfg(feature = "native")]
+pub fn store_cached_native_auth_bundle(
+    storage_root: &Path,
+    bundle: &DragonNativeAuthBundle,
+) -> Result<()> {
+    let path = default_native_auth_bundle_path(storage_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body = serde_json::to_vec_pretty(bundle)?;
+    fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn native_auth_refresh_deadline() -> DateTime<Utc> {
+    Utc::now() + Duration::seconds(NATIVE_AUTH_REFRESH_SKEW_SECS)
+}
+
+#[cfg(feature = "native")]
+pub fn native_auth_bundle_is_fresh(bundle: &DragonNativeAuthBundle) -> bool {
+    if bundle.auth_config.local_peer_auth.is_none() {
+        return false;
+    }
+    let Some(session) = bundle.session.as_ref() else {
+        return false;
+    };
+    let Some(certificate_not_after) = bundle.certificate_not_after else {
+        return false;
+    };
+    let deadline = native_auth_refresh_deadline();
+    session.expires_at > deadline && certificate_not_after > deadline
+}
+
+#[cfg(feature = "native")]
+pub async fn refresh_native_auth_bundle(
+    storage_root: &Path,
+    bundle: &DragonNativeAuthBundle,
+    client_manifest_id: Option<ContentId>,
+) -> Result<DragonNativeAuthBundle> {
+    let edge_base_url = bundle
+        .edge_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("native auth bundle is missing edge_base_url"))?;
+    let enrollment = bundle
+        .enrollment
+        .clone()
+        .ok_or_else(|| anyhow!("native auth bundle is missing enrollment metadata"))?;
+    let prior_session = bundle
+        .session
+        .as_ref()
+        .ok_or_else(|| anyhow!("native auth bundle is missing session metadata"))?;
+    let client = EdgeAuthClient::new(edge_base_url, enrollment.clone());
+    let session = client.refresh_session(&prior_session.session_id).await?;
+    let (_, identity) = edge_peer_identity_for_storage(storage_root, None)?;
+    let certificate = client
+        .enroll(&client.build_enrollment_request(&session, &identity))
+        .await?;
+    let refreshed = finalize_native_auth_session(
+        storage_root,
+        edge_base_url,
+        &enrollment,
+        session,
+        certificate,
+        client_manifest_id,
+        "github-refresh",
+    )?;
+    store_cached_native_auth_bundle(storage_root, &refreshed.auth)?;
+    Ok(refreshed.auth)
+}
+
+#[cfg(feature = "native")]
+pub fn native_cli_bridge_url(
+    pending: &DragonPendingGitHubLogin,
+    callback_url: &str,
+    nonce: &str,
+) -> Result<String> {
+    let authorize_url = pending
+        .login
+        .authorize_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("edge did not return a browser authorize URL"))?;
+    let authorize = Url::parse(authorize_url)
+        .with_context(|| format!("failed to parse browser authorize URL {authorize_url}"))?;
+    let redirect_uri = authorize
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned()))
+        .ok_or_else(|| anyhow!("browser authorize URL is missing redirect_uri"))?;
+    let mut bridge = Url::parse(&redirect_uri)
+        .with_context(|| format!("failed to parse browser redirect URI {redirect_uri}"))?;
+    {
+        let mut query = bridge.query_pairs_mut();
+        query.append_pair("native_cli", "1");
+        query.append_pair("native_callback", callback_url);
+        query.append_pair("native_nonce", nonce);
+        query.append_pair("native_authorize", authorize_url);
+    }
+    Ok(bridge.to_string())
+}
+
+#[cfg(feature = "native")]
 fn finalize_native_auth_session(
     storage_root: &Path,
     edge_base_url: &str,
@@ -124,6 +249,7 @@ fn finalize_native_auth_session(
         edge_base_url.trim_end_matches('/'),
         enrollment.trust_bundle_path
     );
+    let certificate_not_after = certificate.claims().not_after;
     let peer_auth = create_peer_auth_envelope(
         &node_keypair,
         certificate,
@@ -144,6 +270,9 @@ fn finalize_native_auth_session(
             edge_base_url: Some(edge_base_url.trim_end_matches('/').to_owned()),
             session_id: Some(session.session_id.as_str().to_owned()),
             principal_id: Some(session.claims.principal_id.as_str().to_owned()),
+            enrollment: Some(enrollment.clone()),
+            session: Some(session.clone()),
+            certificate_not_after: Some(certificate_not_after),
         },
         session,
     })
@@ -294,7 +423,7 @@ pub async fn complete_native_github_login(
     let certificate = client
         .enroll(&client.build_enrollment_request(&session, &identity))
         .await?;
-    finalize_native_auth_session(
+    let authenticated = finalize_native_auth_session(
         storage_root,
         &pending.edge_base_url,
         &pending.enrollment,
@@ -302,7 +431,9 @@ pub async fn complete_native_github_login(
         certificate,
         client_manifest_id,
         "github-auth",
-    )
+    )?;
+    store_cached_native_auth_bundle(storage_root, &authenticated.auth)?;
+    Ok(authenticated)
 }
 
 #[cfg(feature = "native")]
@@ -333,7 +464,7 @@ pub async fn enroll_native_static_principal(
     let enrolled = client
         .enroll_static_principal(principal_hint, principal_id, &identity)
         .await?;
-    finalize_native_auth_session(
+    let authenticated = finalize_native_auth_session(
         storage_root,
         edge_base_url,
         &enrollment,
@@ -341,7 +472,9 @@ pub async fn enroll_native_static_principal(
         enrolled.certificate,
         client_manifest_id,
         "static-auth",
-    )
+    )?;
+    store_cached_native_auth_bundle(storage_root, &authenticated.auth)?;
+    Ok(authenticated)
 }
 
 pub fn compose_auth_config(
@@ -383,6 +516,8 @@ const DURABLE_BROWSER_STORAGE_PREFIX: &str = "burn-p2p.browser.storage.";
 const DURABLE_BROWSER_RECEIPT_OUTBOX_PREFIX: &str = "burn-p2p.browser.receipt-outbox.";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const PENDING_GITHUB_LOGIN_TTL_SECS: i64 = 15 * 60;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const NATIVE_CALLBACK_BRIDGE_KEY: &str = "burn-dragon-p2p.native-cli-bridge";
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -391,6 +526,14 @@ struct PendingBrowserGitHubLogin {
     created_at: DateTime<Utc>,
     login: LoginStart,
     requested_scopes: BTreeSet<ExperimentScope>,
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingNativeCliBridge {
+    callback_url: String,
+    nonce: String,
+    authorize_url: String,
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -490,6 +633,154 @@ fn browser_session_storage() -> Result<web_sys::Storage> {
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn parse_native_cli_bridge_launch(query: &str) -> Result<Option<PendingNativeCliBridge>> {
+    let mut requested = false;
+    let mut callback_url = None;
+    let mut nonce = None;
+    let mut authorize_url = None;
+    for (key, value) in url::form_urlencoded::parse(query.trim_start_matches('?').as_bytes()) {
+        match key.as_ref() {
+            "native_cli" => {
+                if value == "1" || value.eq_ignore_ascii_case("true") {
+                    requested = true;
+                }
+            }
+            "native_callback" => {
+                if !value.trim().is_empty() {
+                    callback_url = Some(value.into_owned());
+                }
+            }
+            "native_nonce" => {
+                if !value.trim().is_empty() {
+                    nonce = Some(value.into_owned());
+                }
+            }
+            "native_authorize" => {
+                if !value.trim().is_empty() {
+                    authorize_url = Some(value.into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    if !requested {
+        return Ok(None);
+    }
+    Ok(Some(PendingNativeCliBridge {
+        callback_url: callback_url
+            .ok_or_else(|| anyhow!("native CLI bridge is missing native_callback"))?,
+        nonce: nonce.ok_or_else(|| anyhow!("native CLI bridge is missing native_nonce"))?,
+        authorize_url: authorize_url
+            .ok_or_else(|| anyhow!("native CLI bridge is missing native_authorize"))?,
+    }))
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn load_pending_native_cli_bridge() -> Result<Option<PendingNativeCliBridge>> {
+    let Some(raw) = browser_session_storage()?
+        .get_item(NATIVE_CALLBACK_BRIDGE_KEY)
+        .map_err(|error| anyhow!("failed to read native CLI bridge state: {error:?}"))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|error| anyhow!("failed to decode native CLI bridge state: {error}"))
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn store_pending_native_cli_bridge(bridge: &PendingNativeCliBridge) -> Result<()> {
+    browser_session_storage()?
+        .set_item(NATIVE_CALLBACK_BRIDGE_KEY, &serde_json::to_string(bridge)?)
+        .map_err(|error| anyhow!("failed to persist native CLI bridge state: {error:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn clear_pending_native_cli_bridge() -> Result<()> {
+    browser_session_storage()?
+        .remove_item(NATIVE_CALLBACK_BRIDGE_KEY)
+        .map_err(|error| anyhow!("failed to clear native CLI bridge state: {error:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn native_cli_bridge_callback_url(
+    bridge: &PendingNativeCliBridge,
+    provider_code: &str,
+    state: &str,
+) -> Result<String> {
+    let mut url = url::Url::parse(&bridge.callback_url).map_err(|error| {
+        anyhow!(
+            "failed to parse native callback URL {}: {error}",
+            bridge.callback_url
+        )
+    })?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("native_nonce", &bridge.nonce);
+        query.append_pair("provider_code", provider_code);
+        query.append_pair("state", state);
+    }
+    Ok(url.to_string())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub fn native_cli_bridge_mode_active() -> bool {
+    native_cli_bridge_mode_active_result().unwrap_or(false)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn native_cli_bridge_mode_active_result() -> Result<bool> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("window unavailable"))?;
+    let location = window.location();
+    let search = location
+        .search()
+        .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))?;
+    let query = search.strip_prefix('?').unwrap_or(&search);
+    if parse_native_cli_bridge_launch(query)?.is_some() {
+        return Ok(true);
+    }
+    let pathname = location
+        .pathname()
+        .map_err(|error| anyhow!("failed to inspect browser path: {error:?}"))?;
+    Ok(pathname.contains("/callback/") && load_pending_native_cli_bridge()?.is_some())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub fn resume_or_complete_native_cli_bridge() -> Result<bool> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("window unavailable"))?;
+    let location = window.location();
+    let search = location
+        .search()
+        .map_err(|error| anyhow!("failed to inspect browser query params: {error:?}"))?;
+    let query = search.strip_prefix('?').unwrap_or(&search);
+
+    if let Some(bridge) = parse_native_cli_bridge_launch(query)? {
+        store_pending_native_cli_bridge(&bridge)?;
+        location
+            .set_href(&bridge.authorize_url)
+            .map_err(|error| anyhow!("failed to redirect browser auth bridge: {error:?}"))?;
+        return Ok(true);
+    }
+
+    let Some(provider_code) = provider_code_from_window_location() else {
+        return Ok(false);
+    };
+    let Some(bridge) = load_pending_native_cli_bridge()? else {
+        return Ok(false);
+    };
+    let state = provider_state_from_window_location()
+        .ok_or_else(|| anyhow!("browser auth callback is missing state for native CLI relay"))?;
+    let callback_url = native_cli_bridge_callback_url(&bridge, &provider_code, &state)?;
+    location
+        .set_href(&callback_url)
+        .map_err(|error| anyhow!("failed to relay browser auth back to native CLI: {error:?}"))?;
+    let _ = clear_pending_native_cli_bridge();
+    Ok(true)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 fn load_trusted_callback_token() -> Result<Option<String>> {
     let Some(raw) = browser_session_storage()?
         .get_item(TRUSTED_CALLBACK_TOKEN_KEY)
@@ -548,6 +839,7 @@ fn clear_browser_local_storage_prefix(prefix: &str) -> Result<()> {
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 pub async fn reset_browser_runtime_state(edge_base_url: &str) -> Result<()> {
     let _ = clear_pending_browser_login_state();
+    let _ = clear_pending_native_cli_bridge();
     let _ = clear_trusted_callback_token();
     let _ = clear_browser_local_storage_prefix(DURABLE_BROWSER_STORAGE_PREFIX);
     let _ = clear_browser_local_storage_prefix(DURABLE_BROWSER_RECEIPT_OUTBOX_PREFIX);
@@ -687,11 +979,21 @@ pub async fn load_browser_session(edge_base_url: &str) -> Result<BrowserSessionS
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-pub fn provider_code_from_window_location() -> Option<String> {
+fn query_param_from_window_location(name: &str) -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
     let query = search.strip_prefix('?').unwrap_or(&search);
     url::form_urlencoded::parse(query.as_bytes())
-        .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub fn provider_code_from_window_location() -> Option<String> {
+    query_param_from_window_location("code")
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub fn provider_state_from_window_location() -> Option<String> {
+    query_param_from_window_location("state")
 }
 
 #[cfg(all(test, feature = "wasm-ui", target_arch = "wasm32"))]
@@ -761,6 +1063,69 @@ mod tests {
         );
         let snapshot = parse_edge_snapshot_body(&raw).expect("valid snapshot");
         assert_eq!(snapshot.network_id.as_str(), "burn-dragon-mainnet");
+    }
+
+    #[test]
+    fn native_cli_bridge_launch_parser_extracts_required_fields() {
+        let bridge = parse_native_cli_bridge_launch(
+            "native_cli=1&native_callback=http%3A%2F%2F127.0.0.1%3A43123%2Fcallback&native_nonce=nonce-1&native_authorize=https%3A%2F%2Fgithub.example%2Fauthorize",
+        )
+        .expect("parse bridge")
+        .expect("bridge launch");
+        assert_eq!(bridge.callback_url, "http://127.0.0.1:43123/callback");
+        assert_eq!(bridge.nonce, "nonce-1");
+        assert_eq!(bridge.authorize_url, "https://github.example/authorize");
+    }
+
+    #[test]
+    fn native_cli_bridge_callback_url_preserves_existing_query() {
+        let bridge = PendingNativeCliBridge {
+            callback_url: "http://127.0.0.1:43123/callback?source=dragon".into(),
+            nonce: "nonce-1".into(),
+            authorize_url: "https://github.example/authorize".into(),
+        };
+        let callback = native_cli_bridge_callback_url(&bridge, "provider-code", "state-1")
+            .expect("callback url");
+        assert!(callback.contains("source=dragon"));
+        assert!(callback.contains("native_nonce=nonce-1"));
+        assert!(callback.contains("provider_code=provider-code"));
+        assert!(callback.contains("state=state-1"));
+    }
+
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    #[test]
+    fn native_cli_bridge_mode_detection_handles_launch_and_callback_paths() {
+        let launch = native_cli_bridge_mode_active_result_for_test(
+            "/callback/github",
+            "native_cli=1&native_callback=http%3A%2F%2F127.0.0.1%3A43123%2Fcallback&native_nonce=nonce-1&native_authorize=https%3A%2F%2Fgithub.example%2Fauthorize",
+            false,
+        )
+        .expect("detect launch mode");
+        assert!(launch);
+
+        let callback = native_cli_bridge_mode_active_result_for_test(
+            "/callback/github",
+            "code=provider-code&state=state-1",
+            true,
+        )
+        .expect("detect callback mode");
+        assert!(callback);
+
+        let normal = native_cli_bridge_mode_active_result_for_test("/", "", false)
+            .expect("detect normal mode");
+        assert!(!normal);
+    }
+
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    fn native_cli_bridge_mode_active_result_for_test(
+        pathname: &str,
+        query: &str,
+        pending_bridge: bool,
+    ) -> Result<bool> {
+        if parse_native_cli_bridge_launch(query)?.is_some() {
+            return Ok(true);
+        }
+        Ok(pathname.contains("/callback/") && pending_bridge)
     }
 
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]

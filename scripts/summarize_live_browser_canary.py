@@ -22,6 +22,7 @@ def main() -> None:
     live_status = report.get("live_status_label") or "n/a"
     transport_summary = report.get("transport_summary") or "n/a"
     machine_state = report.get("browser_machine_state") or {}
+    webrtc_markers = report.get("webrtc_direct_console_markers") or {}
 
     print("## live browser canary")
     print()
@@ -37,6 +38,12 @@ def main() -> None:
     print(f"- Machine connected transport: `{machine_state.get('connected_transport') or 'n/a'}`")
     print(f"- Machine direct peers: `{machine_state.get('direct_peers', 'n/a')}`")
     print(f"- Machine last error: `{machine_state.get('last_error') or 'none'}`")
+    print(
+        f"- WebRTC-direct phase evidence: `{len(webrtc_markers.get('observed') or [])}/{len(webrtc_markers.get('required') or [])}`"
+    )
+    print(
+        f"- Missing WebRTC-direct phases: `{', '.join(webrtc_markers.get('missing') or []) or 'none'}`"
+    )
     print(
         f"- Signed seed transports: `{', '.join(report.get('signed_seed_transport_preference') or []) or 'none'}`"
     )

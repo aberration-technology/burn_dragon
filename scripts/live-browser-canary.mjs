@@ -72,6 +72,12 @@ const WATCHED_CONTROL_PATHS = [
   "/metrics/catchup/",
 ];
 const EDGE_ARTIFACT_PATH_PREFIXES = ["/artifacts/heads/", "/artifacts/tickets/"];
+const WEBRTC_DIRECT_REQUIRED_CONSOLE_MARKERS = [
+  "libp2p webrtc-direct: created browser RTCPeerConnection",
+  "libp2p webrtc-direct datachannel: open before-noise",
+  "libp2p webrtc-direct: starting Noise handshake over WebRTC datachannel",
+  "libp2p webrtc-direct: completed Noise handshake peer=",
+];
 
 function requiredEnv(name) {
   const value = process.env[name]?.trim();
@@ -417,6 +423,33 @@ function transportConnectedForMode(summary, mode) {
     return /\b(webrtc-direct|webtransport|wss|ws)\b/.test(normalized);
   }
   return normalized.includes(expected);
+}
+
+function webRtcDirectConsoleMarkerReport(consoleMessages) {
+  const texts = consoleMessages.map((entry) => entry.text ?? "");
+  const observed = WEBRTC_DIRECT_REQUIRED_CONSOLE_MARKERS.filter((marker) =>
+    texts.some((text) => text.includes(marker)),
+  );
+  const missing = WEBRTC_DIRECT_REQUIRED_CONSOLE_MARKERS.filter(
+    (marker) => !observed.includes(marker),
+  );
+  return {
+    required: WEBRTC_DIRECT_REQUIRED_CONSOLE_MARKERS,
+    observed,
+    missing,
+  };
+}
+
+function assertWebRtcDirectTransportPhases(report, consoleMessages) {
+  if (report.expected_connected_transport !== "webrtc-direct") {
+    return;
+  }
+  report.webrtc_direct_console_markers = webRtcDirectConsoleMarkerReport(consoleMessages);
+  if (report.webrtc_direct_console_markers.missing.length > 0) {
+    fail(
+      `browser canary connected without complete WebRTC-direct phase evidence: missing=${JSON.stringify(report.webrtc_direct_console_markers.missing)} machine=${JSON.stringify(report.browser_machine_state)}`,
+    );
+  }
 }
 
 function preferredAdvertisedTransport(envelope) {
@@ -892,6 +925,7 @@ async function runCanary() {
     train_timeout_ms: TRAIN_TIMEOUT_MS,
     quiet_window_control_plane_requests: [],
     artifact_http_fallback_requests: [],
+    webrtc_direct_console_markers: null,
     receipt_submission: null,
     retained_transport_error: null,
     console_errors: [],
@@ -1141,6 +1175,7 @@ async function runCanary() {
         `browser canary became training-ready without expected transport ${report.expected_connected_transport}: transport=${report.transport_summary ?? "missing transport signal"} machine=${JSON.stringify(report.browser_machine_state)}`,
       );
     }
+    assertWebRtcDirectTransportPhases(report, consoleMessages);
     report.retained_transport_error = reportConnectedForMode(report, TRANSPORT_MODE)
       ? null
       : (report.browser_machine_state?.last_error ?? null);

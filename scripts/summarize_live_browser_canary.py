@@ -17,6 +17,7 @@ def main() -> None:
 
     report = json.loads(report_path.read_text())
     receipt = report.get("receipt_submission") or {}
+    durable_receipt = report.get("durable_receipt_snapshot") or {}
     control_requests = report.get("quiet_window_control_plane_requests") or []
     artifact_fallback = report.get("artifact_http_fallback_requests") or []
     live_status = report.get("live_status_label") or "n/a"
@@ -52,6 +53,13 @@ def main() -> None:
     print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
     print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
     print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
+    print(
+        f"- Accepted receipt ids: `{', '.join(receipt.get('accepted_receipt_ids') or []) or 'none'}`"
+    )
+    print(
+        f"- Durable receipts: `{durable_receipt.get('observed_accepted_receipts', 'n/a')}` "
+        f"(baseline `{report.get('accepted_receipts_before_training', 'n/a')}`)"
+    )
     print(f"- Error: `{report.get('error') or 'none'}`")
 
 

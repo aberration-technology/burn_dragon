@@ -39,6 +39,15 @@ def main() -> None:
         "report.retained_transport_error = reportConnectedForMode(report, TRANSPORT_MODE)",
         "? null",
         ": (report.browser_machine_state?.last_error ?? null);",
+        "BURN_DRAGON_BROWSER_CANARY_DURABLE_RECEIPT_TIMEOUT_MS",
+        "function snapshotAcceptedReceiptCount(snapshot)",
+        "function acceptedReceiptIdsFromSubmission(body)",
+        "async function waitForDurableReceiptCount(acceptedReceiptIds, baselineCount)",
+        "browser receipt was accepted but did not become durable edge state",
+        "accepted_receipts_before_training: acceptedReceiptsBeforeTraining",
+        "durable_receipt_snapshot: null",
+        "accepted_receipt_ids: acceptedReceiptIds",
+        "report.durable_receipt_snapshot = await waitForDurableReceiptCount(",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"

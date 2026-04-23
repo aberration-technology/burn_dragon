@@ -21,6 +21,10 @@ const TRAIN_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS",
   300_000,
 );
+const DURABLE_RECEIPT_TIMEOUT_MS = parseIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_DURABLE_RECEIPT_TIMEOUT_MS",
+  30_000,
+);
 const BROWSER_NAME = (
   process.env.BURN_DRAGON_BROWSER_CANARY_BROWSER ?? "chromium"
 ).trim().toLowerCase();
@@ -221,6 +225,64 @@ async function fetchJsonWithTransientRetry(url, options = {}) {
     }
   }
   throw lastError;
+}
+
+function snapshotAcceptedReceiptCount(snapshot) {
+  const candidates = [
+    snapshot?.diagnostics?.accepted_receipts,
+    snapshot?.accepted_receipts,
+    snapshot?.payload?.diagnostics?.accepted_receipts,
+  ];
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isFinite(value) && value >= 0) {
+      return Math.trunc(value);
+    }
+  }
+  return null;
+}
+
+function acceptedReceiptIdsFromSubmission(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.accepted_receipt_ids)) {
+    return [];
+  }
+  return body.accepted_receipt_ids.map((value) => String(value)).filter(Boolean);
+}
+
+async function waitForDurableReceiptCount(acceptedReceiptIds, baselineCount) {
+  if (baselineCount == null) {
+    fail(
+      "edge snapshot is missing diagnostics.accepted_receipts; cannot prove durable browser receipt persistence",
+    );
+  }
+  const minimumCount = baselineCount + acceptedReceiptIds.length;
+  const deadline = Date.now() + DURABLE_RECEIPT_TIMEOUT_MS;
+  let lastSnapshot = null;
+  let lastCount = null;
+  while (Date.now() < deadline) {
+    lastSnapshot = await fetchJsonWithTransientRetry(
+      endpoint(EDGE_BASE_URL, "/portal/snapshot"),
+      {
+        method: "GET",
+        headers: {},
+      },
+    );
+    lastCount = snapshotAcceptedReceiptCount(lastSnapshot);
+    if (lastCount != null && lastCount >= minimumCount) {
+      return {
+        accepted_receipt_ids: acceptedReceiptIds,
+        baseline_accepted_receipts: baselineCount,
+        observed_accepted_receipts: lastCount,
+        minimum_expected_accepted_receipts: minimumCount,
+        snapshot_captured_at:
+          lastSnapshot?.diagnostics?.captured_at ?? lastSnapshot?.captured_at ?? null,
+      };
+    }
+    await sleep(1_000);
+  }
+  fail(
+    `browser receipt was accepted but did not become durable edge state: accepted_ids=${JSON.stringify(acceptedReceiptIds)} baseline=${baselineCount} last_count=${lastCount ?? "missing"} timeout_ms=${DURABLE_RECEIPT_TIMEOUT_MS}`,
+  );
 }
 
 async function fetchOk(url, options = {}) {
@@ -797,6 +859,7 @@ async function runCanary() {
   ) ?? [];
   const browserConfigSeeds = browserConfigSeedNodeUrls(filteredBrowserConfig);
   const browserTrainingConfig = browserConfigTrainingConfig(filteredBrowserConfig);
+  const acceptedReceiptsBeforeTraining = snapshotAcceptedReceiptCount(snapshot);
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
   const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
@@ -848,6 +911,9 @@ async function runCanary() {
     fail(
       `browser config is missing training payload for selected experiment ${EXPERIMENT_ID}`,
     );
+  }
+  if (EXPECT_TRAINING && acceptedReceiptsBeforeTraining == null) {
+    fail("portal snapshot did not expose diagnostics.accepted_receipts before training");
   }
 
   const enrollment = await beginBrowserCanaryLogin(snapshot);
@@ -927,6 +993,8 @@ async function runCanary() {
     artifact_http_fallback_requests: [],
     webrtc_direct_console_markers: null,
     receipt_submission: null,
+    accepted_receipts_before_training: acceptedReceiptsBeforeTraining,
+    durable_receipt_snapshot: null,
     retained_transport_error: null,
     console_errors: [],
     page_errors: [],
@@ -1198,16 +1266,37 @@ async function runCanary() {
       ),
       trainActionButton.click(),
     ]).then(([response]) => response);
+    const receiptBodyText = await receiptResponse.text();
+    let receiptBody = null;
+    try {
+      receiptBody = receiptBodyText ? JSON.parse(receiptBodyText) : null;
+    } catch (error) {
+      fail(
+        `browser receipt response was not valid JSON: ${String(error)}: ${trimPreview(receiptBodyText)}`,
+      );
+    }
+    const acceptedReceiptIds = acceptedReceiptIdsFromSubmission(receiptBody);
     report.receipt_submission = {
       url: receiptResponse.url(),
       status: receiptResponse.status(),
-      body_preview: trimPreview(await receiptResponse.text()),
+      accepted_receipt_ids: acceptedReceiptIds,
+      pending_receipt_count: receiptBody?.pending_receipt_count ?? null,
+      body_preview: trimPreview(receiptBodyText),
     };
+    if (acceptedReceiptIds.length === 0) {
+      fail(
+        `browser receipt submission returned no accepted receipt ids: ${trimPreview(receiptBodyText)}`,
+      );
+    }
     await page.waitForFunction(
       () =>
         document.body.innerText.includes("Browser training complete:") ||
         document.body.innerText.includes("train loss"),
       { timeout: TRAIN_TIMEOUT_MS },
+    );
+    report.durable_receipt_snapshot = await waitForDurableReceiptCount(
+      acceptedReceiptIds,
+      acceptedReceiptsBeforeTraining,
     );
     report.success = true;
     await page.screenshot({ path: screenshotPath, fullPage: true });

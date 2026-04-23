@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.21.0-pre.21"
+version = "0.21.0-pre.22"
 edition = "2024"
 rust-version = "1.92"
 authors = ["mosure <mitchell@mosure.me>"]
@@ -39,25 +39,25 @@ burn-store = { version = "0.21.0-pre.3", default-features = false }
 burn-train = { version = "0.21.0-pre.3", default-features = false }
 burn-wgpu = { version = "0.21.0-pre.3", default-features = false }
 
-burn_dragon_checkpoint = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_checkpoint", default-features = false }
-burn_dragon_core = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_core", default-features = false }
-burn_dragon_kernel = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_kernel", default-features = false }
-burn_dragon_language = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_language", default-features = false }
-burn_dragon_p2p = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_p2p", default-features = false }
-burn_dragon_time = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_time", default-features = false }
-burn_dragon_tokenizer = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_tokenizer", default-features = false }
-burn_dragon_train = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_train", default-features = false }
-burn_dragon_universality = { version = "=0.21.0-pre.21", path = "crates/burn_dragon_universality", default-features = false }
+burn_dragon_checkpoint = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_checkpoint", default-features = false }
+burn_dragon_core = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_core", default-features = false }
+burn_dragon_kernel = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_kernel", default-features = false }
+burn_dragon_language = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_language", default-features = false }
+burn_dragon_p2p = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_p2p", default-features = false }
+burn_dragon_time = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_time", default-features = false }
+burn_dragon_tokenizer = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_tokenizer", default-features = false }
+burn_dragon_train = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_train", default-features = false }
+burn_dragon_universality = { version = "=0.21.0-pre.22", path = "crates/burn_dragon_universality", default-features = false }
 
-burn_p2p = { version = "=0.21.0-pre.33", default-features = false }
-burn_p2p_admin = { version = "=0.21.0-pre.33" }
-burn_p2p_app = { version = "=0.21.0-pre.33", default-features = false }
-burn_p2p_bootstrap = { version = "=0.21.0-pre.33" }
-burn_p2p_browser = { version = "=0.21.0-pre.33" }
-burn_p2p_core = { version = "=0.21.0-pre.33" }
-burn_p2p_dataloader = { version = "=0.21.0-pre.33" }
-burn_p2p_views = { version = "=0.21.0-pre.33" }
-burn_p2p_workload = { version = "=0.21.0-pre.33" }
+burn_p2p = { version = "=0.21.0-pre.34", default-features = false }
+burn_p2p_admin = { version = "=0.21.0-pre.34" }
+burn_p2p_app = { version = "=0.21.0-pre.34", default-features = false }
+burn_p2p_bootstrap = { version = "=0.21.0-pre.34" }
+burn_p2p_browser = { version = "=0.21.0-pre.34" }
+burn_p2p_core = { version = "=0.21.0-pre.34" }
+burn_p2p_dataloader = { version = "=0.21.0-pre.34" }
+burn_p2p_views = { version = "=0.21.0-pre.34" }
+burn_p2p_workload = { version = "=0.21.0-pre.34" }
 
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

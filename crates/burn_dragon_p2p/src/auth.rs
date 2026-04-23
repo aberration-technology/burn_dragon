@@ -136,8 +136,11 @@ pub struct DragonGitHubSession {
 
 #[cfg(feature = "native")]
 const NATIVE_AUTH_CACHE_RELATIVE_PATH: &str = "state/native-github-auth.json";
-#[cfg(feature = "native")]
 const NATIVE_AUTH_REFRESH_SKEW_SECS: i64 = 60;
+
+fn auth_refresh_deadline() -> DateTime<Utc> {
+    Utc::now() + Duration::seconds(NATIVE_AUTH_REFRESH_SKEW_SECS)
+}
 
 #[cfg(feature = "native")]
 pub fn default_native_auth_bundle_path(storage_root: &Path) -> PathBuf {
@@ -175,7 +178,7 @@ pub fn store_cached_native_auth_bundle(
 
 #[cfg(feature = "native")]
 fn native_auth_refresh_deadline() -> DateTime<Utc> {
-    Utc::now() + Duration::seconds(NATIVE_AUTH_REFRESH_SKEW_SECS)
+    auth_refresh_deadline()
 }
 
 #[cfg(feature = "native")]
@@ -1006,6 +1009,78 @@ fn submit_native_cli_bridge_error(bridge: &PendingNativeCliBridge, message: &str
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_session_is_fresh_for_native_cli_bridge(session: &BrowserSessionState) -> bool {
+    session
+        .session
+        .as_ref()
+        .map(|session| session.expires_at > auth_refresh_deadline())
+        .unwrap_or(false)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+async fn try_complete_native_cli_browser_auth_from_browser_session(
+    bridge: &PendingNativeCliBridge,
+) -> Result<bool> {
+    let Some(bootstrap) = bridge.auth_bootstrap.as_ref() else {
+        return Ok(false);
+    };
+    let snapshot = BrowserEdgeClient::new(
+        BrowserUiBindings::new(&bootstrap.edge_base_url),
+        BrowserEnrollmentConfig::for_runtime_sync(
+            &fetch_edge_snapshot(&bootstrap.edge_base_url).await?,
+        ),
+    )
+    .fetch_browser_edge_snapshot()
+    .await?;
+    let durable = load_durable_browser_storage(&snapshot.network_id)
+        .await
+        .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
+    if !browser_session_is_fresh_for_native_cli_bridge(&durable.session) {
+        return Ok(false);
+    }
+    let Some(session) = durable.session.session.as_ref() else {
+        return Ok(false);
+    };
+
+    let release_manifest = native_release_manifest_for_bridge(&snapshot, bootstrap)?;
+    let browser_enrollment = browser_github_enrollment_config(
+        &snapshot,
+        &release_manifest,
+        bootstrap.requested_scopes.clone(),
+        bootstrap.session_ttl_secs,
+    )?;
+    let native_enrollment = native_edge_enrollment_config(
+        &snapshot,
+        &release_manifest,
+        bootstrap.requested_scopes.clone(),
+        bootstrap.session_ttl_secs,
+    )?;
+    let client = BrowserEdgeClient::new(
+        BrowserUiBindings::new(&bootstrap.edge_base_url),
+        browser_enrollment,
+    );
+    let identity = browser_worker_identity_from_edge_identity(&bootstrap.identity);
+    let certificate = match client
+        .enroll(&client.build_enrollment_request(session, &identity))
+        .await
+    {
+        Ok(certificate) => certificate,
+        Err(_) => return Ok(false),
+    };
+
+    let auth_result = NativeCliBridgeAuthResult {
+        edge_base_url: normalize_edge_base_url(&bootstrap.edge_base_url),
+        enrollment: native_enrollment,
+        session: session.clone(),
+        certificate,
+    };
+    let _ = clear_pending_native_cli_bridge_auth();
+    let _ = clear_pending_native_cli_bridge();
+    submit_native_cli_bridge_auth_result(bridge, &auth_result)?;
+    Ok(true)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 async fn begin_native_cli_browser_auth(bridge: &PendingNativeCliBridge) -> Result<String> {
     let bootstrap = bridge
         .auth_bootstrap
@@ -1135,8 +1210,17 @@ pub async fn resume_or_complete_native_cli_bridge() -> Result<bool> {
     if let Some(bridge) = parse_native_cli_bridge_launch(query)? {
         store_pending_native_cli_bridge(&bridge)?;
         let authorize_url = if bridge.auth_bootstrap.is_some() {
-            match begin_native_cli_browser_auth(&bridge).await {
-                Ok(authorize_url) => authorize_url,
+            match try_complete_native_cli_browser_auth_from_browser_session(&bridge).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => match begin_native_cli_browser_auth(&bridge).await {
+                    Ok(authorize_url) => authorize_url,
+                    Err(error) => {
+                        let _ = clear_pending_native_cli_bridge_auth();
+                        let _ = clear_pending_native_cli_bridge();
+                        let _ = submit_native_cli_bridge_error(&bridge, &error.to_string());
+                        return Err(error);
+                    }
+                },
                 Err(error) => {
                     let _ = clear_pending_native_cli_bridge_auth();
                     let _ = clear_pending_native_cli_bridge();

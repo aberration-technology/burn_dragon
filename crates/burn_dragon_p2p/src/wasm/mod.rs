@@ -3833,8 +3833,8 @@ mod tests {
     use super::{
         BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
-        DragonBrowserTransportOverride, DragonHeroTone, DragonReadinessStepId, DragonStepStatus,
-        browser_app_refresh_interval_millis, browser_session_is_authenticated,
+        DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext, DragonReadinessStepId,
+        DragonStepStatus, browser_app_refresh_interval_millis, browser_session_is_authenticated,
         browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
         dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
         dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,

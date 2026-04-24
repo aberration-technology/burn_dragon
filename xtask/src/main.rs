@@ -350,6 +350,7 @@ fn deployment_script_checks() -> Result<()> {
         "scripts/test_deployment_version_sync.py",
         "scripts/test_deployment_strategy.py",
         "scripts/test_deployment_guardrails.py",
+        "scripts/test_prod_low_resource_p2p_config.py",
         "scripts/test_bootstrap_instance_selection.py",
         "scripts/test_head_mirror_admin_capability.py",
         "scripts/test_deploy_pages_workflow.py",

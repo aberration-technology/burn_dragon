@@ -70,6 +70,7 @@ jobs:
       - run: python3 scripts/test_cleanup_workflow.py
       - run: python3 scripts/test_deployment_strategy.py
       - run: python3 scripts/test_deployment_version_sync.py
+      - run: python3 scripts/test_prod_low_resource_p2p_config.py
       - run: python3 scripts/test_deploy_pages_workflow.py
       - run: python3 scripts/test_resolve_pages_deploy_settings.py
       - run: python3 scripts/test_live_browser_canary_workflow.py

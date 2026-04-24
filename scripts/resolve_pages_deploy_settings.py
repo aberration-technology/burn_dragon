@@ -173,8 +173,6 @@ def resolve_seed_node_urls(
     seed_node_urls_from_env: str,
 ) -> list[str]:
     seed_urls = dedupe_csv_seed_urls(seed_node_urls_input)
-    if not seed_urls:
-        seed_urls = dedupe_csv_seed_urls(seed_node_urls_from_env)
 
     signed_fetch_error: Exception | None = None
     snapshot: Any | None = None
@@ -186,6 +184,9 @@ def resolve_seed_node_urls(
                 seed_urls = advertisement_seed_urls(advertisement)
         except Exception as error:  # noqa: BLE001 - deployment diagnostics should retain detail.
             signed_fetch_error = error
+
+    if not seed_urls:
+        seed_urls = dedupe_csv_seed_urls(seed_node_urls_from_env)
 
     seed_urls = canonicalize_browser_seed_urls(
         edge_base_url,

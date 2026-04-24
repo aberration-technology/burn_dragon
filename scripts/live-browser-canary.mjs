@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -733,6 +734,38 @@ function isDialableWebTransportSeed(seed) {
   return seed.includes("/quic-v1/webtransport") && seed.includes("/certhash/");
 }
 
+function isDialableBrowserSeed(seed) {
+  return (
+    isDialableWebRtcSeed(seed) ||
+    isDialableWebTransportSeed(seed) ||
+    seed.includes("/wss") ||
+    seed.includes("/ws")
+  );
+}
+
+function browserSeedDnsHost(edgeBaseUrl) {
+  const host = new URL(edgeBaseUrl).hostname;
+  return host && isIP(host) === 0 ? host : null;
+}
+
+function canonicalBrowserSeedUrl(edgeBaseUrl, seed) {
+  const edgeHost = browserSeedDnsHost(edgeBaseUrl);
+  const segments = seed.split("/").filter(Boolean);
+  if (
+    !edgeHost ||
+    segments.length < 3 ||
+    !["ip4", "ip6"].includes(segments[0]) ||
+    !isDialableBrowserSeed(seed)
+  ) {
+    return seed;
+  }
+  return `/dns4/${edgeHost}/${segments.slice(2).join("/")}`;
+}
+
+function canonicalBrowserSeedUrls(edgeBaseUrl, seeds) {
+  return Array.from(new Set(seeds.map((seed) => canonicalBrowserSeedUrl(edgeBaseUrl, seed))));
+}
+
 function contentTypeForPath(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
@@ -878,6 +911,8 @@ async function runCanary() {
     (record) => record.multiaddrs ?? [],
   ) ?? [];
   const browserConfigSeeds = browserConfigSeedNodeUrls(filteredBrowserConfig);
+  const canonicalSignedSeeds = canonicalBrowserSeedUrls(EDGE_BASE_URL, signedSeeds);
+  const canonicalBrowserConfigSeeds = canonicalBrowserSeedUrls(EDGE_BASE_URL, browserConfigSeeds);
   const browserTrainingConfig = browserConfigTrainingConfig(filteredBrowserConfig);
   const acceptedReceiptsBeforeTraining = snapshotAcceptedReceiptCount(snapshot);
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
@@ -922,9 +957,9 @@ async function runCanary() {
       `auto browser config retained unvalidated WSS fallback despite a WebRTC-direct seed: ${JSON.stringify(signedSeeds)}`,
     );
   }
-  if (JSON.stringify(browserConfigSeeds) !== JSON.stringify(signedSeeds)) {
+  if (JSON.stringify(canonicalBrowserConfigSeeds) !== JSON.stringify(canonicalSignedSeeds)) {
     fail(
-      `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)}`,
+      `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)} canonical_config=${JSON.stringify(canonicalBrowserConfigSeeds)} canonical_signed=${JSON.stringify(canonicalSignedSeeds)}`,
     );
   }
   if (EXPERIMENT_ID && !browserTrainingConfig) {

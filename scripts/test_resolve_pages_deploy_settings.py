@@ -24,11 +24,44 @@ def main() -> None:
 
     resolved = module.resolve_seed_node_urls(
         "https://edge.dragon.aberration.technology",
-        "",
         direct_seed,
+        "",
     )
     dns_seed = f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"
     assert resolved == [dns_seed], resolved
+
+    signed_certhash = "uEiBIQQvRGIR6ld6a-VTmYxgsVlaOOMfJtcsf5LvtFwh7mQ"
+    stale_env_seed = direct_seed
+    signed_ip_seed = f"/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/{signed_certhash}"
+    signed_dns_seed = (
+        f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{signed_certhash}"
+    )
+
+    def signed_seed_advertisement(_edge_base_url):
+        return {
+            "payload": {
+                "payload": {
+                    "seeds": [
+                        {
+                            "multiaddrs": [
+                                signed_ip_seed,
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
+    module.fetch_signed_seed_advertisement = signed_seed_advertisement
+    module.fetch_browser_edge_snapshot = unexpected_fetch
+
+    resolved = module.resolve_seed_node_urls(
+        "https://edge.dragon.aberration.technology",
+        "",
+        stale_env_seed,
+    )
+    assert resolved == [signed_dns_seed], resolved
+
     assert module.is_webrtc_direct_browser_seed(dns_seed)
     assert module.is_webrtc_direct_browser_seed(
         f"/dns/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"

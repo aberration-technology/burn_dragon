@@ -338,10 +338,27 @@ fn canonicalize_browser_seed_urls(edge_base_url: &str, seed_urls: Vec<String>) -
     let Some(edge_host) = browser_seed_dns_host(edge_base_url) else {
         return dedupe_seed_urls(seed_urls);
     };
+    canonicalize_browser_seed_urls_for_host(&edge_host, seed_urls)
+}
+
+fn canonicalize_browser_seed_urls_for_host(edge_host: &str, seed_urls: Vec<String>) -> Vec<String> {
+    let seed_urls = dedupe_seed_urls(seed_urls);
+    let canonical_seeds = seed_urls
+        .iter()
+        .filter(|value| canonicalize_browser_seed_url(edge_host, (*value).clone()) == **value)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     dedupe_seed_urls(
         seed_urls
             .into_iter()
-            .map(|value| canonicalize_browser_seed_url(&edge_host, value))
+            .map(|value| {
+                let rewritten = canonicalize_browser_seed_url(edge_host, value.clone());
+                if rewritten != value && canonical_seeds.contains(&rewritten) {
+                    value
+                } else {
+                    rewritten
+                }
+            })
             .collect(),
     )
 }
@@ -526,6 +543,21 @@ mod tests {
                 "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
                     .to_owned(),
                 "/dns4/edge.dragon.aberration.technology/tcp/443/wss".to_owned(),
+            ]
+        );
+        assert_eq!(
+            canonicalize_browser_seed_urls(
+                "https://edge.dragon.aberration.technology",
+                vec![
+                    "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
+                        .to_owned(),
+                    "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+                ],
+            ),
+            vec![
+                "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
+                    .to_owned(),
+                "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
             ]
         );
     }

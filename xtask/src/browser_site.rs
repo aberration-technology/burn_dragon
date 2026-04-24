@@ -1287,11 +1287,38 @@ fn canonicalize_browser_seed_url(edge_host: &str, seed_url: String) -> String {
 
 fn canonicalize_browser_seed_urls(edge_url: Option<&str>, seed_urls: Vec<String>) -> Vec<String> {
     let Some(edge_host) = browser_seed_dns_host(edge_url) else {
-        return seed_urls;
+        return dedupe_browser_seed_urls(seed_urls);
     };
+    canonicalize_browser_seed_urls_for_host(&edge_host, seed_urls)
+}
+
+fn canonicalize_browser_seed_urls_for_host(edge_host: &str, seed_urls: Vec<String>) -> Vec<String> {
+    let seed_urls = dedupe_browser_seed_urls(seed_urls);
+    let canonical_seeds = seed_urls
+        .iter()
+        .filter(|value| canonicalize_browser_seed_url(edge_host, (*value).clone()) == **value)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    dedupe_browser_seed_urls(
+        seed_urls
+            .into_iter()
+            .map(|value| {
+                let rewritten = canonicalize_browser_seed_url(edge_host, value.clone());
+                if rewritten != value && canonical_seeds.contains(&rewritten) {
+                    value
+                } else {
+                    rewritten
+                }
+            })
+            .collect(),
+    )
+}
+
+fn dedupe_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
     seed_urls
         .into_iter()
-        .map(|value| canonicalize_browser_seed_url(&edge_host, value))
+        .filter(|value| seen.insert(value.clone()))
         .collect()
 }
 
@@ -1303,11 +1330,10 @@ fn canonicalize_browser_seed_advertisement(
         return;
     };
     for seed in &mut advertisement.payload.payload.seeds {
-        seed.multiaddrs = seed
-            .multiaddrs
-            .drain(..)
-            .map(|value| canonicalize_browser_seed_url(&edge_host, value))
-            .collect();
+        seed.multiaddrs = canonicalize_browser_seed_urls_for_host(
+            &edge_host,
+            std::mem::take(&mut seed.multiaddrs),
+        );
     }
 }
 
@@ -1554,6 +1580,25 @@ mod tests {
         assert!(is_webrtc_direct_browser_seed(
             "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
         ));
+    }
+
+    #[test]
+    fn browser_seed_canonicalization_preserves_signed_ip_fallback() {
+        assert_eq!(
+            canonicalize_browser_seed_urls(
+                Some("https://edge.dragon.aberration.technology"),
+                vec![
+                    "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
+                        .to_owned(),
+                    "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+                ],
+            ),
+            vec![
+                "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
+                    .to_owned(),
+                "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),
+            ]
+        );
     }
 
     #[test]

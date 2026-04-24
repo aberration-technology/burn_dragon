@@ -112,7 +112,20 @@ def canonicalize_browser_seed_urls(edge_base_url: str, seed_urls: list[str]) -> 
     edge_host = browser_seed_dns_host(edge_base_url)
     if not edge_host:
         return dedupe(seed_urls)
-    return dedupe([canonicalize_browser_seed_url(edge_host, value) for value in seed_urls])
+    seed_urls = dedupe(seed_urls)
+    canonical_seeds = {
+        value
+        for value in seed_urls
+        if canonicalize_browser_seed_url(edge_host, value) == value
+    }
+    resolved: list[str] = []
+    for value in seed_urls:
+        rewritten = canonicalize_browser_seed_url(edge_host, value)
+        if rewritten != value and rewritten in canonical_seeds:
+            resolved.append(value)
+        else:
+            resolved.append(rewritten)
+    return dedupe(resolved)
 
 
 def fetch_json(url: str, resource_name: str) -> Any:

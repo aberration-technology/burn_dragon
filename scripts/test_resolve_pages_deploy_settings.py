@@ -44,6 +44,7 @@ def main() -> None:
                     "seeds": [
                         {
                             "multiaddrs": [
+                                signed_dns_seed,
                                 signed_ip_seed,
                             ]
                         }
@@ -60,7 +61,7 @@ def main() -> None:
         "",
         stale_env_seed,
     )
-    assert resolved == [signed_dns_seed], resolved
+    assert resolved == [signed_dns_seed, signed_ip_seed], resolved
 
     assert module.is_webrtc_direct_browser_seed(dns_seed)
     assert module.is_webrtc_direct_browser_seed(

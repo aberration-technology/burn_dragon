@@ -65,6 +65,14 @@ const HEADLESS = process.env.BURN_DRAGON_BROWSER_CANARY_HEADED === "1" ? false :
 const SITE_OVERRIDE_DIR = process.env.BURN_DRAGON_BROWSER_CANARY_SITE_OVERRIDE_DIR?.trim() || null;
 const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";
 const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";
+const DIALABLE_WEBRTC_HOST_PROTOCOLS = new Set([
+  "ip4",
+  "ip6",
+  "dns",
+  "dns4",
+  "dns6",
+  "dnsaddr",
+]);
 
 const WATCHED_CONTROL_PATHS = [
   "/portal/snapshot",
@@ -715,7 +723,7 @@ function filterBrowserConfigForTransport(browserConfig, mode) {
 function isDialableWebRtcSeed(seed) {
   const segments = seed.split("/").filter(Boolean);
   return (
-    ["ip4", "ip6", "dns4", "dns6", "dnsaddr"].includes(segments[0]) &&
+    DIALABLE_WEBRTC_HOST_PROTOCOLS.has(segments[0]) &&
     segments.includes("webrtc-direct") &&
     segments.includes("certhash")
   );

@@ -30,6 +30,9 @@ def main() -> None:
     dns_seed = f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"
     assert resolved == [dns_seed], resolved
     assert module.is_webrtc_direct_browser_seed(dns_seed)
+    assert module.is_webrtc_direct_browser_seed(
+        f"/dns/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"
+    )
     print("resolve-pages-deploy-settings-ok")
 
 

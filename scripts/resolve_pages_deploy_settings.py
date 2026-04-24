@@ -20,6 +20,7 @@ DEFAULT_BROWSER_APP_BASE_URL = "https://dragon.aberration.technology"
 DEFAULT_EDGE_BASE_URL = "https://edge.dragon.aberration.technology"
 DEFAULT_EXPERIMENT_ID = "nca-prepretraining"
 DEFAULT_REVISION_ID = "nca-r1"
+WEBRTC_DIRECT_BROWSER_HOST_PROTOCOLS = {"ip4", "ip6", "dns", "dns4", "dns6", "dnsaddr"}
 
 
 def first_nonempty(*values: str) -> str:
@@ -60,7 +61,7 @@ def is_webrtc_direct_browser_seed(value: str) -> bool:
     return (
         "webrtc-direct" in segments
         and bool(segments)
-        and segments[0] in {"ip4", "ip6", "dns4", "dns6", "dnsaddr"}
+        and segments[0] in WEBRTC_DIRECT_BROWSER_HOST_PROTOCOLS
         and "certhash" in segments
     )
 

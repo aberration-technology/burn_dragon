@@ -421,15 +421,19 @@ function fail(message) {
 }
 
 function statTileValue(tiles, label) {
+  return labeledRowsValue(tiles, label);
+}
+
+function labeledRowsValue(rows, label) {
   const normalizedLabel = label.trim().toLowerCase();
-  for (const tile of tiles ?? []) {
-    if (!Array.isArray(tile) || tile.length === 0) {
+  for (const row of rows ?? []) {
+    if (!Array.isArray(row) || row.length === 0) {
       continue;
     }
-    if ((tile[0] ?? "").trim().toLowerCase() !== normalizedLabel) {
+    if ((row[0] ?? "").trim().toLowerCase() !== normalizedLabel) {
       continue;
     }
-    return tile
+    return row
       .slice(1)
       .map((part) => part ?? "")
       .join(" | ")
@@ -438,10 +442,18 @@ function statTileValue(tiles, label) {
   return null;
 }
 
-function inferTransportSummary(tiles) {
+function inferTransportSummary(tiles, metricCards = [], keyValues = []) {
   const directTransportTile = statTileValue(tiles, "transport");
   if (directTransportTile) {
     return directTransportTile;
+  }
+  const transportKeyValue = labeledRowsValue(keyValues, "transport");
+  if (transportKeyValue) {
+    return transportKeyValue;
+  }
+  const networkMetric = labeledRowsValue(metricCards, "network");
+  if (networkMetric) {
+    return networkMetric;
   }
   const peersTile = statTileValue(tiles, "peers");
   if (/\b(webrtc-direct|webtransport|wss|ws)\b/i.test(peersTile ?? "")) {
@@ -982,6 +994,8 @@ async function runCanary() {
     get_started_button_visible: false,
     live_status_label: null,
     live_stat_tiles: [],
+    live_metric_cards: [],
+    live_keyvalues: [],
     live_panel_detail: null,
     live_notice_label: null,
     live_notice_detail: null,
@@ -1176,9 +1190,33 @@ async function runCanary() {
           ),
         )
         .catch(() => []);
-      report.live_status_label = statTileValue(report.live_stat_tiles, "status");
-      report.transport_summary = inferTransportSummary(report.live_stat_tiles);
-      const machineStateText = await optionalText(page.locator(".dragon-live-machine-state"));
+      report.live_metric_cards = await page
+        .locator(".dragon-metrics-grid .dragon-metric")
+        .evaluateAll((nodes) =>
+          nodes.map((node) =>
+            Array.from(node.children).map((child) => child.textContent?.trim() ?? ""),
+          ),
+        )
+        .catch(() => []);
+      report.live_keyvalues = await page
+        .locator(".dragon-live-keyvalues .keyvalue-row")
+        .evaluateAll((nodes) =>
+          nodes.map((node) =>
+            Array.from(node.children).map((child) => child.textContent?.trim() ?? ""),
+          ),
+        )
+        .catch(() => []);
+      report.live_status_label =
+        statTileValue(report.live_stat_tiles, "status") ??
+        labeledRowsValue(report.live_metric_cards, "mode");
+      report.transport_summary = inferTransportSummary(
+        report.live_stat_tiles,
+        report.live_metric_cards,
+        report.live_keyvalues,
+      );
+      const machineStateText = await optionalText(
+        page.locator(".dragon-live-machine-state, .dragon-machine-state"),
+      );
       if (machineStateText) {
         try {
           report.browser_machine_state = JSON.parse(machineStateText);

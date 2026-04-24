@@ -13,7 +13,8 @@ def load_module():
 
 def main() -> None:
     module = load_module()
-    direct_seed = "/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiBVooCaHXutTKs8lRU1X09zYELZl49YF8f9WGCd85c8gg"
+    certhash = "uEiBVooCaHXutTKs8lRU1X09zYELZl49YF8f9WGCd85c8gg"
+    direct_seed = f"/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/{certhash}"
 
     def unexpected_fetch(*_args, **_kwargs):
         raise AssertionError("explicit Pages seeds should not require network discovery")
@@ -26,7 +27,9 @@ def main() -> None:
         "",
         direct_seed,
     )
-    assert resolved == [direct_seed], resolved
+    dns_seed = f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"
+    assert resolved == [dns_seed], resolved
+    assert module.is_webrtc_direct_browser_seed(dns_seed)
     print("resolve-pages-deploy-settings-ok")
 
 

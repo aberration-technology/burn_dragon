@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import sys
 import time
@@ -59,7 +60,7 @@ def is_webrtc_direct_browser_seed(value: str) -> bool:
     return (
         "webrtc-direct" in segments
         and bool(segments)
-        and segments[0] in {"ip4", "ip6"}
+        and segments[0] in {"ip4", "ip6", "dns4", "dns6", "dnsaddr"}
         and "certhash" in segments
     )
 
@@ -82,6 +83,35 @@ def prefer_validated_browser_seed_urls(seed_urls: list[str]) -> list[str]:
     if any(is_webrtc_direct_browser_seed(value) for value in seed_urls):
         return [value for value in seed_urls if is_webrtc_direct_browser_seed(value)]
     return seed_urls
+
+
+def browser_seed_dns_host(edge_base_url: str) -> str:
+    host = urllib.parse.urlparse(edge_base_url).hostname or ""
+    if not host:
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return ""
+    except ValueError:
+        return host
+
+
+def canonicalize_browser_seed_url(edge_host: str, seed_url: str) -> str:
+    segments = multiaddr_segments(seed_url)
+    if (
+        len(segments) < 3
+        or segments[0] not in {"ip4", "ip6"}
+        or not is_dialable_browser_seed(seed_url)
+    ):
+        return seed_url
+    return f"/dns4/{edge_host}/{'/'.join(segments[2:])}"
+
+
+def canonicalize_browser_seed_urls(edge_base_url: str, seed_urls: list[str]) -> list[str]:
+    edge_host = browser_seed_dns_host(edge_base_url)
+    if not edge_host:
+        return dedupe(seed_urls)
+    return dedupe([canonicalize_browser_seed_url(edge_host, value) for value in seed_urls])
 
 
 def fetch_json(url: str, resource_name: str) -> Any:
@@ -156,7 +186,10 @@ def resolve_seed_node_urls(
         except Exception as error:  # noqa: BLE001 - deployment diagnostics should retain detail.
             signed_fetch_error = error
 
-    seed_urls = prefer_validated_browser_seed_urls(seed_urls)
+    seed_urls = canonicalize_browser_seed_urls(
+        edge_base_url,
+        prefer_validated_browser_seed_urls(seed_urls),
+    )
 
     if not seed_urls or not any(is_direct_browser_seed(value) for value in seed_urls):
         snapshot = fetch_browser_edge_snapshot(edge_base_url)

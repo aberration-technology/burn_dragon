@@ -287,18 +287,18 @@ fn browser_profile_from_native_config(
                 learning_rate: config.optimizer.learning_rate,
                 weight_decay: config.optimizer.weight_decay,
                 batch_size: config.training.batch_size,
-                max_train_batches: Some(config.training.max_iters.max(1)),
-                max_eval_batches: Some(config.training.max_iters.clamp(1, 8)),
+                max_train_batches: Some(config.training.max_iters.clamp(1, 4)),
+                max_eval_batches: Some(1),
                 capability_policy: DragonCapabilityPolicy::default(),
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,
-                    max_documents: None,
+                    max_documents: Some(16),
                 },
                 eval_source: Some(DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml,
                     split: DragonBrowserDatasetSplit::Validation,
-                    max_documents: None,
+                    max_documents: Some(4),
                 }),
             }))
         }
@@ -560,6 +560,23 @@ pub fn resolve_native_training_profile(
         }
     }
 
+    if has_local_training {
+        let config = load_training_config(&native.training_config_paths)?;
+        let profile = build_profile_from_local_config(
+            &config,
+            experiment_kind,
+            Some(&native.manifest.revision_id),
+            None,
+        )?;
+        return Ok(ResolvedNativeTrainingProfile {
+            config,
+            manifest_seed: native.manifest.clone(),
+            profile,
+            directory_entry: None,
+            source: DragonResolvedProfileSource::LocalConfig,
+        });
+    }
+
     if let Some(profile) = builtin_native_training_profile(native, experiment_kind)? {
         let config = materialize_native_training_config_for_ids(
             &native.storage_root,
@@ -577,26 +594,9 @@ pub fn resolve_native_training_profile(
         });
     }
 
-    if !has_local_training {
-        bail!(
-            "no network-published Dragon profile was available and native.training_config_paths is empty"
-        );
-    }
-
-    let config = load_training_config(&native.training_config_paths)?;
-    let profile = build_profile_from_local_config(
-        &config,
-        experiment_kind,
-        Some(&native.manifest.revision_id),
-        None,
-    )?;
-    Ok(ResolvedNativeTrainingProfile {
-        config,
-        manifest_seed: native.manifest.clone(),
-        profile,
-        directory_entry: None,
-        source: DragonResolvedProfileSource::LocalConfig,
-    })
+    bail!(
+        "no network-published Dragon profile was available and native.training_config_paths is empty"
+    )
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
@@ -874,11 +874,123 @@ prompt = "1 2 3"
             resolved.source,
             DragonResolvedProfileSource::BuiltinFallback
         );
-        assert_eq!(resolved.config.training.block_size, 128);
-        assert_eq!(resolved.config.training.batch_size, 4);
+        assert_eq!(resolved.config.training.block_size, 512);
+        assert_eq!(resolved.config.training.batch_size, 6);
         assert!(matches!(
             resolved.config.dataset.source,
             DatasetSourceConfig::UniversalityNca { .. }
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn local_training_config_wins_over_builtin_nca_profile_fallback() {
+        use crate::config::DragonPeerNetworkConfig;
+        use tempfile::tempdir;
+
+        let storage = tempdir().expect("storage");
+        let config_dir = tempdir().expect("config");
+        let corpus_path = config_dir.path().join("nca-corpus.toml");
+        let training_path = config_dir.path().join("nca-training.toml");
+        fs::write(
+            &corpus_path,
+            format!(
+                r#"
+output_dir = "{}"
+seed = 1337
+name = "local-nca"
+train_samples = 8
+validation_samples = 4
+chunk_token_capacity = 4096
+"#,
+                config_dir.path().join("generated").display()
+            ),
+        )
+        .expect("write corpus");
+        fs::write(
+            &training_path,
+            format!(
+                r#"
+[dataset]
+cache_dir = "{}"
+train_split_ratio = 0.9
+type = "universality_nca"
+config = "{}"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 50257
+eos_id = 50256
+
+[model]
+n_layer = 8
+n_embd = 512
+n_head = 8
+latent_total = 1024
+
+[model.language_head]
+type = "nca_factorized_patch"
+state_count = 10
+patch_size = 2
+frame_special_tokens = true
+eos_id = 50256
+
+[training]
+block_size = 512
+batch_size = 6
+max_iters = 24
+checkpoint_interval_iters = 8
+log_frequency = 1
+seed = 1337
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "0 0 0"
+"#,
+                config_dir.path().join("cache").display(),
+                corpus_path.display()
+            ),
+        )
+        .expect("write training config");
+
+        let native = DragonNativePeerConfig {
+            training_config_paths: vec![training_path],
+            storage_root: storage.path().to_path_buf(),
+            network: DragonPeerNetworkConfig::default(),
+            target: None,
+            identity: Default::default(),
+            bootstrap_peers: Vec::new(),
+            manifest: DragonManifestSeed {
+                study_id: "burn-dragon-mainnet".into(),
+                experiment_id: "nca-prepretraining".into(),
+                revision_id: "nca-r1".into(),
+                ..DragonManifestSeed::default()
+            },
+            app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
+            git_commit: None,
+            enabled_features_label: Some("native".into()),
+            auth: None,
+            capability_policy: DragonCapabilityPolicy::default(),
+            shard_export: None,
+            existing_shard_dataset: None,
+        };
+
+        let resolved = resolve_native_training_profile(
+            &native,
+            DragonExperimentKind::NcaPrepretraining,
+            false,
+        )
+        .expect("local profile should resolve");
+
+        assert_eq!(resolved.source, DragonResolvedProfileSource::LocalConfig);
+        assert_eq!(resolved.config.training.block_size, 512);
+        assert_eq!(resolved.config.training.batch_size, 6);
+        assert_eq!(resolved.config.model.n_layer, Some(8));
+        assert_eq!(resolved.config.model.n_embd, Some(512));
+        assert_eq!(resolved.config.model.latent_total, Some(1024));
     }
 }

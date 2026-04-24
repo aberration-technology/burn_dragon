@@ -421,7 +421,7 @@ Recommended first production setting:
 - leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` while you bring up the control plane
 - keep the managed trainer pool disabled on the normal production path so the fixed AWS spend stays under `$100`
 - add capacity first through browser peers and operator-run native peers before enabling an always-on managed trainer pool
-- if you intentionally move beyond the cheap profile later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu` and `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND=nca`
+- if you enable the managed trainer pool for the larger NCA profile, choose the backend and instance type deliberately instead of relying on the default CPU bootstrap path
 
 Operational constraint:
 
@@ -491,6 +491,8 @@ The initial directory entries are seeded from:
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
+
+The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile keeps bounded smoke/dev caps (`4` train batches, `1` eval batch, and bounded generated documents) so browser peers can still join safely and downgrade when local WebGPU capacity is insufficient.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 

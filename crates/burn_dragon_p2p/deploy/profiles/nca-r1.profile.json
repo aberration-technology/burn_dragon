@@ -2,15 +2,15 @@
   "version": 1,
   "experiment_kind": "nca_prepretraining",
   "native": {
-    "training_toml": "[dataset]\ncache_dir = \"__dragon_network_profile_cache__\"\ntrain_split_ratio = 0.8999999761581421\ntype = \"universality_nca\"\nconfig = \"nca-corpus.toml\"\n\n[dataset.tokenizer]\ntype = \"pretokenized\"\nvocab_size = 50257\neos_id = 50256\n\n[training]\nblock_size = 128\ntbptt_persist_across_steps = false\nbatch_size = 4\nseed = 1337\ngradient_accumulation_steps = 1\nmax_iters = 24\ncheckpoint_interval_iters = 4\nlog_frequency = 1\nlaunch_mode = \"fresh\"\nmodule_lr_scales = []\n\n[training.init_transfer]\npreserve_interface_input_embedding = false\npreserve_interface_output_head = false\npreserve_fresh_decoder = false\npreserve_fresh_norm = false\nmatch_fresh_rms = false\n\n[training.continual_backprop]\nenabled = true\ntarget = \"shared_lowrank_latents\"\nutility_decay = 0.9900000095367432\nreplacement_rate = 0.00009999999747378752\nmaturity_steps = 100\nsample_interval_steps = 8\nreplace_interval_steps = 64\nutility_epsilon = 0.0000009999999974752427\nlr_coupling = \"none\"\nlr_coupling_power = 1.0\n\n[training.context_strategy]\ntype = \"infinite\"\n\n[optimizer]\nname = \"adamw\"\nlearning_rate = 0.001\nweight_decay = 0.0\nschedule_mode = \"dragon_reference\"\n\n[parallel]\nmode = \"single\"\nworld_size = 1\n\n[parallel.data]\nsize = 1\nbackend = \"auto\"\nfind_unused_parameters = false\ngradient_as_bucket_view = true\n\n[parallel.tensor]\nsize = 1\naxis = \"neuron\"\npartition = \"contiguous\"\nsequence_parallel = false\n\n[parallel.fsdp]\nenabled = false\nreshard_after_forward = false\ncpu_offload = false\nmixed_precision = \"disabled\"\n\n[parallel.checkpoint]\nformat = \"unsharded_v1\"\nasync_write = false\n\n[parallel.pipeline]\nenabled = false\nstage_count = 1\nvirtual_stages_per_rank = 1\nschedule = \"interleaved_1f1b\"\nmicrobatches = 1\npartition = \"layer_contiguous\"\nactivation_checkpointing = false\nshared_weight_sync = \"all_reduce_per_step\"\ncommunication = \"activation_tensor\"\n\n[parallel.pipeline.cache]\nenabled = false\npolicy = \"disabled\"\nreuse_across_backward = true\nmax_inflight_microbatches = 1\neviction = \"step_boundary\"\ntransport_dtype = \"auto\"\n\n[generation]\nprompt = \"0 0 0\"\ntemperature = 1.0\noutput_format = \"auto\"\n\n[generation.context_strategy]\ntype = \"infinite\"\n\n[generation.prompt_tokenizer]\nsource = \"dataset\"\n\n[generation.decode_tokenizer]\nsource = \"dataset\"\n\n[wgpu]\nbackend = \"auto\"\nmemory = \"subslices\"\n\n[wgpu.training.startup_autotune]\nenabled = false\ntarget_device_memory_mb = 0\nmin_batch_size = 1\nprobe_steps = 1\nbinary_search = true\n\n[wgpu.inference]\ngeneration_executor = \"baseline\"\ngeneration_chunk_tokens = 8\ngeneration_device_buffer_tokens = 64\n\n[run_layout]\nmirror_config_path = true\n\n[model]\nn_layer = 4\nn_embd = 64\nn_head = 4\nlatent_total = 128\n\n[model.language_head]\ntype = \"nca_factorized_patch\"\nstate_count = 10\npatch_size = 2\nframe_special_tokens = true\neos_id = 50256\n",
+    "training_toml": "[dataset]\ncache_dir = \"__dragon_network_profile_cache__\"\ntrain_split_ratio = 0.8999999761581421\ntype = \"universality_nca\"\nconfig = \"nca-corpus.toml\"\n\n[dataset.tokenizer]\ntype = \"pretokenized\"\nvocab_size = 50257\neos_id = 50256\n\n[training]\nblock_size = 512\ntbptt_persist_across_steps = false\nbatch_size = 6\nseed = 1337\ngradient_accumulation_steps = 1\nmax_iters = 24\ncheckpoint_interval_iters = 8\nlog_frequency = 1\nlaunch_mode = \"fresh\"\nmodule_lr_scales = []\n\n[training.init_transfer]\npreserve_interface_input_embedding = false\npreserve_interface_output_head = false\npreserve_fresh_decoder = false\npreserve_fresh_norm = false\nmatch_fresh_rms = false\n\n[training.continual_backprop]\nenabled = true\ntarget = \"shared_lowrank_latents\"\nutility_decay = 0.9900000095367432\nreplacement_rate = 0.00009999999747378752\nmaturity_steps = 100\nsample_interval_steps = 8\nreplace_interval_steps = 64\nutility_epsilon = 0.0000009999999974752427\nlr_coupling = \"none\"\nlr_coupling_power = 1.0\n\n[training.context_strategy]\ntype = \"infinite\"\n\n[optimizer]\nname = \"adamw\"\nlearning_rate = 0.001\nweight_decay = 0.0\nschedule_mode = \"dragon_reference\"\n\n[parallel]\nmode = \"single\"\nworld_size = 1\n\n[parallel.data]\nsize = 1\nbackend = \"auto\"\nfind_unused_parameters = false\ngradient_as_bucket_view = true\n\n[parallel.tensor]\nsize = 1\naxis = \"neuron\"\npartition = \"contiguous\"\nsequence_parallel = false\n\n[parallel.fsdp]\nenabled = false\nreshard_after_forward = false\ncpu_offload = false\nmixed_precision = \"disabled\"\n\n[parallel.checkpoint]\nformat = \"unsharded_v1\"\nasync_write = false\n\n[parallel.pipeline]\nenabled = false\nstage_count = 1\nvirtual_stages_per_rank = 1\nschedule = \"interleaved_1f1b\"\nmicrobatches = 1\npartition = \"layer_contiguous\"\nactivation_checkpointing = false\nshared_weight_sync = \"all_reduce_per_step\"\ncommunication = \"activation_tensor\"\n\n[parallel.pipeline.cache]\nenabled = false\npolicy = \"disabled\"\nreuse_across_backward = true\nmax_inflight_microbatches = 1\neviction = \"step_boundary\"\ntransport_dtype = \"auto\"\n\n[generation]\nprompt = \"0 0 0\"\ntemperature = 1.0\noutput_format = \"auto\"\n\n[generation.context_strategy]\ntype = \"infinite\"\n\n[generation.prompt_tokenizer]\nsource = \"dataset\"\n\n[generation.decode_tokenizer]\nsource = \"dataset\"\n\n[wgpu]\nbackend = \"auto\"\nmemory = \"subslices\"\n\n[wgpu.training.startup_autotune]\nenabled = false\ntarget_device_memory_mb = 0\nmin_batch_size = 1\nprobe_steps = 1\nbinary_search = true\n\n[wgpu.inference]\ngeneration_executor = \"baseline\"\ngeneration_chunk_tokens = 8\ngeneration_device_buffer_tokens = 64\n\n[run_layout]\nmirror_config_path = true\n\n[model]\nn_layer = 8\nn_embd = 512\nn_head = 8\nlatent_total = 1024\n\n[model.language_head]\ntype = \"nca_factorized_patch\"\nstate_count = 10\npatch_size = 2\nframe_special_tokens = true\neos_id = 50256\n",
     "nca_corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n"
   },
   "browser": {
     "model_config": {
-      "n_layer": 4,
-      "n_embd": 64,
+      "n_layer": 8,
+      "n_embd": 512,
       "dropout": 0.1,
-      "n_head": 4,
+      "n_head": 8,
       "mlp_internal_dim_multiplier": 2,
       "initialization": {
         "kind": "simple_normal",
@@ -56,7 +56,7 @@
         "ngroups": 1,
         "a_init_min": 1.0,
         "a_init_max": 16.0,
-        "norm_eps": 1e-05,
+        "norm_eps": 0.00001,
         "rope_fraction": 0.5,
         "dt_init_floor": 0.0001,
         "a_floor": 0.0001,
@@ -84,11 +84,11 @@
         "lowrank_grad_input_executor": "auto",
         "block_sparse": {
           "latent": {
-            "block_size": 128,
+            "block_size": 512,
             "active_blocks": null
           },
           "time": {
-            "block_size": 128,
+            "block_size": 512,
             "active_pairs": null
           }
         },
@@ -99,37 +99,11 @@
       },
       "normalization": {
         "kind": "layer_norm",
-        "eps": 1e-05,
+        "eps": 0.00001,
         "alpha_init": null,
         "shift_init": null
       },
       "residual_connector": "vanilla",
-      "quant": {
-        "enable": false,
-        "protocol": "none",
-        "training_mode": "qat_ste",
-        "inference_mode": "offline_pack",
-        "weight_format": "fp16",
-        "act_format": "fp16",
-        "saved_activations": {
-          "mode": "disabled",
-          "format": "int8"
-        },
-        "target_modules": [],
-        "decoder_x_mode": "fp16",
-        "encoder_mode": null,
-        "act_grouping": "per_token",
-        "weight_grouping": "per_tensor",
-        "strict_bitnet_reference": false
-      },
-      "rho": {
-        "precision": "bf16",
-        "carry_across_tbptt": true,
-        "detach_between_windows": true,
-        "compression": "none",
-        "compression_interval": "chunk",
-        "stats_monitoring": true
-      },
       "mhc": {
         "enabled": false,
         "num_streams": 1,
@@ -191,10 +165,10 @@
       }
     },
     "execution_backend": "auto",
-    "block_size": 128,
+    "block_size": 512,
     "learning_rate": 0.001,
     "weight_decay": 0.0,
-    "batch_size": 4,
+    "batch_size": 6,
     "max_train_batches": 4,
     "max_eval_batches": 1,
     "capability_policy": {

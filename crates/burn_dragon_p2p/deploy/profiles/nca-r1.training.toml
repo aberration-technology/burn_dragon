@@ -10,10 +10,10 @@ vocab_size = 50257
 eos_id = 50256
 
 [model]
-n_layer = 4
-n_embd = 64
-n_head = 4
-latent_total = 128
+n_layer = 8
+n_embd = 512
+n_head = 8
+latent_total = 1024
 
 [model.language_head]
 type = "nca_factorized_patch"
@@ -23,10 +23,10 @@ frame_special_tokens = true
 eos_id = 50256
 
 [training]
-block_size = 128
-batch_size = 4
+block_size = 512
+batch_size = 6
 max_iters = 24
-checkpoint_interval_iters = 4
+checkpoint_interval_iters = 8
 log_frequency = 1
 seed = 1337
 

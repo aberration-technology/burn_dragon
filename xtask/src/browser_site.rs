@@ -681,6 +681,7 @@ main.dragon-browser-shell {
   border-radius: 8px;
   min-width: 0;
   max-width: 100%;
+  overflow: hidden;
 }
 
 .dragon-activity-feed {
@@ -688,7 +689,12 @@ main.dragon-browser-shell {
   gap: 8px;
   list-style: none;
   margin: 0;
-  padding: 0;
+  max-height: min(236px, 34vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 4px 0 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
 }
 
 .dragon-activity-event {
@@ -696,6 +702,7 @@ main.dragon-browser-shell {
   grid-template-columns: 72px minmax(0, 0.8fr) minmax(0, 1.4fr);
   gap: 10px;
   align-items: baseline;
+  min-width: 0;
   padding: 9px 0;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
 }
@@ -712,16 +719,28 @@ main.dragon-browser-shell {
 }
 
 .dragon-activity-label {
+  min-width: 0;
   color: var(--ink);
   font-size: 0.86rem;
   overflow-wrap: anywhere;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .dragon-activity-detail {
+  min-width: 0;
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .dragon-activity-event-error .dragon-activity-label {

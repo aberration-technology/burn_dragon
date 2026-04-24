@@ -65,6 +65,7 @@ const HERO_RATTLE_INTERVAL_MILLIS: u32 = 80;
 const HERO_RATTLE_FRAMES: &[&str] = &[
     "⠉⠉", "⠈⠙", "⠀⠹", "⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁",
 ];
+const DRAGON_UI_EVENT_LIMIT: usize = 5;
 
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<DragonBrowserAppHandle>> = const { RefCell::new(None) };
@@ -1507,7 +1508,7 @@ fn dragon_ui_event_candidate(
             key: format!("{:?}:active:{}", step.id, step.detail),
             kind: dragon_readiness_event_kind(step.id),
             label: step.detail.clone(),
-            detail: Some(format!("{} step active", step.label)),
+            detail: None,
         };
     }
     DragonUiEventCandidate {
@@ -1519,8 +1520,58 @@ fn dragon_ui_event_candidate(
             DragonHeroTone::Blocked => DragonUiEventKind::Error,
         },
         label: hero.label.clone(),
-        detail: Some(hero.detail.clone()),
+        detail: dragon_ui_event_detail(&hero.label, &hero.detail),
     }
+}
+
+fn dragon_ui_event_detail(label: &str, detail: &str) -> Option<String> {
+    let detail = detail.trim();
+    if detail.is_empty() || detail.eq_ignore_ascii_case(label.trim()) {
+        None
+    } else {
+        Some(detail.to_owned())
+    }
+}
+
+fn dragon_ui_event_matches_candidate(
+    event: &DragonUiEvent,
+    candidate: &DragonUiEventCandidate,
+) -> bool {
+    event.kind == candidate.kind
+        && event.label == candidate.label
+        && event.detail == candidate.detail
+}
+
+fn dragon_ui_event_replaces_candidate(
+    event: &DragonUiEvent,
+    candidate: &DragonUiEventCandidate,
+) -> bool {
+    event.kind == candidate.kind && event.label == candidate.label
+}
+
+fn dragon_push_ui_event(
+    mut events: Vec<DragonUiEvent>,
+    candidate: &DragonUiEventCandidate,
+    at_ms: f64,
+) -> Vec<DragonUiEvent> {
+    if events
+        .first()
+        .is_some_and(|event| dragon_ui_event_matches_candidate(event, candidate))
+    {
+        return events;
+    }
+    events.retain(|event| !dragon_ui_event_replaces_candidate(event, candidate));
+    events.insert(
+        0,
+        DragonUiEvent {
+            at_ms,
+            kind: candidate.kind,
+            label: candidate.label.clone(),
+            detail: candidate.detail.clone(),
+        },
+    );
+    events.truncate(DRAGON_UI_EVENT_LIMIT);
+    events
 }
 
 fn dragon_readiness_event_kind(id: DragonReadinessStepId) -> DragonUiEventKind {
@@ -2918,18 +2969,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 return;
             }
             last_ui_event_key.set(event_candidate.key.clone());
-            let mut next_events = ui_events.read().clone();
-            next_events.insert(
-                0,
-                DragonUiEvent {
-                    at_ms: dragon_ui_now_ms(),
-                    kind: event_candidate.kind,
-                    label: event_candidate.label.clone(),
-                    detail: event_candidate.detail.clone(),
-                },
-            );
-            next_events.truncate(8);
-            ui_events.set(next_events);
+            let current_events = ui_events.read().clone();
+            let next_events =
+                dragon_push_ui_event(current_events.clone(), &event_candidate, dragon_ui_now_ms());
+            if next_events != current_events {
+                ui_events.set(next_events);
+            }
         });
     }
     let activity_events = ui_events.read().clone();
@@ -3728,14 +3773,14 @@ fn ActivityFeed(events: Vec<DragonUiEvent>) -> Element {
     rsx! {
         section { class: "panel compact-panel dragon-activity-panel",
             SectionHeader {
-                eyebrow: "events",
-                title: "peer activity",
-                detail: "recent state transitions from this browser peer.",
+                eyebrow: "log",
+                title: "state changes",
+                detail: "latest peer transitions.",
             }
             if events.is_empty() {
                 EmptyState {
-                    title: "waiting for events",
-                    detail: "state changes will appear here as the peer connects.",
+                    title: "waiting",
+                    detail: "new transitions appear here.",
                 }
             } else {
                 ol { class: "dragon-activity-feed",
@@ -3893,16 +3938,17 @@ mod tests {
     use super::{
         BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
-        DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext, DragonReadinessStepId,
-        DragonStepStatus, browser_app_refresh_interval_millis, browser_session_is_authenticated,
+        DRAGON_UI_EVENT_LIMIT, DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext,
+        DragonReadinessStepId, DragonStepStatus, DragonUiEventCandidate, DragonUiEventKind,
+        browser_app_refresh_interval_millis, browser_session_is_authenticated,
         browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
         dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
         dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
-        dragon_peer_ui_state, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
-        dragon_slice_progress_summary, dragon_training_action_state, dragon_transport_summary,
-        dragon_window_progress_detail, dragon_window_summary, filter_seed_urls_for_transport,
-        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
-        retained_refresh_transport_warning,
+        dragon_peer_ui_state, dragon_push_ui_event, dragon_runtime_mode_detail,
+        dragon_runtime_mode_summary, dragon_slice_progress_summary, dragon_training_action_state,
+        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
+        filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
+        normalized_browser_callback_url, retained_refresh_transport_warning,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -4522,6 +4568,44 @@ mod tests {
                 .status,
             DragonStepStatus::Blocked
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_ui_events_collapse_repeated_display_messages() {
+        let waiting = DragonUiEventCandidate {
+            key: "peer:waiting:1".into(),
+            kind: DragonUiEventKind::Peer,
+            label: "waiting for peers".into(),
+            detail: None,
+        };
+        let waiting_with_detail = DragonUiEventCandidate {
+            key: "peer:waiting:2".into(),
+            kind: DragonUiEventKind::Peer,
+            label: "waiting for peers".into(),
+            detail: Some("training unlocks after a direct peer connects".into()),
+        };
+
+        let events = dragon_push_ui_event(Vec::new(), &waiting, 1_000.0);
+        let events = dragon_push_ui_event(events, &waiting, 2_000.0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].at_ms, 1_000.0);
+
+        let events = dragon_push_ui_event(events, &waiting_with_detail, 3_000.0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].at_ms, 3_000.0);
+        assert_eq!(events[0].detail, waiting_with_detail.detail);
+
+        let mut events = events;
+        for index in 0..(DRAGON_UI_EVENT_LIMIT + 3) {
+            let candidate = DragonUiEventCandidate {
+                key: format!("training:{index}"),
+                kind: DragonUiEventKind::Training,
+                label: format!("training event {index}"),
+                detail: None,
+            };
+            events = dragon_push_ui_event(events, &candidate, 4_000.0 + index as f64);
+        }
+        assert_eq!(events.len(), DRAGON_UI_EVENT_LIMIT);
     }
 
     #[wasm_bindgen_test]

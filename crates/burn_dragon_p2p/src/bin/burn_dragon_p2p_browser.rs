@@ -188,19 +188,7 @@ fn BrowserBootstrapApp() -> Element {
                 }
             }
         },
-        None => rsx! {
-            main { class: "browser-app-shell burn-dragon-p2p-bootstrap-loading",
-                section { class: "panel hero browser-hero",
-                    div { class: "browser-hero-grid",
-                        div { class: "browser-hero-copy",
-                            div { class: "eyebrow", "burn_dragon" }
-                            h1 { class: "app-title", "loading" }
-                            p { class: "app-subtitle", "fetching site config." }
-                        }
-                    }
-                }
-            }
-        },
+        None => rsx! {},
     }
 }
 

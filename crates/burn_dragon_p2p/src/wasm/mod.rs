@@ -997,7 +997,9 @@ fn dragon_training_action_state(
     if view.runtime_label == "blocked" {
         return Some(DragonTrainingActionState {
             label: "training blocked",
-            detail: view.runtime_detail.clone(),
+            detail: downgrade_reason
+                .map(str::to_owned)
+                .unwrap_or_else(|| view.runtime_detail.clone()),
             enabled: false,
         });
     }
@@ -1056,6 +1058,64 @@ fn dragon_training_action_state(
             enabled: false,
         })
     }
+}
+
+fn dragon_short_block_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return "training blocked".into();
+    }
+    let short = reason
+        .split([';', '.'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(reason);
+    short.to_owned()
+}
+
+fn dragon_browser_capability_block_summary(
+    downgrade_reason: Option<&str>,
+    browser_can_attempt_dynamic_training: bool,
+) -> String {
+    if let Some(reason) = downgrade_reason {
+        return dragon_short_block_reason(reason);
+    }
+    if !browser_can_attempt_dynamic_training {
+        return "webgpu or worker unavailable".into();
+    }
+    "browser capability blocked".into()
+}
+
+fn dragon_browser_capability_block_detail(
+    downgrade_reason: Option<&str>,
+    browser_can_attempt_dynamic_training: bool,
+) -> String {
+    if let Some(reason) = downgrade_reason {
+        return reason.to_owned();
+    }
+    if !browser_can_attempt_dynamic_training {
+        return "browser training needs WebGPU available to the page and worker. this tab can still watch the network.".into();
+    }
+    "browser capability policy blocked local training. open advanced diagnostics for capability details.".into()
+}
+
+fn dragon_training_block_detail(
+    view: Option<&BrowserAppClientView>,
+    downgrade_reason: Option<&str>,
+    browser_can_attempt_dynamic_training: bool,
+) -> String {
+    if downgrade_reason.is_some() || !browser_can_attempt_dynamic_training {
+        return dragon_browser_capability_block_summary(
+            downgrade_reason,
+            browser_can_attempt_dynamic_training,
+        );
+    }
+    view.and_then(|view| {
+        let detail = view.runtime_detail.trim();
+        (!detail.is_empty()).then(|| detail.to_owned())
+    })
+    .unwrap_or_else(|| "training blocked".into())
 }
 
 fn dragon_peer_ui_state(context: &DragonPeerUiContext<'_>) -> DragonPeerUiState {
@@ -1129,7 +1189,9 @@ fn dragon_hero_view(context: &DragonPeerUiContext<'_>) -> DragonHeroView {
         if view.runtime_label == "blocked" {
             return DragonHeroView {
                 label: "blocked".into(),
-                detail: view.runtime_detail.clone(),
+                detail: downgrade_reason
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| view.runtime_detail.clone()),
                 tone: DragonHeroTone::Blocked,
                 animate: false,
             };
@@ -1191,7 +1253,7 @@ fn dragon_hero_view(context: &DragonPeerUiContext<'_>) -> DragonHeroView {
         if !browser_can_attempt_dynamic_training {
             return DragonHeroView {
                 label: "observe mode".into(),
-                detail: "browser training is unavailable on this host. this tab can still watch the network.".into(),
+                detail: dragon_browser_capability_block_detail(None, false),
                 tone: DragonHeroTone::Blocked,
                 animate: false,
             };
@@ -1262,6 +1324,12 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
     let training_action_state = context.training_action_state;
 
     let direct_error = view.and_then(active_direct_transport_error);
+    let capability_block_summary = dragon_browser_capability_block_summary(
+        downgrade_reason,
+        browser_can_attempt_dynamic_training,
+    );
+    let training_block_detail =
+        dragon_training_block_detail(view, downgrade_reason, browser_can_attempt_dynamic_training);
     let edge_status = if !edge_configured {
         DragonStepStatus::Blocked
     } else if auth_bootstrap_pending {
@@ -1339,7 +1407,7 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
             detail: match browser_status {
                 DragonStepStatus::Done => "WebGPU available".into(),
                 DragonStepStatus::Active => "probing browser".into(),
-                DragonStepStatus::Blocked => "browser downgraded".into(),
+                DragonStepStatus::Blocked => capability_block_summary.clone(),
                 DragonStepStatus::Waiting => "waiting for browser".into(),
             },
         },
@@ -1394,7 +1462,7 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
             detail: match training_status {
                 DragonStepStatus::Done => "ready".into(),
                 DragonStepStatus::Active => "training".into(),
-                DragonStepStatus::Blocked => "training blocked".into(),
+                DragonStepStatus::Blocked => training_block_detail,
                 DragonStepStatus::Waiting => "not ready yet".into(),
             },
         },
@@ -1497,7 +1565,7 @@ fn dragon_ui_event_candidate(
             key: format!("{:?}:blocked:{}", step.id, step.detail),
             kind: DragonUiEventKind::Error,
             label: step.detail.clone(),
-            detail: Some("open diagnostics for raw state and transport details".into()),
+            detail: dragon_blocked_event_detail(step, hero),
         };
     }
     if let Some(step) = readiness
@@ -1521,6 +1589,28 @@ fn dragon_ui_event_candidate(
         },
         label: hero.label.clone(),
         detail: dragon_ui_event_detail(&hero.label, &hero.detail),
+    }
+}
+
+fn dragon_blocked_event_detail(
+    step: &DragonReadinessStepView,
+    hero: &DragonHeroView,
+) -> Option<String> {
+    if hero.tone == DragonHeroTone::Blocked {
+        let detail = dragon_ui_event_detail(&step.detail, &hero.detail);
+        if detail.is_some() {
+            return detail;
+        }
+    }
+    match step.id {
+        DragonReadinessStepId::Edge => Some("set an edge url before this browser peer can connect".into()),
+        DragonReadinessStepId::BrowserCapabilities => Some("browser training needs WebGPU and worker support. this tab can still watch the network.".into()),
+        DragonReadinessStepId::Transport | DragonReadinessStepId::DirectPeer => {
+            Some("training needs a direct WebRTC peer before it can start".into())
+        }
+        DragonReadinessStepId::Assignment => Some("training starts after this peer receives work".into()),
+        DragonReadinessStepId::Checkpoint => Some("training starts after the current checkpoint is available".into()),
+        DragonReadinessStepId::TrainingReady => Some("resolve the blocked readiness step before training can run".into()),
     }
 }
 
@@ -1954,10 +2044,12 @@ fn dragon_runtime_mode_detail(
     if training_action_state.is_some_and(|state| state.enabled) {
         return "direct peers connected and checkpoint synced. run training when ready.".into();
     }
-    if matches!(
-        view.runtime_label.as_str(),
-        "train" | "validate" | "blocked"
-    ) {
+    if view.runtime_label == "blocked" {
+        return downgrade_reason
+            .map(str::to_owned)
+            .unwrap_or_else(|| view.runtime_detail.clone());
+    }
+    if matches!(view.runtime_label.as_str(), "train" | "validate") {
         return view.runtime_detail.clone();
     }
     if view.runtime_label.starts_with("joining ") {
@@ -2871,6 +2963,44 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .as_ref()
         .map(|footprint| format!("{} MiB", footprint.estimated_shard_bytes / (1024 * 1024)))
         .unwrap_or_else(|| "n/a".into());
+    let capability_training_label = if browser_capability_decision.can_train {
+        "train-ready".to_owned()
+    } else {
+        "blocked".to_owned()
+    };
+    let capability_reason_label = browser_downgrade_reason.clone().unwrap_or_else(|| {
+        if browser_capability_decision.can_train {
+            "WebGPU and worker requirements satisfied".into()
+        } else if props.config.training.is_none() {
+            "browser training is not configured for this deployment".into()
+        } else {
+            "browser trainer capability check blocked local training".into()
+        }
+    });
+    let capability_navigator_gpu_label = if browser_host_capabilities.navigator_gpu_exposed {
+        "available"
+    } else {
+        "not available"
+    }
+    .to_owned();
+    let capability_worker_gpu_label = if browser_host_capabilities.worker_gpu_exposed {
+        "available"
+    } else {
+        "not available"
+    }
+    .to_owned();
+    let capability_worker_label = if browser_host_capabilities.dedicated_worker_exposed {
+        "available"
+    } else {
+        "not available"
+    }
+    .to_owned();
+    let capability_storage_label = if browser_host_capabilities.persistent_storage_exposed {
+        "available"
+    } else {
+        "not available"
+    }
+    .to_owned();
     let active_head_label = view
         .as_ref()
         .and_then(|view| {
@@ -3575,6 +3705,32 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     label: "shard",
                                     value: capability_shard_label,
                                     detail: Some("budget".into()),
+                                }
+                            }
+                            div { class: "keyvalue-list dragon-live-keyvalues",
+                                div { class: "keyvalue-row",
+                                    span { "training decision" }
+                                    strong { "{capability_training_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "why" }
+                                    strong { "{capability_reason_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "page webgpu" }
+                                    strong { "{capability_navigator_gpu_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "worker webgpu" }
+                                    strong { "{capability_worker_gpu_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "dedicated worker" }
+                                    strong { "{capability_worker_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "persistent storage" }
+                                    strong { "{capability_storage_label}" }
                                 }
                             }
                         }
@@ -4567,6 +4723,102 @@ mod tests {
                 .expect("peer step")
                 .status,
             DragonStepStatus::Blocked
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_peer_ui_state_explains_browser_capability_block() {
+        let mut view = sample_browser_view();
+        view.runtime_label = "observe".into();
+        view.runtime_detail = "watching heads and standings".into();
+        view.training.can_train = false;
+        let downgrade_reason = "webgpu unavailable; downgrading browser peer to verifier/observer";
+        let action = dragon_training_action_state(
+            Some(&view),
+            true,
+            true,
+            true,
+            false,
+            Some(downgrade_reason),
+        );
+
+        let context = DragonPeerUiContext {
+            view: Some(&view),
+            status_message: "",
+            has_session: true,
+            auth_bootstrap_pending: false,
+            needs_sign_in: false,
+            ready_to_connect: false,
+            edge_configured: true,
+            browser_can_attempt_dynamic_training: true,
+            direct_transport_ready: true,
+            local_training_pending: false,
+            downgrade_reason: Some(downgrade_reason),
+            training_action_state: action.as_ref(),
+        };
+        let ui = dragon_peer_ui_state(&context);
+
+        assert_eq!(ui.hero.label, "observe mode");
+        assert_eq!(ui.hero.tone, DragonHeroTone::Blocked);
+        assert!(ui.hero.detail.contains("webgpu unavailable"));
+        assert_eq!(
+            ui.readiness
+                .iter()
+                .find(|step| step.id == DragonReadinessStepId::BrowserCapabilities)
+                .expect("browser step")
+                .detail,
+            "webgpu unavailable"
+        );
+        assert_eq!(
+            ui.readiness
+                .iter()
+                .find(|step| step.id == DragonReadinessStepId::TrainingReady)
+                .expect("train step")
+                .detail,
+            "webgpu unavailable"
+        );
+        assert_eq!(ui.event_candidate.kind, DragonUiEventKind::Error);
+        assert_eq!(ui.event_candidate.label, "webgpu unavailable");
+        assert_eq!(ui.event_candidate.detail.as_deref(), Some(downgrade_reason));
+
+        let mut blocked_view = view.clone();
+        blocked_view.runtime_label = "blocked".into();
+        blocked_view.runtime_detail = "training blocked".into();
+        let blocked_action = dragon_training_action_state(
+            Some(&blocked_view),
+            true,
+            true,
+            true,
+            false,
+            Some(downgrade_reason),
+        );
+        let blocked_context = DragonPeerUiContext {
+            view: Some(&blocked_view),
+            status_message: "",
+            has_session: true,
+            auth_bootstrap_pending: false,
+            needs_sign_in: false,
+            ready_to_connect: false,
+            edge_configured: true,
+            browser_can_attempt_dynamic_training: true,
+            direct_transport_ready: true,
+            local_training_pending: false,
+            downgrade_reason: Some(downgrade_reason),
+            training_action_state: blocked_action.as_ref(),
+        };
+        let blocked_ui = dragon_peer_ui_state(&blocked_context);
+
+        assert_eq!(blocked_ui.hero.label, "blocked");
+        assert_eq!(blocked_ui.hero.detail, downgrade_reason);
+        assert_eq!(
+            dragon_runtime_mode_detail(
+                Some(&blocked_view),
+                true,
+                blocked_action.as_ref(),
+                false,
+                Some(downgrade_reason),
+            ),
+            downgrade_reason
         );
     }
 

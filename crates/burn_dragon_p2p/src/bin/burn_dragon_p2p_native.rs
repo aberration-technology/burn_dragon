@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -71,6 +72,7 @@ const DEFAULT_HEAD_SYNC_INTERVAL_SECS: u64 = 15;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const NATIVE_BROWSER_APP_BASE_URL_ENV: &str = "BURN_DRAGON_P2P_BROWSER_APP_BASE_URL";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_dragon native peer operator")]
@@ -1216,7 +1218,16 @@ fn write_auth_bundle(
     write_output(Some(path), auth_bundle_output_format(path, format)?, value)
 }
 
-fn infer_browser_site_base_url(edge_base_url: &str) -> Result<String> {
+fn resolve_browser_site_base_url(
+    edge_base_url: &str,
+    override_base_url: Option<&str>,
+) -> Result<String> {
+    if let Some(base_url) = override_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(base_url.trim_end_matches('/').to_owned());
+    }
     let mut url = Url::parse(edge_base_url)
         .with_context(|| format!("failed to parse edge base URL {edge_base_url}"))?;
     let host = url
@@ -1228,6 +1239,11 @@ fn infer_browser_site_base_url(edge_base_url: &str) -> Result<String> {
         anyhow!("failed to derive browser site host from {edge_base_url}: {error}")
     })?;
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn infer_browser_site_base_url(edge_base_url: &str) -> Result<String> {
+    let override_base_url = env::var(NATIVE_BROWSER_APP_BASE_URL_ENV).ok();
+    resolve_browser_site_base_url(edge_base_url, override_base_url.as_deref())
 }
 
 fn build_native_cli_browser_auth_bootstrap(
@@ -1325,14 +1341,11 @@ fn perform_interactive_native_login(
     let listener = start_native_browser_auth_listener()?;
     let bridge_url =
         native_cli_browser_auth_url(&bootstrap, &listener.callback_url, &listener.nonce)?;
+    eprintln!("Open this URL if the browser did not open automatically:\n{bridge_url}");
     match open_url_in_system_browser(&bridge_url) {
         Ok(()) => eprintln!("launched browser for GitHub login"),
         Err(error) => {
             eprintln!("automatic browser launch failed: {error}");
-            eprintln!(
-                "Open this URL to continue GitHub login:
-{bridge_url}"
-            );
         }
     }
     let callback = listener.wait(Duration::from_secs(callback_timeout_secs))?;
@@ -2865,5 +2878,231 @@ fn infer_format(path: &Path) -> Result<ConfigFormat> {
             "could not infer config format for {}; pass --config-format",
             path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use burn_p2p::{
+        AuthProvider, EdgeEnrollmentConfig, ExperimentId, NodeCertificate, NodeCertificateClaims,
+        PeerId, PeerRole, PrincipalClaims, PrincipalSession, ProjectFamilyId, RevocationEpoch,
+    };
+    use burn_p2p_core::{SignatureAlgorithm, SignatureMetadata};
+    use chrono::Utc;
+    use semver::Version;
+    use tempfile::tempdir;
+
+    fn test_enrollment(requested_scopes: BTreeSet<ExperimentScope>) -> EdgeEnrollmentConfig {
+        EdgeEnrollmentConfig {
+            network_id: NetworkId::new("dragon-native-auth-testnet"),
+            project_family_id: ProjectFamilyId::new("burn-dragon-language"),
+            release_train_hash: ContentId::new("dragon-native-auth-release"),
+            target_artifact_id: "native-cpu".into(),
+            target_artifact_hash: ContentId::new("burn-dragon-native"),
+            login_path: "/login/github".into(),
+            device_path: None,
+            callback_path: "/callback/github".into(),
+            trusted_callback_header: None,
+            trusted_callback_token: None,
+            enroll_path: "/enroll".into(),
+            trust_bundle_path: "/trust".into(),
+            requested_scopes,
+            session_ttl_secs: 1800,
+        }
+    }
+
+    fn test_session(enrollment: &EdgeEnrollmentConfig) -> PrincipalSession {
+        let now = Utc::now();
+        PrincipalSession {
+            session_id: ContentId::new("dragon-native-auth-session"),
+            network_id: enrollment.network_id.clone(),
+            claims: PrincipalClaims {
+                principal_id: PrincipalId::new("github-native-cli"),
+                provider: AuthProvider::GitHub,
+                display_name: "native cli".into(),
+                org_memberships: BTreeSet::new(),
+                group_memberships: BTreeSet::new(),
+                granted_roles: PeerRoleSet::new([PeerRole::TrainerCpu, PeerRole::Archive]),
+                granted_scopes: enrollment.requested_scopes.clone(),
+                custom_claims: BTreeMap::new(),
+                issued_at: now,
+                expires_at: now + chrono::Duration::minutes(30),
+            },
+            issued_at: now,
+            expires_at: now + chrono::Duration::minutes(30),
+        }
+    }
+
+    fn test_certificate(
+        enrollment: &EdgeEnrollmentConfig,
+        session: &PrincipalSession,
+        identity: &burn_p2p::EdgePeerIdentity,
+    ) -> NodeCertificate {
+        let now = Utc::now();
+        NodeCertificate::new(
+            Version::new(0, 1, 0),
+            NodeCertificateClaims {
+                network_id: enrollment.network_id.clone(),
+                project_family_id: enrollment.project_family_id.clone(),
+                release_train_hash: enrollment.release_train_hash.clone(),
+                target_artifact_hash: enrollment.target_artifact_hash.clone(),
+                peer_id: identity.peer_id.clone(),
+                peer_public_key_hex: identity.peer_public_key_hex.clone(),
+                principal_id: session.claims.principal_id.clone(),
+                provider: session.claims.provider.clone(),
+                granted_roles: session.claims.granted_roles.clone(),
+                experiment_scopes: enrollment.requested_scopes.clone(),
+                client_policy_hash: identity.client_policy_hash.clone(),
+                auth_policy_snapshot: None,
+                not_before: now,
+                not_after: now + chrono::Duration::minutes(30),
+                serial: identity.serial,
+                revocation_epoch: RevocationEpoch(0),
+            },
+            SignatureMetadata {
+                signer: PeerId::new("dragon-native-auth-issuer"),
+                key_id: "dragon-native-auth-key".into(),
+                algorithm: SignatureAlgorithm::Ed25519,
+                signed_at: now,
+                signature_hex: "00".into(),
+            },
+        )
+        .expect("test certificate")
+    }
+
+    fn post_form(callback_url: &str, fields: &[(&str, String)]) -> Result<String> {
+        let url = Url::parse(callback_url)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("callback url missing host"))?;
+        let port = url
+            .port()
+            .ok_or_else(|| anyhow!("callback url missing port"))?;
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in fields {
+            body.append_pair(key, value);
+        }
+        let body = body.finish();
+        let target = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let mut stream = TcpStream::connect((host, port))?;
+        write!(
+            stream,
+            "POST {target} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        stream.flush()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    }
+
+    #[test]
+    fn native_cli_browser_auth_url_targets_pages_callback() {
+        let storage = tempdir().expect("storage");
+        let (_, identity) = edge_peer_identity_for_storage(storage.path(), None).expect("identity");
+        let bootstrap = NativeCliBridgeBootstrap {
+            edge_base_url: "https://edge.dragon.example".into(),
+            site_base_url: "https://dragon.example".into(),
+            target_artifact_id: "native-cpu".into(),
+            app_semver: "0.21.0-pre.22".into(),
+            git_commit: "test".into(),
+            enabled_features_label: "native".into(),
+            requested_scopes: BTreeSet::from([ExperimentScope::Connect]),
+            session_ttl_secs: 1800,
+            principal_hint: Some("alice".into()),
+            identity,
+        };
+
+        let url =
+            native_cli_browser_auth_url(&bootstrap, "http://127.0.0.1:43123/callback", "nonce-1")
+                .expect("bridge url");
+        let parsed = Url::parse(&url).expect("parse bridge url");
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("dragon.example"));
+        assert_eq!(parsed.path(), "/callback/github");
+        let query = parsed.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("native_cli").map(|value| value.as_ref()),
+            Some("1")
+        );
+        assert!(query.contains_key("native_auth_bootstrap"));
+        assert!(!query.contains_key("native_authorize"));
+    }
+
+    #[test]
+    fn browser_site_base_url_override_avoids_edge_hostname_guessing() {
+        assert_eq!(
+            resolve_browser_site_base_url(
+                "https://edge-staging.dragon.example",
+                Some("https://staging.dragon.example/"),
+            )
+            .expect("browser site base url"),
+            "https://staging.dragon.example"
+        );
+        assert_eq!(
+            resolve_browser_site_base_url("https://edge.dragon.example", None)
+                .expect("inferred browser site base url"),
+            "https://dragon.example"
+        );
+    }
+
+    #[test]
+    fn native_browser_auth_listener_accepts_bridge_auth_result_and_updates_cache() {
+        let storage = tempdir().expect("storage");
+        let (_, identity) = edge_peer_identity_for_storage(storage.path(), None).expect("identity");
+        let requested_scopes = BTreeSet::from([
+            ExperimentScope::Connect,
+            ExperimentScope::Train {
+                experiment_id: ExperimentId::new("nca-prepretraining"),
+            },
+        ]);
+        let enrollment = test_enrollment(requested_scopes);
+        let session = test_session(&enrollment);
+        let certificate = test_certificate(&enrollment, &session, &identity);
+        let auth_result = NativeCliBridgeAuthResult {
+            edge_base_url: "https://edge.dragon.example".into(),
+            enrollment,
+            session,
+            certificate,
+        };
+        let listener = start_native_browser_auth_listener().expect("listener");
+        let callback_url = listener.callback_url.clone();
+        let nonce = listener.nonce.clone();
+        let response = post_form(
+            &callback_url,
+            &[
+                ("native_nonce", nonce),
+                (
+                    "auth_result_json",
+                    serde_json::to_string(&auth_result).expect("auth result json"),
+                ),
+            ],
+        )
+        .expect("post callback form");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let callback = listener
+            .wait(Duration::from_secs(2))
+            .expect("auth callback");
+        let NativeBrowserAuthCallback::AuthResult(result) = callback else {
+            panic!("expected bridge auth result");
+        };
+        assert_eq!(result.session.session_id, auth_result.session.session_id);
+
+        let authenticated =
+            finalize_native_auth_session_from_bridge_result(storage.path(), &result, None)
+                .expect("finalize native auth");
+        assert!(native_auth_bundle_is_fresh(&authenticated.auth));
+        assert!(authenticated.auth.auth_config.local_peer_auth.is_some());
+        let cached = load_cached_native_auth_bundle(storage.path())
+            .expect("load cached auth")
+            .expect("cached auth");
+        assert_eq!(cached.session_id, authenticated.auth.session_id);
     }
 }

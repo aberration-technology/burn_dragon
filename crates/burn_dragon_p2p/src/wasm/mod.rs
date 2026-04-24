@@ -105,7 +105,7 @@ fn active_direct_transport_error(view: &BrowserAppClientView) -> Option<&str> {
 }
 
 fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
-    serde_json::json!({
+    serde_json::to_string_pretty(&serde_json::json!({
         "runtime_label": &view.runtime_label,
         "runtime_detail": &view.runtime_detail,
         "desired_transport": browser_transport_family_label(view.network.swarm_status.desired_transport.as_ref()),
@@ -118,8 +118,8 @@ fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
         "cached_microshards": view.training.cached_microshards,
         "last_error": active_direct_transport_error(view),
         "network_transport": &view.network.transport,
-    })
-    .to_string()
+    }))
+    .expect("browser machine state json")
 }
 
 fn browser_scope_summary(scopes: &BTreeSet<ExperimentScope>) -> String {
@@ -3716,7 +3716,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         small { "state · network · training · session" }
                     }
                     div { class: "dragon-diagnostics-grid",
-                        section { class: "dragon-diagnostics-section",
+                        section { class: "dragon-diagnostics-section dragon-diagnostics-section-state",
                             SectionHeader {
                                 eyebrow: "state",
                                 title: "machine state",
@@ -3731,7 +3731,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        section { class: "dragon-diagnostics-section",
+                        section { class: "dragon-diagnostics-section dragon-diagnostics-section-network",
                             SectionHeader {
                                 eyebrow: "network",
                                 title: "transport",
@@ -3740,11 +3740,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             div { class: "keyvalue-list dragon-live-keyvalues",
                                 div { class: "keyvalue-row",
                                     span { "edge url" }
-                                    strong { "{edge_url.read().clone()}" }
+                                    strong { code { "{edge_url.read().clone()}" } }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "seed urls" }
-                                    strong { "{seed_node_urls.read().clone()}" }
+                                    strong { code { "{seed_node_urls.read().clone()}" } }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "transport" }
@@ -3757,12 +3757,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 if let Some(error) = direct_transport_error.as_ref() {
                                     div { class: "keyvalue-row",
                                         span { "last error" }
-                                        strong { "{error}" }
+                                        strong { code { "{error}" } }
                                     }
                                 }
                             }
                         }
-                        section { class: "dragon-diagnostics-section",
+                        section { class: "dragon-diagnostics-section dragon-diagnostics-section-training",
                             SectionHeader {
                                 eyebrow: "training",
                                 title: "local slice",
@@ -3776,7 +3776,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     }
                                     div { class: "keyvalue-row",
                                         span { "head" }
-                                        strong { "{active_head_label}" }
+                                        strong { code { "{active_head_label}" } }
                                     }
                                     div { class: "keyvalue-row",
                                         span { "cached microshards" }
@@ -3798,7 +3798,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        section { class: "dragon-diagnostics-section",
+                        section { class: "dragon-diagnostics-section dragon-diagnostics-section-capability",
                             SectionHeader {
                                 eyebrow: "capability",
                                 title: "browser budget",

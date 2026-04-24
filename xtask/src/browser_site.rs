@@ -774,6 +774,10 @@ main.dragon-browser-shell {
 
 .dragon-diagnostics-drawer {
   border-radius: 8px;
+  padding: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0.006)),
+    rgba(5, 5, 5, 0.9);
 }
 
 .dragon-diagnostics-summary {
@@ -796,19 +800,139 @@ main.dragon-browser-shell {
 
 .dragon-diagnostics-grid {
   display: grid;
-  gap: 16px;
+  gap: 14px;
   margin-top: 18px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 0.96fr) minmax(0, 1.04fr);
+  align-items: start;
 }
 
 .dragon-diagnostics-section {
   min-width: 0;
   display: grid;
+  gap: 14px;
+  align-content: start;
+  padding: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.018);
+  overflow: hidden;
+}
+
+.dragon-diagnostics-section .section-header {
+  gap: 7px;
+}
+
+.dragon-diagnostics-section .browser-focus-title {
+  font-size: clamp(1.35rem, 2.2vw, 1.72rem);
+  line-height: 1.08;
+  letter-spacing: 0;
+}
+
+.dragon-diagnostics-section .section-detail {
+  max-width: 46ch;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.dragon-diagnostics-section .eyebrow {
+  color: rgba(216, 124, 124, 0.76);
+}
+
+.dragon-diagnostics-section .keyvalue-list {
+  gap: 0;
+  margin-top: 0;
+  min-width: 0;
+}
+
+.dragon-diagnostics-section .keyvalue-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.34fr) minmax(0, 1fr);
   gap: 12px;
+  align-items: start;
+  padding: 10px 0;
+  min-width: 0;
+}
+
+.dragon-diagnostics-section .keyvalue-row:first-child {
+  padding-top: 0;
+}
+
+.dragon-diagnostics-section .keyvalue-row span {
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.dragon-diagnostics-section .keyvalue-row strong {
+  justify-self: stretch;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.9rem;
+  line-height: 1.36;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.dragon-diagnostics-section .keyvalue-row code {
+  display: block;
+  max-width: 100%;
+  color: rgba(255, 255, 255, 0.78);
+  font: 0.78rem/1.45 "Iosevka Etoile", "IBM Plex Mono", ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.dragon-diagnostics-section .dragon-metric-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 10px;
+  margin-top: 0;
+}
+
+.dragon-diagnostics-section .stat-tile {
+  min-width: 0;
+  min-height: 104px;
+  padding: 13px 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.dragon-diagnostics-section .stat-tile span {
+  margin-bottom: 7px;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+
+.dragon-diagnostics-section .stat-tile strong {
+  font-size: 1.05rem;
+  line-height: 1.18;
+  letter-spacing: 0;
+  overflow-wrap: break-word;
+}
+
+.dragon-diagnostics-section .stat-detail {
+  margin-top: 8px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.82rem;
 }
 
 .dragon-machine-state {
-  max-height: 18rem;
+  max-height: 16rem;
+  padding: 14px 16px;
+  border-radius: 10px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .dragon-public-copy {
@@ -940,6 +1064,15 @@ main.dragon-browser-shell {
     display: grid;
     gap: 4px;
     justify-content: start;
+  }
+
+  .dragon-diagnostics-section {
+    padding: 14px;
+  }
+
+  .dragon-diagnostics-section .keyvalue-row {
+    grid-template-columns: 1fr;
+    gap: 5px;
   }
 }
 

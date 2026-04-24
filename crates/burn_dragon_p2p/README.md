@@ -169,7 +169,7 @@ That writes a static site bundle to `target/xtask/browser-site/`, including:
 
 The focused repo also ships a separate Pages workflow:
 
-- `.github/workflows/deploy-burn-dragon-p2p-pages.yml`
+- `.github/workflows/deploy-pages.yml`
 
 Before the workflow can publish, set the repository Pages source to `GitHub Actions` under `Settings > Pages`.
 
@@ -217,13 +217,14 @@ The browser app also accepts network overrides from query params:
 - `?seed=/dnsaddr/seed-1.example/tcp/4001/p2p/...`
 - repeated or comma-separated `seed` values
 
-The browser runtime still bootstraps through the edge today, but the seed URL list is carried through the config surface so hardcoded defaults can be added later without changing the shape.
-
-That does not yet mean the browser behaves like a first-class libp2p swarm
-peer. The current browser runtime is still edge-mediated for its steady-state
-directory/head/metrics flow. The implementation roadmap for making browser peers
-dial the bootstrap node directly and operate more like native peers is tracked
-in [../../docs/browser-libp2p-roadmap.md](../../docs/browser-libp2p-roadmap.md).
+The browser runtime still bootstraps through the edge today, then reconciles the
+site config with the live signed browser seed advertisement. Browser-capable
+seeds should be DNS multiaddrs with runtime `certhash` material; raw static IP
+WSS fallbacks are treated as degraded when direct browser transports are
+advertised. The current browser transport contract is maintained in
+[`burn_p2p`'s browser transport backend doc](https://github.com/aberration-technology/burn_p2p/blob/main/docs/browser-transport-backend.md),
+while the Dragon deploy defaults and Pages canary gates live in
+[deploy/README.md](deploy/README.md).
 
 If the selected directory entry includes Dragon profile metadata, browser training can run without a static embedded `training` config in the host app.
 
@@ -233,9 +234,21 @@ The native join surface is now a real operator binary:
 
 - `burn_dragon_p2p_native resolve-config`
 - `burn_dragon_p2p_native assess-capability`
+- `burn_dragon_p2p_native deployment-diagnostics`
+- `burn_dragon_p2p_native probe-swarm`
+- `burn_dragon_p2p_native build-profile`
+- `burn_dragon_p2p_native admin-export-directory`
+- `burn_dragon_p2p_native admin-rollout-profile`
+- `burn_dragon_p2p_native login`
 - `burn_dragon_p2p_native begin-github-login`
 - `burn_dragon_p2p_native complete-github-login`
+- `burn_dragon_p2p_native enroll-static-principal`
+- `burn_dragon_p2p_native train-window-once`
 - `burn_dragon_p2p_native run-peer`
+- `burn_dragon_p2p_native run-head-mirror`
+- `burn_dragon_p2p_native run-validator-daemon`
+- `burn_dragon_p2p_native mark-runtime-failure`
+- `burn_dragon_p2p_native clear-downgrade`
 
 Build the target you want:
 
@@ -301,6 +314,10 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
 ```
 
 That launches the deployed browser callback bridge, completes GitHub SSO in the browser, relays the provider callback back into the local CLI over a loopback listener, and writes a refreshable auth bundle. The same bundle is also cached under the peer storage root, and `run-peer`, `run-head-mirror`, `run-validator-daemon`, and `train-window-once` now reuse that cache and attempt session refresh automatically before falling back to another browser login.
+
+If the edge cannot infer the public Pages host for the native callback bridge,
+set `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL` to the deployed browser shell URL
+before running `login`.
 
 The manual two-step path remains available for headless or debugging workflows:
 

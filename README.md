@@ -15,8 +15,8 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 
 ## common paths
 
-- model + language code: [crates/burn_dragon_core](/home/mosure/repos/burn_dragon/crates/burn_dragon_core), [crates/burn_dragon_language](/home/mosure/repos/burn_dragon/crates/burn_dragon_language)
-- p2p + deployment: [crates/burn_dragon_p2p](/home/mosure/repos/burn_dragon/crates/burn_dragon_p2p), [crates/burn_dragon_p2p/deploy/README.md](/home/mosure/repos/burn_dragon/crates/burn_dragon_p2p/deploy/README.md)
+- model + language code: [crates/burn_dragon_core](crates/burn_dragon_core), [crates/burn_dragon_language](crates/burn_dragon_language)
+- p2p + deployment: [crates/burn_dragon_p2p](crates/burn_dragon_p2p), [crates/burn_dragon_p2p/deploy/README.md](crates/burn_dragon_p2p/deploy/README.md)
 - protocol/runtime layer: [`burn_p2p`](https://github.com/aberration-technology/burn_p2p)
 
 ## quick start

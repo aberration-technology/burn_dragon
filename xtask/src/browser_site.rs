@@ -619,7 +619,7 @@ main.dragon-browser-shell {
 .dragon-metrics-grid {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   align-items: stretch;
 }
 
@@ -627,12 +627,13 @@ main.dragon-browser-shell {
   min-width: 0;
   max-width: 100%;
   height: 100%;
-  min-height: 124px;
+  min-height: 132px;
   display: grid;
-  grid-template-rows: 0.9rem minmax(2.35rem, auto) minmax(2.35rem, auto);
+  grid-template-rows: auto minmax(2.55rem, auto) minmax(2.55rem, auto);
   align-content: start;
-  gap: 9px;
-  padding: 14px;
+  gap: 8px;
+  padding: 13px 12px;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.022);
@@ -651,6 +652,7 @@ main.dragon-browser-shell {
 }
 
 .dragon-card-title {
+  align-self: start;
   color: var(--muted);
   font-size: 0.72rem;
   line-height: 0.9rem;
@@ -661,20 +663,43 @@ main.dragon-browser-shell {
 
 .dragon-card-value {
   align-self: start;
+  min-width: 0;
+  max-width: 100%;
   color: var(--ink);
-  font-size: 1.05rem;
+  font-size: 0.98rem;
   font-weight: 700;
   line-height: 1.22;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
+  hyphens: none;
+  text-wrap: pretty;
   font-variant-numeric: tabular-nums;
 }
 
 .dragon-card-detail {
   align-self: start;
+  min-width: 0;
+  max-width: 100%;
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.4;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
+  text-wrap: pretty;
+}
+
+.dragon-metric-card-session .dragon-card-value {
+  white-space: nowrap;
+}
+
+.dragon-metric-card-session .dragon-card-detail {
+  overflow-wrap: break-word;
+}
+
+@media (min-width: 1100px) {
+  .dragon-metrics-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
 }
 
 .dragon-activity-panel {

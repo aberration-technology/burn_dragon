@@ -823,6 +823,12 @@ struct DragonMetricCardView {
     tone: DragonHeroTone,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonSessionMetricView {
+    value: String,
+    detail: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DragonUiEventKind {
     Edge,
@@ -887,6 +893,7 @@ struct DragonPeerUiContext<'a> {
     local_training_pending: bool,
     downgrade_reason: Option<&'a str>,
     training_action_state: Option<&'a DragonTrainingActionState>,
+    session_metric: Option<DragonSessionMetricView>,
 }
 
 fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u32 {
@@ -1540,17 +1547,128 @@ fn dragon_metric_cards(
         },
     ];
     if has_session || view.is_some_and(|view| !view.session_label.trim().is_empty()) {
+        let session_metric = context
+            .session_metric
+            .clone()
+            .or_else(|| dragon_fallback_session_metric(view, has_session));
         metrics.push(DragonMetricCardView {
             title: "session",
-            value: view
-                .map(|view| view.session_label.clone())
-                .filter(|label| !label.trim().is_empty())
+            value: session_metric
+                .as_ref()
+                .map(|metric| metric.value.clone())
                 .unwrap_or_else(|| "signed in".into()),
-            detail: "github session active".into(),
+            detail: session_metric
+                .map(|metric| metric.detail)
+                .unwrap_or_else(|| "session active".into()),
             tone: DragonHeroTone::Ready,
         });
     }
     metrics
+}
+
+fn dragon_session_metric_view(
+    session: &AdminSessionSummaryView,
+    fallback_label: Option<&str>,
+    has_session: bool,
+) -> Option<DragonSessionMetricView> {
+    let fallback_label = fallback_label
+        .map(str::trim)
+        .filter(|label| !label.is_empty() && !matches!(*label, "guest" | "local node"));
+    if !has_session && fallback_label.is_none() {
+        return None;
+    }
+
+    let value = if session.rollout_enabled {
+        "admin ready".into()
+    } else if has_session {
+        "signed in".into()
+    } else {
+        fallback_label
+            .map(dragon_session_value_from_label)
+            .unwrap_or_else(|| "signed in".into())
+    };
+    let detail = dragon_session_metric_detail(session, fallback_label);
+    Some(DragonSessionMetricView { value, detail })
+}
+
+fn dragon_fallback_session_metric(
+    view: Option<&BrowserAppClientView>,
+    has_session: bool,
+) -> Option<DragonSessionMetricView> {
+    let label = view
+        .map(|view| view.session_label.trim())
+        .filter(|label| !label.is_empty() && !matches!(*label, "guest" | "local node"));
+    if !has_session && label.is_none() {
+        return None;
+    }
+    Some(DragonSessionMetricView {
+        value: if has_session {
+            "signed in".into()
+        } else {
+            label
+                .map(dragon_session_value_from_label)
+                .unwrap_or_else(|| "signed in".into())
+        },
+        detail: "session active".into(),
+    })
+}
+
+fn dragon_session_value_from_label(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() || label.contains('…') || label.len() > 16 {
+        return "signed in".into();
+    }
+    label.replace(['_', '-'], " ")
+}
+
+fn dragon_session_metric_detail(
+    session: &AdminSessionSummaryView,
+    fallback_label: Option<&str>,
+) -> String {
+    let provider = session
+        .provider_label
+        .as_deref()
+        .map(dragon_metric_provider_label);
+    let principal = session
+        .principal_label
+        .as_deref()
+        .and_then(|principal| dragon_metric_principal_label(principal, provider.as_deref()))
+        .or_else(|| fallback_label.and_then(|label| dragon_metric_principal_label(label, None)));
+
+    match (provider, principal) {
+        (Some(provider), Some(principal)) => format!("{provider} · {principal}"),
+        (Some(provider), None) => format!("{provider} session active"),
+        (None, Some(principal)) => format!("operator · {principal}"),
+        (None, None) => "session active".into(),
+    }
+}
+
+fn dragon_metric_provider_label(provider: &str) -> String {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("github") {
+        "github".into()
+    } else if provider.len() <= 14 {
+        provider.to_ascii_lowercase()
+    } else {
+        "session".into()
+    }
+}
+
+fn dragon_metric_principal_label(principal: &str, provider: Option<&str>) -> Option<String> {
+    let mut label = principal.trim();
+    if label.is_empty() || matches!(label, "authenticated" | "signed in" | "guest") {
+        return None;
+    }
+    if provider == Some("github") {
+        label = label
+            .strip_prefix("github-admin-")
+            .or_else(|| label.strip_prefix("github-"))
+            .unwrap_or(label);
+    }
+    if label.contains('…') || label.len() > 18 {
+        return None;
+    }
+    Some(label.replace(['_', '-'], " "))
 }
 
 fn dragon_ui_event_candidate(
@@ -3017,6 +3135,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .as_ref()
         .and_then(|session| session.session.as_ref())
         .is_some();
+    let session_metric_view = dragon_session_metric_view(
+        &admin_session_card_view,
+        view.as_ref().map(|view| view.session_label.as_str()),
+        has_session,
+    );
     let auth_bootstrap_pending_active = *auth_bootstrap_pending.read();
     let has_connected_view = view.is_some();
     let public_landing = !auth_bootstrap_pending_active && !has_session && !has_connected_view;
@@ -3070,6 +3193,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         local_training_pending: local_training_pending_active,
         downgrade_reason: browser_downgrade_reason.as_deref(),
         training_action_state: training_action_state.as_ref(),
+        session_metric: session_metric_view,
     };
     let peer_ui_state = dragon_peer_ui_state(&peer_ui_context);
     let hero_rattle_active = peer_ui_state.hero.animate
@@ -3915,11 +4039,12 @@ fn MetricGrid(metrics: Vec<DragonMetricCardView>) -> Element {
 #[component]
 fn MetricCard(view: DragonMetricCardView) -> Element {
     let tone = view.tone.class();
+    let metric_kind = view.title;
     rsx! {
-        article { class: "dragon-card dragon-metric dragon-metric-{tone}",
+        article { class: "dragon-card dragon-metric dragon-metric-{tone} dragon-metric-card-{metric_kind}",
             div { class: "dragon-card-title", "{view.title}" }
-            div { class: "dragon-card-value", "{view.value}" }
-            div { class: "dragon-card-detail", "{view.detail}" }
+            div { class: "dragon-card-value", title: "{view.value}", "{view.value}" }
+            div { class: "dragon-card-detail", title: "{view.detail}", "{view.detail}" }
         }
     }
 }
@@ -4101,16 +4226,18 @@ mod tests {
         dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
         dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
         dragon_peer_ui_state, dragon_push_ui_event, dragon_runtime_mode_detail,
-        dragon_runtime_mode_summary, dragon_slice_progress_summary, dragon_training_action_state,
-        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
-        filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
-        normalized_browser_callback_url, retained_refresh_transport_warning,
+        dragon_runtime_mode_summary, dragon_session_metric_view, dragon_slice_progress_summary,
+        dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
+        dragon_window_summary, filter_seed_urls_for_transport,
+        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
+        retained_refresh_transport_warning,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
         AuthProvider, BrowserMode, ContentId, ExperimentScope, NetworkId, PeerId, PeerRoleSet,
         PrincipalClaims, PrincipalId, PrincipalSession, ProfileMode, SocialMode,
     };
+    use burn_p2p_app::AdminSessionSummaryView;
     use burn_p2p_browser::{
         BrowserAppClientView, BrowserAppNetworkView, BrowserAppPerformanceView, BrowserAppSurface,
         BrowserAppTrainingView, BrowserAppValidationView, BrowserAppViewerView,
@@ -4673,6 +4800,7 @@ mod tests {
             local_training_pending: false,
             downgrade_reason: None,
             training_action_state: action.as_ref(),
+            session_metric: None,
         };
         let ui = dragon_peer_ui_state(&context);
 
@@ -4710,6 +4838,7 @@ mod tests {
             local_training_pending: false,
             downgrade_reason: None,
             training_action_state: action.as_ref(),
+            session_metric: None,
         };
         let ui = dragon_peer_ui_state(&context);
 
@@ -4755,6 +4884,7 @@ mod tests {
             local_training_pending: false,
             downgrade_reason: Some(downgrade_reason),
             training_action_state: action.as_ref(),
+            session_metric: None,
         };
         let ui = dragon_peer_ui_state(&context);
 
@@ -4805,6 +4935,7 @@ mod tests {
             local_training_pending: false,
             downgrade_reason: Some(downgrade_reason),
             training_action_state: blocked_action.as_ref(),
+            session_metric: None,
         };
         let blocked_ui = dragon_peer_ui_state(&blocked_context);
 
@@ -4820,6 +4951,24 @@ mod tests {
             ),
             downgrade_reason
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_session_metric_uses_operator_copy_for_github_admin_identity() {
+        let session = AdminSessionSummaryView {
+            session_label: "admin session ready".into(),
+            principal_label: Some("github-admin-mosure".into()),
+            provider_label: Some("GitHub".into()),
+            session_id: Some("session-browser".into()),
+            rollout_enabled: true,
+        };
+        let metric = dragon_session_metric_view(&session, Some("github-a…mosure"), true)
+            .expect("session metric");
+
+        assert_eq!(metric.value, "admin ready");
+        assert_eq!(metric.detail, "github · mosure");
+        assert!(!metric.value.contains('…'));
+        assert!(!metric.detail.contains('…'));
     }
 
     #[wasm_bindgen_test]

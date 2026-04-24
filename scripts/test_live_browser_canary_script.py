@@ -25,6 +25,7 @@ def main() -> None:
         "function preferValidatedSignedSeedAdvertisement(envelope, mode)",
         'payload.transport_policy = { preferred: ["WebRtcDirect"], allow_fallback_wss: false };',
         "function filterBrowserConfigForTransport(browserConfig, mode)",
+        '["ip4", "ip6", "dns4", "dns6", "dnsaddr"].includes(segments[0])',
         "function reportConnectedForMode(report, mode)",
         "return transportConnectedForMode(report.transport_summary, mode);",
         "function labeledRowsValue(rows, label)",

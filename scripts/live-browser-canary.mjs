@@ -715,7 +715,7 @@ function filterBrowserConfigForTransport(browserConfig, mode) {
 function isDialableWebRtcSeed(seed) {
   const segments = seed.split("/").filter(Boolean);
   return (
-    (segments[0] === "ip4" || segments[0] === "ip6") &&
+    ["ip4", "ip6", "dns4", "dns6", "dnsaddr"].includes(segments[0]) &&
     segments.includes("webrtc-direct") &&
     segments.includes("certhash")
   );

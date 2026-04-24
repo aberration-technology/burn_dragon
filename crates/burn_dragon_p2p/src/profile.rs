@@ -280,10 +280,6 @@ fn browser_profile_from_native_config(
                     nca_config_path.display()
                 )
             })?;
-            let capability_policy = DragonCapabilityPolicy {
-                browser_wgpu_memory_budget_bytes: Some(4 * 1024 * 1024 * 1024),
-                ..DragonCapabilityPolicy::default()
-            };
             Ok(Some(DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
                 execution_backend: DragonBrowserExecutionBackend::Auto,
@@ -293,7 +289,7 @@ fn browser_profile_from_native_config(
                 batch_size: config.training.batch_size,
                 max_train_batches: Some(config.training.max_iters.clamp(1, 4)),
                 max_eval_batches: Some(1),
-                capability_policy,
+                capability_policy: DragonCapabilityPolicy::default(),
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,

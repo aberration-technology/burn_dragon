@@ -70,15 +70,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - lane: chromium-auto-training
+          - lane: chromium-auto-connect
             browser: chromium
             transport_mode: auto
-            expect_training: "1"
+            expect_training: "0"
             required: "1"
-          - lane: chromium-webrtc-direct-training
+          - lane: chromium-webrtc-direct-connect
             browser: chromium
             transport_mode: webrtc-direct
-            expect_training: "1"
+            expect_training: "0"
             required: "1"
           - lane: firefox-auto-connect
             browser: firefox

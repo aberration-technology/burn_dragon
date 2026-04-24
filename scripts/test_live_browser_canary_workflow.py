@@ -28,7 +28,7 @@ def main() -> None:
                 "burn-dragon-live-browser-canary",
                 "default: browser-canary-mainnet-nca",
                 'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"',
-                "chromium-webrtc-direct-training",
+                "chromium-webrtc-direct-connect",
                 "firefox-auto-connect",
                 "firefox-webrtc-direct-connect",
                 "continue-on-error: ${{ matrix.required == '0' }}",
@@ -53,8 +53,8 @@ def main() -> None:
                 for item in jobs["canary"]["strategy"]["matrix"]["include"]
             }
             expected_required = {
-                "chromium-auto-training": "1",
-                "chromium-webrtc-direct-training": "1",
+                "chromium-auto-connect": "1",
+                "chromium-webrtc-direct-connect": "1",
                 "firefox-auto-connect": "1",
                 "firefox-webrtc-direct-connect": "1",
             }
@@ -65,8 +65,8 @@ def main() -> None:
                 assert lanes[lane]["required"] == required, (
                     f"{workflow_path} lane {lane} required={lanes[lane]['required']} expected {required}"
                 )
-            assert lanes["chromium-auto-training"]["expect_training"] == "1"
-            assert lanes["chromium-webrtc-direct-training"]["expect_training"] == "1"
+            for lane in expected_required:
+                assert lanes[lane]["expect_training"] == "0"
         else:
             resolver_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',

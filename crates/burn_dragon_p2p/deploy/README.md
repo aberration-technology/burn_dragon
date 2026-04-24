@@ -492,7 +492,7 @@ The initial directory entries are seeded from:
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
-The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile keeps bounded smoke/dev caps (`4` train batches, `1` eval batch, and bounded generated documents) so browser peers can still join safely and downgrade when local WebGPU capacity is insufficient.
+The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile keeps bounded smoke/dev caps (`4` train batches, `1` eval batch, bounded generated documents, and the conservative browser WebGPU memory budget) so browser peers can still join safely and downgrade for the 100M-class production profile instead of crashing when the browser runtime cannot map the training buffers.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 
@@ -594,7 +594,7 @@ Native peers can leave `training_config_paths` empty and rely on the published D
 
 Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
-Browser peers can train directly from the published Dragon profile metadata for experiments that include a browser-capable profile.
+Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. For the production `nca-r1` profile, the live browser canary verifies the browser shell, auth, seed derivation, and direct WebRTC connectivity; training capacity is expected from operator-run native GPU peers.
 
 ## Terraform Root
 

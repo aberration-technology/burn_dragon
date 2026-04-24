@@ -73,9 +73,7 @@ html {
 }
 
 body {
-  background:
-    radial-gradient(circle at top center, rgba(216, 124, 124, 0.12), transparent 28%),
-    linear-gradient(180deg, #000000, #030303 35%, #000000 100%);
+  background: #000000;
 }
 
 .dragon-browser-shell {
@@ -88,10 +86,7 @@ body {
 }
 
 .hero {
-  background:
-    radial-gradient(circle at top left, rgba(216, 124, 124, 0.16), transparent 26%),
-    radial-gradient(circle at 88% 0%, rgba(216, 124, 124, 0.08), transparent 24%),
-    linear-gradient(135deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
+  background: linear-gradient(180deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
   border-color: var(--line-strong);
 }
 
@@ -137,9 +132,7 @@ body {
 
 .browser-spotlight {
   border-color: rgba(216, 124, 124, 0.22);
-  background:
-    radial-gradient(circle at top right, rgba(216, 124, 124, 0.08), transparent 24%),
-    linear-gradient(145deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
+  background: linear-gradient(180deg, rgba(10, 10, 10, 0.98), rgba(6, 6, 6, 0.98));
 }
 
 .action-button,
@@ -264,9 +257,7 @@ body {
   padding: 18px;
   border-radius: 18px;
   border: 1px solid var(--line);
-  background:
-    radial-gradient(circle at top right, rgba(216, 124, 124, 0.08), transparent 30%),
-    rgba(255, 255, 255, 0.025);
+  background: rgba(255, 255, 255, 0.025);
 }
 
 .dragon-panel-stack {
@@ -418,6 +409,350 @@ body {
   max-width: 34rem;
 }
 
+main.dragon-browser-shell {
+  width: min(100%, 1040px);
+  max-width: 1040px;
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.dragon-browser-shell h1,
+.dragon-browser-shell h2,
+.dragon-browser-shell h3,
+.dragon-browser-shell strong {
+  letter-spacing: 0;
+}
+
+.dragon-peer-hero {
+  gap: 16px;
+  padding: 22px;
+  border-radius: 10px;
+  background: rgba(6, 6, 6, 0.98);
+  overflow: hidden;
+  max-width: 100%;
+}
+
+.dragon-peer-hero-ready {
+  border-color: rgba(111, 211, 164, 0.34);
+  box-shadow: 0 0 0 1px rgba(111, 211, 164, 0.04), 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.dragon-peer-hero-working {
+  border-color: rgba(216, 124, 124, 0.34);
+}
+
+.dragon-peer-hero-blocked {
+  border-color: rgba(255, 127, 127, 0.28);
+}
+
+.dragon-peer-hero-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.dragon-peer-mark {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.025);
+  font-family: ui-monospace, monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+}
+
+.dragon-peer-hero-copy {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dragon-peer-tone {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 0.66rem;
+  text-transform: lowercase;
+}
+
+.dragon-peer-tone-ready {
+  border-color: rgba(111, 211, 164, 0.28);
+  color: var(--success);
+}
+
+.dragon-peer-tone-working {
+  border-color: rgba(216, 124, 124, 0.3);
+  color: var(--accent);
+}
+
+.dragon-peer-tone-blocked {
+  border-color: rgba(255, 127, 127, 0.28);
+  color: var(--danger);
+}
+
+.dragon-peer-hero-title {
+  max-width: none;
+  font-size: clamp(2rem, 5vw, 3rem);
+  line-height: 1.04;
+  overflow-wrap: anywhere;
+}
+
+.dragon-peer-hero-detail {
+  max-width: 58ch;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.dragon-primary-action-bar {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.018);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.dragon-readiness-shell {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.018);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.dragon-readiness {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dragon-step {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.dragon-step-marker {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+.dragon-step-label {
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+
+.dragon-step-detail {
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.dragon-step-done .dragon-step-marker {
+  border-color: rgba(111, 211, 164, 0.32);
+  color: var(--success);
+}
+
+.dragon-step-active {
+  border-color: rgba(216, 124, 124, 0.3);
+}
+
+.dragon-step-active .dragon-step-marker {
+  border-color: rgba(216, 124, 124, 0.36);
+  color: var(--accent);
+}
+
+.dragon-step-blocked {
+  border-color: rgba(255, 127, 127, 0.28);
+}
+
+.dragon-step-blocked .dragon-step-marker {
+  border-color: rgba(255, 127, 127, 0.32);
+  color: var(--danger);
+}
+
+.dragon-metrics-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
+  align-items: stretch;
+}
+
+.dragon-card {
+  min-width: 0;
+  max-width: 100%;
+  height: 100%;
+  min-height: 124px;
+  display: grid;
+  grid-template-rows: 0.9rem minmax(2.35rem, auto) minmax(2.35rem, auto);
+  align-content: start;
+  gap: 9px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.dragon-metric-ready {
+  border-top-color: rgba(111, 211, 164, 0.42);
+}
+
+.dragon-metric-working {
+  border-top-color: rgba(216, 124, 124, 0.42);
+}
+
+.dragon-metric-blocked {
+  border-top-color: rgba(255, 127, 127, 0.36);
+}
+
+.dragon-card-title {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 0.9rem;
+  letter-spacing: 0;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.dragon-card-value {
+  align-self: start;
+  color: var(--ink);
+  font-size: 1.05rem;
+  font-weight: 700;
+  line-height: 1.22;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.dragon-card-detail {
+  align-self: start;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.dragon-activity-panel {
+  border-radius: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.dragon-activity-feed {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dragon-activity-event {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 0.8fr) minmax(0, 1.4fr);
+  gap: 10px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.dragon-activity-event:first-child {
+  border-top: 0;
+}
+
+.dragon-activity-event time {
+  color: rgba(255, 255, 255, 0.46);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.dragon-activity-label {
+  color: var(--ink);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.dragon-activity-detail {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.dragon-activity-event-error .dragon-activity-label {
+  color: var(--danger);
+}
+
+.dragon-diagnostics-drawer {
+  border-radius: 8px;
+}
+
+.dragon-diagnostics-summary {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.dragon-diagnostics-summary span {
+  font-weight: 700;
+}
+
+.dragon-diagnostics-summary small {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.dragon-diagnostics-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dragon-diagnostics-section {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.dragon-machine-state {
+  max-height: 18rem;
+}
+
 .dragon-public-copy {
   max-width: 48rem;
 }
@@ -492,8 +827,67 @@ body {
 }
 
 @media (max-width: 960px) {
+  .dragon-readiness {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dragon-diagnostics-grid {
+    grid-template-columns: 1fr;
+  }
+
   .dragon-editor-grid-wide {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  main.dragon-browser-shell {
+    width: 100%;
+    max-width: 100%;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .dragon-peer-hero {
+    padding: 18px;
+  }
+
+  .dragon-peer-hero-main {
+    grid-template-columns: 1fr;
+  }
+
+  .dragon-peer-mark {
+    width: 36px;
+    height: 36px;
+  }
+
+  .dragon-peer-hero-title {
+    font-size: 2rem;
+  }
+
+  .dragon-peer-hero-detail {
+    max-width: 100%;
+  }
+
+  .dragon-readiness {
+    grid-template-columns: 1fr;
+  }
+
+  .dragon-activity-event {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .dragon-diagnostics-summary {
+    display: grid;
+    gap: 4px;
+    justify-content: start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dragon-eyebrow-rattle {
+    display: none;
   }
 }
 "#;

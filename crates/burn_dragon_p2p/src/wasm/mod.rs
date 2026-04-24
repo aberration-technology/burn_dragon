@@ -725,6 +725,7 @@ fn rollout_result_view(result: &AdminResult) -> Option<DirectoryMutationResultVi
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DragonLiveNotice {
     label: &'static str,
@@ -737,6 +738,154 @@ struct DragonTrainingActionState {
     label: &'static str,
     detail: String,
     enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragonHeroTone {
+    Ready,
+    Working,
+    Waiting,
+    Blocked,
+}
+
+impl DragonHeroTone {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragonReadinessStepId {
+    Edge,
+    BrowserCapabilities,
+    Transport,
+    DirectPeer,
+    Assignment,
+    Checkpoint,
+    TrainingReady,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragonStepStatus {
+    Done,
+    Active,
+    Waiting,
+    Blocked,
+}
+
+impl DragonStepStatus {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Active => "active",
+            Self::Waiting => "waiting",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Done => "✓",
+            Self::Active => "…",
+            Self::Waiting => "—",
+            Self::Blocked => "!",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonReadinessStepView {
+    id: DragonReadinessStepId,
+    label: &'static str,
+    status: DragonStepStatus,
+    detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonHeroView {
+    label: String,
+    detail: String,
+    tone: DragonHeroTone,
+    animate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonMetricCardView {
+    title: &'static str,
+    value: String,
+    detail: String,
+    tone: DragonHeroTone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragonUiEventKind {
+    Edge,
+    Capability,
+    Transport,
+    Peer,
+    Assignment,
+    Checkpoint,
+    Training,
+    Error,
+}
+
+impl DragonUiEventKind {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Edge => "edge",
+            Self::Capability => "capability",
+            Self::Transport => "transport",
+            Self::Peer => "peer",
+            Self::Assignment => "assignment",
+            Self::Checkpoint => "checkpoint",
+            Self::Training => "training",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DragonUiEvent {
+    at_ms: f64,
+    kind: DragonUiEventKind,
+    label: String,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonUiEventCandidate {
+    key: String,
+    kind: DragonUiEventKind,
+    label: String,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DragonPeerUiState {
+    hero: DragonHeroView,
+    readiness: Vec<DragonReadinessStepView>,
+    metrics: Vec<DragonMetricCardView>,
+    event_candidate: DragonUiEventCandidate,
+}
+
+struct DragonPeerUiContext<'a> {
+    view: Option<&'a BrowserAppClientView>,
+    status_message: &'a str,
+    has_session: bool,
+    auth_bootstrap_pending: bool,
+    needs_sign_in: bool,
+    ready_to_connect: bool,
+    edge_configured: bool,
+    browser_can_attempt_dynamic_training: bool,
+    direct_transport_ready: bool,
+    local_training_pending: bool,
+    downgrade_reason: Option<&'a str>,
+    training_action_state: Option<&'a DragonTrainingActionState>,
 }
 
 fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u32 {
@@ -759,6 +908,7 @@ fn browser_app_refresh_interval_millis(view: Option<&BrowserAppClientView>) -> u
     BROWSER_APP_REFRESH_INTERVAL_MILLIS
 }
 
+#[cfg(test)]
 fn dragon_live_notice(
     view: Option<&BrowserAppClientView>,
     local_training_pending: bool,
@@ -904,6 +1054,495 @@ fn dragon_training_action_state(
             detail: "browser training is not ready yet".into(),
             enabled: false,
         })
+    }
+}
+
+fn dragon_peer_ui_state(context: &DragonPeerUiContext<'_>) -> DragonPeerUiState {
+    let hero = dragon_hero_view(context);
+    let readiness = dragon_readiness_steps(context);
+    let metrics = dragon_metric_cards(context, hero.tone);
+    let event_candidate = dragon_ui_event_candidate(&hero, &readiness);
+    DragonPeerUiState {
+        hero,
+        readiness,
+        metrics,
+        event_candidate,
+    }
+}
+
+fn dragon_hero_view(context: &DragonPeerUiContext<'_>) -> DragonHeroView {
+    let view = context.view;
+    let status_message = context.status_message;
+    let auth_bootstrap_pending = context.auth_bootstrap_pending;
+    let needs_sign_in = context.needs_sign_in;
+    let ready_to_connect = context.ready_to_connect;
+    let edge_configured = context.edge_configured;
+    let browser_can_attempt_dynamic_training = context.browser_can_attempt_dynamic_training;
+    let direct_transport_ready = context.direct_transport_ready;
+    let local_training_pending = context.local_training_pending;
+    let downgrade_reason = context.downgrade_reason;
+    let training_action_state = context.training_action_state;
+
+    if local_training_pending {
+        return DragonHeroView {
+            label: "training…".into(),
+            detail: "running a local training window in this tab".into(),
+            tone: DragonHeroTone::Working,
+            animate: true,
+        };
+    }
+    if auth_bootstrap_pending {
+        return DragonHeroView {
+            label: "connecting".into(),
+            detail: "checking session and edge state".into(),
+            tone: DragonHeroTone::Working,
+            animate: true,
+        };
+    }
+    if !edge_configured {
+        return DragonHeroView {
+            label: "blocked".into(),
+            detail: "edge config is missing. set an edge url before this browser peer can connect."
+                .into(),
+            tone: DragonHeroTone::Blocked,
+            animate: false,
+        };
+    }
+    if needs_sign_in {
+        return DragonHeroView {
+            label: "sign in required".into(),
+            detail: "github session is needed before this browser peer can join the network".into(),
+            tone: DragonHeroTone::Waiting,
+            animate: false,
+        };
+    }
+    if ready_to_connect {
+        return DragonHeroView {
+            label: "ready to connect".into(),
+            detail: "edge config loaded. connect this browser to the peer network.".into(),
+            tone: DragonHeroTone::Waiting,
+            animate: false,
+        };
+    }
+    if let Some(view) = view {
+        if view.runtime_label == "blocked" {
+            return DragonHeroView {
+                label: "blocked".into(),
+                detail: view.runtime_detail.clone(),
+                tone: DragonHeroTone::Blocked,
+                animate: false,
+            };
+        }
+        if active_direct_transport_error(view).is_some() {
+            return DragonHeroView {
+                label: "direct peer connection failed".into(),
+                detail: "browser training needs a direct WebRTC peer before it can start. retry connect, switch transport, or open diagnostics.".into(),
+                tone: DragonHeroTone::Blocked,
+                animate: false,
+            };
+        }
+        if let Some(action) = training_action_state.filter(|state| state.enabled) {
+            let detail = if view.training.cached_microshards > 0 {
+                "direct peer connected · checkpoint synced · assigned slice cached".into()
+            } else {
+                "direct peer connected · checkpoint synced · assigned slice ready".into()
+            };
+            return DragonHeroView {
+                label: action
+                    .label
+                    .strip_prefix("run browser training")
+                    .map(|_| "ready to train")
+                    .unwrap_or(action.label)
+                    .into(),
+                detail,
+                tone: DragonHeroTone::Ready,
+                animate: false,
+            };
+        }
+        if view.runtime_label.starts_with("joining ") {
+            return DragonHeroView {
+                label: "connecting".into(),
+                detail: dragon_runtime_mode_detail(
+                    Some(view),
+                    direct_transport_ready,
+                    training_action_state,
+                    false,
+                    downgrade_reason,
+                ),
+                tone: DragonHeroTone::Working,
+                animate: true,
+            };
+        }
+        if view.runtime_label.starts_with("catchup ") {
+            return DragonHeroView {
+                label: "syncing checkpoint".into(),
+                detail: dragon_runtime_mode_detail(
+                    Some(view),
+                    direct_transport_ready,
+                    training_action_state,
+                    false,
+                    downgrade_reason,
+                ),
+                tone: DragonHeroTone::Working,
+                animate: true,
+            };
+        }
+        if !browser_can_attempt_dynamic_training {
+            return DragonHeroView {
+                label: "observe mode".into(),
+                detail: "browser training is unavailable on this host. this tab can still watch the network.".into(),
+                tone: DragonHeroTone::Blocked,
+                animate: false,
+            };
+        }
+        if let Some(reason) = downgrade_reason {
+            return DragonHeroView {
+                label: "observe mode".into(),
+                detail: reason.to_owned(),
+                tone: DragonHeroTone::Blocked,
+                animate: false,
+            };
+        }
+        if let Some(action) = training_action_state {
+            return DragonHeroView {
+                label: action.label.into(),
+                detail: action.detail.clone(),
+                tone: if action.label == "waiting for peers" {
+                    DragonHeroTone::Waiting
+                } else {
+                    DragonHeroTone::Working
+                },
+                animate: matches!(
+                    action.label,
+                    "waiting for peers" | "waiting for work" | "syncing checkpoint"
+                ),
+            };
+        }
+        return DragonHeroView {
+            label: dragon_runtime_mode_summary(
+                Some(view),
+                direct_transport_ready,
+                training_action_state,
+                false,
+                false,
+            ),
+            detail: dragon_runtime_mode_detail(
+                Some(view),
+                direct_transport_ready,
+                training_action_state,
+                false,
+                downgrade_reason,
+            ),
+            tone: DragonHeroTone::Waiting,
+            animate: false,
+        };
+    }
+    let fallback_detail = if status_message.trim().is_empty() {
+        "browser runtime not connected".into()
+    } else {
+        status_message.to_owned()
+    };
+    DragonHeroView {
+        label: "waiting".into(),
+        detail: fallback_detail,
+        tone: DragonHeroTone::Waiting,
+        animate: false,
+    }
+}
+
+fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadinessStepView> {
+    let view = context.view;
+    let auth_bootstrap_pending = context.auth_bootstrap_pending;
+    let edge_configured = context.edge_configured;
+    let browser_can_attempt_dynamic_training = context.browser_can_attempt_dynamic_training;
+    let direct_transport_ready = context.direct_transport_ready;
+    let local_training_pending = context.local_training_pending;
+    let downgrade_reason = context.downgrade_reason;
+    let training_action_state = context.training_action_state;
+
+    let direct_error = view.and_then(active_direct_transport_error);
+    let edge_status = if !edge_configured {
+        DragonStepStatus::Blocked
+    } else if auth_bootstrap_pending {
+        DragonStepStatus::Active
+    } else {
+        DragonStepStatus::Done
+    };
+    let browser_status = if browser_can_attempt_dynamic_training && downgrade_reason.is_none() {
+        DragonStepStatus::Done
+    } else if auth_bootstrap_pending {
+        DragonStepStatus::Active
+    } else {
+        DragonStepStatus::Blocked
+    };
+    let transport_status = if direct_error.is_some() {
+        DragonStepStatus::Blocked
+    } else if view.is_some_and(|view| view.network.swarm_status.connected_transport.is_some()) {
+        DragonStepStatus::Done
+    } else if view.is_some_and(|view| view.network.swarm_status.desired_transport.is_some()) {
+        DragonStepStatus::Active
+    } else {
+        DragonStepStatus::Waiting
+    };
+    let peer_status = if direct_error.is_some() {
+        DragonStepStatus::Blocked
+    } else if direct_transport_ready {
+        DragonStepStatus::Done
+    } else if view.is_some() {
+        DragonStepStatus::Active
+    } else {
+        DragonStepStatus::Waiting
+    };
+    let assignment_status = match view {
+        Some(view) if view.training.active_assignment.is_some() => DragonStepStatus::Done,
+        Some(view) if view.training.can_train && direct_transport_ready => DragonStepStatus::Active,
+        Some(view) if !view.training.can_train => DragonStepStatus::Waiting,
+        Some(_) => DragonStepStatus::Waiting,
+        None => DragonStepStatus::Waiting,
+    };
+    let checkpoint_status = match view {
+        Some(view) if view.training.latest_head_id.is_some() => DragonStepStatus::Done,
+        Some(view) if view.training.active_assignment.is_some() => DragonStepStatus::Active,
+        Some(_) => DragonStepStatus::Waiting,
+        None => DragonStepStatus::Waiting,
+    };
+    let training_status = if local_training_pending {
+        DragonStepStatus::Active
+    } else if training_action_state.is_some_and(|state| state.enabled) {
+        DragonStepStatus::Done
+    } else if view.is_some_and(|view| view.runtime_label == "blocked")
+        || downgrade_reason.is_some()
+        || !browser_can_attempt_dynamic_training
+    {
+        DragonStepStatus::Blocked
+    } else {
+        DragonStepStatus::Waiting
+    };
+
+    vec![
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::Edge,
+            label: "edge",
+            status: edge_status,
+            detail: match edge_status {
+                DragonStepStatus::Done => "edge reachable".into(),
+                DragonStepStatus::Active => "checking edge".into(),
+                DragonStepStatus::Blocked => "edge config missing".into(),
+                DragonStepStatus::Waiting => "waiting for edge".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::BrowserCapabilities,
+            label: "browser",
+            status: browser_status,
+            detail: match browser_status {
+                DragonStepStatus::Done => "WebGPU available".into(),
+                DragonStepStatus::Active => "probing browser".into(),
+                DragonStepStatus::Blocked => "browser downgraded".into(),
+                DragonStepStatus::Waiting => "waiting for browser".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::Transport,
+            label: "transport",
+            status: transport_status,
+            detail: match transport_status {
+                DragonStepStatus::Done => "transport selected".into(),
+                DragonStepStatus::Active => "dialing peer".into(),
+                DragonStepStatus::Blocked => "direct transport failed".into(),
+                DragonStepStatus::Waiting => "transport pending".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::DirectPeer,
+            label: "peer",
+            status: peer_status,
+            detail: match peer_status {
+                DragonStepStatus::Done => "direct peer connected".into(),
+                DragonStepStatus::Active => "waiting for peers".into(),
+                DragonStepStatus::Blocked => "peer connection failed".into(),
+                DragonStepStatus::Waiting => "waiting for peers".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::Assignment,
+            label: "assignment",
+            status: assignment_status,
+            detail: match assignment_status {
+                DragonStepStatus::Done => "work assigned".into(),
+                DragonStepStatus::Active => "waiting for work".into(),
+                DragonStepStatus::Blocked => "no assignment".into(),
+                DragonStepStatus::Waiting => "waiting for work".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::Checkpoint,
+            label: "checkpoint",
+            status: checkpoint_status,
+            detail: match checkpoint_status {
+                DragonStepStatus::Done => "checkpoint synced".into(),
+                DragonStepStatus::Active => "syncing checkpoint".into(),
+                DragonStepStatus::Blocked => "checkpoint unavailable".into(),
+                DragonStepStatus::Waiting => "checkpoint pending".into(),
+            },
+        },
+        DragonReadinessStepView {
+            id: DragonReadinessStepId::TrainingReady,
+            label: "train",
+            status: training_status,
+            detail: match training_status {
+                DragonStepStatus::Done => "ready".into(),
+                DragonStepStatus::Active => "training".into(),
+                DragonStepStatus::Blocked => "training blocked".into(),
+                DragonStepStatus::Waiting => "not ready yet".into(),
+            },
+        },
+    ]
+}
+
+fn dragon_metric_cards(
+    context: &DragonPeerUiContext<'_>,
+    hero_tone: DragonHeroTone,
+) -> Vec<DragonMetricCardView> {
+    let view = context.view;
+    let has_session = context.has_session;
+    let direct_transport_ready = context.direct_transport_ready;
+    let local_training_pending = context.local_training_pending;
+    let downgrade_reason = context.downgrade_reason;
+    let training_action_state = context.training_action_state;
+
+    let runtime_summary = dragon_runtime_mode_summary(
+        view,
+        direct_transport_ready,
+        training_action_state,
+        false,
+        local_training_pending,
+    );
+    let runtime_detail = dragon_runtime_mode_detail(
+        view,
+        direct_transport_ready,
+        training_action_state,
+        local_training_pending,
+        downgrade_reason,
+    );
+    let window_summary = dragon_window_summary(view, local_training_pending);
+    let mut metrics = vec![
+        DragonMetricCardView {
+            title: "network",
+            value: dragon_transport_summary(view),
+            detail: dragon_network_detail(view),
+            tone: if direct_transport_ready {
+                DragonHeroTone::Ready
+            } else {
+                hero_tone
+            },
+        },
+        DragonMetricCardView {
+            title: "mode",
+            value: runtime_summary,
+            detail: runtime_detail,
+            tone: hero_tone,
+        },
+        DragonMetricCardView {
+            title: "local",
+            value: dragon_local_training_summary(view, local_training_pending),
+            detail: dragon_local_training_detail(view, training_action_state),
+            tone: if local_training_pending {
+                DragonHeroTone::Working
+            } else {
+                DragonHeroTone::Waiting
+            },
+        },
+        DragonMetricCardView {
+            title: "swarm",
+            value: dragon_global_training_summary(view),
+            detail: dragon_global_training_detail(view),
+            tone: DragonHeroTone::Waiting,
+        },
+        DragonMetricCardView {
+            title: "slice",
+            value: dragon_slice_progress_summary(view),
+            detail: dragon_window_progress_detail(view, &window_summary),
+            tone: if training_action_state.is_some_and(|state| state.enabled) {
+                DragonHeroTone::Ready
+            } else {
+                DragonHeroTone::Waiting
+            },
+        },
+    ];
+    if has_session || view.is_some_and(|view| !view.session_label.trim().is_empty()) {
+        metrics.push(DragonMetricCardView {
+            title: "session",
+            value: view
+                .map(|view| view.session_label.clone())
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| "signed in".into()),
+            detail: "github session active".into(),
+            tone: DragonHeroTone::Ready,
+        });
+    }
+    metrics
+}
+
+fn dragon_ui_event_candidate(
+    hero: &DragonHeroView,
+    readiness: &[DragonReadinessStepView],
+) -> DragonUiEventCandidate {
+    if let Some(step) = readiness
+        .iter()
+        .find(|step| step.status == DragonStepStatus::Blocked)
+    {
+        return DragonUiEventCandidate {
+            key: format!("{:?}:blocked:{}", step.id, step.detail),
+            kind: DragonUiEventKind::Error,
+            label: step.detail.clone(),
+            detail: Some("open diagnostics for raw state and transport details".into()),
+        };
+    }
+    if let Some(step) = readiness
+        .iter()
+        .find(|step| step.status == DragonStepStatus::Active)
+    {
+        return DragonUiEventCandidate {
+            key: format!("{:?}:active:{}", step.id, step.detail),
+            kind: dragon_readiness_event_kind(step.id),
+            label: step.detail.clone(),
+            detail: Some(format!("{} step active", step.label)),
+        };
+    }
+    DragonUiEventCandidate {
+        key: format!("hero:{}:{}", hero.tone.class(), hero.label),
+        kind: match hero.tone {
+            DragonHeroTone::Ready => DragonUiEventKind::Training,
+            DragonHeroTone::Working => DragonUiEventKind::Transport,
+            DragonHeroTone::Waiting => DragonUiEventKind::Peer,
+            DragonHeroTone::Blocked => DragonUiEventKind::Error,
+        },
+        label: hero.label.clone(),
+        detail: Some(hero.detail.clone()),
+    }
+}
+
+fn dragon_readiness_event_kind(id: DragonReadinessStepId) -> DragonUiEventKind {
+    match id {
+        DragonReadinessStepId::Edge => DragonUiEventKind::Edge,
+        DragonReadinessStepId::BrowserCapabilities => DragonUiEventKind::Capability,
+        DragonReadinessStepId::Transport => DragonUiEventKind::Transport,
+        DragonReadinessStepId::DirectPeer => DragonUiEventKind::Peer,
+        DragonReadinessStepId::Assignment => DragonUiEventKind::Assignment,
+        DragonReadinessStepId::Checkpoint => DragonUiEventKind::Checkpoint,
+        DragonReadinessStepId::TrainingReady => DragonUiEventKind::Training,
+    }
+}
+
+fn dragon_ui_now_ms() -> f64 {
+    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(all(feature = "wasm-ui", target_arch = "wasm32")))]
+    {
+        0.0
     }
 }
 
@@ -1658,6 +2297,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let hero_rattle_generation = use_signal(|| 0_u64);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     let hero_rattle_state = use_signal(|| None::<bool>);
+    let ui_events = use_signal(Vec::<DragonUiEvent>::new);
+    let last_ui_event_key = use_signal(String::new);
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
     #[cfg(feature = "wasm-peer")]
@@ -2200,8 +2841,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let public_landing = !auth_bootstrap_pending_active && !has_session && !has_connected_view;
     let needs_sign_in = !auth_bootstrap_pending_active && auth_required && !has_session;
     let ready_to_connect = !auth_bootstrap_pending_active && !needs_sign_in && !has_connected_view;
-    let hero_title = "train the dragon".to_owned();
-    let hero_subtitle = String::new();
     let raw_status_message = status.read().clone();
     let status_message = if public_landing
         && (raw_status_message.contains("failed to fetch edge snapshot")
@@ -2225,13 +2864,36 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let local_training_pending_active = *local_training_pending.read();
     #[cfg(not(feature = "wasm-peer"))]
     let local_training_pending_active = false;
-    let live_notice = dragon_live_notice(view.as_ref(), local_training_pending_active);
-    let hero_rattle_active = auth_bootstrap_pending_active
+    let direct_transport_ready = view
+        .as_ref()
+        .is_some_and(|view| view.network.direct_peers > 0);
+    let edge_configured = resolved_edge_base_url(&initial_config).is_ok();
+    let training_action_state = dragon_training_action_state(
+        view.as_ref(),
+        browser_can_attempt_dynamic_training,
+        edge_configured,
+        direct_transport_ready,
+        local_training_pending_active,
+        browser_downgrade_reason.as_deref(),
+    );
+    let peer_ui_context = DragonPeerUiContext {
+        view: view.as_ref(),
+        status_message: &status_message,
+        has_session,
+        auth_bootstrap_pending: auth_bootstrap_pending_active,
+        needs_sign_in,
+        ready_to_connect,
+        edge_configured,
+        browser_can_attempt_dynamic_training,
+        direct_transport_ready,
+        local_training_pending: local_training_pending_active,
+        downgrade_reason: browser_downgrade_reason.as_deref(),
+        training_action_state: training_action_state.as_ref(),
+    };
+    let peer_ui_state = dragon_peer_ui_state(&peer_ui_context);
+    let hero_rattle_active = peer_ui_state.hero.animate
         || status_message.starts_with("Connecting")
-        || status_message.starts_with("Starting sign-in")
-        || live_notice
-            .as_ref()
-            .is_some_and(|notice| notice.label != "blocked");
+        || status_message.starts_with("Starting sign-in");
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     {
         let mut hero_rattle_state = hero_rattle_state;
@@ -2247,42 +2909,30 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             );
         });
     }
-    let direct_transport_ready = view
-        .as_ref()
-        .is_some_and(|view| view.network.direct_peers > 0);
-    let edge_configured = resolved_edge_base_url(&initial_config).is_ok();
-    let training_action_state = dragon_training_action_state(
-        view.as_ref(),
-        browser_can_attempt_dynamic_training,
-        edge_configured,
-        direct_transport_ready,
-        local_training_pending_active,
-        browser_downgrade_reason.as_deref(),
-    );
-    let connected_panel_title = "connected";
-    let runtime_mode_summary = dragon_runtime_mode_summary(
-        view.as_ref(),
-        direct_transport_ready,
-        training_action_state.as_ref(),
-        auth_bootstrap_pending_active,
-        local_training_pending_active,
-    );
-    let runtime_mode_detail = dragon_runtime_mode_detail(
-        view.as_ref(),
-        direct_transport_ready,
-        training_action_state.as_ref(),
-        local_training_pending_active,
-        browser_downgrade_reason.as_deref(),
-    );
-    let slice_progress_summary = dragon_slice_progress_summary(view.as_ref());
-    let window_summary = dragon_window_summary(view.as_ref(), local_training_pending_active);
-    let local_training_summary =
-        dragon_local_training_summary(view.as_ref(), local_training_pending_active);
-    let local_training_detail =
-        dragon_local_training_detail(view.as_ref(), training_action_state.as_ref());
-    let global_training_summary = dragon_global_training_summary(view.as_ref());
-    let global_training_detail = dragon_global_training_detail(view.as_ref());
-    let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
+    {
+        let mut ui_events = ui_events;
+        let mut last_ui_event_key = last_ui_event_key;
+        let event_candidate = peer_ui_state.event_candidate.clone();
+        use_effect(move || {
+            if *last_ui_event_key.read() == event_candidate.key {
+                return;
+            }
+            last_ui_event_key.set(event_candidate.key.clone());
+            let mut next_events = ui_events.read().clone();
+            next_events.insert(
+                0,
+                DragonUiEvent {
+                    at_ms: dragon_ui_now_ms(),
+                    kind: event_candidate.kind,
+                    label: event_candidate.label.clone(),
+                    detail: event_candidate.detail.clone(),
+                },
+            );
+            next_events.truncate(8);
+            ui_events.set(next_events);
+        });
+    }
+    let activity_events = ui_events.read().clone();
     let direct_transport_error = view
         .as_ref()
         .and_then(|view| active_direct_transport_error(view).map(str::to_owned));
@@ -2612,24 +3262,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 }
                             }
                         }
-                        h1 { class: "app-title", "{hero_title}" }
-                        if !hero_subtitle.is_empty() {
-                            p { class: "app-subtitle", "{hero_subtitle}" }
-                        }
-                    }
-                }
-                if !status_message.is_empty() {
-                    ActivityNotice {
-                        label: String::from("status"),
-                        detail: status_message,
-                        tone: "accent",
-                    }
-                }
-                if debug_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
-                    ActivityNotice {
-                        label: String::from("capability policy"),
-                        detail: browser_capability_decision.downgrade_reason.clone().unwrap_or_default(),
-                        tone: "neutral",
+                        h1 { class: "app-title", "train the dragon" }
                     }
                 }
                 if needs_sign_in || ready_to_connect || (debug_controls_enabled && has_connected_view) {
@@ -2695,94 +3328,123 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             }
+            if !status_message.is_empty() {
+                ActivityNotice {
+                    label: String::from("status"),
+                    detail: status_message.clone(),
+                    tone: "accent",
+                }
+            }
+            if debug_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
+                ActivityNotice {
+                    label: String::from("capability policy"),
+                    detail: browser_capability_decision.downgrade_reason.clone().unwrap_or_default(),
+                    tone: "neutral",
+                }
+            }
             if has_connected_view {
-                div { class: "dragon-live-shell-wrap",
-                    section { class: "panel primary-panel browser-focus-panel dragon-live-shell",
-                        SectionHeader {
-                            eyebrow: "live",
-                            title: connected_panel_title,
-                            detail: String::new(),
-                        }
-                        if let Some(machine_state) = browser_machine_state_json {
-                            pre {
-                                class: "dragon-live-machine-state",
-                                hidden: true,
-                                "{machine_state}"
+                div { class: "dragon-live-actions",
+                    {train_button}
+                }
+            }
+            ReadinessLadder { steps: peer_ui_state.readiness.clone() }
+            MetricGrid { metrics: peer_ui_state.metrics.clone() }
+            ActivityFeed { events: activity_events }
+            if has_connected_view || debug_controls_enabled {
+                details { class: "panel dragon-diagnostics-drawer", open: debug_controls_enabled,
+                    summary { class: "dragon-diagnostics-summary",
+                        span { "advanced diagnostics" }
+                        small { "state · network · training · session" }
+                    }
+                    div { class: "dragon-diagnostics-grid",
+                        section { class: "dragon-diagnostics-section",
+                            SectionHeader {
+                                eyebrow: "state",
+                                title: "machine state",
+                                detail: "raw browser peer state for operators.",
+                            }
+                            if let Some(machine_state) = browser_machine_state_json {
+                                pre { class: "operator-raw dragon-machine-state", "{machine_state}" }
+                            } else {
+                                EmptyState {
+                                    title: "no runtime state",
+                                    detail: "connect the browser peer to inspect raw state.",
+                                }
                             }
                         }
-                        if let Some(view) = view.clone() {
-                            div { class: "dragon-panel-stack dragon-live-summary",
-                                if let Some(notice) = live_notice.as_ref() {
-                                    ActivityNotice {
-                                        label: notice.label.to_owned(),
-                                        detail: notice.detail.clone(),
-                                        tone: notice.tone,
-                                    }
+                        section { class: "dragon-diagnostics-section",
+                            SectionHeader {
+                                eyebrow: "network",
+                                title: "transport",
+                                detail: "edge and direct peer transport details.",
+                            }
+                            div { class: "keyvalue-list dragon-live-keyvalues",
+                                div { class: "keyvalue-row",
+                                    span { "edge url" }
+                                    strong { "{edge_url.read().clone()}" }
                                 }
-                                if debug_controls_enabled {
-                                    if let Some(reason) = browser_downgrade_reason.as_ref() {
-                                        ActivityNotice {
-                                            label: String::from("capability"),
-                                            detail: reason.clone(),
-                                            tone: "neutral",
-                                        }
-                                    }
-                                    if let Some(error) = direct_transport_error.as_ref() {
-                                        details { class: "dragon-debug-transport-error",
-                                            summary { "transport error" }
-                                            pre { "{error}" }
-                                        }
-                                    }
+                                div { class: "keyvalue-row",
+                                    span { "seed urls" }
+                                    strong { "{seed_node_urls.read().clone()}" }
                                 }
-                                div { class: "dragon-live-stats",
-                                    StatTile {
-                                        label: "status",
-                                        value: runtime_mode_summary,
-                                        detail: Some(runtime_mode_detail.clone()),
-                                    }
-                                    StatTile {
-                                        label: "local train",
-                                        value: local_training_summary,
-                                        detail: Some(local_training_detail),
-                                    }
-                                    StatTile {
-                                        label: "global train",
-                                        value: global_training_summary,
-                                        detail: Some(global_training_detail),
-                                    }
-                                    StatTile {
-                                        label: "window",
-                                        value: slice_progress_summary,
-                                        detail: Some(window_progress_detail),
-                                    }
-                                    StatTile {
-                                        label: "peers",
-                                        value: network_summary.clone(),
-                                        detail: Some(transport_summary.clone()),
-                                    }
+                                div { class: "keyvalue-row",
+                                    span { "transport" }
+                                    strong { "{transport_summary}" }
                                 }
-                                div { class: "dragon-live-actions",
-                                    {train_button}
+                                div { class: "keyvalue-row",
+                                    span { "peers" }
+                                    strong { "{network_summary}" }
                                 }
-                                if debug_controls_enabled {
-                                    div { class: "keyvalue-list",
-                                        div { class: "keyvalue-row",
-                                            span { "optimizer steps" }
-                                            strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
-                                        }
-                                        div { class: "keyvalue-row",
-                                            span { "accepted samples" }
-                                            strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
-                                        }
-                                        div { class: "keyvalue-row",
-                                            span { "head" }
-                                            strong { "{active_head_label}" }
-                                        }
+                                if let Some(error) = direct_transport_error.as_ref() {
+                                    div { class: "keyvalue-row",
+                                        span { "last error" }
+                                        strong { "{error}" }
                                     }
                                 }
                             }
                         }
-                        if debug_controls_enabled && props.config.training.is_some() {
+                        section { class: "dragon-diagnostics-section",
+                            SectionHeader {
+                                eyebrow: "training",
+                                title: "local slice",
+                                detail: "assignment, checkpoint, and local training counters.",
+                            }
+                            if let Some(view) = view.clone() {
+                                div { class: "keyvalue-list dragon-live-keyvalues",
+                                    div { class: "keyvalue-row",
+                                        span { "assignment" }
+                                        strong { "{view.training.active_assignment.is_some().then_some(\"assigned\").unwrap_or(\"waiting\")}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "head" }
+                                        strong { "{active_head_label}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "cached microshards" }
+                                        strong { "{view.training.cached_microshards}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "accepted samples" }
+                                        strong { "{view.training.accepted_samples.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                    div { class: "keyvalue-row",
+                                        span { "optimizer steps" }
+                                        strong { "{view.training.optimizer_steps.map(|value| value.to_string()).unwrap_or_else(|| \"n/a\".into())}" }
+                                    }
+                                }
+                            } else {
+                                EmptyState {
+                                    title: "no training state",
+                                    detail: "training details appear after connect.",
+                                }
+                            }
+                        }
+                        section { class: "dragon-diagnostics-section",
+                            SectionHeader {
+                                eyebrow: "capability",
+                                title: "browser budget",
+                                detail: "policy and memory estimates used by the browser trainer.",
+                            }
                             div { class: "browser-metric-band dragon-metric-band",
                                 StatTile {
                                     label: "recommended role",
@@ -2956,6 +3618,97 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
 }
 
 #[component]
+fn ReadinessLadder(steps: Vec<DragonReadinessStepView>) -> Element {
+    rsx! {
+        section { class: "dragon-readiness-shell", "aria-label": "browser peer readiness",
+            ol { class: "dragon-readiness",
+                for step in steps {
+                    {
+                        let status = step.status.class();
+                        let marker = step.status.marker();
+                        rsx! {
+                            li { class: "dragon-step dragon-step-{status}",
+                                span { class: "dragon-step-marker", "{marker}" }
+                                span { class: "dragon-step-label", "{step.label}" }
+                                span { class: "dragon-step-detail", "{step.detail}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetricGrid(metrics: Vec<DragonMetricCardView>) -> Element {
+    rsx! {
+        section { class: "dragon-metrics-grid", "aria-label": "browser peer metrics",
+            for metric in metrics {
+                MetricCard { view: metric }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetricCard(view: DragonMetricCardView) -> Element {
+    let tone = view.tone.class();
+    rsx! {
+        article { class: "dragon-card dragon-metric dragon-metric-{tone}",
+            div { class: "dragon-card-title", "{view.title}" }
+            div { class: "dragon-card-value", "{view.value}" }
+            div { class: "dragon-card-detail", "{view.detail}" }
+        }
+    }
+}
+
+#[component]
+fn ActivityFeed(events: Vec<DragonUiEvent>) -> Element {
+    rsx! {
+        section { class: "panel compact-panel dragon-activity-panel",
+            SectionHeader {
+                eyebrow: "events",
+                title: "peer activity",
+                detail: "recent state transitions from this browser peer.",
+            }
+            if events.is_empty() {
+                EmptyState {
+                    title: "waiting for events",
+                    detail: "state changes will appear here as the peer connects.",
+                }
+            } else {
+                ol { class: "dragon-activity-feed",
+                    for event in events {
+                        {
+                            let kind = event.kind.class();
+                            let time = dragon_format_ui_event_time(event.at_ms);
+                            rsx! {
+                                li { class: "dragon-activity-event dragon-activity-event-{kind}",
+                                    time { "{time}" }
+                                    span { class: "dragon-activity-label", "{event.label}" }
+                                    if let Some(detail) = event.detail {
+                                        span { class: "dragon-activity-detail", "{detail}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dragon_format_ui_event_time(at_ms: f64) -> String {
+    let total_seconds = ((at_ms / 1000.0).floor() as u64) % 86_400;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[component]
 fn SectionHeader(eyebrow: &'static str, title: &'static str, detail: String) -> Element {
     rsx! {
         header { class: "section-header",
@@ -3080,15 +3833,16 @@ mod tests {
     use super::{
         BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
-        DragonBrowserTransportOverride, browser_app_refresh_interval_millis,
-        browser_session_is_authenticated, browser_view_machine_state_json, connect_config,
-        dragon_browser_training_action_ready, dragon_global_training_detail,
-        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
-        dragon_local_training_summary, dragon_network_detail, dragon_runtime_mode_detail,
-        dragon_runtime_mode_summary, dragon_slice_progress_summary, dragon_training_action_state,
-        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
-        filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
-        normalized_browser_callback_url, retained_refresh_transport_warning,
+        DragonBrowserTransportOverride, DragonHeroTone, DragonReadinessStepId, DragonStepStatus,
+        browser_app_refresh_interval_millis, browser_session_is_authenticated,
+        browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
+        dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
+        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
+        dragon_peer_ui_state, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
+        dragon_slice_progress_summary, dragon_training_action_state, dragon_transport_summary,
+        dragon_window_progress_detail, dragon_window_summary, filter_seed_urls_for_transport,
+        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
+        retained_refresh_transport_warning,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -3632,6 +4386,82 @@ mod tests {
         assert!(ready.enabled);
         assert_eq!(ready.label, "run browser training");
         assert!(ready.detail.contains("downloads when the run starts"));
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_peer_ui_state_promotes_ready_training_path() {
+        let mut view = sample_browser_view();
+        view.network.direct_peers = 1;
+        view.network.swarm_status.connected_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        view.training.active_assignment = Some("assignment-1".into());
+        view.training.latest_head_id = Some("head-1".into());
+        view.training.cached_microshards = 4;
+        let action = dragon_training_action_state(Some(&view), true, true, true, false, None);
+
+        let context = DragonPeerUiContext {
+            view: Some(&view),
+            status_message: "",
+            has_session: true,
+            auth_bootstrap_pending: false,
+            needs_sign_in: false,
+            ready_to_connect: false,
+            edge_configured: true,
+            browser_can_attempt_dynamic_training: true,
+            direct_transport_ready: true,
+            local_training_pending: false,
+            downgrade_reason: None,
+            training_action_state: action.as_ref(),
+        };
+        let ui = dragon_peer_ui_state(&context);
+
+        assert_eq!(ui.hero.label, "ready to train");
+        assert_eq!(ui.hero.tone, DragonHeroTone::Ready);
+        assert!(ui.hero.detail.contains("checkpoint synced"));
+        assert_eq!(
+            ui.readiness
+                .iter()
+                .find(|step| step.id == DragonReadinessStepId::TrainingReady)
+                .expect("train step")
+                .status,
+            DragonStepStatus::Done
+        );
+        assert!(ui.metrics.iter().any(|metric| metric.title == "network"));
+    }
+
+    #[wasm_bindgen_test]
+    fn dragon_peer_ui_state_explains_direct_transport_failure() {
+        let mut view = sample_browser_view();
+        view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
+        view.network.swarm_status.last_error = Some("direct dial timeout".into());
+        let action = dragon_training_action_state(Some(&view), true, true, false, false, None);
+
+        let context = DragonPeerUiContext {
+            view: Some(&view),
+            status_message: "",
+            has_session: true,
+            auth_bootstrap_pending: false,
+            needs_sign_in: false,
+            ready_to_connect: false,
+            edge_configured: true,
+            browser_can_attempt_dynamic_training: true,
+            direct_transport_ready: false,
+            local_training_pending: false,
+            downgrade_reason: None,
+            training_action_state: action.as_ref(),
+        };
+        let ui = dragon_peer_ui_state(&context);
+
+        assert_eq!(ui.hero.label, "direct peer connection failed");
+        assert_eq!(ui.hero.tone, DragonHeroTone::Blocked);
+        assert_eq!(ui.event_candidate.kind, super::DragonUiEventKind::Error);
+        assert_eq!(
+            ui.readiness
+                .iter()
+                .find(|step| step.id == DragonReadinessStepId::DirectPeer)
+                .expect("peer step")
+                .status,
+            DragonStepStatus::Blocked
+        );
     }
 
     #[wasm_bindgen_test]

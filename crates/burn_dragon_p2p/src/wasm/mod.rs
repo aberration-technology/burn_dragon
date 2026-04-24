@@ -2939,6 +2939,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let show_reset_browser_state_button = debug_controls_enabled
         && (direct_transport_error.is_some() || browser_downgrade_reason.is_some());
     let browser_machine_state_json = view.as_ref().map(browser_view_machine_state_json);
+    let runtime_mode_summary = dragon_runtime_mode_summary(
+        view.as_ref(),
+        direct_transport_ready,
+        training_action_state.as_ref(),
+        false,
+        local_training_pending_active,
+    );
+    let runtime_mode_detail = dragon_runtime_mode_detail(
+        view.as_ref(),
+        direct_transport_ready,
+        training_action_state.as_ref(),
+        local_training_pending_active,
+        browser_downgrade_reason.as_deref(),
+    );
+    let local_training_summary =
+        dragon_local_training_summary(view.as_ref(), local_training_pending_active);
+    let local_training_detail =
+        dragon_local_training_detail(view.as_ref(), training_action_state.as_ref());
+    let global_training_summary = dragon_global_training_summary(view.as_ref());
+    let global_training_detail = dragon_global_training_detail(view.as_ref());
+    let window_summary = dragon_window_summary(view.as_ref(), local_training_pending_active);
+    let slice_progress_summary = dragon_slice_progress_summary(view.as_ref());
+    let window_progress_detail = dragon_window_progress_detail(view.as_ref(), &window_summary);
     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
     {
         let mut last_logged_browser_status = last_logged_browser_status;
@@ -3350,6 +3373,43 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             ReadinessLadder { steps: peer_ui_state.readiness.clone() }
             MetricGrid { metrics: peer_ui_state.metrics.clone() }
             ActivityFeed { events: activity_events }
+            if has_connected_view {
+                div { class: "dragon-live-stats dragon-canary-diagnostics", "aria-hidden": "true",
+                    StatTile {
+                        label: "status",
+                        value: runtime_mode_summary.clone(),
+                        detail: Some(runtime_mode_detail.clone()),
+                    }
+                    StatTile {
+                        label: "transport",
+                        value: transport_summary.clone(),
+                        detail: Some(network_summary.clone()),
+                    }
+                    StatTile {
+                        label: "local train",
+                        value: local_training_summary.clone(),
+                        detail: Some(local_training_detail.clone()),
+                    }
+                    StatTile {
+                        label: "global train",
+                        value: global_training_summary.clone(),
+                        detail: Some(global_training_detail.clone()),
+                    }
+                    StatTile {
+                        label: "window",
+                        value: slice_progress_summary.clone(),
+                        detail: Some(window_progress_detail.clone()),
+                    }
+                    StatTile {
+                        label: "peers",
+                        value: network_summary.clone(),
+                        detail: Some(transport_summary.clone()),
+                    }
+                }
+                if let Some(machine_state) = browser_machine_state_json.as_ref() {
+                    pre { class: "dragon-live-machine-state dragon-canary-diagnostics", "aria-hidden": "true", "{machine_state}" }
+                }
+            }
             if has_connected_view || debug_controls_enabled {
                 details { class: "panel dragon-diagnostics-drawer", open: debug_controls_enabled,
                     summary { class: "dragon-diagnostics-summary",
@@ -3363,7 +3423,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 title: "machine state",
                                 detail: "raw browser peer state for operators.",
                             }
-                            if let Some(machine_state) = browser_machine_state_json {
+                            if let Some(machine_state) = browser_machine_state_json.as_ref() {
                                 pre { class: "operator-raw dragon-machine-state", "{machine_state}" }
                             } else {
                                 EmptyState {

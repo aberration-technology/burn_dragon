@@ -571,19 +571,23 @@ For the public production network, the simplest native path is the published
 operator binary:
 
 ```bash
-cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.23 --bin burn_dragon_p2p_native
 burn_dragon_p2p_native login
 burn_dragon_p2p_native train-window-once --require-head-advanced
 burn_dragon_p2p_native run-peer
 ```
+
+Keep the explicit `--version` while the production line is pre-release; without
+it, Cargo can select an older stable crate instead of the current mainnet
+operator.
 
 The crate default feature set includes `native,wgpu`, so the install command
 above produces the portable WebGPU backend. Use a backend-specific install only
 on a host with the matching driver and toolkit libraries:
 
 ```bash
-cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,cuda
-cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.23 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.23 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
 With no `--config`, the binary points at

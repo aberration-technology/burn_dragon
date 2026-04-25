@@ -1343,12 +1343,7 @@ fn resolve_browser_training_config(
         Some(selected_experiment_id),
         selected_revision_id,
     )?;
-    training.ok_or_else(|| {
-        anyhow!(
-            "selected experiment `{selected_experiment_id}` does not publish a browser training profile"
-        )
-    })
-    .map(Some)
+    Ok(training)
 }
 
 fn browser_site_requested_scopes(

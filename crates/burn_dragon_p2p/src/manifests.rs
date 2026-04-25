@@ -13,7 +13,7 @@ use burn_p2p::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::capability::DragonTrainingFootprint;
+use crate::capability::{DragonCapabilityClass, DragonTrainingFootprint};
 use crate::config::{DragonExperimentKind, DragonManifestBundle, DragonManifestSeed};
 use crate::profile::DragonExperimentProfile;
 
@@ -88,6 +88,21 @@ fn dragon_diffusion_merge_topology(experiment_kind: DragonExperimentKind) -> Mer
             ..HeadPromotionPolicy::default()
         },
     }
+}
+
+fn browser_trainer_wgpu_enabled(
+    profile: &DragonExperimentProfile,
+    footprint: &DragonTrainingFootprint,
+) -> bool {
+    profile
+        .browser
+        .as_ref()
+        .and_then(|browser| {
+            browser
+                .capability_policy
+                .memory_budget_bytes(DragonCapabilityClass::BrowserWgpu)
+        })
+        .is_some_and(|budget| footprint.estimated_training_bytes <= budget)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,13 +225,17 @@ pub fn build_manifest_bundle(
             .saturating_add(footprint.estimated_shard_bytes),
         estimated_window_seconds: 30,
     };
-    let allowed_roles = PeerRoleSet::new([
+    let browser_trainer_wgpu = browser_trainer_wgpu_enabled(profile, footprint);
+    let mut allowed_role_values = vec![
         trainer_minimum_role(backend_label),
         PeerRole::Archive,
         PeerRole::Viewer,
         PeerRole::BrowserObserver,
-        PeerRole::BrowserTrainerWgpu,
-    ]);
+    ];
+    if browser_trainer_wgpu {
+        allowed_role_values.push(PeerRole::BrowserTrainerWgpu);
+    }
+    let allowed_roles = PeerRoleSet::new(allowed_role_values);
     let allowed_scopes = BTreeSet::from([
         ExperimentScope::Connect,
         ExperimentScope::Discover,
@@ -297,11 +316,11 @@ pub fn build_manifest_bundle(
         lag_policy: Default::default(),
         merge_window_miss_policy: Default::default(),
         robustness_policy: None,
-        browser_enabled: true,
+        browser_enabled: profile.browser.is_some(),
         browser_role_policy: BrowserRolePolicy {
             observer: true,
             verifier: false,
-            trainer_wgpu: true,
+            trainer_wgpu: browser_trainer_wgpu,
             fallback: true,
         },
         max_browser_checkpoint_bytes: Some(footprint.estimated_checkpoint_bytes),
@@ -485,7 +504,8 @@ mod tests {
         let entry = &bundle.experiment_directory[0];
         assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
         assert!(!entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
-        assert!(entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
+        assert!(!entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
+        assert!(!entry.browser_role_policy().trainer_wgpu);
         assert!(!entry.allowed_scopes.contains(&ExperimentScope::Validate {
             experiment_id: entry.experiment_id.clone(),
         }));

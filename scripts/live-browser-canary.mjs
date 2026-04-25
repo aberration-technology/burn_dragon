@@ -962,7 +962,7 @@ async function runCanary() {
       `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)} canonical_config=${JSON.stringify(canonicalBrowserConfigSeeds)} canonical_signed=${JSON.stringify(canonicalSignedSeeds)}`,
     );
   }
-  if (EXPERIMENT_ID && !browserTrainingConfig) {
+  if (EXPECT_TRAINING && EXPERIMENT_ID && !browserTrainingConfig) {
     fail(
       `browser config is missing training payload for selected experiment ${EXPERIMENT_ID}`,
     );

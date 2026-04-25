@@ -255,6 +255,8 @@ struct DeploymentDiagnosticsArgs {
     #[arg(long, default_value_t = false)]
     require_head_published: bool,
     #[arg(long, default_value_t = false)]
+    require_head_advanced: bool,
+    #[arg(long, default_value_t = false)]
     require_directory_entry_published: bool,
     #[arg(long, default_value_t = false)]
     require_metrics_catchup: bool,
@@ -482,6 +484,8 @@ struct TrainWindowOnceArgs {
     output: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    require_head_advanced: bool,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
 }
@@ -610,8 +614,14 @@ struct TrainWindowOnceTimingReport {
 struct TrainWindowOnceReport {
     experiment_kind: DragonExperimentKind,
     backend: String,
+    edge_base_url: Option<String>,
+    seed_node_count: usize,
+    effective_target: String,
+    can_train: bool,
+    downgrade_reason: Option<String>,
     local_peer_id: String,
     base_head_id: String,
+    base_global_step: u64,
     published_head_id: String,
     published_global_step: u64,
     artifact_id: String,
@@ -818,6 +828,7 @@ fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
             check_auth_authorize: args.check_auth_authorize,
             check_artifact_head_view: args.check_artifact_head_view,
             require_head_published: args.require_head_published,
+            require_head_advanced: args.require_head_advanced,
             require_directory_entry_published: args.require_directory_entry_published,
             require_metrics_catchup: args.require_metrics_catchup,
             require_auth_authorize: args.require_auth_authorize,
@@ -1603,6 +1614,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
@@ -1614,6 +1626,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         #[cfg(feature = "wgpu")]
@@ -1626,6 +1639,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         #[cfg(feature = "wgpu")]
@@ -1638,6 +1652,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         #[cfg(feature = "cuda")]
@@ -1650,6 +1665,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         #[cfg(feature = "cuda")]
@@ -1662,6 +1678,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 args.restore_head_on_start,
                 args.output.as_deref(),
                 args.output_format,
+                args.require_head_advanced,
             )
         }
         #[cfg(not(feature = "wgpu"))]
@@ -2331,6 +2348,7 @@ fn run_prepared_train_window_once<B>(
     restore_head_on_start: bool,
     output: Option<&Path>,
     output_format: OutputFormat,
+    require_head_advanced: bool,
 ) -> Result<()>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -2397,8 +2415,14 @@ where
         Ok(TrainWindowOnceReport {
             experiment_kind: running.prepared().experiment_kind,
             backend: backend.as_label().into(),
+            edge_base_url: config.effective_edge_base_url().map(ToOwned::to_owned),
+            seed_node_count: config.effective_seed_node_urls().len(),
+            effective_target: format!("{:?}", running.prepared().target_decision.effective_target),
+            can_train: running.prepared().target_decision.can_train,
+            downgrade_reason: running.prepared().target_decision.downgrade_reason.clone(),
             local_peer_id: local_peer_id.as_str().to_owned(),
             base_head_id: base_head.head_id.as_str().to_owned(),
+            base_global_step: base_head.global_step,
             published_head_id: outcome.head.head_id.as_str().to_owned(),
             published_global_step: outcome.head.global_step,
             artifact_id: outcome.artifact.artifact_id.as_str().to_owned(),
@@ -2426,6 +2450,13 @@ where
     }
 
     let report = report_result?;
+    if require_head_advanced && report.published_global_step <= report.base_global_step {
+        bail!(
+            "train-window-once did not advance the experiment head: base step {} published step {}",
+            report.base_global_step,
+            report.published_global_step
+        );
+    }
     write_output(output, output_format, &report)
 }
 

@@ -226,7 +226,12 @@ advertised. The current browser transport contract is maintained in
 while the Dragon deploy defaults and Pages canary gates live in
 [deploy/README.md](deploy/README.md).
 
-If the selected directory entry includes Dragon profile metadata, browser training can run without a static embedded `training` config in the host app.
+If the selected directory entry includes Dragon profile metadata and explicitly
+allows `BrowserTrainerWgpu`, browser training can run without a static embedded
+`training` config in the host app. Production profiles that exceed the browser
+WebGPU memory budget still publish browser observer/verifier connectivity, but
+they omit the training payload so the UI and canary do not advertise an unsafe
+browser trainer path.
 
 ### Native Peer
 
@@ -318,6 +323,11 @@ That launches the deployed browser callback bridge, completes GitHub SSO in the 
 If the edge cannot infer the public Pages host for the native callback bridge,
 set `BURN_DRAGON_P2P_BROWSER_APP_BASE_URL` to the deployed browser shell URL
 before running `login`.
+
+Use `train-window-once --require-head-advanced` as the native post-deploy smoke
+when you need proof that the peer published a strictly newer experiment head.
+The same `--require-head-advanced` flag is available on `deployment-diagnostics`
+to make readiness fail while the matching edge head is still at global step `0`.
 
 The manual two-step path remains available for headless or debugging workflows:
 

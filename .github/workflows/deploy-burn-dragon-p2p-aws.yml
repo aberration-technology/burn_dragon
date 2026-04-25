@@ -1316,6 +1316,7 @@ jobs:
           print(f"- Profile source: `{profile_resolution.get('source', 'unknown')}`")
           print(f"- Matching head present: `{edge_snapshot.get('matching_head_present', False)}`")
           print(f"- Matching head id: `{edge_snapshot.get('matching_head_id') or 'none'}`")
+          print(f"- Matching head global step: `{edge_snapshot.get('matching_head_global_step', 'n/a')}`")
           print(f"- Matching directory entry present: `{edge_snapshot.get('matching_directory_entry_present', False)}`")
           print(f"- Artifact head probe ok: `{artifact_head_view.get('ok', False)}`")
           print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")

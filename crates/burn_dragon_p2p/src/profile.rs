@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "native")]
 use anyhow::bail;
 use anyhow::{Result, anyhow};
-use burn_p2p::ExperimentDirectoryEntry;
+use burn_p2p::{BrowserRole, ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt};
 use burn_p2p_workload::{
     DirectoryMetadataAttachment, find_matching_directory_entry_with_predicate,
 };
@@ -636,6 +636,9 @@ pub fn browser_training_config_from_profile(
     entry: &ExperimentDirectoryEntry,
     profile: &DragonExperimentProfile,
 ) -> Result<Option<DragonBrowserTrainingConfig>> {
+    if !entry.browser_role_allowed(BrowserRole::TrainerWgpu) {
+        return Ok(None);
+    }
     let Some(browser) = profile.browser.clone() else {
         return Ok(None);
     };

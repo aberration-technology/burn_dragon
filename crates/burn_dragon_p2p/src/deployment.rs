@@ -29,6 +29,7 @@ pub struct DeploymentDiagnosticsOptions {
     pub check_auth_authorize: bool,
     pub check_artifact_head_view: bool,
     pub require_head_published: bool,
+    pub require_head_advanced: bool,
     pub require_directory_entry_published: bool,
     pub require_metrics_catchup: bool,
     pub require_auth_authorize: bool,
@@ -73,6 +74,7 @@ pub struct DeploymentEdgeSnapshotSummary {
     pub matching_directory_entry_present: bool,
     pub matching_head_present: bool,
     pub matching_head_id: Option<String>,
+    pub matching_head_global_step: Option<u64>,
     pub captured_at: DateTime<Utc>,
 }
 
@@ -304,6 +306,7 @@ fn fetch_deployment_edge_snapshot(
         matching_directory_entry_present: matching_directory_entry.is_some(),
         matching_head_present: matching_head.is_some(),
         matching_head_id: matching_head.map(|head| head.head_id.as_str().to_owned()),
+        matching_head_global_step: matching_head.map(|head| head.global_step),
         captured_at: snapshot.captured_at,
     })
 }
@@ -500,6 +503,12 @@ pub fn evaluate_deployment_readiness(
             } else {
                 observed_warnings.push("matching_experiment_head_missing".into());
             }
+        } else if snapshot.matching_head_global_step == Some(0) {
+            if options.require_head_advanced {
+                blocking_issues.push("matching_experiment_head_not_advanced".into());
+            } else {
+                observed_warnings.push("matching_experiment_head_not_advanced".into());
+            }
         }
     }
 
@@ -670,6 +679,7 @@ mod tests {
             matching_directory_entry_present: true,
             matching_head_present: head_present,
             matching_head_id: head_present.then(|| "head-1".into()),
+            matching_head_global_step: head_present.then_some(1),
             captured_at: Utc::now(),
         })
     }
@@ -686,6 +696,7 @@ mod tests {
 
     fn readiness_options(
         require_head_published: bool,
+        require_head_advanced: bool,
         require_directory_entry_published: bool,
         require_metrics_catchup: bool,
         require_auth_authorize: bool,
@@ -693,6 +704,7 @@ mod tests {
     ) -> DeploymentDiagnosticsOptions {
         DeploymentDiagnosticsOptions {
             require_head_published,
+            require_head_advanced,
             require_directory_entry_published,
             require_metrics_catchup,
             require_auth_authorize,
@@ -710,7 +722,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, false, false, false),
+            &readiness_options(true, false, false, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -730,7 +742,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(false, false, false, false, false),
+            &readiness_options(false, false, false, false, false, false),
         );
 
         assert!(readiness.ready);
@@ -738,6 +750,30 @@ mod tests {
             readiness
                 .observed_warnings
                 .contains(&"matching_experiment_head_missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_advanced_head_when_requested() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.matching_head_global_step = Some(0);
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &readiness_options(true, true, false, false, false, false),
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"matching_experiment_head_not_advanced".to_owned())
         );
     }
 
@@ -758,7 +794,7 @@ mod tests {
                 redirect_uri_secure: false,
             })),
             None,
-            &readiness_options(false, false, false, true, false),
+            &readiness_options(false, false, false, false, true, false),
         );
 
         assert!(!readiness.ready);
@@ -783,7 +819,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, true, false, false, false),
+            &readiness_options(true, false, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -803,7 +839,7 @@ mod tests {
             None,
             None,
             Some(&DeploymentCheck::err(anyhow!("502 bad gateway"))),
-            &readiness_options(true, true, false, false, true),
+            &readiness_options(true, false, true, false, false, true),
         );
 
         assert!(!readiness.ready);
@@ -827,7 +863,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, true, false, false, false),
+            &readiness_options(true, false, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -851,7 +887,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, true, false, false, false),
+            &readiness_options(true, false, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -879,7 +915,7 @@ mod tests {
                 redirect_uri_secure: false,
             })),
             None,
-            &readiness_options(false, false, false, true, false),
+            &readiness_options(false, false, false, false, true, false),
         );
 
         assert!(!readiness.ready);
@@ -903,7 +939,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, true, false, false, false),
+            &readiness_options(true, false, true, false, false, false),
         );
 
         assert!(!readiness.ready);
@@ -927,7 +963,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(false, false, false, false, false),
+            &readiness_options(false, false, false, false, false, false),
         );
 
         assert!(readiness.ready);

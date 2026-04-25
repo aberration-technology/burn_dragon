@@ -11,6 +11,7 @@ def main() -> None:
         "browserConfig.seed_node_urls",
         "const browserConfigSeeds = browserConfigSeedNodeUrls(filteredBrowserConfig);",
         "const browserTrainingConfig = browserConfigTrainingConfig(filteredBrowserConfig);",
+        "if (EXPECT_TRAINING && EXPERIMENT_ID && !browserTrainingConfig)",
         'browser config is missing training payload for selected experiment ${EXPERIMENT_ID}',
         'const PENDING_GITHUB_LOGIN_KEY = "burn-dragon-p2p.pending-github-login";',
         'const TRUSTED_CALLBACK_TOKEN_KEY = "burn-dragon-p2p.canary-callback-token";',

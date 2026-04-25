@@ -631,6 +631,15 @@ struct TrainWindowOnceReport {
     timing: TrainWindowOnceTimingReport,
 }
 
+#[derive(Clone, Copy)]
+struct TrainWindowOnceRunOptions<'a> {
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+    output: Option<&'a Path>,
+    output_format: OutputFormat,
+    require_head_advanced: bool,
+}
+
 fn main() -> Result<()> {
     let cli = parse_cli();
     burn_dragon_p2p::logging::init_native_logging();
@@ -1603,6 +1612,13 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
             callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
         },
     )?;
+    let run_options = TrainWindowOnceRunOptions {
+        initialize_head_on_start: args.initialize_head_on_start,
+        restore_head_on_start: args.restore_head_on_start,
+        output: args.output.as_deref(),
+        output_format: args.output_format,
+        require_head_advanced: args.require_head_advanced,
+    };
 
     match (args.experiment_kind.into_config(), args.backend) {
         (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
@@ -1610,11 +1626,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_nca_native_cpu(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
@@ -1622,11 +1634,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_climbmix_native_cpu(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         #[cfg(feature = "wgpu")]
@@ -1635,11 +1643,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_nca_native_wgpu(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         #[cfg(feature = "wgpu")]
@@ -1648,11 +1652,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_climbmix_native_wgpu(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         #[cfg(feature = "cuda")]
@@ -1661,11 +1661,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_nca_native_cuda(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         #[cfg(feature = "cuda")]
@@ -1674,11 +1670,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 prepare_climbmix_native_cuda(&config, Some(&auth_bundle))?,
                 &config,
                 args.backend,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-                args.output.as_deref(),
-                args.output_format,
-                args.require_head_advanced,
+                run_options,
             )
         }
         #[cfg(not(feature = "wgpu"))]
@@ -2344,11 +2336,7 @@ fn run_prepared_train_window_once<B>(
     prepared: PreparedNativePeer<B>,
     config: &DragonNativePeerConfig,
     backend: BackendArg,
-    initialize_head_on_start: bool,
-    restore_head_on_start: bool,
-    output: Option<&Path>,
-    output_format: OutputFormat,
-    require_head_advanced: bool,
+    options: TrainWindowOnceRunOptions<'_>,
 ) -> Result<()>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -2400,8 +2388,8 @@ where
         let base_head = sync_or_initialize_head_provider(
             &mut running,
             &experiment,
-            initialize_head_on_start,
-            restore_head_on_start,
+            options.initialize_head_on_start,
+            options.restore_head_on_start,
             &mut mirrored_head_id,
             "trainer",
         )?
@@ -2450,14 +2438,14 @@ where
     }
 
     let report = report_result?;
-    if require_head_advanced && report.published_global_step <= report.base_global_step {
+    if options.require_head_advanced && report.published_global_step <= report.base_global_step {
         bail!(
             "train-window-once did not advance the experiment head: base step {} published step {}",
             report.base_global_step,
             report.published_global_step
         );
     }
-    write_output(output, output_format, &report)
+    write_output(options.output, options.output_format, &report)
 }
 
 fn sync_or_initialize_head_provider<B>(

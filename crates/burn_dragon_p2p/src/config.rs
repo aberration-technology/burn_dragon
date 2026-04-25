@@ -31,6 +31,8 @@ pub struct DragonCapabilityPolicy {
     pub native_wgpu_memory_budget_bytes: Option<u64>,
     #[serde(default = "default_native_cuda_memory_budget_bytes")]
     pub native_cuda_memory_budget_bytes: Option<u64>,
+    #[serde(default = "default_native_rocm_memory_budget_bytes")]
+    pub native_rocm_memory_budget_bytes: Option<u64>,
     #[serde(default = "default_browser_wgpu_memory_budget_bytes")]
     pub browser_wgpu_memory_budget_bytes: Option<u64>,
     #[serde(default = "default_allow_native_validator_fallback")]
@@ -45,6 +47,7 @@ impl Default for DragonCapabilityPolicy {
             native_cpu_memory_budget_bytes: default_native_cpu_memory_budget_bytes(),
             native_wgpu_memory_budget_bytes: default_native_wgpu_memory_budget_bytes(),
             native_cuda_memory_budget_bytes: default_native_cuda_memory_budget_bytes(),
+            native_rocm_memory_budget_bytes: default_native_rocm_memory_budget_bytes(),
             browser_wgpu_memory_budget_bytes: default_browser_wgpu_memory_budget_bytes(),
             allow_native_validator_fallback: default_allow_native_validator_fallback(),
             allow_browser_verifier_fallback: default_allow_browser_verifier_fallback(),
@@ -67,6 +70,9 @@ impl DragonCapabilityPolicy {
             crate::capability::DragonCapabilityClass::NativeCuda => {
                 self.native_cuda_memory_budget_bytes
             }
+            crate::capability::DragonCapabilityClass::NativeRocm => {
+                self.native_rocm_memory_budget_bytes
+            }
             crate::capability::DragonCapabilityClass::BrowserCpu => {
                 self.native_cpu_memory_budget_bytes
             }
@@ -86,6 +92,10 @@ fn default_native_wgpu_memory_budget_bytes() -> Option<u64> {
 }
 
 fn default_native_cuda_memory_budget_bytes() -> Option<u64> {
+    Some(6 * GIB)
+}
+
+fn default_native_rocm_memory_budget_bytes() -> Option<u64> {
     Some(6 * GIB)
 }
 

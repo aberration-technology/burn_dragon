@@ -123,7 +123,7 @@ Type=simple
 WorkingDirectory=/var/lib/burn_dragon_p2p
 Environment=RUST_LOG=info
 ExecStartPre=/usr/local/bin/burn-dragon-p2p-fetch-auth-bundle
-ExecStart=/usr/local/bin/burn_dragon_p2p_native run-peer   --config /etc/burn_dragon_p2p/native-peer.toml   --experiment-kind ${trainer_experiment_kind}   --backend ${trainer_backend}   --auth-bundle /var/lib/burn_dragon_p2p/auth-bundle.json
+ExecStart=/usr/local/bin/burn_dragon_p2p_native run-peer   --config /etc/burn_dragon_p2p/native-peer.toml   --experiment-kind ${trainer_experiment_kind}   --backend ${trainer_backend}   --auth-bundle /var/lib/burn_dragon_p2p/auth-bundle.json   --restore-head-on-start true   --head-sync-interval-secs 15
 Restart=always
 RestartSec=5
 KillSignal=SIGINT

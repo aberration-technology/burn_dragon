@@ -31,6 +31,7 @@ pub enum DragonCapabilityClass {
     NativeCpu,
     NativeWgpu,
     NativeCuda,
+    NativeRocm,
     BrowserCpu,
     BrowserWgpu,
 }
@@ -40,6 +41,7 @@ impl DragonCapabilityClass {
         match backend_label {
             "cpu" | "ndarray" => Self::NativeCpu,
             "cuda" => Self::NativeCuda,
+            "rocm" => Self::NativeRocm,
             "wgpu" => Self::NativeWgpu,
             _ => Self::NativeWgpu,
         }
@@ -98,9 +100,9 @@ impl DragonNativeTargetDecision {
                 DragonCapabilityClass::NativeCpu => {
                     BurnTarget::Custom(PeerRoleSet::new([PeerRole::TrainerCpu]))
                 }
-                DragonCapabilityClass::NativeWgpu | DragonCapabilityClass::NativeCuda => {
-                    BurnTarget::Trainer
-                }
+                DragonCapabilityClass::NativeWgpu
+                | DragonCapabilityClass::NativeCuda
+                | DragonCapabilityClass::NativeRocm => BurnTarget::Trainer,
                 DragonCapabilityClass::BrowserCpu | DragonCapabilityClass::BrowserWgpu => {
                     BurnTarget::Trainer
                 }
@@ -210,6 +212,7 @@ pub fn estimate_language_training_footprint(
         }
         DragonCapabilityClass::NativeWgpu
         | DragonCapabilityClass::NativeCuda
+        | DragonCapabilityClass::NativeRocm
         | DragonCapabilityClass::BrowserWgpu => parameter_bytes.saturating_mul(9).saturating_div(2),
     };
 
@@ -251,6 +254,7 @@ pub fn estimate_language_training_footprint(
         DragonCapabilityClass::BrowserWgpu => 1.1e11,
         DragonCapabilityClass::NativeWgpu => 1.5e11,
         DragonCapabilityClass::NativeCuda => 2.0e11,
+        DragonCapabilityClass::NativeRocm => 1.8e11,
     };
     let estimated_tokens_per_second =
         (backend_work_rate / per_token_work as f64).clamp(1.0, 500_000.0);

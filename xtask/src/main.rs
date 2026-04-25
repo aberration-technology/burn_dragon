@@ -22,6 +22,7 @@ enum CommandKind {
     BuildNative,
     BuildNativeWgpu,
     BuildNativeCuda,
+    BuildNativeRocm,
     BuildBrowserCpu,
     BuildBrowser,
     BuildBrowserSite(browser_site::BuildBrowserSiteArgs),
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
         CommandKind::BuildNative => build_native(),
         CommandKind::BuildNativeWgpu => build_native_wgpu(),
         CommandKind::BuildNativeCuda => build_native_cuda(),
+        CommandKind::BuildNativeRocm => build_native_rocm(),
         CommandKind::BuildBrowserCpu => build_browser_cpu(),
         CommandKind::BuildBrowser => build_browser(),
         CommandKind::BuildBrowserSite(args) => browser_site::build_browser_site(&args),
@@ -78,6 +80,7 @@ enum NativeBuildTarget {
     Cpu,
     Wgpu,
     Cuda,
+    Rocm,
 }
 
 impl NativeBuildTarget {
@@ -86,6 +89,7 @@ impl NativeBuildTarget {
             Self::Cpu => "native",
             Self::Wgpu => "native,wgpu",
             Self::Cuda => "native,cuda",
+            Self::Rocm => "native,rocm",
         }
     }
 }
@@ -165,6 +169,10 @@ fn build_native_cuda() -> Result<()> {
     build_native_target(NativeBuildTarget::Cuda)
 }
 
+fn build_native_rocm() -> Result<()> {
+    build_native_target(NativeBuildTarget::Rocm)
+}
+
 fn build_browser_cpu() -> Result<()> {
     build_browser_target(BrowserBuildTarget::Cpu)
 }
@@ -177,6 +185,7 @@ fn build_matrix() -> Result<()> {
     build_native()?;
     build_native_wgpu()?;
     build_native_cuda()?;
+    build_native_rocm()?;
     build_browser_cpu()?;
     build_browser()?;
     browser_site::build_browser_site_default()?;
@@ -295,7 +304,7 @@ fn cargo_native_test(filter: Option<&str>, ignored: bool) -> Result<()> {
 }
 
 fn build_native_target(target: NativeBuildTarget) -> Result<()> {
-    cargo_p2p_check(&["--features", target.features()])?;
+    cargo_p2p_check(&["--no-default-features", "--features", target.features()])?;
     cargo_p2p_native_bin_check(target.features())
 }
 
@@ -316,6 +325,7 @@ fn cargo_p2p_native_bin_check(features: &str) -> Result<()> {
             "check",
             "-p",
             P2P_PACKAGE,
+            "--no-default-features",
             "--features",
             features,
             "--bin",
@@ -341,6 +351,13 @@ fn cargo_p2p_wasm_check(features: &str) -> Result<()> {
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
+    let resolved_program;
+    let program = if program == "cargo" {
+        resolved_program = cargo_bin();
+        resolved_program.as_str()
+    } else {
+        program
+    };
     run_with_env(program, args, &[])
 }
 

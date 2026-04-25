@@ -10,7 +10,7 @@ Current supported experiment families:
 The crate is intentionally split into three layers:
 
 - [config](src/config.rs): stable experiment, auth, and backend configuration
-- [native](src/native.rs): native peer preparation for CPU, WGPU, and CUDA
+- [native](src/native.rs): native peer preparation for CPU, WGPU, CUDA, and ROCm
 - [wasm](src/wasm/mod.rs): browser auth, Dioxus UI, and WebGPU browser training
 
 It is still a library crate first, but both operator surfaces now exist:
@@ -35,6 +35,9 @@ Deployment assets live in [deploy](deploy):
 - native CUDA:
   - feature set: `native,cuda`
   - intended for native GPU trainer peers on CUDA hosts
+- native ROCm:
+  - feature set: `native,rocm`
+  - intended for native GPU trainer peers on ROCm hosts
 - browser WebGPU:
   - feature set: `wasm-ui,wasm-peer,wgpu`
   - intended for real browser trainer and verifier participation
@@ -56,6 +59,8 @@ Browser CPU is not treated as a real deployment mode. The actual browser trainer
   - enables native WGPU and browser WebGPU backends
 - `cuda`
   - enables native CUDA peers
+- `rocm`
+  - enables native ROCm peers
 
 There is intentionally no Cargo feature called `internet-scale`. Authenticated network participation is part of the normal runtime policy of this crate. The default deployed control plane uses GitHub auth, but the peer/browser surface follows the edge's configured browser login provider.
 
@@ -76,7 +81,7 @@ The relevant seams are in:
 
 ## Automatic Trainer Downgrade
 
-Peers do not assume they can train just because the binary was built with `wgpu` or `cuda`.
+Peers do not assume they can train just because the binary was built with `wgpu`, `cuda`, or `rocm`.
 
 Both native and browser paths now run a local preflight assessment before advertising a trainer role:
 
@@ -89,6 +94,7 @@ Current default budgets are conservative:
 - native CPU: `8 GiB`
 - native WGPU: `4 GiB`
 - native CUDA: `6 GiB`
+- native ROCm: `6 GiB`
 - browser WebGPU: `2 GiB`
 
 Fallback policy:
@@ -140,7 +146,9 @@ directly instead of the deterministic fallback.
 
 ## Join Mainnet
 
-The mainnet join flow requires an edge URL from the deployment operator. This README uses `MAINNET_EDGE_URL` as a placeholder for that value.
+The public mainnet defaults are built into the native operator and the Pages
+browser shell. This README uses `MAINNET_EDGE_URL` only for custom deployments
+or local override examples.
 
 The deployed network can publish Dragon experiment profiles directly in the directory. When those profiles are present, peers do not need a matching static experiment config on disk.
 The deployed initial ClimbMix revision should point at a full external shard pool base URL. The
@@ -255,20 +263,49 @@ The native join surface is now a real operator binary:
 - `burn_dragon_p2p_native mark-runtime-failure`
 - `burn_dragon_p2p_native clear-downgrade`
 
-Build the target you want:
+Install the portable native trainer. The published default feature set includes
+`native,wgpu`, so this produces a WebGPU-capable binary without extra flags:
+
+```bash
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native
+```
+
+Then join the public mainnet NCA experiment:
+
+```bash
+burn_dragon_p2p_native login
+burn_dragon_p2p_native train-window-once --require-head-advanced
+burn_dragon_p2p_native run-peer
+```
+
+With no `--config`, the binary uses the public Dragon edge at
+`https://edge.dragon.aberration.technology`, DNS TCP/QUIC seeds for that edge,
+the `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r1` experiment ids, and
+a storage root under `$XDG_DATA_HOME/burn_dragon_p2p/mainnet-native` or
+`~/.local/share/burn_dragon_p2p/mainnet-native`. Override the storage root with
+`BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` when running multiple peers on one host.
+
+Install a narrower target when you need a backend-specific binary:
 
 ```bash
 # CPU
-cargo build -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native
 
 # WGPU
-cargo build -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --features native,wgpu
 
 # CUDA
-cargo build -p burn_dragon_p2p --features native,cuda --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+
+# ROCm
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
-Start from the example config in [deploy/native-peer.toml.example](deploy/native-peer.toml.example).
+`--backend webgpu` is accepted as an alias for `--backend wgpu`. CUDA and ROCm
+installs must be built with the matching feature on hosts that have the matching
+driver and toolkit libraries available to the linker and runtime.
+
+For custom networks, start from the example config in [deploy/native-peer.toml.example](deploy/native-peer.toml.example).
 
 Resolve the config against a specific network before launching:
 
@@ -281,7 +318,8 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --seed-node-url "/dnsaddr/seed-2.example/tcp/4001/p2p/..."
 ```
 
-That resolves the effective edge URL and seed node set without hardcoding defaults into the crate. The same override surface is used by `run-peer`.
+That resolves the effective edge URL and seed node set. The same override
+surface is used by `run-peer`.
 
 If the selected directory entry includes Dragon profile metadata, native peers can leave `training_config_paths` empty and let the network-provided profile materialize the training config locally under the peer storage root.
 
@@ -302,6 +340,7 @@ Useful override flags for both `resolve-config` and `assess-capability`:
 - `--native-cpu-memory-budget-mib`
 - `--native-wgpu-memory-budget-mib`
 - `--native-cuda-memory-budget-mib`
+- `--native-rocm-memory-budget-mib`
 - `--browser-wgpu-memory-budget-mib`
 - `--no-native-validator-fallback`
 - `--no-browser-verifier-fallback`
@@ -360,7 +399,11 @@ cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native
   --status-interval-secs 30
 ```
 
-`run-peer` installs a Ctrl-C handler, requests upstream shutdown, and waits for the runtime to exit cleanly instead of dropping detached background work.
+`run-peer` restores the current experiment head at startup and resyncs it every
+15 seconds by default. That keeps a later native peer aligned with canonical
+work from earlier peers before it starts publishing new windows. It also
+installs a Ctrl-C handler, requests upstream shutdown, and waits for the
+runtime to exit cleanly instead of dropping detached background work.
 
 There is also a deploy example systemd unit in [deploy/burn-dragon-p2p-native.service](deploy/burn-dragon-p2p-native.service).
 
@@ -456,6 +499,7 @@ Build coverage for the peer targets:
 xtask build-native
 xtask build-native-wgpu
 xtask build-native-cuda
+xtask build-native-rocm
 xtask build-browser-cpu
 xtask build-browser
 xtask build-matrix

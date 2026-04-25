@@ -33,8 +33,8 @@ use burn_dragon_p2p::capability_state::{
     persist_native_downgrade,
 };
 use burn_dragon_p2p::config::{
-    DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonNativeAuthBundle,
-    DragonNativePeerConfig, DragonNativeTarget,
+    DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonManifestSeed,
+    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonPeerNetworkConfig,
 };
 use burn_dragon_p2p::deployment::{
     DeploymentDiagnosticsOptions, assert_deployment_ready, collect_deployment_diagnostics,
@@ -46,6 +46,8 @@ use burn_dragon_p2p::native::{
 };
 #[cfg(feature = "cuda")]
 use burn_dragon_p2p::native::{prepare_climbmix_native_cuda, prepare_nca_native_cuda};
+#[cfg(feature = "rocm")]
+use burn_dragon_p2p::native::{prepare_climbmix_native_rocm, prepare_nca_native_rocm};
 #[cfg(feature = "wgpu")]
 use burn_dragon_p2p::native::{prepare_climbmix_native_wgpu, prepare_nca_native_wgpu};
 use burn_dragon_p2p::profile::DragonExperimentProfile;
@@ -58,7 +60,7 @@ use burn_p2p::{
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
@@ -73,6 +75,17 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const NATIVE_BROWSER_APP_BASE_URL_ENV: &str = "BURN_DRAGON_P2P_BROWSER_APP_BASE_URL";
+const NATIVE_STORAGE_ROOT_ENV: &str = "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT";
+const DEFAULT_MAINNET_EDGE_BASE_URL: &str = "https://edge.dragon.aberration.technology";
+const DEFAULT_MAINNET_PROJECT_FAMILY_ID: &str = "burn-dragon-language";
+const DEFAULT_MAINNET_NETWORK_ID: &str = "burn-dragon-mainnet";
+const DEFAULT_MAINNET_STUDY_ID: &str = "burn-dragon-mainnet";
+const DEFAULT_MAINNET_EXPERIMENT_ID: &str = "nca-prepretraining";
+const DEFAULT_MAINNET_REVISION_ID: &str = "nca-r1";
+const DEFAULT_MAINNET_SEED_NODE_URLS: &[&str] = &[
+    "/dns4/edge.dragon.aberration.technology/tcp/4001",
+    "/dns4/edge.dragon.aberration.technology/udp/4001/quic-v1",
+];
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_dragon native peer operator")]
@@ -136,8 +149,10 @@ impl ExperimentKindArg {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum BackendArg {
     Cpu,
+    #[value(alias = "webgpu")]
     Wgpu,
     Cuda,
+    Rocm,
 }
 
 impl BackendArg {
@@ -146,6 +161,16 @@ impl BackendArg {
             Self::Cpu => "cpu",
             Self::Wgpu => "wgpu",
             Self::Cuda => "cuda",
+            Self::Rocm => "rocm",
+        }
+    }
+
+    fn default_enabled_features_label(self) -> &'static str {
+        match self {
+            Self::Cpu => "native",
+            Self::Wgpu => "native,wgpu",
+            Self::Cuda => "native,cuda",
+            Self::Rocm => "native,rocm",
         }
     }
 }
@@ -165,6 +190,8 @@ struct CapabilityPolicyArgs {
     #[arg(long)]
     native_cuda_memory_budget_mib: Option<u64>,
     #[arg(long)]
+    native_rocm_memory_budget_mib: Option<u64>,
+    #[arg(long)]
     browser_wgpu_memory_budget_mib: Option<u64>,
     #[arg(long)]
     no_native_validator_fallback: bool,
@@ -183,6 +210,9 @@ impl CapabilityPolicyArgs {
         if let Some(value) = self.native_cuda_memory_budget_mib {
             policy.native_cuda_memory_budget_bytes = Some(value.saturating_mul(MIB));
         }
+        if let Some(value) = self.native_rocm_memory_budget_mib {
+            policy.native_rocm_memory_budget_bytes = Some(value.saturating_mul(MIB));
+        }
         if let Some(value) = self.browser_wgpu_memory_budget_mib {
             policy.browser_wgpu_memory_budget_bytes = Some(value.saturating_mul(MIB));
         }
@@ -199,7 +229,7 @@ impl CapabilityPolicyArgs {
 #[derive(Debug, Parser)]
 struct ResolveConfigArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long)]
@@ -215,12 +245,12 @@ struct ResolveConfigArgs {
 #[derive(Debug, Parser)]
 struct AssessCapabilityArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long, value_enum, default_value = "toml")]
     output_format: OutputFormat,
@@ -231,12 +261,12 @@ struct AssessCapabilityArgs {
 #[derive(Debug, Parser)]
 struct DeploymentDiagnosticsArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum, default_value = "cpu")]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long)]
     edge_url: Option<String>,
@@ -301,12 +331,12 @@ struct BuildProfileArgs {
 #[derive(Debug, Parser)]
 struct BeginGithubLoginArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long)]
     edge_url: Option<String>,
@@ -355,12 +385,12 @@ struct AdminRolloutProfileArgs {
 #[derive(Debug, Parser)]
 struct LoginArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long)]
     edge_url: Option<String>,
@@ -381,7 +411,7 @@ struct LoginArgs {
 #[derive(Debug, Parser)]
 struct CompleteGithubLoginArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long)]
@@ -399,7 +429,7 @@ struct CompleteGithubLoginArgs {
 #[derive(Debug, Parser)]
 struct EnrollStaticPrincipalArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -431,12 +461,12 @@ struct EnrollStaticPrincipalArgs {
 #[derive(Debug, Parser)]
 struct RunPeerArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long)]
     edge_url: Option<String>,
@@ -450,9 +480,9 @@ struct RunPeerArgs {
     status_interval_secs: u64,
     #[arg(long, default_value_t = false)]
     initialize_head_on_start: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_HEAD_SYNC_INTERVAL_SECS)]
     head_sync_interval_secs: u64,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
@@ -461,12 +491,12 @@ struct RunPeerArgs {
 #[derive(Debug, Parser)]
 struct TrainWindowOnceArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "nca")]
     experiment_kind: ExperimentKindArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "wgpu")]
     backend: BackendArg,
     #[arg(long)]
     edge_url: Option<String>,
@@ -476,9 +506,9 @@ struct TrainWindowOnceArgs {
     auth_bundle: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     auth_bundle_format: ConfigFormat,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     initialize_head_on_start: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
     #[arg(long)]
     output: Option<PathBuf>,
@@ -493,7 +523,7 @@ struct TrainWindowOnceArgs {
 #[derive(Debug, Parser)]
 struct RunHeadMirrorArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -512,9 +542,9 @@ struct RunHeadMirrorArgs {
     status_interval_secs: u64,
     #[arg(long, default_value_t = DEFAULT_HEAD_SYNC_INTERVAL_SECS)]
     head_sync_interval_secs: u64,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     initialize_head_on_start: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
@@ -523,7 +553,7 @@ struct RunHeadMirrorArgs {
 #[derive(Debug, Parser)]
 struct RunValidatorDaemonArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -542,9 +572,9 @@ struct RunValidatorDaemonArgs {
     status_interval_secs: u64,
     #[arg(long, default_value_t = DEFAULT_VALIDATION_INTERVAL_MILLIS)]
     validation_interval_millis: u64,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     initialize_head_on_start: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
@@ -553,7 +583,7 @@ struct RunValidatorDaemonArgs {
 #[derive(Debug, Parser)]
 struct MarkRuntimeFailureArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -571,7 +601,7 @@ struct MarkRuntimeFailureArgs {
 #[derive(Debug, Parser)]
 struct ClearDowngradeArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -582,7 +612,7 @@ struct ClearDowngradeArgs {
 
 #[derive(Debug, Serialize)]
 struct CapabilityAssessmentReport {
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
     experiment_kind: DragonExperimentKind,
     backend: String,
     assessment: burn_dragon_p2p::capability::DragonNativeCapabilityAssessment,
@@ -790,7 +820,7 @@ fn build_profile(args: BuildProfileArgs) -> Result<()> {
 
 fn resolve_config(args: ResolveConfigArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
@@ -801,7 +831,7 @@ fn resolve_config(args: ResolveConfigArgs) -> Result<()> {
 
 fn assess_capability(args: AssessCapabilityArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         None,
         Vec::new(),
@@ -822,7 +852,7 @@ fn assess_capability(args: AssessCapabilityArgs) -> Result<()> {
 
 fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
@@ -1268,7 +1298,7 @@ fn infer_browser_site_base_url(edge_base_url: &str) -> Result<String> {
 
 fn build_native_cli_browser_auth_bootstrap(
     config: &DragonNativePeerConfig,
-    experiment_kind: DragonExperimentKind,
+    _experiment_kind: DragonExperimentKind,
     backend: BackendArg,
     principal_hint: Option<String>,
     session_ttl_secs: i64,
@@ -1278,13 +1308,7 @@ fn build_native_cli_browser_auth_bootstrap(
         .ok_or_else(|| anyhow!("no edge base URL configured"))?
         .to_owned();
     let site_base_url = infer_browser_site_base_url(&edge_base_url)?;
-    let manifests = prepared_manifests(config, experiment_kind, backend)?;
-    let requested_scopes = requested_scopes(
-        manifests
-            .experiment_directory
-            .first()
-            .ok_or_else(|| anyhow!("manifest bundle is missing an experiment directory entry"))?,
-    );
+    let requested_scopes = requested_scopes_for_config(config);
     let (_, identity) = edge_peer_identity_for_storage(config.storage_root.as_path(), None)?;
     Ok(NativeCliBridgeBootstrap {
         edge_base_url: edge_base_url.trim_end_matches('/').to_owned(),
@@ -1299,7 +1323,7 @@ fn build_native_cli_browser_auth_bootstrap(
         enabled_features_label: config
             .enabled_features_label
             .clone()
-            .unwrap_or_else(|| backend.as_label().into()),
+            .unwrap_or_else(|| backend.default_enabled_features_label().into()),
         requested_scopes,
         session_ttl_secs,
         principal_hint,
@@ -1309,7 +1333,7 @@ fn build_native_cli_browser_auth_bootstrap(
 
 fn build_pending_native_login(
     config: &DragonNativePeerConfig,
-    experiment_kind: DragonExperimentKind,
+    _experiment_kind: DragonExperimentKind,
     backend: BackendArg,
     principal_hint: Option<String>,
     session_ttl_secs: i64,
@@ -1325,13 +1349,7 @@ fn build_pending_native_login(
         .context("failed to build async runtime for GitHub login")?;
     let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
     let release_manifest = native_release_manifest_for_snapshot(config, &snapshot, backend, None)?;
-    let manifests = prepared_manifests(config, experiment_kind, backend)?;
-    let requested_scopes = requested_scopes(
-        manifests
-            .experiment_directory
-            .first()
-            .ok_or_else(|| anyhow!("manifest bundle is missing an experiment directory entry"))?,
-    );
+    let requested_scopes = requested_scopes_for_config(config);
     let pending = runtime.block_on(begin_native_github_login(
         &edge_base_url,
         &release_manifest,
@@ -1480,7 +1498,7 @@ fn resolve_or_login_native_auth_bundle(
 
 fn login(args: LoginArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
@@ -1506,7 +1524,7 @@ fn login(args: LoginArgs) -> Result<()> {
 
 fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
@@ -1527,7 +1545,13 @@ fn begin_github_login(args: BeginGithubLoginArgs) -> Result<()> {
 }
 
 fn complete_github_login(args: CompleteGithubLoginArgs) -> Result<()> {
-    let config = load_native_config(&args.config, args.config_format)?;
+    let config = resolved_config(
+        args.config.as_deref(),
+        args.config_format,
+        None,
+        Vec::new(),
+        None,
+    )?;
     let pending: DragonPendingGitHubLogin = load_typed(&args.pending, args.pending_format)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1548,7 +1572,7 @@ fn complete_github_login(args: CompleteGithubLoginArgs) -> Result<()> {
 
 fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
@@ -1594,12 +1618,13 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
 
 fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = resolve_or_login_native_auth_bundle(
         &config,
         args.experiment_kind.into_config(),
@@ -1673,10 +1698,30 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
                 run_options,
             )
         }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
+            run_prepared_train_window_once(
+                prepare_nca_native_rocm(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                run_options,
+            )
+        }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
+            run_prepared_train_window_once(
+                prepare_climbmix_native_rocm(&config, Some(&auth_bundle))?,
+                &config,
+                args.backend,
+                run_options,
+            )
+        }
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
         (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
     }
 }
 
@@ -1685,6 +1730,7 @@ fn native_target_artifact_id(backend: BackendArg) -> &'static str {
         BackendArg::Cpu => "native-cpu",
         BackendArg::Wgpu => "native-wgpu",
         BackendArg::Cuda => "native-cuda",
+        BackendArg::Rocm => "native-rocm",
     }
 }
 
@@ -1765,7 +1811,7 @@ fn native_release_manifest_for_snapshot(
             config
                 .enabled_features_label
                 .clone()
-                .unwrap_or_else(|| backend.as_label().into()),
+                .unwrap_or_else(|| backend.default_enabled_features_label().into()),
         ),
         protocol_major: 0,
         supported_workloads: Vec::new(),
@@ -1775,12 +1821,13 @@ fn native_release_manifest_for_snapshot(
 
 fn run_peer(args: RunPeerArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = Some(resolve_or_login_native_auth_bundle(
         &config,
         args.experiment_kind.into_config(),
@@ -1853,21 +1900,44 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
             args.restore_head_on_start,
             args.head_sync_interval_secs,
         ),
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => run_prepared_peer(
+            prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
+        ),
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => run_prepared_peer(
+            prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+            args.head_sync_interval_secs,
+        ),
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
         (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
     }
 }
 
 fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = Some(resolve_or_login_native_auth_bundle(
         &config,
         args.experiment_kind.into_config(),
@@ -1946,21 +2016,46 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
             args.initialize_head_on_start,
             args.restore_head_on_start,
         ),
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => run_prepared_head_mirror(
+            prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
+            &config,
+            auth_bundle.as_ref(),
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => run_prepared_head_mirror(
+            prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
+            &config,
+            auth_bundle.as_ref(),
+            args.backend,
+            args.status_interval_secs,
+            args.head_sync_interval_secs,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        ),
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
         (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
     }
 }
 
 fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = Some(resolve_or_login_native_auth_bundle(
         &config,
         args.experiment_kind.into_config(),
@@ -2045,16 +2140,42 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
                 args.restore_head_on_start,
             )
         }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
+            run_prepared_validator_daemon(
+                prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
+            run_prepared_validator_daemon(
+                prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
+                &config,
+                args.backend,
+                args.status_interval_secs,
+                args.validation_interval_millis,
+                args.initialize_head_on_start,
+                args.restore_head_on_start,
+            )
+        }
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
         (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
     }
 }
 
 fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
     let config = resolved_config(
-        &args.config,
+        args.config.as_deref(),
         args.config_format,
         None,
         Vec::new(),
@@ -2086,7 +2207,13 @@ fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
 }
 
 fn clear_downgrade(args: ClearDowngradeArgs) -> Result<()> {
-    let config = load_native_config(&args.config, args.config_format)?;
+    let config = resolved_config(
+        args.config.as_deref(),
+        args.config_format,
+        None,
+        Vec::new(),
+        None,
+    )?;
     let assessment = assess_native_peer(
         &config,
         args.experiment_kind.into_config(),
@@ -2104,13 +2231,17 @@ fn clear_downgrade(args: ClearDowngradeArgs) -> Result<()> {
 }
 
 fn resolved_config(
-    path: &Path,
+    path: Option<&Path>,
     format: ConfigFormat,
     edge_url: Option<String>,
     seed_node_urls: Vec<String>,
     capability_policy: Option<CapabilityPolicyArgs>,
 ) -> Result<DragonNativePeerConfig> {
-    let mut config = load_native_config(path, format)?;
+    let mut config = if let Some(path) = path {
+        load_native_config(path, format)?
+    } else {
+        default_mainnet_native_config()
+    };
     config = config.with_network_overrides(
         edge_url,
         (!seed_node_urls.is_empty()).then_some(seed_node_urls),
@@ -2120,6 +2251,61 @@ fn resolved_config(
     }
     let _ = config.effective_bootstrap_peers()?;
     Ok(config)
+}
+
+fn default_mainnet_storage_root() -> PathBuf {
+    if let Some(root) = env::var_os(NATIVE_STORAGE_ROOT_ENV) {
+        return PathBuf::from(root);
+    }
+    if let Some(root) = env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(root)
+            .join("burn_dragon_p2p")
+            .join("mainnet-native");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("burn_dragon_p2p")
+            .join("mainnet-native");
+    }
+    PathBuf::from("runs/p2p/mainnet-native")
+}
+
+fn default_mainnet_native_config() -> DragonNativePeerConfig {
+    DragonNativePeerConfig {
+        training_config_paths: Vec::new(),
+        storage_root: default_mainnet_storage_root(),
+        network: DragonPeerNetworkConfig::default()
+            .with_edge_base_url(Some(DEFAULT_MAINNET_EDGE_BASE_URL.to_owned()))
+            .with_seed_node_urls(Some(
+                DEFAULT_MAINNET_SEED_NODE_URLS
+                    .iter()
+                    .map(|seed| (*seed).to_owned())
+                    .collect(),
+            )),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: DragonManifestSeed {
+            project_family_id: DEFAULT_MAINNET_PROJECT_FAMILY_ID.into(),
+            network_id: DEFAULT_MAINNET_NETWORK_ID.into(),
+            study_id: DEFAULT_MAINNET_STUDY_ID.into(),
+            experiment_id: DEFAULT_MAINNET_EXPERIMENT_ID.into(),
+            revision_id: DEFAULT_MAINNET_REVISION_ID.into(),
+            display_name: "burn_dragon mainnet NCA pre-pre-training".into(),
+            description: "burn_dragon mainnet native trainer".into(),
+            ..DragonManifestSeed::default()
+        },
+        app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("valid burn_dragon version"),
+        git_commit: build_info::embedded_git_commit_owned(),
+        enabled_features_label: None,
+        auth: None,
+        capability_policy: DragonCapabilityPolicy::default(),
+        shard_export: None,
+        existing_shard_dataset: None,
+    }
 }
 
 fn prepared_manifests(
@@ -2160,15 +2346,25 @@ fn prepared_manifests(
         (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
             Ok(prepare_climbmix_native_cuda(config, Some(&placeholder_auth))?.manifests)
         }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
+            Ok(prepare_nca_native_rocm(config, Some(&placeholder_auth))?.manifests)
+        }
+        #[cfg(feature = "rocm")]
+        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
+            Ok(prepare_climbmix_native_rocm(config, Some(&placeholder_auth))?.manifests)
+        }
         #[cfg(not(feature = "wgpu"))]
         (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
         (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
     }
 }
 
-fn requested_scopes(entry: &ExperimentDirectoryEntry) -> BTreeSet<ExperimentScope> {
-    standard_experiment_scopes(&entry.experiment_id)
+fn requested_scopes_for_config(config: &DragonNativePeerConfig) -> BTreeSet<ExperimentScope> {
+    standard_experiment_scopes(&ExperimentId::new(config.manifest.experiment_id.clone()))
 }
 
 fn standard_experiment_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
@@ -2199,6 +2395,30 @@ fn managed_validator_scopes(experiment_id: &ExperimentId) -> BTreeSet<Experiment
             experiment_id: experiment_id.clone(),
         },
     ])
+}
+
+fn ensure_training_backend_runtime_accessible(backend: BackendArg) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match backend {
+            BackendArg::Cuda => {
+                if !Path::new("/dev/nvidiactl").exists() || !Path::new("/dev/nvidia0").exists() {
+                    bail!(
+                        "cuda backend requested but NVIDIA device nodes are not visible; expected /dev/nvidiactl and /dev/nvidia0. Run on a CUDA host/container with NVIDIA driver devices mounted, or use `login --backend cuda` separately to refresh auth without starting training."
+                    );
+                }
+            }
+            BackendArg::Rocm => {
+                if !Path::new("/dev/kfd").exists() || !Path::new("/dev/dri").exists() {
+                    bail!(
+                        "rocm backend requested but ROCm device nodes are not visible; expected /dev/kfd and /dev/dri. Run on a ROCm host/container with AMD GPU devices mounted, or use `login --backend rocm` separately to refresh auth without starting training."
+                    );
+                }
+            }
+            BackendArg::Cpu | BackendArg::Wgpu => {}
+        }
+    }
+    Ok(())
 }
 
 fn run_prepared_peer<B>(
@@ -2395,7 +2615,7 @@ where
         )?
         .ok_or_else(|| {
             anyhow!(
-                "no experiment head is available; rerun with --initialize-head-on-start or seed a head first"
+                "no experiment head is available; rerun with --initialize-head-on-start true or seed a head first"
             )
         })?;
         let mut trainer = running.continuous_trainer(&experiment)?;
@@ -3022,6 +3242,97 @@ mod tests {
     }
 
     #[test]
+    fn default_mainnet_native_config_targets_public_nca_profile() {
+        let config = default_mainnet_native_config();
+        let expected_seeds = DEFAULT_MAINNET_SEED_NODE_URLS
+            .iter()
+            .map(|seed| (*seed).to_owned())
+            .collect::<Vec<_>>();
+
+        assert!(config.training_config_paths.is_empty());
+        assert_eq!(config.target, Some(DragonNativeTarget::Trainer));
+        assert_eq!(
+            config.effective_edge_base_url(),
+            Some(DEFAULT_MAINNET_EDGE_BASE_URL)
+        );
+        assert_eq!(config.effective_seed_node_urls(), expected_seeds);
+        assert_eq!(
+            config.manifest.project_family_id,
+            DEFAULT_MAINNET_PROJECT_FAMILY_ID
+        );
+        assert_eq!(config.manifest.network_id, DEFAULT_MAINNET_NETWORK_ID);
+        assert_eq!(config.manifest.study_id, DEFAULT_MAINNET_STUDY_ID);
+        assert_eq!(config.manifest.experiment_id, DEFAULT_MAINNET_EXPERIMENT_ID);
+        assert_eq!(config.manifest.revision_id, DEFAULT_MAINNET_REVISION_ID);
+    }
+
+    #[test]
+    fn native_join_commands_default_to_mainnet_wgpu_and_head_sync() {
+        let run_peer = Cli::try_parse_from(["burn_dragon_p2p_native", "run-peer"])
+            .expect("parse run-peer defaults");
+        let CommandKind::RunPeer(run_peer) = run_peer.command else {
+            panic!("expected run-peer command");
+        };
+        assert!(run_peer.config.is_none());
+        assert_eq!(run_peer.experiment_kind, ExperimentKindArg::Nca);
+        assert_eq!(run_peer.backend, BackendArg::Wgpu);
+        assert!(run_peer.restore_head_on_start);
+        assert_eq!(
+            run_peer.head_sync_interval_secs,
+            DEFAULT_HEAD_SYNC_INTERVAL_SECS
+        );
+
+        let train_once = Cli::try_parse_from([
+            "burn_dragon_p2p_native",
+            "train-window-once",
+            "--backend",
+            "webgpu",
+        ])
+        .expect("parse train-window-once defaults");
+        let CommandKind::TrainWindowOnce(train_once) = train_once.command else {
+            panic!("expected train-window-once command");
+        };
+        assert!(train_once.config.is_none());
+        assert_eq!(train_once.experiment_kind, ExperimentKindArg::Nca);
+        assert_eq!(train_once.backend, BackendArg::Wgpu);
+        assert!(train_once.initialize_head_on_start);
+        assert!(train_once.restore_head_on_start);
+
+        let no_restore = Cli::try_parse_from([
+            "burn_dragon_p2p_native",
+            "train-window-once",
+            "--initialize-head-on-start",
+            "false",
+            "--restore-head-on-start",
+            "false",
+        ])
+        .expect("parse explicit head flags");
+        let CommandKind::TrainWindowOnce(no_restore) = no_restore.command else {
+            panic!("expected train-window-once command");
+        };
+        assert!(!no_restore.initialize_head_on_start);
+        assert!(!no_restore.restore_head_on_start);
+    }
+
+    #[test]
+    fn native_backend_labels_match_install_features() {
+        assert_eq!(BackendArg::Cpu.default_enabled_features_label(), "native");
+        assert_eq!(
+            BackendArg::Wgpu.default_enabled_features_label(),
+            "native,wgpu"
+        );
+        assert_eq!(
+            BackendArg::Cuda.default_enabled_features_label(),
+            "native,cuda"
+        );
+        assert_eq!(
+            BackendArg::Rocm.default_enabled_features_label(),
+            "native,rocm"
+        );
+        assert_eq!(native_target_artifact_id(BackendArg::Rocm), "native-rocm");
+    }
+
+    #[test]
     fn native_cli_browser_auth_url_targets_pages_callback() {
         let storage = tempdir().expect("storage");
         let (_, identity) = edge_peer_identity_for_storage(storage.path(), None).expect("identity");
@@ -3029,7 +3340,7 @@ mod tests {
             edge_base_url: "https://edge.dragon.example".into(),
             site_base_url: "https://dragon.example".into(),
             target_artifact_id: "native-cpu".into(),
-            app_semver: "0.21.0-pre.22".into(),
+            app_semver: "0.21.0-pre.23".into(),
             git_commit: "test".into(),
             enabled_features_label: "native".into(),
             requested_scopes: BTreeSet::from([ExperimentScope::Connect]),

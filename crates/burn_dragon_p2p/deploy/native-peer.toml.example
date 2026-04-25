@@ -1,36 +1,36 @@
-training_config_paths = ["config/local/generated/p2p/nca.toml"]
-storage_root = "runs/p2p/mainnet-native-wgpu"
+training_config_paths = []
+storage_root = "runs/p2p/mainnet-native"
 target = "trainer"
-app_semver = "0.21.0-pre.22"
+app_semver = "0.21.0-pre.23"
 enabled_features_label = "native,wgpu"
 
 [network]
-# Fill these at deploy time or override them via CLI flags.
-edge_base_url = "https://MAINNET_EDGE_URL"
-seed_node_urls = []
+# These match the public mainnet defaults baked into burn_dragon_p2p_native.
+edge_base_url = "https://edge.dragon.aberration.technology"
+seed_node_urls = [
+  "/dns4/edge.dragon.aberration.technology/tcp/4001",
+  "/dns4/edge.dragon.aberration.technology/udp/4001/quic-v1",
+]
 listen_addresses = [
   "/ip4/0.0.0.0/tcp/4001",
   "/ip4/0.0.0.0/udp/4001/quic-v1",
-  "/ip4/0.0.0.0/udp/443/webrtc-direct",
 ]
-external_addresses = [
-  "/ip4/PUBLIC_IP/tcp/4001",
-  "/ip4/PUBLIC_IP/udp/4001/quic-v1",
-  "/ip4/PUBLIC_IP/udp/443/webrtc-direct",
-]
+external_addresses = []
 
 [manifest]
 project_family_id = "burn-dragon-language"
-network_id = "burn-dragon-net"
-study_id = "burn-dragon-study"
-experiment_id = "language-pretraining"
-revision_id = "r1"
-display_name = "burn_dragon language pretraining"
-description = "burn_dragon peer-to-peer language training network"
+network_id = "burn-dragon-mainnet"
+study_id = "burn-dragon-mainnet"
+experiment_id = "nca-prepretraining"
+revision_id = "nca-r1"
+display_name = "burn_dragon mainnet NCA pre-pre-training"
+description = "burn_dragon mainnet native trainer"
 protocol_major = 0
 authority_public_keys = []
 bootstrap_addrs = []
 
 [capability_policy]
 native_wgpu_memory_budget_bytes = 4294967296
+native_cuda_memory_budget_bytes = 6442450944
+native_rocm_memory_budget_bytes = 6442450944
 allow_native_validator_fallback = false

@@ -19,6 +19,9 @@ pub type NativeWgpuBackend = Autodiff<burn_wgpu::Wgpu<f32>>;
 #[cfg(feature = "cuda")]
 pub type NativeCudaBackend = Autodiff<burn_cuda::Cuda<f32>>;
 
+#[cfg(feature = "rocm")]
+pub type NativeRocmBackend = Autodiff<burn_rocm::Rocm<f32>>;
+
 pub fn assess_native_peer(
     native: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
@@ -80,6 +83,32 @@ pub fn prepare_nca_native_cuda(
     prepare_nca_peer_for_backend::<NativeCudaBackend>(
         native,
         "cuda",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
+#[cfg(feature = "rocm")]
+pub fn prepare_nca_native_rocm(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeRocmBackend>> {
+    prepare_nca_peer_for_backend::<NativeRocmBackend>(
+        native,
+        "rocm",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
+#[cfg(feature = "rocm")]
+pub fn prepare_climbmix_native_rocm(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeRocmBackend>> {
+    prepare_climbmix_peer_for_backend::<NativeRocmBackend>(
+        native,
+        "rocm",
         Default::default(),
         auth_bundle,
     )

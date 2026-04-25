@@ -11,7 +11,9 @@ ExecStart=/usr/local/bin/burn_dragon_p2p_native run-peer \
   --config /etc/burn_dragon_p2p/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \
-  --auth-bundle /var/lib/burn_dragon_p2p/auth-bundle.json
+  --auth-bundle /var/lib/burn_dragon_p2p/auth-bundle.json \
+  --restore-head-on-start true \
+  --head-sync-interval-secs 15
 Restart=always
 RestartSec=5
 KillSignal=SIGINT

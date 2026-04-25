@@ -31,6 +31,8 @@ fn backend_resource_class(backend_label: &str) -> String {
         "cpu".into()
     } else if backend_label.eq_ignore_ascii_case("cuda") {
         "cuda".into()
+    } else if backend_label.eq_ignore_ascii_case("rocm") {
+        "rocm".into()
     } else {
         "wgpu".into()
     }
@@ -173,6 +175,8 @@ pub fn build_manifest_bundle(
     );
     let target_artifact_id = if backend_label.eq_ignore_ascii_case("cuda") {
         "native-cuda"
+    } else if backend_label.eq_ignore_ascii_case("rocm") {
+        "native-rocm"
     } else if backend_label.eq_ignore_ascii_case("wgpu") {
         "native-wgpu"
     } else {

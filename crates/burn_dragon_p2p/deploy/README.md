@@ -319,7 +319,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.22`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.23`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
@@ -567,7 +567,34 @@ The older `begin-github-login` + `complete-github-login` path still exists for m
 
 ## Native Peer Join After Deploy
 
-After the workflow finishes, use the outputs from the workflow summary:
+For the public production network, the simplest native path is the published
+operator binary:
+
+```bash
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native
+burn_dragon_p2p_native login
+burn_dragon_p2p_native train-window-once --require-head-advanced
+burn_dragon_p2p_native run-peer
+```
+
+The crate default feature set includes `native,wgpu`, so the install command
+above produces the portable WebGPU backend. Use a backend-specific install only
+on a host with the matching driver and toolkit libraries:
+
+```bash
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+```
+
+With no `--config`, the binary points at
+`https://edge.dragon.aberration.technology`, uses DNS TCP/QUIC seed multiaddrs,
+joins `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r1`, restores the
+canonical head at startup, and resyncs it every 15 seconds while `run-peer` is
+alive. Set `BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` if you want the auth cache,
+materialized network profile, and checkpoints somewhere other than the default
+XDG data directory.
+
+For non-default deployments, use the outputs from the workflow summary:
 
 - `edge_url`
 - `seed_node_tcp_multiaddr`
@@ -579,7 +606,7 @@ Then run the native operator binary against that network, for example:
 
 ```bash
 cargo run -p burn_dragon_p2p --features native,wgpu --bin burn_dragon_p2p_native -- \
-  begin-github-login \
+  login \
   --config /path/to/native-peer.toml \
   --experiment-kind nca \
   --backend wgpu \

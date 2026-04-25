@@ -12,7 +12,7 @@ repository.workspace = true
 readme = "README.md"
 
 [features]
-default = ["native"]
+default = ["native", "wgpu"]
 native = [
   "dep:burn-autodiff",
   "dep:burn-ndarray",
@@ -34,6 +34,10 @@ cuda = [
   "burn_dragon_language/cuda",
   "dep:burn-cuda",
 ]
+rocm = [
+  "native",
+  "dep:burn-rocm",
+]
 wasm-ui = [
   "dep:burn_p2p_app",
   "dep:burn_p2p_browser",
@@ -52,6 +56,7 @@ burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
 burn-autodiff = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true, features = ["std"] }
 burn-ndarray = { workspace = true, optional = true }
+burn-rocm = { workspace = true, optional = true, features = ["std"] }
 burn-train = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true, features = ["fusion", "std", "webgpu"] }
 burn_dragon_core = { workspace = true, optional = true, default-features = false }

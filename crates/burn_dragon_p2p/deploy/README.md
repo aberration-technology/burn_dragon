@@ -307,7 +307,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY`
   - desired instance count for the optional managed native trainer pool. Defaults to `0`, which disables the pool. Any nonzero production pool on the default `m7i.large` path exceeds the fixed-cost guardrail and is rejected.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND`
-  - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`. Defaults to `cpu` so GPU trainers stay opt-in.
+  - backend used by the managed trainer pool. Supported values: `cpu`, `wgpu`, `cuda`, `rocm`. Defaults to `cpu` so GPU trainers stay opt-in.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_EXPERIMENT_KIND`
   - experiment family assigned to the managed trainer pool. Supported values: `nca`, `climbmix`. Defaults to `nca`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_TARGET`

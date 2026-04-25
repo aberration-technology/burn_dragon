@@ -95,13 +95,14 @@ on:
         default: "0"
         type: string
       managed_trainer_backend:
-        description: "Native backend used by the managed trainer pool. Defaults to `cpu` so GPU trainers stay opt-in. Use `wgpu` or `cuda` only when you intentionally want GPU capacity and a GPU instance type."
+        description: "Native backend used by the managed trainer pool. Defaults to `cpu` so GPU trainers stay opt-in. Use `wgpu`, `cuda`, or `rocm` only when you intentionally want GPU capacity and a GPU instance type."
         required: true
         default: cpu
         type: choice
         options:
           - wgpu
           - cuda
+          - rocm
           - cpu
       managed_trainer_experiment_kind:
         description: "Experiment kind assigned to the managed trainer pool. Example: `nca` for the default warm trainer fleet or `climbmix` when bringing up that experiment."

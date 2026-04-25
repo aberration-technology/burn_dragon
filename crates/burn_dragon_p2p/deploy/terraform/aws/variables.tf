@@ -549,13 +549,13 @@ variable "managed_trainer_root_volume_size_gib" {
 }
 
 variable "managed_trainer_backend" {
-  description = "Native backend used by the managed trainer pool. Supported values: cpu, wgpu, cuda."
+  description = "Native backend used by the managed trainer pool. Supported values: cpu, wgpu, cuda, rocm."
   type        = string
   default     = "cpu"
 
   validation {
-    condition     = contains(["cpu", "wgpu", "cuda"], lower(trimspace(var.managed_trainer_backend)))
-    error_message = "managed_trainer_backend must be one of: cpu, wgpu, cuda."
+    condition     = contains(["cpu", "wgpu", "cuda", "rocm"], lower(trimspace(var.managed_trainer_backend)))
+    error_message = "managed_trainer_backend must be one of: cpu, wgpu, cuda, rocm."
   }
 }
 

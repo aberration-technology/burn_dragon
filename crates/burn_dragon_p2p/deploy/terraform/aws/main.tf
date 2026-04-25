@@ -869,7 +869,7 @@ check "managed_trainer_scaling_configuration" {
 check "managed_trainer_instance_type_configuration" {
   assert {
     condition     = !local.managed_trainer_enabled || local.managed_trainer_backend == "cpu" || startswith(lower(var.managed_trainer_instance_type), "g") || startswith(lower(var.managed_trainer_instance_type), "p")
-    error_message = "Managed trainer backends wgpu and cuda require a GPU-capable instance type, for example g5.xlarge."
+    error_message = "Managed trainer backends wgpu, cuda, and rocm require a GPU-capable instance type, for example g5.xlarge."
   }
 }
 

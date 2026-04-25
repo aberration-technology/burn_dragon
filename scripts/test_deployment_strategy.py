@@ -41,6 +41,7 @@ def main() -> None:
     restore_inputs = workflow_inputs(RESTORE_WORKFLOW)
     assert deploy_inputs["managed_trainer_desired_capacity"]["default"] == "0"
     assert deploy_inputs["managed_trainer_backend"]["default"] == "cpu"
+    assert "rocm" in deploy_inputs["managed_trainer_backend"]["options"]
     assert restore_inputs["plan_only"]["default"] is True
 
     ci_workflow = yaml.safe_load(CI_WORKFLOW.read_text())

@@ -3340,7 +3340,7 @@ mod tests {
             edge_base_url: "https://edge.dragon.example".into(),
             site_base_url: "https://dragon.example".into(),
             target_artifact_id: "native-cpu".into(),
-            app_semver: "0.21.0-pre.23".into(),
+            app_semver: "0.21.0-pre.24".into(),
             git_commit: "test".into(),
             enabled_features_label: "native".into(),
             requested_scopes: BTreeSet::from([ExperimentScope::Connect]),

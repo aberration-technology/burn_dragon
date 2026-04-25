@@ -33,14 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           dry_run='${{ github.event.inputs.dry_run }}'
-          version="$(python3 - <<'PYV'
-          from pathlib import Path
-          import tomllib
-          root = Path('Cargo.toml')
-          data = tomllib.loads(root.read_text())
-          print(data['workspace']['package']['version'])
-          PYV
-          )"
+          version="$(python3 -c 'from pathlib import Path; import tomllib; print(tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
 
           if [ "$dry_run" != "true" ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "CARGO_REGISTRY_TOKEN is required for a real publish" >&2
@@ -63,25 +56,25 @@ jobs:
             local crate="$1"
             local version="$2"
             python3 - "$crate" "$version" <<'PY'
-            import json
-            import sys
-            import time
-            import urllib.request
+          import json
+          import sys
+          import time
+          import urllib.request
 
-            crate = sys.argv[1]
-            version = sys.argv[2]
-            url = f"https://crates.io/api/v1/crates/{crate}"
-            for _ in range(36):
-                try:
-                    with urllib.request.urlopen(url, timeout=20) as response:
-                        payload = json.load(response)
-                    if any(item.get('num') == version for item in payload.get('versions', [])):
-                        sys.exit(0)
-                except Exception:
-                    pass
-                time.sleep(10)
-            sys.exit(1)
-            PY
+          crate = sys.argv[1]
+          version = sys.argv[2]
+          url = f"https://crates.io/api/v1/crates/{crate}"
+          for _ in range(36):
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  if any(item.get("num") == version for item in payload.get("versions", [])):
+                      sys.exit(0)
+              except Exception:
+                  pass
+              time.sleep(10)
+          sys.exit(1)
+          PY
           }
 
           verify_crate() {

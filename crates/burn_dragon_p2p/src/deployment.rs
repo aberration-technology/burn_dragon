@@ -694,25 +694,6 @@ mod tests {
         })
     }
 
-    fn readiness_options(
-        require_head_published: bool,
-        require_head_advanced: bool,
-        require_directory_entry_published: bool,
-        require_metrics_catchup: bool,
-        require_auth_authorize: bool,
-        require_artifact_head_view: bool,
-    ) -> DeploymentDiagnosticsOptions {
-        DeploymentDiagnosticsOptions {
-            require_head_published,
-            require_head_advanced,
-            require_directory_entry_published,
-            require_metrics_catchup,
-            require_auth_authorize,
-            require_artifact_head_view,
-            ..DeploymentDiagnosticsOptions::default()
-        }
-    }
-
     #[test]
     fn deployment_readiness_requires_head_when_requested() {
         let readiness = evaluate_deployment_readiness(
@@ -722,7 +703,10 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, false, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -742,7 +726,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(false, false, false, false, false, false),
+            &DeploymentDiagnosticsOptions::default(),
         );
 
         assert!(readiness.ready);
@@ -766,7 +750,11 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, true, false, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_head_advanced: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -794,7 +782,10 @@ mod tests {
                 redirect_uri_secure: false,
             })),
             None,
-            &readiness_options(false, false, false, false, true, false),
+            &DeploymentDiagnosticsOptions {
+                require_auth_authorize: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -819,7 +810,11 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, true, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -839,7 +834,12 @@ mod tests {
             None,
             None,
             Some(&DeploymentCheck::err(anyhow!("502 bad gateway"))),
-            &readiness_options(true, false, true, false, false, true),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                require_artifact_head_view: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -863,7 +863,11 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, true, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -887,7 +891,11 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, true, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -915,7 +923,10 @@ mod tests {
                 redirect_uri_secure: false,
             })),
             None,
-            &readiness_options(false, false, false, false, true, false),
+            &DeploymentDiagnosticsOptions {
+                require_auth_authorize: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -939,7 +950,11 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(true, false, true, false, false, false),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
         );
 
         assert!(!readiness.ready);
@@ -963,7 +978,7 @@ mod tests {
             None,
             None,
             None,
-            &readiness_options(false, false, false, false, false, false),
+            &DeploymentDiagnosticsOptions::default(),
         );
 
         assert!(readiness.ready);

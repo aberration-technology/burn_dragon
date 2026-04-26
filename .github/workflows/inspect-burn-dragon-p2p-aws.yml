@@ -332,7 +332,7 @@ jobs:
                   "systemctl restart burn-p2p-bootstrap",
                   "systemctl is-active caddy",
                   "systemctl is-active burn-p2p-bootstrap",
-                  "curl -fsS https://127.0.0.1/portal/snapshot >/dev/null"
+                  "curl -fsS http://127.0.0.1:8787/portal/snapshot >/dev/null"
                 ]' \
                 --query 'Command.CommandId' \
                 --output text)"

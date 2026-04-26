@@ -44,6 +44,9 @@ def main() -> None:
     service_unit = (
         TF_ROOT / "templates" / "burn-p2p-bootstrap.service.tftpl"
     ).read_text()
+    secret_sync = (
+        TF_ROOT / "templates" / "bootstrap-secret-sync.sh.tftpl"
+    ).read_text()
 
     # Keep the production deployment on the fixed-cost, browser-first profile.
     for variable_name, expected in [
@@ -155,7 +158,23 @@ def main() -> None:
         'address.replace("PUBLIC_IP", sys.argv[1])',
         "runtime public IPv4 WebRTC-direct rewrite",
     )
+    require_contains(
+        secret_sync,
+        'AWS_CLI_CONNECT_TIMEOUT="$${AWS_CLI_CONNECT_TIMEOUT:-5}"',
+        "bounded bootstrap secret sync connect timeout",
+    )
+    require_contains(
+        secret_sync,
+        'auth_client_id="$${BURN_P2P_AUTH_CLIENT_ID:-}"',
+        "cached bootstrap auth client id reuse",
+    )
+    require_contains(
+        secret_sync,
+        'if [ -s "$AUTHORITY_KEY_PATH" ]; then',
+        "cached bootstrap authority key reuse",
+    )
     require_contains(service_unit, "LimitNOFILE=${limit_nofile}", "bootstrap fd limit")
+    require_contains(service_unit, "TimeoutStartSec=90", "bounded bootstrap startup")
     require_contains(main_tf, "limit_nofile       = 262144", "bootstrap fd limit value")
 
     print("prod-low-resource-p2p-config-ok")

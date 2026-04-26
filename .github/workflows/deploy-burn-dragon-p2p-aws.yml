@@ -820,6 +820,7 @@ jobs:
               "systemctl is-enabled burn-p2p-bootstrap",
               "systemctl is-active caddy",
               "systemctl is-active burn-p2p-bootstrap",
+              "journalctl -u burn-p2p-bootstrap --no-pager -n 200 || true",
               "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 120 || true"
             ]' \
             --query 'Command.CommandId' \

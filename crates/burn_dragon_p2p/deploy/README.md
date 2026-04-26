@@ -572,6 +572,7 @@ operator binary:
 
 ```bash
 cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native
+burn_dragon_p2p_native doctor --assert-ready
 burn_dragon_p2p_native login
 burn_dragon_p2p_native train-window-once --require-head-advanced
 burn_dragon_p2p_native run-peer

@@ -248,6 +248,7 @@ The native join surface is now a real operator binary:
 - `burn_dragon_p2p_native resolve-config`
 - `burn_dragon_p2p_native assess-capability`
 - `burn_dragon_p2p_native deployment-diagnostics`
+- `burn_dragon_p2p_native doctor`
 - `burn_dragon_p2p_native probe-swarm`
 - `burn_dragon_p2p_native build-profile`
 - `burn_dragon_p2p_native admin-export-directory`
@@ -277,6 +278,7 @@ operator.
 Then join the public mainnet NCA experiment:
 
 ```bash
+burn_dragon_p2p_native doctor --assert-ready
 burn_dragon_p2p_native login
 burn_dragon_p2p_native train-window-once --require-head-advanced
 burn_dragon_p2p_native run-peer

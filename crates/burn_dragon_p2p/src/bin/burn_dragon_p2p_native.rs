@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,6 +71,11 @@ const DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STATUS_INTERVAL_SECS: u64 = 30;
 const DEFAULT_VALIDATION_INTERVAL_MILLIS: u64 = 250;
 const DEFAULT_HEAD_SYNC_INTERVAL_SECS: u64 = 15;
+const NATIVE_AUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const NATIVE_AUTH_CALLBACK_MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const NATIVE_AUTH_CALLBACK_MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+const NATIVE_AUTH_CALLBACK_MAX_HEADER_BYTES: usize = 64 * 1024;
+const NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES: usize = 512 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -99,6 +104,7 @@ enum CommandKind {
     ResolveConfig(ResolveConfigArgs),
     AssessCapability(AssessCapabilityArgs),
     DeploymentDiagnostics(DeploymentDiagnosticsArgs),
+    Doctor(DoctorArgs),
     ProbeSwarm(ProbeSwarmArgs),
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
@@ -296,6 +302,30 @@ struct DeploymentDiagnosticsArgs {
     require_artifact_head_view: bool,
     #[arg(long, default_value_t = false)]
     assert_ready: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DoctorArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum, default_value = "nca")]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum, default_value = "wgpu")]
+    backend: BackendArg,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long = "seed-node-url", alias = "seed", value_delimiter = ',')]
+    seed_node_urls: Vec<String>,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    assert_ready: bool,
+    #[command(flatten)]
+    capability_policy: CapabilityPolicyArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -661,6 +691,38 @@ struct TrainWindowOnceReport {
     timing: TrainWindowOnceTimingReport,
 }
 
+#[derive(Debug, Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorEdgeSnapshotReport {
+    network_id: String,
+    protocol_major: u16,
+    minimum_client_version: String,
+    auth_enabled: bool,
+    directory_entries: usize,
+    browser_mode: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    config_path: Option<PathBuf>,
+    experiment_kind: DragonExperimentKind,
+    backend: String,
+    storage_root: PathBuf,
+    edge_base_url: Option<String>,
+    seed_node_count: usize,
+    install_features: String,
+    capability: burn_dragon_p2p::capability::DragonNativeCapabilityAssessment,
+    edge_snapshot: Option<DoctorEdgeSnapshotReport>,
+    checks: Vec<DoctorCheck>,
+    ready: bool,
+}
+
 #[derive(Clone, Copy)]
 struct TrainWindowOnceRunOptions<'a> {
     initialize_head_on_start: bool,
@@ -681,6 +743,7 @@ fn main() -> Result<()> {
         CommandKind::ResolveConfig(args) => resolve_config(args),
         CommandKind::AssessCapability(args) => assess_capability(args),
         CommandKind::DeploymentDiagnostics(args) => deployment_diagnostics(args),
+        CommandKind::Doctor(args) => doctor(args),
         CommandKind::ProbeSwarm(args) => probe_swarm(args),
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
@@ -703,6 +766,7 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::ResolveConfig(_) => "resolve-config",
         CommandKind::AssessCapability(_) => "assess-capability",
         CommandKind::DeploymentDiagnostics(_) => "deployment-diagnostics",
+        CommandKind::Doctor(_) => "doctor",
         CommandKind::ProbeSwarm(_) => "probe-swarm",
         CommandKind::BuildProfile(_) => "build-profile",
         CommandKind::AdminExportDirectory(_) => "admin-export-directory",
@@ -881,6 +945,107 @@ fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
     Ok(())
 }
 
+fn doctor(args: DoctorArgs) -> Result<()> {
+    let config = resolved_config(
+        args.config.as_deref(),
+        args.config_format,
+        args.edge_url,
+        args.seed_node_urls,
+        Some(args.capability_policy),
+    )?;
+    fs::create_dir_all(&config.storage_root).with_context(|| {
+        format!(
+            "failed to create native storage root {}",
+            config.storage_root.display()
+        )
+    })?;
+    let experiment_kind = args.experiment_kind.into_config();
+    let backend = args.backend.as_label().to_owned();
+    let capability = assess_native_peer(&config, experiment_kind, &backend)?;
+    let mut checks = Vec::new();
+    checks.push(DoctorCheck {
+        name: "storage_root".into(),
+        ok: true,
+        message: config.storage_root.display().to_string(),
+    });
+    checks.push(DoctorCheck {
+        name: "capability".into(),
+        ok: capability.target_decision.can_train,
+        message: capability
+            .target_decision
+            .downgrade_reason
+            .clone()
+            .unwrap_or_else(|| "native trainer capability accepted".into()),
+    });
+    let edge_base_url = config.effective_edge_base_url().map(ToOwned::to_owned);
+    let mut edge_snapshot = None;
+    if let Some(edge_url) = edge_base_url.as_deref() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build async runtime for doctor edge snapshot")?;
+        match runtime.block_on(fetch_edge_snapshot(edge_url)) {
+            Ok(snapshot) => {
+                checks.push(DoctorCheck {
+                    name: "edge_snapshot".into(),
+                    ok: true,
+                    message: format!(
+                        "{} entries from {}",
+                        snapshot.directory.entries.len(),
+                        edge_url
+                    ),
+                });
+                edge_snapshot = Some(DoctorEdgeSnapshotReport {
+                    network_id: snapshot.network_id.as_str().to_owned(),
+                    protocol_major: snapshot.protocol_major,
+                    minimum_client_version: snapshot.minimum_client_version.to_string(),
+                    auth_enabled: snapshot.auth_enabled,
+                    directory_entries: snapshot.directory.entries.len(),
+                    browser_mode: format!("{:?}", snapshot.browser_mode),
+                });
+            }
+            Err(error) => checks.push(DoctorCheck {
+                name: "edge_snapshot".into(),
+                ok: false,
+                message: error.to_string(),
+            }),
+        }
+    } else {
+        checks.push(DoctorCheck {
+            name: "edge_snapshot".into(),
+            ok: false,
+            message: "no edge_base_url configured".into(),
+        });
+    }
+    checks.push(DoctorCheck {
+        name: "seed_nodes".into(),
+        ok: !config.effective_seed_node_urls().is_empty(),
+        message: format!(
+            "{} configured seed(s)",
+            config.effective_seed_node_urls().len()
+        ),
+    });
+    let ready = checks.iter().all(|check| check.ok);
+    let report = DoctorReport {
+        config_path: args.config,
+        experiment_kind,
+        backend,
+        storage_root: config.storage_root.clone(),
+        edge_base_url,
+        seed_node_count: config.effective_seed_node_urls().len(),
+        install_features: args.backend.default_enabled_features_label().into(),
+        capability,
+        edge_snapshot,
+        checks,
+        ready,
+    };
+    write_output(args.output.as_deref(), args.output_format, &report)?;
+    if args.assert_ready && !ready {
+        bail!("native peer doctor checks did not pass");
+    }
+    Ok(())
+}
+
 fn admin_export_directory(args: AdminExportDirectoryArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1019,7 +1184,17 @@ fn browser_auth_response_html(title: &str, message: &str) -> String {
 fn write_browser_auth_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        concat!(
+            "HTTP/1.1 {}\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "Cache-Control: no-store\r\n",
+            "Content-Length: {}\r\n",
+            "Connection: close\r\n",
+            "X-Content-Type-Options: nosniff\r\n",
+            "Referrer-Policy: no-referrer\r\n",
+            "\r\n{}"
+        ),
+        status,
         body.len(),
         body,
     )?;
@@ -1031,9 +1206,11 @@ fn parse_native_browser_auth_callback(
     stream: &mut TcpStream,
     expected_nonce: &str,
 ) -> Result<NativeBrowserAuthCallback> {
-    let mut request_line = String::new();
+    stream.set_read_timeout(Some(NATIVE_AUTH_CALLBACK_READ_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    reader.read_line(&mut request_line)?;
+    let request_line =
+        read_bounded_browser_auth_line(&mut reader, NATIVE_AUTH_CALLBACK_MAX_REQUEST_LINE_BYTES)?
+            .ok_or_else(|| anyhow!("browser auth callback closed before request line"))?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
@@ -1060,16 +1237,41 @@ fn parse_native_browser_auth_callback(
     }
 
     let mut content_length = 0usize;
+    let mut header_bytes = 0usize;
     loop {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
+        let Some(header) = read_bounded_browser_auth_line(
+            &mut reader,
+            NATIVE_AUTH_CALLBACK_MAX_HEADER_LINE_BYTES,
+        )?
+        else {
+            break;
+        };
+        header_bytes = header_bytes
+            .checked_add(header.len())
+            .ok_or_else(|| anyhow!("browser auth callback headers exceeded maximum size"))?;
+        if header_bytes > NATIVE_AUTH_CALLBACK_MAX_HEADER_BYTES {
+            bail!(
+                "browser auth callback headers exceeded {} bytes",
+                NATIVE_AUTH_CALLBACK_MAX_HEADER_BYTES
+            );
+        }
         if header == "\r\n" || header.is_empty() {
             break;
         }
         if let Some(value) = header.split_once(':')
             && value.0.eq_ignore_ascii_case("content-length")
         {
-            content_length = value.1.trim().parse::<usize>().unwrap_or_default();
+            content_length = value
+                .1
+                .trim()
+                .parse::<usize>()
+                .context("invalid browser auth callback content-length")?;
+            if content_length > NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES {
+                bail!(
+                    "browser auth callback body exceeded {} bytes",
+                    NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES
+                );
+            }
         }
     }
 
@@ -1153,6 +1355,36 @@ fn parse_native_browser_auth_callback(
         provider_code,
         state,
     })
+}
+
+fn read_bounded_browser_auth_line(
+    reader: &mut BufReader<TcpStream>,
+    max_len: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        match reader.read(&mut byte)? {
+            0 => {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            _ => {
+                bytes.push(byte[0]);
+                if bytes.len() > max_len {
+                    bail!("browser auth callback line exceeded {max_len} bytes");
+                }
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .context("browser auth callback line was not utf-8")
 }
 
 fn random_browser_auth_nonce() -> String {
@@ -3290,6 +3522,15 @@ mod tests {
             run_peer.head_sync_interval_secs,
             DEFAULT_HEAD_SYNC_INTERVAL_SECS
         );
+
+        let doctor = Cli::try_parse_from(["burn_dragon_p2p_native", "doctor"])
+            .expect("parse doctor defaults");
+        let CommandKind::Doctor(doctor) = doctor.command else {
+            panic!("expected doctor command");
+        };
+        assert!(doctor.config.is_none());
+        assert_eq!(doctor.experiment_kind, ExperimentKindArg::Nca);
+        assert_eq!(doctor.backend, BackendArg::Wgpu);
 
         let train_once = Cli::try_parse_from([
             "burn_dragon_p2p_native",

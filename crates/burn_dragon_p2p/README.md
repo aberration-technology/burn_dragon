@@ -268,7 +268,7 @@ Install the portable native trainer. The published default feature set includes
 `native,wgpu`, so this produces a WebGPU-capable binary without extra flags:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.26 --bin burn_dragon_p2p_native
 ```
 
 Keep the explicit `--version` while the production line is pre-release; without
@@ -295,16 +295,16 @@ Install a narrower target when you need a backend-specific binary:
 
 ```bash
 # CPU
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native --no-default-features --features native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.26 --bin burn_dragon_p2p_native --no-default-features --features native
 
 # WGPU
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native --features native,wgpu
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.26 --bin burn_dragon_p2p_native --features native,wgpu
 
 # CUDA
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.26 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
 
 # ROCm
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.25 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.26 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
 `--backend webgpu` is accepted as an alias for `--backend wgpu`. CUDA and ROCm

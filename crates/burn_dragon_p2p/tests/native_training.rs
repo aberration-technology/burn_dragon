@@ -23,6 +23,8 @@ use burn_dragon_p2p::config::{
     DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonPeerNetworkConfig,
     DragonShardExportConfig, TokenWindowRecord,
 };
+#[cfg(feature = "cuda")]
+use burn_dragon_p2p::native::prepare_nca_native_cuda;
 use burn_dragon_p2p::native::{
     ManagedRunningNativePeer, prepare_climbmix_native_cpu, prepare_nca_native_cpu,
     spawn_prepared_native_peer,
@@ -1617,7 +1619,7 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1689,7 +1691,7 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("artifact-smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -1772,6 +1774,92 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
     }
 
     shutdown_runtime_peer(peer, "artifact peer");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA GPU and NVIDIA driver devices"]
+fn nca_native_cuda_runtime_trains_window() {
+    if !Path::new("/dev/nvidiactl").exists() || !Path::new("/dev/nvidia0").exists() {
+        eprintln!(
+            "skipping CUDA runtime smoke because /dev/nvidiactl and /dev/nvidia0 are not visible"
+        );
+        return;
+    }
+
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train-cuda.toml");
+    let shard_root = root.path().join("nca-cuda-shards");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(
+            &root.path().join("nca-cache-cuda"),
+            &nca_config_path,
+            SMALL_SPEC,
+        ),
+    );
+
+    let native = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path],
+        storage_root: root.path().join("storage-cuda-runtime"),
+        network: DragonPeerNetworkConfig::default()
+            .with_listen_addresses(vec![loopback_swarm_address()]),
+        target: Some(DragonNativeTarget::Trainer),
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
+        git_commit: Some("cuda-runtime-smoke".into()),
+        enabled_features_label: Some("native,cuda".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: shard_root,
+            dataset_name: Some("dragon-nca-cuda-runtime".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+
+    let prepared = prepare_nca_native_cuda(&native, Some(&dummy_auth_bundle())).expect("cuda peer");
+    assert_eq!(prepared.backend_label, "cuda");
+    let experiment_entry = prepared.manifests.experiment_directory[0].clone();
+    let mut peer = spawn_prepared_native_peer(prepared).expect("spawn cuda peer");
+    let telemetry = peer.telemetry();
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            let snapshot = telemetry.snapshot();
+            snapshot.local_peer_id.is_some() && !snapshot.listen_addresses.is_empty()
+        },
+        "cuda runtime peer did not start",
+    );
+
+    let experiment = peer.mainnet().experiment(
+        experiment_entry.study_id,
+        experiment_entry.experiment_id,
+        experiment_entry.current_revision_id,
+    );
+    let genesis_head = peer
+        .initialize_local_head(&experiment)
+        .expect("init cuda genesis head");
+    let training = peer
+        .train_window_once_with_pinned_head(&experiment, Some(&genesis_head))
+        .expect("train one cuda window");
+    let loss = metric_float_any(&training.report.stats, &["loss", "train_loss"]);
+    assert!(loss.is_finite(), "cuda train loss must be finite");
+    assert_eq!(
+        training.head.parent_head_id,
+        Some(genesis_head.head_id.clone())
+    );
+    assert_eq!(training.head.global_step, genesis_head.global_step + 1);
+
+    shutdown_runtime_peer(peer, "cuda runtime peer");
 }
 
 #[test]
@@ -1875,7 +1963,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
             identity: Default::default(),
             bootstrap_peers: vec![bootstrap_addr.clone()],
             manifest: native_manifest_seed(),
-            app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+            app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
             git_commit: Some(format!("runtime-cluster-{label}")),
             enabled_features_label: Some("native-cpu".into()),
             auth: None,
@@ -2415,7 +2503,7 @@ fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
         identity: Default::default(),
         bootstrap_peers: vec![bootstrap_addr],
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("bootstrap-only-trainer".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2556,7 +2644,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
             identity: Default::default(),
             bootstrap_peers: vec![bootstrap_addr.clone()],
             manifest: native_manifest_seed(),
-            app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+            app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
             git_commit: Some(label.into()),
             enabled_features_label: Some("native-cpu".into()),
             auth: None,
@@ -2923,7 +3011,7 @@ fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("downgrade".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -2993,7 +3081,7 @@ fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("downgrade-persisted".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3062,7 +3150,7 @@ fn climbmix_native_existing_shards_supports_multi_peer_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3124,7 +3212,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("smoke".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3316,7 +3404,7 @@ fn climbmix_http_shards_publish_http_input_source_descriptor() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("http".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3394,7 +3482,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3504,7 +3592,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("mixed".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3626,7 +3714,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3737,7 +3825,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("mixed-medium".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3868,7 +3956,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3915,7 +4003,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("scale".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -3973,7 +4061,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -4020,7 +4108,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("large".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -4082,7 +4170,7 @@ fn native_auth_refresh_reenrolls_and_updates_cached_bundle() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("auth-refresh".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -4203,7 +4291,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,
@@ -4243,7 +4331,7 @@ fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
         identity: Default::default(),
         bootstrap_peers: Vec::new(),
         manifest: native_manifest_seed(),
-        app_semver: semver::Version::parse("0.21.0-pre.24").expect("valid burn_dragon version"),
+        app_semver: semver::Version::parse("0.21.0-pre.25").expect("valid burn_dragon version"),
         git_commit: Some("edge-drill".into()),
         enabled_features_label: Some("native-cpu".into()),
         auth: None,

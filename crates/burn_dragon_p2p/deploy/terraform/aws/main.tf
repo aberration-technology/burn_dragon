@@ -679,6 +679,7 @@ locals {
       persist_provider_tokens     = false
       issuer_key_id               = "burn-dragon-mainnet"
       project_family_id           = var.project_family_id
+      minimum_client_version      = var.dragon_crate_version
       required_release_train_hash = var.release_train_hash
       allowed_target_artifact_hashes = [
         var.native_target_artifact_hash,

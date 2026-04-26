@@ -77,14 +77,16 @@ pub fn native_edge_enrollment_config(
             release_manifest.target_artifact_hash.as_str()
         );
     }
+    release_manifest
+        .validate_for_edge_snapshot(snapshot)
+        .map_err(|error| anyhow!("release manifest is incompatible with edge snapshot: {error}"))?;
 
     Ok(EdgeEnrollmentConfig {
         network_id: snapshot.network_id.clone(),
         project_family_id: trust_bundle.project_family_id.clone(),
-        release_train_hash: snapshot
-            .required_release_train_hash
-            .clone()
-            .unwrap_or_else(|| trust_bundle.required_release_train_hash.clone()),
+        protocol_major: release_manifest.protocol_major,
+        app_semver: release_manifest.app_semver.clone(),
+        release_train_hash: release_manifest.release_train_hash.clone(),
         target_artifact_id: release_manifest.target_artifact_id.clone(),
         target_artifact_hash: release_manifest.target_artifact_hash.clone(),
         login_path: provider.login_path.clone(),
@@ -311,7 +313,7 @@ fn native_release_manifest_for_bridge(
         .required_release_train_hash
         .clone()
         .unwrap_or_else(|| trust_bundle.required_release_train_hash.clone());
-    Ok(ClientReleaseManifest {
+    let release_manifest = ClientReleaseManifest {
         project_family_id: trust_bundle.project_family_id.clone(),
         release_train_hash,
         target_artifact_id: bootstrap.target_artifact_id.clone(),
@@ -323,10 +325,16 @@ fn native_release_manifest_for_bridge(
         cargo_lock_hash: ContentId::new("dragon-native-auth-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new(bootstrap.enabled_features_label.clone()),
-        protocol_major: 0,
+        protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),
         built_at: Utc::now(),
-    })
+    };
+    release_manifest
+        .validate_for_edge_snapshot(snapshot)
+        .map_err(|error| {
+            anyhow!("native bridge release manifest is incompatible with edge snapshot: {error}")
+        })?;
+    Ok(release_manifest)
 }
 
 #[cfg(feature = "native")]
@@ -1625,6 +1633,8 @@ mod tests {
         let now = Utc::now();
         BrowserEdgeSnapshot {
             network_id: burn_p2p::NetworkId::new("burn-dragon-mainnet"),
+            protocol_major: 0,
+            minimum_client_version: semver::Version::new(0, 0, 0),
             edge_mode: BrowserEdgeMode::Peer,
             browser_mode: burn_p2p::BrowserMode::Trainer,
             social_mode: burn_p2p::SocialMode::Public,

@@ -210,6 +210,7 @@ pub fn build_manifest_bundle(
         network_id: NetworkId::new(&seed.network_id),
         project_family_id: release_manifest.project_family_id.clone(),
         protocol_major: seed.protocol_major,
+        minimum_client_version: release_manifest.app_semver.clone(),
         required_release_train_hash: release_train_hash,
         allowed_target_artifact_hashes: BTreeSet::from([target_artifact_hash]),
         authority_public_keys: seed.authority_public_keys.clone(),

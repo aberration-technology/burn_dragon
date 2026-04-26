@@ -1793,7 +1793,7 @@ fn native_release_manifest_for_snapshot(
         .required_release_train_hash
         .clone()
         .unwrap_or_else(|| trust_bundle.required_release_train_hash.clone());
-    Ok(ClientReleaseManifest {
+    let release_manifest = ClientReleaseManifest {
         project_family_id: trust_bundle.project_family_id.clone(),
         release_train_hash,
         target_artifact_id: native_target_artifact_id(backend).into(),
@@ -1813,10 +1813,16 @@ fn native_release_manifest_for_snapshot(
                 .clone()
                 .unwrap_or_else(|| backend.default_enabled_features_label().into()),
         ),
-        protocol_major: 0,
+        protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),
         built_at: chrono::Utc::now(),
-    })
+    };
+    release_manifest
+        .validate_for_edge_snapshot(snapshot)
+        .map_err(|error| {
+            anyhow!("native release manifest is incompatible with edge snapshot: {error}")
+        })?;
+    Ok(release_manifest)
 }
 
 fn run_peer(args: RunPeerArgs) -> Result<()> {
@@ -3138,6 +3144,9 @@ mod tests {
         EdgeEnrollmentConfig {
             network_id: NetworkId::new("dragon-native-auth-testnet"),
             project_family_id: ProjectFamilyId::new("burn-dragon-language"),
+            protocol_major: 0,
+            app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
             release_train_hash: ContentId::new("dragon-native-auth-release"),
             target_artifact_id: "native-cpu".into(),
             target_artifact_hash: ContentId::new("burn-dragon-native"),

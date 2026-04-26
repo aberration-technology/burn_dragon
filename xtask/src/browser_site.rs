@@ -1636,7 +1636,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new("dragon-browser-site-features"),
-        protocol_major: 0,
+        protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),
         built_at: snapshot.captured_at,
     }

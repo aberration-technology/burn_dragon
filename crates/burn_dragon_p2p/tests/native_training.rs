@@ -814,6 +814,8 @@ fn edge_snapshot_for_manifests(
 
     BrowserEdgeSnapshot {
         network_id: manifests.network_manifest.network_id.clone(),
+        protocol_major: manifests.network_manifest.protocol_major,
+        minimum_client_version: semver::Version::new(0, 0, 0),
         edge_mode: BrowserEdgeMode::Peer,
         browser_mode,
         social_mode: burn_p2p::SocialMode::Disabled,
@@ -853,6 +855,8 @@ fn edge_snapshot_for_manifests(
             project_family_id: ProjectFamilyId::new(
                 manifests.release_manifest.project_family_id.as_str(),
             ),
+            protocol_major: manifests.network_manifest.protocol_major,
+            minimum_client_version: semver::Version::new(0, 0, 0),
             required_release_train_hash: manifests.release_manifest.release_train_hash.clone(),
             allowed_target_artifact_hashes: BTreeSet::from([manifests
                 .release_manifest
@@ -1324,7 +1328,7 @@ fn run_edge_drill_for_prepared<B>(
 
         let browser_client = BrowserEdgeClient::new(
             BrowserUiBindings::from_edge_snapshot(&edge.base_url, &browser_snapshot),
-            BrowserEnrollmentConfig::from_edge_snapshot(
+            BrowserEnrollmentConfig::from_edge_snapshot_with_app_version(
                 &browser_snapshot,
                 "browser-wasm",
                 prepared
@@ -1332,6 +1336,7 @@ fn run_edge_drill_for_prepared<B>(
                     .release_manifest
                     .target_artifact_hash
                     .clone(),
+                prepared.manifests.release_manifest.app_semver.clone(),
                 trainer_requested_scopes,
                 1800,
             )
@@ -1375,7 +1380,7 @@ fn run_edge_drill_for_prepared<B>(
 
         let verifier_client = BrowserEdgeClient::new(
             BrowserUiBindings::from_edge_snapshot(&edge.base_url, &browser_snapshot),
-            BrowserEnrollmentConfig::from_edge_snapshot(
+            BrowserEnrollmentConfig::from_edge_snapshot_with_app_version(
                 &browser_snapshot,
                 "browser-wasm-verifier",
                 prepared
@@ -1383,6 +1388,7 @@ fn run_edge_drill_for_prepared<B>(
                     .release_manifest
                     .target_artifact_hash
                     .clone(),
+                prepared.manifests.release_manifest.app_semver.clone(),
                 local_verifier_requested_scopes,
                 1800,
             )

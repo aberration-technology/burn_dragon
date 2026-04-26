@@ -523,11 +523,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
         burn_version_string: "0.21.0-pre.3".into(),
         enabled_features_hash: ContentId::new("dragon-browser-site-features"),
-        // BrowserEdgeSnapshot does not currently expose protocol_major. Dragon's
-        // network/deploy surface still defaults to protocol 0, so keep the
-        // synthesized browser-site release manifest aligned with that until the
-        // edge snapshot exposes the network manifest protocol directly.
-        protocol_major: 0,
+        protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),
         built_at: chrono::Utc::now(),
     }
@@ -4280,6 +4276,8 @@ mod tests {
     fn sample_edge_snapshot() -> BrowserEdgeSnapshot {
         BrowserEdgeSnapshot {
             network_id: NetworkId::new("burn-dragon-mainnet"),
+            protocol_major: 0,
+            minimum_client_version: semver::Version::new(0, 0, 0),
             edge_mode: BrowserEdgeMode::Peer,
             browser_mode: BrowserMode::Trainer,
             social_mode: SocialMode::Public,

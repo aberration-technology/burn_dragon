@@ -60,10 +60,9 @@ pub fn browser_enrollment_config_from_snapshot(
     requested_scopes: BTreeSet<ExperimentScope>,
     session_ttl_secs: i64,
 ) -> Result<BrowserEnrollmentConfig> {
-    BrowserEnrollmentConfig::from_edge_snapshot(
+    BrowserEnrollmentConfig::from_edge_snapshot_for_release(
         snapshot,
-        release_manifest.target_artifact_id.clone(),
-        release_manifest.target_artifact_hash.clone(),
+        release_manifest,
         requested_scopes,
         session_ttl_secs,
     )

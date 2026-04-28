@@ -122,8 +122,10 @@ jobs:
         timeout-minutes: 25
       - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"
         timeout-minutes: 15
+      - run: cargo clean --manifest-path Cargo.toml
       - run: cargo run --manifest-path Cargo.toml -p xtask -- native-smoke
         timeout-minutes: 45
+      - run: cargo clean --manifest-path Cargo.toml
       - run: cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke
         timeout-minutes: 45
 

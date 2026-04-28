@@ -79,6 +79,6 @@ managed_trainer_experiment_kind = "nca"
 # managed_trainer_instance_type = "m7i.large"
 # managed_trainer_min_size = 1
 # managed_trainer_max_size = 2
-# managed_trainer_crate_version = "0.21.0-pre.28"
+# managed_trainer_crate_version = "0.21.0-pre.29"
 # managed_trainer_auth_bundle_parameter_name = "/burn-dragon-p2p/mainnet/bootstrap/trainer_auth_bundle_json"
 # alarm_sns_topic_arn   = "arn:aws:sns:us-east-2:123456789012:burn-dragon-p2p-alerts"

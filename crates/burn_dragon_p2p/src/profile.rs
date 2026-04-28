@@ -48,6 +48,10 @@ const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
+const DEFAULT_NCA_BROWSER_WGPU_BATCH_SIZE: usize = 1;
+#[cfg(feature = "native")]
+const DEFAULT_NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES: usize = 1;
+#[cfg(feature = "native")]
 const DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 #[cfg(feature = "native")]
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
@@ -294,8 +298,16 @@ fn browser_profile_from_native_config(
                 block_size: config.training.block_size,
                 learning_rate: config.optimizer.learning_rate,
                 weight_decay: config.optimizer.weight_decay,
-                batch_size: config.training.batch_size,
-                max_train_batches: Some(config.training.max_iters.clamp(1, 4)),
+                batch_size: config
+                    .training
+                    .batch_size
+                    .clamp(1, DEFAULT_NCA_BROWSER_WGPU_BATCH_SIZE),
+                max_train_batches: Some(
+                    config
+                        .training
+                        .max_iters
+                        .clamp(1, DEFAULT_NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES),
+                ),
                 max_eval_batches: Some(1),
                 capability_policy,
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {

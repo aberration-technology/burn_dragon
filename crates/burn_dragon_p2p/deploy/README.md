@@ -319,7 +319,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.28`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.29`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
@@ -492,7 +492,7 @@ The initial directory entries are seeded from:
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
-The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile keeps bounded work caps (`4` train batches, `1` eval batch, bounded generated documents) and advertises a `6 GiB` browser WebGPU training budget. Capable high-memory WebGPU browsers can train; lower-memory browsers still downgrade before allocating the training buffers.
+The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile keeps a single-batch WebGPU training window (`batch_size = 1`, `1` train batch, `1` eval batch, bounded generated documents) and advertises a `6 GiB` browser WebGPU training budget. Capable high-memory WebGPU browsers can train without taking the native trainer memory path; lower-memory browsers still downgrade before allocating the training buffers.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 
@@ -571,7 +571,7 @@ For the public production network, the simplest native path is the published
 operator binary:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.28 --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.29 --bin burn_dragon_p2p_native
 burn_dragon_p2p_native doctor --assert-ready
 burn_dragon_p2p_native login
 burn_dragon_p2p_native train-window-once --require-head-advanced
@@ -587,8 +587,8 @@ above produces the portable WebGPU backend. Use a backend-specific install only
 on a host with the matching driver and toolkit libraries:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.28 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.28 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.29 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.29 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
 With no `--config`, the binary points at
@@ -626,7 +626,7 @@ Native peers can leave `training_config_paths` empty and rely on the published D
 
 Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
-Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. For the production `nca-r1` profile, the live browser canary verifies the browser shell, auth, seed derivation, and direct WebRTC connectivity; training capacity is expected from operator-run native GPU peers.
+Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. For the production `nca-r1` profile, the live browser canary verifies the browser shell, auth, seed derivation, direct WebRTC connectivity, WebGPU training start, and receipt submission. Sustained training capacity is still expected from operator-run native GPU peers.
 
 ## Terraform Root
 

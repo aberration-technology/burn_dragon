@@ -1,7 +1,7 @@
 training_config_paths = []
 storage_root = "runs/p2p/mainnet-native"
 target = "trainer"
-app_semver = "0.21.0-pre.28"
+app_semver = "0.21.0-pre.29"
 enabled_features_label = "native,wgpu"
 
 [network]

@@ -473,6 +473,61 @@ mod tests {
     }
 
     #[test]
+    fn manifest_publishes_browser_trainer_when_profile_budget_fits() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let mut capability_policy = crate::config::DragonCapabilityPolicy::default();
+        capability_policy.browser_wgpu_memory_budget_bytes = Some(16_384);
+        let bundle = build_manifest_bundle(
+            &seed(),
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            &DragonExperimentProfile {
+                version: 1,
+                experiment_kind: DragonExperimentKind::NcaPrepretraining,
+                native: crate::profile::DragonNativeExperimentProfile {
+                    training_toml: String::new(),
+                    nca_corpus_toml: None,
+                },
+                browser: Some(crate::profile::DragonBrowserExperimentProfile {
+                    model_config: model_config.clone(),
+                    execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
+                    block_size: 8,
+                    learning_rate: 1.0e-3,
+                    weight_decay: 0.0,
+                    batch_size: 1,
+                    max_train_batches: Some(1),
+                    max_eval_batches: Some(1),
+                    capability_policy,
+                    train_source: crate::profile::DragonBrowserProfileTokenSource::Inline {
+                        records: Vec::new(),
+                    },
+                    eval_source: None,
+                }),
+            },
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
+            "test",
+            "native,cpu",
+        )
+        .expect("manifest bundle");
+
+        let entry = &bundle.experiment_directory[0];
+        assert!(entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
+        assert!(entry.browser_role_policy().trainer_wgpu);
+    }
+
+    #[test]
     fn manifests_default_to_trainer_only_diffusion_topology() {
         let model_config = DragonConfig::default();
         let footprint = DragonTrainingFootprint {

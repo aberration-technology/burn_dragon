@@ -617,6 +617,22 @@ function browserConfigTrainingConfig(browserConfig) {
   return null;
 }
 
+function snapshotAllowsBrowserTraining(snapshot, experimentId) {
+  if (!snapshot || !experimentId) {
+    return false;
+  }
+  const entries = snapshot.directory?.entries ?? [];
+  const entry = entries.find((candidate) => candidate?.experiment_id === experimentId);
+  if (!entry) {
+    return false;
+  }
+  const roles = entry.allowed_roles?.roles ?? [];
+  if (roles.includes("BrowserTrainerWgpu")) {
+    return true;
+  }
+  return entry.metadata?.["burn_p2p.revision.browser.role.trainer_wgpu"] === "true";
+}
+
 function seedTransportMode(seed) {
   if (isDialableWebRtcSeed(seed)) {
     return "webrtc-direct";
@@ -962,9 +978,14 @@ async function runCanary() {
       `browser config seeds drifted from signed browser seeds: config=${JSON.stringify(browserConfigSeeds)} signed=${JSON.stringify(signedSeeds)} canonical_config=${JSON.stringify(canonicalBrowserConfigSeeds)} canonical_signed=${JSON.stringify(canonicalSignedSeeds)}`,
     );
   }
-  if (EXPECT_TRAINING && EXPERIMENT_ID && !browserTrainingConfig) {
+  if (
+    EXPECT_TRAINING &&
+    EXPERIMENT_ID &&
+    !browserTrainingConfig &&
+    !snapshotAllowsBrowserTraining(snapshot, EXPERIMENT_ID)
+  ) {
     fail(
-      `browser config is missing training payload for selected experiment ${EXPERIMENT_ID}`,
+      `browser config and live snapshot are missing browser training for selected experiment ${EXPERIMENT_ID}`,
     );
   }
   if (EXPECT_TRAINING && acceptedReceiptsBeforeTraining == null) {

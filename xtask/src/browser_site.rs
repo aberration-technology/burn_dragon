@@ -1289,15 +1289,15 @@ fn browser_site_bootstrap_json(
         .map(ToOwned::to_owned);
     let edge_snapshot =
         fetch_optional_browser_edge_snapshot(edge_url.as_deref(), seed_node_urls.as_slice())?;
-    let mut signed_seed_advertisement =
+    let validated_signed_seed_advertisement =
         if let (Some(edge_url), Some(snapshot)) = (edge_url.as_deref(), edge_snapshot.as_ref()) {
             fetch_signed_seed_advertisement(edge_url, snapshot)?
         } else {
             None
         };
-    if let Some(advertisement) = signed_seed_advertisement.as_mut() {
-        prefer_validated_browser_seed_advertisement(advertisement);
-        canonicalize_browser_seed_advertisement(edge_url.as_deref(), advertisement);
+    if let Some(mut advertisement) = validated_signed_seed_advertisement {
+        prefer_validated_browser_seed_advertisement(&mut advertisement);
+        canonicalize_browser_seed_advertisement(edge_url.as_deref(), &mut advertisement);
     }
     let training = resolve_browser_training_config(
         edge_snapshot.as_ref(),
@@ -1321,7 +1321,7 @@ fn browser_site_bootstrap_json(
             .as_ref()
             .map(browser_release_manifest_from_snapshot),
         edge_snapshot,
-        signed_seed_advertisement,
+        signed_seed_advertisement: None,
     })
 }
 

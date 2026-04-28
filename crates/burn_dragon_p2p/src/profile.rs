@@ -48,6 +48,8 @@ const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
+const DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+#[cfg(feature = "native")]
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
 #[cfg(feature = "native")]
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
@@ -280,6 +282,9 @@ fn browser_profile_from_native_config(
                     nca_config_path.display()
                 )
             })?;
+            let mut capability_policy = DragonCapabilityPolicy::default();
+            capability_policy.browser_wgpu_memory_budget_bytes =
+                Some(DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES);
             Ok(Some(DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
                 execution_backend: DragonBrowserExecutionBackend::Auto,
@@ -289,7 +294,7 @@ fn browser_profile_from_native_config(
                 batch_size: config.training.batch_size,
                 max_train_batches: Some(config.training.max_iters.clamp(1, 4)),
                 max_eval_batches: Some(1),
-                capability_policy: DragonCapabilityPolicy::default(),
+                capability_policy,
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,

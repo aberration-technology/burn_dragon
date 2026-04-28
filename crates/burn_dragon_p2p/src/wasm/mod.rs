@@ -566,11 +566,50 @@ async fn resolve_browser_training_config(
         return Ok(training);
     }
 
-    let snapshot = if let Some(snapshot) = edge_snapshot {
-        snapshot.clone()
-    } else {
-        let edge_base_url = resolved_edge_base_url(config)?;
-        fetch_edge_snapshot(&edge_base_url).await?
+    let mut training = resolve_browser_training_config_from_directory(config, edge_snapshot)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("selected experiment does not publish a browser training profile")
+        })?;
+    training.training_lease = active_training_lease(
+        bootstrap_config,
+        config,
+        edge_snapshot,
+        signed_seed_advertisement,
+    )
+    .await?;
+    Ok(training)
+}
+
+#[cfg(feature = "wasm-peer")]
+async fn resolve_browser_training_config_from_directory(
+    config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+) -> Result<Option<crate::config::DragonBrowserTrainingConfig>> {
+    let snapshot = match resolved_edge_base_url(config) {
+        Ok(edge_base_url) => match fetch_edge_snapshot(&edge_base_url).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if let Some(snapshot) = edge_snapshot {
+                    warn!(
+                        "failed to refresh browser training profile from live edge; using embedded snapshot: {error}"
+                    );
+                    snapshot.clone()
+                } else {
+                    return Err(error);
+                }
+            }
+        },
+        Err(error) => {
+            if let Some(snapshot) = edge_snapshot {
+                warn!(
+                    "failed to resolve edge URL for live browser training profile; using embedded snapshot: {error}"
+                );
+                snapshot.clone()
+            } else {
+                return Err(error);
+            }
+        }
     };
     let entry = find_matching_entry(
         &snapshot.directory.entries,
@@ -581,17 +620,23 @@ async fn resolve_browser_training_config(
     .ok_or_else(|| anyhow!("no Dragon experiment entry was found on the current edge"))?;
     let profile = DragonExperimentProfile::from_entry_metadata(entry)?
         .ok_or_else(|| anyhow!("selected experiment does not publish a Dragon training profile"))?;
-    let mut training = browser_training_config_from_profile(entry, &profile)?.ok_or_else(|| {
-        anyhow!("selected experiment does not publish a browser training profile")
-    })?;
-    training.training_lease = active_training_lease(
-        bootstrap_config,
-        config,
-        edge_snapshot,
-        signed_seed_advertisement,
-    )
-    .await?;
-    Ok(training)
+    browser_training_config_from_profile(entry, &profile)
+}
+
+#[cfg(feature = "wasm-peer")]
+async fn resolve_browser_app_runtime_config(
+    config: &DragonBrowserAppConfig,
+    edge_snapshot: Option<&BrowserEdgeSnapshot>,
+) -> Result<DragonBrowserAppConfig> {
+    let mut effective_config = config_with_window_network_overrides(config)?;
+    if effective_config.training.is_none() {
+        match resolve_browser_training_config_from_directory(&effective_config, edge_snapshot).await
+        {
+            Ok(training) => effective_config.training = training,
+            Err(error) => warn!("browser training profile resolution failed: {error}"),
+        }
+    }
+    Ok(effective_config)
 }
 
 #[cfg(feature = "wasm-peer")]
@@ -2276,7 +2321,7 @@ pub async fn connect_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
-    let effective_config = config_with_window_network_overrides(config)?;
+    let effective_config = resolve_browser_app_runtime_config(config, edge_snapshot).await?;
     let edge_base_url = resolved_edge_base_url(&effective_config)?;
     let (browser_host_capabilities, browser_capability_decision) =
         browser_capability_decision_for_config(&effective_config);
@@ -2320,6 +2365,7 @@ pub async fn refresh_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
+    let effective_config = resolve_browser_app_runtime_config(config, edge_snapshot).await?;
     let mut controller = if let Some(controller) =
         DRAGON_BROWSER_APP_CONTROLLER.with(|slot| slot.borrow_mut().take())
     {
@@ -2327,7 +2373,7 @@ pub async fn refresh_browser_app(
     } else {
         DragonBrowserAppHandle::connect(connect_config(
             bootstrap_config,
-            config,
+            &effective_config,
             edge_snapshot,
             signed_seed_advertisement,
         )?)
@@ -2518,6 +2564,7 @@ pub struct DragonBrowserAppProps {
 pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let initial_config = config_with_window_network_overrides(&props.config)
         .unwrap_or_else(|_| props.config.clone());
+    let runtime_config = use_signal(|| initial_config.clone());
     let mut edge_url = use_signal(|| {
         initial_config
             .effective_edge_base_url()
@@ -2570,6 +2617,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut session_state = session_state;
         let mut current_view = current_view;
         let mut status = status;
+        let mut runtime_config = runtime_config;
         let mut auth_bootstrap_started = auth_bootstrap_started;
         let mut auth_bootstrap_pending = auth_bootstrap_pending;
         use_effect(move || {
@@ -2592,9 +2640,24 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
+                        let connect_config = match resolve_browser_app_runtime_config(
+                            &config,
+                            edge_snapshot.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(config) => {
+                                runtime_config.set(config.clone());
+                                config
+                            }
+                            Err(error) => {
+                                warn!("browser runtime config resolution failed: {error}");
+                                config.clone()
+                            }
+                        };
                         if let Ok(view) = connect_browser_app(
                             &bootstrap_config,
-                            &config,
+                            &connect_config,
                             edge_snapshot.as_ref(),
                             signed_seed_advertisement.as_ref(),
                         )
@@ -2603,7 +2666,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             current_view.set(Some(view));
                             spawn_browser_app_refresh_loop(
                                 bootstrap_config.clone(),
-                                config.clone(),
+                                connect_config.clone(),
                                 edge_snapshot.clone(),
                                 signed_seed_advertisement.clone(),
                                 current_view,
@@ -2641,11 +2704,25 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut current_view = current_view;
             let mut session_state = session_state;
+            let mut runtime_config = runtime_config;
             let checkpoint_wait_generation = checkpoint_wait_generation;
             let edge_snapshot = props.edge_snapshot.clone();
             let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             spawn(async move {
                 status.set("Connecting…".into());
+                let next_config =
+                    match resolve_browser_app_runtime_config(&next_config, edge_snapshot.as_ref())
+                        .await
+                    {
+                        Ok(config) => {
+                            runtime_config.set(config.clone());
+                            config
+                        }
+                        Err(error) => {
+                            warn!("browser runtime config resolution failed: {error}");
+                            next_config
+                        }
+                    };
                 match connect_browser_app(
                     &bootstrap_config,
                     &next_config,
@@ -3046,9 +3123,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let admin_rollout_status_view = admin_rollout_result.read().clone();
     let show_connection_settings_active = *show_connection_settings.read();
     let show_admin_tools_active = *show_admin_tools.read();
+    let display_config = runtime_config.read().clone();
     let (browser_host_capabilities, browser_capability_decision) =
-        browser_capability_decision_for_config(&initial_config);
-    let browser_can_attempt_dynamic_training = props.config.training.is_some()
+        browser_capability_decision_for_config(&display_config);
+    let browser_can_attempt_dynamic_training = display_config.training.is_some()
         || (browser_host_capabilities.navigator_gpu_exposed
             && browser_host_capabilities.worker_gpu_exposed
             && browser_host_capabilities.dedicated_worker_exposed);
@@ -3085,8 +3163,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let capability_reason_label = browser_downgrade_reason.clone().unwrap_or_else(|| {
         if browser_capability_decision.can_train {
             "WebGPU and worker requirements satisfied".into()
-        } else if props.config.training.is_none() {
-            "browser training is not configured for this deployment".into()
+        } else if display_config.training.is_none() {
+            if view.is_some() {
+                "browser training is not configured for this deployment".into()
+            } else {
+                "resolving browser training profile from the live network".into()
+            }
         } else {
             "browser trainer capability check blocked local training".into()
         }

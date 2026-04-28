@@ -9,6 +9,7 @@ def main() -> None:
         "training: Option<DragonBrowserTrainingConfig>,",
         "let training = resolve_browser_training_config(",
         "training,",
+        "signed_seed_advertisement: None,",
         "fn resolve_browser_training_config(",
         "snapshot.directory.entries",
         "Ok(training)",

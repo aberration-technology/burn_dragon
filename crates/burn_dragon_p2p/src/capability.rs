@@ -372,10 +372,8 @@ pub fn decide_browser_capability(
     capability.max_checkpoint_bytes = budget.max_checkpoint_bytes;
     capability.max_shard_bytes = budget.max_shard_bytes;
 
-    let trainer_memory_budget_bytes = config
-        .capability_policy
-        .memory_budget_bytes(DragonCapabilityClass::BrowserWgpu)
-        .or(host.system_memory_bytes.map(|bytes| bytes / 2));
+    let trainer_memory_budget_bytes =
+        browser_trainer_memory_budget_bytes(&config.capability_policy, host);
     let gpu_ready = host.navigator_gpu_exposed && host.worker_gpu_exposed;
     let worker_ready = host.dedicated_worker_exposed;
     let can_train = gpu_ready
@@ -431,6 +429,21 @@ pub fn decide_browser_capability(
     }
 }
 
+#[cfg(feature = "wasm-ui")]
+fn browser_trainer_memory_budget_bytes(
+    policy: &DragonCapabilityPolicy,
+    host: &DragonBrowserHostCapabilityProbe,
+) -> Option<u64> {
+    let profile_budget = policy.memory_budget_bytes(DragonCapabilityClass::BrowserWgpu);
+    let host_budget = host.system_memory_bytes.map(|bytes| bytes / 2);
+    match (profile_budget, host_budget) {
+        (Some(profile), Some(host)) => Some(profile.min(host)),
+        (Some(profile), None) => Some(profile),
+        (None, Some(host)) => Some(host),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +496,73 @@ mod tests {
         assert_eq!(
             decision.burn_target(DragonCapabilityClass::NativeWgpu),
             BurnTarget::Trainer
+        );
+    }
+
+    #[cfg(all(feature = "wasm-ui", feature = "wasm-peer"))]
+    fn browser_training_config_with_budget(
+        budget_bytes: u64,
+    ) -> crate::config::DragonBrowserTrainingConfig {
+        crate::config::DragonBrowserTrainingConfig {
+            experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
+            model_config: DragonConfig {
+                n_layer: 8,
+                n_embd: 512,
+                n_head: 8,
+                vocab_size: 50_257,
+                ..DragonConfig::default()
+            },
+            execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
+            block_size: 512,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 6,
+            max_train_batches: Some(4),
+            max_eval_batches: Some(1),
+            capability_policy: DragonCapabilityPolicy {
+                browser_wgpu_memory_budget_bytes: Some(budget_bytes),
+                ..DragonCapabilityPolicy::default()
+            },
+            training_lease: None,
+            train_source: crate::config::DragonBrowserTokenSource::Inline {
+                records: Vec::new(),
+            },
+            eval_source: None,
+            live_participant: None,
+        }
+    }
+
+    #[cfg(all(feature = "wasm-ui", feature = "wasm-peer"))]
+    fn browser_probe(system_memory_bytes: u64) -> DragonBrowserHostCapabilityProbe {
+        DragonBrowserHostCapabilityProbe {
+            navigator_gpu_exposed: true,
+            worker_gpu_exposed: true,
+            dedicated_worker_exposed: true,
+            persistent_storage_exposed: true,
+            web_transport_exposed: true,
+            web_rtc_exposed: true,
+            system_memory_bytes: Some(system_memory_bytes),
+        }
+    }
+
+    #[cfg(all(feature = "wasm-ui", feature = "wasm-peer"))]
+    #[test]
+    fn browser_training_uses_profile_and_host_memory_budget() {
+        let config = browser_training_config_with_budget(6 * 1024 * 1024 * 1024);
+        let high_memory =
+            decide_browser_capability(Some(&config), &browser_probe(32 * 1024 * 1024 * 1024));
+        assert!(high_memory.can_train, "{high_memory:?}");
+        assert_eq!(
+            high_memory.trainer_memory_budget_bytes,
+            Some(6 * 1024 * 1024 * 1024)
+        );
+
+        let low_memory =
+            decide_browser_capability(Some(&config), &browser_probe(4 * 1024 * 1024 * 1024));
+        assert!(!low_memory.can_train, "{low_memory:?}");
+        assert_eq!(
+            low_memory.trainer_memory_budget_bytes,
+            Some(2 * 1024 * 1024 * 1024)
         );
     }
 }

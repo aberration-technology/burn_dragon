@@ -504,18 +504,21 @@ where
         eval_batches_len, eval_loss, eval_time_ms,
     );
 
+    let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
     info!("browser live participant flush starting");
     let contribution = browser_training_contribution(
         &context,
-        train_batch_count,
-        train_example_count,
-        train_token_count,
-        train_loss_count > 0,
-        train_loss_mean,
-        eval_loss,
-        training_time_ms,
-        eval_time_ms,
-        context.setup_time_ms + elapsed_ms(total_started_at),
+        BrowserTrainingContributionStats {
+            train_batch_count,
+            train_example_count,
+            train_token_count,
+            train_loss_observed: train_loss_count > 0,
+            train_loss_mean,
+            eval_loss,
+            training_time_ms,
+            eval_time_ms,
+            total_time_ms,
+        },
     );
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
@@ -549,7 +552,7 @@ where
         setup_time_ms: context.setup_time_ms,
         training_time_ms,
         eval_time_ms,
-        total_time_ms: context.setup_time_ms + elapsed_ms(total_started_at),
+        total_time_ms,
         tokens_per_second: (training_time_ms > 0)
             .then_some(train_token_count as f64 / (training_time_ms as f64 / 1000.0)),
         live_participant,
@@ -1010,8 +1013,7 @@ async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
         .map_err(|error| anyhow!("failed to read browser loss scalar: {error}"))
 }
 
-fn browser_training_contribution(
-    context: &BrowserTrainingRunContext<'_>,
+struct BrowserTrainingContributionStats {
     train_batch_count: usize,
     train_example_count: usize,
     train_token_count: usize,
@@ -1021,13 +1023,18 @@ fn browser_training_contribution(
     training_time_ms: u64,
     eval_time_ms: u64,
     total_time_ms: u64,
+}
+
+fn browser_training_contribution(
+    context: &BrowserTrainingRunContext<'_>,
+    stats: BrowserTrainingContributionStats,
 ) -> WorkloadTrainingContribution {
     let now = Utc::now();
     let artifact_id = ArtifactId::new(format!(
         "browser-dragon-artifact-{}-{}-{}-{}",
         context.config.experiment_kind.workload_slug(),
         context.config.block_size,
-        train_token_count,
+        stats.train_token_count,
         now.timestamp_micros()
     ));
     let mut metadata = BTreeMap::from([
@@ -1042,23 +1049,26 @@ fn browser_training_contribution(
     ]);
     metadata.insert(
         "train_loss_observed".into(),
-        train_loss_observed.to_string(),
+        stats.train_loss_observed.to_string(),
     );
-    if train_loss_observed {
-        metadata.insert("train_loss_mean".into(), format!("{train_loss_mean:.8}"));
+    if stats.train_loss_observed {
+        metadata.insert(
+            "train_loss_mean".into(),
+            format!("{:.8}", stats.train_loss_mean),
+        );
     }
-    if let Some(eval_loss) = eval_loss {
+    if let Some(eval_loss) = stats.eval_loss {
         metadata.insert("eval_loss".into(), format!("{eval_loss:.8}"));
     }
 
     WorkloadTrainingContribution {
         artifact_id,
-        completed_batches: train_batch_count as u64,
-        completed_examples: train_example_count as u64,
-        completed_tokens: train_token_count as u64,
-        training_time_ms,
-        eval_time_ms,
-        total_time_ms,
+        completed_batches: stats.train_batch_count as u64,
+        completed_examples: stats.train_example_count as u64,
+        completed_tokens: stats.train_token_count as u64,
+        training_time_ms: stats.training_time_ms,
+        eval_time_ms: stats.eval_time_ms,
+        total_time_ms: stats.total_time_ms,
         artifact_published: false,
         metadata,
     }

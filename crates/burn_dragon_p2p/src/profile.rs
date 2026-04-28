@@ -282,9 +282,12 @@ fn browser_profile_from_native_config(
                     nca_config_path.display()
                 )
             })?;
-            let mut capability_policy = DragonCapabilityPolicy::default();
-            capability_policy.browser_wgpu_memory_budget_bytes =
-                Some(DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES);
+            let capability_policy = DragonCapabilityPolicy {
+                browser_wgpu_memory_budget_bytes: Some(
+                    DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES,
+                ),
+                ..DragonCapabilityPolicy::default()
+            };
             Ok(Some(DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
                 execution_backend: DragonBrowserExecutionBackend::Auto,

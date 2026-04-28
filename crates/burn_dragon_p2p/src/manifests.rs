@@ -484,8 +484,10 @@ mod tests {
             estimated_shard_bytes: 2048,
             estimated_tokens_per_second: 1234.0,
         };
-        let mut capability_policy = crate::config::DragonCapabilityPolicy::default();
-        capability_policy.browser_wgpu_memory_budget_bytes = Some(16_384);
+        let capability_policy = crate::config::DragonCapabilityPolicy {
+            browser_wgpu_memory_budget_bytes: Some(16_384),
+            ..crate::config::DragonCapabilityPolicy::default()
+        };
         let bundle = build_manifest_bundle(
             &seed(),
             DragonExperimentKind::NcaPrepretraining,

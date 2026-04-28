@@ -13,6 +13,7 @@ use burn_p2p::{
     TelemetryHandle,
 };
 
+use crate::capability_state::is_probable_trainer_fit_failure;
 use crate::experiments::common::{DragonProjectFamily, PreparedNativePeer};
 
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -153,7 +154,7 @@ where
                     while !stop_flag_for_thread.load(Ordering::SeqCst) {
                         let snapshot = telemetry.snapshot();
                         if let Some(error) = snapshot.last_error.as_deref()
-                            && is_probable_training_fit_failure(error)
+                            && is_probable_trainer_fit_failure(error)
                         {
                             let _ = prepared_for_monitor
                                 .persist_runtime_training_failure_with_source(
@@ -172,7 +173,7 @@ where
                     if !persisted {
                         let snapshot = telemetry.snapshot();
                         if let Some(error) = snapshot.last_error.as_deref()
-                            && is_probable_training_fit_failure(error)
+                            && is_probable_trainer_fit_failure(error)
                         {
                             let _ = prepared_for_monitor
                                 .persist_runtime_training_failure_with_source(
@@ -193,40 +194,4 @@ where
         stop_flag,
         monitor_thread,
     })
-}
-
-fn is_probable_training_fit_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "out of memory",
-        "oom",
-        "vram",
-        "device lost",
-        "failed to allocate",
-        "insufficient memory",
-        "allocation failed",
-        "allocator",
-        "cuda error",
-        "webgpu",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_probable_training_fit_failure;
-
-    #[test]
-    fn fit_failure_classifier_catches_memory_signals() {
-        assert!(is_probable_training_fit_failure(
-            "CUDA error: out of memory while allocating optimizer state"
-        ));
-        assert!(is_probable_training_fit_failure(
-            "webgpu device lost after failed to allocate buffer"
-        ));
-        assert!(!is_probable_training_fit_failure(
-            "authentication failed: peer certificate rejected"
-        ));
-    }
 }

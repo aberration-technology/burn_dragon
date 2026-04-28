@@ -112,7 +112,7 @@ Native and browser peers also persist downgrade state for a specific workload fi
 - batch size
 - block size
 
-If a trainer run fails with a probable fit error like OOM / failed allocation / device loss, the next startup comes back as validator or verifier automatically instead of retrying trainer blindly. The downgrade record stops binding automatically if the configured trainer budget increases above the recorded failed footprint, and native peers can also clear it explicitly.
+If a trainer run fails with a probable local fit error like OOM / failed allocation / device loss, the next startup comes back as validator or verifier automatically instead of retrying trainer blindly. Transient control-plane failures such as edge receipt submission 5xx responses are not treated as trainer fit failures, and stale records with those reasons do not bind. The downgrade record stops binding automatically if the configured trainer budget increases above the recorded failed footprint, and native peers can also clear it explicitly.
 
 The browser app now renders the local capability decision directly:
 
@@ -268,7 +268,7 @@ Install the portable native trainer. The published default feature set includes
 `native,wgpu`, so this produces a WebGPU-capable binary without extra flags:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.30 --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native
 ```
 
 Keep the explicit `--version` while the production line is pre-release; without
@@ -295,16 +295,16 @@ Install a narrower target when you need a backend-specific binary:
 
 ```bash
 # CPU
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.30 --bin burn_dragon_p2p_native --no-default-features --features native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --no-default-features --features native
 
 # WGPU
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.30 --bin burn_dragon_p2p_native --features native,wgpu
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --features native,wgpu
 
 # CUDA
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.30 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
 
 # ROCm
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.30 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
 `--backend webgpu` is accepted as an alias for `--backend wgpu`. CUDA and ROCm

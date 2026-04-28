@@ -67,6 +67,9 @@ fn record_is_still_binding(
     record: &DragonCapabilityDowngradeRecord,
     current_trainer_budget_bytes: Option<u64>,
 ) -> bool {
+    if !is_probable_trainer_fit_failure(&record.reason) {
+        return false;
+    }
     let failed_budget_bytes = record
         .trainer_budget_bytes
         .unwrap_or(record.observed_training_bytes)
@@ -74,5 +77,97 @@ fn record_is_still_binding(
     match current_trainer_budget_bytes {
         Some(current_budget) => current_budget <= failed_budget_bytes,
         None => true,
+    }
+}
+
+pub(crate) fn is_probable_trainer_fit_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if is_transient_runtime_or_control_plane_failure(&message) {
+        return false;
+    }
+    [
+        "out of memory",
+        "oom",
+        "vram",
+        "gpu memory",
+        "device lost",
+        "failed to allocate",
+        "failed allocation",
+        "insufficient memory",
+        "allocation failed",
+        "allocator",
+        "buffer allocation",
+        "cuda error",
+        "wgpu error",
+        "webgpu device lost",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn is_transient_runtime_or_control_plane_failure(message: &str) -> bool {
+    [
+        "http client error",
+        "http status",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "receipts/browser",
+        "/receipts/",
+        "failed to synchronize browser runtime",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    fn record_with_reason(reason: &str) -> DragonCapabilityDowngradeRecord {
+        DragonCapabilityDowngradeRecord {
+            scope_fingerprint: "scope".into(),
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            backend_label: "wgpu".into(),
+            downgrade_to: "browser_verifier".into(),
+            observed_training_bytes: 1024,
+            trainer_budget_bytes: Some(512),
+            reason: reason.into(),
+            source: "runtime".into(),
+            observed_at: Utc::now(),
+            failure_count: 1,
+        }
+    }
+
+    #[test]
+    fn trainer_fit_failure_classifier_rejects_transient_receipt_errors() {
+        assert!(!is_probable_trainer_fit_failure(
+            "http client error: HTTP status server error (502 Bad Gateway) for url (https://edge.dragon.aberration.technology/receipts/browser)"
+        ));
+        assert!(!record_is_still_binding(
+            &record_with_reason(
+                "http client error: HTTP status server error (502 Bad Gateway) for url (https://edge.dragon.aberration.technology/receipts/browser)"
+            ),
+            Some(512),
+        ));
+    }
+
+    #[test]
+    fn trainer_fit_failure_classifier_accepts_memory_and_device_failures() {
+        assert!(is_probable_trainer_fit_failure(
+            "CUDA error: out of memory while allocating optimizer state"
+        ));
+        assert!(is_probable_trainer_fit_failure(
+            "webgpu device lost after failed to allocate buffer"
+        ));
+        assert!(record_is_still_binding(
+            &record_with_reason("webgpu device lost after failed to allocate buffer"),
+            Some(512),
+        ));
     }
 }

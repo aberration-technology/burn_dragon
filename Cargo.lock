@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_checkpoint"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_core"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_kernel"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "burn 0.21.0-pre.3",
  "burn-autodiff 0.21.0-pre.3",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_language"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_p2p"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn 0.21.0-pre.3",
@@ -1971,14 +1971,14 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_time"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "web-time",
 ]
 
 [[package]]
 name = "burn_dragon_tokenizer"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "ahash",
  "compact_str",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_train"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "avirus",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_universality"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn_dragon_tokenizer",
@@ -15365,7 +15365,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.21.0-pre.30"
+version = "0.21.0-pre.31"
 dependencies = [
  "anyhow",
  "burn_dragon_p2p",

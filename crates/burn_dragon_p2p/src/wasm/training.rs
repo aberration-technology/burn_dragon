@@ -35,7 +35,8 @@ use crate::auth::{browser_github_enrollment_config, fetch_edge_snapshot, load_br
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 #[cfg(target_arch = "wasm32")]
 use crate::capability_state::{
-    apply_browser_downgrade_state, clear_browser_downgrade, persist_browser_downgrade,
+    apply_browser_downgrade_state, clear_browser_downgrade, is_probable_trainer_fit_failure,
+    persist_browser_downgrade,
 };
 use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
@@ -278,7 +279,10 @@ pub async fn run_browser_training_with_release_manifest(
         Ok(_) if browser_training_requires_webgpu => {
             let _ = clear_browser_downgrade(edge_base_url, config, backend_label);
         }
-        Err(error) if browser_training_requires_webgpu => {
+        Err(error)
+            if browser_training_requires_webgpu
+                && is_probable_trainer_fit_failure(&error.to_string()) =>
+        {
             let _ = persist_browser_downgrade(
                 edge_base_url,
                 config,
@@ -1082,20 +1086,25 @@ async fn finish_live_browser_participant(
         .await
         .map_err(|error| match error {
             BrowserSessionRuntimeError::Worker(message) => {
-                let capability_decision = apply_browser_downgrade_state(
-                    edge_base_url,
-                    config,
-                    config.execution_backend.backend_label(),
-                    decide_browser_capability(Some(config), &detect_browser_host_capabilities()),
-                );
-                let _ = persist_browser_downgrade(
-                    edge_base_url,
-                    config,
-                    config.execution_backend.backend_label(),
-                    &capability_decision,
-                    &message,
-                    "browser-worker-runtime",
-                );
+                if is_probable_trainer_fit_failure(&message) {
+                    let capability_decision = apply_browser_downgrade_state(
+                        edge_base_url,
+                        config,
+                        config.execution_backend.backend_label(),
+                        decide_browser_capability(
+                            Some(config),
+                            &detect_browser_host_capabilities(),
+                        ),
+                    );
+                    let _ = persist_browser_downgrade(
+                        edge_base_url,
+                        config,
+                        config.execution_backend.backend_label(),
+                        &capability_decision,
+                        &message,
+                        "browser-worker-runtime",
+                    );
+                }
                 anyhow!("browser worker training failed: {message}")
             }
             other => anyhow!(other),

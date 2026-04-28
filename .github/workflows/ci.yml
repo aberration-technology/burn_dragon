@@ -87,10 +87,6 @@ jobs:
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --features native,wgpu --all-targets --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_p2p --target wasm32-unknown-unknown --no-default-features --features wasm-ui,wasm-peer,wgpu --bin burn_dragon_p2p_browser --no-deps -- -D warnings
       - run: cargo check --manifest-path Cargo.toml -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native
-      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib deployment::tests:: -- --nocapture"
-        timeout-minutes: 10
-      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"
-        timeout-minutes: 10
 
   test:
     runs-on: ubuntu-latest
@@ -121,6 +117,10 @@ jobs:
       - run: cargo test --manifest-path Cargo.toml -p burn_dragon_train --all-targets -- --test-threads=1
         timeout-minutes: 15
       - run: cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets -- --test-threads=1
+        timeout-minutes: 15
+      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib deployment::tests:: -- --nocapture"
+        timeout-minutes: 25
+      - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"
         timeout-minutes: 15
       - run: cargo run --manifest-path Cargo.toml -p xtask -- native-smoke
         timeout-minutes: 45

@@ -71,6 +71,8 @@ pub struct DragonBrowserTrainingResult {
     pub train_examples: usize,
     pub train_tokens: usize,
     pub train_loss_mean: f64,
+    #[serde(default)]
+    pub train_loss_observed: bool,
     pub eval_examples: usize,
     pub eval_loss: Option<f64>,
     pub setup_time_ms: u64,
@@ -412,7 +414,15 @@ where
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
         .init();
+    let collect_loss_scalars = browser_loss_scalar_readback_enabled(context.backend_kind);
+    if !collect_loss_scalars {
+        info!(
+            "browser training loss scalar readback disabled for backend={}; avoiding wasm WebGPU buffer maps during live training",
+            context.backend_label,
+        );
+    }
     let mut train_loss_sum = 0.0;
+    let mut train_loss_count = 0usize;
     let mut train_batch_count = 0usize;
     let mut train_token_count = 0usize;
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
@@ -425,7 +435,10 @@ where
         }
         let hidden = model.forward_hidden(batch.inputs);
         let loss = model.language_loss_from_hidden(hidden, batch.targets);
-        train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
+        if collect_loss_scalars {
+            train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
+            train_loss_count = train_loss_count.saturating_add(1);
+        }
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
         let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -433,14 +446,21 @@ where
     }
     let training_time_ms = elapsed_ms(training_started_at);
     let train_batch_count = train_batch_count.max(1);
-    let train_loss_mean = train_loss_sum / train_batch_count as f64;
+    let train_loss_mean = if train_loss_count > 0 {
+        train_loss_sum / train_loss_count as f64
+    } else {
+        0.0
+    };
     info!(
-        "browser training loop complete: train_batches={} train_loss_mean={:.4} training_time_ms={}",
-        train_batch_count, train_loss_mean, training_time_ms,
+        "browser training loop complete: train_batches={} train_loss_mean={:.4} train_loss_observed={} training_time_ms={}",
+        train_batch_count,
+        train_loss_mean,
+        train_loss_count > 0,
+        training_time_ms,
     );
 
     let eval_started_at = Instant::now();
-    let eval_loss = if eval_batches.is_empty() {
+    let eval_loss = if eval_batches.is_empty() || !collect_loss_scalars {
         None
     } else {
         let eval_model = model.valid();
@@ -493,6 +513,7 @@ where
         train_examples: train_records.len(),
         train_tokens: train_token_count,
         train_loss_mean,
+        train_loss_observed: train_loss_count > 0,
         eval_examples: eval_records.len(),
         eval_loss,
         setup_time_ms: context.setup_time_ms,
@@ -525,6 +546,14 @@ fn backend_supports_live_participant(backend_kind: BrowserTrainingBackendKind) -
         BrowserTrainingBackendKind::Cpu => false,
         #[cfg(feature = "wgpu")]
         BrowserTrainingBackendKind::Wgpu => true,
+    }
+}
+
+fn browser_loss_scalar_readback_enabled(backend_kind: BrowserTrainingBackendKind) -> bool {
+    match backend_kind {
+        BrowserTrainingBackendKind::Cpu => true,
+        #[cfg(feature = "wgpu")]
+        BrowserTrainingBackendKind::Wgpu => !cfg!(target_arch = "wasm32"),
     }
 }
 

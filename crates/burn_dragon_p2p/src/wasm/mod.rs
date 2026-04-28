@@ -3445,10 +3445,15 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 .await
                 {
                     Ok(result) => {
-                        status.set(format!(
-                            "Browser training complete: mean train loss {:.4}",
-                            result.train_loss_mean
-                        ));
+                        let status_message = if result.train_loss_observed {
+                            format!(
+                                "Browser training complete: mean train loss {:.4}",
+                                result.train_loss_mean
+                            )
+                        } else {
+                            "Browser training complete: WebGPU window finished".into()
+                        };
+                        status.set(status_message);
                         local_training.set(Some(result));
                         if let Ok(view) = refresh_browser_app(
                             &bootstrap_config,
@@ -3577,7 +3582,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             .eval_loss
             .map(|value| format!("{value:.4}"))
             .unwrap_or_else(|| "n/a".into());
-        let train_loss_label = format!("{:.4}", result.train_loss_mean);
+        let train_loss_label = if result.train_loss_observed {
+            format!("{:.4}", result.train_loss_mean)
+        } else {
+            "not sampled".into()
+        };
         let tokens_per_second_label = result
             .tokens_per_second
             .map(|value| format!("{value:.1}"))

@@ -249,7 +249,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.41`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.42`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
@@ -319,7 +319,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_MAX_SIZE`
   - optional autoscaling-group maximum size. Leave empty or `0` to default to the desired capacity.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_CRATE_VERSION`
-  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.31`.
+  - optional published `burn_dragon_p2p` crate version installed on managed trainer instances. Defaults to the current repo workspace version from `Cargo.toml` when using the deployment workflows, currently `0.21.0-pre.32`.
 - `BURN_DRAGON_P2P_MANAGED_TRAINER_AUTH_BUNDLE_PARAMETER_NAME`
   - optional SSM parameter name containing the JSON auth bundle used by managed trainer instances. Leave empty to derive `/<stack>/<workspace>/bootstrap/trainer_auth_bundle_json`.
 - `BURN_DRAGON_P2P_ENABLE_DATA_VOLUME_SNAPSHOTS`
@@ -571,7 +571,7 @@ For the public production network, the simplest native path is the published
 operator binary:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.32 --bin burn_dragon_p2p_native
 burn_dragon_p2p_native doctor --assert-ready
 burn_dragon_p2p_native login
 burn_dragon_p2p_native train-window-once --require-head-advanced
@@ -587,8 +587,8 @@ above produces the portable WebGPU backend. Use a backend-specific install only
 on a host with the matching driver and toolkit libraries:
 
 ```bash
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
-cargo install --locked burn_dragon_p2p --version 0.21.0-pre.31 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.32 --bin burn_dragon_p2p_native --no-default-features --features native,cuda
+cargo install --locked burn_dragon_p2p --version 0.21.0-pre.32 --bin burn_dragon_p2p_native --no-default-features --features native,rocm
 ```
 
 With no `--config`, the binary points at

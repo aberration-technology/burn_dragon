@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "wgpu")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,8 +14,8 @@ use burn_dragon_core::DragonModel;
 use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
-    ContentId, ExperimentId, ExperimentScope, RevisionId, StudyId, WorkloadId,
-    WorkloadTrainingLease,
+    ArtifactId, ContentId, ExperimentId, ExperimentScope, RevisionId, StudyId, WorkloadId,
+    WorkloadTrainingContribution, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
     BrowserCapabilityReport, BrowserRuntimeRole, BrowserSessionRuntimeConfig,
@@ -26,6 +26,7 @@ use burn_p2p_core::codec::multihash_sha256;
 use burn_p2p_dataloader::ShardFetchManifest;
 #[cfg(feature = "wgpu")]
 use burn_wgpu::{RuntimeOptions, graphics};
+use chrono::Utc;
 use gloo_net::http::Request;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,12 @@ pub struct DragonBrowserTrainingResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DragonBrowserLiveParticipantResult {
     pub receipt_submission_accepted: bool,
+    #[serde(default)]
+    pub receipt_submission_deferred: bool,
+    #[serde(default)]
+    pub pending_receipt_count: usize,
+    #[serde(default)]
+    pub receipt_submission_error: Option<String>,
     pub accepted_receipt_ids: Vec<String>,
     pub emitted_receipt_id: Option<String>,
     pub runtime_state: Option<String>,
@@ -428,6 +435,7 @@ where
     let mut train_loss_sum = 0.0;
     let mut train_loss_count = 0usize;
     let mut train_batch_count = 0usize;
+    let mut train_example_count = 0usize;
     let mut train_token_count = 0usize;
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
         if context
@@ -443,6 +451,11 @@ where
             train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
             train_loss_count = train_loss_count.saturating_add(1);
         }
+        train_example_count = train_example_count.saturating_add(
+            batch
+                .token_count
+                .saturating_div(context.config.block_size.max(1)),
+        );
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
         let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -492,10 +505,23 @@ where
     );
 
     info!("browser live participant flush starting");
+    let contribution = browser_training_contribution(
+        &context,
+        train_batch_count,
+        train_example_count,
+        train_token_count,
+        train_loss_count > 0,
+        train_loss_mean,
+        eval_loss,
+        training_time_ms,
+        eval_time_ms,
+        context.setup_time_ms + elapsed_ms(total_started_at),
+    );
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
         context.config,
         live_participant.as_mut(),
+        contribution,
     )
     .await?;
     if let Some(live) = live_participant.as_ref() {
@@ -984,6 +1010,60 @@ async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
         .map_err(|error| anyhow!("failed to read browser loss scalar: {error}"))
 }
 
+fn browser_training_contribution(
+    context: &BrowserTrainingRunContext<'_>,
+    train_batch_count: usize,
+    train_example_count: usize,
+    train_token_count: usize,
+    train_loss_observed: bool,
+    train_loss_mean: f64,
+    eval_loss: Option<f64>,
+    training_time_ms: u64,
+    eval_time_ms: u64,
+    total_time_ms: u64,
+) -> WorkloadTrainingContribution {
+    let now = Utc::now();
+    let artifact_id = ArtifactId::new(format!(
+        "browser-dragon-artifact-{}-{}-{}-{}",
+        context.config.experiment_kind.workload_slug(),
+        context.config.block_size,
+        train_token_count,
+        now.timestamp_micros()
+    ));
+    let mut metadata = BTreeMap::from([
+        ("contribution_kind".into(), "browser-local-window".into()),
+        ("backend".into(), context.backend_label.into()),
+        (
+            "experiment_kind".into(),
+            context.config.experiment_kind.workload_slug().into(),
+        ),
+        ("block_size".into(), context.config.block_size.to_string()),
+        ("receipt_payload_version".into(), "browser-window-v1".into()),
+    ]);
+    metadata.insert(
+        "train_loss_observed".into(),
+        train_loss_observed.to_string(),
+    );
+    if train_loss_observed {
+        metadata.insert("train_loss_mean".into(), format!("{train_loss_mean:.8}"));
+    }
+    if let Some(eval_loss) = eval_loss {
+        metadata.insert("eval_loss".into(), format!("{eval_loss:.8}"));
+    }
+
+    WorkloadTrainingContribution {
+        artifact_id,
+        completed_batches: train_batch_count as u64,
+        completed_examples: train_example_count as u64,
+        completed_tokens: train_token_count as u64,
+        training_time_ms,
+        eval_time_ms,
+        total_time_ms,
+        artifact_published: false,
+        metadata,
+    }
+}
+
 async fn start_live_browser_participant(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
@@ -1062,6 +1142,7 @@ async fn finish_live_browser_participant(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
     handle: Option<&mut LiveBrowserParticipantHandle>,
+    contribution: WorkloadTrainingContribution,
 ) -> Result<Option<DragonBrowserLiveParticipantResult>> {
     let Some(handle) = handle else {
         return Ok(None);
@@ -1082,6 +1163,7 @@ async fn finish_live_browser_participant(
             workload_id: WorkloadId::new("browser-dragon-training"),
             budget: handle.training_budget.clone(),
             lease: config.training_lease.clone(),
+            contribution: Some(contribution),
         })
         .await
         .map_err(|error| match error {
@@ -1111,6 +1193,9 @@ async fn finish_live_browser_participant(
         })?;
     Ok(Some(DragonBrowserLiveParticipantResult {
         receipt_submission_accepted: outcome.receipt_submission_accepted,
+        receipt_submission_deferred: outcome.receipt_submission_deferred,
+        pending_receipt_count: outcome.pending_receipt_count,
+        receipt_submission_error: outcome.receipt_submission_error,
         accepted_receipt_ids: outcome.accepted_receipt_ids,
         emitted_receipt_id: outcome.emitted_receipt_id,
         runtime_state: outcome.runtime_state.as_ref().map(|state| state.label()),

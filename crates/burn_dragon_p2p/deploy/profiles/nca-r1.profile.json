@@ -169,7 +169,7 @@
     "learning_rate": 0.001,
     "weight_decay": 0.0,
     "batch_size": 1,
-    "max_train_batches": 1,
+    "max_train_batches": 4,
     "max_eval_batches": 1,
     "capability_policy": {
       "native_cpu_memory_budget_bytes": 8589934592,

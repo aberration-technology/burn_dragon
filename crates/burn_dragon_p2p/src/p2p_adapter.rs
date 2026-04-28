@@ -3,17 +3,20 @@ use anyhow::{Result, anyhow};
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p::WorkloadTrainingLease;
-#[cfg(feature = "wasm-ui")]
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p::{ClientReleaseManifest, ExperimentScope};
+#[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+use burn_p2p_browser::{BrowserAppClientView, BrowserAppConnectConfig, BrowserAppController};
 #[cfg(feature = "wasm-ui")]
+use burn_p2p_browser::{BrowserAppTarget, BrowserRuntimeRole};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p_browser::{
-    BrowserAppClientView, BrowserAppConnectConfig, BrowserAppController, BrowserAppTarget,
-    BrowserCapabilityReport, BrowserEdgeSnapshot, BrowserEnrollmentConfig, BrowserRuntimeRole,
+    BrowserCapabilityReport, BrowserEdgeSnapshot, BrowserEnrollmentConfig,
     BrowserSeedAdvertisement, BrowserTransportKind, BrowserTransportPolicy, SchemaEnvelope,
     SignedPayload,
 };
 
-#[cfg(feature = "wasm-ui")]
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use std::collections::BTreeSet;
 
 #[cfg(feature = "wasm-ui")]

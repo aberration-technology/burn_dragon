@@ -3593,9 +3593,18 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             .unwrap_or_else(|| "n/a".into());
         let train_batches_label = result.train_batches.to_string();
         let live_training_details = result.live_participant.map(|live| {
+            let receipt_state = if live.receipt_submission_accepted {
+                "accepted".to_owned()
+            } else if live.receipt_submission_deferred {
+                "pending retry".to_owned()
+            } else {
+                "not accepted".to_owned()
+            };
             (
-                live.receipt_submission_accepted,
+                receipt_state,
                 live.accepted_receipt_ids.join(", "),
+                live.pending_receipt_count,
+                live.receipt_submission_error,
                 live.runtime_state.unwrap_or_else(|| "n/a".into()),
             )
         });
@@ -3632,15 +3641,25 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         strong { "{tokens_per_second_label}" }
                     }
                 }
-                if let Some((receipt_submission_accepted, accepted_receipts_label, runtime_state_label)) = live_training_details {
+                if let Some((receipt_state, accepted_receipts_label, pending_receipt_count, receipt_submission_error, runtime_state_label)) = live_training_details {
                     div { class: "keyvalue-list",
                         div { class: "keyvalue-row",
-                            span { "receipt accepted" }
-                            strong { "{receipt_submission_accepted}" }
+                            span { "receipt state" }
+                            strong { "{receipt_state}" }
                         }
                         div { class: "keyvalue-row",
                             span { "accepted receipts" }
                             strong { "{accepted_receipts_label}" }
+                        }
+                        div { class: "keyvalue-row",
+                            span { "pending receipts" }
+                            strong { "{pending_receipt_count}" }
+                        }
+                        if let Some(receipt_submission_error) = receipt_submission_error {
+                            div { class: "keyvalue-row",
+                                span { "receipt retry" }
+                                strong { "{receipt_submission_error}" }
+                            }
                         }
                         div { class: "keyvalue-row",
                             span { "runtime state" }

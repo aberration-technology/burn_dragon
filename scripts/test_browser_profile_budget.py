@@ -11,7 +11,7 @@ def main() -> None:
     policy = browser["capability_policy"]
 
     assert browser["batch_size"] == 1, browser["batch_size"]
-    assert browser["max_train_batches"] == 1, browser["max_train_batches"]
+    assert 4 <= browser["max_train_batches"] <= 8, browser["max_train_batches"]
     assert browser["max_eval_batches"] <= 1, browser["max_eval_batches"]
     assert (
         policy["browser_wgpu_memory_budget_bytes"] == 6 * 1024 * 1024 * 1024

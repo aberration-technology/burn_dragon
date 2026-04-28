@@ -11,8 +11,10 @@ use burn_p2p_browser::BrowserSiteBootstrapConfig;
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::*;
 
+#[cfg(any(target_arch = "wasm32", test))]
 const DEFAULT_BOOTSTRAP_PATH: &str = "browser-app-config.json";
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn callback_site_root_prefix(pathname: &str) -> Option<String> {
     let (prefix, _) = pathname.split_once("/callback/")?;
     let prefix = prefix.trim_end_matches('/');
@@ -23,6 +25,7 @@ fn callback_site_root_prefix(pathname: &str) -> Option<String> {
     })
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn default_bootstrap_path_for_pathname(pathname: &str) -> String {
     callback_site_root_prefix(pathname)
         .map(|prefix| format!("{prefix}{DEFAULT_BOOTSTRAP_PATH}"))

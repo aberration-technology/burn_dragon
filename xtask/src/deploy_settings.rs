@@ -326,7 +326,7 @@ fn dedupe_csv_seed_urls(value: &str) -> Vec<String> {
     )
 }
 
-fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
+pub(crate) fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     seed_urls
         .into_iter()
@@ -334,14 +334,20 @@ fn dedupe_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn canonicalize_browser_seed_urls(edge_base_url: &str, seed_urls: Vec<String>) -> Vec<String> {
+pub(crate) fn canonicalize_browser_seed_urls(
+    edge_base_url: &str,
+    seed_urls: Vec<String>,
+) -> Vec<String> {
     let Some(edge_host) = browser_seed_dns_host(edge_base_url) else {
         return dedupe_seed_urls(seed_urls);
     };
     canonicalize_browser_seed_urls_for_host(&edge_host, seed_urls)
 }
 
-fn canonicalize_browser_seed_urls_for_host(edge_host: &str, seed_urls: Vec<String>) -> Vec<String> {
+pub(crate) fn canonicalize_browser_seed_urls_for_host(
+    edge_host: &str,
+    seed_urls: Vec<String>,
+) -> Vec<String> {
     let seed_urls = dedupe_seed_urls(seed_urls);
     let canonical_seeds = seed_urls
         .iter()
@@ -363,7 +369,7 @@ fn canonicalize_browser_seed_urls_for_host(edge_host: &str, seed_urls: Vec<Strin
     )
 }
 
-fn browser_seed_dns_host(edge_base_url: &str) -> Option<String> {
+pub(crate) fn browser_seed_dns_host(edge_base_url: &str) -> Option<String> {
     reqwest::Url::parse(edge_base_url)
         .ok()
         .and_then(|value| value.host_str().map(ToOwned::to_owned))
@@ -381,7 +387,7 @@ fn canonicalize_browser_seed_url(edge_host: &str, seed_url: String) -> String {
     format!("/dns4/{edge_host}/{}", segments[2..].join("/"))
 }
 
-fn is_dialable_browser_seed(value: &str) -> bool {
+pub(crate) fn is_dialable_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
     is_direct_browser_seed(value)
         || segments
@@ -389,7 +395,7 @@ fn is_dialable_browser_seed(value: &str) -> bool {
             .any(|segment| matches!(*segment, "wss" | "ws"))
 }
 
-fn is_webrtc_direct_browser_seed(value: &str) -> bool {
+pub(crate) fn is_webrtc_direct_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
     segments.contains(&"webrtc-direct")
         && segments
@@ -398,7 +404,7 @@ fn is_webrtc_direct_browser_seed(value: &str) -> bool {
         && segments.contains(&"certhash")
 }
 
-fn is_direct_browser_seed(value: &str) -> bool {
+pub(crate) fn is_direct_browser_seed(value: &str) -> bool {
     let segments = multiaddr_segments(value);
     if is_webrtc_direct_browser_seed(value) {
         return true;
@@ -409,7 +415,7 @@ fn is_direct_browser_seed(value: &str) -> bool {
     false
 }
 
-fn prefer_validated_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
+pub(crate) fn prefer_validated_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
     if seed_urls
         .iter()
         .any(|value| is_webrtc_direct_browser_seed(value))

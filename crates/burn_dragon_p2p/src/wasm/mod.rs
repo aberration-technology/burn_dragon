@@ -1012,14 +1012,28 @@ fn dragon_live_notice(
     }
 }
 
-fn dragon_training_action_state(
-    view: Option<&BrowserAppClientView>,
+#[derive(Clone, Copy)]
+struct DragonTrainingActionContext<'a> {
+    view: Option<&'a BrowserAppClientView>,
     browser_can_attempt_dynamic_training: bool,
     edge_configured: bool,
     direct_transport_ready: bool,
     local_training_pending: bool,
-    downgrade_reason: Option<&str>,
+    downgrade_reason: Option<&'a str>,
+}
+
+fn dragon_training_action_state(
+    context: DragonTrainingActionContext<'_>,
 ) -> Option<DragonTrainingActionState> {
+    let DragonTrainingActionContext {
+        view,
+        browser_can_attempt_dynamic_training,
+        edge_configured,
+        direct_transport_ready,
+        local_training_pending,
+        downgrade_reason,
+    } = context;
+
     if !browser_can_attempt_dynamic_training {
         return None;
     }
@@ -3252,14 +3266,14 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .as_ref()
         .is_some_and(|view| view.network.direct_peers > 0);
     let edge_configured = resolved_edge_base_url(&initial_config).is_ok();
-    let training_action_state = dragon_training_action_state(
-        view.as_ref(),
+    let training_action_state = dragon_training_action_state(DragonTrainingActionContext {
+        view: view.as_ref(),
         browser_can_attempt_dynamic_training,
         edge_configured,
         direct_transport_ready,
-        local_training_pending_active,
-        browser_downgrade_reason.as_deref(),
-    );
+        local_training_pending: local_training_pending_active,
+        downgrade_reason: browser_downgrade_reason.as_deref(),
+    });
     let peer_ui_context = DragonPeerUiContext {
         view: view.as_ref(),
         status_message: &status_message,
@@ -4381,17 +4395,17 @@ mod tests {
         BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS,
         BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_INTERVAL_MILLIS,
         DRAGON_UI_EVENT_LIMIT, DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext,
-        DragonReadinessStepId, DragonStepStatus, DragonUiEventCandidate, DragonUiEventKind,
-        browser_app_refresh_interval_millis, browser_session_is_authenticated,
-        browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
-        dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
-        dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
-        dragon_peer_ui_state, dragon_push_ui_event, dragon_runtime_mode_detail,
-        dragon_runtime_mode_summary, dragon_session_metric_view, dragon_slice_progress_summary,
-        dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
-        dragon_window_summary, filter_seed_urls_for_transport,
-        filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
-        retained_refresh_transport_warning,
+        DragonReadinessStepId, DragonStepStatus, DragonTrainingActionContext,
+        DragonUiEventCandidate, DragonUiEventKind, browser_app_refresh_interval_millis,
+        browser_session_is_authenticated, browser_view_machine_state_json, connect_config,
+        dragon_browser_training_action_ready, dragon_global_training_detail,
+        dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
+        dragon_local_training_summary, dragon_network_detail, dragon_peer_ui_state,
+        dragon_push_ui_event, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
+        dragon_session_metric_view, dragon_slice_progress_summary, dragon_training_action_state,
+        dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
+        filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
+        normalized_browser_callback_url, retained_refresh_transport_warning,
     };
     use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
     use burn_p2p::{
@@ -4582,6 +4596,19 @@ mod tests {
                 performance: None,
                 diffusion: None,
             },
+        }
+    }
+
+    fn ready_training_action_context(
+        view: &BrowserAppClientView,
+    ) -> DragonTrainingActionContext<'_> {
+        DragonTrainingActionContext {
+            view: Some(view),
+            browser_can_attempt_dynamic_training: true,
+            edge_configured: true,
+            direct_transport_ready: true,
+            local_training_pending: false,
+            downgrade_reason: None,
         }
     }
 
@@ -4887,7 +4914,7 @@ mod tests {
             idle_time: "1s".into(),
         });
         let training_action_state =
-            dragon_training_action_state(Some(&view), true, true, true, false, None);
+            dragon_training_action_state(ready_training_action_context(&view));
 
         assert_eq!(
             dragon_local_training_summary(Some(&view), false),
@@ -4923,7 +4950,7 @@ mod tests {
         view.network.direct_peers = 2;
         view.training.can_train = false;
 
-        let observe = dragon_training_action_state(Some(&view), true, true, true, false, None)
+        let observe = dragon_training_action_state(ready_training_action_context(&view))
             .expect("observe training state");
         assert!(!observe.enabled);
         assert_eq!(observe.label, "observe mode");
@@ -4933,7 +4960,7 @@ mod tests {
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
 
-        let ready = dragon_training_action_state(Some(&view), true, true, true, false, None)
+        let ready = dragon_training_action_state(ready_training_action_context(&view))
             .expect("ready training state");
         assert!(ready.enabled);
         assert_eq!(ready.label, "run browser training");
@@ -4948,7 +4975,7 @@ mod tests {
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
         view.training.cached_microshards = 4;
-        let action = dragon_training_action_state(Some(&view), true, true, true, false, None);
+        let action = dragon_training_action_state(ready_training_action_context(&view));
 
         let context = DragonPeerUiContext {
             view: Some(&view),
@@ -4986,7 +5013,10 @@ mod tests {
         let mut view = sample_browser_view();
         view.network.swarm_status.desired_transport = Some(BrowserTransportFamily::WebRtcDirect);
         view.network.swarm_status.last_error = Some("direct dial timeout".into());
-        let action = dragon_training_action_state(Some(&view), true, true, false, false, None);
+        let action = dragon_training_action_state(DragonTrainingActionContext {
+            direct_transport_ready: false,
+            ..ready_training_action_context(&view)
+        });
 
         let context = DragonPeerUiContext {
             view: Some(&view),
@@ -5025,14 +5055,10 @@ mod tests {
         view.runtime_detail = "watching heads and standings".into();
         view.training.can_train = false;
         let downgrade_reason = "webgpu unavailable; downgrading browser peer to verifier/observer";
-        let action = dragon_training_action_state(
-            Some(&view),
-            true,
-            true,
-            true,
-            false,
-            Some(downgrade_reason),
-        );
+        let action = dragon_training_action_state(DragonTrainingActionContext {
+            downgrade_reason: Some(downgrade_reason),
+            ..ready_training_action_context(&view)
+        });
 
         let context = DragonPeerUiContext {
             view: Some(&view),
@@ -5077,14 +5103,10 @@ mod tests {
         let mut blocked_view = view.clone();
         blocked_view.runtime_label = "blocked".into();
         blocked_view.runtime_detail = "training blocked".into();
-        let blocked_action = dragon_training_action_state(
-            Some(&blocked_view),
-            true,
-            true,
-            true,
-            false,
-            Some(downgrade_reason),
-        );
+        let blocked_action = dragon_training_action_state(DragonTrainingActionContext {
+            downgrade_reason: Some(downgrade_reason),
+            ..ready_training_action_context(&blocked_view)
+        });
         let blocked_context = DragonPeerUiContext {
             view: Some(&blocked_view),
             status_message: "",
@@ -5179,7 +5201,10 @@ mod tests {
         view.runtime_detail = "connecting peer transport".into();
         view.training.can_train = true;
 
-        let action = dragon_training_action_state(Some(&view), true, true, false, false, None);
+        let action = dragon_training_action_state(DragonTrainingActionContext {
+            direct_transport_ready: false,
+            ..ready_training_action_context(&view)
+        });
         assert!(action.is_none());
         assert_eq!(
             dragon_local_training_detail(Some(&view), action.as_ref()),
@@ -5198,14 +5223,11 @@ mod tests {
         view.runtime_detail = "watching heads and standings".into();
         view.training.can_train = false;
 
-        let blocked = dragon_training_action_state(
-            Some(&view),
-            true,
-            true,
-            false,
-            false,
-            Some("persisted trainer failure for this workload fingerprint"),
-        )
+        let blocked = dragon_training_action_state(DragonTrainingActionContext {
+            direct_transport_ready: false,
+            downgrade_reason: Some("persisted trainer failure for this workload fingerprint"),
+            ..ready_training_action_context(&view)
+        })
         .expect("downgraded training state");
         assert!(!blocked.enabled);
         assert_eq!(blocked.label, "trainer downgraded");
@@ -5223,7 +5245,7 @@ mod tests {
         view.network.direct_peers = 2;
         view.training.can_train = false;
         let observe_training_action =
-            dragon_training_action_state(Some(&view), true, true, true, false, None);
+            dragon_training_action_state(ready_training_action_context(&view));
 
         assert_eq!(
             dragon_runtime_mode_summary(
@@ -5250,7 +5272,7 @@ mod tests {
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
         let ready_training_action =
-            dragon_training_action_state(Some(&view), true, true, true, false, None);
+            dragon_training_action_state(ready_training_action_context(&view));
 
         assert_eq!(
             dragon_runtime_mode_summary(

@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -1262,18 +1261,20 @@ fn browser_site_bootstrap_json(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let seed_node_urls = canonicalize_browser_seed_urls(
-        edge_url.as_deref(),
-        prefer_validated_browser_seed_urls(
-            args.seed_node_urls
-                .iter()
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-        ),
-    );
+    let seed_node_urls = args
+        .seed_node_urls
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let seed_node_urls = crate::deploy_settings::prefer_validated_browser_seed_urls(seed_node_urls);
+    let seed_node_urls = if let Some(edge_url) = edge_url.as_deref() {
+        crate::deploy_settings::canonicalize_browser_seed_urls(edge_url, seed_node_urls)
+    } else {
+        crate::deploy_settings::dedupe_seed_urls(seed_node_urls)
+    };
 
     let selected_experiment_id = args
         .selected_experiment_id
@@ -1392,98 +1393,15 @@ fn fetch_optional_browser_edge_snapshot(
     }
 }
 
-fn is_webrtc_direct_browser_seed(value: &str) -> bool {
-    let segments = value
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    segments.contains(&"webrtc-direct")
-        && segments
-            .first()
-            .is_some_and(|segment| matches!(*segment, "ip4" | "ip6" | "dns4" | "dns6" | "dnsaddr"))
-        && segments.contains(&"certhash")
-}
-
-fn prefer_validated_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
-    if seed_urls
-        .iter()
-        .any(|value| is_webrtc_direct_browser_seed(value))
-    {
-        return seed_urls
-            .into_iter()
-            .filter(|value| is_webrtc_direct_browser_seed(value))
-            .collect();
-    }
-    seed_urls
-}
-
-fn browser_seed_dns_host(edge_url: Option<&str>) -> Option<String> {
-    reqwest::Url::parse(edge_url?)
-        .ok()
-        .and_then(|value| value.host_str().map(ToOwned::to_owned))
-        .filter(|host| host.parse::<IpAddr>().is_err())
-}
-
-fn canonicalize_browser_seed_url(edge_host: &str, seed_url: String) -> String {
-    let segments = seed_url
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() < 3
-        || !matches!(segments.first().copied(), Some("ip4" | "ip6"))
-        || !is_webrtc_direct_browser_seed(&seed_url)
-    {
-        return seed_url;
-    }
-    format!("/dns4/{edge_host}/{}", segments[2..].join("/"))
-}
-
-fn canonicalize_browser_seed_urls(edge_url: Option<&str>, seed_urls: Vec<String>) -> Vec<String> {
-    let Some(edge_host) = browser_seed_dns_host(edge_url) else {
-        return dedupe_browser_seed_urls(seed_urls);
-    };
-    canonicalize_browser_seed_urls_for_host(&edge_host, seed_urls)
-}
-
-fn canonicalize_browser_seed_urls_for_host(edge_host: &str, seed_urls: Vec<String>) -> Vec<String> {
-    let seed_urls = dedupe_browser_seed_urls(seed_urls);
-    let canonical_seeds = seed_urls
-        .iter()
-        .filter(|value| canonicalize_browser_seed_url(edge_host, (*value).clone()) == **value)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    dedupe_browser_seed_urls(
-        seed_urls
-            .into_iter()
-            .map(|value| {
-                let rewritten = canonicalize_browser_seed_url(edge_host, value.clone());
-                if rewritten != value && canonical_seeds.contains(&rewritten) {
-                    value
-                } else {
-                    rewritten
-                }
-            })
-            .collect(),
-    )
-}
-
-fn dedupe_browser_seed_urls(seed_urls: Vec<String>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    seed_urls
-        .into_iter()
-        .filter(|value| seen.insert(value.clone()))
-        .collect()
-}
-
 fn canonicalize_browser_seed_advertisement(
     edge_url: Option<&str>,
     advertisement: &mut SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>,
 ) {
-    let Some(edge_host) = browser_seed_dns_host(edge_url) else {
+    let Some(edge_host) = edge_url.and_then(crate::deploy_settings::browser_seed_dns_host) else {
         return;
     };
     for seed in &mut advertisement.payload.payload.seeds {
-        seed.multiaddrs = canonicalize_browser_seed_urls_for_host(
+        seed.multiaddrs = crate::deploy_settings::canonicalize_browser_seed_urls_for_host(
             &edge_host,
             std::mem::take(&mut seed.multiaddrs),
         );
@@ -1498,14 +1416,14 @@ fn prefer_validated_browser_seed_advertisement(
         .seeds
         .iter()
         .flat_map(|record| record.multiaddrs.iter())
-        .any(|value| is_webrtc_direct_browser_seed(value));
+        .any(|value| crate::deploy_settings::is_webrtc_direct_browser_seed(value));
     if !has_webrtc_direct {
         return;
     }
 
     for seed in &mut payload.seeds {
         seed.multiaddrs
-            .retain(|value| is_webrtc_direct_browser_seed(value));
+            .retain(|value| crate::deploy_settings::is_webrtc_direct_browser_seed(value));
     }
     payload.seeds.retain(|seed| !seed.multiaddrs.is_empty());
     payload.transport_policy.preferred = vec![BrowserSeedTransportKind::WebRtcDirect];
@@ -1663,12 +1581,14 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_HTML_TEMPLATE, canonicalize_browser_seed_urls, fetch_optional_browser_edge_snapshot,
-        is_webrtc_direct_browser_seed, prefer_validated_browser_seed_urls,
-        resolve_browser_training_config, should_retry_edge_status, write_html_page,
-        write_site_shell,
+        INDEX_HTML_TEMPLATE, fetch_optional_browser_edge_snapshot, resolve_browser_training_config,
+        should_retry_edge_status, write_html_page, write_site_shell,
     };
     use crate::browser_site::BuildBrowserSiteArgs;
+    use crate::deploy_settings::{
+        canonicalize_browser_seed_urls, is_webrtc_direct_browser_seed,
+        prefer_validated_browser_seed_urls,
+    };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1722,7 +1642,7 @@ mod tests {
     fn browser_seed_canonicalization_rewrites_ip_direct_seed_to_edge_dns_host() {
         assert_eq!(
             canonicalize_browser_seed_urls(
-                Some("https://edge.dragon.aberration.technology"),
+                "https://edge.dragon.aberration.technology",
                 vec!["/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiAbc".to_owned(),],
             ),
             vec![
@@ -1739,7 +1659,7 @@ mod tests {
     fn browser_seed_canonicalization_preserves_signed_ip_fallback() {
         assert_eq!(
             canonicalize_browser_seed_urls(
-                Some("https://edge.dragon.aberration.technology"),
+                "https://edge.dragon.aberration.technology",
                 vec![
                     "/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/uEiAbc"
                         .to_owned(),

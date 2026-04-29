@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
 use burn::backend::NdArray;
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::record::{
+    BinBytesRecorder, FullPrecisionSettings, HalfPrecisionSettings, NamedMpkBytesRecorder, Recorder,
+};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
@@ -14,14 +17,16 @@ use burn_dragon_core::DragonModel;
 use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
-    ArtifactId, ContentId, ExperimentId, ExperimentScope, RevisionId, StudyId, WorkloadId,
-    WorkloadTrainingContribution, WorkloadTrainingLease,
+    ArtifactId, ArtifactKind, ChunkingScheme, ContentId, ExperimentId, ExperimentScope, HeadId,
+    Precision, RevisionId, StudyId, WorkloadId, WorkloadTrainingArtifact,
+    WorkloadTrainingArtifactChunk, WorkloadTrainingContribution, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
     BrowserCapabilityReport, BrowserRuntimeRole, BrowserSessionRuntimeConfig,
     BrowserSessionRuntimeError, BrowserSessionRuntimeHandle, BrowserSessionState,
     BrowserTrainingBudget, BrowserTrainingPlan,
 };
+use burn_p2p_checkpoint::{ArtifactBuildSpec, build_artifact_descriptor_from_bytes};
 use burn_p2p_core::codec::multihash_sha256;
 use burn_p2p_dataloader::ShardFetchManifest;
 #[cfg(feature = "wgpu")]
@@ -97,6 +102,10 @@ pub struct DragonBrowserLiveParticipantResult {
     pub receipt_submission_error: Option<String>,
     pub accepted_receipt_ids: Vec<String>,
     pub emitted_receipt_id: Option<String>,
+    #[serde(default)]
+    pub artifact_published: bool,
+    #[serde(default)]
+    pub update_announced: bool,
     pub runtime_state: Option<String>,
     pub transport: Option<String>,
 }
@@ -350,6 +359,7 @@ async fn run_browser_training_inner<TrainB, EvalB>(
 where
     TrainB: AutodiffBackend<InnerBackend = EvalB> + Clone,
     EvalB: Backend + Clone,
+    DragonModel<TrainB>: Module<TrainB>,
 {
     validate_browser_training_config(context.config)?;
     validate_live_training_backend(context.config, context.backend_kind)?;
@@ -422,6 +432,20 @@ where
     let training_started_at = Instant::now();
     info!("browser training loop starting");
     let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
+    let mut active_model_schema_hash = None;
+    if let Some(live) = live_participant.as_ref() {
+        let Some((head_id, descriptor, bytes)) = live.session_runtime.active_head_artifact_bytes()
+        else {
+            bail!("browser live training requires active head artifact bytes before training");
+        };
+        active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
+        model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
+        info!(
+            "browser training loaded active head artifact: head_id={} artifact_id={}",
+            head_id.as_str(),
+            descriptor.artifact_id.as_str(),
+        );
+    }
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
         .init();
@@ -505,6 +529,20 @@ where
     );
 
     let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
+    let published_artifact = if let Some(live) = live_participant.as_ref() {
+        let model_schema_hash = active_model_schema_hash.unwrap_or_else(|| {
+            ContentId::derive(&context.config.model_config)
+                .unwrap_or_else(|_| ContentId::new("dragon-browser-model-schema"))
+        });
+        Some(browser_training_head_artifact(
+            &context,
+            live,
+            model,
+            model_schema_hash,
+        )?)
+    } else {
+        None
+    };
     info!("browser live participant flush starting");
     let contribution = browser_training_contribution(
         &context,
@@ -519,6 +557,7 @@ where
             eval_time_ms,
             total_time_ms,
         },
+        published_artifact,
     );
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
@@ -1025,12 +1064,215 @@ struct BrowserTrainingContributionStats {
     total_time_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserBurnRecordBytesFormat {
+    Bin,
+    NamedMpk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserBurnRecordPrecision {
+    Full,
+    Half,
+}
+
+fn browser_record_bytes_format(record_format: &str) -> Result<BrowserBurnRecordBytesFormat> {
+    match record_format {
+        "burn-record:bytes-mpk" => Ok(BrowserBurnRecordBytesFormat::NamedMpk),
+        "burn-record:bytes-bin" => Ok(BrowserBurnRecordBytesFormat::Bin),
+        other => bail!("browser active head artifact format {other} is not supported"),
+    }
+}
+
+fn browser_record_precision(precision: &Precision) -> Result<BrowserBurnRecordPrecision> {
+    match precision {
+        Precision::Fp32 => Ok(BrowserBurnRecordPrecision::Full),
+        Precision::Fp16 => Ok(BrowserBurnRecordPrecision::Half),
+        other => bail!("browser active head artifact precision {other:?} is not supported"),
+    }
+}
+
+fn browser_record_precision_descriptor(precision: BrowserBurnRecordPrecision) -> Precision {
+    match precision {
+        BrowserBurnRecordPrecision::Full => Precision::Fp32,
+        BrowserBurnRecordPrecision::Half => Precision::Fp16,
+    }
+}
+
+fn browser_record_format_name(format: BrowserBurnRecordBytesFormat) -> &'static str {
+    match format {
+        BrowserBurnRecordBytesFormat::Bin => "burn-record:bytes-bin",
+        BrowserBurnRecordBytesFormat::NamedMpk => "burn-record:bytes-mpk",
+    }
+}
+
+fn encode_browser_record_bytes<B, M>(
+    module: M,
+    format: BrowserBurnRecordBytesFormat,
+    precision: BrowserBurnRecordPrecision,
+) -> Result<Vec<u8>>
+where
+    B: Backend,
+    M: Module<B>,
+{
+    match (format, precision) {
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Full) => {
+            record_browser_module::<B, M, BinBytesRecorder<FullPrecisionSettings>>(module)
+        }
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Half) => {
+            record_browser_module::<B, M, BinBytesRecorder<HalfPrecisionSettings>>(module)
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Full) => {
+            record_browser_module::<B, M, NamedMpkBytesRecorder<FullPrecisionSettings>>(module)
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Half) => {
+            record_browser_module::<B, M, NamedMpkBytesRecorder<HalfPrecisionSettings>>(module)
+        }
+    }
+}
+
+fn record_browser_module<B, M, R>(module: M) -> Result<Vec<u8>>
+where
+    B: Backend,
+    M: Module<B>,
+    R: Recorder<B, RecordArgs = (), RecordOutput = Vec<u8>, LoadArgs = Vec<u8>>,
+{
+    R::default()
+        .record(module.into_record(), ())
+        .map_err(|error| anyhow!("failed to encode browser model record: {error}"))
+}
+
+fn load_browser_record_bytes<B, M, R>(module: M, bytes: Vec<u8>, device: &B::Device) -> Result<M>
+where
+    B: Backend,
+    M: Module<B>,
+    R: Recorder<B, RecordArgs = (), RecordOutput = Vec<u8>, LoadArgs = Vec<u8>>,
+{
+    let record = R::default()
+        .load(bytes, device)
+        .map_err(|error| anyhow!("failed to decode browser model record: {error}"))?;
+    Ok(module.load_record(record))
+}
+
+fn load_browser_active_head_model<B>(
+    model: DragonModel<B>,
+    descriptor: &burn_p2p::ArtifactDescriptor,
+    bytes: Vec<u8>,
+    device: &B::Device,
+) -> Result<DragonModel<B>>
+where
+    B: Backend,
+    DragonModel<B>: Module<B>,
+{
+    let format = browser_record_bytes_format(&descriptor.record_format)?;
+    let precision = browser_record_precision(&descriptor.precision)?;
+    match (format, precision) {
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Full) => {
+            load_browser_record_bytes::<B, _, BinBytesRecorder<FullPrecisionSettings>>(
+                model, bytes, device,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Half) => {
+            load_browser_record_bytes::<B, _, BinBytesRecorder<HalfPrecisionSettings>>(
+                model, bytes, device,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Full) => {
+            load_browser_record_bytes::<B, _, NamedMpkBytesRecorder<FullPrecisionSettings>>(
+                model, bytes, device,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Half) => {
+            load_browser_record_bytes::<B, _, NamedMpkBytesRecorder<HalfPrecisionSettings>>(
+                model, bytes, device,
+            )
+        }
+    }
+}
+
+fn browser_training_head_artifact<B>(
+    context: &BrowserTrainingRunContext<'_>,
+    live: &LiveBrowserParticipantHandle,
+    model: DragonModel<B>,
+    model_schema_hash: ContentId,
+) -> Result<WorkloadTrainingArtifact>
+where
+    B: Backend,
+    DragonModel<B>: Module<B>,
+{
+    let peer_id = live
+        .session_runtime
+        .runtime
+        .storage
+        .stored_certificate_peer_id
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("browser canonical training requires an enrolled node certificate")
+        })?;
+    let base_head_id = live
+        .session_runtime
+        .runtime
+        .storage
+        .last_head_id
+        .clone()
+        .ok_or_else(|| anyhow!("browser canonical training requires a synced active head"))?;
+    let window_id = context
+        .config
+        .training_lease
+        .as_ref()
+        .map(|lease| lease.window_id.0)
+        .unwrap_or(0);
+    let head_id = HeadId::new(format!(
+        "{}-{}-browser-window-{}-{}",
+        context.config.experiment_kind.workload_slug(),
+        peer_id.as_str(),
+        window_id,
+        Utc::now().timestamp_micros()
+    ));
+    let record_format = BrowserBurnRecordBytesFormat::NamedMpk;
+    let record_precision = BrowserBurnRecordPrecision::Half;
+    let bytes = encode_browser_record_bytes::<B, _>(model, record_format, record_precision)?;
+    let descriptor = build_artifact_descriptor_from_bytes(
+        &ArtifactBuildSpec::new(
+            ArtifactKind::FullHead,
+            browser_record_precision_descriptor(record_precision),
+            model_schema_hash,
+            browser_record_format_name(record_format),
+        )
+        .with_head(head_id)
+        .with_base_head(base_head_id),
+        &bytes,
+        ChunkingScheme::new(1024 * 1024)?,
+    )
+    .map_err(|error| anyhow!("failed to materialize browser training artifact: {error}"))?;
+    let mut chunks = Vec::with_capacity(descriptor.chunks.len());
+    for chunk in &descriptor.chunks {
+        let start = usize::try_from(chunk.offset_bytes)
+            .map_err(|_| anyhow!("browser artifact chunk offset exceeded local usize"))?;
+        let len = usize::try_from(chunk.length_bytes)
+            .map_err(|_| anyhow!("browser artifact chunk length exceeded local usize"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("browser artifact chunk range overflowed"))?;
+        let chunk_bytes = bytes
+            .get(start..end)
+            .ok_or_else(|| anyhow!("browser artifact chunk range exceeded artifact bytes"))?
+            .to_vec();
+        chunks.push(WorkloadTrainingArtifactChunk {
+            chunk: chunk.clone(),
+            bytes: chunk_bytes,
+        });
+    }
+    Ok(WorkloadTrainingArtifact { descriptor, chunks })
+}
+
 fn browser_training_contribution(
     context: &BrowserTrainingRunContext<'_>,
     stats: BrowserTrainingContributionStats,
+    artifact: Option<WorkloadTrainingArtifact>,
 ) -> WorkloadTrainingContribution {
     let now = Utc::now();
-    let artifact_id = ArtifactId::new(format!(
+    let fallback_artifact_id = ArtifactId::new(format!(
         "browser-dragon-artifact-{}-{}-{}-{}",
         context.config.experiment_kind.workload_slug(),
         context.config.block_size,
@@ -1060,6 +1302,13 @@ fn browser_training_contribution(
     if let Some(eval_loss) = stats.eval_loss {
         metadata.insert("eval_loss".into(), format!("{eval_loss:.8}"));
     }
+    let artifact_id = artifact
+        .as_ref()
+        .map(|artifact| artifact.descriptor.artifact_id.clone())
+        .unwrap_or(fallback_artifact_id);
+    let base_head_id = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.descriptor.base_head_id.clone());
 
     WorkloadTrainingContribution {
         artifact_id,
@@ -1070,6 +1319,8 @@ fn browser_training_contribution(
         eval_time_ms: stats.eval_time_ms,
         total_time_ms: stats.total_time_ms,
         artifact_published: false,
+        base_head_id,
+        published_artifact: artifact,
         metadata,
     }
 }
@@ -1208,6 +1459,8 @@ async fn finish_live_browser_participant(
         receipt_submission_error: outcome.receipt_submission_error,
         accepted_receipt_ids: outcome.accepted_receipt_ids,
         emitted_receipt_id: outcome.emitted_receipt_id,
+        artifact_published: outcome.artifact_published,
+        update_announced: outcome.update_announced,
         runtime_state: outcome.runtime_state.as_ref().map(|state| state.label()),
         transport: outcome
             .transport

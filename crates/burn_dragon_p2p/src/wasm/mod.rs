@@ -1025,9 +1025,9 @@ fn dragon_training_action_state(
     }
     if local_training_pending {
         return Some(DragonTrainingActionState {
-            label: "training…",
-            detail: "running a local training window in this tab".into(),
-            enabled: false,
+            label: "stop training",
+            detail: "training continues window by window until stopped".into(),
+            enabled: true,
         });
     }
 
@@ -2607,6 +2607,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
     #[cfg(feature = "wasm-peer")]
     let local_training_pending = use_signal(|| false);
+    #[cfg(feature = "wasm-peer")]
+    let local_training_stop_requested = use_signal(|| false);
 
     {
         let config = initial_config.clone();
@@ -3399,6 +3401,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut current_view = current_view;
             let mut local_training = local_training;
             let mut local_training_pending = local_training_pending;
+            let mut local_training_stop_requested = local_training_stop_requested;
+            if *local_training_pending.read() {
+                local_training_stop_requested.set(true);
+                status.set("Stopping browser training after the current window…".into());
+                return;
+            }
             spawn(async move {
                 let release_manifest = match resolve_browser_release_manifest(
                     &next_config,
@@ -3413,22 +3421,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
-                let training = match resolve_browser_training_config(
-                    &bootstrap_config,
-                    &next_config,
-                    edge_snapshot.as_ref(),
-                    signed_seed_advertisement.as_ref(),
-                )
-                .await
-                {
-                    Ok(training) => training,
-                    Err(error) => {
-                        status.set(error.to_string());
-                        return;
-                    }
-                };
                 local_training_pending.set(true);
-                status.set("Running browser training…".into());
+                local_training_stop_requested.set(false);
                 let edge_base_url = match resolved_edge_base_url(&next_config) {
                     Ok(edge_base_url) => edge_base_url,
                     Err(error) => {
@@ -3437,49 +3431,90 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
-                match run_browser_training_with_release_manifest(
-                    &edge_base_url,
-                    &training,
-                    &release_manifest,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        let status_message = if result.train_loss_observed {
-                            format!(
-                                "Browser training complete: mean train loss {:.4}",
-                                result.train_loss_mean
+                let mut completed_windows = 0_u64;
+                loop {
+                    if *local_training_stop_requested.read() {
+                        break;
+                    }
+                    let training = match resolve_browser_training_config(
+                        &bootstrap_config,
+                        &next_config,
+                        edge_snapshot.as_ref(),
+                        signed_seed_advertisement.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(training) => training,
+                        Err(error) => {
+                            status.set(error.to_string());
+                            break;
+                        }
+                    };
+                    status.set(format!(
+                        "Running browser training window {}…",
+                        completed_windows.saturating_add(1)
+                    ));
+                    match run_browser_training_with_release_manifest(
+                        &edge_base_url,
+                        &training,
+                        &release_manifest,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            completed_windows = completed_windows.saturating_add(1);
+                            let status_message = if result.train_loss_observed {
+                                format!(
+                                    "Browser training window {} complete: mean train loss {:.4}",
+                                    completed_windows, result.train_loss_mean
+                                )
+                            } else {
+                                format!(
+                                    "Browser training window {} complete: WebGPU window finished",
+                                    completed_windows
+                                )
+                            };
+                            status.set(status_message);
+                            local_training.set(Some(result));
+                            if let Ok(view) = refresh_browser_app(
+                                &bootstrap_config,
+                                &next_config,
+                                edge_snapshot.as_ref(),
+                                signed_seed_advertisement.as_ref(),
                             )
-                        } else {
-                            "Browser training complete: WebGPU window finished".into()
-                        };
-                        status.set(status_message);
-                        local_training.set(Some(result));
-                        if let Ok(view) = refresh_browser_app(
-                            &bootstrap_config,
-                            &next_config,
-                            edge_snapshot.as_ref(),
-                            signed_seed_advertisement.as_ref(),
-                        )
-                        .await
-                        {
-                            current_view.set(Some(view));
+                            .await
+                            {
+                                current_view.set(Some(view));
+                            }
+                        }
+                        Err(error) => {
+                            status.set(error.to_string());
+                            if let Ok(view) = refresh_browser_app(
+                                &bootstrap_config,
+                                &next_config,
+                                edge_snapshot.as_ref(),
+                                signed_seed_advertisement.as_ref(),
+                            )
+                            .await
+                            {
+                                current_view.set(Some(view));
+                            }
+                            break;
                         }
                     }
-                    Err(error) => {
-                        status.set(error.to_string());
-                        if let Ok(view) = refresh_browser_app(
-                            &bootstrap_config,
-                            &next_config,
-                            edge_snapshot.as_ref(),
-                            signed_seed_advertisement.as_ref(),
-                        )
-                        .await
-                        {
-                            current_view.set(Some(view));
-                        }
+                    #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+                    gloo_timers::future::TimeoutFuture::new(25).await;
+                }
+                if *local_training_stop_requested.read() {
+                    if completed_windows == 0 {
+                        status.set("Browser training stopped before a window completed".into());
+                    } else {
+                        status.set(format!(
+                            "Browser training stopped after {completed_windows} window(s)"
+                        ));
                     }
                 }
+                local_training_stop_requested.set(false);
                 local_training_pending.set(false);
             });
         }
@@ -3600,12 +3635,24 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             } else {
                 "not accepted".to_owned()
             };
+            let artifact_state = if live.artifact_published {
+                "published"
+            } else {
+                "not published"
+            };
+            let update_state = if live.update_announced {
+                "announced"
+            } else {
+                "not announced"
+            };
             (
                 receipt_state,
                 live.accepted_receipt_ids.join(", "),
                 live.pending_receipt_count,
                 live.receipt_submission_error,
                 live.runtime_state.unwrap_or_else(|| "n/a".into()),
+                artifact_state,
+                update_state,
             )
         });
         rsx! {
@@ -3613,7 +3660,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 SectionHeader {
                     eyebrow: "local",
                     title: "browser training",
-                    detail: "latest local-only training window executed in this tab.",
+                    detail: "latest browser training window executed in this tab.",
                 }
                 div { class: "keyvalue-list",
                     div { class: "keyvalue-row",
@@ -3641,11 +3688,19 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         strong { "{tokens_per_second_label}" }
                     }
                 }
-                if let Some((receipt_state, accepted_receipts_label, pending_receipt_count, receipt_submission_error, runtime_state_label)) = live_training_details {
+                if let Some((receipt_state, accepted_receipts_label, pending_receipt_count, receipt_submission_error, runtime_state_label, artifact_state, update_state)) = live_training_details {
                     div { class: "keyvalue-list",
                         div { class: "keyvalue-row",
                             span { "receipt state" }
                             strong { "{receipt_state}" }
+                        }
+                        div { class: "keyvalue-row",
+                            span { "artifact" }
+                            strong { "{artifact_state}" }
+                        }
+                        div { class: "keyvalue-row",
+                            span { "p2p update" }
+                            strong { "{update_state}" }
                         }
                         div { class: "keyvalue-row",
                             span { "accepted receipts" }

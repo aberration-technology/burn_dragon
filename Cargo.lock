@@ -1935,6 +1935,7 @@ dependencies = [
  "burn_p2p_app",
  "burn_p2p_bootstrap",
  "burn_p2p_browser",
+ "burn_p2p_checkpoint",
  "burn_p2p_core",
  "burn_p2p_dataloader",
  "burn_p2p_workload",

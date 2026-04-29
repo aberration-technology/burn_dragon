@@ -617,6 +617,24 @@ function browserConfigTrainingConfig(browserConfig) {
   return null;
 }
 
+function summarizeBrowserTrainingProfile(browserConfig) {
+  const training = browserConfigTrainingConfig(browserConfig);
+  if (!training) {
+    return null;
+  }
+  return {
+    block_size: training.block_size ?? null,
+    max_train_batches: training.max_train_batches ?? null,
+    max_eval_batches: training.max_eval_batches ?? null,
+    publish_canonical_update: training.live_participant?.publish_canonical_update ?? null,
+    load_active_head_artifact: training.live_participant?.load_active_head_artifact ?? null,
+    model_n_embd: training.model_config?.n_embd ?? null,
+    model_n_head: training.model_config?.n_head ?? null,
+    model_n_layer: training.model_config?.n_layer ?? null,
+    model_language_head: training.model_config?.language_head?.type ?? null,
+  };
+}
+
 function applyBrowserTrainingCanaryProfile(browserConfig) {
   if (!EXPECT_TRAINING || !browserConfig || typeof browserConfig !== "object") {
     return browserConfig;
@@ -957,9 +975,14 @@ async function runCanary() {
     filterSignedSeedAdvertisementForTransport(signedSeedsEnvelope, TRANSPORT_MODE),
     TRANSPORT_MODE,
   );
-  const filteredBrowserConfig = applyBrowserTrainingCanaryProfile(
-    filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE),
+  const transportFilteredBrowserConfig = filterBrowserConfigForTransport(
+    browserConfig,
+    TRANSPORT_MODE,
   );
+  const productionBrowserTrainingConfig = browserConfigTrainingConfig(
+    transportFilteredBrowserConfig,
+  );
+  const filteredBrowserConfig = applyBrowserTrainingCanaryProfile(transportFilteredBrowserConfig);
   const expectedTransport = expectedConnectedTransport(
     TRANSPORT_MODE,
     filteredSignedSeedsEnvelope,
@@ -1035,6 +1058,19 @@ async function runCanary() {
       `browser config and live snapshot are missing browser training for selected experiment ${EXPERIMENT_ID}`,
     );
   }
+  if (EXPECT_TRAINING && productionBrowserTrainingConfig?.live_participant) {
+    const liveParticipant = productionBrowserTrainingConfig.live_participant;
+    if (liveParticipant.publish_canonical_update !== true) {
+      fail(
+        `production browser training is not configured to publish canonical updates for ${EXPERIMENT_ID}`,
+      );
+    }
+    if (liveParticipant.load_active_head_artifact !== true) {
+      fail(
+        `production browser training is not configured to load the active head artifact for ${EXPERIMENT_ID}`,
+      );
+    }
+  }
   if (EXPECT_TRAINING && acceptedReceiptsBeforeTraining == null) {
     fail("portal snapshot did not expose diagnostics.accepted_receipts before training");
   }
@@ -1095,27 +1131,8 @@ async function runCanary() {
     live_signed_seed_multiaddrs: liveSignedSeeds,
     signed_seed_transport_preference:
       filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
-    training_canary_profile: browserConfigTrainingConfig(filteredBrowserConfig)
-      ? {
-          block_size: browserConfigTrainingConfig(filteredBrowserConfig)?.block_size ?? null,
-          max_train_batches:
-            browserConfigTrainingConfig(filteredBrowserConfig)?.max_train_batches ?? null,
-          max_eval_batches:
-            browserConfigTrainingConfig(filteredBrowserConfig)?.max_eval_batches ?? null,
-          publish_canonical_update:
-            browserConfigTrainingConfig(filteredBrowserConfig)?.live_participant
-              ?.publish_canonical_update ?? null,
-          load_active_head_artifact:
-            browserConfigTrainingConfig(filteredBrowserConfig)?.live_participant
-              ?.load_active_head_artifact ?? null,
-          model_n_embd: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_embd ?? null,
-          model_n_head: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_head ?? null,
-          model_n_layer: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_layer ?? null,
-          model_language_head:
-            browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.language_head?.type ??
-            null,
-        }
-      : null,
+    production_training_profile: summarizeBrowserTrainingProfile(transportFilteredBrowserConfig),
+    training_canary_profile: summarizeBrowserTrainingProfile(filteredBrowserConfig),
     site_runtime_assets: siteRuntimeAssets,
     connect_clicked: false,
     training_button_visible: false,

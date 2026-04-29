@@ -488,34 +488,35 @@ mod tests {
             browser_wgpu_memory_budget_bytes: Some(16_384),
             ..crate::config::DragonCapabilityPolicy::default()
         };
+        let profile = DragonExperimentProfile {
+            version: 1,
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            native: crate::profile::DragonNativeExperimentProfile {
+                training_toml: String::new(),
+                nca_corpus_toml: None,
+            },
+            browser: Some(crate::profile::DragonBrowserExperimentProfile {
+                model_config: model_config.clone(),
+                execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
+                block_size: 8,
+                learning_rate: 1.0e-3,
+                weight_decay: 0.0,
+                batch_size: 1,
+                max_train_batches: Some(1),
+                max_eval_batches: Some(1),
+                capability_policy,
+                train_source: crate::profile::DragonBrowserProfileTokenSource::Inline {
+                    records: Vec::new(),
+                },
+                eval_source: None,
+            }),
+        };
         let bundle = build_manifest_bundle(
             &seed(),
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
-            &DragonExperimentProfile {
-                version: 1,
-                experiment_kind: DragonExperimentKind::NcaPrepretraining,
-                native: crate::profile::DragonNativeExperimentProfile {
-                    training_toml: String::new(),
-                    nca_corpus_toml: None,
-                },
-                browser: Some(crate::profile::DragonBrowserExperimentProfile {
-                    model_config: model_config.clone(),
-                    execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
-                    block_size: 8,
-                    learning_rate: 1.0e-3,
-                    weight_decay: 0.0,
-                    batch_size: 1,
-                    max_train_batches: Some(1),
-                    max_eval_batches: Some(1),
-                    capability_policy,
-                    train_source: crate::profile::DragonBrowserProfileTokenSource::Inline {
-                        records: Vec::new(),
-                    },
-                    eval_source: None,
-                }),
-            },
+            &profile,
             DatasetViewId::new("dataset-view"),
             &footprint,
             Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
@@ -527,6 +528,15 @@ mod tests {
         let entry = &bundle.experiment_directory[0];
         assert!(entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
         assert!(entry.browser_role_policy().trainer_wgpu);
+        let browser_training =
+            crate::profile::browser_training_config_from_profile(entry, &profile)
+                .expect("browser training profile")
+                .expect("browser trainer should be configured");
+        let live = browser_training
+            .live_participant
+            .expect("browser live participant config");
+        assert!(live.publish_canonical_update);
+        assert!(live.load_active_head_artifact);
     }
 
     #[test]
@@ -564,6 +574,7 @@ mod tests {
         .expect("manifest bundle");
 
         let entry = &bundle.experiment_directory[0];
+        assert_eq!(entry.training_protocol(), TrainingProtocol::ArtifactWindows);
         assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
         assert!(!entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
         assert!(!entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));

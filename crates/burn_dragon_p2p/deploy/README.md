@@ -626,7 +626,7 @@ Native peers can leave `training_config_paths` empty and rely on the published D
 
 Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
-Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. For the production `nca-r1` profile, the live browser canary verifies the browser shell, auth, seed derivation, direct WebRTC connectivity, WebGPU training start, truthful work metrics, and durable receipt submission. Sustained high-throughput capacity is still expected from operator-run native GPU peers until browser delta/artifact publication is promoted into the canonical reducer path.
+Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. Production browser profiles are expected to load the active canonical head artifact and publish canonical browser updates through the p2p artifact/update path. The live browser canary first checks those production profile flags, then applies a tiny receipt-only override so the canary can verify the browser shell, auth, seed derivation, direct WebRTC connectivity, WebGPU training start, truthful work metrics, and durable receipt submission without pushing a synthetic canary model into the main network.
 
 ## Terraform Root
 

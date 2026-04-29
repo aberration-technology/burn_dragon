@@ -434,17 +434,39 @@ where
     let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
     let mut active_model_schema_hash = None;
     if let Some(live) = live_participant.as_ref() {
-        let Some((head_id, descriptor, bytes)) = live.session_runtime.active_head_artifact_bytes()
-        else {
-            bail!("browser live training requires active head artifact bytes before training");
-        };
-        active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
-        model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
-        info!(
-            "browser training loaded active head artifact: head_id={} artifact_id={}",
-            head_id.as_str(),
-            descriptor.artifact_id.as_str(),
-        );
+        let load_active_head = context
+            .config
+            .live_participant
+            .as_ref()
+            .is_none_or(|config| config.load_active_head_artifact);
+        let publish_canonical_update = context
+            .config
+            .live_participant
+            .as_ref()
+            .is_some_and(|config| config.publish_canonical_update);
+        if publish_canonical_update && !load_active_head {
+            bail!(
+                "browser canonical artifact publication requires loading the active head artifact"
+            );
+        }
+        if load_active_head {
+            let Some((head_id, descriptor, bytes)) =
+                live.session_runtime.active_head_artifact_bytes()
+            else {
+                bail!("browser live training requires active head artifact bytes before training");
+            };
+            active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
+            model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
+            info!(
+                "browser training loaded active head artifact: head_id={} artifact_id={}",
+                head_id.as_str(),
+                descriptor.artifact_id.as_str(),
+            );
+        } else {
+            info!(
+                "browser active head artifact loading disabled for this training profile; using local initialized model"
+            );
+        }
     }
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
@@ -1307,6 +1329,15 @@ fn browser_training_contribution(
                 .is_some_and(|live| live.publish_canonical_update)
                 .to_string(),
         ),
+        (
+            "load_active_head_artifact".into(),
+            context
+                .config
+                .live_participant
+                .as_ref()
+                .is_none_or(|live| live.load_active_head_artifact)
+                .to_string(),
+        ),
         ("block_size".into(), context.config.block_size.to_string()),
         ("receipt_payload_version".into(), "browser-window-v1".into()),
     ]);
@@ -1539,6 +1570,7 @@ mod tests {
             revision_id: "dragon-revision".into(),
             workload_id: "dragon-workload".into(),
             publish_canonical_update: true,
+            load_active_head_artifact: true,
         });
 
         let shard_key = browser_shard_selection_key(
@@ -1562,6 +1594,7 @@ mod tests {
             revision_id: "dragon-revision".into(),
             workload_id: "dragon-workload".into(),
             publish_canonical_update: true,
+            load_active_head_artifact: true,
         });
 
         let configured_key =

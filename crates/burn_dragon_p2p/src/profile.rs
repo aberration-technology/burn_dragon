@@ -686,6 +686,7 @@ pub fn browser_training_config_from_profile(
             revision_id: entry.current_revision_id.as_str().to_owned(),
             workload_id: entry.workload_id.as_str().to_owned(),
             publish_canonical_update: true,
+            load_active_head_artifact: true,
         }),
     }))
 }

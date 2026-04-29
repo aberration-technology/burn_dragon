@@ -612,10 +612,17 @@ pub struct DragonBrowserLiveParticipantConfig {
     pub workload_id: String,
     #[serde(default = "default_browser_publish_canonical_update")]
     pub publish_canonical_update: bool,
+    #[serde(default = "default_browser_load_active_head_artifact")]
+    pub load_active_head_artifact: bool,
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
 fn default_browser_publish_canonical_update() -> bool {
+    true
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+fn default_browser_load_active_head_artifact() -> bool {
     true
 }
 

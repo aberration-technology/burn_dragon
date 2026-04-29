@@ -626,11 +626,38 @@ function applyBrowserTrainingCanaryProfile(browserConfig) {
   if (!training || typeof training !== "object") {
     return profiled;
   }
-  training.block_size = Math.min(Number(training.block_size ?? 128) || 128, 128);
+  training.block_size = Math.min(Number(training.block_size ?? 32) || 32, 32);
   training.max_train_batches = 1;
   training.max_eval_batches = 0;
+  if (training.model_config && typeof training.model_config === "object") {
+    training.model_config.n_embd = 16;
+    training.model_config.n_head = 1;
+    training.model_config.n_layer = 1;
+    training.model_config.n_expert = 1;
+    training.model_config.mlp_internal_dim_multiplier = 2;
+    training.model_config.language_head = { type: "standard_token_classification" };
+    if (training.model_config.mhc && typeof training.model_config.mhc === "object") {
+      training.model_config.mhc.enabled = false;
+    }
+    if (
+      training.model_config.attention_residual &&
+      typeof training.model_config.attention_residual === "object"
+    ) {
+      training.model_config.attention_residual.enabled = false;
+    }
+    if (
+      training.model_config.block_attention_residual &&
+      typeof training.model_config.block_attention_residual === "object"
+    ) {
+      training.model_config.block_attention_residual.enabled = false;
+    }
+    if (training.model_config.fused_kernels && typeof training.model_config.fused_kernels === "object") {
+      training.model_config.fused_kernels.enabled = false;
+    }
+  }
   if (training.live_participant && typeof training.live_participant === "object") {
     training.live_participant.publish_canonical_update = false;
+    training.live_participant.load_active_head_artifact = false;
   }
   return profiled;
 }
@@ -1078,6 +1105,15 @@ async function runCanary() {
           publish_canonical_update:
             browserConfigTrainingConfig(filteredBrowserConfig)?.live_participant
               ?.publish_canonical_update ?? null,
+          load_active_head_artifact:
+            browserConfigTrainingConfig(filteredBrowserConfig)?.live_participant
+              ?.load_active_head_artifact ?? null,
+          model_n_embd: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_embd ?? null,
+          model_n_head: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_head ?? null,
+          model_n_layer: browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.n_layer ?? null,
+          model_language_head:
+            browserConfigTrainingConfig(filteredBrowserConfig)?.model_config?.language_head?.type ??
+            null,
         }
       : null,
     site_runtime_assets: siteRuntimeAssets,

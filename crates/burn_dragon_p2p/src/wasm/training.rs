@@ -429,44 +429,69 @@ where
     )
     .await?;
 
+    let load_active_head = context
+        .config
+        .live_participant
+        .as_ref()
+        .is_none_or(|config| config.load_active_head_artifact);
+    let publish_canonical_update = context
+        .config
+        .live_participant
+        .as_ref()
+        .is_some_and(|config| config.publish_canonical_update);
+    if publish_canonical_update && !load_active_head {
+        bail!("browser canonical artifact publication requires loading the active head artifact");
+    }
+
+    let active_head_artifact = if load_active_head {
+        if let Some(live) = live_participant.as_mut() {
+            info!(
+                "browser active head artifact sync starting: preferred_transport=p2p fallback=edge-download-ticket"
+            );
+            let artifact = live
+                .session_runtime
+                .ensure_active_head_artifact_cached()
+                .await
+                .map_err(|error| anyhow!("browser active head artifact sync failed: {error}"))?;
+            let source = live.session_runtime.runtime.swarm_status().artifact_source;
+            info!(
+                "browser active head artifact sync complete: head_id={} artifact_id={} bytes={} source={:?}",
+                artifact.0.as_str(),
+                artifact.1.artifact_id.as_str(),
+                artifact.2.len(),
+                source,
+            );
+            Some(artifact)
+        } else {
+            None
+        }
+    } else {
+        info!(
+            "browser active head artifact loading disabled for this training profile; using local initialized model"
+        );
+        None
+    };
+
     let training_started_at = Instant::now();
     info!("browser training loop starting");
+    info!("browser model initialization starting");
     let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
+    info!("browser model initialization complete");
     let mut active_model_schema_hash = None;
-    if let Some(live) = live_participant.as_ref() {
-        let load_active_head = context
-            .config
-            .live_participant
-            .as_ref()
-            .is_none_or(|config| config.load_active_head_artifact);
-        let publish_canonical_update = context
-            .config
-            .live_participant
-            .as_ref()
-            .is_some_and(|config| config.publish_canonical_update);
-        if publish_canonical_update && !load_active_head {
-            bail!(
-                "browser canonical artifact publication requires loading the active head artifact"
-            );
-        }
-        if load_active_head {
-            let Some((head_id, descriptor, bytes)) =
-                live.session_runtime.active_head_artifact_bytes()
-            else {
-                bail!("browser live training requires active head artifact bytes before training");
-            };
-            active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
-            model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
-            info!(
-                "browser training loaded active head artifact: head_id={} artifact_id={}",
-                head_id.as_str(),
-                descriptor.artifact_id.as_str(),
-            );
-        } else {
-            info!(
-                "browser active head artifact loading disabled for this training profile; using local initialized model"
-            );
-        }
+    if let Some((head_id, descriptor, bytes)) = active_head_artifact {
+        info!(
+            "browser active head model load starting: head_id={} artifact_id={} bytes={}",
+            head_id.as_str(),
+            descriptor.artifact_id.as_str(),
+            bytes.len(),
+        );
+        active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
+        model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
+        info!(
+            "browser training loaded active head artifact: head_id={} artifact_id={}",
+            head_id.as_str(),
+            descriptor.artifact_id.as_str(),
+        );
     }
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
@@ -491,6 +516,12 @@ where
         {
             break;
         }
+        if batch_index == 0 {
+            info!(
+                "browser training first batch starting: token_count={} block_size={} batch_size={}",
+                batch.token_count, context.config.block_size, context.config.batch_size,
+            );
+        }
         let hidden = model.forward_hidden(batch.inputs);
         let loss = model.language_loss_from_hidden(hidden, batch.targets);
         if collect_loss_scalars {
@@ -506,6 +537,9 @@ where
         train_batch_count = train_batch_count.saturating_add(1);
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         model = optimizer.step(context.config.learning_rate, model, grads);
+        if batch_index == 0 {
+            info!("browser training first batch complete");
+        }
     }
     let training_time_ms = elapsed_ms(training_started_at);
     let train_batch_count = train_batch_count.max(1);

@@ -67,6 +67,38 @@ const HERO_RATTLE_FRAMES: &[&str] = &[
 ];
 const DRAGON_UI_EVENT_LIMIT: usize = 5;
 
+#[cfg(feature = "wasm-peer")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum DragonLocalTrainingState {
+    #[default]
+    Idle,
+    Starting,
+    SyncingCheckpoint,
+    TrainingWindow,
+    Stopping,
+    Failed {
+        message: String,
+    },
+    Stopped,
+}
+
+#[cfg(feature = "wasm-peer")]
+impl DragonLocalTrainingState {
+    fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::SyncingCheckpoint | Self::TrainingWindow | Self::Stopping
+        )
+    }
+
+    fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Failed { message } => Some(message.as_str()),
+            _ => None,
+        }
+    }
+}
+
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<DragonBrowserAppHandle>> = const { RefCell::new(None) };
 }
@@ -77,7 +109,7 @@ fn current_app_semver() -> semver::Version {
 
 fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
     format!(
-        "runtime={} detail={} desired_transport={:?} connected_transport={:?} direct_peers={} can_train={} assignment={} head_present={} cached_microshards={}",
+        "runtime={} detail={} desired_transport={:?} connected_transport={:?} direct_peers={} can_train={} assignment={} head_present={} head_artifact_ready={} head_artifact_source={:?} cached_microshards={}",
         view.runtime_label,
         view.runtime_detail,
         view.network.swarm_status.desired_transport,
@@ -86,6 +118,8 @@ fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
         view.training.can_train,
         view.training.active_assignment.is_some(),
         view.training.latest_head_id.is_some(),
+        view.training.active_head_artifact_ready,
+        view.training.active_head_artifact_source,
         view.training.cached_microshards,
     )
 }
@@ -115,6 +149,9 @@ fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
         "can_train": view.training.can_train,
         "assignment": view.training.active_assignment.is_some(),
         "head_present": view.training.latest_head_id.is_some(),
+        "head_artifact_ready": view.training.active_head_artifact_ready,
+        "head_artifact_source": &view.training.active_head_artifact_source,
+        "head_artifact_error": &view.training.active_head_artifact_error,
         "cached_microshards": view.training.cached_microshards,
         "last_error": active_direct_transport_error(view),
         "network_transport": &view.network.transport,
@@ -932,6 +969,7 @@ struct DragonPeerUiContext<'a> {
     browser_can_attempt_dynamic_training: bool,
     direct_transport_ready: bool,
     local_training_pending: bool,
+    local_training_failure: Option<&'a str>,
     downgrade_reason: Option<&'a str>,
     training_action_state: Option<&'a DragonTrainingActionState>,
     session_metric: Option<DragonSessionMetricView>,
@@ -997,15 +1035,20 @@ fn dragon_live_notice(
         view.training.can_train,
         view.training.active_assignment.as_ref(),
         view.training.latest_head_id.as_ref(),
+        view.training.active_head_artifact_ready,
     ) {
-        (true, None, _) => Some(DragonLiveNotice {
+        (true, None, _, _) => Some(DragonLiveNotice {
             label: "waiting",
             detail: "waiting for work".into(),
             tone: "neutral",
         }),
-        (true, Some(_), None) => Some(DragonLiveNotice {
+        (true, Some(_), None, _) | (true, Some(_), Some(_), false) => Some(DragonLiveNotice {
             label: "syncing",
-            detail: "syncing checkpoint".into(),
+            detail: view
+                .training
+                .active_head_artifact_error
+                .clone()
+                .unwrap_or_else(|| "syncing checkpoint".into()),
             tone: "neutral",
         }),
         _ => None,
@@ -1019,6 +1062,7 @@ struct DragonTrainingActionContext<'a> {
     edge_configured: bool,
     direct_transport_ready: bool,
     local_training_pending: bool,
+    local_training_failure: Option<&'a str>,
     downgrade_reason: Option<&'a str>,
 }
 
@@ -1031,6 +1075,7 @@ fn dragon_training_action_state(
         edge_configured,
         direct_transport_ready,
         local_training_pending,
+        local_training_failure,
         downgrade_reason,
     } = context;
 
@@ -1041,6 +1086,13 @@ fn dragon_training_action_state(
         return Some(DragonTrainingActionState {
             label: "stop training",
             detail: "training continues window by window until stopped".into(),
+            enabled: true,
+        });
+    }
+    if let Some(error) = local_training_failure {
+        return Some(DragonTrainingActionState {
+            label: "retry browser training",
+            detail: error.to_owned(),
             enabled: true,
         });
     }
@@ -1101,11 +1153,28 @@ fn dragon_training_action_state(
             enabled: false,
         });
     }
+    if !view.training.active_head_artifact_ready {
+        return Some(DragonTrainingActionState {
+            label: "syncing checkpoint",
+            detail: view
+                .training
+                .active_head_artifact_error
+                .clone()
+                .unwrap_or_else(|| {
+                    "fetching the active head over p2p before browser training can start".into()
+                }),
+            enabled: false,
+        });
+    }
 
     if dragon_browser_training_action_ready(Some(view), direct_transport_ready) {
         Some(DragonTrainingActionState {
             label: "run browser training",
-            detail: if view.training.cached_microshards > 0 {
+            detail: if view.training.active_head_artifact_source.as_deref() == Some("edge-fallback")
+            {
+                "manual in this tab. checkpoint is cached via edge fallback; p2p artifact serving is degraded."
+                    .into()
+            } else if view.training.cached_microshards > 0 {
                 "manual in this tab. the assigned slice is already cached for this browser peer."
                     .into()
             } else {
@@ -1203,6 +1272,7 @@ fn dragon_hero_view(context: &DragonPeerUiContext<'_>) -> DragonHeroView {
     let browser_can_attempt_dynamic_training = context.browser_can_attempt_dynamic_training;
     let direct_transport_ready = context.direct_transport_ready;
     let local_training_pending = context.local_training_pending;
+    let local_training_failure = context.local_training_failure;
     let downgrade_reason = context.downgrade_reason;
     let training_action_state = context.training_action_state;
 
@@ -1212,6 +1282,14 @@ fn dragon_hero_view(context: &DragonPeerUiContext<'_>) -> DragonHeroView {
             detail: "running a local training window in this tab".into(),
             tone: DragonHeroTone::Working,
             animate: true,
+        };
+    }
+    if let Some(error) = local_training_failure {
+        return DragonHeroView {
+            label: "training failed".into(),
+            detail: error.to_owned(),
+            tone: DragonHeroTone::Blocked,
+            animate: false,
         };
     }
     if auth_bootstrap_pending {
@@ -1382,6 +1460,7 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
     let browser_can_attempt_dynamic_training = context.browser_can_attempt_dynamic_training;
     let direct_transport_ready = context.direct_transport_ready;
     let local_training_pending = context.local_training_pending;
+    let local_training_failure = context.local_training_failure;
     let downgrade_reason = context.downgrade_reason;
     let training_action_state = context.training_action_state;
 
@@ -1432,13 +1511,16 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
         None => DragonStepStatus::Waiting,
     };
     let checkpoint_status = match view {
-        Some(view) if view.training.latest_head_id.is_some() => DragonStepStatus::Done,
+        Some(view) if view.training.active_head_artifact_ready => DragonStepStatus::Done,
+        Some(view) if view.training.latest_head_id.is_some() => DragonStepStatus::Active,
         Some(view) if view.training.active_assignment.is_some() => DragonStepStatus::Active,
         Some(_) => DragonStepStatus::Waiting,
         None => DragonStepStatus::Waiting,
     };
     let training_status = if local_training_pending {
         DragonStepStatus::Active
+    } else if local_training_failure.is_some() {
+        DragonStepStatus::Blocked
     } else if training_action_state.is_some_and(|state| state.enabled) {
         DragonStepStatus::Done
     } else if view.is_some_and(|view| view.runtime_label == "blocked")
@@ -1511,8 +1593,16 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
             label: "checkpoint",
             status: checkpoint_status,
             detail: match checkpoint_status {
-                DragonStepStatus::Done => "checkpoint synced".into(),
-                DragonStepStatus::Active => "syncing checkpoint".into(),
+                DragonStepStatus::Done => match view
+                    .and_then(|view| view.training.active_head_artifact_source.as_deref())
+                {
+                    Some("p2p") => "checkpoint synced over p2p".into(),
+                    Some("edge-fallback") => "checkpoint synced via edge fallback".into(),
+                    _ => "checkpoint synced".into(),
+                },
+                DragonStepStatus::Active => view
+                    .and_then(|view| view.training.active_head_artifact_error.clone())
+                    .unwrap_or_else(|| "syncing checkpoint over p2p".into()),
                 DragonStepStatus::Blocked => "checkpoint unavailable".into(),
                 DragonStepStatus::Waiting => "checkpoint pending".into(),
             },
@@ -1524,7 +1614,9 @@ fn dragon_readiness_steps(context: &DragonPeerUiContext<'_>) -> Vec<DragonReadin
             detail: match training_status {
                 DragonStepStatus::Done => "ready".into(),
                 DragonStepStatus::Active => "training".into(),
-                DragonStepStatus::Blocked => training_block_detail,
+                DragonStepStatus::Blocked => local_training_failure
+                    .map(str::to_owned)
+                    .unwrap_or(training_block_detail),
                 DragonStepStatus::Waiting => "not ready yet".into(),
             },
         },
@@ -1873,7 +1965,9 @@ fn dragon_browser_training_action_ready(
     if view.runtime_label.starts_with("joining ") || view.runtime_label == "blocked" {
         return false;
     }
-    view.training.active_assignment.is_some() && view.training.latest_head_id.is_some()
+    view.training.active_assignment.is_some()
+        && view.training.latest_head_id.is_some()
+        && view.training.active_head_artifact_ready
 }
 
 fn dragon_window_summary(
@@ -2620,7 +2714,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     #[cfg(feature = "wasm-peer")]
     let local_training = use_signal(|| None::<DragonBrowserTrainingResult>);
     #[cfg(feature = "wasm-peer")]
-    let local_training_pending = use_signal(|| false);
+    let local_training_state = use_signal(DragonLocalTrainingState::default);
     #[cfg(feature = "wasm-peer")]
     let local_training_stop_requested = use_signal(|| false);
 
@@ -3259,9 +3353,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let show_public_retry =
         !auth_bootstrap_pending_active && callback_available && !status_message.is_empty();
     #[cfg(feature = "wasm-peer")]
-    let local_training_pending_active = *local_training_pending.read();
+    let local_training_state_active = local_training_state.read().clone();
+    #[cfg(feature = "wasm-peer")]
+    let local_training_pending_active = local_training_state_active.is_active();
+    #[cfg(feature = "wasm-peer")]
+    let local_training_failure = local_training_state_active
+        .failure_message()
+        .map(str::to_owned);
     #[cfg(not(feature = "wasm-peer"))]
     let local_training_pending_active = false;
+    #[cfg(not(feature = "wasm-peer"))]
+    let local_training_failure: Option<String> = None;
     let direct_transport_ready = view
         .as_ref()
         .is_some_and(|view| view.network.direct_peers > 0);
@@ -3272,6 +3374,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         edge_configured,
         direct_transport_ready,
         local_training_pending: local_training_pending_active,
+        local_training_failure: local_training_failure.as_deref(),
         downgrade_reason: browser_downgrade_reason.as_deref(),
     });
     let peer_ui_context = DragonPeerUiContext {
@@ -3285,6 +3388,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         browser_can_attempt_dynamic_training,
         direct_transport_ready,
         local_training_pending: local_training_pending_active,
+        local_training_failure: local_training_failure.as_deref(),
         downgrade_reason: browser_downgrade_reason.as_deref(),
         training_action_state: training_action_state.as_ref(),
         session_metric: session_metric_view,
@@ -3414,14 +3518,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut status = status;
             let mut current_view = current_view;
             let mut local_training = local_training;
-            let mut local_training_pending = local_training_pending;
+            let mut local_training_state = local_training_state;
             let mut local_training_stop_requested = local_training_stop_requested;
-            if *local_training_pending.read() {
+            if local_training_state.read().is_active() {
                 local_training_stop_requested.set(true);
+                local_training_state.set(DragonLocalTrainingState::Stopping);
                 status.set("Stopping browser training after the current window…".into());
                 return;
             }
             spawn(async move {
+                local_training_state.set(DragonLocalTrainingState::Starting);
                 let release_manifest = match resolve_browser_release_manifest(
                     &next_config,
                     release_manifest.as_ref(),
@@ -3431,25 +3537,31 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(release_manifest) => release_manifest,
                     Err(error) => {
-                        status.set(error.to_string());
+                        let message = error.to_string();
+                        error!("browser training start failed: {message}");
+                        status.set(message.clone());
+                        local_training_state.set(DragonLocalTrainingState::Failed { message });
                         return;
                     }
                 };
-                local_training_pending.set(true);
                 local_training_stop_requested.set(false);
                 let edge_base_url = match resolved_edge_base_url(&next_config) {
                     Ok(edge_base_url) => edge_base_url,
                     Err(error) => {
-                        local_training_pending.set(false);
-                        status.set(error.to_string());
+                        let message = error.to_string();
+                        error!("browser training edge resolution failed: {message}");
+                        status.set(message.clone());
+                        local_training_state.set(DragonLocalTrainingState::Failed { message });
                         return;
                     }
                 };
                 let mut completed_windows = 0_u64;
+                let mut failed = false;
                 loop {
                     if *local_training_stop_requested.read() {
                         break;
                     }
+                    local_training_state.set(DragonLocalTrainingState::SyncingCheckpoint);
                     let training = match resolve_browser_training_config(
                         &bootstrap_config,
                         &next_config,
@@ -3460,14 +3572,17 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     {
                         Ok(training) => training,
                         Err(error) => {
-                            status.set(error.to_string());
+                            let message = error.to_string();
+                            error!("browser training config resolution failed: {message}");
+                            status.set(message.clone());
+                            local_training_state.set(DragonLocalTrainingState::Failed { message });
+                            failed = true;
                             break;
                         }
                     };
-                    status.set(format!(
-                        "Running browser training window {}…",
-                        completed_windows.saturating_add(1)
-                    ));
+                    let next_window = completed_windows.saturating_add(1);
+                    local_training_state.set(DragonLocalTrainingState::TrainingWindow);
+                    status.set(format!("Running browser training window {}…", next_window));
                     match run_browser_training_with_release_manifest(
                         &edge_base_url,
                         &training,
@@ -3502,7 +3617,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             }
                         }
                         Err(error) => {
-                            status.set(error.to_string());
+                            let message = error.to_string();
+                            error!("browser training window failed: {message}");
+                            status.set(message.clone());
+                            local_training_state.set(DragonLocalTrainingState::Failed { message });
                             if let Ok(view) = refresh_browser_app(
                                 &bootstrap_config,
                                 &next_config,
@@ -3513,6 +3631,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             {
                                 current_view.set(Some(view));
                             }
+                            failed = true;
                             break;
                         }
                     }
@@ -3520,6 +3639,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     gloo_timers::future::TimeoutFuture::new(25).await;
                 }
                 if *local_training_stop_requested.read() {
+                    local_training_state.set(DragonLocalTrainingState::Stopped);
                     if completed_windows == 0 {
                         status.set("Browser training stopped before a window completed".into());
                     } else {
@@ -3527,9 +3647,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             "Browser training stopped after {completed_windows} window(s)"
                         ));
                     }
+                } else if !failed {
+                    local_training_state.set(DragonLocalTrainingState::Idle);
                 }
                 local_training_stop_requested.set(false);
-                local_training_pending.set(false);
             });
         }
     };
@@ -4563,6 +4684,9 @@ mod tests {
                 active_training_lease: None,
                 slice_status: "pending".into(),
                 latest_head_id: None,
+                active_head_artifact_ready: false,
+                active_head_artifact_source: None,
+                active_head_artifact_error: None,
                 cached_chunk_artifacts: 0,
                 cached_microshards: 0,
                 pending_receipts: 0,
@@ -4608,6 +4732,7 @@ mod tests {
             edge_configured: true,
             direct_transport_ready: true,
             local_training_pending: false,
+            local_training_failure: None,
             downgrade_reason: None,
         }
     }
@@ -4723,6 +4848,8 @@ mod tests {
         assert_eq!(checkpoint_notice.detail, "syncing checkpoint");
 
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         assert!(dragon_live_notice(Some(&view), false).is_none());
     }
 
@@ -4743,6 +4870,10 @@ mod tests {
         assert!(!dragon_browser_training_action_ready(Some(&view), true));
 
         view.training.latest_head_id = Some("head-1".into());
+        assert!(!dragon_browser_training_action_ready(Some(&view), true));
+
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         assert!(dragon_browser_training_action_ready(Some(&view), true));
         assert!(dragon_live_notice(Some(&view), false).is_none());
     }
@@ -4752,6 +4883,8 @@ mod tests {
         let mut view = sample_browser_view();
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         view.runtime_label = "joining train".into();
         view.runtime_detail = "syncing checkpoint before training".into();
 
@@ -4769,6 +4902,8 @@ mod tests {
         view.network.direct_peers = 2;
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         view.training.cached_microshards = 2;
         view.training.last_window_secs = Some(9);
         view.training.max_window_secs = Some(30);
@@ -4809,6 +4944,8 @@ mod tests {
         );
 
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         view.training.max_window_secs = Some(30);
         assert_eq!(dragon_slice_progress_summary(Some(&view)), "loads on run");
         assert_eq!(dragon_window_summary(Some(&view), false), "30s max");
@@ -4959,6 +5096,8 @@ mod tests {
         view.training.can_train = true;
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
 
         let ready = dragon_training_action_state(ready_training_action_context(&view))
             .expect("ready training state");
@@ -4974,6 +5113,8 @@ mod tests {
         view.network.swarm_status.connected_transport = Some(BrowserTransportFamily::WebRtcDirect);
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         view.training.cached_microshards = 4;
         let action = dragon_training_action_state(ready_training_action_context(&view));
 
@@ -4988,6 +5129,7 @@ mod tests {
             browser_can_attempt_dynamic_training: true,
             direct_transport_ready: true,
             local_training_pending: false,
+            local_training_failure: None,
             downgrade_reason: None,
             training_action_state: action.as_ref(),
             session_metric: None,
@@ -5029,6 +5171,7 @@ mod tests {
             browser_can_attempt_dynamic_training: true,
             direct_transport_ready: false,
             local_training_pending: false,
+            local_training_failure: None,
             downgrade_reason: None,
             training_action_state: action.as_ref(),
             session_metric: None,
@@ -5071,6 +5214,7 @@ mod tests {
             browser_can_attempt_dynamic_training: true,
             direct_transport_ready: true,
             local_training_pending: false,
+            local_training_failure: None,
             downgrade_reason: Some(downgrade_reason),
             training_action_state: action.as_ref(),
             session_metric: None,
@@ -5118,6 +5262,7 @@ mod tests {
             browser_can_attempt_dynamic_training: true,
             direct_transport_ready: true,
             local_training_pending: false,
+            local_training_failure: None,
             downgrade_reason: Some(downgrade_reason),
             training_action_state: blocked_action.as_ref(),
             session_metric: None,
@@ -5271,6 +5416,8 @@ mod tests {
         view.training.can_train = true;
         view.training.active_assignment = Some("assignment-1".into());
         view.training.latest_head_id = Some("head-1".into());
+        view.training.active_head_artifact_ready = true;
+        view.training.active_head_artifact_source = Some("p2p".into());
         let ready_training_action =
             dragon_training_action_state(ready_training_action_context(&view));
 

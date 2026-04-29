@@ -610,6 +610,13 @@ pub struct DragonBrowserLiveParticipantConfig {
     pub experiment_id: String,
     pub revision_id: String,
     pub workload_id: String,
+    #[serde(default = "default_browser_publish_canonical_update")]
+    pub publish_canonical_update: bool,
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+fn default_browser_publish_canonical_update() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

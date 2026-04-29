@@ -617,6 +617,24 @@ function browserConfigTrainingConfig(browserConfig) {
   return null;
 }
 
+function applyBrowserTrainingCanaryProfile(browserConfig) {
+  if (!EXPECT_TRAINING || !browserConfig || typeof browserConfig !== "object") {
+    return browserConfig;
+  }
+  const profiled = JSON.parse(JSON.stringify(browserConfig));
+  const training = browserConfigTrainingConfig(profiled);
+  if (!training || typeof training !== "object") {
+    return profiled;
+  }
+  training.block_size = Math.min(Number(training.block_size ?? 128) || 128, 128);
+  training.max_train_batches = 1;
+  training.max_eval_batches = 0;
+  if (training.live_participant && typeof training.live_participant === "object") {
+    training.live_participant.publish_canonical_update = false;
+  }
+  return profiled;
+}
+
 function snapshotAllowsBrowserTraining(snapshot, experimentId) {
   if (!snapshot || !experimentId) {
     return false;
@@ -912,7 +930,9 @@ async function runCanary() {
     filterSignedSeedAdvertisementForTransport(signedSeedsEnvelope, TRANSPORT_MODE),
     TRANSPORT_MODE,
   );
-  const filteredBrowserConfig = filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE);
+  const filteredBrowserConfig = applyBrowserTrainingCanaryProfile(
+    filterBrowserConfigForTransport(browserConfig, TRANSPORT_MODE),
+  );
   const expectedTransport = expectedConnectedTransport(
     TRANSPORT_MODE,
     filteredSignedSeedsEnvelope,
@@ -1048,6 +1068,18 @@ async function runCanary() {
     live_signed_seed_multiaddrs: liveSignedSeeds,
     signed_seed_transport_preference:
       filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
+    training_canary_profile: browserConfigTrainingConfig(filteredBrowserConfig)
+      ? {
+          block_size: browserConfigTrainingConfig(filteredBrowserConfig)?.block_size ?? null,
+          max_train_batches:
+            browserConfigTrainingConfig(filteredBrowserConfig)?.max_train_batches ?? null,
+          max_eval_batches:
+            browserConfigTrainingConfig(filteredBrowserConfig)?.max_eval_batches ?? null,
+          publish_canonical_update:
+            browserConfigTrainingConfig(filteredBrowserConfig)?.live_participant
+              ?.publish_canonical_update ?? null,
+        }
+      : null,
     site_runtime_assets: siteRuntimeAssets,
     connect_clicked: false,
     training_button_visible: false,
@@ -1393,9 +1425,14 @@ async function runCanary() {
     await page.waitForFunction(
       () =>
         document.body.innerText.includes("Browser training complete:") ||
+        document.body.innerText.includes("Browser training window") ||
         document.body.innerText.includes("train loss"),
       { timeout: TRAIN_TIMEOUT_MS },
     );
+    await captureLiveStatus();
+    if (report.training_button_enabled && report.training_button_label === "stop training") {
+      await trainActionButton.click().catch(() => {});
+    }
     report.durable_receipt_snapshot = await waitForDurableReceiptCount(
       acceptedReceiptIds,
       acceptedReceiptsBeforeTraining,

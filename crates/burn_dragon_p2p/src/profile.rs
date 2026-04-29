@@ -685,6 +685,7 @@ pub fn browser_training_config_from_profile(
             experiment_id: entry.experiment_id.as_str().to_owned(),
             revision_id: entry.current_revision_id.as_str().to_owned(),
             workload_id: entry.workload_id.as_str().to_owned(),
+            publish_canonical_update: true,
         }),
     }))
 }

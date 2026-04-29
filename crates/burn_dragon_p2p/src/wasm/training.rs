@@ -529,17 +529,29 @@ where
     );
 
     let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
+    let publish_canonical_update = context
+        .config
+        .live_participant
+        .as_ref()
+        .is_some_and(|live| live.publish_canonical_update);
     let published_artifact = if let Some(live) = live_participant.as_ref() {
-        let model_schema_hash = active_model_schema_hash.unwrap_or_else(|| {
-            ContentId::derive(&context.config.model_config)
-                .unwrap_or_else(|_| ContentId::new("dragon-browser-model-schema"))
-        });
-        Some(browser_training_head_artifact(
-            &context,
-            live,
-            model,
-            model_schema_hash,
-        )?)
+        if !publish_canonical_update {
+            info!(
+                "browser canonical artifact publication disabled for this training profile; submitting receipt only"
+            );
+            None
+        } else {
+            let model_schema_hash = active_model_schema_hash.unwrap_or_else(|| {
+                ContentId::derive(&context.config.model_config)
+                    .unwrap_or_else(|_| ContentId::new("dragon-browser-model-schema"))
+            });
+            Some(browser_training_head_artifact(
+                &context,
+                live,
+                model,
+                model_schema_hash,
+            )?)
+        }
     } else {
         None
     };
@@ -1286,6 +1298,15 @@ fn browser_training_contribution(
             "experiment_kind".into(),
             context.config.experiment_kind.workload_slug().into(),
         ),
+        (
+            "publish_canonical_update".into(),
+            context
+                .config
+                .live_participant
+                .as_ref()
+                .is_some_and(|live| live.publish_canonical_update)
+                .to_string(),
+        ),
         ("block_size".into(), context.config.block_size.to_string()),
         ("receipt_payload_version".into(), "browser-window-v1".into()),
     ]);
@@ -1517,6 +1538,7 @@ mod tests {
             experiment_id: "dragon-experiment".into(),
             revision_id: "dragon-revision".into(),
             workload_id: "dragon-workload".into(),
+            publish_canonical_update: true,
         });
 
         let shard_key = browser_shard_selection_key(
@@ -1539,6 +1561,7 @@ mod tests {
             experiment_id: "dragon-experiment".into(),
             revision_id: "dragon-revision".into(),
             workload_id: "dragon-workload".into(),
+            publish_canonical_update: true,
         });
 
         let configured_key =

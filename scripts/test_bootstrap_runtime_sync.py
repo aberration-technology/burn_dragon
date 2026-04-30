@@ -29,7 +29,7 @@ def base_env() -> dict[str, str]:
         "HEAD_MIRROR_AUTH_SCRIPT_OBJECT_URI": "s3://bucket/runtime/fetch-head-mirror-auth",
         "HEAD_MIRROR_SERVICE_OBJECT_URI": "s3://bucket/runtime/head-mirror.service",
         "BOOTSTRAP_INSTALL_SOURCE": "crate",
-        "BOOTSTRAP_CRATE_VERSION": "0.21.0-pre.48",
+        "BOOTSTRAP_CRATE_VERSION": "0.21.0-pre.49",
         "BOOTSTRAP_GIT_REPOSITORY": "https://github.com/aberration-technology/burn_p2p.git",
         "BOOTSTRAP_GIT_REF": "deadbeef",
         "BOOTSTRAP_FEATURES": "admin-http,metrics,browser-edge,auth-github",
@@ -66,7 +66,7 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         commands = module.generate_commands(base_env())
         joined = "\n".join(commands)
         self.assertIn("cargo install --locked burn_p2p_bootstrap", joined)
-        self.assertIn("--version '0.21.0-pre.48'", joined)
+        self.assertIn("--version '0.21.0-pre.49'", joined)
         self.assertIn(
             "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
             joined,

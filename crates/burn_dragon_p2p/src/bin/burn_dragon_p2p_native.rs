@@ -72,6 +72,7 @@ const DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STATUS_INTERVAL_SECS: u64 = 30;
 const DEFAULT_VALIDATION_INTERVAL_MILLIS: u64 = 250;
 const DEFAULT_HEAD_SYNC_INTERVAL_SECS: u64 = 15;
+const EDGE_HEAD_ARTIFACT_MIRROR_TIMEOUT_MILLIS: u64 = 10 * 60 * 1000;
 const NATIVE_AUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const NATIVE_AUTH_CALLBACK_MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const NATIVE_AUTH_CALLBACK_MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
@@ -2972,7 +2973,7 @@ fn register_live_head_with_edge(
             burn_p2p_publish::PeerArtifactMirrorRequest {
                 artifact_id: announcement.head.artifact_id.clone(),
                 provider_peer_ids: vec![provider_peer_id.clone()],
-                timeout_ms: Some(45_000),
+                timeout_ms: Some(EDGE_HEAD_ARTIFACT_MIRROR_TIMEOUT_MILLIS),
             },
         ))
         .with_context(|| {

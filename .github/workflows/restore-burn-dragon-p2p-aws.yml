@@ -45,9 +45,9 @@ on:
           - crate
           - git
       bootstrap_version:
-        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.51`."
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.52`."
         required: false
-        default: 0.21.0-pre.51
+        default: 0.21.0-pre.52
         type: string
       bootstrap_git_ref:
         description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
@@ -963,8 +963,11 @@ jobs:
               ;;
           esac
 
+          diagnostics_timeout_secs=90
           for attempt in $(seq 1 80); do
-            if "${DRAGON_NATIVE_BINARY}" \
+            rm -f "$report_path"
+            if timeout --foreground "${diagnostics_timeout_secs}s" \
+              "${DRAGON_NATIVE_BINARY}" \
               deployment-diagnostics \
               --config "$config_path" \
               --experiment-kind nca \

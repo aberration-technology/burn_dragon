@@ -2700,13 +2700,13 @@ where
             experiment_entry.experiment_id.clone(),
             experiment_entry.current_revision_id.clone(),
         );
-        let mut mirrored_head_id = None;
+        let mut served_head_id = None;
         let _ = sync_or_initialize_head_provider(
             &mut running,
             &experiment,
             initialize_head_on_start,
             restore_head_on_start,
-            &mut mirrored_head_id,
+            &mut served_head_id,
             "peer",
         )?;
     }
@@ -2735,7 +2735,7 @@ where
             None
         };
     let head_sync_interval = Duration::from_secs(head_sync_interval_secs.max(1));
-    let mut mirrored_head_id = None;
+    let mut served_head_id = None;
     let mut last_head_sync = Instant::now()
         .checked_sub(head_sync_interval)
         .unwrap_or_else(Instant::now);
@@ -2750,7 +2750,7 @@ where
                 experiment,
                 initialize_head_on_start,
                 restore_head_on_start,
-                &mut mirrored_head_id,
+                &mut served_head_id,
                 "peer",
             )?;
             last_head_sync = Instant::now();
@@ -2843,13 +2843,13 @@ where
             experiment_entry.experiment_id,
             experiment_entry.current_revision_id,
         );
-        let mut mirrored_head_id = None;
+        let mut served_head_id = None;
         let base_head = sync_or_initialize_head_provider(
             &mut running,
             &experiment,
             options.initialize_head_on_start,
             options.restore_head_on_start,
-            &mut mirrored_head_id,
+            &mut served_head_id,
             "trainer",
         )?
         .ok_or_else(|| {
@@ -2912,7 +2912,7 @@ fn sync_or_initialize_head_provider<B>(
     experiment: &burn_p2p::ExperimentHandle,
     initialize_head_on_start: bool,
     restore_head_on_start: bool,
-    mirrored_head_id: &mut Option<burn_p2p::HeadId>,
+    served_head_id: &mut Option<burn_p2p::HeadId>,
     log_prefix: &str,
 ) -> Result<Option<burn_p2p::HeadDescriptor>>
 where
@@ -2942,13 +2942,13 @@ where
     // browser peers can always discover at least one live provider.
     running.publish_head_provider(experiment, &head)?;
 
-    if mirrored_head_id.as_ref() != Some(&head.head_id) {
+    if served_head_id.as_ref() != Some(&head.head_id) {
         eprintln!(
-            "{log_prefix}-mirroring head id={} global_step={}",
+            "{log_prefix}-serving head id={} global_step={}",
             head.head_id.as_str(),
             head.global_step,
         );
-        *mirrored_head_id = Some(head.head_id.clone());
+        *served_head_id = Some(head.head_id.clone());
     }
 
     Ok(Some(head))
@@ -2961,31 +2961,45 @@ fn register_live_head_with_edge(
     directory_template: &ExperimentDirectoryEntry,
     announcement: &HeadAnnouncement,
 ) -> Result<()> {
-    let _ = runtime.block_on(register_live_head(
-        edge_base_url,
-        session_id,
-        announcement.clone(),
-    ))?;
-    if let Some(provider_peer_id) = announcement.provider_peer_id.as_ref() {
-        match runtime.block_on(mirror_peer_artifact(
+    let provider_peer_id = announcement
+        .provider_peer_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("live head registration requires a provider peer id"))?;
+    let mirror = runtime
+        .block_on(mirror_peer_artifact(
             edge_base_url,
             session_id,
             burn_p2p_publish::PeerArtifactMirrorRequest {
                 artifact_id: announcement.head.artifact_id.clone(),
                 provider_peer_ids: vec![provider_peer_id.clone()],
-                timeout_ms: Some(20_000),
+                timeout_ms: Some(45_000),
             },
-        )) {
-            Ok(mirror) => eprintln!(
-                "head-mirror-edge-artifact-mirrored artifact_id={} provider={} bytes={} chunks={}",
-                mirror.artifact_id.as_str(),
-                mirror.mirrored_from.as_str(),
-                mirror.bytes_len,
-                mirror.chunk_count,
-            ),
-            Err(error) => eprintln!("head-mirror-edge-artifact-mirror-failed: {error}"),
-        }
-    }
+        ))
+        .with_context(|| {
+            format!(
+                "failed to mirror head artifact {} from provider {} before live head registration",
+                announcement.head.artifact_id.as_str(),
+                provider_peer_id.as_str()
+            )
+        })?;
+    eprintln!(
+        "head-mirror-edge-artifact-mirrored artifact_id={} provider={} bytes={} chunks={}",
+        mirror.artifact_id.as_str(),
+        mirror.mirrored_from.as_str(),
+        mirror.bytes_len,
+        mirror.chunk_count,
+    );
+
+    let _ = runtime.block_on(register_live_head(
+        edge_base_url,
+        session_id,
+        announcement.clone(),
+    ))?;
+    eprintln!(
+        "head-mirror-edge-head-registered head_id={} provider={}",
+        announcement.head.head_id.as_str(),
+        provider_peer_id.as_str(),
+    );
     let mut directory_entries =
         runtime.block_on(fetch_signed_directory_entries(edge_base_url, session_id))?;
     if upsert_directory_entry_current_head(
@@ -2998,6 +3012,10 @@ fn register_live_head_with_edge(
             session_id,
             directory_entries,
         ))?;
+        eprintln!(
+            "head-mirror-edge-directory-updated head_id={}",
+            announcement.head.head_id.as_str(),
+        );
     }
     Ok(())
 }
@@ -3085,7 +3103,8 @@ where
     let mut last_head_sync = Instant::now()
         .checked_sub(head_sync_interval)
         .unwrap_or_else(Instant::now);
-    let mut mirrored_head_id = None;
+    let mut served_head_id = None;
+    let mut edge_mirrored_head_id = None;
 
     loop {
         if last_head_sync.elapsed() >= head_sync_interval {
@@ -3094,7 +3113,7 @@ where
                 &experiment,
                 initialize_head_on_start,
                 restore_head_on_start,
-                &mut mirrored_head_id,
+                &mut served_head_id,
                 "head-mirror",
             )?;
             if let (Some(head), Some((registration_runtime, edge_base_url, session_id))) =
@@ -3116,6 +3135,8 @@ where
                         &announcement,
                     ) {
                         eprintln!("head-mirror-edge-registration-failed: {error}");
+                    } else {
+                        edge_mirrored_head_id = Some(head.head_id.clone());
                     }
                 }
             }
@@ -3125,11 +3146,15 @@ where
         let snapshot = running.snapshot();
         if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
             eprintln!(
-                "head-mirror-status status={:?} node_state={:?} connected_peers={} mirrored_head={} last_error={}",
+                "head-mirror-status status={:?} node_state={:?} connected_peers={} served_head={} edge_mirrored_head={} last_error={}",
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
-                mirrored_head_id
+                served_head_id
+                    .as_ref()
+                    .map(|head_id| head_id.as_str())
+                    .unwrap_or("-"),
+                edge_mirrored_head_id
                     .as_ref()
                     .map(|head_id| head_id.as_str())
                     .unwrap_or("-"),
@@ -3383,10 +3408,13 @@ fn infer_format(path: &Path) -> Result<ConfigFormat> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     use burn_p2p::{
-        AuthProvider, EdgeEnrollmentConfig, ExperimentId, NodeCertificate, NodeCertificateClaims,
-        PeerId, PeerRole, PrincipalClaims, PrincipalSession, ProjectFamilyId, RevocationEpoch,
+        AuthProvider, DatasetViewId, EdgeEnrollmentConfig, ExperimentId, ExperimentOptInPolicy,
+        ExperimentResourceRequirements, ExperimentVisibility, NodeCertificate,
+        NodeCertificateClaims, OverlayTopic, PeerId, PeerRole, PrincipalClaims, PrincipalSession,
+        ProjectFamilyId, RevisionId, RevocationEpoch, StudyId, WorkloadId,
     };
     use burn_p2p_core::{SignatureAlgorithm, SignatureMetadata};
     use chrono::Utc;
@@ -3503,6 +3531,85 @@ mod tests {
         Ok(response)
     }
 
+    fn test_experiment_entry() -> ExperimentDirectoryEntry {
+        ExperimentDirectoryEntry {
+            network_id: NetworkId::new("burn-dragon-mainnet"),
+            study_id: StudyId::new("burn-dragon-mainnet"),
+            experiment_id: ExperimentId::new("nca-prepretraining"),
+            workload_id: WorkloadId::new("dragon-nca-prepretraining-cpu"),
+            display_name: "NCA".into(),
+            model_schema_hash: ContentId::new("schema"),
+            dataset_view_id: DatasetViewId::new("dataset"),
+            resource_requirements: ExperimentResourceRequirements {
+                minimum_roles: BTreeSet::new(),
+                minimum_device_memory_bytes: None,
+                minimum_system_memory_bytes: Some(1),
+                estimated_download_bytes: 1,
+                estimated_window_seconds: 30,
+            },
+            visibility: ExperimentVisibility::Public,
+            opt_in_policy: ExperimentOptInPolicy::Open,
+            current_revision_id: RevisionId::new("nca-r1"),
+            current_head_id: None,
+            allowed_roles: PeerRoleSet::new([PeerRole::TrainerCpu]),
+            allowed_scopes: BTreeSet::from([ExperimentScope::Connect]),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn test_head_announcement(provider_peer_id: Option<PeerId>) -> HeadAnnouncement {
+        HeadAnnouncement {
+            overlay: OverlayTopic::control(NetworkId::new("burn-dragon-mainnet")),
+            provider_peer_id,
+            head: burn_p2p::HeadDescriptor {
+                head_id: burn_p2p::HeadId::new("head-1"),
+                study_id: StudyId::new("burn-dragon-mainnet"),
+                experiment_id: ExperimentId::new("nca-prepretraining"),
+                revision_id: RevisionId::new("nca-r1"),
+                artifact_id: burn_p2p::ArtifactId::new("artifact-1"),
+                parent_head_id: None,
+                global_step: 0,
+                created_at: Utc::now(),
+                metrics: BTreeMap::new(),
+            },
+            announced_at: Utc::now(),
+        }
+    }
+
+    fn spawn_single_response_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0; 4096];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("<missing>")
+                .to_owned();
+            requests_for_thread
+                .lock()
+                .expect("requests lock")
+                .push(path);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+            stream.flush().expect("flush response");
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
     #[test]
     fn default_mainnet_native_config_targets_public_nca_profile() {
         let config = default_mainnet_native_config();
@@ -3583,6 +3690,40 @@ mod tests {
         };
         assert!(!no_restore.initialize_head_on_start);
         assert!(!no_restore.restore_head_on_start);
+    }
+
+    #[test]
+    fn head_mirror_registration_requires_artifact_mirror_before_live_head() {
+        let (edge_base_url, requests, server) =
+            spawn_single_response_server("502 Bad Gateway", "mirror unavailable");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let announcement = test_head_announcement(Some(PeerId::new(
+            "12D3KooWCPbD9DgsaDHtPC6cC6DsvLNL64rtfo8UsQCVMBuazuuP",
+        )));
+
+        let error = register_live_head_with_edge(
+            &runtime,
+            &edge_base_url,
+            "session-1",
+            &test_experiment_entry(),
+            &announcement,
+        )
+        .expect_err("mirror failure should block live head registration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to mirror head artifact artifact-1"),
+            "{error:#}"
+        );
+        server.join().expect("server thread");
+        assert_eq!(
+            *requests.lock().expect("requests lock"),
+            vec!["/admin/artifacts/mirror-peer".to_owned()]
+        );
     }
 
     #[test]

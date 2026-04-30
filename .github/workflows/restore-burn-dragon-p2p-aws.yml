@@ -883,6 +883,14 @@ jobs:
             --query "Command.CommandId" \
             --output text)"
 
+          print_invocation() {
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+              --output json || true
+          }
+
           for attempt in $(seq 1 30); do
             invocation_status="$(aws ssm get-command-invocation \
               --region "$AWS_REGION" \
@@ -892,14 +900,11 @@ jobs:
               --output text 2>/dev/null || true)"
             case "$invocation_status" in
               Success)
+                print_invocation
                 exit 0
                 ;;
               Cancelled|TimedOut|Failed|Cancelling)
-                aws ssm get-command-invocation \
-                  --region "$AWS_REGION" \
-                  --command-id "$command_id" \
-                  --instance-id "$BOOTSTRAP_INSTANCE_ID" \
-                  --output json || true
+                print_invocation
                 exit 1
                 ;;
             esac

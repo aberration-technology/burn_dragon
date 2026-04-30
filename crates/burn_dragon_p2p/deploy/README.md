@@ -249,7 +249,7 @@ Recommended Midwest baseline:
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
   - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
-  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.43`.
+  - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0-pre.44`.
 - `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
   - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
 
@@ -626,7 +626,9 @@ Native peers can leave `training_config_paths` empty and rely on the published D
 
 Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
-Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. Production browser profiles are expected to load the active canonical head artifact and publish canonical browser updates through the p2p artifact/update path. The live browser canary first checks those production profile flags, then applies a tiny receipt-only override so the canary can verify the browser shell, auth, seed derivation, direct WebRTC connectivity, WebGPU training start, truthful work metrics, and durable receipt submission without pushing a synthetic canary model into the main network.
+Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. Production browser profiles are expected to load the active canonical head artifact and publish canonical browser updates through the p2p artifact/update path. The live browser canary checks those production profile flags in two lanes: a checkpoint-sync lane keeps the production profile and requires the active head artifact to arrive over browser P2P, while the receipt-training lane applies a tiny receipt-only override so the canary can verify the browser shell, auth, seed derivation, direct WebRTC connectivity, WebGPU training start, truthful work metrics, and durable receipt submission without pushing a synthetic canary model into the main network.
+
+For local production-edge triage, run the canary with `BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING=0`, `BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC=1`, and `BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE=webrtc-direct`. That path should fail if the browser falls back to edge artifact HTTP for the active head.
 
 ## Terraform Root
 

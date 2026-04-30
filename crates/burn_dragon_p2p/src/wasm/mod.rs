@@ -125,8 +125,9 @@ fn current_app_semver() -> semver::Version {
 }
 
 fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
+    let artifact_sync = view.network.swarm_status.artifact_sync.as_ref();
     format!(
-        "runtime={} detail={} desired_transport={:?} connected_transport={:?} direct_peers={} can_train={} assignment={} head_present={} head_artifact_ready={} head_artifact_source={:?} cached_microshards={}",
+        "runtime={} detail={} desired_transport={:?} connected_transport={:?} direct_peers={} can_train={} assignment={} head_present={} head_artifact_ready={} head_artifact_source={:?} head_artifact_route={:?} head_artifact_error={:?} cached_microshards={}",
         view.runtime_label,
         view.runtime_detail,
         view.network.swarm_status.desired_transport,
@@ -137,6 +138,8 @@ fn browser_view_log_summary(view: &BrowserAppClientView) -> String {
         view.training.latest_head_id.is_some(),
         view.training.active_head_artifact_ready,
         view.training.active_head_artifact_source,
+        artifact_sync.and_then(|diagnostic| diagnostic.route_label.as_deref()),
+        artifact_sync.and_then(|diagnostic| diagnostic.last_error.as_deref()),
         view.training.cached_microshards,
     )
 }
@@ -185,6 +188,7 @@ fn browser_view_machine_state_json(view: &BrowserAppClientView) -> String {
         "head_artifact_ready": view.training.active_head_artifact_ready,
         "head_artifact_source": &view.training.active_head_artifact_source,
         "head_artifact_error": &view.training.active_head_artifact_error,
+        "head_artifact_sync": &view.network.swarm_status.artifact_sync,
         "cached_microshards": view.training.cached_microshards,
         "last_error": active_direct_transport_error(view),
         "network_transport": &view.network.transport,

@@ -17,8 +17,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::backend::AutodiffBackend;
 use burn_dragon_language::load_training_config;
 use burn_dragon_p2p::admin::{
-    fetch_directory_entries, fetch_signed_directory_entries, register_live_head,
-    rollout_directory_entries, upsert_directory_entry, upsert_directory_entry_current_head,
+    fetch_directory_entries, fetch_signed_directory_entries, mirror_peer_artifact,
+    register_live_head, rollout_directory_entries, upsert_directory_entry,
+    upsert_directory_entry_current_head,
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, NativeCliBridgeAuthResult, NativeCliBridgeBootstrap,
@@ -2965,6 +2966,26 @@ fn register_live_head_with_edge(
         session_id,
         announcement.clone(),
     ))?;
+    if let Some(provider_peer_id) = announcement.provider_peer_id.as_ref() {
+        match runtime.block_on(mirror_peer_artifact(
+            edge_base_url,
+            session_id,
+            burn_p2p_publish::PeerArtifactMirrorRequest {
+                artifact_id: announcement.head.artifact_id.clone(),
+                provider_peer_ids: vec![provider_peer_id.clone()],
+                timeout_ms: Some(20_000),
+            },
+        )) {
+            Ok(mirror) => eprintln!(
+                "head-mirror-edge-artifact-mirrored artifact_id={} provider={} bytes={} chunks={}",
+                mirror.artifact_id.as_str(),
+                mirror.mirrored_from.as_str(),
+                mirror.bytes_len,
+                mirror.chunk_count,
+            ),
+            Err(error) => eprintln!("head-mirror-edge-artifact-mirror-failed: {error}"),
+        }
+    }
     let mut directory_entries =
         runtime.block_on(fetch_signed_directory_entries(edge_base_url, session_id))?;
     if upsert_directory_entry_current_head(

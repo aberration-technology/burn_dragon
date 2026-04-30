@@ -67,6 +67,7 @@ burn_p2p_admin.workspace = true
 burn_p2p_app = { workspace = true, optional = true, features = ["readonly"] }
 burn_p2p_browser = { workspace = true, optional = true }
 burn_p2p_checkpoint.workspace = true
+burn_p2p_publish.workspace = true
 burn_p2p_workload.workspace = true
 chrono.workspace = true
 clap.workspace = true

@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadId};
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
+#[cfg(feature = "native")]
+use burn_p2p_publish::{PeerArtifactMirrorRequest, PeerArtifactMirrorResponse};
 
 fn admin_client(edge_base_url: &str, session_id: Option<&str>) -> AdminClient {
     let config = session_id
@@ -80,6 +82,37 @@ pub async fn register_live_head(
         .register_live_head(announcement)
         .await
         .map_err(|error| anyhow!("failed to register live head on edge: {error}"))
+}
+
+#[cfg(feature = "native")]
+pub async fn mirror_peer_artifact(
+    edge_base_url: &str,
+    session_id: &str,
+    request: PeerArtifactMirrorRequest,
+) -> Result<PeerArtifactMirrorResponse> {
+    let url = format!(
+        "{}/admin/artifacts/mirror-peer",
+        edge_base_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("x-session-id", session_id)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| anyhow!("failed to request peer artifact mirror: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| anyhow!("failed to read peer artifact mirror response: {error}"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "peer artifact mirror failed with status {status}: {body}"
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| anyhow!("failed to decode peer artifact mirror response: {error}: {body}"))
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ def main() -> None:
                 "default: browser-canary-mainnet-nca",
                 'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"',
                 "chromium-webrtc-direct-connect",
+                "chromium-webrtc-direct-checkpoint",
                 "chromium-webrtc-direct-training",
                 "firefox-auto-connect",
                 "firefox-webrtc-direct-connect",
@@ -36,6 +37,7 @@ def main() -> None:
                 "BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}",
                 "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
                 "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",
+                "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}",
                 'BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN:',
             ]
             for snippet in required_snippets:
@@ -56,6 +58,7 @@ def main() -> None:
             expected_required = {
                 "chromium-auto-connect": "1",
                 "chromium-webrtc-direct-connect": "1",
+                "chromium-webrtc-direct-checkpoint": "1",
                 "chromium-webrtc-direct-training": "1",
                 "firefox-auto-connect": "1",
                 "firefox-webrtc-direct-connect": "1",
@@ -72,6 +75,10 @@ def main() -> None:
                     "1" if lane == "chromium-webrtc-direct-training" else "0"
                 )
                 assert lanes[lane]["expect_training"] == expected_training
+                expected_checkpoint = (
+                    "1" if lane == "chromium-webrtc-direct-checkpoint" else "0"
+                )
+                assert lanes[lane]["expect_checkpoint_sync"] == expected_checkpoint
         else:
             resolver_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',

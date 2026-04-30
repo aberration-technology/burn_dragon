@@ -74,26 +74,37 @@ jobs:
             browser: chromium
             transport_mode: auto
             expect_training: "0"
+            expect_checkpoint_sync: "0"
             required: "1"
           - lane: chromium-webrtc-direct-connect
             browser: chromium
             transport_mode: webrtc-direct
             expect_training: "0"
+            expect_checkpoint_sync: "0"
+            required: "1"
+          - lane: chromium-webrtc-direct-checkpoint
+            browser: chromium
+            transport_mode: webrtc-direct
+            expect_training: "0"
+            expect_checkpoint_sync: "1"
             required: "1"
           - lane: chromium-webrtc-direct-training
             browser: chromium
             transport_mode: webrtc-direct
             expect_training: "1"
+            expect_checkpoint_sync: "0"
             required: "1"
           - lane: firefox-auto-connect
             browser: firefox
             transport_mode: auto
             expect_training: "0"
+            expect_checkpoint_sync: "0"
             required: "1"
           - lane: firefox-webrtc-direct-connect
             browser: firefox
             transport_mode: webrtc-direct
             expect_training: "0"
+            expect_checkpoint_sync: "0"
             required: "1"
     continue-on-error: ${{ matrix.required == '0' }}
     steps:
@@ -121,6 +132,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}
           BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}
           BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}
+          BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}/canary-summary.json

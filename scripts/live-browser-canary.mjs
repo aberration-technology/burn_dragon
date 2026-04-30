@@ -33,6 +33,10 @@ const TRANSPORT_MODE = (
   process.env.BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE ?? "auto"
 ).trim().toLowerCase();
 const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);
+const EXPECT_CHECKPOINT_SYNC = parseBooleanEnv(
+  "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC",
+  false,
+);
 const EXPECT_CONNECTED_TRANSPORT =
   process.env.BURN_DRAGON_BROWSER_CANARY_EXPECT_CONNECTED_TRANSPORT?.trim().toLowerCase() ||
   null;
@@ -158,6 +162,9 @@ function validateCanaryMode() {
   }
   if (EXPECT_TRAINING && BROWSER_NAME !== "chromium") {
     throw new Error("training canary currently requires chromium; use EXPECT_TRAINING=0 for connect-only browser lanes");
+  }
+  if (EXPECT_CHECKPOINT_SYNC && BROWSER_NAME !== "chromium") {
+    throw new Error("checkpoint-sync canary currently requires chromium");
   }
 }
 
@@ -582,6 +589,31 @@ function machineStateConnected(report) {
   }
   const directPeers = Number(state.direct_peers ?? 0);
   return directPeers >= report.expected_min_direct_peers;
+}
+
+function machineStateCheckpointReady(report) {
+  const state = report.browser_machine_state;
+  if (!state || typeof state !== "object") {
+    return false;
+  }
+  return (
+    state.head_artifact_ready === true &&
+    normalizeArtifactSourceLabel(state.head_artifact_source) === "p2p"
+  );
+}
+
+function normalizeArtifactSourceLabel(value) {
+  if (value == null) {
+    return null;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["p2p", "peer", "peer-swarm", "peerswarm"].includes(normalized)) {
+    return "p2p";
+  }
+  if (["edge", "edge-http", "edge-fallback"].includes(normalized)) {
+    return "edge";
+  }
+  return normalized || null;
 }
 
 function reportConnectedForMode(report, mode) {
@@ -1049,7 +1081,7 @@ async function runCanary() {
     );
   }
   if (
-    EXPECT_TRAINING &&
+    (EXPECT_TRAINING || EXPECT_CHECKPOINT_SYNC) &&
     EXPERIMENT_ID &&
     !browserTrainingConfig &&
     !snapshotAllowsBrowserTraining(snapshot, EXPERIMENT_ID)
@@ -1058,9 +1090,9 @@ async function runCanary() {
       `browser config and live snapshot are missing browser training for selected experiment ${EXPERIMENT_ID}`,
     );
   }
-  if (EXPECT_TRAINING && productionBrowserTrainingConfig?.live_participant) {
+  if ((EXPECT_TRAINING || EXPECT_CHECKPOINT_SYNC) && productionBrowserTrainingConfig?.live_participant) {
     const liveParticipant = productionBrowserTrainingConfig.live_participant;
-    if (liveParticipant.publish_canonical_update !== true) {
+    if (EXPECT_TRAINING && liveParticipant.publish_canonical_update !== true) {
       fail(
         `production browser training is not configured to publish canonical updates for ${EXPERIMENT_ID}`,
       );
@@ -1133,6 +1165,7 @@ async function runCanary() {
       filteredSignedSeedsEnvelope?.payload?.payload?.transport_policy?.preferred ?? [],
     production_training_profile: summarizeBrowserTrainingProfile(transportFilteredBrowserConfig),
     training_canary_profile: summarizeBrowserTrainingProfile(filteredBrowserConfig),
+    expect_checkpoint_sync: EXPECT_CHECKPOINT_SYNC,
     site_runtime_assets: siteRuntimeAssets,
     connect_clicked: false,
     training_button_visible: false,
@@ -1380,8 +1413,13 @@ async function runCanary() {
     while (Date.now() < connectDeadline) {
       await captureLiveStatus();
       if (
+        (EXPECT_CHECKPOINT_SYNC &&
+          reportConnectedForMode(report, TRANSPORT_MODE) &&
+          machineStateCheckpointReady(report)) ||
         (EXPECT_TRAINING && canStartTraining()) ||
-        (!EXPECT_TRAINING && reportConnectedForMode(report, TRANSPORT_MODE))
+        (!EXPECT_TRAINING &&
+          !EXPECT_CHECKPOINT_SYNC &&
+          reportConnectedForMode(report, TRANSPORT_MODE))
       ) {
         break;
       }
@@ -1406,7 +1444,13 @@ async function runCanary() {
         `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} action=${report.training_button_label ?? "missing"} action_detail=${report.training_action_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
       );
     }
-    if (!EXPECT_TRAINING && !reportConnectedForMode(report, TRANSPORT_MODE)) {
+    if (EXPECT_CHECKPOINT_SYNC && !machineStateCheckpointReady(report)) {
+      report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+      fail(
+        `browser canary did not sync active head checkpoint over P2P: machine=${JSON.stringify(report.browser_machine_state)} artifact_fallback_requests=${JSON.stringify(report.artifact_http_fallback_requests)}`,
+      );
+    }
+    if (!EXPECT_TRAINING && !EXPECT_CHECKPOINT_SYNC && !reportConnectedForMode(report, TRANSPORT_MODE)) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
         `browser canary did not connect with expected transport ${report.expected_connected_transport ?? TRANSPORT_MODE}: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} machine=${JSON.stringify(report.browser_machine_state)} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"}`,
@@ -1420,6 +1464,11 @@ async function runCanary() {
       (entry) => entry.ts >= quietWindowStartedAt && entry.watchedControlPlane,
     );
     report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+    if (EXPECT_CHECKPOINT_SYNC && report.artifact_http_fallback_requests.length > 0) {
+      fail(
+        `browser checkpoint canary used edge artifact fallback instead of P2P: ${JSON.stringify(report.artifact_http_fallback_requests)}`,
+      );
+    }
     if (report.quiet_window_control_plane_requests.length > 0) {
       fail(
         `browser canary observed steady-state edge polling after direct connect: ${JSON.stringify(report.quiet_window_control_plane_requests)}`,

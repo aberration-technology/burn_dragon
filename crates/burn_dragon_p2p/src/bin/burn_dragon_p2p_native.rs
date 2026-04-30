@@ -56,8 +56,8 @@ use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
     ExperimentId, ExperimentScope, HeadAnnouncement, LiveControlPlaneEvent,
-    NativeControlPlaneShell, NetworkId, PeerRoleSet, PrincipalId, ProtocolSet, RuntimeStatus,
-    RuntimeTransportPolicy, SwarmAddress,
+    NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
+    RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -2983,22 +2983,32 @@ fn register_live_head_with_edge(
                 provider_peer_id.as_str()
             )
         })?;
+    let mirrored_provider_peer_id = mirror.mirrored_provider_peer_id.clone().ok_or_else(|| {
+        anyhow!(
+            "edge mirror response for artifact {} did not include a mirrored provider peer id",
+            announcement.head.artifact_id.as_str()
+        )
+    })?;
     eprintln!(
-        "head-mirror-edge-artifact-mirrored artifact_id={} provider={} bytes={} chunks={}",
+        "head-mirror-edge-artifact-mirrored artifact_id={} source_provider={} edge_provider={} bytes={} chunks={}",
         mirror.artifact_id.as_str(),
         mirror.mirrored_from.as_str(),
+        mirrored_provider_peer_id.as_str(),
         mirror.bytes_len,
         mirror.chunk_count,
     );
 
+    let edge_announcement =
+        mirrored_edge_head_announcement(announcement, mirrored_provider_peer_id.clone());
     let _ = runtime.block_on(register_live_head(
         edge_base_url,
         session_id,
-        announcement.clone(),
+        edge_announcement.clone(),
     ))?;
     eprintln!(
-        "head-mirror-edge-head-registered head_id={} provider={}",
-        announcement.head.head_id.as_str(),
+        "head-mirror-edge-head-registered head_id={} provider={} source_provider={}",
+        edge_announcement.head.head_id.as_str(),
+        mirrored_provider_peer_id.as_str(),
         provider_peer_id.as_str(),
     );
     let mut directory_entries =
@@ -3006,7 +3016,7 @@ fn register_live_head_with_edge(
     if upsert_directory_entry_current_head(
         &mut directory_entries,
         directory_template,
-        announcement.head.head_id.clone(),
+        edge_announcement.head.head_id.clone(),
     ) {
         let _ = runtime.block_on(rollout_directory_entries(
             edge_base_url,
@@ -3019,6 +3029,15 @@ fn register_live_head_with_edge(
         );
     }
     Ok(())
+}
+
+fn mirrored_edge_head_announcement(
+    announcement: &HeadAnnouncement,
+    mirrored_provider_peer_id: PeerId,
+) -> HeadAnnouncement {
+    let mut edge_announcement = announcement.clone();
+    edge_announcement.provider_peer_id = Some(mirrored_provider_peer_id);
+    edge_announcement
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3725,6 +3744,19 @@ mod tests {
             *requests.lock().expect("requests lock"),
             vec!["/admin/artifacts/mirror-peer".to_owned()]
         );
+    }
+
+    #[test]
+    fn head_mirror_registration_uses_edge_provider_after_mirror() {
+        let source_provider = PeerId::new("12D3KooWCPbD9DgsaDHtPC6cC6DsvLNL64rtfo8UsQCVMBuazuuP");
+        let edge_provider = PeerId::new("12D3KooWJLKDYyWyB26bcJwV3u2ASqXvewHdKWRLkTe8xH7gb63");
+        let announcement = test_head_announcement(Some(source_provider));
+        let edge_announcement =
+            mirrored_edge_head_announcement(&announcement, edge_provider.clone());
+
+        assert_eq!(edge_announcement.provider_peer_id, Some(edge_provider));
+        assert_eq!(edge_announcement.head, announcement.head);
+        assert_eq!(edge_announcement.overlay, announcement.overlay);
     }
 
     #[test]

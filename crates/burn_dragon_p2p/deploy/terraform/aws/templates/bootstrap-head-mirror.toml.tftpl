@@ -6,6 +6,9 @@ enabled_features_label = "${enabled_features_label}"
 
 [network]
 edge_base_url = "${edge_base_url}"
+listen_addresses = [
+  "/ip4/127.0.0.1/tcp/0",
+]
 seed_node_urls = [
 %{ for url in seed_node_urls ~}
   "${url}",

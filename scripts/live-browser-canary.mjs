@@ -1172,6 +1172,7 @@ async function runCanary() {
     training_button_enabled: false,
     training_button_label: null,
     training_action_detail: null,
+    training_p2p_checkpoint_ready: null,
     connect_button_visible: false,
     get_started_button_visible: false,
     live_status_label: null,
@@ -1438,10 +1439,21 @@ async function runCanary() {
     }
 
     await captureLiveStatus();
+    report.training_p2p_checkpoint_ready = machineStateCheckpointReady(report);
     if (EXPECT_TRAINING && !canStartTraining()) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
       fail(
         `browser canary did not become training-ready: status=${report.live_status_label ?? "missing"} transport=${report.transport_summary ?? "missing"} notice=${report.live_notice_detail ?? report.live_panel_detail ?? "none"} action=${report.training_button_label ?? "missing"} action_detail=${report.training_action_detail ?? "none"} button_visible=${report.training_button_visible} button_enabled=${report.training_button_enabled}`,
+      );
+    }
+    if (
+      EXPECT_TRAINING &&
+      productionBrowserTrainingConfig?.live_participant?.load_active_head_artifact === true &&
+      !report.training_p2p_checkpoint_ready
+    ) {
+      report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+      fail(
+        `browser training canary did not sync the active head checkpoint over P2P before training: machine=${JSON.stringify(report.browser_machine_state)} artifact_fallback_requests=${JSON.stringify(report.artifact_http_fallback_requests)}`,
       );
     }
     if (EXPECT_CHECKPOINT_SYNC && !machineStateCheckpointReady(report)) {
@@ -1460,6 +1472,7 @@ async function runCanary() {
     quietWindowStartedAt = Date.now();
     await page.waitForTimeout(QUIET_WINDOW_MS);
     await captureLiveStatus();
+    report.training_p2p_checkpoint_ready = machineStateCheckpointReady(report);
     report.quiet_window_control_plane_requests = requests.filter(
       (entry) => entry.ts >= quietWindowStartedAt && entry.watchedControlPlane,
     );

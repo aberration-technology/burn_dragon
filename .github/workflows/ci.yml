@@ -73,6 +73,7 @@ jobs:
       - run: python3 scripts/test_prod_low_resource_p2p_config.py
       - run: python3 scripts/test_deploy_pages_workflow.py
       - run: python3 scripts/test_resolve_pages_deploy_settings.py
+      - run: python3 scripts/test_local_browser_e2e_plan.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
       - run: python3 scripts/test_live_browser_canary_script.py
       - run: python3 scripts/test_browser_transport_terraform.py

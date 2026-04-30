@@ -35,6 +35,8 @@ enum CommandKind {
     DowngradeSmoke,
     MixedFleet,
     EdgeDrill,
+    LocalBrowserE2e,
+    WasmTrainingSmoke,
     WasmSmoke,
     CudaCheck,
     Smoke,
@@ -64,6 +66,8 @@ fn main() -> Result<()> {
         CommandKind::DowngradeSmoke => downgrade_smoke(),
         CommandKind::MixedFleet => mixed_fleet(),
         CommandKind::EdgeDrill => edge_drill(),
+        CommandKind::LocalBrowserE2e => local_browser_e2e(),
+        CommandKind::WasmTrainingSmoke => wasm_training_smoke(),
         CommandKind::WasmSmoke => wasm_smoke(),
         CommandKind::CudaCheck => cuda_check(),
         CommandKind::Smoke => smoke(),
@@ -222,7 +226,21 @@ fn edge_drill() -> Result<()> {
     cargo_native_test(Some("edge_drill"), true)
 }
 
+fn local_browser_e2e() -> Result<()> {
+    deployment_script_checks()?;
+    cargo_native_test(Some("local_browser_training_e2e"), false)?;
+    wasm_training_smoke()
+}
+
+fn wasm_training_smoke() -> Result<()> {
+    wasm_browser_test(Some("browser_training_smoke_generated_nca"))
+}
+
 fn wasm_smoke() -> Result<()> {
+    wasm_browser_test(Some("browser_training_smoke"))
+}
+
+fn wasm_browser_test(filter: Option<&str>) -> Result<()> {
     let chrome = resolve_chrome_path()
         .context("could not find Google Chrome; install it or set BURN_DRAGON_PLAYWRIGHT_CHROME")?;
     let chromedriver = ensure_chromedriver(&chrome)?;
@@ -257,24 +275,23 @@ fn wasm_smoke() -> Result<()> {
     if let Some(existing) = std::env::var_os("PATH") {
         envs.push((OsString::from("PATH"), existing));
     }
-    run_with_env(
-        "cargo",
-        &[
-            "test",
-            "-p",
-            P2P_PACKAGE,
-            "--target",
-            "wasm32-unknown-unknown",
-            "--no-default-features",
-            "--features",
-            BrowserBuildTarget::Wgpu.features(),
-            "--lib",
-            "browser_training_smoke",
-            "--",
-            "--nocapture",
-        ],
-        &envs,
-    )
+    let mut args = vec![
+        "test",
+        "-p",
+        P2P_PACKAGE,
+        "--target",
+        "wasm32-unknown-unknown",
+        "--no-default-features",
+        "--features",
+        BrowserBuildTarget::Wgpu.features(),
+        "--lib",
+    ];
+    if let Some(filter) = filter {
+        args.push(filter);
+    }
+    args.push("--");
+    args.push("--nocapture");
+    run_with_env("cargo", &args, &envs)
 }
 
 fn cuda_check() -> Result<()> {
@@ -372,6 +389,7 @@ fn deployment_script_checks() -> Result<()> {
         "scripts/test_head_mirror_admin_capability.py",
         "scripts/test_deploy_pages_workflow.py",
         "scripts/test_browser_site_training_config.py",
+        "scripts/test_local_browser_e2e_plan.py",
         "scripts/test_live_browser_canary_script.py",
         "scripts/test_live_browser_canary_workflow.py",
         "scripts/test_browser_profile_budget.py",
@@ -385,6 +403,13 @@ fn deployment_script_checks() -> Result<()> {
 }
 
 fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> Result<()> {
+    let resolved_program;
+    let program = if program == "cargo" {
+        resolved_program = cargo_bin();
+        resolved_program.as_str()
+    } else {
+        program
+    };
     eprintln!("+ {} {}", program, args.join(" "));
     let mut command = Command::new(program);
     command

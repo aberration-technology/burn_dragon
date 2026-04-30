@@ -513,6 +513,11 @@ xtask build-matrix
 
 Validation ladder:
 
+- `xtask local-browser-e2e`
+  - fastest local production-parity gate for browser training changes
+  - deployment config drift checks, including Pages seed/canary contracts
+  - local HTTP edge/auth drill with one NCA browser trainer path and receipt ack
+  - one real Chrome/WebGPU generated-NCA browser training smoke
 - `xtask smoke`
   - native WGPU smoke for:
     - NCA shard export + leased training windows

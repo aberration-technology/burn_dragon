@@ -14,8 +14,13 @@ seed_node_urls = [
 listen_addresses = [
   "/ip4/0.0.0.0/tcp/4001",
   "/ip4/0.0.0.0/udp/4001/quic-v1",
+  "/ip4/0.0.0.0/udp/443/webrtc-direct",
 ]
-external_addresses = []
+# Replace PUBLIC_IP with this peer's routable address when this native peer should
+# serve browser WebRTC-direct traffic.
+external_addresses = [
+  "/ip4/PUBLIC_IP/udp/443/webrtc-direct",
+]
 
 [manifest]
 project_family_id = "burn-dragon-language"

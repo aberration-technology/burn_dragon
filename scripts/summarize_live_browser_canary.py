@@ -50,6 +50,7 @@ def main() -> None:
     )
     print(f"- Connect clicked: `{report.get('connect_clicked', False)}`")
     print(f"- Training button visible: `{report.get('training_button_visible', False)}`")
+    print(f"- Training P2P checkpoint ready: `{report.get('training_p2p_checkpoint_ready', 'n/a')}`")
     print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
     print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
     print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")

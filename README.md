@@ -22,6 +22,12 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 ## quick start
 
 ```bash
+cargo run -p xtask -- local-browser-e2e
 cargo run -p xtask -- smoke
 cargo run -p xtask -- deploy-check
 ```
+
+Use `local-browser-e2e` as the first browser/p2p production-parity gate. It runs
+the deployment config drift checks, a local edge/auth/browser training receipt
+e2e, and the smallest real Chrome/WebGPU browser training smoke without forcing
+the full CI build matrix.

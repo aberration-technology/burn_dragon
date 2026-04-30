@@ -96,6 +96,8 @@ const LARGE_SPEC: SmokeModelSpec = SmokeModelSpec {
     max_iters: 32,
 };
 
+const TEST_WEBRTC_DIRECT_SEED: &str = "/dns4/edge.example/udp/443/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
 fn dummy_auth_bundle() -> DragonNativeAuthBundle {
     DragonNativeAuthBundle {
         auth_config: AuthConfig::new(),
@@ -545,7 +547,7 @@ fn local_browser_training_and_verification_pair(
     let trainer = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
             role: BrowserRuntimeRole::BrowserTrainerWgpu,
-            site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
+            site_seed_node_urls: vec![TEST_WEBRTC_DIRECT_SEED.into()],
             ..BrowserRuntimeConfig::new(
                 "https://edge.example",
                 network_id.clone(),
@@ -562,7 +564,7 @@ fn local_browser_training_and_verification_pair(
     let verifier = BrowserConformanceHarness::start(
         BrowserRuntimeConfig {
             role: BrowserRuntimeRole::BrowserVerifier,
-            site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
+            site_seed_node_urls: vec![TEST_WEBRTC_DIRECT_SEED.into()],
             ..BrowserRuntimeConfig::new(
                 "https://edge.example",
                 network_id.clone(),
@@ -821,9 +823,9 @@ fn edge_snapshot_for_manifests(
         social_mode: burn_p2p::SocialMode::Disabled,
         profile_mode: burn_p2p::ProfileMode::Disabled,
         transports: BrowserTransportSurface {
-            webrtc_direct: false,
-            webtransport_gateway: true,
-            wss_fallback: true,
+            webrtc_direct: true,
+            webtransport_gateway: false,
+            wss_fallback: false,
         },
         paths,
         auth_enabled: true,
@@ -1250,7 +1252,7 @@ fn browser_runtime_for_edge(
 ) -> BrowserRuntimeConfig {
     BrowserRuntimeConfig {
         role,
-        site_seed_node_urls: vec!["/dns4/edge.example/tcp/443/wss".into()],
+        site_seed_node_urls: vec![TEST_WEBRTC_DIRECT_SEED.into()],
         ..BrowserRuntimeConfig::new(
             edge_base_url,
             network_id,
@@ -3578,6 +3580,45 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
         (1..=native_obs.len()).contains(&verify_receipts),
         "browser validation receipts should flush at least once and at most once per window"
     );
+}
+
+#[test]
+fn local_browser_training_e2e() {
+    let _guard = native_swarm_test_guard();
+    let root = tempdir().expect("root");
+    let nca_config_path = root.path().join("nca.toml");
+    let training_config_path = root.path().join("nca-train.toml");
+    let shard_root = root.path().join("nca-shards-local-browser-e2e");
+    write(&nca_config_path, &nca_corpus_config_toml(root.path()));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.path().join("nca-cache"), &nca_config_path, SMALL_SPEC),
+    );
+
+    let native = DragonNativePeerConfig {
+        training_config_paths: vec![training_config_path],
+        storage_root: root.path().join("storage-local-browser-e2e"),
+        network: Default::default(),
+        target: None,
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0-pre.33").expect("valid burn_dragon version"),
+        git_commit: Some("local-browser-e2e".into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export: Some(DragonShardExportConfig {
+            root: shard_root,
+            dataset_name: Some("dragon-nca-local-browser-e2e".into()),
+            microshards: Some(4),
+            max_records: Some(32),
+            http_upstream: None,
+        }),
+        existing_shard_dataset: None,
+    };
+    let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+    run_edge_drill_for_prepared(&prepared, "local-browser-e2e");
 }
 
 #[test]

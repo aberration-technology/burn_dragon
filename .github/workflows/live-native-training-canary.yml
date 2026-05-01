@@ -66,8 +66,8 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
       BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
-      BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-native-training-canary
-      BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-native-training-canary/native-canary-summary.json
+      BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
+      BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json
       BURN_DRAGON_NATIVE_CANARY_BINARY: target/debug/burn_dragon_p2p_native
 
     steps:

@@ -25,10 +25,13 @@ def main() -> None:
     job = workflow["jobs"]["canary"]
     assert job["environment"] == "burn-dragon-p2p-${{ github.event.inputs.environment || 'production' }}"
     env = job["env"]
+    for key, value in env.items():
+        assert "runner." not in str(value), f"job env {key} uses unavailable runner context"
     assert (
         env["BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN"]
         == "${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}"
     )
+    assert env["BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR"].startswith("/tmp/")
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
     runs = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ensure-burn-p2p-sibling.sh" in runs

@@ -452,6 +452,66 @@ locals {
     token_header = "x-burn-p2p-canary-token"
     token_value  = trimspace(var.github_browser_canary_callback_token)
   } : null
+  native_canary_rules = concat(
+    trimspace(var.github_native_canary_principal_id) == "" ? [] : [
+      {
+        principal_id   = trimspace(var.github_native_canary_principal_id)
+        display_name   = "burn_dragon live native training canary"
+        required_orgs  = local.github_required_orgs
+        required_teams = local.github_required_teams
+        required_repo_access = [
+          {
+            repo               = var.github_required_repo
+            minimum_permission = "write"
+          },
+        ]
+        granted_roles = {
+          roles = ["TrainerCpu", "TrainerGpu", "Archive", "Viewer"]
+        }
+        granted_scopes = [
+          "Connect",
+          "Discover",
+          { "Train" = { experiment_id = "nca-prepretraining" } },
+          { "Archive" = { experiment_id = "nca-prepretraining" } },
+        ]
+        allowed_networks = [var.network_id]
+        custom_claims = {
+          deployment_profile = var.environment_name
+          stack              = var.stack_name
+          canary             = "native-trainer"
+        }
+      }
+    ],
+    trimspace(var.github_native_canary_validator_principal_id) == "" ? [] : [
+      {
+        principal_id   = trimspace(var.github_native_canary_validator_principal_id)
+        display_name   = "burn_dragon live native validator canary"
+        required_orgs  = local.github_required_orgs
+        required_teams = local.github_required_teams
+        required_repo_access = [
+          {
+            repo               = var.github_required_repo
+            minimum_permission = "write"
+          },
+        ]
+        granted_roles = {
+          roles = ["Validator", "Archive", "Viewer"]
+        }
+        granted_scopes = [
+          "Connect",
+          "Discover",
+          { "Validate" = { experiment_id = "nca-prepretraining" } },
+          { "Archive" = { experiment_id = "nca-prepretraining" } },
+        ]
+        allowed_networks = [var.network_id]
+        custom_claims = {
+          deployment_profile = var.environment_name
+          stack              = var.stack_name
+          canary             = "native-validator"
+        }
+      }
+    ],
+  )
 
   admin_rules = [
     for login in local.github_admin_logins : {
@@ -481,7 +541,7 @@ locals {
   ]
   auth_provider_policy = local.auth_connector_kind == "github" ? {
     github = {
-      rules            = concat([local.contributor_rule], local.browser_canary_rules, local.admin_rules)
+      rules            = concat([local.contributor_rule], local.browser_canary_rules, local.native_canary_rules, local.admin_rules)
       trusted_callback = local.browser_canary_trusted_callback
     }
   } : null

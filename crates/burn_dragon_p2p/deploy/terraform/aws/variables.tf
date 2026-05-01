@@ -350,6 +350,18 @@ variable "github_browser_canary_callback_token" {
   sensitive   = true
 }
 
+variable "github_native_canary_principal_id" {
+  description = "Optional dedicated trainer principal id used by the live native training canary when GitHub auth is enabled."
+  type        = string
+  default     = ""
+}
+
+variable "github_native_canary_validator_principal_id" {
+  description = "Optional dedicated validator principal id used by the live native training canary when GitHub auth is enabled."
+  type        = string
+  default     = ""
+}
+
 variable "instance_type" {
   description = "EC2 instance type for the bootstrap edge."
   type        = string

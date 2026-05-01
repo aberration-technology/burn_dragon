@@ -68,7 +68,20 @@ def main() -> None:
         step.get("run", "") for step in deploy_workflow["jobs"]["deploy"]["steps"]
     )
     assert "scripts/dispatch_native_training_canary_and_wait.sh" in deploy_runs
-    assert "BURN_DRAGON_NATIVE_CANARY_WINDOWS" in str(deploy_workflow["jobs"]["deploy"]["steps"])
+    canary_step = next(
+        step
+        for step in deploy_workflow["jobs"]["deploy"]["steps"]
+        if step.get("id") == "live_native_training_canary"
+    )
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "2"
+    assert (
+        canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID"]
+        == "${{ env.NATIVE_CANARY_PRINCIPAL_ID }}"
+    )
+    assert (
+        canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID"]
+        == "${{ env.NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID }}"
+    )
     test_job_steps = ci_workflow["jobs"]["test"]["steps"]
     test_job_runs = "\n".join(step.get("run", "") for step in test_job_steps)
     assert "cargo clean" not in test_job_runs
@@ -103,6 +116,9 @@ def main() -> None:
     assert 'type              = "HTTPS"' in main_tf
     assert 'resource_path     = "/portal/snapshot"' in main_tf
     assert 'enable_sni        = true' in main_tf
+    assert "local.native_canary_rules" in main_tf
+    assert 'canary             = "native-trainer"' in main_tf
+    assert 'canary             = "native-validator"' in main_tf
 
     print("deployment-strategy-ok")
 

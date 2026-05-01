@@ -53,6 +53,7 @@ def main() -> None:
         "train_loss",
         "batch_count",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",
+        "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID",
     ]
     for snippet in required:
         assert snippet in script, f"missing native canary script snippet: {snippet}"

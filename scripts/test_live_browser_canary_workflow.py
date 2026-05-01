@@ -87,10 +87,17 @@ def main() -> None:
         else:
             resolver_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',
+                'native_canary_principal_id="native-canary-${TF_WORKSPACE_NAME}-nca"',
+                'native_canary_validator_principal_id="${native_canary_principal_id}-validator"',
                 """auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_id = sys.argv[2]; principals = [item for item in principals if item.get("principal_id") != principal_id]; print(json.dumps(principals))''' "$auth_principals_json" "$browser_canary_principal_id")" """.strip(),
+                """auth_principals_json="$(python3 -c '''import json, sys; principals = json.loads(sys.argv[1] or "[]"); principal_ids = set(sys.argv[2:]); principals = [item for item in principals if item.get("principal_id") not in principal_ids]; print(json.dumps(principals))''' "$auth_principals_json" "$native_canary_principal_id" "$native_canary_validator_principal_id")" """.strip(),
                 'echo "BROWSER_CANARY_PRINCIPAL_ID=$browser_canary_principal_id"',
+                'echo "NATIVE_CANARY_PRINCIPAL_ID=$native_canary_principal_id"',
+                'echo "NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID=$native_canary_validator_principal_id"',
                 'echo "TF_VAR_github_browser_canary_principal_id=$browser_canary_principal_id"',
                 'echo "TF_VAR_github_browser_canary_callback_token=$BROWSER_CANARY_CALLBACK_TOKEN"',
+                'echo "TF_VAR_github_native_canary_principal_id=$native_canary_principal_id"',
+                'echo "TF_VAR_github_native_canary_validator_principal_id=$native_canary_validator_principal_id"',
             ]
             for snippet in resolver_snippets:
                 assert snippet in resolver_text, (

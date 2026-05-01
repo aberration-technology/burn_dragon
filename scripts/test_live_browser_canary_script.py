@@ -102,6 +102,13 @@ def main() -> None:
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"
+    expect_training_init = (
+        'const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);'
+    )
+    min_receipts_init = 'const MIN_ACCEPTED_RECEIPTS = parseNonnegativeIntegerEnv('
+    assert script.index(expect_training_init) < script.index(min_receipts_init), (
+        "MIN_ACCEPTED_RECEIPTS default reads EXPECT_TRAINING, so EXPECT_TRAINING must be initialized first"
+    )
     forbidden_snippets = [
         'const session = await fetchJson(endpoint(EDGE_BASE_URL, callbackPath)',
         'const certificate = await fetchJson(endpoint(EDGE_BASE_URL, snapshot.paths.enroll_path)',

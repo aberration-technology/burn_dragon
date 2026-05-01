@@ -56,9 +56,10 @@ use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
-    ExperimentId, ExperimentScope, HeadAnnouncement, LiveControlPlaneEvent, MetricValue,
-    NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
-    RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
+    ExperimentDirectoryPolicyExt, ExperimentId, ExperimentScope, HeadAnnouncement,
+    HeadPromotionMode, LiveControlPlaneEvent, MetricValue, NativeControlPlaneShell, NetworkId,
+    PeerId, PeerRoleSet, PrincipalId, ProtocolSet, RuntimeStatus, RuntimeTransportPolicy,
+    SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -2752,6 +2753,15 @@ where
     Ok(Some(head))
 }
 
+fn directory_entry_promotes_with_diffusion(entry: &ExperimentDirectoryEntry) -> bool {
+    entry.merge_topology_policy().is_some_and(|policy| {
+        matches!(
+            policy.promotion_policy.mode,
+            HeadPromotionMode::DiffusionSteadyState
+        )
+    })
+}
+
 fn register_live_head_with_edge(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
@@ -3021,12 +3031,18 @@ where
         .first()
         .cloned()
         .ok_or_else(|| anyhow!("prepared validator manifest bundle is missing an experiment"))?;
+    let diffusion_promotion = directory_entry_promotes_with_diffusion(&experiment_entry);
     eprintln!(
-        "starting burn_dragon validator daemon: experiment={} backend={} target={:?} can_train={} edge={} seeds={} storage_root={}",
+        "starting burn_dragon validator daemon: experiment={} backend={} target={:?} can_train={} promotion={} edge={} seeds={} storage_root={}",
         prepared.experiment_kind.workload_slug(),
         backend.as_label(),
         prepared.target_decision.effective_target,
         prepared.target_decision.can_train,
+        if diffusion_promotion {
+            "diffusion-steady-state"
+        } else {
+            "validator-quorum"
+        },
         config.effective_edge_base_url().unwrap_or("<none>"),
         config.effective_seed_node_urls().len(),
         config.storage_root.display(),
@@ -3060,20 +3076,15 @@ where
         experiment_entry.experiment_id,
         experiment_entry.current_revision_id,
     );
-    let restored = if restore_head_on_start {
-        running.restore_experiment_head(&experiment)?
-    } else {
-        None
-    };
-    let synced = running.sync_experiment_head(&experiment)?;
-    if restored.is_none() && synced.is_none() && initialize_head_on_start {
-        let head = running.initialize_local_head(&experiment)?;
-        eprintln!(
-            "validator-daemon initialized genesis head id={} global_step={}",
-            head.head_id.as_str(),
-            head.global_step,
-        );
-    }
+    let mut served_head_id = None;
+    let _ = sync_or_initialize_head_provider(
+        &mut running,
+        &experiment,
+        initialize_head_on_start,
+        restore_head_on_start,
+        &mut served_head_id,
+        "validator",
+    )?;
 
     let status_interval = Duration::from_secs(status_interval_secs.max(1));
     let validation_interval = Duration::from_millis(validation_interval_millis.max(25));
@@ -3117,17 +3128,24 @@ where
         }
 
         if last_validation.elapsed() >= validation_interval {
-            match running.validate_candidates_once(&experiment) {
-                Ok(Some(outcome)) => {
-                    eprintln!(
-                        "validator-promoted merged_head_id={} global_step={}",
-                        outcome.merged_head.head_id.as_str(),
-                        outcome.merged_head.global_step,
-                    );
+            if diffusion_promotion {
+                if let Err(error) = running.advance_diffusion_steady_state(&experiment, None, None)
+                {
+                    eprintln!("validator-diffusion-pass-error: {error}");
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("validator-validation-pass-error: {error}");
+            } else {
+                match running.validate_candidates_once(&experiment) {
+                    Ok(Some(outcome)) => {
+                        eprintln!(
+                            "validator-promoted merged_head_id={} global_step={}",
+                            outcome.merged_head.head_id.as_str(),
+                            outcome.merged_head.global_step,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("validator-validation-pass-error: {error}");
+                    }
                 }
             }
             last_validation = Instant::now();
@@ -3372,6 +3390,27 @@ mod tests {
             allowed_scopes: BTreeSet::from([ExperimentScope::Connect]),
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn directory_entry_promotes_with_diffusion_reads_merge_topology_metadata() {
+        let mut entry = test_experiment_entry();
+        assert!(!directory_entry_promotes_with_diffusion(&entry));
+
+        let policy = burn_p2p::MergeTopologyPolicy {
+            promotion_policy: burn_p2p::HeadPromotionPolicy {
+                mode: HeadPromotionMode::DiffusionSteadyState,
+                diffusion: Some(burn_p2p::DiffusionSteadyStatePolicy::default()),
+                ..burn_p2p::HeadPromotionPolicy::default()
+            },
+            ..burn_p2p::MergeTopologyPolicy::default()
+        };
+        entry.metadata.insert(
+            "burn_p2p.revision.merge_topology.policy_json".into(),
+            serde_json::to_string(&policy).expect("serialize merge topology policy"),
+        );
+
+        assert!(directory_entry_promotes_with_diffusion(&entry));
     }
 
     fn test_head_announcement(provider_peer_id: Option<PeerId>) -> HeadAnnouncement {

@@ -101,6 +101,10 @@ class DeploymentVersionSyncTests(unittest.TestCase):
             f'# managed_trainer_crate_version = "{dragon_version}"',
             TERRAFORM_TFVARS_EXAMPLE.read_text(),
         )
+        self.assertIn(
+            f'bootstrap_crate_version  = "{burn_p2p_version}"',
+            TERRAFORM_TFVARS_EXAMPLE.read_text(),
+        )
         readme = README.read_text()
         self.assertIn(
             f"Defaults to `{burn_p2p_version}`.",

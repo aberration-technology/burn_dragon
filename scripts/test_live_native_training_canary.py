@@ -58,6 +58,10 @@ def main() -> None:
     ]
     for snippet in required:
         assert snippet in script, f"missing native canary script snippet: {snippet}"
+    assert (
+        '"--require-head-advanced",\n                    "true",'
+        not in script
+    ), "--require-head-advanced is a presence flag; do not pass a boolean value"
 
     dispatch_script = DISPATCH_SCRIPT.read_text()
     for snippet in [

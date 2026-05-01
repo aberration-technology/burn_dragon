@@ -378,7 +378,6 @@ def main() -> int:
                     "--restore-head-on-start",
                     "true",
                     "--require-head-advanced",
-                    "true",
                     "--output",
                     str(report_path),
                     "--output-format",

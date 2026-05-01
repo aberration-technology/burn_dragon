@@ -83,6 +83,7 @@ const NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES: usize = 512 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const TRAIN_WINDOW_HEAD_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const NATIVE_BROWSER_APP_BASE_URL_ENV: &str = "BURN_DRAGON_P2P_BROWSER_APP_BASE_URL";
 const NATIVE_STORAGE_ROOT_ENV: &str = "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT";
 const DEFAULT_MAINNET_EDGE_BASE_URL: &str = "https://edge.dragon.aberration.technology";
@@ -2705,19 +2706,15 @@ where
         );
         let mut served_head_id = None;
         eprintln!("train-window-once progress: resolving active canonical head");
-        let base_head = sync_or_initialize_head_provider(
+        let base_head = wait_for_head_provider(
             &mut running,
             &experiment,
             options.initialize_head_on_start,
             options.restore_head_on_start,
             &mut served_head_id,
             "trainer",
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "no experiment head is available; rerun with --initialize-head-on-start true or seed a head first"
-            )
-        })?;
+            TRAIN_WINDOW_HEAD_SYNC_TIMEOUT,
+        )?;
         eprintln!(
             "train-window-once progress: active head ready head={} step={} served_head={:?} elapsed_ms={}",
             base_head.head_id,
@@ -2793,6 +2790,59 @@ where
         );
     }
     write_output(options.output, options.output_format, &report)
+}
+
+fn wait_for_head_provider<B>(
+    running: &mut ManagedRunningNativePeer<B>,
+    experiment: &burn_p2p::ExperimentHandle,
+    initialize_head_on_start: bool,
+    restore_head_on_start: bool,
+    served_head_id: &mut Option<burn_p2p::HeadId>,
+    log_prefix: &str,
+    timeout: Duration,
+) -> Result<burn_p2p::HeadDescriptor>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut attempts = 0_u64;
+    let mut last_error = None;
+    loop {
+        attempts += 1;
+        match sync_or_initialize_head_provider(
+            running,
+            experiment,
+            initialize_head_on_start,
+            restore_head_on_start,
+            served_head_id,
+            log_prefix,
+        ) {
+            Ok(Some(head)) => return Ok(head),
+            Ok(None) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        if Instant::now() >= deadline {
+            let detail = last_error
+                .map(|error| format!("; last error: {error}"))
+                .unwrap_or_default();
+            bail!(
+                "no experiment head became available within {:?}; rerun with --initialize-head-on-start true or seed a head first{}",
+                timeout,
+                detail
+            );
+        }
+
+        if attempts == 1 || attempts.is_multiple_of(10) {
+            eprintln!(
+                "{log_prefix}-head-waiting elapsed_ms={} attempts={}",
+                started.elapsed().as_millis(),
+                attempts
+            );
+        }
+        thread::sleep(STATUS_POLL_INTERVAL);
+    }
 }
 
 fn sync_or_initialize_head_provider<B>(

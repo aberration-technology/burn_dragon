@@ -77,6 +77,22 @@ def main() -> None:
         not in script
     ), "--require-head-advanced is a presence flag; do not pass a boolean value"
 
+    native_source = (
+        REPO_ROOT
+        / "crates"
+        / "burn_dragon_p2p"
+        / "src"
+        / "bin"
+        / "burn_dragon_p2p_native.rs"
+    ).read_text()
+    for snippet in [
+        "TRAIN_WINDOW_HEAD_SYNC_TIMEOUT",
+        "wait_for_head_provider(",
+        "{log_prefix}-head-waiting",
+        "no experiment head became available within",
+    ]:
+        assert snippet in native_source, f"missing native head-sync readiness snippet: {snippet}"
+
     dispatch_script = DISPATCH_SCRIPT.read_text()
     for snippet in [
         ".github/workflows/live-native-training-canary.yml",

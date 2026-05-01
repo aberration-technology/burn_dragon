@@ -55,11 +55,11 @@ use burn_dragon_p2p::native::{prepare_climbmix_native_wgpu, prepare_nca_native_w
 use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
-    AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
-    ExperimentDirectoryPolicyExt, ExperimentId, ExperimentScope, HeadAnnouncement,
-    HeadPromotionMode, LiveControlPlaneEvent, MetricValue, NativeControlPlaneShell, NetworkId,
-    PeerId, PeerRoleSet, PrincipalId, ProtocolSet, RuntimeStatus, RuntimeTransportPolicy,
-    SwarmAddress,
+    AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ControlPlaneSnapshot,
+    ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentScope,
+    HeadAnnouncement, HeadPromotionMode, LiveControlPlaneEvent, MetricValue,
+    NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
+    RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -412,6 +412,10 @@ struct ProbeSwarmArgs {
     timeout_secs: u64,
     #[arg(long, default_value_t = 64)]
     max_events: usize,
+    #[arg(long, default_value_t = false)]
+    fetch_snapshot: bool,
+    #[arg(long, default_value_t = 5)]
+    snapshot_timeout_secs: u64,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
 }
@@ -878,7 +882,40 @@ struct ProbeSwarmReport {
     connected_peer_id: Option<String>,
     elapsed_millis: u64,
     events: Vec<LiveControlPlaneEvent>,
+    snapshot: Option<ProbeSwarmSnapshotSummary>,
+    snapshot_error: Option<String>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeSwarmSnapshotSummary {
+    head_announcements: usize,
+    directory_announcements: usize,
+    peer_directory_announcements: usize,
+    merge_announcements: usize,
+    diffusion_promotion_certificate_announcements: usize,
+    heads: Vec<ProbeSwarmHeadSummary>,
+    directory_entries: Vec<ProbeSwarmDirectoryEntrySummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeSwarmHeadSummary {
+    provider_peer_id: Option<String>,
+    study_id: String,
+    experiment_id: String,
+    revision_id: String,
+    head_id: String,
+    parent_head_id: Option<String>,
+    artifact_id: String,
+    global_step: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeSwarmDirectoryEntrySummary {
+    study_id: String,
+    experiment_id: String,
+    revision_id: String,
+    current_head_id: Option<String>,
 }
 
 fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
@@ -928,8 +965,22 @@ fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
         events.push(event);
     }
 
-    let elapsed_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let connected = connected_peer_id.is_some();
+    let (snapshot, snapshot_error) = if args.fetch_snapshot {
+        match connected_peer_id.as_deref() {
+            Some(peer_id) => match shell.fetch_snapshot(
+                peer_id,
+                Duration::from_secs(args.snapshot_timeout_secs.max(1)),
+            ) {
+                Ok(snapshot) => (Some(probe_swarm_snapshot_summary(&snapshot)), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, Some("not connected".into())),
+        }
+    } else {
+        (None, None)
+    };
+    let elapsed_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let report = ProbeSwarmReport {
         network_id: args.network_id,
         address: args.address,
@@ -938,6 +989,8 @@ fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
         connected_peer_id,
         elapsed_millis,
         events,
+        snapshot,
+        snapshot_error,
         last_error,
     };
     write_output(None, args.output_format, &report)?;
@@ -948,6 +1001,55 @@ fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn probe_swarm_snapshot_summary(snapshot: &ControlPlaneSnapshot) -> ProbeSwarmSnapshotSummary {
+    let heads = snapshot
+        .head_announcements
+        .iter()
+        .map(|announcement| ProbeSwarmHeadSummary {
+            provider_peer_id: announcement
+                .provider_peer_id
+                .as_ref()
+                .map(|peer_id| peer_id.as_str().to_owned()),
+            study_id: announcement.head.study_id.as_str().to_owned(),
+            experiment_id: announcement.head.experiment_id.as_str().to_owned(),
+            revision_id: announcement.head.revision_id.as_str().to_owned(),
+            head_id: announcement.head.head_id.as_str().to_owned(),
+            parent_head_id: announcement
+                .head
+                .parent_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
+            artifact_id: announcement.head.artifact_id.as_str().to_owned(),
+            global_step: announcement.head.global_step,
+        })
+        .collect();
+    let directory_entries = snapshot
+        .directory_announcements
+        .iter()
+        .flat_map(|announcement| announcement.entries.iter())
+        .map(|entry| ProbeSwarmDirectoryEntrySummary {
+            study_id: entry.study_id.as_str().to_owned(),
+            experiment_id: entry.experiment_id.as_str().to_owned(),
+            revision_id: entry.current_revision_id.as_str().to_owned(),
+            current_head_id: entry
+                .current_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
+        })
+        .collect();
+    ProbeSwarmSnapshotSummary {
+        head_announcements: snapshot.head_announcements.len(),
+        directory_announcements: snapshot.directory_announcements.len(),
+        peer_directory_announcements: snapshot.peer_directory_announcements.len(),
+        merge_announcements: snapshot.merge_announcements.len(),
+        diffusion_promotion_certificate_announcements: snapshot
+            .diffusion_promotion_certificate_announcements
+            .len(),
+        heads,
+        directory_entries,
+    }
 }
 
 fn build_profile(args: BuildProfileArgs) -> Result<()> {

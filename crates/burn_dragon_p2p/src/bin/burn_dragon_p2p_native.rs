@@ -35,7 +35,8 @@ use burn_dragon_p2p::capability_state::{
 };
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonManifestSeed,
-    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonPeerNetworkConfig,
+    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget,
+    DragonNativeTrainingOverrides, DragonPeerNetworkConfig,
 };
 use burn_dragon_p2p::deployment::{
     DeploymentDiagnosticsOptions, assert_deployment_ready, collect_deployment_diagnostics,
@@ -282,6 +283,25 @@ impl CapabilityPolicyArgs {
             policy.allow_browser_verifier_fallback = false;
         }
         policy
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Parser)]
+struct NativeTrainingOverrideArgs {
+    #[arg(long = "training-batch-size", value_name = "BATCH_SIZE")]
+    batch_size: Option<usize>,
+    #[arg(long = "training-max-iters", value_name = "ITERS")]
+    max_iters: Option<usize>,
+}
+
+impl NativeTrainingOverrideArgs {
+    fn apply_to(self, config: &mut DragonNativePeerConfig) {
+        if self.batch_size.is_some() || self.max_iters.is_some() {
+            config.training_overrides = DragonNativeTrainingOverrides {
+                batch_size: self.batch_size,
+                max_iters: self.max_iters,
+            };
+        }
     }
 }
 
@@ -600,6 +620,8 @@ struct TrainWindowOnceArgs {
     #[arg(long, default_value_t = false)]
     require_head_advanced: bool,
     #[command(flatten)]
+    training_overrides: NativeTrainingOverrideArgs,
+    #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
 }
 
@@ -659,6 +681,8 @@ struct RunValidatorDaemonArgs {
     initialize_head_on_start: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
+    #[command(flatten)]
+    training_overrides: NativeTrainingOverrideArgs,
     #[command(flatten)]
     capability_policy: CapabilityPolicyArgs,
 }
@@ -1903,13 +1927,14 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
 }
 
 fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
-    let config = resolved_config(
+    let mut config = resolved_config(
         args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    args.training_overrides.apply_to(&mut config);
     ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = resolve_or_login_native_auth_bundle(
         &config,
@@ -2127,6 +2152,7 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    args.training_overrides.apply_to(&mut config);
     config.target = Some(DragonNativeTarget::Validator);
     ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = Some(resolve_or_login_native_auth_bundle(
@@ -2260,6 +2286,7 @@ fn default_mainnet_storage_root() -> PathBuf {
 
 fn default_mainnet_native_config() -> DragonNativePeerConfig {
     DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: Vec::new(),
         storage_root: default_mainnet_storage_root(),
         network: DragonPeerNetworkConfig::default()
@@ -2553,19 +2580,28 @@ where
         );
     }
 
+    let started = Instant::now();
+    eprintln!("train-window-once progress: spawning native peer runtime");
     let mut running = spawn_prepared_native_peer(prepared)?;
     let report_result = (|| -> Result<TrainWindowOnceReport> {
+        eprintln!("train-window-once progress: waiting for runtime readiness");
         wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
         let local_peer_id = running
             .snapshot()
             .local_peer_id
             .ok_or_else(|| anyhow!("peer runtime did not report a local peer id"))?;
+        eprintln!(
+            "train-window-once progress: runtime ready peer={} elapsed_ms={}",
+            local_peer_id,
+            started.elapsed().as_millis()
+        );
         let experiment = running.mainnet().experiment(
             experiment_entry.study_id,
             experiment_entry.experiment_id,
             experiment_entry.current_revision_id,
         );
         let mut served_head_id = None;
+        eprintln!("train-window-once progress: syncing active head artifact");
         let base_head = sync_or_initialize_head_provider(
             &mut running,
             &experiment,
@@ -2579,8 +2615,35 @@ where
                 "no experiment head is available; rerun with --initialize-head-on-start true or seed a head first"
             )
         })?;
+        eprintln!(
+            "train-window-once progress: active head ready head={} step={} served_head={:?} elapsed_ms={}",
+            base_head.head_id,
+            base_head.global_step,
+            served_head_id,
+            started.elapsed().as_millis()
+        );
+        eprintln!("train-window-once progress: preparing continuous trainer state");
         let mut trainer = running.continuous_trainer(&experiment)?;
+        eprintln!(
+            "train-window-once progress: trainer ready; running one training window elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         let outcome = trainer.train_next_window()?;
+        let train_loss = outcome
+            .report
+            .stats
+            .get("train_loss")
+            .or_else(|| outcome.report.stats.get("loss"));
+        eprintln!(
+            "train-window-once progress: window published head={} step={} artifact={} train_loss={:?} data_fetch_ms={} publish_ms={} elapsed_ms={}",
+            outcome.head.head_id,
+            outcome.head.global_step,
+            outcome.artifact.artifact_id,
+            train_loss,
+            outcome.timing.data_fetch_time_ms,
+            outcome.timing.publish_latency_ms,
+            started.elapsed().as_millis()
+        );
         Ok(TrainWindowOnceReport {
             experiment_kind: running.prepared().experiment_kind,
             backend: backend.as_label().into(),
@@ -3417,6 +3480,8 @@ mod tests {
         assert_eq!(train_once.backend, BackendArg::Wgpu);
         assert!(train_once.initialize_head_on_start);
         assert!(train_once.restore_head_on_start);
+        assert_eq!(train_once.training_overrides.batch_size, None);
+        assert_eq!(train_once.training_overrides.max_iters, None);
 
         let no_restore = Cli::try_parse_from([
             "burn_dragon_p2p_native",
@@ -3425,6 +3490,10 @@ mod tests {
             "false",
             "--restore-head-on-start",
             "false",
+            "--training-batch-size",
+            "1",
+            "--training-max-iters",
+            "4",
         ])
         .expect("parse explicit head flags");
         let CommandKind::TrainWindowOnce(no_restore) = no_restore.command else {
@@ -3432,6 +3501,8 @@ mod tests {
         };
         assert!(!no_restore.initialize_head_on_start);
         assert!(!no_restore.restore_head_on_start);
+        assert_eq!(no_restore.training_overrides.batch_size, Some(1));
+        assert_eq!(no_restore.training_overrides.max_iters, Some(4));
     }
 
     #[test]

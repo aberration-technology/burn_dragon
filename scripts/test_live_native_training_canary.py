@@ -33,6 +33,8 @@ def main() -> None:
     )
     assert env["BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR"].startswith("/tmp/")
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
+    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
+    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "4"
     runs = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ensure-burn-p2p-sibling.sh" in runs
     assert "cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native" in runs
@@ -53,6 +55,10 @@ def main() -> None:
         "canonical_loss_improved",
         "train_loss",
         "batch_count",
+        "training_batch_size",
+        "training_max_iters",
+        "--training-batch-size",
+        "--training-max-iters",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",
         "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID",
     ]

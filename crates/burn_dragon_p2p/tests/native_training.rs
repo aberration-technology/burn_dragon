@@ -1621,6 +1621,7 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-native"),
         network: Default::default(),
@@ -1692,6 +1693,7 @@ fn nca_native_runtime_persists_and_publishes_artifacts() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-runtime-artifacts"),
         network: DragonPeerNetworkConfig::default()
@@ -1812,6 +1814,7 @@ fn nca_native_cuda_runtime_trains_window() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-cuda-runtime"),
         network: DragonPeerNetworkConfig::default()
@@ -1965,6 +1968,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
 
     let make_trainer_config =
         |label: &str, training_config_path: &std::path::Path| DragonNativePeerConfig {
+            training_overrides: Default::default(),
             training_config_paths: vec![training_config_path.to_path_buf()],
             storage_root: root.path().join(format!("storage-{label}")),
             network: Default::default(),
@@ -2505,6 +2509,7 @@ fn nca_bootstrap_only_topology_supports_trainer_only_diffusion_roles() {
 
     let bootstrap_addr = loopback_swarm_address();
     let trainer_config = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path.clone()],
         storage_root: root.path().join("storage-trainer-bootstrap-only"),
         network: Default::default(),
@@ -2646,6 +2651,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
 
     let make_trainer_config =
         |label: &str, training_config_path: &std::path::Path| DragonNativePeerConfig {
+            training_overrides: Default::default(),
             training_config_paths: vec![training_config_path.to_path_buf()],
             storage_root: root.path().join(format!("storage-{label}")),
             network: Default::default(),
@@ -3013,6 +3019,7 @@ fn nca_native_auto_target_holds_trainer_role_under_tight_budget() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-downgrade"),
         network: Default::default(),
@@ -3083,6 +3090,7 @@ fn nca_native_persisted_runtime_failure_holds_trainer_role_on_reprepare() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-downgrade-persisted"),
         network: Default::default(),
@@ -3152,6 +3160,7 @@ fn climbmix_native_existing_shards_supports_multi_peer_windows() {
     );
 
     let base_native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-peer-a"),
         network: Default::default(),
@@ -3214,6 +3223,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-browser-compat"),
         network: Default::default(),
@@ -3407,6 +3417,7 @@ fn climbmix_http_shards_publish_http_input_source_descriptor() {
 
     let http_upstream = "https://datasets.example/climbmix";
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-http-climbmix"),
         network: Default::default(),
@@ -3485,6 +3496,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-mixed-native"),
         network: Default::default(),
@@ -3596,6 +3608,7 @@ fn local_browser_training_e2e() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-local-browser-e2e"),
         network: Default::default(),
@@ -3635,6 +3648,7 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
     );
 
     let base_native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-peer-a"),
         network: Default::default(),
@@ -3758,6 +3772,7 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-mixed-medium"),
         network: Default::default(),
@@ -3870,6 +3885,7 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
     );
 
     let base_native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-peer-a"),
         network: Default::default(),
@@ -4002,6 +4018,7 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-medium"),
         network: Default::default(),
@@ -4049,6 +4066,7 @@ fn climbmix_native_three_peers_medium_model_stays_consistent() {
     );
 
     let base_native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-peer-a"),
         network: Default::default(),
@@ -4107,6 +4125,7 @@ fn nca_native_peer_large_model_converges_over_more_windows() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-large"),
         network: Default::default(),
@@ -4154,6 +4173,7 @@ fn climbmix_native_three_peers_large_model_stays_consistent() {
     );
 
     let base_native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-peer-a"),
         network: Default::default(),
@@ -4216,6 +4236,7 @@ fn native_auth_refresh_reenrolls_and_updates_cached_bundle() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-refresh-native"),
         network: Default::default(),
@@ -4337,6 +4358,7 @@ fn nca_edge_drill_native_and_browser_github_auth_and_receipts() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-edge-native"),
         network: Default::default(),
@@ -4377,6 +4399,7 @@ fn climbmix_edge_drill_native_and_browser_github_auth_and_receipts() {
     );
 
     let native = DragonNativePeerConfig {
+        training_overrides: Default::default(),
         training_config_paths: vec![training_config_path],
         storage_root: root.path().join("storage-edge-peer-a"),
         network: Default::default(),

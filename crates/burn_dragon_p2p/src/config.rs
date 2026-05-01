@@ -365,9 +365,19 @@ pub struct DragonExistingShardDatasetConfig {
     pub http_upstream: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragonNativeTrainingOverrides {
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub max_iters: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonNativePeerConfig {
     pub training_config_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub training_overrides: DragonNativeTrainingOverrides,
     pub storage_root: PathBuf,
     #[serde(default)]
     pub network: DragonPeerNetworkConfig,
@@ -741,6 +751,7 @@ mod tests {
     #[test]
     fn native_peer_prefers_explicit_seed_node_urls_over_manifest_defaults() {
         let config = DragonNativePeerConfig {
+            training_overrides: Default::default(),
             training_config_paths: Vec::new(),
             storage_root: PathBuf::from("tmp"),
             network: DragonPeerNetworkConfig::default().with_seed_node_urls(Some(vec![
@@ -774,6 +785,7 @@ mod tests {
     #[test]
     fn native_target_defaults_to_auto_for_safe_downgrade() {
         let config = DragonNativePeerConfig {
+            training_overrides: Default::default(),
             training_config_paths: Vec::new(),
             storage_root: PathBuf::from("tmp"),
             network: DragonPeerNetworkConfig::default(),

@@ -40,7 +40,7 @@ use crate::config::{
     DragonBrowserLiveParticipantConfig, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
 };
 #[cfg(feature = "native")]
-use crate::config::{DragonManifestSeed, DragonNativePeerConfig};
+use crate::config::{DragonManifestSeed, DragonNativePeerConfig, DragonNativeTrainingOverrides};
 
 pub const DRAGON_PROFILE_VERSION_METADATA_KEY: &str = "dragon_profile_version";
 pub const DRAGON_PROFILE_JSON_METADATA_KEY: &str = "dragon_profile_json";
@@ -496,6 +496,37 @@ fn materialize_native_training_config_for_ids(
 }
 
 #[cfg(feature = "native")]
+fn apply_native_training_overrides(
+    mut config: TrainingConfig,
+    overrides: &DragonNativeTrainingOverrides,
+) -> Result<TrainingConfig> {
+    if let Some(batch_size) = overrides.batch_size {
+        if batch_size == 0 {
+            bail!("native training override batch_size must be > 0");
+        }
+        config.training.batch_size = batch_size;
+        if let Some(target_effective_batch_size) = config.training.target_effective_batch_size
+            && target_effective_batch_size < batch_size
+        {
+            config.training.target_effective_batch_size = Some(batch_size);
+        }
+    }
+    if let Some(max_iters) = overrides.max_iters {
+        if max_iters == 0 {
+            bail!("native training override max_iters must be > 0");
+        }
+        config.training.max_iters = max_iters;
+        config.training.checkpoint_interval_iters = config
+            .training
+            .checkpoint_interval_iters
+            .clamp(1, max_iters);
+        config.training.log_frequency = config.training.log_frequency.clamp(1, max_iters);
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg(feature = "native")]
 fn builtin_native_training_profile(
     native: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
@@ -566,6 +597,8 @@ pub fn resolve_native_training_profile(
                 {
                     let config =
                         materialize_native_training_config(&native.storage_root, &entry, &profile)?;
+                    let config =
+                        apply_native_training_overrides(config, &native.training_overrides)?;
                     return Ok(ResolvedNativeTrainingProfile {
                         config,
                         manifest_seed: manifest_seed_from_entry(&native.manifest, &entry),
@@ -582,6 +615,7 @@ pub fn resolve_native_training_profile(
 
     if has_local_training {
         let config = load_training_config(&native.training_config_paths)?;
+        let config = apply_native_training_overrides(config, &native.training_overrides)?;
         let profile = build_profile_from_local_config(
             &config,
             experiment_kind,
@@ -605,6 +639,7 @@ pub fn resolve_native_training_profile(
             &native.manifest.revision_id,
             &profile,
         )?;
+        let config = apply_native_training_overrides(config, &native.training_overrides)?;
         return Ok(ResolvedNativeTrainingProfile {
             config,
             manifest_seed: native.manifest.clone(),
@@ -856,11 +891,12 @@ prompt = "1 2 3"
     #[cfg(feature = "native")]
     #[test]
     fn builtin_nca_profile_fallback_materializes_without_local_or_network_profile() {
-        use crate::config::DragonPeerNetworkConfig;
+        use crate::config::{DragonNativeTrainingOverrides, DragonPeerNetworkConfig};
         use tempfile::tempdir;
 
         let storage = tempdir().expect("storage");
         let native = DragonNativePeerConfig {
+            training_overrides: DragonNativeTrainingOverrides::default(),
             training_config_paths: Vec::new(),
             storage_root: storage.path().to_path_buf(),
             network: DragonPeerNetworkConfig::default(),
@@ -905,6 +941,55 @@ prompt = "1 2 3"
             resolved.config.dataset.source,
             DatasetSourceConfig::UniversalityNca { .. }
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_training_overrides_bound_runtime_without_changing_model_profile() {
+        use crate::config::{DragonNativeTrainingOverrides, DragonPeerNetworkConfig};
+        use tempfile::tempdir;
+
+        let storage = tempdir().expect("storage");
+        let native = DragonNativePeerConfig {
+            training_overrides: DragonNativeTrainingOverrides {
+                batch_size: Some(1),
+                max_iters: Some(4),
+            },
+            training_config_paths: Vec::new(),
+            storage_root: storage.path().to_path_buf(),
+            network: DragonPeerNetworkConfig::default(),
+            target: None,
+            identity: Default::default(),
+            bootstrap_peers: Vec::new(),
+            manifest: DragonManifestSeed {
+                study_id: "burn-dragon-mainnet".into(),
+                experiment_id: "nca-prepretraining".into(),
+                revision_id: "nca-r1".into(),
+                ..DragonManifestSeed::default()
+            },
+            app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
+            git_commit: None,
+            enabled_features_label: Some("native".into()),
+            auth: None,
+            capability_policy: DragonCapabilityPolicy::default(),
+            shard_export: None,
+            existing_shard_dataset: None,
+        };
+
+        let resolved = resolve_native_training_profile(
+            &native,
+            DragonExperimentKind::NcaPrepretraining,
+            false,
+        )
+        .expect("builtin fallback should resolve");
+
+        assert_eq!(resolved.config.training.batch_size, 1);
+        assert_eq!(resolved.config.training.max_iters, 4);
+        assert_eq!(resolved.config.training.checkpoint_interval_iters, 4);
+        assert_eq!(resolved.config.model.n_layer, Some(8));
+        assert_eq!(resolved.config.model.n_embd, Some(512));
+        assert_eq!(resolved.config.model.latent_total, Some(1024));
     }
 
     #[cfg(feature = "native")]
@@ -982,6 +1067,7 @@ prompt = "0 0 0"
         .expect("write training config");
 
         let native = DragonNativePeerConfig {
+            training_overrides: Default::default(),
             training_config_paths: vec![training_path],
             storage_root: storage.path().to_path_buf(),
             network: DragonPeerNetworkConfig::default(),

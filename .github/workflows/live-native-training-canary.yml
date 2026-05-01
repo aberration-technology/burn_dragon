@@ -64,6 +64,8 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'native-canary-mainnet-nca' }}
       BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
+      BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: "1"
+      BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: "4"
       BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
@@ -109,6 +111,8 @@ jobs:
           print(f"- Edge: `{report.get('edge_base_url')}`")
           print(f"- Experiment: `{report.get('experiment_id')}`")
           print(f"- Backend: `{report.get('backend')}`")
+          print(f"- Training batch size: `{report.get('training_batch_size')}`")
+          print(f"- Training max iters: `{report.get('training_max_iters')}`")
           print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
           print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
           print(f"- Windows: `{len(windows)}`")

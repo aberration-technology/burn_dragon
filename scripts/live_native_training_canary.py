@@ -118,6 +118,8 @@ def start_validator(
     auth_bundle: Path,
     storage_root: Path,
     log_path: Path,
+    training_batch_size: int,
+    training_max_iters: int,
 ) -> subprocess.Popen[str]:
     proc_env = os.environ.copy()
     proc_env["BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT"] = str(storage_root)
@@ -139,6 +141,10 @@ def start_validator(
             "10",
             "--validation-interval-millis",
             "500",
+            "--training-batch-size",
+            str(training_batch_size),
+            "--training-max-iters",
+            str(training_max_iters),
             "--initialize-head-on-start",
             "true",
             "--restore-head-on-start",
@@ -302,6 +308,8 @@ def main() -> int:
     )
     trusted_callback_token = env("BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN")
     windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "2"))
+    training_batch_size = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE", "1"))
+    training_max_iters = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS", "4"))
     command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
     canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
     artifact_dir = Path(
@@ -355,6 +363,8 @@ def main() -> int:
         auth_bundle=validator_bundle,
         storage_root=validator_storage,
         log_path=artifact_dir / "validator.log",
+        training_batch_size=training_batch_size,
+        training_max_iters=training_max_iters,
     )
     window_reports: list[dict[str, Any]] = []
     try:
@@ -377,6 +387,10 @@ def main() -> int:
                     "true",
                     "--restore-head-on-start",
                     "true",
+                    "--training-batch-size",
+                    str(training_batch_size),
+                    "--training-max-iters",
+                    str(training_max_iters),
                     "--require-head-advanced",
                     "--output",
                     str(report_path),
@@ -417,6 +431,8 @@ def main() -> int:
         "experiment_kind": experiment_kind,
         "experiment_id": experiment_id,
         "backend": backend,
+        "training_batch_size": training_batch_size,
+        "training_max_iters": training_max_iters,
         "principal_id": principal_id,
         "validator_principal_id": validator_principal_id,
         "head_before": head_before,

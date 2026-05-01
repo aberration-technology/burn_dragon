@@ -77,6 +77,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: cache rust artifacts
         uses: Swatinem/rust-cache@v2
 
@@ -125,6 +130,41 @@ jobs:
             args+=(--selected-revision-id "$SELECTED_REVISION_ID")
           fi
           cargo "${args[@]}"
+
+      - name: run predeploy browser training canary
+        id: predeploy_browser_canary
+        shell: bash
+        env:
+          BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.browser_app_base_url }}
+          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}
+          BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ steps.resolve_browser_shell_settings.outputs.canary_principal_id }}
+          BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
+          BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ steps.resolve_browser_shell_settings.outputs.selected_experiment_id }}
+          BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: "2"
+          BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
+          BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary
+          BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary/canary-summary.json
+          BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR: target/browser-site
+        run: bash scripts/run_pages_predeploy_canary.sh
+
+      - name: summarize predeploy browser canary
+        if: ${{ always() && steps.predeploy_browser_canary.outputs.report_path != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="${{ steps.predeploy_browser_canary.outputs.report_path }}"
+          if [ ! -f "$report_path" ]; then
+            exit 0
+          fi
+          python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: upload predeploy browser canary artifact
+        if: ${{ always() && steps.predeploy_browser_canary.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-pages-predeploy-canary
+          path: ${{ steps.predeploy_browser_canary.outputs.artifact_dir }}
+          if-no-files-found: ignore
 
       - name: write pages cname
         if: ${{ env.SITE_HOST != '' }}

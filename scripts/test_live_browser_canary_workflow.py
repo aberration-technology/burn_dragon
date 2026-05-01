@@ -38,6 +38,7 @@ def main() -> None:
                 "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
                 "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",
                 "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}",
+                "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: ${{ matrix.min_accepted_receipts }}",
                 'BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN:',
             ]
             for snippet in required_snippets:
@@ -79,6 +80,10 @@ def main() -> None:
                     "1" if lane == "chromium-webrtc-direct-checkpoint" else "0"
                 )
                 assert lanes[lane]["expect_checkpoint_sync"] == expected_checkpoint
+                expected_min_receipts = (
+                    "2" if lane == "chromium-webrtc-direct-training" else "0"
+                )
+                assert lanes[lane]["min_accepted_receipts"] == expected_min_receipts
         else:
             resolver_snippets = [
                 'browser_canary_principal_id="browser-canary-${TF_WORKSPACE_NAME}-nca"',

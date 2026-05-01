@@ -26,6 +26,10 @@ const DURABLE_RECEIPT_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_DURABLE_RECEIPT_TIMEOUT_MS",
   30_000,
 );
+const MIN_ACCEPTED_RECEIPTS = parseNonnegativeIntegerEnv(
+  "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
+  EXPECT_TRAINING ? 1 : 0,
+);
 const BROWSER_NAME = (
   process.env.BURN_DRAGON_BROWSER_CANARY_BROWSER ?? "chromium"
 ).trim().toLowerCase();
@@ -166,6 +170,9 @@ function validateCanaryMode() {
   if (EXPECT_CHECKPOINT_SYNC && BROWSER_NAME !== "chromium") {
     throw new Error("checkpoint-sync canary currently requires chromium");
   }
+  if (EXPECT_TRAINING && MIN_ACCEPTED_RECEIPTS < 1) {
+    throw new Error("training canary requires at least one accepted browser receipt");
+  }
 }
 
 function ensureDir(dirPath) {
@@ -263,6 +270,94 @@ function acceptedReceiptIdsFromSubmission(body) {
     return [];
   }
   return body.accepted_receipt_ids.map((value) => String(value)).filter(Boolean);
+}
+
+function isBrowserReceiptResponse(response) {
+  if (!response || response.request().method() !== "POST") {
+    return false;
+  }
+  const url = new URL(response.url());
+  return url.host === new URL(EDGE_BASE_URL).host && url.pathname === "/receipts/browser";
+}
+
+async function waitForAcceptedReceiptSubmissions(page, minimumAcceptedReceipts, timeoutMs) {
+  const submissions = [];
+  const acceptedReceiptIds = [];
+  let done = false;
+  let timeout = null;
+
+  return await new Promise((resolve, reject) => {
+    const finish = (callback, value) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      page.off("response", onResponse);
+      callback(value);
+    };
+
+    const onResponse = async (response) => {
+      if (!isBrowserReceiptResponse(response)) {
+        return;
+      }
+      let bodyText = "";
+      try {
+        bodyText = await response.text();
+        let body = null;
+        try {
+          body = bodyText ? JSON.parse(bodyText) : null;
+        } catch (error) {
+          finish(
+            reject,
+            new Error(
+              `browser receipt response was not valid JSON: ${String(error)}: ${trimPreview(bodyText)}`,
+            ),
+          );
+          return;
+        }
+        const accepted = acceptedReceiptIdsFromSubmission(body);
+        const submission = {
+          url: response.url(),
+          status: response.status(),
+          accepted_receipt_ids: accepted,
+          pending_receipt_count: body?.pending_receipt_count ?? null,
+          body_preview: trimPreview(bodyText),
+        };
+        submissions.push(submission);
+        acceptedReceiptIds.push(...accepted);
+        if (response.status() < 200 || response.status() >= 300) {
+          finish(
+            reject,
+            new Error(
+              `browser receipt submission failed with ${response.status()}: ${trimPreview(bodyText)}`,
+            ),
+          );
+          return;
+        }
+        if (acceptedReceiptIds.length >= minimumAcceptedReceipts) {
+          finish(resolve, {
+            submissions,
+            accepted_receipt_ids: acceptedReceiptIds,
+          });
+        }
+      } catch (error) {
+        finish(reject, error);
+      }
+    };
+
+    timeout = setTimeout(() => {
+      finish(
+        reject,
+        new Error(
+          `timed out waiting for ${minimumAcceptedReceipts} accepted browser receipts; observed=${acceptedReceiptIds.length}; submissions=${JSON.stringify(submissions)}`,
+        ),
+      );
+    }, timeoutMs);
+    page.on("response", onResponse);
+  });
 }
 
 async function waitForDurableReceiptCount(acceptedReceiptIds, baselineCount) {
@@ -600,6 +695,96 @@ function machineStateCheckpointReady(report) {
     state.head_artifact_ready === true &&
     normalizeArtifactSourceLabel(state.head_artifact_source) === "p2p"
   );
+}
+
+function acceptedReceiptCount(report) {
+  const submissions = report.receipt_submission?.submissions;
+  if (!Array.isArray(submissions)) {
+    return 0;
+  }
+  return submissions.reduce(
+    (total, submission) => total + (submission.accepted_receipt_ids?.length ?? 0),
+    0,
+  );
+}
+
+function productionRequiresP2pCheckpoint(report) {
+  return (
+    report.expect_checkpoint_sync ||
+    (report.expect_training &&
+      report.production_training_profile?.load_active_head_artifact === true)
+  );
+}
+
+function e2eInvariant(name, required, passed, detail = null) {
+  return {
+    name,
+    required,
+    passed: required ? Boolean(passed) : true,
+    detail,
+  };
+}
+
+function buildBrowserE2eContract(report) {
+  const requiresP2pCheckpoint = productionRequiresP2pCheckpoint(report);
+  const acceptedReceipts = acceptedReceiptCount(report);
+  const artifactFallbackCount = report.artifact_http_fallback_requests?.length ?? 0;
+  const invariants = [
+    e2eInvariant(
+      "expected_transport_connected",
+      Boolean(report.expected_connected_transport),
+      reportConnectedForMode(report, report.transport_mode),
+      {
+        expected_transport: report.expected_connected_transport,
+        machine_state: report.browser_machine_state,
+      },
+    ),
+    e2eInvariant(
+      "active_head_checkpoint_synced_over_p2p",
+      requiresP2pCheckpoint,
+      report.training_p2p_checkpoint_ready === true,
+      {
+        machine_state: report.browser_machine_state,
+      },
+    ),
+    e2eInvariant(
+      "no_edge_artifact_fallback",
+      requiresP2pCheckpoint,
+      artifactFallbackCount === 0,
+      {
+        artifact_http_fallback_requests: report.artifact_http_fallback_requests ?? [],
+      },
+    ),
+    e2eInvariant(
+      "minimum_browser_receipts_accepted",
+      report.expect_training,
+      acceptedReceipts >= report.min_accepted_receipts,
+      {
+        accepted_receipts: acceptedReceipts,
+        minimum_accepted_receipts: report.min_accepted_receipts,
+      },
+    ),
+    e2eInvariant(
+      "accepted_receipts_reached_durable_edge_state",
+      report.expect_training,
+      report.durable_receipt_snapshot != null,
+      {
+        durable_receipt_snapshot: report.durable_receipt_snapshot,
+      },
+    ),
+  ];
+  return {
+    passed: invariants.every((invariant) => invariant.passed),
+    invariants,
+  };
+}
+
+function assertBrowserE2eContract(report) {
+  report.e2e_contract = buildBrowserE2eContract(report);
+  const failed = report.e2e_contract.invariants.filter((invariant) => !invariant.passed);
+  if (failed.length > 0) {
+    fail(`browser e2e contract failed: ${JSON.stringify(failed)}`);
+  }
 }
 
 function normalizeArtifactSourceLabel(value) {
@@ -1154,6 +1339,7 @@ async function runCanary() {
     browser_name: BROWSER_NAME,
     transport_mode: TRANSPORT_MODE,
     expect_training: EXPECT_TRAINING,
+    min_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
     expected_connected_transport: expectedTransport,
     expected_min_direct_peers: expectedMinDirectPeers,
     network_id: snapshot.network_id,
@@ -1192,6 +1378,7 @@ async function runCanary() {
     receipt_submission: null,
     accepted_receipts_before_training: acceptedReceiptsBeforeTraining,
     durable_receipt_snapshot: null,
+    e2e_contract: null,
     retained_transport_error: null,
     console_errors: [],
     page_errors: [],
@@ -1498,43 +1685,29 @@ async function runCanary() {
       : (report.browser_machine_state?.last_error ?? null);
 
     if (!EXPECT_TRAINING) {
+      assertBrowserE2eContract(report);
       report.success = true;
       await page.screenshot({ path: screenshotPath, fullPage: true });
       return report;
     }
 
-    const receiptResponse = await Promise.all([
-      page.waitForResponse(
-        (response) =>
-          response.request().method() === "POST" &&
-          new URL(response.url()).host === new URL(EDGE_BASE_URL).host &&
-          new URL(response.url()).pathname === "/receipts/browser" &&
-          response.status() >= 200 &&
-          response.status() < 300,
-        { timeout: TRAIN_TIMEOUT_MS },
-      ),
-      trainActionButton.click(),
-    ]).then(([response]) => response);
-    const receiptBodyText = await receiptResponse.text();
-    let receiptBody = null;
-    try {
-      receiptBody = receiptBodyText ? JSON.parse(receiptBodyText) : null;
-    } catch (error) {
-      fail(
-        `browser receipt response was not valid JSON: ${String(error)}: ${trimPreview(receiptBodyText)}`,
-      );
-    }
-    const acceptedReceiptIds = acceptedReceiptIdsFromSubmission(receiptBody);
+    const receiptResultPromise = waitForAcceptedReceiptSubmissions(
+      page,
+      MIN_ACCEPTED_RECEIPTS,
+      TRAIN_TIMEOUT_MS,
+    );
+    await trainActionButton.click();
+    const receiptResult = await receiptResultPromise;
+    const acceptedReceiptIds = receiptResult.accepted_receipt_ids;
     report.receipt_submission = {
-      url: receiptResponse.url(),
-      status: receiptResponse.status(),
+      submissions: receiptResult.submissions,
       accepted_receipt_ids: acceptedReceiptIds,
-      pending_receipt_count: receiptBody?.pending_receipt_count ?? null,
-      body_preview: trimPreview(receiptBodyText),
+      accepted_receipt_count: acceptedReceiptIds.length,
+      minimum_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
     };
-    if (acceptedReceiptIds.length === 0) {
+    if (acceptedReceiptIds.length < MIN_ACCEPTED_RECEIPTS) {
       fail(
-        `browser receipt submission returned no accepted receipt ids: ${trimPreview(receiptBodyText)}`,
+        `browser receipt submissions accepted ${acceptedReceiptIds.length} receipts; expected at least ${MIN_ACCEPTED_RECEIPTS}: ${JSON.stringify(receiptResult.submissions)}`,
       );
     }
     await page.waitForFunction(
@@ -1552,6 +1725,7 @@ async function runCanary() {
       acceptedReceiptIds,
       acceptedReceiptsBeforeTraining,
     );
+    assertBrowserE2eContract(report);
     report.success = true;
     await page.screenshot({ path: screenshotPath, fullPage: true });
   } catch (error) {

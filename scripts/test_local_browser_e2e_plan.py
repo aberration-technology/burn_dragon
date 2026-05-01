@@ -11,9 +11,13 @@ def main() -> None:
 
     required_xtask_snippets = [
         "LocalBrowserE2e",
+        "LocalProdE2e",
         "WasmTrainingSmoke",
         "fn local_browser_e2e() -> Result<()>",
+        "fn local_prod_e2e() -> Result<()>",
+        "fn local_browser_contract_e2e(build_site: bool) -> Result<()>",
         "deployment_script_checks()?;",
+        "browser_site::build_browser_site_default()?;",
         'cargo_native_test(Some("local_browser_training_e2e"), false)?;',
         "wasm_training_smoke()",
         "fn wasm_training_smoke() -> Result<()>",

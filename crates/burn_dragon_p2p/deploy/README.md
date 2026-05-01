@@ -89,7 +89,7 @@ The intended operator entrypoint is:
 
 - `.github/workflows/deploy-burn-dragon-p2p-aws.yml`
 
-a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it.
+a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it. CI now runs `xtask local-prod-e2e` before auto-dispatching production AWS deploys, which keeps the local production-shaped browser/native contract in front of AWS rollout latency.
 
 the bootstrap runtime sync now updates the bootstrap systemd unit itself, not just `bootstrap.json` and caddy config. that keeps the live edge aligned with the repo-managed fd limit and service settings without depending on instance replacement.
 
@@ -167,7 +167,7 @@ The deploy path is now split more cleanly:
 - `scripts/dispatch_pages_deploy_and_wait.sh` owns the child-workflow dispatch/watch logic used by deploy and restore
 - `scripts/run_live_browser_canary.sh` and `scripts/summarize_live_browser_canary.py` own the shared canary execution and summary path used by Pages, deploy, restore, and the standalone live-canary workflow
 
-`deploy-pages.yml` now runs the live browser canary after the Pages publish completes. The workflow does not succeed unless the freshly deployed shell can boot, connect, and reach the expected browser peer path against the configured edge.
+`deploy-pages.yml` runs a predeploy browser training canary against the freshly built Pages artifact before upload, then runs the live browser canary after the Pages publish completes. The workflow does not succeed unless the exact static bundle about to be published can boot, connect, train through the browser path, and reach the expected browser peer contract against the configured edge.
 
 The deployed browser shell now includes an operator panel alongside the peer UI. It requests `Connect` and `Discover` by default, plus `Train` and `Archive` for the selected experiment id when one is baked into the shell. Operators can then use `Sign In (Admin)` from the browser to request an additional `ExperimentScope::Admin { study_id }` session for live directory edits. Under the default deployment, that browser login provider is GitHub.
 

@@ -53,6 +53,7 @@ def main() -> None:
     assert deploy_job["needs"] == [
         "test",
         "browser-site",
+        "local-prod-e2e",
         "terraform-validate",
     ]
     dispatch_step = deploy_job["steps"][0]
@@ -72,7 +73,8 @@ def main() -> None:
         "keep restore drills on `plan_only=true` until you are intentionally executing a failover",
         "The supported production bootstrap path is the published `burn_p2p_bootstrap` crate.",
         "use `git` only when validating an unpublished upstream `burn_p2p` revision.",
-        "deploy-pages.yml` now runs the live browser canary after the Pages publish completes",
+        "deploy-pages.yml` runs a predeploy browser training canary against the freshly built Pages artifact before upload",
+        "CI now runs `xtask local-prod-e2e` before auto-dispatching production AWS deploys",
         "keep the Route53 edge health check on `https://${BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}/portal/snapshot`, not a raw TCP 443 probe",
         "keep the post-deploy Pages browser canary green before treating a browser publish as complete",
         "a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`",

@@ -62,7 +62,7 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: bash -n scripts/sync-bootstrap-runtime-config.sh scripts/install_playwright_chromium.sh scripts/run_live_browser_canary.sh scripts/dispatch_pages_deploy_and_wait.sh scripts/resolve_bootstrap_stack_settings.sh
+      - run: bash -n scripts/sync-bootstrap-runtime-config.sh scripts/install_playwright_chromium.sh scripts/run_live_browser_canary.sh scripts/run_pages_predeploy_canary.sh scripts/dispatch_pages_deploy_and_wait.sh scripts/resolve_bootstrap_stack_settings.sh
       - run: python3 scripts/test_bootstrap_runtime_sync.py
       - run: python3 scripts/test_bootstrap_instance_selection.py
       - run: python3 scripts/test_bootstrap_head_mirror_seed_urls.py
@@ -151,6 +151,22 @@ jobs:
           path: target/browser-site
           if-no-files-found: error
 
+  local-prod-e2e:
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/ensure-burn-p2p-sibling.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path Cargo.toml -p xtask -- local-prod-e2e
+
   terraform-validate:
     runs-on: ubuntu-latest
     env:
@@ -168,6 +184,7 @@ jobs:
     needs:
       - test
       - browser-site
+      - local-prod-e2e
       - terraform-validate
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     permissions:

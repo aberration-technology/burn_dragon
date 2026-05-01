@@ -28,6 +28,10 @@ def main() -> None:
         'principal_id: ${{ needs.build.outputs.canary_principal_id }}',
         'experiment_id: ${{ needs.build.outputs.selected_experiment_id }}',
         'secrets: inherit',
+        'run: bash scripts/run_pages_predeploy_canary.sh',
+        'BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR',
+        'BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS',
+        'name: burn-dragon-pages-predeploy-canary',
     ]
     for snippet in required_snippets:
         assert snippet in workflow_text, f"deploy-pages.yml missing required snippet: {snippet}"
@@ -39,7 +43,6 @@ def main() -> None:
         'node scripts/live-browser-canary.mjs',
         'bash scripts/install_playwright_chromium.sh',
         'bash scripts/run_live_browser_canary.sh',
-        'python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"',
     ]
     for snippet in forbidden_snippets:
         assert snippet not in workflow_text, (

@@ -18,6 +18,8 @@ def main() -> None:
     report = json.loads(report_path.read_text())
     receipt = report.get("receipt_submission") or {}
     durable_receipt = report.get("durable_receipt_snapshot") or {}
+    e2e_contract = report.get("e2e_contract") or {}
+    contract_invariants = e2e_contract.get("invariants") or []
     control_requests = report.get("quiet_window_control_plane_requests") or []
     artifact_fallback = report.get("artifact_http_fallback_requests") or []
     live_status = report.get("live_status_label") or "n/a"
@@ -34,6 +36,7 @@ def main() -> None:
     print(f"- Expected connected transport: `{report.get('expected_connected_transport') or 'n/a'}`")
     print(f"- Expected minimum direct peers: `{report.get('expected_min_direct_peers', 'n/a')}`")
     print(f"- Expect training: `{report.get('expect_training', 'n/a')}`")
+    print(f"- Minimum accepted receipts: `{report.get('min_accepted_receipts', 'n/a')}`")
     print(f"- Live status: `{live_status}`")
     print(f"- Transport signal: `{transport_summary}`")
     print(f"- Machine connected transport: `{machine_state.get('connected_transport') or 'n/a'}`")
@@ -53,7 +56,8 @@ def main() -> None:
     print(f"- Training P2P checkpoint ready: `{report.get('training_p2p_checkpoint_ready', 'n/a')}`")
     print(f"- Quiet-window control-plane requests: `{len(control_requests)}`")
     print(f"- Edge artifact fallback requests: `{len(artifact_fallback)}`")
-    print(f"- Receipt status: `{receipt.get('status', 'n/a')}`")
+    print(f"- Receipt submissions: `{len(receipt.get('submissions') or [])}`")
+    print(f"- Accepted receipt count: `{receipt.get('accepted_receipt_count', 'n/a')}`")
     print(
         f"- Accepted receipt ids: `{', '.join(receipt.get('accepted_receipt_ids') or []) or 'none'}`"
     )
@@ -61,6 +65,13 @@ def main() -> None:
         f"- Durable receipts: `{durable_receipt.get('observed_accepted_receipts', 'n/a')}` "
         f"(baseline `{report.get('accepted_receipts_before_training', 'n/a')}`)"
     )
+    print(f"- E2E contract: `{e2e_contract.get('passed', 'n/a')}`")
+    failed_contract = [
+        invariant.get("name", "unknown")
+        for invariant in contract_invariants
+        if invariant.get("required") and not invariant.get("passed")
+    ]
+    print(f"- Failed E2E invariants: `{', '.join(failed_contract) or 'none'}`")
     print(f"- Error: `{report.get('error') or 'none'}`")
 
 

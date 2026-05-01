@@ -35,6 +35,7 @@ enum CommandKind {
     DowngradeSmoke,
     MixedFleet,
     EdgeDrill,
+    LocalProdE2e,
     LocalBrowserE2e,
     WasmTrainingSmoke,
     WasmSmoke,
@@ -66,6 +67,7 @@ fn main() -> Result<()> {
         CommandKind::DowngradeSmoke => downgrade_smoke(),
         CommandKind::MixedFleet => mixed_fleet(),
         CommandKind::EdgeDrill => edge_drill(),
+        CommandKind::LocalProdE2e => local_prod_e2e(),
         CommandKind::LocalBrowserE2e => local_browser_e2e(),
         CommandKind::WasmTrainingSmoke => wasm_training_smoke(),
         CommandKind::WasmSmoke => wasm_smoke(),
@@ -227,7 +229,18 @@ fn edge_drill() -> Result<()> {
 }
 
 fn local_browser_e2e() -> Result<()> {
+    local_browser_contract_e2e(false)
+}
+
+fn local_prod_e2e() -> Result<()> {
+    local_browser_contract_e2e(true)
+}
+
+fn local_browser_contract_e2e(build_site: bool) -> Result<()> {
     deployment_script_checks()?;
+    if build_site {
+        browser_site::build_browser_site_default()?;
+    }
     cargo_native_test(Some("local_browser_training_e2e"), false)?;
     wasm_training_smoke()
 }

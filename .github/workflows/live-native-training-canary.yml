@@ -68,6 +68,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: "4"
       BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
+      BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
       BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json
       BURN_DRAGON_NATIVE_CANARY_BINARY: target/debug/burn_dragon_p2p_native
@@ -122,6 +123,7 @@ jobs:
               train = window.get("train_report") or {}
               train_signal = window.get("train_signal") or {}
               canonical_signal = window.get("canonical_signal") or {}
+              p2p_signal = window.get("p2p_signal") or {}
               print(
                   f"  - window `{window.get('window_index')}`: "
                   f"`{before}` -> `{after}`, "
@@ -129,7 +131,9 @@ jobs:
                   f"train loss `{train_signal.get('train_loss')}`, "
                   f"canonical loss `{canonical_signal.get('canonical_loss_after')}`, "
                   f"canonical improved `{canonical_signal.get('canonical_loss_improved')}`, "
-                  f"canonical wait `{window.get('canonical_wait_secs'):.1f}s`"
+                  f"canonical wait `{window.get('canonical_wait_secs'):.1f}s`, "
+                  f"p2p wait `{window.get('p2p_wait_secs'):.1f}s`, "
+                  f"p2p heads `{p2p_signal.get('head_announcements')}`"
               )
           PY
 

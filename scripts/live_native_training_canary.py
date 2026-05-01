@@ -110,6 +110,117 @@ def run_native(
         )
 
 
+def parse_json_stdout(path: Path) -> Any:
+    text = path.read_text(errors="replace")
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise RuntimeError(f"command output did not contain a JSON object: {text[-2000:]}")
+    return json.loads(text[start : end + 1])
+
+
+def p2p_bootstrap_address(edge_base_url: str) -> str:
+    parsed = urllib.parse.urlparse(edge_base_url)
+    if not parsed.hostname:
+        raise RuntimeError(f"edge URL has no hostname: {edge_base_url!r}")
+    return f"/dns4/{parsed.hostname}/tcp/4001"
+
+
+def p2p_probe_summary(probe: dict[str, Any]) -> dict[str, Any]:
+    snapshot = probe.get("snapshot") or {}
+    heads = snapshot.get("heads") or []
+    return {
+        "connected": probe.get("connected"),
+        "connected_peer_id": probe.get("connected_peer_id"),
+        "address": probe.get("address"),
+        "elapsed_millis": probe.get("elapsed_millis"),
+        "snapshot_error": probe.get("snapshot_error"),
+        "head_announcements": snapshot.get("head_announcements"),
+        "directory_announcements": snapshot.get("directory_announcements"),
+        "peer_directory_announcements": snapshot.get("peer_directory_announcements"),
+        "merge_announcements": snapshot.get("merge_announcements"),
+        "diffusion_promotion_certificate_announcements": snapshot.get(
+            "diffusion_promotion_certificate_announcements"
+        ),
+        "head_ids": [head.get("head_id") for head in heads if head.get("head_id")],
+    }
+
+
+def probe_p2p_snapshot(
+    binary: str,
+    *,
+    edge_base_url: str,
+    storage_root: Path,
+    log_path: Path,
+    timeout_secs: int,
+) -> dict[str, Any]:
+    run_native(
+        [
+            binary,
+            "probe-swarm",
+            "--address",
+            p2p_bootstrap_address(edge_base_url),
+            "--timeout-secs",
+            "30",
+            "--max-events",
+            "96",
+            "--fetch-snapshot",
+            "--snapshot-timeout-secs",
+            "15",
+            "--output-format",
+            "json",
+        ],
+        storage_root=storage_root,
+        timeout_secs=timeout_secs,
+        stdout_path=log_path,
+    )
+    probe = parse_json_stdout(log_path)
+    if not probe.get("connected"):
+        raise RuntimeError(f"p2p bootstrap probe did not connect: {p2p_probe_summary(probe)}")
+    if probe.get("snapshot_error"):
+        raise RuntimeError(f"p2p bootstrap snapshot fetch failed: {p2p_probe_summary(probe)}")
+    if not probe.get("snapshot"):
+        raise RuntimeError(f"p2p bootstrap probe did not return a snapshot: {probe}")
+    return probe
+
+
+def wait_for_p2p_head(
+    binary: str,
+    *,
+    edge_base_url: str,
+    head_id: str,
+    storage_root: Path,
+    log_dir: Path,
+    timeout_secs: int,
+) -> tuple[dict[str, Any], float]:
+    started = time.monotonic()
+    attempt = 1
+    last_summary: dict[str, Any] | None = None
+    last_error: str | None = None
+    while time.monotonic() - started < timeout_secs:
+        try:
+            probe = probe_p2p_snapshot(
+                binary,
+                edge_base_url=edge_base_url,
+                storage_root=storage_root,
+                log_path=log_dir / f"p2p-probe-{attempt}.log",
+                timeout_secs=60,
+            )
+            summary = p2p_probe_summary(probe)
+            last_summary = summary
+            last_error = None
+            if head_id in set(summary.get("head_ids") or []):
+                return summary, time.monotonic() - started
+        except Exception as error:
+            last_error = str(error)
+        attempt += 1
+        time.sleep(5)
+    raise RuntimeError(
+        "p2p bootstrap snapshot did not advertise canonical head "
+        f"{head_id} within {timeout_secs}s; last={last_summary}; last_error={last_error}"
+    )
+
+
 def start_validator(
     binary: str,
     *,
@@ -313,6 +424,7 @@ def main() -> int:
     training_max_iters = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS", "4"))
     command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
     canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
+    p2p_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS", "300"))
     artifact_dir = Path(
         env("BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR", "/tmp/burn-dragon-native-canary")
     )
@@ -326,10 +438,20 @@ def main() -> int:
 
     trainer_storage = artifact_dir / "trainer-storage"
     validator_storage = artifact_dir / "validator-storage"
+    probe_storage = artifact_dir / "probe-storage"
     trainer_bundle = artifact_dir / "trainer-auth-bundle.json"
     validator_bundle = artifact_dir / "validator-auth-bundle.json"
 
     head_before = current_directory_head(edge_base_url, experiment_id)
+    p2p_before = p2p_probe_summary(
+        probe_p2p_snapshot(
+            binary,
+            edge_base_url=edge_base_url,
+            storage_root=probe_storage,
+            log_path=artifact_dir / "p2p-probe-before.log",
+            timeout_secs=60,
+        )
+    )
     initialize_head_on_start = not bool(head_before.get("head_id"))
     enroll_static_principal(
         binary,
@@ -413,6 +535,14 @@ def main() -> int:
                 canonical_timeout_secs,
             )
             canonical_signal = assert_canonical_signal(previous_head, advanced_head)
+            p2p_signal, p2p_wait_secs = wait_for_p2p_head(
+                binary,
+                edge_base_url=edge_base_url,
+                head_id=advanced_head["head_id"],
+                storage_root=probe_storage,
+                log_dir=artifact_dir / f"p2p-window-{window_index + 1}",
+                timeout_secs=p2p_timeout_secs,
+            )
             window_reports.append(
                 {
                     "window_index": window_index + 1,
@@ -422,6 +552,8 @@ def main() -> int:
                     "head_after": advanced_head,
                     "canonical_wait_secs": wait_secs,
                     "canonical_signal": canonical_signal,
+                    "p2p_wait_secs": p2p_wait_secs,
+                    "p2p_signal": p2p_signal,
                 }
             )
             previous_head = advanced_head
@@ -436,10 +568,12 @@ def main() -> int:
         "backend": backend,
         "training_batch_size": training_batch_size,
         "training_max_iters": training_max_iters,
+        "p2p_timeout_secs": p2p_timeout_secs,
         "initialize_head_on_start": initialize_head_on_start,
         "principal_id": principal_id,
         "validator_principal_id": validator_principal_id,
         "head_before": head_before,
+        "p2p_before": p2p_before,
         "windows": window_reports,
         "head_after": current_directory_head(edge_base_url, experiment_id),
         "catchup": fetch_json(f"{edge_base_url}/metrics/catchup/{experiment_id}"),

@@ -57,6 +57,8 @@ def main() -> None:
         "batch_count",
         "training_batch_size",
         "training_max_iters",
+        "initialize_head_on_start",
+        'not bool(head_before.get("head_id"))',
         "--training-batch-size",
         "--training-max-iters",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",

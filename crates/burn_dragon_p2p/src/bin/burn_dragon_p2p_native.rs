@@ -2601,7 +2601,7 @@ where
             experiment_entry.current_revision_id,
         );
         let mut served_head_id = None;
-        eprintln!("train-window-once progress: syncing active head artifact");
+        eprintln!("train-window-once progress: resolving active canonical head");
         let base_head = sync_or_initialize_head_provider(
             &mut running,
             &experiment,
@@ -2704,21 +2704,33 @@ where
     B: AutodiffBackend + Clone + 'static,
 {
     let restored = if restore_head_on_start {
+        eprintln!("{log_prefix}-head-restore-start");
         running.restore_experiment_head(experiment)?
     } else {
         None
     };
     let head = if let Some(head) = restored {
+        eprintln!(
+            "{log_prefix}-head-restored id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
+        head
+    } else if let Some(head) = running.sync_experiment_head(experiment)? {
+        eprintln!(
+            "{log_prefix}-head-synced id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
         head
     } else if initialize_head_on_start {
+        eprintln!("{log_prefix}-initializing local genesis head");
         let head = running.initialize_local_head(experiment)?;
         eprintln!(
             "{log_prefix}-initialized genesis head id={} global_step={}",
             head.head_id.as_str(),
             head.global_step,
         );
-        head
-    } else if let Some(head) = running.sync_experiment_head(experiment)? {
         head
     } else {
         return Ok(None);

@@ -120,6 +120,7 @@ def start_validator(
     log_path: Path,
     training_batch_size: int,
     training_max_iters: int,
+    initialize_head_on_start: bool,
 ) -> subprocess.Popen[str]:
     proc_env = os.environ.copy()
     proc_env["BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT"] = str(storage_root)
@@ -146,7 +147,7 @@ def start_validator(
             "--training-max-iters",
             str(training_max_iters),
             "--initialize-head-on-start",
-            "true",
+            str(initialize_head_on_start).lower(),
             "--restore-head-on-start",
             "true",
         ],
@@ -329,6 +330,7 @@ def main() -> int:
     validator_bundle = artifact_dir / "validator-auth-bundle.json"
 
     head_before = current_directory_head(edge_base_url, experiment_id)
+    initialize_head_on_start = not bool(head_before.get("head_id"))
     enroll_static_principal(
         binary,
         edge_base_url=edge_base_url,
@@ -365,6 +367,7 @@ def main() -> int:
         log_path=artifact_dir / "validator.log",
         training_batch_size=training_batch_size,
         training_max_iters=training_max_iters,
+        initialize_head_on_start=initialize_head_on_start,
     )
     window_reports: list[dict[str, Any]] = []
     try:
@@ -384,7 +387,7 @@ def main() -> int:
                     "--auth-bundle",
                     str(trainer_bundle),
                     "--initialize-head-on-start",
-                    "true",
+                    str(initialize_head_on_start).lower(),
                     "--restore-head-on-start",
                     "true",
                     "--training-batch-size",
@@ -433,6 +436,7 @@ def main() -> int:
         "backend": backend,
         "training_batch_size": training_batch_size,
         "training_max_iters": training_max_iters,
+        "initialize_head_on_start": initialize_head_on_start,
         "principal_id": principal_id,
         "validator_principal_id": validator_principal_id,
         "head_before": head_before,

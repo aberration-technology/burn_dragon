@@ -89,7 +89,7 @@ The intended operator entrypoint is:
 
 - `.github/workflows/deploy-burn-dragon-p2p-aws.yml`
 
-a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it. CI now runs `xtask local-prod-e2e` before auto-dispatching production AWS deploys, which keeps the local production-shaped browser/native contract in front of AWS rollout latency.
+a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`. that production deploy workflow remains the single orchestrator and still dispatches `deploy-pages.yml` only after the AWS rollout succeeds, so the browser shell stays ordered behind the live edge rollout instead of racing it. CI gates that dispatch on both the browser site artifact build and `xtask local-browser-e2e`; together they cover the local production-shaped browser/native contract without rebuilding the static site twice. Use `xtask local-prod-e2e` for the local one-shot version of the same contract when you want the site build and browser/native checks in one command.
 
 the bootstrap runtime sync now updates the bootstrap systemd unit itself, not just `bootstrap.json` and caddy config. that keeps the live edge aligned with the repo-managed fd limit and service settings without depending on instance replacement.
 

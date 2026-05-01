@@ -64,6 +64,15 @@ def main() -> None:
     assert "gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml" in dispatch_run
     assert "-f environment=production" in dispatch_run
     assert "-f terraform_workspace=mainnet" in dispatch_run
+    test_job_steps = ci_workflow["jobs"]["test"]["steps"]
+    test_job_runs = "\n".join(step.get("run", "") for step in test_job_steps)
+    assert "cargo clean" not in test_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- native-smoke" in test_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke" in test_job_runs
+    local_prod_job_steps = ci_workflow["jobs"]["local-prod-e2e"]["steps"]
+    local_prod_job_runs = "\n".join(step.get("run", "") for step in local_prod_job_steps)
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- local-browser-e2e" in local_prod_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- local-prod-e2e" not in local_prod_job_runs
 
     readme = README.read_text()
     required_snippets = [
@@ -74,7 +83,8 @@ def main() -> None:
         "The supported production bootstrap path is the published `burn_p2p_bootstrap` crate.",
         "use `git` only when validating an unpublished upstream `burn_p2p` revision.",
         "deploy-pages.yml` runs a predeploy browser training canary against the freshly built Pages artifact before upload",
-        "CI now runs `xtask local-prod-e2e` before auto-dispatching production AWS deploys",
+        "CI gates that dispatch on both the browser site artifact build and `xtask local-browser-e2e`",
+        "Use `xtask local-prod-e2e` for the local one-shot version of the same contract",
         "keep the Route53 edge health check on `https://${BURN_DRAGON_P2P_EDGE_DOMAIN_NAME}/portal/snapshot`, not a raw TCP 443 probe",
         "keep the post-deploy Pages browser canary green before treating a browser publish as complete",
         "a successful `push` to `main` now auto-dispatches the production AWS deploy workflow from `CI`",

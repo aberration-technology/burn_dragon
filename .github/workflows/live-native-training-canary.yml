@@ -1,0 +1,138 @@
+name: Live Native Training Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment suffix to run against
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+      edge_base_url:
+        description: Edge base URL
+        required: false
+        default: https://edge.dragon.aberration.technology
+      experiment_kind:
+        description: Native experiment kind
+        required: false
+        default: nca
+      experiment_id:
+        description: Experiment id to assert canonical progress against
+        required: false
+        default: nca-prepretraining
+      backend:
+        description: Native trainer backend
+        required: false
+        default: cpu
+        type: choice
+        options:
+          - cpu
+          - wgpu
+      principal_id:
+        description: Admitted trainer principal id for the canary
+        required: false
+        default: native-canary-mainnet-nca
+      windows:
+        description: Number of canonical windows to publish and observe
+        required: false
+        default: "2"
+  schedule:
+    - cron: "43 */6 * * *"
+
+concurrency:
+  group: live-native-training-canary-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: burn-dragon-p2p-${{ github.event.inputs.environment || 'production' }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL: ${{ github.event.inputs.edge_base_url || 'https://edge.dragon.aberration.technology' }}
+      BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_KIND: ${{ github.event.inputs.experiment_kind || 'nca' }}
+      BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id || 'nca-prepretraining' }}
+      BURN_DRAGON_NATIVE_CANARY_BACKEND: ${{ github.event.inputs.backend || 'cpu' }}
+      BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'native-canary-mainnet-nca' }}
+      BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
+      BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
+      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "900"
+      BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
+      BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-native-training-canary
+      BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-native-training-canary/native-canary-summary.json
+      BURN_DRAGON_NATIVE_CANARY_BINARY: target/debug/burn_dragon_p2p_native
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: checkout burn_p2p sibling
+        run: scripts/ensure-burn-p2p-sibling.sh
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build native canary binary
+        run: cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native
+
+      - name: run live native training canary
+        id: live_native_training_canary
+        run: python3 scripts/live_native_training_canary.py
+
+      - name: summarize live native training canary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="${BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON}"
+          if [ ! -f "$report_path" ]; then
+            exit 0
+          fi
+          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          windows = report.get("windows") or []
+          print("## live native training canary")
+          print()
+          print(f"- Success: `{report.get('success', False)}`")
+          print(f"- Edge: `{report.get('edge_base_url')}`")
+          print(f"- Experiment: `{report.get('experiment_id')}`")
+          print(f"- Backend: `{report.get('backend')}`")
+          print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
+          print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
+          print(f"- Windows: `{len(windows)}`")
+          for window in windows:
+              before = (window.get("head_before") or {}).get("head_id")
+              after = (window.get("head_after") or {}).get("head_id")
+              train = window.get("train_report") or {}
+              train_signal = window.get("train_signal") or {}
+              canonical_signal = window.get("canonical_signal") or {}
+              print(
+                  f"  - window `{window.get('window_index')}`: "
+                  f"`{before}` -> `{after}`, "
+                  f"published `{train.get('published_head_id')}`, "
+                  f"train loss `{train_signal.get('train_loss')}`, "
+                  f"canonical loss `{canonical_signal.get('canonical_loss_after')}`, "
+                  f"canonical improved `{canonical_signal.get('canonical_loss_improved')}`, "
+                  f"canonical wait `{window.get('canonical_wait_secs'):.1f}s`"
+              )
+          PY
+
+      - name: upload live native training canary artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-dragon-live-native-training-canary
+          path: ${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}
+          if-no-files-found: ignore

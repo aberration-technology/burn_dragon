@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -55,7 +55,7 @@ use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ExperimentDirectoryEntry,
-    ExperimentId, ExperimentScope, HeadAnnouncement, LiveControlPlaneEvent,
+    ExperimentId, ExperimentScope, HeadAnnouncement, LiveControlPlaneEvent, MetricValue,
     NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
     RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
 };
@@ -742,6 +742,7 @@ struct TrainWindowOnceReport {
     lease_window_id: String,
     lease_microshard_count: usize,
     timing: TrainWindowOnceTimingReport,
+    metrics: BTreeMap<String, MetricValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2119,13 +2120,14 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
 }
 
 fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
-    let config = resolved_config(
+    let mut config = resolved_config(
         args.config.as_deref(),
         args.config_format,
         args.edge_url,
         args.seed_node_urls,
         Some(args.capability_policy),
     )?;
+    config.target = Some(DragonNativeTarget::Validator);
     ensure_training_backend_runtime_accessible(args.backend)?;
     let auth_bundle = Some(resolve_or_login_native_auth_bundle(
         &config,
@@ -2317,7 +2319,13 @@ fn prepared_manifests(
 }
 
 fn requested_scopes_for_config(config: &DragonNativePeerConfig) -> BTreeSet<ExperimentScope> {
-    standard_experiment_scopes(&ExperimentId::new(config.manifest.experiment_id.clone()))
+    let experiment_id = ExperimentId::new(config.manifest.experiment_id.clone());
+    match config.target_or_default() {
+        DragonNativeTarget::Validator => managed_validator_scopes(&experiment_id),
+        DragonNativeTarget::Auto | DragonNativeTarget::Trainer | DragonNativeTarget::Reducer => {
+            standard_experiment_scopes(&experiment_id)
+        }
+    }
 }
 
 fn standard_experiment_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
@@ -2594,6 +2602,7 @@ where
                 data_fetch_time_ms: outcome.timing.data_fetch_time_ms,
                 publish_latency_ms: outcome.timing.publish_latency_ms,
             },
+            metrics: outcome.report.stats,
         })
     })();
 
@@ -3423,6 +3432,28 @@ mod tests {
         };
         assert!(!no_restore.initialize_head_on_start);
         assert!(!no_restore.restore_head_on_start);
+    }
+
+    #[test]
+    fn validator_config_requests_validate_scopes() {
+        let mut config = default_mainnet_native_config();
+        config.target = Some(DragonNativeTarget::Validator);
+        let scopes = requested_scopes_for_config(&config);
+        let experiment_id = ExperimentId::new(DEFAULT_MAINNET_EXPERIMENT_ID);
+        assert!(scopes.contains(&ExperimentScope::Connect));
+        assert!(scopes.contains(&ExperimentScope::Discover));
+        assert!(scopes.contains(&ExperimentScope::Validate {
+            experiment_id: experiment_id.clone()
+        }));
+        assert!(scopes.contains(&ExperimentScope::Archive { experiment_id }));
+        assert!(!scopes.iter().any(|scope| {
+            matches!(
+                scope,
+                ExperimentScope::Train {
+                    experiment_id
+                } if experiment_id.as_str() == DEFAULT_MAINNET_EXPERIMENT_ID
+            )
+        }));
     }
 
     #[test]

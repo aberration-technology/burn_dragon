@@ -1354,6 +1354,21 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
         run: bash scripts/dispatch_pages_deploy_and_wait.sh
 
+      - name: verify live native canonical training dynamics
+        id: live_native_training_canary
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BURN_DRAGON_NATIVE_CANARY_ENVIRONMENT: ${{ env.DEPLOY_ENVIRONMENT }}
+          BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
+          BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_KIND: nca
+          BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
+          BURN_DRAGON_NATIVE_CANARY_BACKEND: cpu
+          BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: native-canary-mainnet-nca
+          BURN_DRAGON_NATIVE_CANARY_WINDOWS: "2"
+        run: bash scripts/dispatch_native_training_canary_and_wait.sh
+
       - name: publish workflow summary
         if: ${{ always() }}
         shell: bash

@@ -64,6 +64,11 @@ def main() -> None:
     assert "gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml" in dispatch_run
     assert "-f environment=production" in dispatch_run
     assert "-f terraform_workspace=mainnet" in dispatch_run
+    deploy_runs = "\n".join(
+        step.get("run", "") for step in deploy_workflow["jobs"]["deploy"]["steps"]
+    )
+    assert "scripts/dispatch_native_training_canary_and_wait.sh" in deploy_runs
+    assert "BURN_DRAGON_NATIVE_CANARY_WINDOWS" in str(deploy_workflow["jobs"]["deploy"]["steps"])
     test_job_steps = ci_workflow["jobs"]["test"]["steps"]
     test_job_runs = "\n".join(step.get("run", "") for step in test_job_steps)
     assert "cargo clean" not in test_job_runs

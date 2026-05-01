@@ -9,6 +9,7 @@ on:
       - ".github/workflows/inspect-burn-dragon-p2p-aws.yml"
       - ".github/workflows/cleanup-burn-dragon-p2p-aws.yml"
       - ".github/workflows/live-browser-canary.yml"
+      - ".github/workflows/live-native-training-canary.yml"
       - ".github/workflows/publish-burn-dragon-p2p-dataset.yml"
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
@@ -29,6 +30,7 @@ on:
       - ".github/workflows/inspect-burn-dragon-p2p-aws.yml"
       - ".github/workflows/cleanup-burn-dragon-p2p-aws.yml"
       - ".github/workflows/live-browser-canary.yml"
+      - ".github/workflows/live-native-training-canary.yml"
       - ".github/workflows/publish-burn-dragon-p2p-dataset.yml"
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
@@ -62,7 +64,7 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: bash -n scripts/sync-bootstrap-runtime-config.sh scripts/install_playwright_chromium.sh scripts/run_live_browser_canary.sh scripts/run_pages_predeploy_canary.sh scripts/dispatch_pages_deploy_and_wait.sh scripts/resolve_bootstrap_stack_settings.sh
+      - run: bash -n scripts/sync-bootstrap-runtime-config.sh scripts/install_playwright_chromium.sh scripts/run_live_browser_canary.sh scripts/run_pages_predeploy_canary.sh scripts/dispatch_pages_deploy_and_wait.sh scripts/dispatch_native_training_canary_and_wait.sh scripts/resolve_bootstrap_stack_settings.sh
       - run: python3 scripts/test_bootstrap_runtime_sync.py
       - run: python3 scripts/test_bootstrap_instance_selection.py
       - run: python3 scripts/test_bootstrap_head_mirror_seed_urls.py
@@ -76,10 +78,11 @@ jobs:
       - run: python3 scripts/test_local_browser_e2e_plan.py
       - run: python3 scripts/test_live_browser_canary_workflow.py
       - run: python3 scripts/test_live_browser_canary_script.py
+      - run: python3 scripts/test_live_native_training_canary.py
       - run: python3 scripts/test_browser_transport_terraform.py
       - run: python3 scripts/test_browser_profile_budget.py
       - run: python3 scripts/test_edge_caddyfile.py
-      - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/deploy-pages.yml',\n  '.github/workflows/live-browser-canary.yml',\n  '.github/workflows/p2p-validation.yml',\n  '.github/workflows/publish-crates.yml',\n  '.github/workflows/publish-readiness.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
+      - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/deploy-pages.yml',\n  '.github/workflows/live-browser-canary.yml',\n  '.github/workflows/live-native-training-canary.yml',\n  '.github/workflows/p2p-validation.yml',\n  '.github/workflows/publish-crates.yml',\n  '.github/workflows/publish-readiness.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
       - run: node --check scripts/live-browser-canary.mjs
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings

@@ -49,6 +49,7 @@ def main() -> None:
         "/artifacts/heads/",
         "/metrics/catchup/",
         "canonical head did not advance",
+        "canonical loss regressed",
         "canonical_loss_improved",
         "train_loss",
         "batch_count",

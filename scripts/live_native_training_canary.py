@@ -230,6 +230,11 @@ def assert_canonical_signal(
         )
     before_loss = metric_number(before.get("metrics") or {}, "loss", "train_loss")
     after_loss = require_metric_number(after.get("metrics") or {}, "loss", "train_loss")
+    if before_loss is not None and after_loss > before_loss + 1e-6:
+        raise RuntimeError(
+            "canonical loss regressed after native training window: "
+            f"before={before_loss} after={after_loss}"
+        )
     return {
         "canonical_loss_before": before_loss,
         "canonical_loss_after": after_loss,

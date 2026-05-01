@@ -183,6 +183,57 @@ impl BackendArg {
     }
 }
 
+macro_rules! with_prepared_native_peer {
+    ($experiment_kind:expr, $backend:expr, $config:expr, $auth_bundle:expr, |$prepared:ident| $body:expr) => {
+        match ($experiment_kind, $backend) {
+            (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
+                let $prepared = prepare_nca_native_cpu($config, $auth_bundle)?;
+                $body
+            }
+            (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
+                let $prepared = prepare_climbmix_native_cpu($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "wgpu")]
+            (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
+                let $prepared = prepare_nca_native_wgpu($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "wgpu")]
+            (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
+                let $prepared = prepare_climbmix_native_wgpu($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "cuda")]
+            (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
+                let $prepared = prepare_nca_native_cuda($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "cuda")]
+            (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
+                let $prepared = prepare_climbmix_native_cuda($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "rocm")]
+            (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
+                let $prepared = prepare_nca_native_rocm($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "rocm")]
+            (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
+                let $prepared = prepare_climbmix_native_rocm($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(not(feature = "wgpu"))]
+            (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
+            #[cfg(not(feature = "cuda"))]
+            (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
+            #[cfg(not(feature = "rocm"))]
+            (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ManagedPrincipalKindArg {
     Trainer,
@@ -1879,84 +1930,13 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         require_head_advanced: args.require_head_advanced,
     };
 
-    match (args.experiment_kind.into_config(), args.backend) {
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
-            run_prepared_train_window_once(
-                prepare_nca_native_cpu(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
-            run_prepared_train_window_once(
-                prepare_climbmix_native_cpu(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
-            run_prepared_train_window_once(
-                prepare_nca_native_wgpu(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
-            run_prepared_train_window_once(
-                prepare_climbmix_native_wgpu(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
-            run_prepared_train_window_once(
-                prepare_nca_native_cuda(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
-            run_prepared_train_window_once(
-                prepare_climbmix_native_cuda(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
-            run_prepared_train_window_once(
-                prepare_nca_native_rocm(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
-            run_prepared_train_window_once(
-                prepare_climbmix_native_rocm(&config, Some(&auth_bundle))?,
-                &config,
-                args.backend,
-                run_options,
-            )
-        }
-        #[cfg(not(feature = "wgpu"))]
-        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
-        #[cfg(not(feature = "cuda"))]
-        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
-        #[cfg(not(feature = "rocm"))]
-        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
-    }
+    with_prepared_native_peer!(
+        args.experiment_kind.into_config(),
+        args.backend,
+        &config,
+        Some(&auth_bundle),
+        |prepared| run_prepared_train_window_once(prepared, &config, args.backend, run_options)
+    )
 }
 
 fn native_target_artifact_id(backend: BackendArg) -> &'static str {
@@ -2081,92 +2061,21 @@ fn run_peer(args: RunPeerArgs) -> Result<()> {
         },
     )?);
 
-    match (args.experiment_kind.into_config(), args.backend) {
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_peer(
-            prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
+    with_prepared_native_peer!(
+        args.experiment_kind.into_config(),
+        args.backend,
+        &config,
+        auth_bundle.as_ref(),
+        |prepared| run_prepared_peer(
+            prepared,
             &config,
             args.backend,
             args.status_interval_secs,
             args.initialize_head_on_start,
             args.restore_head_on_start,
             args.head_sync_interval_secs,
-        ),
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => run_prepared_peer(
-            prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => run_prepared_peer(
-            prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => run_prepared_peer(
-            prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => run_prepared_peer(
-            prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => run_prepared_peer(
-            prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => run_prepared_peer(
-            prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => run_prepared_peer(
-            prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
-            &config,
-            args.backend,
-            args.status_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-            args.head_sync_interval_secs,
-        ),
-        #[cfg(not(feature = "wgpu"))]
-        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
-        #[cfg(not(feature = "cuda"))]
-        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
-        #[cfg(not(feature = "rocm"))]
-        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
-    }
+        )
+    )
 }
 
 fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
@@ -2191,9 +2100,13 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
         },
     )?);
 
-    match (args.experiment_kind.into_config(), args.backend) {
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => run_prepared_head_mirror(
-            prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
+    with_prepared_native_peer!(
+        args.experiment_kind.into_config(),
+        args.backend,
+        &config,
+        auth_bundle.as_ref(),
+        |prepared| run_prepared_head_mirror(
+            prepared,
             &config,
             auth_bundle.as_ref(),
             args.backend,
@@ -2201,90 +2114,8 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
             args.head_sync_interval_secs,
             args.initialize_head_on_start,
             args.restore_head_on_start,
-        ),
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => run_prepared_head_mirror(
-            prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
-            prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => run_prepared_head_mirror(
-            prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => run_prepared_head_mirror(
-            prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => run_prepared_head_mirror(
-            prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => run_prepared_head_mirror(
-            prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => run_prepared_head_mirror(
-            prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
-            &config,
-            auth_bundle.as_ref(),
-            args.backend,
-            args.status_interval_secs,
-            args.head_sync_interval_secs,
-            args.initialize_head_on_start,
-            args.restore_head_on_start,
-        ),
-        #[cfg(not(feature = "wgpu"))]
-        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
-        #[cfg(not(feature = "cuda"))]
-        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
-        #[cfg(not(feature = "rocm"))]
-        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
-    }
+        )
+    )
 }
 
 fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
@@ -2309,108 +2140,21 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
         },
     )?);
 
-    match (args.experiment_kind.into_config(), args.backend) {
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
-            run_prepared_validator_daemon(
-                prepare_nca_native_cpu(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
-            run_prepared_validator_daemon(
-                prepare_climbmix_native_cpu(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
-            run_prepared_validator_daemon(
-                prepare_nca_native_wgpu(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
-            run_prepared_validator_daemon(
-                prepare_climbmix_native_wgpu(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
-            run_prepared_validator_daemon(
-                prepare_nca_native_cuda(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
-            run_prepared_validator_daemon(
-                prepare_climbmix_native_cuda(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
-            run_prepared_validator_daemon(
-                prepare_nca_native_rocm(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
-            run_prepared_validator_daemon(
-                prepare_climbmix_native_rocm(&config, auth_bundle.as_ref())?,
-                &config,
-                args.backend,
-                args.status_interval_secs,
-                args.validation_interval_millis,
-                args.initialize_head_on_start,
-                args.restore_head_on_start,
-            )
-        }
-        #[cfg(not(feature = "wgpu"))]
-        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
-        #[cfg(not(feature = "cuda"))]
-        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
-        #[cfg(not(feature = "rocm"))]
-        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
-    }
+    with_prepared_native_peer!(
+        args.experiment_kind.into_config(),
+        args.backend,
+        &config,
+        auth_bundle.as_ref(),
+        |prepared| run_prepared_validator_daemon(
+            prepared,
+            &config,
+            args.backend,
+            args.status_interval_secs,
+            args.validation_interval_millis,
+            args.initialize_head_on_start,
+            args.restore_head_on_start,
+        )
+    )
 }
 
 fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
@@ -2563,44 +2307,13 @@ fn prepared_manifests(
         session: None,
         certificate_not_after: None,
     };
-    match (experiment_kind, backend) {
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cpu) => {
-            Ok(prepare_nca_native_cpu(config, Some(&placeholder_auth))?.manifests)
-        }
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
-            Ok(prepare_climbmix_native_cpu(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
-            Ok(prepare_nca_native_wgpu(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "wgpu")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Wgpu) => {
-            Ok(prepare_climbmix_native_wgpu(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Cuda) => {
-            Ok(prepare_nca_native_cuda(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "cuda")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
-            Ok(prepare_climbmix_native_cuda(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
-            Ok(prepare_nca_native_rocm(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(feature = "rocm")]
-        (DragonExperimentKind::ClimbMixPretraining, BackendArg::Rocm) => {
-            Ok(prepare_climbmix_native_rocm(config, Some(&placeholder_auth))?.manifests)
-        }
-        #[cfg(not(feature = "wgpu"))]
-        (_, BackendArg::Wgpu) => bail!("this binary was built without the `wgpu` feature"),
-        #[cfg(not(feature = "cuda"))]
-        (_, BackendArg::Cuda) => bail!("this binary was built without the `cuda` feature"),
-        #[cfg(not(feature = "rocm"))]
-        (_, BackendArg::Rocm) => bail!("this binary was built without the `rocm` feature"),
-    }
+    with_prepared_native_peer!(
+        experiment_kind,
+        backend,
+        config,
+        Some(&placeholder_auth),
+        |prepared| Ok(prepared.manifests)
+    )
 }
 
 fn requested_scopes_for_config(config: &DragonNativePeerConfig) -> BTreeSet<ExperimentScope> {

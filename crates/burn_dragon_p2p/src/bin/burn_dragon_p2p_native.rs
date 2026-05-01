@@ -2622,13 +2622,12 @@ where
             served_head_id,
             started.elapsed().as_millis()
         );
-        eprintln!("train-window-once progress: preparing continuous trainer state");
-        let mut trainer = running.continuous_trainer(&experiment)?;
+        eprintln!("train-window-once progress: preparing pinned trainer state");
         eprintln!(
             "train-window-once progress: trainer ready; running one training window elapsed_ms={}",
             started.elapsed().as_millis()
         );
-        let outcome = trainer.train_next_window()?;
+        let outcome = running.train_window_once_with_pinned_head(&experiment, Some(&base_head))?;
         let train_loss = outcome
             .report
             .stats
@@ -2709,8 +2708,7 @@ where
     } else {
         None
     };
-    let synced = running.sync_experiment_head(experiment)?;
-    let head = if let Some(head) = synced.or(restored) {
+    let head = if let Some(head) = restored {
         head
     } else if initialize_head_on_start {
         let head = running.initialize_local_head(experiment)?;
@@ -2719,6 +2717,8 @@ where
             head.head_id.as_str(),
             head.global_step,
         );
+        head
+    } else if let Some(head) = running.sync_experiment_head(experiment)? {
         head
     } else {
         return Ok(None);

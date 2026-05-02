@@ -290,7 +290,8 @@ mod tests {
             artifact_id: ArtifactId::new(format!("artifact-{head_id}")),
             parent_head_id: parent_head_id.map(HeadId::new),
             global_step,
-            created_at: chrono::DateTime::from_timestamp(global_step as i64, 0).unwrap(),
+            created_at: chrono::DateTime::from_timestamp(global_step as i64, 0)
+                .expect("test timestamp should fit"),
             metrics: BTreeMap::new(),
         }
     }

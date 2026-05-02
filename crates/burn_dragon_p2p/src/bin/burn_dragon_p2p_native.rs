@@ -2835,10 +2835,28 @@ where
         }
 
         if attempts == 1 || attempts.is_multiple_of(10) {
+            let snapshot = running.snapshot();
+            let last_snapshot_heads = snapshot
+                .last_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.head_announcements.len())
+                .unwrap_or(0);
             eprintln!(
-                "{log_prefix}-head-waiting elapsed_ms={} attempts={}",
+                "{log_prefix}-head-waiting elapsed_ms={} attempts={} connected_peers={} local_heads={} last_snapshot_peer={} last_snapshot_heads={} node_state={:?} last_error={}",
                 started.elapsed().as_millis(),
-                attempts
+                attempts,
+                snapshot.connected_peers,
+                snapshot.control_plane.head_announcements.len(),
+                snapshot
+                    .last_snapshot_peer_id
+                    .as_ref()
+                    .map(|peer_id| peer_id.as_str())
+                    .unwrap_or("-"),
+                last_snapshot_heads,
+                snapshot.node_state,
+                operator_visible_last_error(snapshot.last_error.as_deref())
+                    .as_deref()
+                    .unwrap_or("-"),
             );
         }
         thread::sleep(STATUS_POLL_INTERVAL);

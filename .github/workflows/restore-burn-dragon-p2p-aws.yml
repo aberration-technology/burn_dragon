@@ -45,9 +45,9 @@ on:
           - crate
           - git
       bootstrap_version:
-        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.55`."
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.56`."
         required: false
-        default: 0.21.0-pre.55
+        default: 0.21.0-pre.56
         type: string
       bootstrap_git_ref:
         description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."

@@ -34,7 +34,7 @@ def main() -> None:
     assert env["BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR"].startswith("/tmp/")
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
     assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
-    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "4"
+    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "24"
     assert env["BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS"] == "300"
     assert env["BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS"] == "1500"
     assert env["BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS"] == "300"
@@ -61,6 +61,8 @@ def main() -> None:
         "canonical head did not advance",
         "canonical loss regressed",
         "canonical_loss_improved",
+        "canonical_loss_metric",
+        "comparable_loss_signal",
         "train_loss",
         "batch_count",
         "training_batch_size",

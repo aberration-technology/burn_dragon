@@ -35,6 +35,18 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def comparable_loss_signal(
+    before_metrics: dict[str, Any],
+    after_metrics: dict[str, Any],
+) -> tuple[str | None, float | None, float | None]:
+    for key in ("train_loss", "loss"):
+        before = metric_number(before_metrics, key)
+        after = metric_number(after_metrics, key)
+        if before is not None and after is not None:
+            return key, before, after
+    return None, None, None
+
+
 def require_metric_number(metrics: dict[str, Any], *keys: str) -> float:
     value = metric_number(metrics, *keys)
     if value is None:
@@ -346,18 +358,34 @@ def assert_canonical_signal(
             "canonical head did not advance global step: "
             f"before={before_step} after={after_step}"
         )
-    before_loss = metric_number(before.get("metrics") or {}, "loss", "train_loss")
-    after_loss = require_metric_number(after.get("metrics") or {}, "loss", "train_loss")
-    if before_loss is not None and after_loss > before_loss + 1e-6:
+    before_metrics = before.get("metrics") or {}
+    after_metrics = after.get("metrics") or {}
+    before_loss = metric_number(before_metrics, "train_loss", "loss")
+    after_loss = require_metric_number(after_metrics, "train_loss", "loss")
+    comparable_loss_key, comparable_before_loss, comparable_after_loss = comparable_loss_signal(
+        before_metrics,
+        after_metrics,
+    )
+    if (
+        comparable_before_loss is not None
+        and comparable_after_loss is not None
+        and comparable_after_loss > comparable_before_loss + 1e-6
+    ):
         raise RuntimeError(
             "canonical loss regressed after native training window: "
-            f"before={before_loss} after={after_loss}"
+            f"metric={comparable_loss_key} before={comparable_before_loss} "
+            f"after={comparable_after_loss}"
         )
     return {
         "canonical_loss_before": before_loss,
         "canonical_loss_after": after_loss,
         "canonical_loss_delta": None if before_loss is None else after_loss - before_loss,
-        "canonical_loss_improved": None if before_loss is None else after_loss <= before_loss,
+        "canonical_loss_improved": None
+        if comparable_before_loss is None or comparable_after_loss is None
+        else comparable_after_loss <= comparable_before_loss,
+        "canonical_loss_metric": comparable_loss_key,
+        "comparable_loss_before": comparable_before_loss,
+        "comparable_loss_after": comparable_after_loss,
     }
 
 

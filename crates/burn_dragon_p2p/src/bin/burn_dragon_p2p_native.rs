@@ -18,6 +18,7 @@ use burn::tensor::backend::AutodiffBackend;
 use burn_dragon_language::load_training_config;
 use burn_dragon_p2p::admin::{
     fetch_directory_entries, fetch_signed_directory_entries, mirror_peer_artifact,
+    preserve_directory_entry_current_head, recover_directory_current_head_from_visible_roots,
     register_live_head, rollout_directory_entries, upsert_directory_entry,
     upsert_directory_entry_current_head,
 };
@@ -487,6 +488,8 @@ struct AdminRolloutProfileArgs {
     auth_bundle_format: ConfigFormat,
     #[arg(long)]
     edge_url: Option<String>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    recover_current_head_from_visible_root: bool,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
 }
@@ -745,6 +748,9 @@ struct AdminRolloutReport {
     session_id: String,
     experiment_id: String,
     revision_id: String,
+    current_head_id: Option<String>,
+    preserved_current_head_id: Option<String>,
+    recovered_current_head_id: Option<String>,
     directory_entries: usize,
     result: AdminResult,
 }
@@ -1279,7 +1285,7 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         args.experiment_kind.into_config(),
         args.backend,
     )?;
-    let replacement = manifests
+    let mut replacement = manifests
         .experiment_directory
         .first()
         .cloned()
@@ -1291,6 +1297,20 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         .context("failed to build async runtime for admin rollout")?;
     let mut directory_entries =
         runtime.block_on(fetch_signed_directory_entries(&edge_base_url, &session_id))?;
+    let preserved_current_head_id =
+        preserve_directory_entry_current_head(&directory_entries, &mut replacement);
+    let recovered_current_head_id =
+        if replacement.current_head_id.is_none() && args.recover_current_head_from_visible_root {
+            let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
+            let recovered =
+                recover_directory_current_head_from_visible_roots(&replacement, &snapshot.heads);
+            if let Some(head_id) = recovered.as_ref() {
+                replacement.current_head_id = Some(head_id.clone());
+            }
+            recovered
+        } else {
+            None
+        };
     upsert_directory_entry(&mut directory_entries, replacement.clone());
     let result = runtime.block_on(rollout_directory_entries(
         &edge_base_url,
@@ -1306,6 +1326,16 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
             session_id,
             experiment_id: replacement.experiment_id.as_str().to_owned(),
             revision_id: replacement.current_revision_id.as_str().to_owned(),
+            current_head_id: replacement
+                .current_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
+            preserved_current_head_id: preserved_current_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
+            recovered_current_head_id: recovered_current_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
             directory_entries: directory_entries.len(),
             result,
         },

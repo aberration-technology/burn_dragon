@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadId};
+use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadDescriptor, HeadId};
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
 #[cfg(feature = "native")]
 use burn_p2p_publish::{PeerArtifactMirrorRequest, PeerArtifactMirrorResponse};
@@ -38,6 +38,45 @@ pub fn upsert_directory_entry(
     replacement: ExperimentDirectoryEntry,
 ) {
     AdminClient::upsert_directory_entry(entries, replacement);
+}
+
+pub fn preserve_directory_entry_current_head(
+    entries: &[ExperimentDirectoryEntry],
+    replacement: &mut ExperimentDirectoryEntry,
+) -> Option<HeadId> {
+    if replacement.current_head_id.is_some() {
+        return replacement.current_head_id.clone();
+    }
+    let current_head_id = entries
+        .iter()
+        .find(|entry| {
+            entry.study_id == replacement.study_id
+                && entry.experiment_id == replacement.experiment_id
+                && entry.current_revision_id == replacement.current_revision_id
+        })
+        .and_then(|entry| entry.current_head_id.clone())?;
+    replacement.current_head_id = Some(current_head_id.clone());
+    Some(current_head_id)
+}
+
+pub fn recover_directory_current_head_from_visible_roots(
+    entry: &ExperimentDirectoryEntry,
+    heads: &[HeadDescriptor],
+) -> Option<HeadId> {
+    heads
+        .iter()
+        .filter(|head| {
+            head.study_id == entry.study_id
+                && head.experiment_id == entry.experiment_id
+                && head.revision_id == entry.current_revision_id
+                && head.parent_head_id.is_none()
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.head_id.cmp(&right.head_id))
+        })
+        .map(|head| head.head_id.clone())
 }
 
 pub fn upsert_directory_entry_current_head(
@@ -121,9 +160,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use burn_p2p::{
-        ContentId, DatasetViewId, ExperimentId, ExperimentOptInPolicy,
-        ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, NetworkId, PeerRole,
-        PeerRoleSet, RevisionId, StudyId, WorkloadId,
+        ArtifactId, ContentId, DatasetViewId, ExperimentId, ExperimentOptInPolicy,
+        ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadDescriptor,
+        NetworkId, PeerRole, PeerRoleSet, RevisionId, StudyId, WorkloadId,
     };
 
     fn sample_entry() -> ExperimentDirectoryEntry {
@@ -208,5 +247,65 @@ mod tests {
             entries[0].current_head_id.as_ref().map(|id| id.as_str()),
             Some("head-1")
         );
+    }
+
+    #[test]
+    fn preserve_directory_entry_current_head_keeps_existing_matching_revision() {
+        let mut existing = sample_entry();
+        existing.current_head_id = Some(HeadId::new("head-1"));
+        let mut replacement = sample_entry();
+
+        let preserved = preserve_directory_entry_current_head(&[existing], &mut replacement);
+
+        assert_eq!(preserved.as_ref().map(|id| id.as_str()), Some("head-1"));
+        assert_eq!(
+            replacement.current_head_id.as_ref().map(|id| id.as_str()),
+            Some("head-1")
+        );
+    }
+
+    #[test]
+    fn preserve_directory_entry_current_head_does_not_cross_revision() {
+        let mut existing = sample_entry();
+        existing.current_head_id = Some(HeadId::new("head-1"));
+        existing.current_revision_id = RevisionId::new("old-revision");
+        let mut replacement = sample_entry();
+
+        let preserved = preserve_directory_entry_current_head(&[existing], &mut replacement);
+
+        assert!(preserved.is_none());
+        assert!(replacement.current_head_id.is_none());
+    }
+
+    fn sample_head(
+        head_id: &str,
+        global_step: u64,
+        parent_head_id: Option<&str>,
+    ) -> HeadDescriptor {
+        HeadDescriptor {
+            head_id: HeadId::new(head_id),
+            study_id: StudyId::new("burn-dragon-mainnet"),
+            experiment_id: ExperimentId::new("nca-prepretraining"),
+            revision_id: RevisionId::new("nca-r1"),
+            artifact_id: ArtifactId::new(format!("artifact-{head_id}")),
+            parent_head_id: parent_head_id.map(HeadId::new),
+            global_step,
+            created_at: chrono::DateTime::from_timestamp(global_step as i64, 0).unwrap(),
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn recover_directory_current_head_from_visible_roots_uses_latest_root_only() {
+        let entry = sample_entry();
+        let heads = vec![
+            sample_head("older-root", 1, None),
+            sample_head("newer-child", 3, Some("newer-root")),
+            sample_head("newer-root", 2, None),
+        ];
+
+        let recovered = recover_directory_current_head_from_visible_roots(&entry, &heads);
+
+        assert_eq!(recovered.as_ref().map(|id| id.as_str()), Some("newer-root"));
     }
 }

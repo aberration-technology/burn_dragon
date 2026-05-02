@@ -37,6 +37,7 @@ def main() -> None:
         (RESTORE_WORKFLOW, restore_workflow),
     ):
         assert_contains(text, "admin-rollout-profile", str(path))
+        assert_contains(text, "--recover-current-head-from-visible-root", str(path))
         assert_contains(text, "--require-directory-entry-published", str(path))
 
     print("head-mirror-admin-capability-ok")

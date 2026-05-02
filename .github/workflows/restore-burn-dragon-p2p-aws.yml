@@ -850,6 +850,7 @@ jobs:
                 --experiment-kind nca \
                 --backend cpu \
                 --auth-bundle "$bundle_path" \
+                --recover-current-head-from-visible-root \
                 --output-format json >/tmp/bootstrap-head-mirror-admin-rollout.json
               cat /tmp/bootstrap-head-mirror-admin-rollout.json
               exit 0

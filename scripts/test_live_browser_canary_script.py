@@ -99,6 +99,7 @@ def main() -> None:
         "accepted_receipt_ids: acceptedReceiptIds",
         "accepted_receipt_count: acceptedReceiptIds.length",
         "report.durable_receipt_snapshot = await waitForDurableReceiptCount(",
+        "report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);\n    assertBrowserE2eContract(report);",
     ]
     for snippet in required_snippets:
         assert snippet in script, f"live-browser-canary.mjs missing required snippet: {snippet}"

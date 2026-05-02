@@ -1466,6 +1466,8 @@ async fn start_live_browser_participant(
             capability,
             include_leaderboard: true,
             enable_direct_swarm: true,
+            sync_active_head_artifact: live.load_active_head_artifact
+                || live.publish_canonical_update,
         },
         session,
     )

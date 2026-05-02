@@ -1725,6 +1725,7 @@ async function runCanary() {
       acceptedReceiptIds,
       acceptedReceiptsBeforeTraining,
     );
+    report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
     assertBrowserE2eContract(report);
     report.success = true;
     await page.screenshot({ path: screenshotPath, fullPage: true });

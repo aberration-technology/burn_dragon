@@ -267,7 +267,7 @@ resolve_deploy() {
     bootstrap_version="$bootstrap_version_var"
   fi
   if [ -z "$bootstrap_version" ]; then
-    bootstrap_version="0.21.0-pre.56"
+    bootstrap_version="0.21.0-pre.57"
   fi
 
   bootstrap_git_ref="$bootstrap_git_ref_input"
@@ -826,7 +826,7 @@ resolve_restore() {
     bootstrap_version="$bootstrap_version_var"
   fi
   if [ -z "$bootstrap_version" ]; then
-    bootstrap_version="0.21.0-pre.56"
+    bootstrap_version="0.21.0-pre.57"
   fi
 
   bootstrap_git_ref="$bootstrap_git_ref_input"

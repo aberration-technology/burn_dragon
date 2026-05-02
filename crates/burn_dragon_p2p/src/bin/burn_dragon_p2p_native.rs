@@ -3284,32 +3284,66 @@ where
         experiment_entry.current_revision_id,
     );
     let mut served_head_id = None;
-    let _ = sync_or_initialize_head_provider(
-        &mut running,
-        &experiment,
-        initialize_head_on_start,
-        restore_head_on_start,
-        &mut served_head_id,
-        "validator",
-    )?;
 
     let status_interval = Duration::from_secs(status_interval_secs.max(1));
     let validation_interval = Duration::from_millis(validation_interval_millis.max(25));
+    let head_sync_interval = Duration::from_secs(status_interval_secs.clamp(1, 5));
     let mut last_status = Instant::now()
         .checked_sub(status_interval)
         .unwrap_or_else(Instant::now);
     let mut last_validation = Instant::now()
         .checked_sub(validation_interval)
         .unwrap_or_else(Instant::now);
+    let mut last_head_sync = Instant::now()
+        .checked_sub(head_sync_interval)
+        .unwrap_or_else(Instant::now);
+    let mut head_sync_attempts = 0_u64;
 
     loop {
+        if last_head_sync.elapsed() >= head_sync_interval {
+            head_sync_attempts = head_sync_attempts.saturating_add(1);
+            match sync_or_initialize_head_provider(
+                &mut running,
+                &experiment,
+                initialize_head_on_start,
+                restore_head_on_start,
+                &mut served_head_id,
+                "validator",
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if head_sync_attempts == 1 || head_sync_attempts.is_multiple_of(12) {
+                        let snapshot = running.snapshot();
+                        eprintln!(
+                            "validator-head-sync-waiting attempts={} connected_peers={} local_heads={} node_state={:?} last_error={}",
+                            head_sync_attempts,
+                            snapshot.connected_peers,
+                            snapshot.control_plane.head_announcements.len(),
+                            snapshot.node_state,
+                            operator_visible_last_error(snapshot.last_error.as_deref())
+                                .as_deref()
+                                .unwrap_or("-"),
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("validator-head-sync-error: {error}");
+                }
+            }
+            last_head_sync = Instant::now();
+        }
+
         let snapshot = running.snapshot();
         if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
             eprintln!(
-                "validator-status status={:?} node_state={:?} connected_peers={} last_error={}",
+                "validator-status status={:?} node_state={:?} connected_peers={} served_head={} last_error={}",
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
+                served_head_id
+                    .as_ref()
+                    .map(|head_id| head_id.as_str())
+                    .unwrap_or("-"),
                 operator_visible_last_error(snapshot.last_error.as_deref())
                     .as_deref()
                     .unwrap_or("-"),
@@ -3335,7 +3369,11 @@ where
         }
 
         if last_validation.elapsed() >= validation_interval {
-            if diffusion_promotion {
+            if served_head_id.is_none() {
+                last_validation = Instant::now();
+                thread::sleep(STATUS_POLL_INTERVAL);
+                continue;
+            } else if diffusion_promotion {
                 if let Err(error) = running.advance_diffusion_steady_state(&experiment, None, None)
                 {
                     eprintln!("validator-diffusion-pass-error: {error}");

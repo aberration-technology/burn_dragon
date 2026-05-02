@@ -83,7 +83,7 @@ const NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES: usize = 512 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
-const TRAIN_WINDOW_HEAD_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS: u64 = 300;
 const NATIVE_BROWSER_APP_BASE_URL_ENV: &str = "BURN_DRAGON_P2P_BROWSER_APP_BASE_URL";
 const NATIVE_STORAGE_ROOT_ENV: &str = "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT";
 const DEFAULT_MAINNET_EDGE_BASE_URL: &str = "https://edge.dragon.aberration.technology";
@@ -625,6 +625,8 @@ struct TrainWindowOnceArgs {
     output_format: OutputFormat,
     #[arg(long, default_value_t = false)]
     require_head_advanced: bool,
+    #[arg(long, default_value_t = DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS)]
+    head_sync_timeout_secs: u64,
     #[command(flatten)]
     training_overrides: NativeTrainingOverrideArgs,
     #[command(flatten)]
@@ -814,6 +816,7 @@ struct TrainWindowOnceRunOptions<'a> {
     output: Option<&'a Path>,
     output_format: OutputFormat,
     require_head_advanced: bool,
+    head_sync_timeout_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -2058,6 +2061,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         output: args.output.as_deref(),
         output_format: args.output_format,
         require_head_advanced: args.require_head_advanced,
+        head_sync_timeout_secs: args.head_sync_timeout_secs,
     };
 
     with_prepared_native_peer!(
@@ -2713,7 +2717,7 @@ where
             options.restore_head_on_start,
             &mut served_head_id,
             "trainer",
-            TRAIN_WINDOW_HEAD_SYNC_TIMEOUT,
+            Duration::from_secs(options.head_sync_timeout_secs.max(1)),
         )?;
         eprintln!(
             "train-window-once progress: active head ready head={} step={} served_head={:?} elapsed_ms={}",

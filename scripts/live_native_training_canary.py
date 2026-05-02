@@ -422,6 +422,7 @@ def main() -> int:
     windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "2"))
     training_batch_size = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE", "1"))
     training_max_iters = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS", "4"))
+    head_sync_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS", "300"))
     command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
     canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
     p2p_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS", "300"))
@@ -516,6 +517,8 @@ def main() -> int:
                     str(training_batch_size),
                     "--training-max-iters",
                     str(training_max_iters),
+                    "--head-sync-timeout-secs",
+                    str(head_sync_timeout_secs),
                     "--require-head-advanced",
                     "--output",
                     str(report_path),
@@ -568,6 +571,7 @@ def main() -> int:
         "backend": backend,
         "training_batch_size": training_batch_size,
         "training_max_iters": training_max_iters,
+        "head_sync_timeout_secs": head_sync_timeout_secs,
         "p2p_timeout_secs": p2p_timeout_secs,
         "initialize_head_on_start": initialize_head_on_start,
         "principal_id": principal_id,

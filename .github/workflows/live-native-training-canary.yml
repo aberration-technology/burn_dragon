@@ -66,6 +66,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
       BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: "1"
       BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: "4"
+      BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
@@ -114,6 +115,7 @@ jobs:
           print(f"- Backend: `{report.get('backend')}`")
           print(f"- Training batch size: `{report.get('training_batch_size')}`")
           print(f"- Training max iters: `{report.get('training_max_iters')}`")
+          print(f"- Head sync timeout: `{report.get('head_sync_timeout_secs')}s`")
           print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
           print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
           print(f"- Windows: `{len(windows)}`")

@@ -35,6 +35,7 @@ def main() -> None:
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
     assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
     assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "4"
+    assert env["BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS"] == "300"
     assert env["BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS"] == "300"
     runs = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ensure-burn-p2p-sibling.sh" in runs
@@ -63,6 +64,8 @@ def main() -> None:
         "batch_count",
         "training_batch_size",
         "training_max_iters",
+        "head_sync_timeout_secs",
+        "--head-sync-timeout-secs",
         "initialize_head_on_start",
         'not bool(head_before.get("head_id"))',
         "--training-batch-size",
@@ -86,7 +89,8 @@ def main() -> None:
         / "burn_dragon_p2p_native.rs"
     ).read_text()
     for snippet in [
-        "TRAIN_WINDOW_HEAD_SYNC_TIMEOUT",
+        "DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS",
+        "head_sync_timeout_secs",
         "wait_for_head_provider(",
         "{log_prefix}-head-waiting",
         "no experiment head became available within",

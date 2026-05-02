@@ -39,6 +39,30 @@ on:
         description: Number of canonical windows to publish and observe
         required: false
         default: "2"
+      training_max_iters:
+        description: Per-window training iterations for the CPU canary
+        required: false
+        default: "4"
+      evaluation_max_batches:
+        description: Per-candidate validation batches for live diffusion promotion
+        required: false
+        default: "1"
+      settle_diffusion:
+        description: Run bounded diffusion promotion passes from the trainer after publishing
+        required: false
+        default: "true"
+      diffusion_settle_passes:
+        description: Initial diffusion promotion passes to run after each window
+        required: false
+        default: "3"
+      serve_after_publish_secs:
+        description: Seconds the trainer should stay online after publishing so peers can fetch artifacts
+        required: false
+        default: "120"
+      command_timeout_secs:
+        description: Per native command timeout
+        required: false
+        default: "900"
   schedule:
     - cron: "43 */6 * * *"
 
@@ -65,14 +89,20 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
       BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: "1"
-      BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: "24"
+      BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '4' }}
+      BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}
       BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "300"
-      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: "1500"
+      BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
+      BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '3' }}
+      BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '120' }}
+      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '900' }}
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
       BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json
       BURN_DRAGON_NATIVE_CANARY_BINARY: target/debug/burn_dragon_p2p_native
+      BURN_P2P_ARTIFACT_TRACE: "1"
+      BURN_P2P_DIFFUSION_TRACE: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -115,7 +145,11 @@ jobs:
           print(f"- Backend: `{report.get('backend')}`")
           print(f"- Training batch size: `{report.get('training_batch_size')}`")
           print(f"- Training max iters: `{report.get('training_max_iters')}`")
+          print(f"- Evaluation max batches: `{report.get('evaluation_max_batches')}`")
           print(f"- Head sync timeout: `{report.get('head_sync_timeout_secs')}s`")
+          print(f"- Settle diffusion: `{report.get('settle_diffusion')}`")
+          print(f"- Diffusion settle passes: `{report.get('diffusion_settle_passes')}`")
+          print(f"- Serve after publish: `{report.get('serve_after_publish_secs')}s`")
           print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
           print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
           print(f"- Windows: `{len(windows)}`")
@@ -123,6 +157,7 @@ jobs:
               before = (window.get("head_before") or {}).get("head_id")
               after = (window.get("head_after") or {}).get("head_id")
               train = window.get("train_report") or {}
+              settlement = train.get("diffusion_settlement") or {}
               train_signal = window.get("train_signal") or {}
               canonical_signal = window.get("canonical_signal") or {}
               p2p_signal = window.get("p2p_signal") or {}
@@ -134,8 +169,13 @@ jobs:
                   f"canonical loss `{canonical_signal.get('canonical_loss_after')}`, "
                   f"canonical improved `{canonical_signal.get('canonical_loss_improved')}`, "
                   f"canonical wait `{window.get('canonical_wait_secs'):.1f}s`, "
+                  f"settlement passes `{settlement.get('passes_completed')}`, "
+                  f"settlement certs `{settlement.get('certificates')}`, "
                   f"p2p wait `{window.get('p2p_wait_secs'):.1f}s`, "
-                  f"p2p heads `{p2p_signal.get('head_announcements')}`"
+                  f"p2p heads `{p2p_signal.get('head_announcements')}`, "
+                  f"p2p updates `{p2p_signal.get('update_announcements')}`, "
+                  f"p2p attestations `{p2p_signal.get('trainer_promotion_attestation_announcements')}`, "
+                  f"p2p diffusion certs `{p2p_signal.get('diffusion_promotion_certificate_announcements')}`"
               )
           PY
 

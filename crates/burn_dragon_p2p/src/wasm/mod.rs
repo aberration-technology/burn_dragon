@@ -725,7 +725,7 @@ async fn active_training_lease(
     let live_training_lease = DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         slot.borrow()
             .as_ref()
-            .and_then(|controller| controller.active_training_lease().cloned())
+            .and_then(|controller| controller.effective_active_training_lease())
     });
     if live_controller_present {
         return Ok(live_training_lease);
@@ -738,7 +738,7 @@ async fn active_training_lease(
         signed_seed_advertisement,
     )?)
     .await?;
-    Ok(controller.active_training_lease().cloned())
+    Ok(controller.effective_active_training_lease())
 }
 
 fn auth_provider_label(provider: &AuthProvider) -> String {

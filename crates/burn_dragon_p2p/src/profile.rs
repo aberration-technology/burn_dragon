@@ -954,6 +954,7 @@ prompt = "1 2 3"
             training_overrides: DragonNativeTrainingOverrides {
                 batch_size: Some(1),
                 max_iters: Some(4),
+                max_eval_batches: Some(1),
             },
             training_config_paths: Vec::new(),
             storage_root: storage.path().to_path_buf(),

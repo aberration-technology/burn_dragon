@@ -36,8 +36,7 @@ use burn_dragon_p2p::capability_state::{
 };
 use burn_dragon_p2p::config::{
     DragonCapabilityPolicy, DragonExperimentKind, DragonManifestBundle, DragonManifestSeed,
-    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget,
-    DragonNativeTrainingOverrides, DragonPeerNetworkConfig,
+    DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget, DragonPeerNetworkConfig,
 };
 use burn_dragon_p2p::deployment::{
     DeploymentDiagnosticsOptions, assert_deployment_ready, collect_deployment_diagnostics,
@@ -295,15 +294,20 @@ struct NativeTrainingOverrideArgs {
     batch_size: Option<usize>,
     #[arg(long = "training-max-iters", value_name = "ITERS")]
     max_iters: Option<usize>,
+    #[arg(long = "evaluation-max-batches", value_name = "BATCHES")]
+    max_eval_batches: Option<usize>,
 }
 
 impl NativeTrainingOverrideArgs {
     fn apply_to(self, config: &mut DragonNativePeerConfig) {
-        if self.batch_size.is_some() || self.max_iters.is_some() {
-            config.training_overrides = DragonNativeTrainingOverrides {
-                batch_size: self.batch_size,
-                max_iters: self.max_iters,
-            };
+        if let Some(batch_size) = self.batch_size {
+            config.training_overrides.batch_size = Some(batch_size);
+        }
+        if let Some(max_iters) = self.max_iters {
+            config.training_overrides.max_iters = Some(max_iters);
+        }
+        if let Some(max_eval_batches) = self.max_eval_batches {
+            config.training_overrides.max_eval_batches = Some(max_eval_batches);
         }
     }
 }
@@ -630,6 +634,12 @@ struct TrainWindowOnceArgs {
     require_head_advanced: bool,
     #[arg(long, default_value_t = DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS)]
     head_sync_timeout_secs: u64,
+    #[arg(long, default_value_t = false)]
+    settle_diffusion: bool,
+    #[arg(long, default_value_t = 3)]
+    diffusion_settle_passes: u32,
+    #[arg(long, default_value_t = 0)]
+    serve_after_publish_secs: u64,
     #[command(flatten)]
     training_overrides: NativeTrainingOverrideArgs,
     #[command(flatten)]
@@ -762,6 +772,19 @@ struct TrainWindowOnceTimingReport {
 }
 
 #[derive(Debug, Serialize)]
+struct DiffusionSettlementReport {
+    enabled: bool,
+    passes_requested: u32,
+    passes_completed: u32,
+    served_after_publish_secs: u64,
+    merge_windows: usize,
+    updates: usize,
+    attestations: usize,
+    certificates: usize,
+    merges: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct TrainWindowOnceReport {
     experiment_kind: DragonExperimentKind,
     backend: String,
@@ -780,6 +803,7 @@ struct TrainWindowOnceReport {
     lease_window_id: String,
     lease_microshard_count: usize,
     timing: TrainWindowOnceTimingReport,
+    diffusion_settlement: Option<DiffusionSettlementReport>,
     metrics: BTreeMap<String, MetricValue>,
 }
 
@@ -823,6 +847,9 @@ struct TrainWindowOnceRunOptions<'a> {
     output_format: OutputFormat,
     require_head_advanced: bool,
     head_sync_timeout_secs: u64,
+    settle_diffusion: bool,
+    diffusion_settle_passes: u32,
+    serve_after_publish_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -903,6 +930,12 @@ struct ProbeSwarmSnapshotSummary {
     directory_announcements: usize,
     peer_directory_announcements: usize,
     merge_announcements: usize,
+    merge_window_announcements: usize,
+    update_announcements: usize,
+    aggregate_proposal_announcements: usize,
+    reduction_certificate_announcements: usize,
+    validation_quorum_announcements: usize,
+    trainer_promotion_attestation_announcements: usize,
     diffusion_promotion_certificate_announcements: usize,
     heads: Vec<ProbeSwarmHeadSummary>,
     directory_entries: Vec<ProbeSwarmDirectoryEntrySummary>,
@@ -1054,6 +1087,14 @@ fn probe_swarm_snapshot_summary(snapshot: &ControlPlaneSnapshot) -> ProbeSwarmSn
         directory_announcements: snapshot.directory_announcements.len(),
         peer_directory_announcements: snapshot.peer_directory_announcements.len(),
         merge_announcements: snapshot.merge_announcements.len(),
+        merge_window_announcements: snapshot.merge_window_announcements.len(),
+        update_announcements: snapshot.update_announcements.len(),
+        aggregate_proposal_announcements: snapshot.aggregate_proposal_announcements.len(),
+        reduction_certificate_announcements: snapshot.reduction_certificate_announcements.len(),
+        validation_quorum_announcements: snapshot.validation_quorum_announcements.len(),
+        trainer_promotion_attestation_announcements: snapshot
+            .trainer_promotion_attestation_announcements
+            .len(),
         diffusion_promotion_certificate_announcements: snapshot
             .diffusion_promotion_certificate_announcements
             .len(),
@@ -2092,6 +2133,9 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         output_format: args.output_format,
         require_head_advanced: args.require_head_advanced,
         head_sync_timeout_secs: args.head_sync_timeout_secs,
+        settle_diffusion: args.settle_diffusion,
+        diffusion_settle_passes: args.diffusion_settle_passes,
+        serve_after_publish_secs: args.serve_after_publish_secs,
     };
 
     with_prepared_native_peer!(
@@ -2734,9 +2778,9 @@ where
             started.elapsed().as_millis()
         );
         let experiment = running.mainnet().experiment(
-            experiment_entry.study_id,
-            experiment_entry.experiment_id,
-            experiment_entry.current_revision_id,
+            experiment_entry.study_id.clone(),
+            experiment_entry.experiment_id.clone(),
+            experiment_entry.current_revision_id.clone(),
         );
         let mut served_head_id = None;
         eprintln!("train-window-once progress: resolving active canonical head");
@@ -2777,6 +2821,142 @@ where
             outcome.timing.publish_latency_ms,
             started.elapsed().as_millis()
         );
+        let mut diffusion_settlement = None;
+        if options.settle_diffusion || options.serve_after_publish_secs > 0 {
+            if directory_entry_promotes_with_diffusion(&experiment_entry) {
+                let passes_requested = if options.settle_diffusion {
+                    options.diffusion_settle_passes.max(1)
+                } else {
+                    0
+                };
+                let mut passes_completed = 0_u32;
+                if options.settle_diffusion {
+                    for pass in 1..=passes_requested {
+                        eprintln!(
+                            "train-window-once progress: diffusion settle pass={} starting elapsed_ms={}",
+                            pass,
+                            started.elapsed().as_millis(),
+                        );
+                        running.advance_diffusion_steady_state(
+                            &experiment,
+                            Some(outcome.lease.window_id),
+                            Some(&base_head.head_id),
+                        )?;
+                        passes_completed = pass;
+                        let snapshot = running.snapshot();
+                        eprintln!(
+                            "train-window-once progress: diffusion settle pass={} connected_peers={} merge_windows={} updates={} attestations={} certificates={} merges={} elapsed_ms={}",
+                            pass,
+                            snapshot.connected_peers,
+                            snapshot.control_plane.merge_window_announcements.len(),
+                            snapshot.control_plane.update_announcements.len(),
+                            snapshot
+                                .control_plane
+                                .trainer_promotion_attestation_announcements
+                                .len(),
+                            snapshot
+                                .control_plane
+                                .diffusion_promotion_certificate_announcements
+                                .len(),
+                            snapshot.control_plane.merge_announcements.len(),
+                            started.elapsed().as_millis(),
+                        );
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                }
+                if options.serve_after_publish_secs > 0 {
+                    let serve_for = Duration::from_secs(options.serve_after_publish_secs);
+                    let serve_deadline = Instant::now() + serve_for;
+                    let status_interval = Duration::from_secs(5);
+                    let mut last_status = Instant::now()
+                        .checked_sub(status_interval)
+                        .unwrap_or_else(Instant::now);
+                    eprintln!(
+                        "train-window-once progress: serving published artifact for {}s elapsed_ms={}",
+                        options.serve_after_publish_secs,
+                        started.elapsed().as_millis()
+                    );
+                    while Instant::now() < serve_deadline {
+                        if options.settle_diffusion {
+                            eprintln!(
+                                "train-window-once progress: diffusion serve pass starting elapsed_ms={}",
+                                started.elapsed().as_millis(),
+                            );
+                            match running.advance_diffusion_steady_state(
+                                &experiment,
+                                Some(outcome.lease.window_id),
+                                Some(&base_head.head_id),
+                            ) {
+                                Ok(()) => {
+                                    passes_completed = passes_completed.saturating_add(1);
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "train-window-once diffusion serve-pass-error: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        let snapshot = running.snapshot();
+                        if last_status.elapsed() >= status_interval {
+                            eprintln!(
+                                "train-window-once progress: serving status connected_peers={} merge_windows={} updates={} attestations={} certificates={} merges={} last_error={} elapsed_ms={}",
+                                snapshot.connected_peers,
+                                snapshot.control_plane.merge_window_announcements.len(),
+                                snapshot.control_plane.update_announcements.len(),
+                                snapshot
+                                    .control_plane
+                                    .trainer_promotion_attestation_announcements
+                                    .len(),
+                                snapshot
+                                    .control_plane
+                                    .diffusion_promotion_certificate_announcements
+                                    .len(),
+                                snapshot.control_plane.merge_announcements.len(),
+                                operator_visible_last_error(snapshot.last_error.as_deref())
+                                    .as_deref()
+                                    .unwrap_or("-"),
+                                started.elapsed().as_millis(),
+                            );
+                            last_status = Instant::now();
+                        }
+                        match snapshot.status {
+                            RuntimeStatus::Failed => {
+                                let reason = snapshot
+                                    .last_error
+                                    .unwrap_or_else(|| "peer runtime failed".into());
+                                bail!("train-window-once runtime failed while serving: {reason}");
+                            }
+                            RuntimeStatus::Stopped => {
+                                bail!("train-window-once runtime stopped while serving");
+                            }
+                            _ => {}
+                        }
+                        thread::sleep(STATUS_POLL_INTERVAL);
+                    }
+                }
+                let snapshot = running.snapshot();
+                diffusion_settlement = Some(diffusion_settlement_report(
+                    &snapshot.control_plane,
+                    true,
+                    passes_requested,
+                    passes_completed,
+                    options.serve_after_publish_secs,
+                ));
+            } else {
+                eprintln!(
+                    "train-window-once progress: diffusion settlement requested but experiment promotion mode is not diffusion-steady-state"
+                );
+                let snapshot = running.snapshot();
+                diffusion_settlement = Some(diffusion_settlement_report(
+                    &snapshot.control_plane,
+                    false,
+                    0,
+                    0,
+                    options.serve_after_publish_secs,
+                ));
+            }
+        }
         Ok(TrainWindowOnceReport {
             experiment_kind: running.prepared().experiment_kind,
             backend: backend.as_label().into(),
@@ -2798,6 +2978,7 @@ where
                 data_fetch_time_ms: outcome.timing.data_fetch_time_ms,
                 publish_latency_ms: outcome.timing.publish_latency_ms,
             },
+            diffusion_settlement,
             metrics: outcome.report.stats,
         })
     })();
@@ -2997,6 +3178,26 @@ fn directory_entry_promotes_with_diffusion(entry: &ExperimentDirectoryEntry) -> 
             HeadPromotionMode::DiffusionSteadyState
         )
     })
+}
+
+fn diffusion_settlement_report(
+    snapshot: &ControlPlaneSnapshot,
+    enabled: bool,
+    passes_requested: u32,
+    passes_completed: u32,
+    served_after_publish_secs: u64,
+) -> DiffusionSettlementReport {
+    DiffusionSettlementReport {
+        enabled,
+        passes_requested,
+        passes_completed,
+        served_after_publish_secs,
+        merge_windows: snapshot.merge_window_announcements.len(),
+        updates: snapshot.update_announcements.len(),
+        attestations: snapshot.trainer_promotion_attestation_announcements.len(),
+        certificates: snapshot.diffusion_promotion_certificate_announcements.len(),
+        merges: snapshot.merge_announcements.len(),
+    }
 }
 
 fn register_live_head_with_edge(
@@ -3806,8 +4007,12 @@ mod tests {
         assert_eq!(train_once.backend, BackendArg::Wgpu);
         assert!(train_once.initialize_head_on_start);
         assert!(train_once.restore_head_on_start);
+        assert!(!train_once.settle_diffusion);
+        assert_eq!(train_once.diffusion_settle_passes, 3);
+        assert_eq!(train_once.serve_after_publish_secs, 0);
         assert_eq!(train_once.training_overrides.batch_size, None);
         assert_eq!(train_once.training_overrides.max_iters, None);
+        assert_eq!(train_once.training_overrides.max_eval_batches, None);
 
         let no_restore = Cli::try_parse_from([
             "burn_dragon_p2p_native",
@@ -3820,6 +4025,13 @@ mod tests {
             "1",
             "--training-max-iters",
             "4",
+            "--evaluation-max-batches",
+            "1",
+            "--settle-diffusion",
+            "--diffusion-settle-passes",
+            "7",
+            "--serve-after-publish-secs",
+            "30",
         ])
         .expect("parse explicit head flags");
         let CommandKind::TrainWindowOnce(no_restore) = no_restore.command else {
@@ -3827,8 +4039,12 @@ mod tests {
         };
         assert!(!no_restore.initialize_head_on_start);
         assert!(!no_restore.restore_head_on_start);
+        assert!(no_restore.settle_diffusion);
+        assert_eq!(no_restore.diffusion_settle_passes, 7);
+        assert_eq!(no_restore.serve_after_publish_secs, 30);
         assert_eq!(no_restore.training_overrides.batch_size, Some(1));
         assert_eq!(no_restore.training_overrides.max_iters, Some(4));
+        assert_eq!(no_restore.training_overrides.max_eval_batches, Some(1));
     }
 
     #[test]

@@ -20,6 +20,12 @@ def main() -> None:
     assert dispatch_inputs["environment"]["default"] == "production"
     assert dispatch_inputs["experiment_id"]["default"] == "nca-prepretraining"
     assert dispatch_inputs["backend"]["default"] == "cpu"
+    assert dispatch_inputs["training_max_iters"]["default"] == "4"
+    assert dispatch_inputs["evaluation_max_batches"]["default"] == "1"
+    assert dispatch_inputs["settle_diffusion"]["default"] == "true"
+    assert dispatch_inputs["diffusion_settle_passes"]["default"] == "3"
+    assert dispatch_inputs["serve_after_publish_secs"]["default"] == "120"
+    assert dispatch_inputs["command_timeout_secs"]["default"] == "900"
     assert "schedule" in on_config
 
     job = workflow["jobs"]["canary"]
@@ -34,9 +40,31 @@ def main() -> None:
     assert env["BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR"].startswith("/tmp/")
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
     assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
-    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "24"
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"]
+        == "${{ github.event.inputs.training_max_iters || '4' }}"
+    )
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES"]
+        == "${{ github.event.inputs.evaluation_max_batches || '1' }}"
+    )
     assert env["BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS"] == "300"
-    assert env["BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS"] == "1500"
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION"]
+        == "${{ github.event.inputs.settle_diffusion || 'true' }}"
+    )
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES"]
+        == "${{ github.event.inputs.diffusion_settle_passes || '3' }}"
+    )
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS"]
+        == "${{ github.event.inputs.serve_after_publish_secs || '120' }}"
+    )
+    assert (
+        env["BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS"]
+        == "${{ github.event.inputs.command_timeout_secs || '900' }}"
+    )
     assert env["BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS"] == "300"
     runs = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ensure-burn-p2p-sibling.sh" in runs
@@ -58,6 +86,9 @@ def main() -> None:
         "p2p bootstrap snapshot did not advertise canonical head",
         "p2p_signal",
         "p2p_wait_secs",
+        "update_announcements",
+        "trainer_promotion_attestation_announcements",
+        "diffusion_promotion_certificate_announcements",
         "canonical head did not advance",
         "canonical loss regressed",
         "canonical_loss_improved",
@@ -67,14 +98,28 @@ def main() -> None:
         "batch_count",
         "training_batch_size",
         "training_max_iters",
+        "evaluation_max_batches",
         "head_sync_timeout_secs",
+        "settle_diffusion",
+        "diffusion_settle_passes",
+        "serve_after_publish_secs",
         "--head-sync-timeout-secs",
+        "--settle-diffusion",
+        "--diffusion-settle-passes",
+        "--serve-after-publish-secs",
+        "diffusion_settlement",
+        "passes_completed",
         "initialize_head_on_start",
         'not bool(head_before.get("head_id"))',
         "--training-batch-size",
         "--training-max-iters",
+        "--evaluation-max-batches",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",
         "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID",
+        "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
+        "BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES",
+        "BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS",
+        "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
     ]
     for snippet in required:
         assert snippet in script, f"missing native canary script snippet: {snippet}"
@@ -93,7 +138,13 @@ def main() -> None:
     ).read_text()
     for snippet in [
         "DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS",
+        "DiffusionSettlementReport",
         "head_sync_timeout_secs",
+        "settle_diffusion",
+        "diffusion_settle_passes",
+        "serve_after_publish_secs",
+        "advance_diffusion_steady_state(",
+        "serving published artifact",
         "wait_for_head_provider(",
         "{log_prefix}-head-waiting",
         "validator-head-sync-waiting",
@@ -108,6 +159,9 @@ def main() -> None:
         "gh workflow run",
         "gh run watch",
         "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL",
+        "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
+        "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
+        "serve_after_publish_secs",
     ]:
         assert snippet in dispatch_script, f"missing native canary dispatch snippet: {snippet}"
 

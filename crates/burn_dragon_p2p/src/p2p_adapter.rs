@@ -99,6 +99,10 @@ impl DragonBrowserAppHandle {
     pub fn active_training_lease(&self) -> Option<&WorkloadTrainingLease> {
         self.0.active_training_lease()
     }
+
+    pub fn effective_active_training_lease(&self) -> Option<WorkloadTrainingLease> {
+        self.0.effective_active_training_lease()
+    }
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]

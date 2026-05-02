@@ -506,6 +506,7 @@ fn mean_loss_from_train_output_ref<B: AutodiffBackend>(output: &LanguageModelTra
 fn language_evaluate<B>(
     model: &LanguageTrainModel<ValidBackend<B>>,
     validation_loader: BurnValidationLoader<DragonLearningComponents<B>>,
+    max_batches: Option<usize>,
     _split: EvalSplit,
 ) -> MetricReport
 where
@@ -515,6 +516,9 @@ where
     let mut total = 0.0;
     let mut count = 0usize;
     for item in validation_loader.iter() {
+        if max_batches.is_some_and(|limit| count >= limit) {
+            break;
+        }
         total += mean_loss_from_valid_output(model.step(item));
         count += 1;
     }
@@ -893,6 +897,13 @@ where
 {
     let resolved = resolve_native_training_profile(native, experiment_kind, true)?;
     let config = resolved.config;
+    if native
+        .training_overrides
+        .max_eval_batches
+        .is_some_and(|max_eval_batches| max_eval_batches == 0)
+    {
+        bail!("native training override max_eval_batches must be > 0");
+    }
     let capability_assessment = apply_native_downgrade_state(
         &native.storage_root,
         &config,
@@ -970,10 +981,16 @@ where
             summary_event_token_ids.clone(),
         )? {
             let validation_for_eval = validation_loader.clone();
+            let max_eval_batches = native.training_overrides.max_eval_batches;
             builder = builder
                 .with_validation_loader(validation_loader)
                 .with_evaluate(move |model, split| {
-                    language_evaluate::<B>(model, validation_for_eval.clone(), split)
+                    language_evaluate::<B>(
+                        model,
+                        validation_for_eval.clone(),
+                        max_eval_batches,
+                        split,
+                    )
                 });
         }
         builder = attach_existing_sharded_dataset::<B>(
@@ -1023,6 +1040,7 @@ where
             &device,
         )?;
         let validation_for_eval = validation_loader.clone();
+        let max_eval_batches = native.training_overrides.max_eval_batches;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
         let mut builder = from_loaders(learner, device.clone(), train_loader, validation_loader)
@@ -1036,7 +1054,7 @@ where
                 }
             })
             .with_evaluate(move |model, split| {
-                language_evaluate::<B>(model, validation_for_eval.clone(), split)
+                language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
             })
             .with_step_metrics(|step_index, output, metrics| {
                 metrics.insert(

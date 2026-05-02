@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import selectors
 import subprocess
 import sys
 import time
@@ -18,6 +19,15 @@ def env(name: str, default: str | None = None) -> str:
     if value is None or value == "":
         raise SystemExit(f"missing required environment variable {name}")
     return value
+
+
+def env_bool(name: str, default: str) -> bool:
+    value = env(name, default).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"environment variable {name} must be boolean, got {value!r}")
 
 
 def fetch_json(url: str, timeout: int = 30) -> Any:
@@ -106,19 +116,48 @@ def run_native(
     proc_env["BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT"] = str(storage_root)
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("w") as stdout:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             env=proc_env,
-            stdout=stdout,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout_secs,
-            check=False,
+            bufsize=1,
         )
-    if result.returncode != 0:
+        selector = selectors.DefaultSelector()
+        assert process.stdout is not None
+        selector.register(process.stdout, selectors.EVENT_READ)
+        started = time.monotonic()
+        timed_out = False
+        while process.poll() is None:
+            remaining = timeout_secs - (time.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                process.kill()
+                break
+            for key, _ in selector.select(timeout=min(1.0, remaining)):
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                stdout.write(line)
+                stdout.flush()
+                print(line, end="", flush=True)
+        tail = process.stdout.read()
+        if tail:
+            stdout.write(tail)
+            stdout.flush()
+            print(tail, end="", flush=True)
+        selector.close()
+        returncode = process.wait()
+    if timed_out:
         tail = stdout_path.read_text(errors="replace")[-6000:]
         raise RuntimeError(
-            f"command failed with exit {result.returncode}: {' '.join(command)}\n{tail}"
+            f"command timed out after {timeout_secs}s: {' '.join(command)}\n{tail}"
+        )
+    if returncode != 0:
+        tail = stdout_path.read_text(errors="replace")[-6000:]
+        raise RuntimeError(
+            f"command failed with exit {returncode}: {' '.join(command)}\n{tail}"
         )
 
 
@@ -151,6 +190,14 @@ def p2p_probe_summary(probe: dict[str, Any]) -> dict[str, Any]:
         "directory_announcements": snapshot.get("directory_announcements"),
         "peer_directory_announcements": snapshot.get("peer_directory_announcements"),
         "merge_announcements": snapshot.get("merge_announcements"),
+        "merge_window_announcements": snapshot.get("merge_window_announcements"),
+        "update_announcements": snapshot.get("update_announcements"),
+        "aggregate_proposal_announcements": snapshot.get("aggregate_proposal_announcements"),
+        "reduction_certificate_announcements": snapshot.get("reduction_certificate_announcements"),
+        "validation_quorum_announcements": snapshot.get("validation_quorum_announcements"),
+        "trainer_promotion_attestation_announcements": snapshot.get(
+            "trainer_promotion_attestation_announcements"
+        ),
         "diffusion_promotion_certificate_announcements": snapshot.get(
             "diffusion_promotion_certificate_announcements"
         ),
@@ -243,6 +290,7 @@ def start_validator(
     log_path: Path,
     training_batch_size: int,
     training_max_iters: int,
+    evaluation_max_batches: int,
     initialize_head_on_start: bool,
 ) -> subprocess.Popen[str]:
     proc_env = os.environ.copy()
@@ -269,6 +317,8 @@ def start_validator(
             str(training_batch_size),
             "--training-max-iters",
             str(training_max_iters),
+            "--evaluation-max-batches",
+            str(evaluation_max_batches),
             "--initialize-head-on-start",
             str(initialize_head_on_start).lower(),
             "--restore-head-on-start",
@@ -340,6 +390,14 @@ def assert_train_report(report: dict[str, Any]) -> dict[str, float]:
     batch_count = metric_number(metrics, "batch_count") or train_steps
     if train_steps <= 0 or batch_count <= 0:
         raise RuntimeError(f"native trainer reported no work: metrics={metrics}")
+    settlement = report.get("diffusion_settlement")
+    if settlement:
+        if not settlement.get("enabled"):
+            raise RuntimeError(f"diffusion settlement was requested but not enabled: {settlement}")
+        if int(settlement.get("passes_completed") or 0) <= 0:
+            raise RuntimeError(f"diffusion settlement did not run: {settlement}")
+        if int(settlement.get("update_announcements") or settlement.get("updates") or 0) <= 0:
+            raise RuntimeError(f"diffusion settlement saw no trainer updates: {settlement}")
     return {
         "train_loss": train_loss,
         "train_steps": train_steps,
@@ -450,7 +508,13 @@ def main() -> int:
     windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "2"))
     training_batch_size = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE", "1"))
     training_max_iters = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS", "4"))
+    evaluation_max_batches = int(env("BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES", "1"))
     head_sync_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS", "300"))
+    settle_diffusion = env_bool("BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION", "1")
+    diffusion_settle_passes = int(env("BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES", "3"))
+    serve_after_publish_secs = int(
+        env("BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS", "120")
+    )
     command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
     canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
     p2p_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS", "300"))
@@ -518,6 +582,7 @@ def main() -> int:
         log_path=artifact_dir / "validator.log",
         training_batch_size=training_batch_size,
         training_max_iters=training_max_iters,
+        evaluation_max_batches=evaluation_max_batches,
         initialize_head_on_start=initialize_head_on_start,
     )
     window_reports: list[dict[str, Any]] = []
@@ -525,34 +590,47 @@ def main() -> int:
         previous_head = head_before
         for window_index in range(windows):
             report_path = artifact_dir / f"train-window-{window_index + 1}.json"
+            train_command = [
+                binary,
+                "train-window-once",
+                "--experiment-kind",
+                experiment_kind,
+                "--backend",
+                backend,
+                "--edge-url",
+                edge_base_url,
+                "--auth-bundle",
+                str(trainer_bundle),
+                "--initialize-head-on-start",
+                str(initialize_head_on_start).lower(),
+                "--restore-head-on-start",
+                "true",
+                "--training-batch-size",
+                str(training_batch_size),
+                "--training-max-iters",
+                str(training_max_iters),
+                "--evaluation-max-batches",
+                str(evaluation_max_batches),
+                "--head-sync-timeout-secs",
+                str(head_sync_timeout_secs),
+                "--serve-after-publish-secs",
+                str(serve_after_publish_secs),
+                "--require-head-advanced",
+                "--output",
+                str(report_path),
+                "--output-format",
+                "json",
+            ]
+            if settle_diffusion:
+                train_command.extend(
+                    [
+                        "--settle-diffusion",
+                        "--diffusion-settle-passes",
+                        str(diffusion_settle_passes),
+                    ]
+                )
             run_native(
-                [
-                    binary,
-                    "train-window-once",
-                    "--experiment-kind",
-                    experiment_kind,
-                    "--backend",
-                    backend,
-                    "--edge-url",
-                    edge_base_url,
-                    "--auth-bundle",
-                    str(trainer_bundle),
-                    "--initialize-head-on-start",
-                    str(initialize_head_on_start).lower(),
-                    "--restore-head-on-start",
-                    "true",
-                    "--training-batch-size",
-                    str(training_batch_size),
-                    "--training-max-iters",
-                    str(training_max_iters),
-                    "--head-sync-timeout-secs",
-                    str(head_sync_timeout_secs),
-                    "--require-head-advanced",
-                    "--output",
-                    str(report_path),
-                    "--output-format",
-                    "json",
-                ],
+                train_command,
                 storage_root=trainer_storage,
                 timeout_secs=command_timeout_secs,
                 stdout_path=artifact_dir / f"train-window-{window_index + 1}.log",
@@ -599,7 +677,11 @@ def main() -> int:
         "backend": backend,
         "training_batch_size": training_batch_size,
         "training_max_iters": training_max_iters,
+        "evaluation_max_batches": evaluation_max_batches,
         "head_sync_timeout_secs": head_sync_timeout_secs,
+        "settle_diffusion": settle_diffusion,
+        "diffusion_settle_passes": diffusion_settle_passes,
+        "serve_after_publish_secs": serve_after_publish_secs,
         "p2p_timeout_secs": p2p_timeout_secs,
         "initialize_head_on_start": initialize_head_on_start,
         "principal_id": principal_id,

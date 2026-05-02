@@ -371,6 +371,8 @@ pub struct DragonNativeTrainingOverrides {
     pub batch_size: Option<usize>,
     #[serde(default)]
     pub max_iters: Option<usize>,
+    #[serde(default)]
+    pub max_eval_batches: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

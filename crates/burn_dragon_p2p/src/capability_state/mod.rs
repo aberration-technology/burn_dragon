@@ -87,7 +87,7 @@ pub(crate) fn is_probable_trainer_fit_failure(message: &str) -> bool {
     }
     [
         "out of memory",
-        "oom",
+        "out_of_memory",
         "vram",
         "gpu memory",
         "device lost",
@@ -103,6 +103,13 @@ pub(crate) fn is_probable_trainer_fit_failure(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+        || contains_oom_token(&message)
+}
+
+fn contains_oom_token(message: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == "oom")
 }
 
 fn is_transient_runtime_or_control_plane_failure(message: &str) -> bool {
@@ -118,6 +125,11 @@ fn is_transient_runtime_or_control_plane_failure(message: &str) -> bool {
         "receipts/browser",
         "/receipts/",
         "failed to synchronize browser runtime",
+        "failed to negotiate transport",
+        "failed to connect to destination",
+        "failed to dial",
+        "resource limit exceeded",
+        "timeout has been reached",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -158,9 +170,28 @@ mod tests {
     }
 
     #[test]
+    fn trainer_fit_failure_classifier_rejects_transport_resource_limits_with_peer_id_noise() {
+        assert!(!is_probable_trainer_fit_failure(
+            "Failed to negotiate transport protocol(s): [(/ip4/3.149.166.58/udp/443/webrtc-direct/certhash/uEiBIQQvRGIR6ld6a-VTmYxgsVlaOOMfJtcsf5LvtFwh7mQ/p2p/12D3KooWCkxZ42qCD3mSzPeAazTE9cCrFtidxAQKisQgMiXtVFxB/p2p-circuit/p2p/12D3KooWRBYrqJ8PvwQsJ523gNCUHJ4YJyo6p91QhC3DMssfitWe: : Failed to connect to destination.: Failed to connect to destination.: Remote reported resource limit exceeded.)]"
+        ));
+        assert!(!record_is_still_binding(
+            &record_with_reason(
+                "Failed to negotiate transport protocol(s): /p2p/12D3KooWExample resource limit exceeded"
+            ),
+            Some(512),
+        ));
+    }
+
+    #[test]
     fn trainer_fit_failure_classifier_accepts_memory_and_device_failures() {
         assert!(is_probable_trainer_fit_failure(
             "CUDA error: out of memory while allocating optimizer state"
+        ));
+        assert!(is_probable_trainer_fit_failure(
+            "trainer failed with OOM while allocating activation buffer"
+        ));
+        assert!(is_probable_trainer_fit_failure(
+            "CUDA_ERROR_OUT_OF_MEMORY during forward pass"
         ));
         assert!(is_probable_trainer_fit_failure(
             "webgpu device lost after failed to allocate buffer"

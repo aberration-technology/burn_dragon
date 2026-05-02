@@ -25,7 +25,7 @@ def main() -> None:
     assert dispatch_inputs["settle_diffusion"]["default"] == "true"
     assert dispatch_inputs["diffusion_settle_passes"]["default"] == "3"
     assert dispatch_inputs["serve_after_publish_secs"]["default"] == "120"
-    assert dispatch_inputs["command_timeout_secs"]["default"] == "900"
+    assert dispatch_inputs["command_timeout_secs"]["default"] == "1800"
     assert "schedule" in on_config
 
     job = workflow["jobs"]["canary"]
@@ -63,7 +63,7 @@ def main() -> None:
     )
     assert (
         env["BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS"]
-        == "${{ github.event.inputs.command_timeout_secs || '900' }}"
+        == "${{ github.event.inputs.command_timeout_secs || '1800' }}"
     )
     assert env["BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS"] == "300"
     runs = "\n".join(step.get("run", "") for step in job["steps"])

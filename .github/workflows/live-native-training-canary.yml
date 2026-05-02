@@ -62,7 +62,7 @@ on:
       command_timeout_secs:
         description: Per native command timeout
         required: false
-        default: "900"
+        default: "1800"
   schedule:
     - cron: "43 */6 * * *"
 
@@ -95,7 +95,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '3' }}
       BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '120' }}
-      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '900' }}
+      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1800' }}
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary

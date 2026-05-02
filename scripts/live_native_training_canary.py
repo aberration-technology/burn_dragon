@@ -515,7 +515,7 @@ def main() -> int:
     serve_after_publish_secs = int(
         env("BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS", "120")
     )
-    command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
+    command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "1800"))
     canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
     p2p_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS", "300"))
     artifact_dir = Path(

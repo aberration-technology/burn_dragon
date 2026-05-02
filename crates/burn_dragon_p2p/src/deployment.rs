@@ -72,9 +72,12 @@ pub struct DeploymentEdgeSnapshotSummary {
     pub transports: DeploymentBrowserTransportSummary,
     pub directory_entries: usize,
     pub matching_directory_entry_present: bool,
+    pub matching_directory_current_head_id: Option<String>,
+    pub matching_directory_current_head_visible: bool,
     pub matching_head_present: bool,
     pub matching_head_id: Option<String>,
     pub matching_head_global_step: Option<u64>,
+    pub connected_peer_ids: Vec<String>,
     pub captured_at: DateTime<Utc>,
 }
 
@@ -131,6 +134,8 @@ pub struct DeploymentArtifactHeadProbe {
     pub url: String,
     pub status_code: u16,
     pub head_id: String,
+    pub provider_peer_ids: Vec<String>,
+    pub connected_provider_peer_ids: Vec<String>,
 }
 
 #[cfg(feature = "native")]
@@ -273,17 +278,46 @@ fn fetch_deployment_edge_snapshot(
         .enable_all()
         .build()
         .context("failed to build async runtime for deployment diagnostics")?;
-    let snapshot = runtime.block_on(fetch_edge_snapshot(edge_base_url))?;
+    let (snapshot, snapshot_json) = runtime.block_on(async {
+        let url = format!("{}/portal/snapshot", edge_base_url.trim_end_matches('/'));
+        let response = Client::new().get(&url).send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("{} {}", status.as_u16(), trim_preview(&body));
+        }
+        let snapshot_json: serde_json::Value =
+            serde_json::from_str(&body).context("failed to decode edge snapshot JSON")?;
+        let snapshot: burn_p2p::BrowserEdgeSnapshot = serde_json::from_value(snapshot_json.clone())
+            .context("failed to decode edge snapshot")?;
+        Ok::<_, anyhow::Error>((snapshot, snapshot_json))
+    })?;
     let matching_directory_entry = find_matching_entry(
         &snapshot.directory.entries,
         Some(&config.manifest.experiment_id),
         Some(&config.manifest.revision_id),
         Some(experiment_kind),
     )?;
-    let matching_head = snapshot
-        .heads
-        .iter()
-        .find(|head| head.experiment_id.as_str() == config.manifest.experiment_id);
+    let matching_directory_current_head =
+        matching_directory_entry.and_then(|entry| entry.current_head_id.clone());
+    let matching_directory_current_head_visible = matching_directory_current_head
+        .as_ref()
+        .is_some_and(|head_id| snapshot.heads.iter().any(|head| &head.head_id == head_id));
+    let matching_head = matching_directory_current_head
+        .as_ref()
+        .and_then(|head_id| snapshot.heads.iter().find(|head| &head.head_id == head_id))
+        .or_else(|| {
+            snapshot
+                .heads
+                .iter()
+                .filter(|head| head.experiment_id.as_str() == config.manifest.experiment_id)
+                .max_by(|left, right| {
+                    left.global_step
+                        .cmp(&right.global_step)
+                        .then_with(|| left.created_at.cmp(&right.created_at))
+                })
+        });
+    let connected_peer_ids = connected_peer_ids_from_edge_snapshot_json(&snapshot_json);
     Ok(DeploymentEdgeSnapshotSummary {
         network_id: snapshot.network_id.as_str().to_owned(),
         auth_enabled: snapshot.auth_enabled,
@@ -304,11 +338,30 @@ fn fetch_deployment_edge_snapshot(
         },
         directory_entries: snapshot.directory.entries.len(),
         matching_directory_entry_present: matching_directory_entry.is_some(),
+        matching_directory_current_head_id: matching_directory_current_head
+            .as_ref()
+            .map(|head_id| head_id.as_str().to_owned()),
+        matching_directory_current_head_visible,
         matching_head_present: matching_head.is_some(),
         matching_head_id: matching_head.map(|head| head.head_id.as_str().to_owned()),
         matching_head_global_step: matching_head.map(|head| head.global_step),
+        connected_peer_ids,
         captured_at: snapshot.captured_at,
     })
+}
+
+#[cfg(feature = "native")]
+fn connected_peer_ids_from_edge_snapshot_json(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.get("swarm"))
+        .and_then(|swarm| swarm.get("connected_peer_ids"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 #[cfg(feature = "native")]
@@ -419,9 +472,18 @@ fn probe_artifact_head_view(
     let edge_base_url = config
         .effective_edge_base_url()
         .ok_or_else(|| anyhow!("no edge base URL configured"))?;
+    let edge_snapshot =
+        edge_snapshot.ok_or_else(|| anyhow!("edge snapshot summary is unavailable"))?;
     let head_id = edge_snapshot
-        .and_then(|snapshot| snapshot.matching_head_id.clone())
+        .matching_directory_current_head_id
+        .clone()
+        .or_else(|| edge_snapshot.matching_head_id.clone())
         .ok_or_else(|| anyhow!("edge snapshot does not expose a matching head id"))?;
+    let connected_peer_ids = edge_snapshot
+        .connected_peer_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let url = format!(
         "{}/artifacts/heads/{}",
         edge_base_url.trim_end_matches('/'),
@@ -438,12 +500,27 @@ fn probe_artifact_head_view(
         if !status.is_success() {
             bail!("{} {}", status.as_u16(), trim_preview(&body));
         }
-        serde_json::from_str::<serde_json::Value>(&body)
-            .context("failed to decode artifact head response")?;
+        let body: serde_json::Value =
+            serde_json::from_str(&body).context("failed to decode artifact head response")?;
+        let provider_peer_ids = body
+            .get("provider_peer_ids")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let connected_provider_peer_ids = provider_peer_ids
+            .iter()
+            .filter(|peer_id| connected_peer_ids.contains(*peer_id))
+            .cloned()
+            .collect();
         Ok(DeploymentArtifactHeadProbe {
             url,
             status_code: status.as_u16(),
             head_id,
+            provider_peer_ids,
+            connected_provider_peer_ids,
         })
     })
 }
@@ -495,6 +572,19 @@ pub fn evaluate_deployment_readiness(
                 blocking_issues.push("matching_directory_entry_missing".into());
             } else {
                 observed_warnings.push("matching_directory_entry_missing".into());
+            }
+        }
+        if snapshot.matching_directory_current_head_id.is_none() {
+            if options.require_head_published {
+                blocking_issues.push("matching_directory_current_head_missing".into());
+            } else {
+                observed_warnings.push("matching_directory_current_head_missing".into());
+            }
+        } else if !snapshot.matching_directory_current_head_visible {
+            if options.require_head_published {
+                blocking_issues.push("matching_directory_current_head_not_visible".into());
+            } else {
+                observed_warnings.push("matching_directory_current_head_not_visible".into());
             }
         }
         if !snapshot.matching_head_present {
@@ -571,6 +661,20 @@ pub fn evaluate_deployment_readiness(
             blocking_issues.push("artifact_head_view_probe_failed".into());
         } else {
             observed_warnings.push("artifact_head_view_probe_failed".into());
+        }
+    } else if let Some(probe) = artifact_head_view.and_then(|probe| probe.value.as_ref()) {
+        if probe.provider_peer_ids.is_empty() {
+            if options.require_artifact_head_view {
+                blocking_issues.push("artifact_head_view_missing_provider_peers".into());
+            } else {
+                observed_warnings.push("artifact_head_view_missing_provider_peers".into());
+            }
+        } else if probe.connected_provider_peer_ids.is_empty() {
+            if options.require_artifact_head_view {
+                blocking_issues.push("artifact_head_view_has_no_connected_provider".into());
+            } else {
+                observed_warnings.push("artifact_head_view_has_no_connected_provider".into());
+            }
         }
     }
 
@@ -677,9 +781,12 @@ mod tests {
             },
             directory_entries: 1,
             matching_directory_entry_present: true,
+            matching_directory_current_head_id: head_present.then(|| "head-1".into()),
+            matching_directory_current_head_visible: head_present,
             matching_head_present: head_present,
             matching_head_id: head_present.then(|| "head-1".into()),
             matching_head_global_step: head_present.then_some(1),
+            connected_peer_ids: vec!["edge-peer".into()],
             captured_at: Utc::now(),
         })
     }
@@ -847,6 +954,65 @@ mod tests {
             readiness
                 .blocking_issues
                 .contains(&"artifact_head_view_probe_failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_current_directory_head_when_head_is_required() {
+        let mut edge = edge_check(true);
+        if let Some(snapshot) = edge.value.as_mut() {
+            snapshot.matching_directory_current_head_id = None;
+            snapshot.matching_directory_current_head_visible = false;
+        }
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"matching_directory_current_head_missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_artifact_head_connected_provider_when_requested() {
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge_check(true),
+            &profile_check(),
+            None,
+            None,
+            Some(&DeploymentCheck::ok(DeploymentArtifactHeadProbe {
+                url: "https://edge.example/artifacts/heads/head-1".into(),
+                status_code: 200,
+                head_id: "head-1".into(),
+                provider_peer_ids: vec!["stale-peer".into()],
+                connected_provider_peer_ids: Vec::new(),
+            })),
+            &DeploymentDiagnosticsOptions {
+                require_head_published: true,
+                require_directory_entry_published: true,
+                require_artifact_head_view: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"artifact_head_view_has_no_connected_provider".to_owned())
         );
     }
 

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import selectors
+import socket
 import subprocess
 import sys
 import time
@@ -170,11 +171,37 @@ def parse_json_stdout(path: Path) -> Any:
     return json.loads(text[start : end + 1])
 
 
-def p2p_bootstrap_address(edge_base_url: str) -> str:
+def p2p_bootstrap_addresses(edge_base_url: str) -> list[str]:
+    override = os.environ.get("BURN_DRAGON_NATIVE_CANARY_P2P_BOOTSTRAP_ADDRS", "").strip()
+    if override:
+        return [address.strip() for address in override.split(",") if address.strip()]
+
     parsed = urllib.parse.urlparse(edge_base_url)
     if not parsed.hostname:
         raise RuntimeError(f"edge URL has no hostname: {edge_base_url!r}")
-    return f"/dns4/{parsed.hostname}/tcp/4001"
+    host = parsed.hostname
+    addresses = [
+        f"/dns4/{host}/tcp/4001",
+        f"/dns4/{host}/udp/4001/quic-v1",
+    ]
+    try:
+        resolved = socket.getaddrinfo(host, 4001, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        resolved = []
+    for entry in resolved:
+        ip = entry[4][0]
+        addresses.extend(
+            [
+                f"/ip4/{ip}/tcp/4001",
+                f"/ip4/{ip}/udp/4001/quic-v1",
+            ]
+        )
+
+    deduped = []
+    for address in addresses:
+        if address not in deduped:
+            deduped.append(address)
+    return deduped
 
 
 def p2p_probe_summary(probe: dict[str, Any]) -> dict[str, Any]:
@@ -213,12 +240,42 @@ def probe_p2p_snapshot(
     log_path: Path,
     timeout_secs: int,
 ) -> dict[str, Any]:
+    errors = []
+    addresses = p2p_bootstrap_addresses(edge_base_url)
+    for index, address in enumerate(addresses, start=1):
+        candidate_log_path = log_path
+        if len(addresses) > 1:
+            candidate_log_path = log_path.with_name(
+                f"{log_path.stem}-addr{index}{log_path.suffix}"
+            )
+        try:
+            return probe_p2p_snapshot_address(
+                binary,
+                address=address,
+                storage_root=storage_root,
+                log_path=candidate_log_path,
+                timeout_secs=timeout_secs,
+            )
+        except Exception as error:
+            errors.append(f"{address}: {error}")
+    joined = "\n".join(errors[-4:])
+    raise RuntimeError(f"p2p bootstrap probes failed across {len(addresses)} addresses:\n{joined}")
+
+
+def probe_p2p_snapshot_address(
+    binary: str,
+    *,
+    address: str,
+    storage_root: Path,
+    log_path: Path,
+    timeout_secs: int,
+) -> dict[str, Any]:
     run_native(
         [
             binary,
             "probe-swarm",
             "--address",
-            p2p_bootstrap_address(edge_base_url),
+            address,
             "--timeout-secs",
             "30",
             "--max-events",

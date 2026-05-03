@@ -495,6 +495,30 @@ jobs:
             python3 -c 'import sys; print(sys.argv[1].lower().replace(".", "-").replace("_", "-").replace("/", "-")[:63].rstrip("-"))' "$1"
           }
 
+          find_route53_health_check_by_name_tag() {
+            local wanted_name="$1"
+            local id
+            local name
+            local candidate_ids
+            candidate_ids="$(aws route53 list-health-checks \
+              --query 'HealthChecks[].Id' \
+              --output text 2>/dev/null || true)"
+            if [ -z "$candidate_ids" ] || [ "$candidate_ids" = "None" ]; then
+              return 0
+            fi
+            for id in $candidate_ids; do
+              name="$(aws route53 list-tags-for-resource \
+                --resource-type healthcheck \
+                --resource-id "$id" \
+                --query "ResourceTagSet.Tags[?Key=='Name'].Value | [0]" \
+                --output text 2>/dev/null || true)"
+              if [ "$name" = "$wanted_name" ]; then
+                printf '%s\n' "$id"
+                return 0
+              fi
+            done
+          }
+
           account_id="$(aws sts get-caller-identity --query Account --output text)"
           role_name="${STACK_NAME}-bootstrap"
           profile_name="${STACK_NAME}-bootstrap"
@@ -514,6 +538,7 @@ jobs:
           public_subnet_name_tag="${STACK_NAME}-public-a"
           public_secondary_subnet_name_tag="${STACK_NAME}-public-b"
           public_route_table_name_tag="${STACK_NAME}-public"
+          edge_health_check_name_tag="${STACK_NAME}-edge-primary"
           dataset_domain_name="${TF_VAR_dataset_domain_name:-$DATASET_DOMAIN_NAME}"
 
           if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
@@ -653,6 +678,14 @@ jobs:
             --output text 2>/dev/null || true)"
           if [ -n "$dataset_distribution_id" ] && [ "$dataset_distribution_id" != "None" ]; then
             tf_import_if_missing aws_cloudfront_distribution.dataset "$dataset_distribution_id"
+          fi
+
+          edge_health_check_id="$(find_route53_health_check_by_name_tag "$edge_health_check_name_tag" | head -n 1)"
+          if [ -n "$edge_health_check_id" ] && [ "$edge_health_check_id" != "None" ]; then
+            tf_import_if_missing aws_route53_health_check.edge_primary "$edge_health_check_id"
+          else
+            health_check_count="$(aws route53 list-health-checks --query 'length(HealthChecks)' --output text 2>/dev/null || true)"
+            echo "::notice::No Route53 health check tagged Name=$edge_health_check_name_tag found to import (active health checks: ${health_check_count:-unknown}). Terraform may need available Route53 health-check quota."
           fi
 
       - name: terraform validate

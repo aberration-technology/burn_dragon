@@ -90,6 +90,9 @@ def fetch_head_artifact(edge_base_url: str, head_id: str) -> dict[str, Any]:
         "global_step": head.get("global_step"),
         "metrics": head.get("metrics") or {},
         "provider_peer_ids": artifact.get("provider_peer_ids") or [],
+        "connected_provider_peer_ids": artifact.get("connected_provider_peer_ids") or [],
+        "available_profiles": artifact.get("available_profiles") or [],
+        "published_artifacts": artifact.get("published_artifacts") or [],
     }
 
 
@@ -112,6 +115,9 @@ def current_directory_head(edge_base_url: str, experiment_id: str) -> dict[str, 
                 "parent_head_id": artifact.get("parent_head_id"),
                 "metrics": artifact.get("metrics") or {},
                 "provider_peer_ids": artifact.get("provider_peer_ids") or [],
+                "connected_provider_peer_ids": artifact.get("connected_provider_peer_ids") or [],
+                "available_profiles": artifact.get("available_profiles") or [],
+                "published_artifacts": artifact.get("published_artifacts") or [],
             }
     raise RuntimeError(f"directory has no entry for experiment {experiment_id!r}")
 
@@ -345,6 +351,39 @@ def wait_for_p2p_head(
         "p2p bootstrap snapshot did not advertise canonical head "
         f"{head_id} within {timeout_secs}s; last={last_summary}; last_error={last_error}"
     )
+
+
+def assert_head_provider_signal(
+    head: dict[str, Any],
+    p2p_signal: dict[str, Any],
+    *,
+    require_edge_provider: bool,
+) -> dict[str, Any]:
+    head_id = head.get("head_id")
+    provider_peer_ids = [
+        provider for provider in (head.get("provider_peer_ids") or []) if provider
+    ]
+    if not provider_peer_ids:
+        raise RuntimeError(f"head {head_id} has no artifact provider peers: {head}")
+    edge_peer_id = p2p_signal.get("connected_peer_id")
+    edge_provider = bool(edge_peer_id and edge_peer_id in set(provider_peer_ids))
+    if require_edge_provider and not edge_provider:
+        raise RuntimeError(
+            "canonical head is visible over p2p but is not edge-backed for fresh restores: "
+            f"head={head_id} edge_peer_id={edge_peer_id} providers={provider_peer_ids}"
+        )
+    return {
+        "head_id": head_id,
+        "edge_peer_id": edge_peer_id,
+        "provider_peer_ids": provider_peer_ids,
+        "connected_provider_peer_ids": head.get("connected_provider_peer_ids") or [],
+        "available_profiles": head.get("available_profiles") or [],
+        "published_artifacts": head.get("published_artifacts") or [],
+        "edge_provider": edge_provider,
+        "non_edge_provider_count": len(
+            [provider for provider in provider_peer_ids if provider != edge_peer_id]
+        ),
+    }
 
 
 def start_validator(
@@ -596,7 +635,7 @@ def main() -> int:
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    trainer_storage = artifact_dir / "trainer-storage"
+    trainer_storage = artifact_dir / "trainer-enroll-storage"
     validator_storage = artifact_dir / "validator-storage"
     probe_storage = artifact_dir / "probe-storage"
     trainer_bundle = artifact_dir / "trainer-auth-bundle.json"
@@ -612,6 +651,13 @@ def main() -> int:
             timeout_secs=60,
         )
     )
+    head_provider_before = None
+    if head_before.get("head_id"):
+        head_provider_before = assert_head_provider_signal(
+            head_before,
+            p2p_before,
+            require_edge_provider=True,
+        )
     initialize_head_on_start = not bool(head_before.get("head_id"))
     enroll_static_principal(
         binary,
@@ -657,6 +703,7 @@ def main() -> int:
         previous_head = head_before
         for window_index in range(windows):
             report_path = artifact_dir / f"train-window-{window_index + 1}.json"
+            window_trainer_storage = artifact_dir / f"trainer-window-{window_index + 1}-storage"
             train_command = [
                 binary,
                 "train-window-once",
@@ -698,7 +745,7 @@ def main() -> int:
                 )
             run_native(
                 train_command,
-                storage_root=trainer_storage,
+                storage_root=window_trainer_storage,
                 timeout_secs=command_timeout_secs,
                 stdout_path=artifact_dir / f"train-window-{window_index + 1}.log",
             )
@@ -719,6 +766,11 @@ def main() -> int:
                 log_dir=artifact_dir / f"p2p-window-{window_index + 1}",
                 timeout_secs=p2p_timeout_secs,
             )
+            head_provider_signal = assert_head_provider_signal(
+                advanced_head,
+                p2p_signal,
+                require_edge_provider=True,
+            )
             window_reports.append(
                 {
                     "window_index": window_index + 1,
@@ -730,6 +782,7 @@ def main() -> int:
                     "canonical_signal": canonical_signal,
                     "p2p_wait_secs": p2p_wait_secs,
                     "p2p_signal": p2p_signal,
+                    "head_provider_signal": head_provider_signal,
                 }
             )
             previous_head = advanced_head
@@ -755,6 +808,7 @@ def main() -> int:
         "validator_principal_id": validator_principal_id,
         "head_before": head_before,
         "p2p_before": p2p_before,
+        "head_provider_before": head_provider_before,
         "windows": window_reports,
         "head_after": current_directory_head(edge_base_url, experiment_id),
         "catchup": fetch_json(f"{edge_base_url}/metrics/catchup/{experiment_id}"),

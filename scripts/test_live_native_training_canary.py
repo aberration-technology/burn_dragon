@@ -85,6 +85,7 @@ def main() -> None:
         "--fetch-snapshot",
         "p2p_bootstrap_addresses",
         "BURN_DRAGON_NATIVE_CANARY_P2P_BOOTSTRAP_ADDRS",
+        "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS",
         "quic-v1",
         "p2p bootstrap snapshot did not advertise canonical head",
         "p2p_signal",

@@ -32,8 +32,18 @@ def env_bool(name: str, default: str) -> bool:
 
 
 def fetch_json(url: str, timeout: int = 30) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.loads(response.read())
+    attempts = int(os.environ.get("BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS", "5"))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return json.loads(response.read())
+        except Exception as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            time.sleep(min(2 * attempt, 10))
+    raise RuntimeError(f"failed to fetch {url} after {attempts} attempts: {last_error}")
 
 
 def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:

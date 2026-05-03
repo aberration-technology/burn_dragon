@@ -11,15 +11,18 @@ def main() -> None:
     policy = browser["capability_policy"]
 
     assert browser["batch_size"] == 1, browser["batch_size"]
-    assert 4 <= browser["max_train_batches"] <= 8, browser["max_train_batches"]
+    assert browser["max_train_batches"] == 8, browser["max_train_batches"]
     assert browser["max_eval_batches"] <= 1, browser["max_eval_batches"]
     assert (
         policy["browser_wgpu_memory_budget_bytes"] == 6 * 1024 * 1024 * 1024
     ), policy["browser_wgpu_memory_budget_bytes"]
     assert train_source["type"] == "generated_nca", train_source["type"]
     assert eval_source["type"] == "generated_nca", eval_source["type"]
-    assert train_source["max_documents"] <= 16, train_source["max_documents"]
-    assert eval_source["max_documents"] <= 4, eval_source["max_documents"]
+    native_training = profile["native"]["training_toml"]
+    assert "batch_size = 6" in native_training
+    assert "max_iters = 24" in native_training
+    assert train_source["max_documents"] == 6 * 24, train_source["max_documents"]
+    assert eval_source["max_documents"] == 8, eval_source["max_documents"]
 
     print("browser-profile-budget-ok")
 

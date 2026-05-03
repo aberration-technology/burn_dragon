@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::auth::{browser_github_enrollment_config, fetch_edge_snapshot, load_browser_session};
+use crate::browser_data::deterministic_sample_indices;
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 #[cfg(target_arch = "wasm32")]
 use crate::capability_state::{
@@ -428,6 +429,9 @@ where
         context.live_browser_session.as_ref(),
     )
     .await?;
+    let training_window_budget_ms = live_participant
+        .as_ref()
+        .map(|handle| handle.training_budget.max_window_secs.saturating_mul(1000));
 
     let load_active_head = context
         .config
@@ -509,6 +513,17 @@ where
     let mut train_example_count = 0usize;
     let mut train_token_count = 0usize;
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
+        if train_batch_count > 0
+            && training_window_budget_ms.is_some_and(|budget_ms| {
+                training_started_at.elapsed().as_millis() as u64 >= budget_ms
+            })
+        {
+            info!(
+                "browser training window budget reached after {} batch(es); stopping local window before next batch",
+                train_batch_count
+            );
+            break;
+        }
         if context
             .config
             .max_train_batches
@@ -650,7 +665,7 @@ where
         backend: context.backend_label.into(),
         experiment_kind_label: context.config.experiment_kind.display_name().into(),
         train_batches: train_batch_count,
-        train_examples: train_records.len(),
+        train_examples: train_example_count,
         train_tokens: train_token_count,
         train_loss_mean,
         train_loss_observed: train_loss_count > 0,
@@ -799,7 +814,9 @@ async fn load_token_records(
             corpus,
             split,
             max_documents,
-        } => load_generated_nca_records(corpus, split.clone(), *max_documents, block_size)?,
+        } => {
+            load_generated_nca_records(corpus, split.clone(), *max_documents, block_size, &policy)?
+        }
     };
     validate_token_records(&records, block_size)?;
     Ok(records)
@@ -1015,6 +1032,7 @@ fn load_generated_nca_records(
     split: DragonBrowserDatasetSplit,
     max_documents: Option<usize>,
     block_size: usize,
+    policy: &TokenRecordLoadPolicy,
 ) -> Result<Vec<TokenWindowRecord>> {
     let logical_document_tokens = block_size.saturating_add(1);
     let runtime = OnlineNcaCorpus::new_with_min_logical_document_tokens(
@@ -1025,13 +1043,21 @@ fn load_generated_nca_records(
         DragonBrowserDatasetSplit::Train => SampleSplit::Train,
         DragonBrowserDatasetSplit::Validation => SampleSplit::Validation,
     };
-    let document_count = runtime
-        .sample_count(split)
-        .min(max_documents.unwrap_or(usize::MAX));
+    let sample_indices = deterministic_sample_indices(
+        runtime.sample_count(split),
+        max_documents,
+        policy.shard_selection_key.as_deref(),
+        policy.training_lease.as_ref(),
+    );
+    let record_limit = policy.record_limit.unwrap_or(usize::MAX);
     let mut records = Vec::new();
-    for sample_index in 0..document_count {
+    for sample_index in sample_indices {
         let tokens = runtime.generate_document_tokens(split, sample_index)?;
         records.extend(token_windows_from_tokens(&tokens, block_size));
+        if records.len() >= record_limit {
+            records.truncate(record_limit);
+            break;
+        }
     }
     Ok(records)
 }

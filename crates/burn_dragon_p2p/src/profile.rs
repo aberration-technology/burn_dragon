@@ -48,17 +48,63 @@ const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
-const DEFAULT_NCA_BROWSER_WGPU_BATCH_SIZE: usize = 1;
+const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 1;
 #[cfg(feature = "native")]
-const DEFAULT_NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES: usize = 4;
+const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 8;
 #[cfg(feature = "native")]
 const DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+#[cfg(feature = "native")]
+const NCA_BROWSER_MIN_TRAIN_DOCUMENT_POOL: usize = 64;
+#[cfg(feature = "native")]
+const NCA_BROWSER_MIN_EVAL_DOCUMENT_POOL: usize = 8;
 #[cfg(feature = "native")]
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
 #[cfg(feature = "native")]
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
 #[cfg(feature = "native")]
 const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r1.profile.json");
+
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DragonBrowserWindowTuning {
+    batch_size: usize,
+    max_train_batches: usize,
+    max_eval_batches: usize,
+    train_document_pool: usize,
+    eval_document_pool: usize,
+}
+
+#[cfg(feature = "native")]
+impl DragonBrowserWindowTuning {
+    fn nca_wgpu_from_native(config: &TrainingConfig) -> Self {
+        let batch_size = config
+            .training
+            .batch_size
+            .clamp(1, NCA_BROWSER_WGPU_BATCH_SIZE_CAP);
+        let max_train_batches = config
+            .training
+            .max_iters
+            .clamp(1, NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP);
+        let native_window_examples = config
+            .training
+            .batch_size
+            .saturating_mul(config.training.max_iters)
+            .max(1);
+        let train_document_pool = native_window_examples.max(NCA_BROWSER_MIN_TRAIN_DOCUMENT_POOL);
+        let eval_document_pool = config
+            .training
+            .batch_size
+            .max(NCA_BROWSER_MIN_EVAL_DOCUMENT_POOL);
+
+        Self {
+            batch_size,
+            max_train_batches,
+            max_eval_batches: 1,
+            train_document_pool,
+            eval_document_pool,
+        }
+    }
+}
 
 fn dragon_profile_attachment() -> DirectoryMetadataAttachment {
     DirectoryMetadataAttachment::new(
@@ -286,6 +332,7 @@ fn browser_profile_from_native_config(
                     nca_config_path.display()
                 )
             })?;
+            let window_tuning = DragonBrowserWindowTuning::nca_wgpu_from_native(config);
             let capability_policy = DragonCapabilityPolicy {
                 browser_wgpu_memory_budget_bytes: Some(
                     DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES,
@@ -298,27 +345,19 @@ fn browser_profile_from_native_config(
                 block_size: config.training.block_size,
                 learning_rate: config.optimizer.learning_rate,
                 weight_decay: config.optimizer.weight_decay,
-                batch_size: config
-                    .training
-                    .batch_size
-                    .clamp(1, DEFAULT_NCA_BROWSER_WGPU_BATCH_SIZE),
-                max_train_batches: Some(
-                    config
-                        .training
-                        .max_iters
-                        .clamp(1, DEFAULT_NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES),
-                ),
-                max_eval_batches: Some(1),
+                batch_size: window_tuning.batch_size,
+                max_train_batches: Some(window_tuning.max_train_batches),
+                max_eval_batches: Some(window_tuning.max_eval_batches),
                 capability_policy,
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,
-                    max_documents: Some(16),
+                    max_documents: Some(window_tuning.train_document_pool),
                 },
                 eval_source: Some(DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml,
                     split: DragonBrowserDatasetSplit::Validation,
-                    max_documents: Some(4),
+                    max_documents: Some(window_tuning.eval_document_pool),
                 }),
             }))
         }
@@ -941,6 +980,37 @@ prompt = "1 2 3"
             resolved.config.dataset.source,
             DatasetSourceConfig::UniversalityNca { .. }
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_nca_browser_window_uses_native_profile_tuning() {
+        let profile: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON).expect("builtin NCA profile");
+        let native_config: TrainingConfig =
+            toml::from_str(&profile.native.training_toml).expect("native training config");
+        let expected = DragonBrowserWindowTuning::nca_wgpu_from_native(&native_config);
+        let browser = profile.browser.expect("browser profile");
+
+        assert_eq!(browser.block_size, native_config.training.block_size);
+        assert_eq!(browser.learning_rate, native_config.optimizer.learning_rate);
+        assert_eq!(browser.weight_decay, native_config.optimizer.weight_decay);
+        assert_eq!(browser.batch_size, expected.batch_size);
+        assert_eq!(browser.max_train_batches, Some(expected.max_train_batches));
+        assert_eq!(browser.max_eval_batches, Some(expected.max_eval_batches));
+
+        match browser.train_source {
+            DragonBrowserProfileTokenSource::GeneratedNca { max_documents, .. } => {
+                assert_eq!(max_documents, Some(expected.train_document_pool));
+            }
+            other => panic!("expected generated NCA train source, got {other:?}"),
+        }
+        match browser.eval_source.expect("eval source") {
+            DragonBrowserProfileTokenSource::GeneratedNca { max_documents, .. } => {
+                assert_eq!(max_documents, Some(expected.eval_document_pool));
+            }
+            other => panic!("expected generated NCA eval source, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "native")]

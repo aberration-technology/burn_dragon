@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+#[cfg(any(feature = "wasm-peer", test))]
+pub(crate) mod browser_data;
 pub mod build_info;
 pub mod capability;
 pub mod capability_state;

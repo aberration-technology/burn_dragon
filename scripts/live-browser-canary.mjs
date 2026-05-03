@@ -708,11 +708,11 @@ function acceptedReceiptCount(report) {
   );
 }
 
-function productionRequiresP2pCheckpoint(report) {
+function canaryRequiresP2pCheckpoint(report) {
   return (
     report.expect_checkpoint_sync ||
     (report.expect_training &&
-      report.production_training_profile?.load_active_head_artifact === true)
+      report.training_canary_profile?.load_active_head_artifact === true)
   );
 }
 
@@ -726,7 +726,7 @@ function e2eInvariant(name, required, passed, detail = null) {
 }
 
 function buildBrowserE2eContract(report) {
-  const requiresP2pCheckpoint = productionRequiresP2pCheckpoint(report);
+  const requiresP2pCheckpoint = canaryRequiresP2pCheckpoint(report);
   const acceptedReceipts = acceptedReceiptCount(report);
   const artifactFallbackCount = report.artifact_http_fallback_requests?.length ?? 0;
   const invariants = [
@@ -1635,7 +1635,7 @@ async function runCanary() {
     }
     if (
       EXPECT_TRAINING &&
-      productionBrowserTrainingConfig?.live_participant?.load_active_head_artifact === true &&
+      browserTrainingConfig?.live_participant?.load_active_head_artifact === true &&
       !report.training_p2p_checkpoint_ready
     ) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);

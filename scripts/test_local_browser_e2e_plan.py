@@ -61,7 +61,8 @@ def main() -> None:
         "training_p2p_checkpoint_ready: null",
         "report.training_p2p_checkpoint_ready = machineStateCheckpointReady(report);",
         "browser training canary did not sync the active head checkpoint over P2P before training",
-        "productionBrowserTrainingConfig?.live_participant?.load_active_head_artifact === true",
+        "report.training_canary_profile?.load_active_head_artifact === true",
+        "browserTrainingConfig?.live_participant?.load_active_head_artifact === true",
         "Training P2P checkpoint ready",
     ]
     canary_and_summary = canary + "\n" + Path("scripts/summarize_live_browser_canary.py").read_text()

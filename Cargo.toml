@@ -50,17 +50,17 @@ burn_dragon_tokenizer = { version = "=0.21.0-pre.33", path = "crates/burn_dragon
 burn_dragon_train = { version = "=0.21.0-pre.33", path = "crates/burn_dragon_train", default-features = false }
 burn_dragon_universality = { version = "=0.21.0-pre.33", path = "crates/burn_dragon_universality", default-features = false }
 
-burn_p2p = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p", default-features = false }
-burn_p2p_admin = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_admin" }
-burn_p2p_app = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_app", default-features = false }
-burn_p2p_bootstrap = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_bootstrap" }
-burn_p2p_browser = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_browser" }
-burn_p2p_checkpoint = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_checkpoint" }
-burn_p2p_core = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_core" }
-burn_p2p_dataloader = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_dataloader" }
-burn_p2p_publish = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_publish", default-features = false }
-burn_p2p_views = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_views" }
-burn_p2p_workload = { version = "=0.21.0-pre.70", path = "../burn_p2p/crates/burn_p2p_workload" }
+burn_p2p = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p", default-features = false }
+burn_p2p_admin = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_admin" }
+burn_p2p_app = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_app", default-features = false }
+burn_p2p_bootstrap = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_bootstrap" }
+burn_p2p_browser = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_browser" }
+burn_p2p_checkpoint = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_checkpoint" }
+burn_p2p_core = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_core" }
+burn_p2p_dataloader = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_dataloader" }
+burn_p2p_publish = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_publish", default-features = false }
+burn_p2p_views = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_views" }
+burn_p2p_workload = { version = "=0.21.0-pre.71", path = "../burn_p2p/crates/burn_p2p_workload" }
 
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

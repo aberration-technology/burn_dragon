@@ -84,9 +84,15 @@ def main() -> None:
     )
     test_job_steps = ci_workflow["jobs"]["test"]["steps"]
     test_job_runs = "\n".join(step.get("run", "") for step in test_job_steps)
+    lint_job_steps = ci_workflow["jobs"]["lint"]["steps"]
+    lint_job_runs = "\n".join(step.get("run", "") for step in lint_job_steps)
     assert "cargo clean" not in test_job_runs
-    assert "cargo run --manifest-path Cargo.toml -p xtask -- native-smoke" in test_job_runs
-    assert "cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke" in test_job_runs
+    assert "cargo clean" not in lint_job_runs
+    assert "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib deployment::tests::" in lint_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- native-smoke" in lint_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke" in lint_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- native-smoke" not in test_job_runs
+    assert "cargo run --manifest-path Cargo.toml -p xtask -- wasm-smoke" not in test_job_runs
     local_prod_job_steps = ci_workflow["jobs"]["local-prod-e2e"]["steps"]
     local_prod_job_runs = "\n".join(step.get("run", "") for step in local_prod_job_steps)
     assert "cargo run --manifest-path Cargo.toml -p xtask -- local-browser-e2e" in local_prod_job_runs

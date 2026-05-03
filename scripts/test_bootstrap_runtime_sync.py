@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
+import subprocess
+import tempfile
 import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 HELPER_PATH = REPO_ROOT / "scripts" / "render_bootstrap_runtime_sync_commands.py"
+PRESERVE_HEADS_SCRIPT = REPO_ROOT / "scripts" / "preserve_bootstrap_current_heads.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-burn-dragon-p2p-aws.yml"
 RESTORE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "restore-burn-dragon-p2p-aws.yml"
 
@@ -20,6 +24,66 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 
 
+def bootstrap_config(current_head_id: str | None = None) -> dict:
+    return {
+        "auth": {
+            "directory_entries": [
+                {
+                    "study_id": "study-mainnet",
+                    "experiment_id": "exp-nca",
+                    "current_revision_id": "rev-nca",
+                    "current_head_id": current_head_id,
+                }
+            ]
+        }
+    }
+
+
+def portal_snapshot(
+    directory_current: str | None = None,
+    heads: list[dict] | None = None,
+) -> dict:
+    return {
+        "directory": {
+            "entries": [
+                {
+                    "study_id": "study-mainnet",
+                    "experiment_id": "exp-nca",
+                    "current_revision_id": "rev-nca",
+                    "current_head_id": directory_current,
+                }
+            ]
+        },
+        "heads": heads or [],
+    }
+
+
+def run_preserve_heads(config: dict, snapshot: dict, *extra_args: str) -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = pathlib.Path(tmpdir)
+        config_path = tmpdir_path / "bootstrap.json"
+        snapshot_path = tmpdir_path / "snapshot.json"
+        config_path.write_text(json.dumps(config))
+        snapshot_path.write_text(json.dumps(snapshot))
+        subprocess.run(
+            [
+                "python3",
+                str(PRESERVE_HEADS_SCRIPT),
+                "--config",
+                str(config_path),
+                "--snapshot-file",
+                str(snapshot_path),
+                *extra_args,
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return json.loads(config_path.read_text())
+
+
 def base_env() -> dict[str, str]:
     return {
         "BOOTSTRAP_OBJECT_URI": "s3://bucket/runtime/bootstrap.json",
@@ -29,7 +93,7 @@ def base_env() -> dict[str, str]:
         "HEAD_MIRROR_AUTH_SCRIPT_OBJECT_URI": "s3://bucket/runtime/fetch-head-mirror-auth",
         "HEAD_MIRROR_SERVICE_OBJECT_URI": "s3://bucket/runtime/head-mirror.service",
         "BOOTSTRAP_INSTALL_SOURCE": "crate",
-        "BOOTSTRAP_CRATE_VERSION": "0.21.0-pre.67",
+        "BOOTSTRAP_CRATE_VERSION": "0.21.0-pre.68",
         "BOOTSTRAP_GIT_REPOSITORY": "https://github.com/aberration-technology/burn_p2p.git",
         "BOOTSTRAP_GIT_REF": "deadbeef",
         "BOOTSTRAP_FEATURES": "admin-http,metrics,browser-edge,auth-github",
@@ -43,6 +107,68 @@ def base_env() -> dict[str, str]:
 
 
 class BootstrapRuntimeSyncTests(unittest.TestCase):
+    def test_preserve_bootstrap_current_heads_uses_live_directory_current(self) -> None:
+        config = run_preserve_heads(
+            bootstrap_config(),
+            portal_snapshot(directory_current="head-live-current"),
+        )
+
+        self.assertEqual(
+            config["auth"]["directory_entries"][0]["current_head_id"],
+            "head-live-current",
+        )
+
+    def test_preserve_bootstrap_current_heads_recovers_latest_visible_root(self) -> None:
+        config = run_preserve_heads(
+            bootstrap_config(),
+            portal_snapshot(
+                heads=[
+                    {
+                        "study_id": "study-mainnet",
+                        "experiment_id": "exp-nca",
+                        "revision_id": "rev-nca",
+                        "head_id": "head-window",
+                        "parent_head_id": "head-root-newer",
+                        "created_at": "2026-05-01T00:02:00Z",
+                    },
+                    {
+                        "study_id": "study-mainnet",
+                        "experiment_id": "exp-nca",
+                        "revision_id": "rev-nca",
+                        "head_id": "head-root-older",
+                        "parent_head_id": None,
+                        "created_at": "2026-05-01T00:00:00Z",
+                    },
+                    {
+                        "study_id": "study-mainnet",
+                        "experiment_id": "exp-nca",
+                        "revision_id": "rev-nca",
+                        "head_id": "head-root-newer",
+                        "parent_head_id": None,
+                        "created_at": "2026-05-01T00:01:00Z",
+                    },
+                ]
+            ),
+            "--recover-visible-root",
+        )
+
+        self.assertEqual(
+            config["auth"]["directory_entries"][0]["current_head_id"],
+            "head-root-newer",
+        )
+
+    def test_preserve_bootstrap_current_heads_keeps_existing_config_current(self) -> None:
+        config = run_preserve_heads(
+            bootstrap_config(current_head_id="head-existing"),
+            portal_snapshot(directory_current="head-live-current"),
+            "--recover-visible-root",
+        )
+
+        self.assertEqual(
+            config["auth"]["directory_entries"][0]["current_head_id"],
+            "head-existing",
+        )
+
     def test_remote_sync_waits_for_runtime_prereqs_and_aws_before_s3_ops(self) -> None:
         commands = module.generate_commands(base_env())
         prereq_index = next(
@@ -66,7 +192,7 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
         commands = module.generate_commands(base_env())
         joined = "\n".join(commands)
         self.assertIn("cargo install --locked burn_p2p_bootstrap", joined)
-        self.assertIn("--version '0.21.0-pre.67'", joined)
+        self.assertIn("--version '0.21.0-pre.68'", joined)
         self.assertIn(
             "ln -sf /root/.cargo/bin/burn-p2p-bootstrap /usr/local/bin/burn-p2p-bootstrap",
             joined,
@@ -275,6 +401,7 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
             )
             self.assertIn("BOOTSTRAP_BINARY_SHA256", text, path.name)
             self.assertIn("HEAD_MIRROR_BINARY_SHA256", text, path.name)
+            self.assertIn("EDGE_BASE_URL", text, path.name)
 
     def test_sync_script_times_out_when_ssm_command_never_succeeds(self) -> None:
         text = (REPO_ROOT / "scripts" / "sync-bootstrap-runtime-config.sh").read_text()

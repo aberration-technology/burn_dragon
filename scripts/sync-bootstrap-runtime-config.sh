@@ -13,7 +13,7 @@ bootstrap_head_mirror_auth_script_b64="${BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64:?
 bootstrap_head_mirror_service_unit_b64="${BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64:?BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64 is required}"
 runtime_config_prefix="${RUNTIME_CONFIG_PREFIX:-runtime-config/bootstrap/${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}}"
 bootstrap_install_source="${BOOTSTRAP_INSTALL_SOURCE:-crate}"
-bootstrap_crate_version="${BOOTSTRAP_CRATE_VERSION:-0.21.0-pre.67}"
+bootstrap_crate_version="${BOOTSTRAP_CRATE_VERSION:-0.21.0-pre.68}"
 bootstrap_git_repository="${BOOTSTRAP_GIT_REPOSITORY:-https://github.com/aberration-technology/burn_p2p.git}"
 bootstrap_git_ref="${BOOTSTRAP_GIT_REF:-}"
 bootstrap_binary_path="${BOOTSTRAP_BINARY_PATH:-}"
@@ -27,6 +27,7 @@ dragon_git_ref="${DRAGON_GIT_REF:-main}"
 head_mirror_binary_path="${HEAD_MIRROR_BINARY_PATH:-}"
 head_mirror_binary_sha256="${HEAD_MIRROR_BINARY_SHA256:-}"
 head_mirror_reinstall="${HEAD_MIRROR_REINSTALL:-true}"
+edge_base_url="${EDGE_BASE_URL:-}"
 
 if [ -z "$bootstrap_auth_feature" ]; then
   case "$auth_connector_kind" in
@@ -82,6 +83,15 @@ printf '%s' "$bootstrap_service_unit_b64" | base64 -d >"$tmpdir/burn-p2p-bootstr
 printf '%s' "$bootstrap_head_mirror_config_b64" | base64 -d >"$tmpdir/bootstrap-head-mirror.toml"
 printf '%s' "$bootstrap_head_mirror_auth_script_b64" | base64 -d >"$tmpdir/burn-dragon-p2p-fetch-head-mirror-auth-bundle"
 printf '%s' "$bootstrap_head_mirror_service_unit_b64" | base64 -d >"$tmpdir/burn-dragon-p2p-head-mirror.service"
+
+if [ -n "$edge_base_url" ]; then
+  if ! python3 "$(dirname "$0")/preserve_bootstrap_current_heads.py" \
+    --config "$tmpdir/bootstrap.json" \
+    --snapshot-url "${edge_base_url%/}/portal/snapshot" \
+    --recover-visible-root; then
+    echo "warning: failed to preserve bootstrap current heads from ${edge_base_url}" >&2
+  fi
+fi
 
 aws s3 cp "$tmpdir/bootstrap.json" "$bootstrap_object_uri" >/dev/null
 aws s3 cp "$tmpdir/Caddyfile" "$caddy_object_uri" >/dev/null

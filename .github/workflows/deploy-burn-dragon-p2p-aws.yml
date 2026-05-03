@@ -40,9 +40,9 @@ on:
           - crate
           - git
       bootstrap_version:
-        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.67`."
+        description: "Published `burn_p2p_bootstrap` crate version used when `bootstrap_install_source=crate`. Example: `0.21.0-pre.68`."
         required: false
-        default: 0.21.0-pre.67
+        default: 0.21.0-pre.68
         type: string
       bootstrap_git_ref:
         description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
@@ -785,6 +785,7 @@ jobs:
           BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
           BOOTSTRAP_BINARY_PATH: ${{ steps.edge_binaries.outputs.bootstrap_binary_path }}
           BOOTSTRAP_BINARY_SHA256: ${{ steps.edge_binaries.outputs.bootstrap_binary_sha256 }}
+          EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
           DRAGON_GIT_REPOSITORY: ${{ env.TF_VAR_dragon_git_repository }}
           DRAGON_GIT_REF: ${{ env.TF_VAR_dragon_git_ref }}
           HEAD_MIRROR_BINARY_PATH: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}

@@ -84,6 +84,10 @@ def main() -> None:
             "bootstrap_head_mirror_seed_node_urls         = local.bootstrap_peer_internal_multiaddrs",
             "head mirror internal bootstrap seeding",
         ),
+        (
+            "head_artifact_mirror_source_roots = [\n        local.bootstrap_head_mirror_storage_root,\n      ]",
+            "edge bootstrap local head mirror artifact source",
+        ),
         ('preset = "BootstrapOnly"', "bootstrap-only burn_p2p preset"),
         (
             "bootstrap_addresses = local.bootstrap_peer_internal_multiaddrs",

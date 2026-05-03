@@ -713,6 +713,9 @@ locals {
       ]
     }
     bootstrap_peer = {
+      head_artifact_mirror_source_roots = [
+        local.bootstrap_head_mirror_storage_root,
+      ]
       node = {
         identity = "Persistent"
         storage = {

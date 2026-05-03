@@ -1974,6 +1974,7 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads() {
                 listen_addresses: vec![bootstrap_addr.clone()],
                 external_addresses: Vec::new(),
             },
+            head_artifact_mirror_source_roots: Vec::new(),
         })
         .expect("spawn bootstrap peer daemon");
     let bootstrap_telemetry = bootstrap.telemetry();
@@ -2657,6 +2658,7 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
                 listen_addresses: vec![bootstrap_addr.clone()],
                 external_addresses: Vec::new(),
             },
+            head_artifact_mirror_source_roots: Vec::new(),
         })
         .expect("spawn bootstrap peer daemon");
     let bootstrap_telemetry = bootstrap.telemetry();

@@ -581,6 +581,29 @@ fn local_browser_training_and_verification_pair(
     (trainer, verifier)
 }
 
+fn apply_canonical_browser_head(harness: &mut BrowserConformanceHarness, head: &HeadDescriptor) {
+    let mut directory = harness.directory.clone();
+    let mut updated = false;
+    for entry in &mut directory.entries {
+        if entry.study_id == head.study_id
+            && entry.experiment_id == head.experiment_id
+            && entry.current_revision_id == head.revision_id
+        {
+            entry.current_head_id = Some(head.head_id.clone());
+            updated = true;
+        }
+    }
+    assert!(
+        updated,
+        "canonical browser head must match a directory entry"
+    );
+    harness.update_directory(directory);
+    assert_eq!(
+        harness.apply_heads(std::slice::from_ref(head)),
+        Some(head.head_id.clone())
+    );
+}
+
 fn flush_and_ack_receipts(harness: &mut BrowserConformanceHarness) -> usize {
     let flush_events =
         harness
@@ -1270,8 +1293,12 @@ fn run_edge_drill_for_prepared<B>(
     B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    let entry = prepared.manifests.experiment_directory[0].clone();
-    let snapshot = edge_snapshot_for_manifests(&prepared.manifests, BrowserMode::Trainer);
+    let mut entry = prepared.manifests.experiment_directory[0].clone();
+    let head = current_edge_head(&entry, label);
+    entry.current_head_id = Some(head.head_id.clone());
+    let mut snapshot = edge_snapshot_for_manifests(&prepared.manifests, BrowserMode::Trainer);
+    snapshot.directory.entries = vec![entry.clone()];
+    snapshot.heads = vec![head.clone()];
     let edge = spawn_local_edge(snapshot.clone());
     let trainer_requested_scopes = entry.allowed_scopes.clone();
     let local_verifier_requested_scopes = local_mock_verifier_scopes(&entry);
@@ -1435,7 +1462,6 @@ fn run_edge_drill_for_prepared<B>(
             .expect("authorized directory fetch");
         assert_eq!(directory[0].experiment_id, entry.experiment_id);
 
-        let head = current_edge_head(&entry, label);
         let browser_session_state = BrowserSessionState {
             session: Some(browser_session.clone()),
             certificate: Some(browser_certificate),
@@ -1472,7 +1498,7 @@ fn run_edge_drill_for_prepared<B>(
             entry.experiment_id.clone(),
             Some(entry.current_revision_id.clone()),
         );
-        trainer.apply_heads(std::slice::from_ref(&head));
+        apply_canonical_browser_head(&mut trainer, &head);
         let training = trainer
             .run_training(BrowserTrainingPlan {
                 study_id: entry.study_id.clone(),
@@ -1536,7 +1562,7 @@ fn run_edge_drill_for_prepared<B>(
             entry.experiment_id.clone(),
             Some(entry.current_revision_id.clone()),
         );
-        verifier.apply_heads(std::slice::from_ref(&head));
+        apply_canonical_browser_head(&mut verifier, &head);
         let validation = verifier
             .run_validation(BrowserValidationPlan {
                 head_id: head.head_id.clone(),
@@ -3305,7 +3331,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         entry.experiment_id.clone(),
         Some(entry.current_revision_id.clone()),
     );
-    harness.apply_heads(&[HeadDescriptor {
+    let browser_head = HeadDescriptor {
         head_id: burn_p2p::HeadId::new("dragon-head"),
         study_id: entry.study_id.clone(),
         experiment_id: entry.experiment_id.clone(),
@@ -3315,7 +3341,8 @@ fn browser_conformance_uses_native_dragon_manifests() {
         global_step: 1,
         created_at: Utc::now(),
         metrics: Default::default(),
-    }]);
+    };
+    apply_canonical_browser_head(&mut harness, &browser_head);
     let training_lease = WorkloadTrainingLease {
         lease_id: LeaseId::new("dragon-browser-lease"),
         window_id: WindowId(1),
@@ -3372,17 +3399,7 @@ fn browser_conformance_uses_native_dragon_manifests() {
         entry.experiment_id.clone(),
         Some(entry.current_revision_id.clone()),
     );
-    verifier.apply_heads(&[HeadDescriptor {
-        head_id: burn_p2p::HeadId::new("dragon-head"),
-        study_id: entry.study_id,
-        experiment_id: entry.experiment_id.clone(),
-        revision_id: entry.current_revision_id.clone(),
-        artifact_id: burn_p2p::ArtifactId::new("dragon-artifact"),
-        parent_head_id: None,
-        global_step: 1,
-        created_at: Utc::now(),
-        metrics: Default::default(),
-    }]);
+    apply_canonical_browser_head(&mut verifier, &browser_head);
 
     let validation = verifier
         .run_validation(BrowserValidationPlan {
@@ -3549,8 +3566,8 @@ fn nca_mixed_fleet_browser_and_native_same_net_progresses() {
     let mut verify_receipts = 0usize;
 
     for obs in &native_obs {
-        trainer.apply_heads(std::slice::from_ref(&obs.head));
-        verifier.apply_heads(std::slice::from_ref(&obs.head));
+        apply_canonical_browser_head(&mut trainer, &obs.head);
+        apply_canonical_browser_head(&mut verifier, &obs.head);
 
         let training = trainer
             .run_training(BrowserTrainingPlan {
@@ -3706,8 +3723,8 @@ fn climbmix_mixed_fleet_browser_and_native_same_net_progresses() {
     let mut verify_receipts = 0usize;
 
     for obs in &ordered {
-        trainer.apply_heads(std::slice::from_ref(&obs.head));
-        verifier.apply_heads(std::slice::from_ref(&obs.head));
+        apply_canonical_browser_head(&mut trainer, &obs.head);
+        apply_canonical_browser_head(&mut verifier, &obs.head);
 
         let training = trainer
             .run_training(BrowserTrainingPlan {
@@ -3825,8 +3842,8 @@ fn nca_mixed_fleet_browser_and_native_same_net_medium() {
     let mut verify_receipts = 0usize;
 
     for obs in &native_obs {
-        trainer.apply_heads(std::slice::from_ref(&obs.head));
-        verifier.apply_heads(std::slice::from_ref(&obs.head));
+        apply_canonical_browser_head(&mut trainer, &obs.head);
+        apply_canonical_browser_head(&mut verifier, &obs.head);
         let training = trainer
             .run_training(BrowserTrainingPlan {
                 study_id: entry.study_id.clone(),
@@ -3950,8 +3967,8 @@ fn climbmix_mixed_fleet_browser_and_native_three_peers_medium() {
     let mut verify_receipts = 0usize;
 
     for obs in &ordered {
-        trainer.apply_heads(std::slice::from_ref(&obs.head));
-        verifier.apply_heads(std::slice::from_ref(&obs.head));
+        apply_canonical_browser_head(&mut trainer, &obs.head);
+        apply_canonical_browser_head(&mut verifier, &obs.head);
 
         let training = trainer
             .run_training(BrowserTrainingPlan {

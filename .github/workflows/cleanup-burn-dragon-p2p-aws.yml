@@ -41,6 +41,11 @@ on:
         required: true
         default: true
         type: boolean
+      cleanup_route53_health_checks:
+        description: "Delete redundant burn_dragon Route53 health checks, preserving the active canonical edge check."
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   id-token: write
@@ -58,6 +63,7 @@ jobs:
       CLEANUP_EMPTY_LEGACY_BUCKETS: ${{ github.event.inputs.cleanup_empty_legacy_buckets }}
       CLEANUP_FORCE_LEGACY_BUCKETS: ${{ github.event.inputs.cleanup_force_legacy_buckets }}
       CLEANUP_DUPLICATE_DATASET_CERTIFICATES: ${{ github.event.inputs.cleanup_duplicate_dataset_certificates }}
+      CLEANUP_ROUTE53_HEALTH_CHECKS: ${{ github.event.inputs.cleanup_route53_health_checks }}
 
     steps:
       - name: resolve aws session settings
@@ -65,14 +71,27 @@ jobs:
         env:
           AWS_REGION_VAR: ${{ vars.BURN_DRAGON_P2P_AWS_REGION }}
           AWS_ROLE_ARN_VAR: ${{ vars.BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN }}
+          AWS_DEPLOY_ROLE_ARN_VAR: ${{ vars.BURN_DRAGON_P2P_AWS_ROLE_ARN }}
         run: |
           set -euo pipefail
           : "${AWS_REGION_VAR:?missing BURN_DRAGON_P2P_AWS_REGION}"
-          : "${AWS_ROLE_ARN_VAR:?missing BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN}"
+          aws_role_arn="$AWS_ROLE_ARN_VAR"
+          if [ -z "$aws_role_arn" ]; then
+            if [ "$CLEANUP_ROUTE53_HEALTH_CHECKS" = "true" ] &&
+              [ "$CLEANUP_LEGACY_STACK" != "true" ] &&
+              [ "$CLEANUP_ORPHAN_CANONICAL_NETWORK" != "true" ] &&
+              [ "$CLEANUP_EMPTY_LEGACY_BUCKETS" != "true" ] &&
+              [ "$CLEANUP_FORCE_LEGACY_BUCKETS" != "true" ] &&
+              [ "$CLEANUP_DUPLICATE_DATASET_CERTIFICATES" != "true" ]; then
+              aws_role_arn="$AWS_DEPLOY_ROLE_ARN_VAR"
+              echo "::notice::BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN is unset; using deploy role for route53-only cleanup."
+            fi
+          fi
+          : "${aws_role_arn:?missing BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN; broader cleanup still requires the dedicated cleanup role}"
           {
             echo "AWS_REGION=$AWS_REGION_VAR"
-            echo "AWS_ROLE_ARN=$AWS_ROLE_ARN_VAR"
-            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$AWS_ROLE_ARN_VAR")"
+            echo "AWS_ROLE_ARN=$aws_role_arn"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$aws_role_arn")"
           } >>"$GITHUB_ENV"
 
       - name: configure aws credentials
@@ -392,6 +411,98 @@ jobs:
               done
           }
 
+          route53_health_check_inventory() {
+            aws route53 list-health-checks --output json | jq -c '.HealthChecks[]?' | while read -r health_check; do
+              health_check_id="$(jq -r '.Id' <<<"$health_check")"
+              tags_json="$(aws route53 list-tags-for-resource \
+                --resource-type healthcheck \
+                --resource-id "$health_check_id" \
+                --output json 2>/dev/null || printf '{"ResourceTagSet":{"Tags":[]}}')"
+              health_check_name="$(jq -r '.ResourceTagSet.Tags[]? | select(.Key == "Name") | .Value' <<<"$tags_json" | head -n 1)"
+              jq -cn \
+                --argjson health_check "$health_check" \
+                --arg name "$health_check_name" \
+                '{
+                  id: $health_check.Id,
+                  name: $name,
+                  type: ($health_check.HealthCheckConfig.Type // ""),
+                  fqdn: ($health_check.HealthCheckConfig.FullyQualifiedDomainName // ""),
+                  resource_path: ($health_check.HealthCheckConfig.ResourcePath // ""),
+                  ip_address: ($health_check.HealthCheckConfig.IPAddress // ""),
+                  port: ($health_check.HealthCheckConfig.Port // null),
+                  disabled: ($health_check.HealthCheckConfig.Disabled // false)
+                }'
+            done
+          }
+
+          cleanup_route53_health_checks() {
+            if [ "$CLEANUP_ROUTE53_HEALTH_CHECKS" != "true" ]; then
+              return 0
+            fi
+
+            local canonical_health_check_name="${canonical_stack_name}-edge-primary"
+            local edge_fqdn="edge.dragon.aberration.technology"
+            local edge_path="/portal/snapshot"
+            local inventory_file
+            local preserve_id=""
+            inventory_file="$(mktemp)"
+            route53_health_check_inventory >"$inventory_file"
+
+            echo "::group::route53 health check inventory before cleanup"
+            jq -s 'sort_by(.name, .fqdn, .id)' "$inventory_file"
+            echo "::endgroup::"
+
+            preserve_id="$(aws cloudwatch describe-alarms \
+              --output json | jq -r --arg prefix "$canonical_stack_name" '
+                .MetricAlarms[]?
+                | select(.AlarmName | startswith($prefix))
+                | .Dimensions[]?
+                | select(.Name == "HealthCheckId")
+                | .Value
+              ' | head -n 1)"
+            if [ -z "$preserve_id" ]; then
+              preserve_id="$(jq -r --arg name "$canonical_health_check_name" '
+                select(.name == $name and .type == "HTTPS")
+                | .id
+              ' "$inventory_file" | head -n 1)"
+            fi
+            if [ -z "$preserve_id" ]; then
+              preserve_id="$(jq -r --arg fqdn "$edge_fqdn" --arg path "$edge_path" '
+                select(.fqdn == $fqdn and .resource_path == $path and .type == "HTTPS")
+                | .id
+              ' "$inventory_file" | head -n 1)"
+            fi
+
+            if [ -n "$preserve_id" ]; then
+              echo "preserving Route53 health check ${preserve_id} for ${canonical_health_check_name}"
+            else
+              echo "::notice::No canonical Route53 health check found to preserve for ${canonical_health_check_name}."
+            fi
+
+            jq -r \
+              --arg preserve_id "$preserve_id" \
+              --arg legacy_stack "$legacy_stack_name" \
+              --arg fqdn "$edge_fqdn" \
+              --arg path "$edge_path" '
+                select(.id != $preserve_id)
+                | select(
+                    (.name | startswith($legacy_stack)) or
+                    ((.name | startswith("burn-dragon-p2p-")) and (.name | endswith("-edge-primary"))) or
+                    ((.name == "") and .fqdn == $fqdn and .resource_path == $path and .type == "HTTPS")
+                  )
+                | [.id, .name, .fqdn, .resource_path, .type] | @tsv
+              ' "$inventory_file" | while IFS=$'\t' read -r health_check_id health_check_name health_check_fqdn health_check_path health_check_type; do
+                echo "deleting redundant Route53 health check ${health_check_id} name=${health_check_name:-untagged} fqdn=${health_check_fqdn:-none} path=${health_check_path:-none} type=${health_check_type:-none}"
+                aws route53 delete-health-check --health-check-id "$health_check_id" >/dev/null || \
+                  echo "::warning::failed to delete Route53 health check ${health_check_id}; it may already be gone or still referenced"
+              done
+
+            route53_health_check_inventory >"$inventory_file"
+            echo "::group::route53 health check inventory after cleanup"
+            jq -s 'sort_by(.name, .fqdn, .id)' "$inventory_file"
+            echo "::endgroup::"
+          }
+
           cleanup_iam_by_prefix() {
             local prefix="$1"
 
@@ -585,6 +696,7 @@ jobs:
           fi
 
           cleanup_duplicate_dataset_certificates
+          cleanup_route53_health_checks
 
           inventory_summary "$canonical_stack_name"
           inventory_summary "$legacy_stack_name"

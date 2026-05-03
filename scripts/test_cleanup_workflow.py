@@ -17,9 +17,14 @@ def main() -> None:
     assert inputs["cleanup_force_legacy_buckets"]["default"] is False
     assert "cleanup_duplicate_dataset_certificates" in inputs
     assert inputs["cleanup_duplicate_dataset_certificates"]["default"] is True
+    assert "cleanup_route53_health_checks" in inputs
+    assert inputs["cleanup_route53_health_checks"]["default"] is True
 
     required_snippets = [
         "BURN_DRAGON_P2P_AWS_CLEANUP_ROLE_ARN",
+        "BURN_DRAGON_P2P_AWS_ROLE_ARN",
+        "using deploy role for route53-only cleanup",
+        'broader cleanup still requires the dedicated cleanup role',
         'account_id="$(aws sts get-caller-identity --query Account --output text)"',
         'if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then',
         'legacy_stack_name="dragon-p2p-prod"',
@@ -32,6 +37,13 @@ def main() -> None:
         'aws s3 rm "s3://${bucket_name}" --recursive',
         'aws s3api delete-bucket --bucket "$bucket_name"',
         'delete_empty_buckets_by_prefix "$legacy_stack_name"',
+        'cleanup_route53_health_checks()',
+        'canonical_health_check_name="${canonical_stack_name}-edge-primary"',
+        'route53_health_check_inventory',
+        'aws route53 list-health-checks',
+        'aws route53 list-tags-for-resource',
+        'aws route53 delete-health-check --health-check-id "$health_check_id"',
+        'preserving Route53 health check',
     ]
     for snippet in required_snippets:
         assert snippet in workflow_text, f"missing required snippet: {snippet}"

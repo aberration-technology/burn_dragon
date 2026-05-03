@@ -144,6 +144,10 @@ def main() -> None:
         ('mode                  = "DiffusionSteadyState"', "diffusion promotion policy"),
         ("validator_quorum      = 1", "single-validator low-resource quorum"),
         ("promote_serve_head    = true", "serve-head promotion"),
+        (
+            "artifact_sync_timeout_secs   = 120",
+            "large-checkpoint diffusion artifact sync timeout",
+        ),
         ("allow_solo_promotion         = true", "solo promotion fallback"),
     ]:
         require_contains(main_tf, snippet, label)

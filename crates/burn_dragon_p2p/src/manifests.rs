@@ -69,6 +69,8 @@ fn minimum_system_memory_bytes(backend_label: &str, footprint: &DragonTrainingFo
     }
 }
 
+const DRAGON_DIFFUSION_ARTIFACT_SYNC_TIMEOUT_SECS: u32 = 120;
+
 fn dragon_diffusion_merge_topology(experiment_kind: DragonExperimentKind) -> MergeTopologyPolicy {
     let window_duration_secs = match experiment_kind {
         DragonExperimentKind::NcaPrepretraining => 60,
@@ -86,7 +88,10 @@ fn dragon_diffusion_merge_topology(experiment_kind: DragonExperimentKind) -> Mer
         promotion_policy: HeadPromotionPolicy {
             mode: HeadPromotionMode::DiffusionSteadyState,
             validator_quorum: 1,
-            diffusion: Some(DiffusionSteadyStatePolicy::default()),
+            diffusion: Some(DiffusionSteadyStatePolicy {
+                artifact_sync_timeout_secs: DRAGON_DIFFUSION_ARTIFACT_SYNC_TIMEOUT_SECS,
+                ..DiffusionSteadyStatePolicy::default()
+            }),
             ..HeadPromotionPolicy::default()
         },
     }
@@ -598,6 +603,15 @@ mod tests {
                 .diffusion
                 .as_ref()
                 .is_some_and(|policy| policy.allow_solo_promotion)
+        );
+        assert_eq!(
+            topology
+                .promotion_policy
+                .diffusion
+                .as_ref()
+                .expect("diffusion policy")
+                .artifact_sync_timeout_secs,
+            DRAGON_DIFFUSION_ARTIFACT_SYNC_TIMEOUT_SECS
         );
     }
 }

@@ -362,6 +362,7 @@ locals {
       promote_serve_head    = true
       diffusion = {
         settlement_timeout_secs      = 45
+        artifact_sync_timeout_secs   = 120
         observation_poll_ms          = 250
         required_stable_observations = 4
         support_margin               = 1
@@ -385,6 +386,7 @@ locals {
       promote_serve_head    = true
       diffusion = {
         settlement_timeout_secs      = 45
+        artifact_sync_timeout_secs   = 120
         observation_poll_ms          = 250
         required_stable_observations = 4
         support_margin               = 1

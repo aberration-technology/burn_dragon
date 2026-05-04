@@ -755,7 +755,6 @@ struct AdminDirectoryEntryReport {
 #[derive(Debug, Serialize)]
 struct AdminRolloutReport {
     edge_base_url: String,
-    session_id: String,
     experiment_id: String,
     revision_id: String,
     current_head_id: Option<String>,
@@ -1364,7 +1363,6 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         args.output_format,
         &AdminRolloutReport {
             edge_base_url,
-            session_id,
             experiment_id: replacement.experiment_id.as_str().to_owned(),
             revision_id: replacement.current_revision_id.as_str().to_owned(),
             current_head_id: replacement

@@ -1604,6 +1604,19 @@ mod tests {
     }
 
     #[test]
+    fn native_cli_bridge_launch_parser_rejects_non_loopback_callback() {
+        let error = parse_native_cli_bridge_launch(
+            "native_cli=1&native_callback=https%3A%2F%2Fattacker.example%2Fcollect&native_nonce=nonce-1&native_authorize=https%3A%2F%2Fgithub.example%2Fauthorize",
+        )
+        .expect_err("non-loopback callback should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("native CLI callback host must be loopback")
+        );
+    }
+
+    #[test]
     fn native_cli_bridge_callback_url_preserves_existing_query() {
         let bridge = PendingNativeCliBridge {
             callback_url: "http://127.0.0.1:43123/callback?source=dragon".into(),

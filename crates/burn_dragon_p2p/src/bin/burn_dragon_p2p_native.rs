@@ -3131,18 +3131,7 @@ where
                 );
                 head
             }
-            Err(error) => {
-                eprintln!(
-                    "{log_prefix}-head-sync-failed error={error}; falling back to local genesis initialization"
-                );
-                let head = running.initialize_local_head(experiment)?;
-                eprintln!(
-                    "{log_prefix}-initialized genesis head id={} global_step={}",
-                    head.head_id.as_str(),
-                    head.global_step,
-                );
-                head
-            }
+            Err(error) => return Err(error),
         }
     } else if let Some(head) = running.sync_experiment_head(experiment)? {
         eprintln!(

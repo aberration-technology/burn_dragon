@@ -812,6 +812,30 @@ fn browser_session_storage() -> Result<web_sys::Storage> {
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn validate_native_cli_loopback_callback(callback_url: &str) -> Result<()> {
+    let callback = url::Url::parse(callback_url)
+        .map_err(|error| anyhow!("failed to parse native callback URL {callback_url}: {error}"))?;
+    if callback.scheme() != "http" {
+        bail!("native CLI callback must use http scheme");
+    }
+    let Some(host) = callback.host() else {
+        bail!("native CLI callback must include a host");
+    };
+    let loopback = match host {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if !loopback {
+        bail!("native CLI callback host must be loopback");
+    }
+    if callback.port().is_none() {
+        bail!("native CLI callback must include an explicit port");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 fn parse_native_cli_bridge_launch(query: &str) -> Result<Option<PendingNativeCliBridge>> {
     let mut requested = false;
     let mut callback_url = None;
@@ -845,12 +869,14 @@ fn parse_native_cli_bridge_launch(query: &str) -> Result<Option<PendingNativeCli
     if !requested {
         return Ok(None);
     }
-    if authorize_url.is_none() && auth_bootstrap.is_none() {
-        bail!("native CLI bridge is missing native_authorize or native_auth_bootstrap");
+    if auth_bootstrap.is_none() {
+        bail!("native CLI bridge is missing native_auth_bootstrap");
     }
+    let callback_url =
+        callback_url.ok_or_else(|| anyhow!("native CLI bridge is missing native_callback"))?;
+    validate_native_cli_loopback_callback(&callback_url)?;
     Ok(Some(PendingNativeCliBridge {
-        callback_url: callback_url
-            .ok_or_else(|| anyhow!("native CLI bridge is missing native_callback"))?,
+        callback_url,
         nonce: nonce.ok_or_else(|| anyhow!("native CLI bridge is missing native_nonce"))?,
         authorize_url,
         auth_bootstrap,
@@ -936,6 +962,7 @@ fn native_cli_bridge_callback_url(
     provider_code: &str,
     state: &str,
 ) -> Result<String> {
+    validate_native_cli_loopback_callback(&bridge.callback_url)?;
     let mut url = url::Url::parse(&bridge.callback_url).map_err(|error| {
         anyhow!(
             "failed to parse native callback URL {}: {error}",

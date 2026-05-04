@@ -2141,7 +2141,15 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         args.backend,
         &config,
         Some(&auth_bundle),
-        |prepared| run_prepared_train_window_once(prepared, &config, args.backend, run_options)
+        |prepared| {
+            run_prepared_train_window_once(
+                prepared,
+                &config,
+                Some(&auth_bundle),
+                args.backend,
+                run_options,
+            )
+        }
     )
 }
 
@@ -2723,6 +2731,7 @@ where
 fn run_prepared_train_window_once<B>(
     prepared: PreparedNativePeer<B>,
     config: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
     backend: BackendArg,
     options: TrainWindowOnceRunOptions<'_>,
 ) -> Result<()>
@@ -2763,6 +2772,7 @@ where
     let started = Instant::now();
     eprintln!("train-window-once progress: spawning native peer runtime");
     let mut running = spawn_prepared_native_peer(prepared)?;
+    let edge_registration = train_window_edge_registration(config, auth_bundle)?;
     let report_result = (|| -> Result<TrainWindowOnceReport> {
         eprintln!("train-window-once progress: waiting for runtime readiness");
         wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
@@ -2955,6 +2965,28 @@ where
                 ));
             }
         }
+        if let Some((registration_runtime, edge_base_url, session_id)) = edge_registration.as_ref()
+        {
+            let announcement = HeadAnnouncement {
+                overlay: experiment.overlay_set()?.heads,
+                provider_peer_id: Some(local_peer_id.clone()),
+                head: outcome.head.clone(),
+                announced_at: chrono::Utc::now(),
+            };
+            mirror_live_head_with_edge(
+                registration_runtime,
+                edge_base_url,
+                session_id,
+                &announcement,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to mirror published head {} artifact {} to edge",
+                    announcement.head.head_id.as_str(),
+                    announcement.head.artifact_id.as_str()
+                )
+            })?;
+        }
         Ok(TrainWindowOnceReport {
             experiment_kind: running.prepared().experiment_kind,
             backend: backend.as_label().into(),
@@ -3003,6 +3035,28 @@ where
         );
     }
     write_output(options.output, options.output_format, &report)
+}
+
+fn train_window_edge_registration(
+    config: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<Option<(tokio::runtime::Runtime, String, String)>> {
+    let Some((edge_base_url, session_id)) = auth_bundle.and_then(|auth| {
+        auth.session_id.as_ref().and_then(|session_id| {
+            let edge_base_url = auth
+                .edge_base_url
+                .clone()
+                .or_else(|| config.effective_edge_base_url().map(ToOwned::to_owned));
+            edge_base_url.map(|edge_base_url| (edge_base_url, session_id.clone()))
+        })
+    }) else {
+        return Ok(None);
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build async runtime for train-window edge registration")?;
+    Ok(Some((runtime, edge_base_url, session_id)))
 }
 
 fn wait_for_head_provider<B>(
@@ -3205,6 +3259,31 @@ fn register_live_head_with_edge(
     directory_template: &ExperimentDirectoryEntry,
     announcement: &HeadAnnouncement,
 ) -> Result<()> {
+    register_live_head_with_edge_options(
+        runtime,
+        edge_base_url,
+        session_id,
+        Some(directory_template),
+        announcement,
+    )
+}
+
+fn mirror_live_head_with_edge(
+    runtime: &tokio::runtime::Runtime,
+    edge_base_url: &str,
+    session_id: &str,
+    announcement: &HeadAnnouncement,
+) -> Result<()> {
+    register_live_head_with_edge_options(runtime, edge_base_url, session_id, None, announcement)
+}
+
+fn register_live_head_with_edge_options(
+    runtime: &tokio::runtime::Runtime,
+    edge_base_url: &str,
+    session_id: &str,
+    directory_template: Option<&ExperimentDirectoryEntry>,
+    announcement: &HeadAnnouncement,
+) -> Result<()> {
     let provider_peer_id = announcement
         .provider_peer_id
         .as_ref()
@@ -3254,22 +3333,24 @@ fn register_live_head_with_edge(
         mirrored_provider_peer_id.as_str(),
         provider_peer_id.as_str(),
     );
-    let mut directory_entries =
-        runtime.block_on(fetch_signed_directory_entries(edge_base_url, session_id))?;
-    if upsert_directory_entry_current_head(
-        &mut directory_entries,
-        directory_template,
-        edge_announcement.head.head_id.clone(),
-    ) {
-        let _ = runtime.block_on(rollout_directory_entries(
-            edge_base_url,
-            session_id,
-            directory_entries,
-        ))?;
-        eprintln!(
-            "head-mirror-edge-directory-updated head_id={}",
-            announcement.head.head_id.as_str(),
-        );
+    if let Some(directory_template) = directory_template {
+        let mut directory_entries =
+            runtime.block_on(fetch_signed_directory_entries(edge_base_url, session_id))?;
+        if upsert_directory_entry_current_head(
+            &mut directory_entries,
+            directory_template,
+            edge_announcement.head.head_id.clone(),
+        ) {
+            let _ = runtime.block_on(rollout_directory_entries(
+                edge_base_url,
+                session_id,
+                directory_entries,
+            ))?;
+            eprintln!(
+                "head-mirror-edge-directory-updated head_id={}",
+                announcement.head.head_id.as_str(),
+            );
+        }
     }
     Ok(())
 }

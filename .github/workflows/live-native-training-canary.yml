@@ -184,5 +184,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: burn-dragon-live-native-training-canary
-          path: ${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}
+          path: |
+            ${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}
+            !${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}/**/*auth-bundle*.json
+            !${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}/**/*-storage/**
+            !${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}/**/native-github-auth.json
+            !${{ env.BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR }}/enroll-*.log
           if-no-files-found: ignore

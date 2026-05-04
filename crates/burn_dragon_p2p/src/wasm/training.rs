@@ -47,8 +47,7 @@ use crate::capability_state::{
 };
 use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
-    DragonBrowserTokenSource, DragonBrowserTrainingConfig, DragonBrowserTrainingObjectiveConfig,
-    TokenWindowRecord,
+    DragonBrowserTokenSource, DragonBrowserTrainingConfig, TokenWindowRecord,
 };
 use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_policy};
 
@@ -1611,7 +1610,7 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 #[cfg(all(test, target_arch = "wasm32", feature = "wasm-peer"))]
 mod tests {
     use super::*;
-    use crate::config::DragonBrowserLiveParticipantConfig;
+    use crate::config::{DragonBrowserLiveParticipantConfig, DragonBrowserTrainingObjectiveConfig};
     use burn_dragon_core::{DragonConfig, LanguageHeadConfig};
     use burn_dragon_universality::{
         NcaCorpusConfig, NcaFamilyConfig, NcaFamilyKind, NcaSerializationConfig,

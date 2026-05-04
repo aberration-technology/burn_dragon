@@ -4,6 +4,7 @@ mod prelude;
 
 pub mod backend;
 mod continual_backprop;
+pub mod objective;
 pub mod profile;
 #[cfg(feature = "rerun")]
 pub mod rerun;
@@ -16,6 +17,8 @@ pub mod utils;
 pub use backend::*;
 #[allow(unused_imports)]
 pub use continual_backprop::*;
+#[allow(unused_imports)]
+pub use objective::*;
 #[allow(unused_imports)]
 pub use profile::*;
 #[cfg(feature = "rerun")]

@@ -81,6 +81,11 @@ urlencoding = { version = "2.1", optional = true }
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
+[[bench]]
+name = "training_objectives"
+harness = false
+required-features = ["train"]
+
 [dev-dependencies]
 burn-autodiff.workspace = true
 burn-ndarray.workspace = true

@@ -512,6 +512,7 @@ mod tests {
                 vocab_size: 50_257,
                 ..DragonConfig::default()
             },
+            training_objective: crate::config::DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
             block_size: 512,
             learning_rate: 1.0e-3,

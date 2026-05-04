@@ -174,6 +174,7 @@ mod tests {
                 vocab_size: 256,
                 ..burn_dragon_core::DragonConfig::default()
             },
+            training_objective: crate::config::DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Wgpu,
             block_size: 8,
             learning_rate: 1.0e-3,

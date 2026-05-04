@@ -67,6 +67,7 @@ pub(crate) use crate::tokenizer::TokenizerConfig;
 pub(crate) use crate::{ContextStrategyConfig, GenerationConfig, ModelOverrides};
 
 pub(crate) use crate::loss::language_model_loss;
+pub(crate) use crate::train::objective::{ObjectiveTrainerKind, ensure_objective_supported};
 pub(crate) use crate::train::steps::LanguageTrainModel;
 pub(crate) use burn_dragon_core::{DragonConfig, DragonModel, LanguagePipelineState, ModelState};
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;

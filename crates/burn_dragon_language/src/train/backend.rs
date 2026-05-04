@@ -573,6 +573,20 @@ where
     } else {
         None
     };
+    let objective_trainer = if resolved_config.parallel.pipeline.enabled {
+        ObjectiveTrainerKind::Pipeline
+    } else {
+        match parallel_runtime.mode {
+            ParallelismKind::Single => ObjectiveTrainerKind::SingleDevice,
+            ParallelismKind::Ddp => ObjectiveTrainerKind::Ddp,
+            mode => {
+                return Err(anyhow!(
+                    "parallel.mode={mode:?} is not wired into objective-aware language training yet"
+                ));
+            }
+        }
+    };
+    ensure_objective_supported(&resolved_config.training.objective, objective_trainer)?;
     let summary_event_token_ids = model_config.summary_memory.write_trigger_token_ids.clone();
 
     let dataset_steps_per_epoch = datasets.train.steps_per_epoch(DatasetSplit::Train);

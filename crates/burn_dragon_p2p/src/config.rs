@@ -664,10 +664,37 @@ impl DragonBrowserExecutionBackend {
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DragonBrowserTrainingObjectiveConfig {
+    #[default]
+    NextToken,
+    Sdft,
+    Sdpo,
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+impl DragonBrowserTrainingObjectiveConfig {
+    pub fn is_next_token(&self) -> bool {
+        matches!(self, Self::NextToken)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NextToken => "next_token",
+            Self::Sdft => "sdft",
+            Self::Sdpo => "sdpo",
+        }
+    }
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserTrainingConfig {
     pub experiment_kind: DragonExperimentKind,
     pub model_config: DragonConfig,
+    #[serde(default)]
+    pub training_objective: DragonBrowserTrainingObjectiveConfig,
     #[serde(default)]
     pub execution_backend: DragonBrowserExecutionBackend,
     #[serde(default = "default_browser_block_size")]

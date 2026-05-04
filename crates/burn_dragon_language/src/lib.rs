@@ -44,7 +44,10 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            TrainingConfig, TrainingHyperparameters, load_training_config,
+            RepromptTruncation, SdftObjectiveConfig, SdpoObjectiveConfig,
+            SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
+            TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+            load_training_config,
         };
     }
 
@@ -99,7 +102,9 @@ pub use config::{
 #[cfg(feature = "train")]
 pub use config::{
     DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    TrainingConfig, TrainingHyperparameters, load_training_config,
+    RepromptTruncation, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings, generate_text, generate_tokens,

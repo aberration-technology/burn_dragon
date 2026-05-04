@@ -141,6 +141,145 @@ pub struct ModuleLrScaleEntry {
     pub schedule: Option<ModuleLrScaleScheduleConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TrainingObjectiveConfig {
+    #[default]
+    NextToken,
+    Sdft(SdftObjectiveConfig),
+    Sdpo(SdpoObjectiveConfig),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingObjectiveKind {
+    NextToken,
+    Sdft,
+    Sdpo,
+}
+
+impl TrainingObjectiveConfig {
+    pub fn kind(&self) -> TrainingObjectiveKind {
+        match self {
+            Self::NextToken => TrainingObjectiveKind::NextToken,
+            Self::Sdft(_) => TrainingObjectiveKind::Sdft,
+            Self::Sdpo(_) => TrainingObjectiveKind::Sdpo,
+        }
+    }
+
+    pub fn is_next_token(&self) -> bool {
+        matches!(self, Self::NextToken)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfDistillationKlKind {
+    #[default]
+    Forward,
+    Reverse,
+    JensenShannon,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TeacherRegularization {
+    #[default]
+    Ema,
+    TrustRegion,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepromptTruncation {
+    Left,
+    #[default]
+    Right,
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SdftObjectiveConfig {
+    pub max_completion_tokens: usize,
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+    pub kl: SelfDistillationKlKind,
+    pub generate_from_teacher: bool,
+    pub teacher_update_rate: f32,
+    pub top_entropy_quantile: Option<f32>,
+    pub num_loss_tokens_to_skip: usize,
+}
+
+impl Default for SdftObjectiveConfig {
+    fn default() -> Self {
+        Self {
+            max_completion_tokens: 32,
+            temperature: 1.0,
+            top_k: None,
+            kl: SelfDistillationKlKind::Forward,
+            generate_from_teacher: false,
+            teacher_update_rate: 0.01,
+            top_entropy_quantile: None,
+            num_loss_tokens_to_skip: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SdpoObjectiveConfig {
+    pub group_size: usize,
+    pub max_completion_tokens: usize,
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+    pub full_logit_distillation: bool,
+    pub alpha: f32,
+    pub success_reward_threshold: f32,
+    pub teacher_regularization: TeacherRegularization,
+    pub teacher_update_rate: f32,
+    pub distillation_topk: Option<usize>,
+    pub distillation_add_tail: bool,
+    pub is_clip: Option<f32>,
+    pub max_reprompt_len: usize,
+    pub reprompt_truncation: RepromptTruncation,
+    pub dont_reprompt_on_self_success: bool,
+    pub remove_thinking_from_demonstration: bool,
+    pub reprompt_template: Option<String>,
+    pub solution_template: Option<String>,
+    pub feedback_template: Option<String>,
+    pub include_environment_feedback: bool,
+    pub environment_feedback_only_without_solution: bool,
+}
+
+impl Default for SdpoObjectiveConfig {
+    fn default() -> Self {
+        Self {
+            group_size: 2,
+            max_completion_tokens: 32,
+            temperature: 1.0,
+            top_k: None,
+            full_logit_distillation: true,
+            alpha: 0.5,
+            success_reward_threshold: 1.0,
+            teacher_regularization: TeacherRegularization::Ema,
+            teacher_update_rate: 0.05,
+            distillation_topk: Some(100),
+            distillation_add_tail: true,
+            is_clip: Some(2.0),
+            max_reprompt_len: 10_240,
+            reprompt_truncation: RepromptTruncation::Right,
+            dont_reprompt_on_self_success: true,
+            remove_thinking_from_demonstration: true,
+            reprompt_template: None,
+            solution_template: None,
+            feedback_template: None,
+            include_environment_feedback: true,
+            environment_feedback_only_without_solution: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
     pub block_size: usize,
@@ -183,6 +322,8 @@ pub struct TrainingHyperparameters {
     pub context_strategy: ContextStrategyConfig,
     #[serde(default)]
     pub sequence_kernel_override: Option<SequenceKernelConfig>,
+    #[serde(default)]
+    pub objective: TrainingObjectiveConfig,
     #[serde(default)]
     pub gdpo: Option<burn_dragon_train::GdpoConfig>,
 }

@@ -38,6 +38,7 @@ use crate::config::{
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
 use crate::config::{
     DragonBrowserLiveParticipantConfig, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
+    DragonBrowserTrainingObjectiveConfig,
 };
 #[cfg(feature = "native")]
 use crate::config::{DragonManifestSeed, DragonNativePeerConfig, DragonNativeTrainingOverrides};
@@ -739,6 +740,7 @@ pub fn browser_training_config_from_profile(
     Ok(Some(DragonBrowserTrainingConfig {
         experiment_kind: profile.experiment_kind,
         model_config: browser.model_config,
+        training_objective: DragonBrowserTrainingObjectiveConfig::default(),
         execution_backend: browser.execution_backend,
         block_size: browser.block_size,
         learning_rate: browser.learning_rate,

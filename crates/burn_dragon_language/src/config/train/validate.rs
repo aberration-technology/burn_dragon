@@ -3,12 +3,114 @@ use std::collections::HashSet;
 
 use burn_dragon_core::{DragonConfig, ResidualConnectorKind};
 use burn_dragon_train::{
-    GdpoHardGate, LearningRateScheduleConfig, ParallelismKind, PipelineCommunicationKind,
-    PipelineScheduleKind, TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
+    LearningRateScheduleConfig, ParallelismKind, PipelineCommunicationKind, PipelineScheduleKind,
+    TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
 };
 
-use super::{DatasetSourceConfig, TrainingConfig};
+use super::{DatasetSourceConfig, TrainingConfig, TrainingObjectiveConfig};
 use crate::tokenizer::TokenizerKind;
+
+fn validate_probability(value: f32, path: &str) -> Result<()> {
+    if !(0.0..=1.0).contains(&value) {
+        return Err(anyhow!("{path} must be in [0, 1] (got {value})"));
+    }
+    Ok(())
+}
+
+fn validate_positive_f32(value: f32, path: &str) -> Result<()> {
+    if value <= 0.0 || !value.is_finite() {
+        return Err(anyhow!("{path} must be finite and > 0 (got {value})"));
+    }
+    Ok(())
+}
+
+fn validate_optional_nonempty(value: Option<&String>, path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value.trim().is_empty()
+    {
+        return Err(anyhow!("{path} must not be empty when set"));
+    }
+    Ok(())
+}
+
+fn validate_training_objective(objective: &TrainingObjectiveConfig) -> Result<()> {
+    match objective {
+        TrainingObjectiveConfig::NextToken => Ok(()),
+        TrainingObjectiveConfig::Sdft(config) => {
+            if config.max_completion_tokens == 0 {
+                return Err(anyhow!(
+                    "training.objective.max_completion_tokens must be > 0"
+                ));
+            }
+            validate_positive_f32(config.temperature, "training.objective.temperature")?;
+            if let Some(top_k) = config.top_k
+                && top_k == 0
+            {
+                return Err(anyhow!("training.objective.top_k must be > 0 when set"));
+            }
+            validate_probability(
+                config.teacher_update_rate,
+                "training.objective.teacher_update_rate",
+            )?;
+            if let Some(quantile) = config.top_entropy_quantile {
+                validate_probability(quantile, "training.objective.top_entropy_quantile")?;
+            }
+            Ok(())
+        }
+        TrainingObjectiveConfig::Sdpo(config) => {
+            if config.group_size == 0 {
+                return Err(anyhow!("training.objective.group_size must be > 0"));
+            }
+            if config.max_completion_tokens == 0 {
+                return Err(anyhow!(
+                    "training.objective.max_completion_tokens must be > 0"
+                ));
+            }
+            validate_positive_f32(config.temperature, "training.objective.temperature")?;
+            if let Some(top_k) = config.top_k
+                && top_k == 0
+            {
+                return Err(anyhow!("training.objective.top_k must be > 0 when set"));
+            }
+            validate_probability(config.alpha, "training.objective.alpha")?;
+            if !config.success_reward_threshold.is_finite() {
+                return Err(anyhow!(
+                    "training.objective.success_reward_threshold must be finite"
+                ));
+            }
+            validate_probability(
+                config.teacher_update_rate,
+                "training.objective.teacher_update_rate",
+            )?;
+            if let Some(topk) = config.distillation_topk
+                && topk == 0
+            {
+                return Err(anyhow!(
+                    "training.objective.distillation_topk must be > 0 when set"
+                ));
+            }
+            if let Some(is_clip) = config.is_clip {
+                validate_positive_f32(is_clip, "training.objective.is_clip")?;
+            }
+            if config.max_reprompt_len == 0 {
+                return Err(anyhow!("training.objective.max_reprompt_len must be > 0"));
+            }
+            validate_optional_nonempty(
+                config.reprompt_template.as_ref(),
+                "training.objective.reprompt_template",
+            )?;
+            validate_optional_nonempty(
+                config.solution_template.as_ref(),
+                "training.objective.solution_template",
+            )?;
+            validate_optional_nonempty(
+                config.feedback_template.as_ref(),
+                "training.objective.feedback_template",
+            )?;
+            Ok(())
+        }
+    }
+}
 
 impl TrainingConfig {
     pub fn validate(&self) -> Result<()> {
@@ -719,42 +821,12 @@ impl TrainingConfig {
         if let Some(gdpo) = &self.training.gdpo
             && gdpo.enabled
         {
-            if gdpo.group_size == 0 {
-                return Err(anyhow!("training.gdpo.group_size must be > 0"));
-            }
-            if gdpo.hard_weight < 0.0 {
-                return Err(anyhow!("training.gdpo.hard_weight must be >= 0"));
-            }
-            if gdpo.easy_weight < 0.0 {
-                return Err(anyhow!("training.gdpo.easy_weight must be >= 0"));
-            }
-            if gdpo.policy_weight < 0.0 {
-                return Err(anyhow!("training.gdpo.policy_weight must be >= 0"));
-            }
-            if gdpo.policy_clip_range < 0.0 {
-                return Err(anyhow!("training.gdpo.policy_clip_range must be >= 0"));
-            }
-            if gdpo.advantage_clip < 0.0 {
-                return Err(anyhow!(
-                    "training.gdpo.advantage_clip must be >= 0 (got {})",
-                    gdpo.advantage_clip
-                ));
-            }
-            if !(0.0..1.0).contains(&gdpo.advantage_ema_decay) {
-                return Err(anyhow!(
-                    "training.gdpo.advantage_ema_decay must be in [0, 1) (got {})",
-                    gdpo.advantage_ema_decay
-                ));
-            }
-            if let GdpoHardGate::Percentile { quantile } = gdpo.hard_gate
-                && !(0.0..=1.0).contains(&quantile)
-            {
-                return Err(anyhow!(
-                    "training.gdpo.hard_gate.quantile must be in [0, 1] (got {})",
-                    quantile
-                ));
-            }
+            return Err(anyhow!(
+                "training.gdpo.enabled is a legacy objective flag and cannot be combined with training.objective; use training.objective.type = \"sdpo\" for self-distilled policy optimization"
+            ));
         }
+
+        validate_training_objective(&self.training.objective)?;
 
         if let Some(n_layer) = self.model.n_layer
             && n_layer == 0
@@ -1215,6 +1287,96 @@ impl TrainingConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_config(extra_training: &str) -> TrainingConfig {
+        let toml = format!(
+            r#"
+[dataset]
+cache_dir = "target/test-cache"
+type = "nemotron_climb_mix"
+max_records = 4
+
+[training]
+block_size = 8
+batch_size = 2
+max_iters = 1
+log_frequency = 1
+{extra_training}
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = ""
+"#
+        );
+        toml::from_str(&toml).expect("training config should parse")
+    }
+
+    #[test]
+    fn default_objective_is_next_token() {
+        let config = parse_config("");
+        assert!(config.training.objective.is_next_token());
+        config.validate().expect("default objective validates");
+    }
+
+    #[test]
+    fn sdft_objective_config_validates() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdft"
+max_completion_tokens = 4
+teacher_update_rate = 0.25
+"#,
+        );
+        assert!(matches!(
+            config.training.objective,
+            TrainingObjectiveConfig::Sdft(_)
+        ));
+        config.validate().expect("sdft objective validates");
+    }
+
+    #[test]
+    fn sdpo_rejects_invalid_alpha() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdpo"
+alpha = 1.25
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid sdpo alpha should fail");
+        assert!(
+            err.to_string().contains("training.objective.alpha"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_gdpo_flag_is_mutually_exclusive_with_objective_switch() {
+        let config = parse_config(
+            r#"
+[training.gdpo]
+enabled = true
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("legacy gdpo objective flag should fail");
+        assert!(
+            err.to_string().contains("training.gdpo.enabled"),
+            "unexpected error: {err}"
+        );
     }
 }
 

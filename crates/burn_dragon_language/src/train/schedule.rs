@@ -2014,6 +2014,7 @@ mod tests {
             module_lr_scales: Vec::new(),
             context_strategy: ContextStrategyConfig::Infinite,
             sequence_kernel_override: None,
+            objective: Default::default(),
             gdpo: None,
         }
     }

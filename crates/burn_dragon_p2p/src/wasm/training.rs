@@ -47,7 +47,8 @@ use crate::capability_state::{
 };
 use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
-    DragonBrowserTokenSource, DragonBrowserTrainingConfig, TokenWindowRecord,
+    DragonBrowserTokenSource, DragonBrowserTrainingConfig, DragonBrowserTrainingObjectiveConfig,
+    TokenWindowRecord,
 };
 use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_policy};
 
@@ -721,6 +722,12 @@ fn validate_browser_training_config(config: &DragonBrowserTrainingConfig) -> Res
     }
     if config.model_config.vocab_size == 0 {
         bail!("browser training model_config.vocab_size must be > 0");
+    }
+    if !config.training_objective.is_next_token() {
+        bail!(
+            "browser training objective {} is not wired yet; browser training currently supports next_token only",
+            config.training_objective.label()
+        );
     }
     Ok(())
 }
@@ -1682,6 +1689,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -1732,6 +1740,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config,
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -1788,6 +1797,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -1865,6 +1875,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -1944,6 +1955,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -2043,6 +2055,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -2078,6 +2091,7 @@ mod tests {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Wgpu,
             block_size: 8,
             learning_rate: 1.0e-3,
@@ -2128,6 +2142,7 @@ mod tests {
         DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
             learning_rate: 1.0e-3,

@@ -136,7 +136,7 @@ jobs:
         shell: bash
         env:
           BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.browser_app_base_url }}
-          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}
+          BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}
           BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID: ${{ steps.resolve_browser_shell_settings.outputs.canary_principal_id }}
           BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
           BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ steps.resolve_browser_shell_settings.outputs.selected_experiment_id }}
@@ -200,7 +200,7 @@ jobs:
     with:
       environment: ${{ github.event.inputs.environment }}
       site_base_url: ${{ needs.build.outputs.site_base_url }}
-      edge_base_url: ${{ needs.build.outputs.edge_base_url }}
+      edge_base_url: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}
       principal_id: ${{ needs.build.outputs.canary_principal_id }}
       experiment_id: ${{ needs.build.outputs.selected_experiment_id }}
     secrets: inherit

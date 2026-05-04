@@ -201,6 +201,7 @@ fi
 if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then
   for attempt in $(seq 1 120); do
     if [ -s "$${BOOTSTRAP_AUTHORITY_KEY_PATH}" ]; then
+      set +x
       authority_key_b64="$(base64 -w0 "$${BOOTSTRAP_AUTHORITY_KEY_PATH}")"
       aws ssm put-parameter \
         --region "$${AWS_REGION}" \
@@ -208,6 +209,8 @@ if [ "$${BOOTSTRAP_NODE_ROLE}" = "primary" ]; then
         --overwrite \
         --name "$${AUTHORITY_KEY_PARAMETER_NAME}" \
         --value "$${authority_key_b64}"
+      unset authority_key_b64
+      set -x
       break
     fi
     sleep 5

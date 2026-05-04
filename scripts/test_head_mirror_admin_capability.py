@@ -17,6 +17,11 @@ def assert_contains(text: str, needle: str, context: str) -> None:
 def main() -> None:
     terraform = MAIN_TF.read_text()
     assert_contains(terraform, '"RegisterLiveHead"', str(MAIN_TF))
+    assert_contains(
+        terraform,
+        'canary             = "native-trainer"\n          admin_capabilities = "register_live_head"',
+        str(MAIN_TF),
+    )
 
     resolver_text = BOOTSTRAP_SETTINGS_SCRIPT.read_text()
     assert_contains(

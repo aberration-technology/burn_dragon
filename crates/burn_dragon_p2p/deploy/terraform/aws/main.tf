@@ -481,6 +481,7 @@ locals {
           deployment_profile = var.environment_name
           stack              = var.stack_name
           canary             = "native-trainer"
+          admin_capabilities = "register_live_head"
         }
       }
     ],

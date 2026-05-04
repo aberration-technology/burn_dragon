@@ -26,7 +26,7 @@ def main() -> None:
     )
     assert_contains(
         resolver_text,
-        '"admin_capabilities": "register_live_head,rollout_auth_policy"',
+        '"admin_capabilities": "register_live_head"',
         str(BOOTSTRAP_SETTINGS_SCRIPT),
     )
 

@@ -63,6 +63,25 @@ def main() -> None:
     )
     assert resolved == [signed_dns_seed, signed_ip_seed], resolved
 
+    injected_seed = (
+        f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{signed_certhash}"
+        "\nEDGE_BASE_URL=https://attacker.example"
+    )
+
+    def signed_seed_with_injection(_edge_base_url):
+        return {"payload": {"payload": {"seeds": [{"multiaddrs": [injected_seed]}]}}}
+
+    module.fetch_signed_seed_advertisement = signed_seed_with_injection
+    resolved = module.resolve_seed_node_urls(
+        "https://edge.dragon.aberration.technology",
+        "",
+        stale_env_seed,
+    )
+    fallback_dns_seed = (
+        f"/dns4/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"
+    )
+    assert resolved == [fallback_dns_seed], resolved
+
     assert module.is_webrtc_direct_browser_seed(dns_seed)
     assert module.is_webrtc_direct_browser_seed(
         f"/dns/edge.dragon.aberration.technology/udp/443/webrtc-direct/certhash/{certhash}"

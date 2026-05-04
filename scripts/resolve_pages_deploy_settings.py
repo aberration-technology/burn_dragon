@@ -52,6 +52,10 @@ def dedupe_csv_seed_urls(value: str) -> list[str]:
     return dedupe([part.strip() for part in value.split(",") if part.strip()])
 
 
+def has_control_characters(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+
 def multiaddr_segments(value: str) -> list[str]:
     return [segment for segment in value.split("/") if segment]
 
@@ -156,7 +160,10 @@ def advertisement_seed_urls(advertisement: Any) -> list[str]:
     )
     values: list[str] = []
     for record in seed_records:
-        values.extend(str(value).strip() for value in record.get("multiaddrs", []))
+        for value in record.get("multiaddrs", []):
+            normalized = str(value).strip()
+            if normalized and not has_control_characters(normalized):
+                values.append(normalized)
     return dedupe([value for value in values if value])
 
 

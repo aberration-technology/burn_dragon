@@ -1,8 +1,18 @@
+#[cfg(feature = "native")]
+use std::time::Duration;
+
 use anyhow::{Result, anyhow};
 use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadDescriptor, HeadId};
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
 #[cfg(feature = "native")]
 use burn_p2p_publish::{PeerArtifactMirrorRequest, PeerArtifactMirrorResponse};
+
+#[cfg(feature = "native")]
+const DEFAULT_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
+#[cfg(feature = "native")]
+const MAX_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+#[cfg(feature = "native")]
+const PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
 
 fn admin_client(edge_base_url: &str, session_id: Option<&str>) -> AdminClient {
     let config = session_id
@@ -133,7 +143,10 @@ pub async fn mirror_peer_artifact(
         "{}/admin/artifacts/mirror-peer",
         edge_base_url.trim_end_matches('/')
     );
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(peer_artifact_mirror_http_timeout(&request))
+        .build()
+        .map_err(|error| anyhow!("failed to build peer artifact mirror client: {error}"))?
         .post(&url)
         .header("x-session-id", session_id)
         .json(&request)
@@ -154,11 +167,23 @@ pub async fn mirror_peer_artifact(
         .map_err(|error| anyhow!("failed to decode peer artifact mirror response: {error}: {body}"))
 }
 
+#[cfg(feature = "native")]
+fn peer_artifact_mirror_http_timeout(request: &PeerArtifactMirrorRequest) -> Duration {
+    request
+        .timeout_ms
+        .map(Duration::from_millis)
+        .and_then(|timeout| timeout.checked_add(PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT_GRACE))
+        .unwrap_or(DEFAULT_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT)
+        .min(MAX_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    #[cfg(feature = "native")]
+    use burn_p2p::PeerId;
     use burn_p2p::{
         ArtifactId, ContentId, DatasetViewId, ExperimentId, ExperimentOptInPolicy,
         ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadDescriptor,
@@ -189,6 +214,32 @@ mod tests {
             allowed_scopes: BTreeSet::from([ExperimentScope::Connect]),
             metadata: BTreeMap::from([("dragon_profile".into(), "{}".into())]),
         }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn peer_artifact_mirror_http_timeout_tracks_request_with_cap() {
+        let mut request = PeerArtifactMirrorRequest {
+            artifact_id: ArtifactId::new("artifact"),
+            provider_peer_ids: vec![PeerId::new("provider")],
+            timeout_ms: Some(1_000),
+        };
+        assert_eq!(
+            peer_artifact_mirror_http_timeout(&request),
+            Duration::from_secs(31)
+        );
+
+        request.timeout_ms = Some(60 * 60 * 1000);
+        assert_eq!(
+            peer_artifact_mirror_http_timeout(&request),
+            MAX_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT
+        );
+
+        request.timeout_ms = None;
+        assert_eq!(
+            peer_artifact_mirror_http_timeout(&request),
+            DEFAULT_PEER_ARTIFACT_MIRROR_HTTP_TIMEOUT
+        );
     }
 
     #[test]

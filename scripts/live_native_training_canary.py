@@ -656,7 +656,7 @@ def main() -> int:
         head_provider_before = assert_head_provider_signal(
             head_before,
             p2p_before,
-            require_edge_provider=True,
+            require_edge_provider=False,
         )
     initialize_head_on_start = not bool(head_before.get("head_id"))
     enroll_static_principal(
@@ -769,7 +769,7 @@ def main() -> int:
             head_provider_signal = assert_head_provider_signal(
                 advanced_head,
                 p2p_signal,
-                require_edge_provider=True,
+                require_edge_provider=False,
             )
             window_reports.append(
                 {

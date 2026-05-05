@@ -640,6 +640,8 @@ struct TrainWindowOnceArgs {
     diffusion_settle_passes: u32,
     #[arg(long, default_value_t = 0)]
     serve_after_publish_secs: u64,
+    #[arg(long, default_value_t = false)]
+    mirror_live_head_to_edge: bool,
     #[command(flatten)]
     training_overrides: NativeTrainingOverrideArgs,
     #[command(flatten)]
@@ -849,6 +851,7 @@ struct TrainWindowOnceRunOptions<'a> {
     settle_diffusion: bool,
     diffusion_settle_passes: u32,
     serve_after_publish_secs: u64,
+    mirror_live_head_to_edge: bool,
 }
 
 fn main() -> Result<()> {
@@ -2134,6 +2137,7 @@ fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {
         settle_diffusion: args.settle_diffusion,
         diffusion_settle_passes: args.diffusion_settle_passes,
         serve_after_publish_secs: args.serve_after_publish_secs,
+        mirror_live_head_to_edge: args.mirror_live_head_to_edge,
     };
 
     with_prepared_native_peer!(
@@ -2772,7 +2776,11 @@ where
     let started = Instant::now();
     eprintln!("train-window-once progress: spawning native peer runtime");
     let mut running = spawn_prepared_native_peer(prepared)?;
-    let edge_registration = train_window_edge_registration(config, auth_bundle)?;
+    let edge_registration = if options.mirror_live_head_to_edge {
+        train_window_edge_registration(config, auth_bundle)?
+    } else {
+        None
+    };
     let report_result = (|| -> Result<TrainWindowOnceReport> {
         eprintln!("train-window-once progress: waiting for runtime readiness");
         wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
@@ -3252,19 +3260,20 @@ fn diffusion_settlement_report(
     }
 }
 
-fn register_live_head_with_edge(
+fn register_live_head_reference_with_edge(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
     session_id: &str,
     directory_template: &ExperimentDirectoryEntry,
     announcement: &HeadAnnouncement,
 ) -> Result<()> {
-    register_live_head_with_edge_options(
+    register_edge_head_and_directory(
         runtime,
         edge_base_url,
         session_id,
         Some(directory_template),
-        announcement,
+        announcement.clone(),
+        announcement.provider_peer_id.as_ref(),
     )
 }
 
@@ -3322,6 +3331,24 @@ fn register_live_head_with_edge_options(
 
     let edge_announcement =
         mirrored_edge_head_announcement(announcement, mirrored_provider_peer_id.clone());
+    register_edge_head_and_directory(
+        runtime,
+        edge_base_url,
+        session_id,
+        directory_template,
+        edge_announcement,
+        Some(provider_peer_id),
+    )
+}
+
+fn register_edge_head_and_directory(
+    runtime: &tokio::runtime::Runtime,
+    edge_base_url: &str,
+    session_id: &str,
+    directory_template: Option<&ExperimentDirectoryEntry>,
+    edge_announcement: HeadAnnouncement,
+    source_provider_peer_id: Option<&PeerId>,
+) -> Result<()> {
     let _ = runtime.block_on(register_live_head(
         edge_base_url,
         session_id,
@@ -3330,8 +3357,14 @@ fn register_live_head_with_edge_options(
     eprintln!(
         "head-mirror-edge-head-registered head_id={} provider={} source_provider={}",
         edge_announcement.head.head_id.as_str(),
-        mirrored_provider_peer_id.as_str(),
-        provider_peer_id.as_str(),
+        edge_announcement
+            .provider_peer_id
+            .as_ref()
+            .map(|peer_id| peer_id.as_str())
+            .unwrap_or("-"),
+        source_provider_peer_id
+            .map(|peer_id| peer_id.as_str())
+            .unwrap_or("-"),
     );
     if let Some(directory_template) = directory_template {
         let mut directory_entries =
@@ -3348,7 +3381,7 @@ fn register_live_head_with_edge_options(
             ))?;
             eprintln!(
                 "head-mirror-edge-directory-updated head_id={}",
-                announcement.head.head_id.as_str(),
+                edge_announcement.head.head_id.as_str(),
             );
         }
     }
@@ -3448,7 +3481,7 @@ where
         .checked_sub(head_sync_interval)
         .unwrap_or_else(Instant::now);
     let mut served_head_id = None;
-    let mut edge_mirrored_head_id = None;
+    let mut edge_registered_head_id = None;
 
     loop {
         if last_head_sync.elapsed() >= head_sync_interval {
@@ -3471,7 +3504,7 @@ where
                         head: head.clone(),
                         announced_at: chrono::Utc::now(),
                     };
-                    if let Err(error) = register_live_head_with_edge(
+                    if let Err(error) = register_live_head_reference_with_edge(
                         registration_runtime,
                         edge_base_url,
                         session_id,
@@ -3480,7 +3513,7 @@ where
                     ) {
                         eprintln!("head-mirror-edge-registration-failed: {error}");
                     } else {
-                        edge_mirrored_head_id = Some(head.head_id.clone());
+                        edge_registered_head_id = Some(head.head_id.clone());
                     }
                 }
             }
@@ -3490,7 +3523,7 @@ where
         let snapshot = running.snapshot();
         if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
             eprintln!(
-                "head-mirror-status status={:?} node_state={:?} connected_peers={} served_head={} edge_mirrored_head={} last_error={}",
+                "head-mirror-status status={:?} node_state={:?} connected_peers={} served_head={} edge_registered_head={} last_error={}",
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
@@ -3498,7 +3531,7 @@ where
                     .as_ref()
                     .map(|head_id| head_id.as_str())
                     .unwrap_or("-"),
-                edge_mirrored_head_id
+                edge_registered_head_id
                     .as_ref()
                     .map(|head_id| head_id.as_str())
                     .unwrap_or("-"),
@@ -4089,6 +4122,7 @@ mod tests {
         assert!(!train_once.settle_diffusion);
         assert_eq!(train_once.diffusion_settle_passes, 3);
         assert_eq!(train_once.serve_after_publish_secs, 0);
+        assert!(!train_once.mirror_live_head_to_edge);
         assert_eq!(train_once.training_overrides.batch_size, None);
         assert_eq!(train_once.training_overrides.max_iters, None);
         assert_eq!(train_once.training_overrides.max_eval_batches, None);
@@ -4111,6 +4145,7 @@ mod tests {
             "7",
             "--serve-after-publish-secs",
             "30",
+            "--mirror-live-head-to-edge",
         ])
         .expect("parse explicit head flags");
         let CommandKind::TrainWindowOnce(no_restore) = no_restore.command else {
@@ -4121,6 +4156,7 @@ mod tests {
         assert!(no_restore.settle_diffusion);
         assert_eq!(no_restore.diffusion_settle_passes, 7);
         assert_eq!(no_restore.serve_after_publish_secs, 30);
+        assert!(no_restore.mirror_live_head_to_edge);
         assert_eq!(no_restore.training_overrides.batch_size, Some(1));
         assert_eq!(no_restore.training_overrides.max_iters, Some(4));
         assert_eq!(no_restore.training_overrides.max_eval_batches, Some(1));
@@ -4160,11 +4196,11 @@ mod tests {
             "12D3KooWCPbD9DgsaDHtPC6cC6DsvLNL64rtfo8UsQCVMBuazuuP",
         )));
 
-        let error = register_live_head_with_edge(
+        let error = register_live_head_with_edge_options(
             &runtime,
             &edge_base_url,
             "session-1",
-            &test_experiment_entry(),
+            Some(&test_experiment_entry()),
             &announcement,
         )
         .expect_err("mirror failure should block live head registration");

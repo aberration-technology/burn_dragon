@@ -79,7 +79,9 @@ pub(crate) use crate::train::objective::{
     self_distillation_loss_from_logits, self_distillation_per_token_from_log_probs,
 };
 pub(crate) use crate::train::steps::LanguageTrainModel;
-pub(crate) use burn_dragon_core::{DragonConfig, DragonModel, LanguagePipelineState, ModelState};
+pub(crate) use burn_dragon_core::{
+    DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState, ModelState,
+};
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;
 pub(crate) use burn_dragon_train::train::metrics::{
     DeviceMetric, LanguageModelOutput, LanguageModelTrainItem, LossValue, MetricSinkEntry,
@@ -101,6 +103,6 @@ pub(crate) use burn_dragon_train::train::runtime::{
 pub(crate) use burn_dragon_train::{
     GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec, LearningRateScheduleConfig, ModelSpec,
     OptimizerConfig, OptimizerKind, OptimizerScheduleMode, OptimizerSpec, ParallelConfig,
-    ParallelSpec, ParallelismKind, SequenceKernelConfig, StateAxisSpec, StateLayout,
-    StateTensorSpec, WgpuRuntimeConfig,
+    ParallelSpec, ParallelismKind, ReservoirInitializationSpec, SequenceKernelConfig,
+    StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
 };

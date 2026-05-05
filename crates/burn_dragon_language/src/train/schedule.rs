@@ -2052,7 +2052,7 @@ mod tests {
 
         let training = objective_training_hparams(objective.clone());
         let model_config = tiny_model_config();
-        let devices = vec![primary_device.clone()];
+        let devices = vec![primary_device];
         let env = TrainEnvironment {
             parallel_runtime: &parallel_runtime,
             parallel_config: &parallel_config,
@@ -2425,7 +2425,7 @@ mod tests {
 
         let training = tiny_training_hparams_with_epochs(4, None);
         let model_config = tiny_model_config();
-        let devices = vec![primary_device.clone()];
+        let devices = vec![primary_device];
         let env = TrainEnvironment {
             parallel_runtime: &parallel_runtime,
             parallel_config: &parallel_config,

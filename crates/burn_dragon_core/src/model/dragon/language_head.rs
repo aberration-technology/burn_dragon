@@ -63,7 +63,6 @@ impl<B: Backend> DragonModel<B> {
         }
         let shared_lowrank_encoder = HashSet::from([self.encoder.id, self.encoder_v.id]);
         let shared_lowrank_decoder = HashSet::from([self.decoder.id]);
-        let shared_lowrank_decay = HashSet::from([self.rwkv_time_decay.id]);
         let attention = Self::collect_param_ids_from_module(&self.attention);
         let mamba = Self::collect_optional_param_ids_from_module(self.mamba.as_ref());
         let mut residual_modules =
@@ -81,7 +80,6 @@ impl<B: Backend> DragonModel<B> {
             LanguageModuleLrScaleTarget::OutputHead => output_head,
             LanguageModuleLrScaleTarget::SharedLowrankEncoder => shared_lowrank_encoder,
             LanguageModuleLrScaleTarget::SharedLowrankDecoder => shared_lowrank_decoder,
-            LanguageModuleLrScaleTarget::SharedLowrankDecay => shared_lowrank_decay,
             LanguageModuleLrScaleTarget::Attention => attention,
             LanguageModuleLrScaleTarget::Mamba => mamba,
             LanguageModuleLrScaleTarget::ResidualModules => residual_modules,
@@ -93,7 +91,6 @@ impl<B: Backend> DragonModel<B> {
                     .chain(output_head)
                     .chain(shared_lowrank_encoder)
                     .chain(shared_lowrank_decoder)
-                    .chain(shared_lowrank_decay)
                     .chain(attention)
                     .chain(mamba)
                     .chain(residual_modules)
@@ -177,30 +174,6 @@ impl<B: Backend> DragonModel<B> {
             return source;
         }
         source.mul_scalar(fresh_rms / source_rms).detach()
-    }
-
-    fn reset_top_layers_2d(
-        source: Tensor<B, 2>,
-        fresh: Tensor<B, 2>,
-        top_layers: usize,
-    ) -> Tensor<B, 2> {
-        let [layers, width] = source.shape().dims();
-        let reset = top_layers.min(layers);
-        let keep = layers.saturating_sub(reset);
-        if keep == layers {
-            return source;
-        }
-        if keep == 0 {
-            return fresh;
-        }
-        Tensor::cat(
-            vec![
-                source.slice([0..keep, 0..width]),
-                fresh.slice([keep..layers, 0..width]),
-            ],
-            0,
-        )
-        .detach()
     }
 
     fn reset_top_layers_3d(
@@ -330,10 +303,6 @@ impl<B: Backend> DragonModel<B> {
         let mut adapted = self.clone();
 
         if match_fresh_rms {
-            adapted.rwkv_time_decay = Param::from_tensor(Self::match_fresh_rms_tensor(
-                adapted.rwkv_time_decay.val(),
-                fresh.rwkv_time_decay.val(),
-            ));
             adapted.encoder = Param::from_tensor(Self::match_fresh_rms_tensor(
                 adapted.encoder.val(),
                 fresh.encoder.val(),
@@ -355,11 +324,6 @@ impl<B: Backend> DragonModel<B> {
         }
 
         if let Some(alpha) = backbone_blend_alpha {
-            adapted.rwkv_time_decay = Param::from_tensor(Self::blend_tensor(
-                adapted.rwkv_time_decay.val(),
-                fresh.rwkv_time_decay.val(),
-                alpha,
-            ));
             adapted.encoder = Param::from_tensor(Self::blend_tensor(
                 adapted.encoder.val(),
                 fresh.encoder.val(),
@@ -384,11 +348,6 @@ impl<B: Backend> DragonModel<B> {
         }
 
         if let Some(top_layers) = fresh_top_layers {
-            adapted.rwkv_time_decay = Param::from_tensor(Self::reset_top_layers_2d(
-                adapted.rwkv_time_decay.val(),
-                fresh.rwkv_time_decay.val(),
-                top_layers,
-            ));
             adapted.encoder = Param::from_tensor(Self::reset_top_layers_3d(
                 adapted.encoder.val(),
                 fresh.encoder.val(),

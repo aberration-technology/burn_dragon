@@ -3,7 +3,8 @@ use std::fmt;
 use burn::module::{Content, ModuleDisplay, ModuleDisplayDefault};
 pub use burn_dragon_core::{
     DragonFiringTargetKind, DragonInitializationKind, DragonNeuronGainKind,
-    DragonResidualScalingKind, DragonTopologyPriorKind, SequenceKernelConfig,
+    DragonReservoirInitializationConfig, DragonResidualScalingKind, DragonTopologyPriorKind,
+    SequenceKernelConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -306,7 +307,7 @@ impl Default for ParallelConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ModelSpec {
     pub arch: String,
     pub n_embd: usize,
@@ -326,6 +327,27 @@ pub struct ModelSpec {
     pub dragon_topology_prior_kind: DragonTopologyPriorKind,
     #[serde(default)]
     pub dragon_firing_target_kind: DragonFiringTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dragon_reservoir_initialization: Option<ReservoirInitializationSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ReservoirInitializationSpec {
+    pub seed: u64,
+    pub density: f64,
+    pub encoder_value_scale: f64,
+    pub decoder_scale: f64,
+}
+
+impl From<&DragonReservoirInitializationConfig> for ReservoirInitializationSpec {
+    fn from(config: &DragonReservoirInitializationConfig) -> Self {
+        Self {
+            seed: config.seed,
+            density: config.density,
+            encoder_value_scale: config.encoder_value_scale,
+            decoder_scale: config.decoder_scale,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

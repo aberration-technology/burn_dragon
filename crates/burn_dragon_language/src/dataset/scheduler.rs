@@ -1181,7 +1181,7 @@ mod streaming_tests {
                 let input_row = &inputs[row * dataset.block_size..(row + 1) * dataset.block_size];
                 let target_row = &targets[row * dataset.block_size..(row + 1) * dataset.block_size];
                 let bucket = input_row[0] / 100;
-                assert!(bucket >= 1 && bucket <= 3);
+                assert!((1..=3).contains(&bucket));
                 assert!(input_row.iter().all(|value| *value / 100 == bucket));
                 assert!(
                     target_row

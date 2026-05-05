@@ -109,7 +109,7 @@ where
         ContinualBackpropParamResetTargets {
             feature_tensors_3d: vec![param_ids.encoder, param_ids.encoder_v],
             row_feature_tensors_2d: vec![(param_ids.decoder, latent_per_head)],
-            feature_tensors_2d: vec![param_ids.rwkv_time_decay],
+            feature_tensors_2d: Vec::new(),
         }
     }
 

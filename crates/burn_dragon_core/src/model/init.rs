@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 const CONTROLLED_INIT_STD_CAP: f64 = 0.02;
 
+mod reservoir;
+
+pub use reservoir::DragonReservoirInitializationConfig;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DragonInitializationKind {
@@ -17,6 +21,7 @@ pub enum DragonInitializationKind {
     SimpleNormal,
     HeGlorot,
     HeadwiseSemiOrthogonal,
+    Reservoir,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -159,6 +164,8 @@ pub struct DragonInitializationConfig {
     pub firing_targets: DragonFiringTargetConfig,
     #[serde(default = "default_simple_normal_std")]
     pub simple_normal_std: f64,
+    #[serde(default)]
+    pub reservoir: DragonReservoirInitializationConfig,
 }
 
 impl Default for DragonInitializationConfig {
@@ -176,6 +183,7 @@ impl Default for DragonInitializationConfig {
             topology_prior: DragonTopologyPriorConfig::default(),
             firing_targets: DragonFiringTargetConfig::default(),
             simple_normal_std: default_simple_normal_std(),
+            reservoir: DragonReservoirInitializationConfig::default(),
         }
     }
 }
@@ -232,6 +240,7 @@ impl DragonInitializationConfig {
                 )?;
             }
         }
+        self.reservoir.validate()?;
         match self.firing_targets.kind {
             DragonFiringTargetKind::Disabled => {}
             DragonFiringTargetKind::GaussianEstimate => {
@@ -353,13 +362,14 @@ impl<B: AutodiffBackend> AutodiffModule<B> for DragonInitializationConfig {
 impl ModuleDisplayDefault for DragonInitializationConfig {
     fn content(&self, content: Content) -> Option<Content> {
         let summary = format!(
-            "kind={:?}, residual_scaling={:?}, neuron_gains={:?}, topology_prior={:?}, firing_targets={:?}, simple_normal_std={}",
+            "kind={:?}, residual_scaling={:?}, neuron_gains={:?}, topology_prior={:?}, firing_targets={:?}, simple_normal_std={}, reservoir={:?}",
             self.kind,
             self.residual_scaling.kind,
             self.neuron_gains.kind,
             self.topology_prior.kind,
             self.firing_targets.kind,
-            self.simple_normal_std
+            self.simple_normal_std,
+            self.reservoir
         );
         content
             .set_top_level_type("DragonInitializationConfig")
@@ -444,6 +454,17 @@ impl<'a> DragonInitializer<'a> {
         residual_depth: usize,
         device: &B::Device,
     ) -> Tensor<B, 3> {
+        if matches!(self.config.kind, DragonInitializationKind::Reservoir) {
+            return self.reservoir_headwise_projection_tensor(
+                role,
+                heads,
+                fan_in,
+                fan_out,
+                residual_depth,
+                device,
+            );
+        }
+
         let tensor = match self.config.kind {
             DragonInitializationKind::HeadwiseSemiOrthogonal => {
                 let target_std = self.projection_std(role, fan_in, fan_out, residual_depth);
@@ -477,6 +498,12 @@ impl<'a> DragonInitializer<'a> {
         residual_depth: usize,
         device: &B::Device,
     ) -> Tensor<B, 2> {
+        if matches!(self.config.kind, DragonInitializationKind::Reservoir)
+            && !matches!(role, DragonProjectionRole::LmHead)
+        {
+            return self.reservoir_projection_tensor(role, fan_in, fan_out, residual_depth, device);
+        }
+
         let tensor = match self.config.kind {
             DragonInitializationKind::HeadwiseSemiOrthogonal
                 if matches!(role, DragonProjectionRole::Decoder) =>
@@ -546,9 +573,8 @@ impl<'a> DragonInitializer<'a> {
     fn embedding_std(&self, width: usize) -> f64 {
         match self.config.kind {
             DragonInitializationKind::NearCritical
-            | DragonInitializationKind::HeadwiseSemiOrthogonal => {
-                near_critical_embedding_std(width)
-            }
+            | DragonInitializationKind::HeadwiseSemiOrthogonal
+            | DragonInitializationKind::Reservoir => near_critical_embedding_std(width),
             DragonInitializationKind::SimpleNormal => self.config.simple_normal_std,
             DragonInitializationKind::HeGlorot => glorot_std(width.max(1), width.max(1)),
         }
@@ -573,9 +599,8 @@ impl<'a> DragonInitializer<'a> {
     ) -> f64 {
         match self.config.kind {
             DragonInitializationKind::NearCritical
-            | DragonInitializationKind::HeadwiseSemiOrthogonal => {
-                near_critical_projection_std(fan_in, fan_out)
-            }
+            | DragonInitializationKind::HeadwiseSemiOrthogonal
+            | DragonInitializationKind::Reservoir => near_critical_projection_std(fan_in, fan_out),
             DragonInitializationKind::SimpleNormal => self.config.simple_normal_std,
             DragonInitializationKind::HeGlorot => match role {
                 DragonProjectionRole::Encoder | DragonProjectionRole::EncoderValue => {
@@ -599,6 +624,7 @@ impl<'a> DragonInitializer<'a> {
                     self.config.kind,
                     DragonInitializationKind::NearCritical
                         | DragonInitializationKind::HeadwiseSemiOrthogonal
+                        | DragonInitializationKind::Reservoir
                 ) {
                     1.0 / (residual_depth.max(1) as f64).sqrt()
                 } else {
@@ -1400,6 +1426,330 @@ mod tests {
         assert!(same_mean > cross_mean);
         assert!(bridge_rows_are_uniform(&values, 16, 8, 4));
         assert!((matrix_rms(&values) - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn reservoir_initialization_round_trips_through_serde() {
+        let config = DragonInitializationConfig {
+            kind: DragonInitializationKind::Reservoir,
+            reservoir: DragonReservoirInitializationConfig {
+                seed: 1337,
+                density: 0.12,
+                encoder_value_scale: 0.5,
+                decoder_scale: 1.25,
+            },
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_string(&config).expect("serialize");
+        let decoded: DragonInitializationConfig =
+            serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.kind, DragonInitializationKind::Reservoir);
+        assert_eq!(decoded.reservoir, config.reservoir);
+    }
+
+    #[test]
+    fn initialization_config_deserializes_without_reservoir_section() {
+        let config: DragonInitializationConfig =
+            serde_json::from_str(r#"{"kind":"simple_normal","simple_normal_std":0.01}"#)
+                .expect("deserialize legacy initialization config");
+        assert_eq!(config.kind, DragonInitializationKind::SimpleNormal);
+        assert_eq!(
+            config.reservoir,
+            DragonReservoirInitializationConfig::default()
+        );
+    }
+
+    #[test]
+    fn initialization_config_rejects_invalid_reservoir_values() {
+        let mut config = DragonInitializationConfig {
+            kind: DragonInitializationKind::Reservoir,
+            ..Default::default()
+        };
+        config.reservoir.density = 0.0;
+        assert!(
+            config
+                .validate()
+                .expect_err("expected invalid density")
+                .contains("reservoir.density")
+        );
+
+        config.reservoir = DragonReservoirInitializationConfig {
+            encoder_value_scale: 0.0,
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("expected invalid encoder value scale")
+                .contains("encoder_value_scale")
+        );
+    }
+
+    #[test]
+    fn reservoir_headwise_projection_is_deterministic_and_role_specific() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = reservoir_test_config(0.08, DragonTopologyPriorConfig::default());
+        let initializer = DragonInitializer::new(&config);
+
+        let first = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::Encoder,
+            2,
+            32,
+            64,
+            4,
+            &device,
+        );
+        let second = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::Encoder,
+            2,
+            32,
+            64,
+            4,
+            &device,
+        );
+        let value_projection = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::EncoderValue,
+            2,
+            32,
+            64,
+            4,
+            &device,
+        );
+
+        let first_values = tensor3_values(first);
+        assert_eq!(first_values, tensor3_values(second));
+        assert_ne!(first_values, tensor3_values(value_projection));
+    }
+
+    #[test]
+    fn reservoir_projection_shapes_and_latent_coverage_are_valid() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = reservoir_test_config(0.01, DragonTopologyPriorConfig::default());
+        let initializer = DragonInitializer::new(&config);
+
+        let encoder = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::Encoder,
+            2,
+            24,
+            48,
+            4,
+            &device,
+        );
+        assert_eq!(encoder.shape().dims(), [2, 24, 48]);
+        let encoder_values = tensor3_values(encoder);
+        assert!(headwise_columns_are_covered(&encoder_values, 2, 24, 48));
+
+        let decoder = initializer.projection_tensor::<TestBackend>(
+            DragonProjectionRole::Decoder,
+            96,
+            24,
+            4,
+            &device,
+        );
+        assert_eq!(decoder.shape().dims(), [96, 24]);
+        let decoder_values = tensor2_values(decoder);
+        assert!(rows_are_covered(&decoder_values, 96, 24));
+    }
+
+    #[test]
+    fn reservoir_projection_density_and_rms_track_config() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = reservoir_test_config(0.08, DragonTopologyPriorConfig::default());
+        let initializer = DragonInitializer::new(&config);
+        let tensor = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::Encoder,
+            1,
+            512,
+            512,
+            8,
+            &device,
+        );
+        let values = tensor3_values(tensor);
+
+        let density = nonzero_density(&values);
+        assert!((density - 0.08).abs() < 0.02, "density={density}");
+
+        let target_rms = initializer.projection_std(DragonProjectionRole::Encoder, 512, 512, 8);
+        let max_error = headwise_column_rms_max_error(&values, 1, 512, 512, target_rms as f32);
+        assert!(max_error < 1.0e-5, "max_error={max_error}");
+    }
+
+    #[test]
+    fn reservoir_lm_head_uses_existing_dense_initializer_path() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = reservoir_test_config(0.01, DragonTopologyPriorConfig::default());
+        let initializer = DragonInitializer::new(&config);
+        let tensor = initializer.projection_tensor::<TestBackend>(
+            DragonProjectionRole::LmHead,
+            64,
+            128,
+            4,
+            &device,
+        );
+        let values = tensor2_values(tensor);
+        assert!(nonzero_density(&values) > 0.95);
+    }
+
+    #[test]
+    fn reservoir_modular_bridges_biases_same_community_density() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = reservoir_test_config(
+            0.35,
+            DragonTopologyPriorConfig {
+                kind: DragonTopologyPriorKind::ModularBridges,
+                community_count: 4,
+                bridge_fraction: 0.1,
+                intra_community_gain: 1.5,
+                inter_community_gain: 0.5,
+                bridge_gain: 1.0,
+            },
+        );
+        let initializer = DragonInitializer::new(&config);
+        let tensor = initializer.headwise_projection_tensor::<TestBackend>(
+            DragonProjectionRole::Encoder,
+            1,
+            192,
+            192,
+            4,
+            &device,
+        );
+        let values = tensor3_values(tensor);
+        let (same_density, cross_density) = community_densities(
+            &values,
+            192,
+            192,
+            4,
+            (192.0_f64 * 0.1).round() as usize,
+            false,
+        );
+        assert!(
+            same_density > cross_density * 3.0,
+            "same_density={same_density} cross_density={cross_density}"
+        );
+    }
+
+    fn reservoir_test_config(
+        density: f64,
+        topology_prior: DragonTopologyPriorConfig,
+    ) -> DragonInitializationConfig {
+        DragonInitializationConfig {
+            kind: DragonInitializationKind::Reservoir,
+            neuron_gains: DragonNeuronGainConfig {
+                kind: DragonNeuronGainKind::Iid,
+                ..Default::default()
+            },
+            topology_prior,
+            reservoir: DragonReservoirInitializationConfig {
+                seed: 42,
+                density,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn tensor2_values(tensor: Tensor<TestBackend, 2>) -> Vec<f32> {
+        tensor
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("values")
+    }
+
+    fn tensor3_values(tensor: Tensor<TestBackend, 3>) -> Vec<f32> {
+        tensor
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("values")
+    }
+
+    fn nonzero_density(values: &[f32]) -> f64 {
+        values.iter().filter(|value| **value != 0.0).count() as f64 / values.len().max(1) as f64
+    }
+
+    fn headwise_columns_are_covered(
+        values: &[f32],
+        heads: usize,
+        fan_in: usize,
+        fan_out: usize,
+    ) -> bool {
+        for head in 0..heads {
+            for col in 0..fan_out {
+                if !(0..fan_in).any(|row| {
+                    let idx = head * fan_in * fan_out + row * fan_out + col;
+                    values[idx] != 0.0
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn rows_are_covered(values: &[f32], rows: usize, cols: usize) -> bool {
+        (0..rows).all(|row| (0..cols).any(|col| values[row * cols + col] != 0.0))
+    }
+
+    fn headwise_column_rms_max_error(
+        values: &[f32],
+        heads: usize,
+        fan_in: usize,
+        fan_out: usize,
+        target_rms: f32,
+    ) -> f32 {
+        let mut max_error = 0.0f32;
+        for head in 0..heads {
+            for col in 0..fan_out {
+                let mut sum_sq = 0.0f32;
+                for row in 0..fan_in {
+                    let idx = head * fan_in * fan_out + row * fan_out + col;
+                    let value = values[idx];
+                    sum_sq += value * value;
+                }
+                let rms = (sum_sq / fan_in.max(1) as f32).sqrt();
+                max_error = max_error.max((rms - target_rms).abs());
+            }
+        }
+        max_error
+    }
+
+    fn community_densities(
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+        community_count: usize,
+        bridge_count: usize,
+        bridge_on_rows: bool,
+    ) -> (f64, f64) {
+        let mut same_nonzero = 0usize;
+        let mut same_count = 0usize;
+        let mut cross_nonzero = 0usize;
+        let mut cross_count = 0usize;
+        for row in 0..rows {
+            let row_community = (row * community_count) / rows.max(1);
+            for col in 0..cols {
+                let latent_index = if bridge_on_rows { row } else { col };
+                let latent_size = if bridge_on_rows { rows } else { cols };
+                if latent_index >= latent_size.saturating_sub(bridge_count) {
+                    continue;
+                }
+                let col_community = (col * community_count) / cols.max(1);
+                let is_nonzero = values[row * cols + col] != 0.0;
+                if row_community == col_community {
+                    same_count += 1;
+                    same_nonzero += usize::from(is_nonzero);
+                } else {
+                    cross_count += 1;
+                    cross_nonzero += usize::from(is_nonzero);
+                }
+            }
+        }
+        (
+            same_nonzero as f64 / same_count.max(1) as f64,
+            cross_nonzero as f64 / cross_count.max(1) as f64,
+        )
     }
 
     fn headwise_column_norm_cv(values: &[f32], heads: usize, fan_in: usize, fan_out: usize) -> f32 {

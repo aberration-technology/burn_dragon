@@ -110,7 +110,6 @@ impl GradientScaleSchedule {
         let param_scale_rules =
             Self::build_param_scale_rules(model, &training.module_lr_scales, total_steps);
         let shared_lowrank_param_ids = vec![
-            model.shared_lowrank_param_ids().rwkv_time_decay,
             model.shared_lowrank_param_ids().encoder,
             model.shared_lowrank_param_ids().encoder_v,
             model.shared_lowrank_param_ids().decoder,
@@ -504,11 +503,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     fn peek_step_state_for_test(&self) -> Option<ModelState<B>> {
         lock_streaming_state_store()
             .get(&(self.streaming_runtime_key, TypeId::of::<B>()))
-            .and_then(|state| {
-                state
-                    .downcast_ref::<ModelState<B>>()
-                    .map(|state| state.clone())
-            })
+            .and_then(|state| state.downcast_ref::<ModelState<B>>().cloned())
     }
 
     fn slice_tokens(

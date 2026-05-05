@@ -17,10 +17,10 @@ pub use core::{
     ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec, ParallelTensorConfig,
     ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy, PipelineCommunicationKind,
     PipelinePartitionKind, PipelineScheduleKind, PipelineSharedWeightSyncKind,
-    PipelineTransportDtype, SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec,
-    TensorParallelAxis, TensorParallelPartitionKind, VisionTeacherVariant, WgpuBackend,
-    WgpuGenerationExecutor, WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig,
-    WgpuStartupAutotuneConfig, WgpuTrainingConfig,
+    PipelineTransportDtype, ReservoirInitializationSpec, SequenceKernelConfig, StateAxisSpec,
+    StateLayout, StateTensorSpec, TensorParallelAxis, TensorParallelPartitionKind,
+    VisionTeacherVariant, WgpuBackend, WgpuGenerationExecutor, WgpuInferenceConfig,
+    WgpuMemoryConfig, WgpuRuntimeConfig, WgpuStartupAutotuneConfig, WgpuTrainingConfig,
 };
 pub use optimizer::{
     LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,

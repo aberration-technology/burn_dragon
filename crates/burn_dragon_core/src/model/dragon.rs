@@ -118,7 +118,6 @@ pub struct DragonModel<B: Backend> {
     attention_residual_shared: Option<AttentionResidual<B>>,
     block_attention_residual_first_layer: usize,
     block_attention_residual_shared: Option<BlockAttentionResidual<B>>,
-    rwkv_time_decay: Param<Tensor<B, 2>>,
     encoder: Param<Tensor<B, 3>>,
     encoder_v: Param<Tensor<B, 3>>,
     decoder: Param<Tensor<B, 2>>,
@@ -170,7 +169,6 @@ pub enum LanguageModuleLrScaleTarget {
     OutputHead,
     SharedLowrankEncoder,
     SharedLowrankDecoder,
-    SharedLowrankDecay,
     Attention,
     Mamba,
     ResidualModules,
@@ -300,11 +298,6 @@ impl<B: Backend> DragonModel<B> {
             device,
             &config.fused_kernels,
         );
-        let rwkv_time_decay = Param::from_tensor(Self::init_rwkv_time_decay(
-            config.n_head,
-            latent_per_head,
-            device,
-        ));
         let residual_depth = config.n_layer.max(1) * config.rollout_fast_steps_per_slow_step.max(1);
         let activation_thresholds =
             initializer.activation_thresholds(config.n_embd, latent_per_head, residual_depth);
@@ -463,7 +456,6 @@ impl<B: Backend> DragonModel<B> {
             attention_residual_shared,
             block_attention_residual_first_layer,
             block_attention_residual_shared,
-            rwkv_time_decay,
             encoder,
             encoder_v,
             decoder,
@@ -474,33 +466,6 @@ impl<B: Backend> DragonModel<B> {
             nca_special_lm_head,
             nca_factorized_head_tables,
         }
-    }
-
-    fn init_rwkv_time_decay(
-        n_head: usize,
-        latent_per_head: usize,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
-        let mut values = Vec::with_capacity(n_head * latent_per_head);
-        for head_idx in 0..n_head {
-            let head_ratio = if n_head <= 1 {
-                0.0
-            } else {
-                head_idx as f32 / (n_head - 1) as f32
-            };
-            for latent_idx in 0..latent_per_head {
-                let latent_ratio = if latent_per_head <= 1 {
-                    0.0
-                } else {
-                    latent_idx as f32 / (latent_per_head - 1) as f32
-                };
-                let target_decay =
-                    (0.995 - 0.22 * latent_ratio - 0.03 * head_ratio).clamp(0.55, 0.995);
-                let raw = (target_decay / (1.0 - target_decay)).ln();
-                values.push(raw);
-            }
-        }
-        Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([n_head, latent_per_head])
     }
 
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
@@ -1615,5 +1580,52 @@ impl<B: Backend> DragonModel<B> {
 
     pub fn summary_memory_write_trigger_token_ids(&self) -> Option<&[u32]> {
         self.summary_memory.write_trigger_token_ids.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::init::{
+        DragonInitializationConfig, DragonInitializationKind, DragonReservoirInitializationConfig,
+    };
+    use burn_ndarray::NdArray;
+
+    type TestBackend = NdArray<f32>;
+
+    #[test]
+    fn tiny_reservoir_model_constructs_and_runs_forward() {
+        let device = <TestBackend as Backend>::Device::default();
+        let config = DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            initialization: DragonInitializationConfig {
+                kind: DragonInitializationKind::Reservoir,
+                reservoir: DragonReservoirInitializationConfig {
+                    seed: 7,
+                    density: 0.2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+        let logits = model.forward(tokens);
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        let values = logits
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("logits");
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 }

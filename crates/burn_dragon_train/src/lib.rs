@@ -35,11 +35,11 @@ pub mod api {
             ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec,
             ParallelTensorConfig, ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy,
             PipelineCommunicationKind, PipelinePartitionKind, PipelineScheduleKind,
-            PipelineSharedWeightSyncKind, PipelineTransportDtype, RunLayoutConfig,
-            SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec, TensorParallelAxis,
-            TensorParallelPartitionKind, VisionTeacherVariant, WgpuBackend, WgpuGenerationExecutor,
-            WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig, WgpuStartupAutotuneConfig,
-            WgpuTrainingConfig,
+            PipelineSharedWeightSyncKind, PipelineTransportDtype, ReservoirInitializationSpec,
+            RunLayoutConfig, SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec,
+            TensorParallelAxis, TensorParallelPartitionKind, VisionTeacherVariant, WgpuBackend,
+            WgpuGenerationExecutor, WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig,
+            WgpuStartupAutotuneConfig, WgpuTrainingConfig,
         };
         #[cfg(feature = "train")]
         pub use crate::config::{
@@ -81,10 +81,10 @@ pub use config::{
     ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec, ParallelTensorConfig,
     ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy, PipelineCommunicationKind,
     PipelinePartitionKind, PipelineScheduleKind, PipelineSharedWeightSyncKind,
-    PipelineTransportDtype, RunLayoutConfig, SequenceKernelConfig, StateAxisSpec, StateLayout,
-    StateTensorSpec, TensorParallelAxis, TensorParallelPartitionKind, VisionTeacherVariant,
-    WgpuBackend, WgpuGenerationExecutor, WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig,
-    WgpuStartupAutotuneConfig, WgpuTrainingConfig,
+    PipelineTransportDtype, ReservoirInitializationSpec, RunLayoutConfig, SequenceKernelConfig,
+    StateAxisSpec, StateLayout, StateTensorSpec, TensorParallelAxis, TensorParallelPartitionKind,
+    VisionTeacherVariant, WgpuBackend, WgpuGenerationExecutor, WgpuInferenceConfig,
+    WgpuMemoryConfig, WgpuRuntimeConfig, WgpuStartupAutotuneConfig, WgpuTrainingConfig,
 };
 #[cfg(feature = "train")]
 pub use config::{

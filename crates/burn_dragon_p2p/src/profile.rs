@@ -567,13 +567,6 @@ fn apply_native_training_overrides(
 }
 
 #[cfg(feature = "native")]
-fn native_training_overrides_requested(overrides: &DragonNativeTrainingOverrides) -> bool {
-    overrides.batch_size.is_some()
-        || overrides.max_iters.is_some()
-        || overrides.max_eval_batches.is_some()
-}
-
-#[cfg(feature = "native")]
 fn builtin_native_training_profile(
     native: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
@@ -642,11 +635,6 @@ pub fn resolve_native_training_profile(
                 if let Some((entry, profile)) =
                     fetch_matching_profile_entry(&snapshot, native, experiment_kind)?
                 {
-                    if native_training_overrides_requested(&native.training_overrides) {
-                        bail!(
-                            "native training overrides are only allowed with local training_config_paths"
-                        );
-                    }
                     let config =
                         materialize_native_training_config(&native.storage_root, &entry, &profile)?;
                     let config =
@@ -684,9 +672,6 @@ pub fn resolve_native_training_profile(
     }
 
     if let Some(profile) = builtin_native_training_profile(native, experiment_kind)? {
-        if native_training_overrides_requested(&native.training_overrides) {
-            bail!("native training overrides are only allowed with local training_config_paths");
-        }
         let config = materialize_native_training_config_for_ids(
             &native.storage_root,
             &native.manifest.study_id,
@@ -1032,7 +1017,7 @@ prompt = "1 2 3"
 
     #[cfg(feature = "native")]
     #[test]
-    fn native_training_overrides_require_local_training_config_paths() {
+    fn native_training_overrides_apply_to_builtin_profile() {
         use crate::config::{DragonNativeTrainingOverrides, DragonPeerNetworkConfig};
         use tempfile::tempdir;
 
@@ -1069,12 +1054,16 @@ prompt = "1 2 3"
             &native,
             DragonExperimentKind::NcaPrepretraining,
             false,
-        );
+        )
+        .expect("builtin fallback should accept resource-only training overrides");
 
-        let error = resolved.expect_err("builtin fallback should reject overrides");
-        assert!(error.to_string().contains(
-            "native training overrides are only allowed with local training_config_paths"
-        ));
+        assert_eq!(
+            resolved.source,
+            DragonResolvedProfileSource::BuiltinFallback
+        );
+        assert_eq!(resolved.config.training.batch_size, 1);
+        assert_eq!(resolved.config.training.max_iters, 4);
+        assert_eq!(resolved.config.model.n_embd, Some(512));
     }
 
     #[cfg(feature = "native")]

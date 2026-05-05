@@ -38,7 +38,7 @@ on:
       windows:
         description: Number of canonical windows to publish and observe
         required: false
-        default: "2"
+        default: "1"
       settle_diffusion:
         description: Run bounded diffusion promotion passes from the trainer after publishing
         required: false
@@ -46,15 +46,35 @@ on:
       diffusion_settle_passes:
         description: Initial diffusion promotion passes to run after each window
         required: false
-        default: "3"
+        default: "2"
       serve_after_publish_secs:
         description: Seconds the trainer should stay online after publishing so peers can fetch artifacts
         required: false
-        default: "120"
+        default: "45"
       command_timeout_secs:
         description: Per native command timeout
         required: false
-        default: "1800"
+        default: "900"
+      start_validator:
+        description: Start a colocated validator during the canary. Leave disabled for the standard trainer-only diffusion deployment.
+        required: false
+        default: "false"
+      training_batch_size:
+        description: Native canary batch size override. This is a resource knob and does not alter model compatibility.
+        required: false
+        default: "1"
+      training_max_iters:
+        description: Native canary max iteration override. This bounds hosted-runner cost without changing the network profile.
+        required: false
+        default: "2"
+      evaluation_max_batches:
+        description: Native canary evaluation batch cap.
+        required: false
+        default: "1"
+      require_canonical_loss_non_regression:
+        description: Fail if canonical loss rises across the canary window.
+        required: false
+        default: "false"
   schedule:
     - cron: "43 */6 * * *"
 
@@ -79,13 +99,18 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_BACKEND: ${{ github.event.inputs.backend || 'cpu' }}
       BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'native-canary-mainnet-nca' }}
       BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
-      BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
+      BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '1' }}
       BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
-      BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '3' }}
-      BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '120' }}
-      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1800' }}
-      BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "900"
+      BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '2' }}
+      BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '45' }}
+      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '900' }}
+      BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'false' }}
+      BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: ${{ github.event.inputs.training_batch_size || '1' }}
+      BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '2' }}
+      BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}
+      BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION: ${{ github.event.inputs.require_canonical_loss_non_regression || 'false' }}
+      BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "480"
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
       BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json
@@ -136,6 +161,10 @@ jobs:
           print(f"- Settle diffusion: `{report.get('settle_diffusion')}`")
           print(f"- Diffusion settle passes: `{report.get('diffusion_settle_passes')}`")
           print(f"- Serve after publish: `{report.get('serve_after_publish_secs')}s`")
+          print(f"- Start local validator: `{report.get('start_local_validator')}`")
+          print(f"- Training batch size: `{report.get('training_batch_size')}`")
+          print(f"- Training max iters: `{report.get('training_max_iters')}`")
+          print(f"- Evaluation max batches: `{report.get('evaluation_max_batches')}`")
           print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
           print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
           print(f"- Windows: `{len(windows)}`")

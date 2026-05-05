@@ -77,7 +77,12 @@ def main() -> None:
         for step in deploy_workflow["jobs"]["deploy"]["steps"]
         if step.get("id") == "live_native_training_canary"
     )
-    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "2"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "1"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR"] == "false"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"] == "2"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES"] == "1"
+    assert canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS"] == "60"
     assert (
         canary_step["env"]["BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID"]
         == "${{ env.NATIVE_CANARY_PRINCIPAL_ID }}"

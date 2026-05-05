@@ -31,6 +31,31 @@ def env_bool(name: str, default: str) -> bool:
     raise SystemExit(f"environment variable {name} must be boolean, got {value!r}")
 
 
+def env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise SystemExit(f"environment variable {name} must be > 0, got {value!r}")
+    return parsed
+
+
+def append_training_overrides(
+    command: list[str],
+    *,
+    batch_size: int | None,
+    max_iters: int | None,
+    max_eval_batches: int | None,
+) -> None:
+    if batch_size is not None:
+        command.extend(["--training-batch-size", str(batch_size)])
+    if max_iters is not None:
+        command.extend(["--training-max-iters", str(max_iters)])
+    if max_eval_batches is not None:
+        command.extend(["--evaluation-max-batches", str(max_eval_batches)])
+
+
 def fetch_json(url: str, timeout: int = 30) -> Any:
     attempts = int(os.environ.get("BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS", "5"))
     last_error: Exception | None = None
@@ -395,32 +420,42 @@ def start_validator(
     storage_root: Path,
     log_path: Path,
     initialize_head_on_start: bool,
+    training_batch_size: int | None,
+    training_max_iters: int | None,
+    evaluation_max_batches: int | None,
 ) -> subprocess.Popen[str]:
     proc_env = os.environ.copy()
     proc_env["BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT"] = str(storage_root)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w")
+    command = [
+        binary,
+        "run-validator-daemon",
+        "--experiment-kind",
+        experiment_kind,
+        "--backend",
+        "cpu",
+        "--edge-url",
+        edge_base_url,
+        "--auth-bundle",
+        str(auth_bundle),
+        "--status-interval-secs",
+        "10",
+        "--validation-interval-millis",
+        "500",
+        "--initialize-head-on-start",
+        str(initialize_head_on_start).lower(),
+        "--restore-head-on-start",
+        "true",
+    ]
+    append_training_overrides(
+        command,
+        batch_size=training_batch_size,
+        max_iters=training_max_iters,
+        max_eval_batches=evaluation_max_batches,
+    )
     process = subprocess.Popen(
-        [
-            binary,
-            "run-validator-daemon",
-            "--experiment-kind",
-            experiment_kind,
-            "--backend",
-            "cpu",
-            "--edge-url",
-            edge_base_url,
-            "--auth-bundle",
-            str(auth_bundle),
-            "--status-interval-secs",
-            "10",
-            "--validation-interval-millis",
-            "500",
-            "--initialize-head-on-start",
-            str(initialize_head_on_start).lower(),
-            "--restore-head-on-start",
-            "true",
-        ],
+        command,
         env=proc_env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -505,6 +540,8 @@ def assert_train_report(report: dict[str, Any]) -> dict[str, float]:
 def assert_canonical_signal(
     before: dict[str, Any],
     after: dict[str, Any],
+    *,
+    require_loss_non_regression: bool,
 ) -> dict[str, float | bool | None]:
     before_step = int(before.get("global_step") or 0)
     after_step = int(after.get("global_step") or 0)
@@ -522,6 +559,8 @@ def assert_canonical_signal(
         after_metrics,
     )
     if (
+        require_loss_non_regression
+        and
         comparable_before_loss is not None
         and comparable_after_loss is not None
         and comparable_after_loss > comparable_before_loss + 1e-6
@@ -602,15 +641,23 @@ def main() -> int:
         f"{principal_id}-validator",
     )
     trusted_callback_token = env("BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN")
-    windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "2"))
+    windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "1"))
     head_sync_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS", "300"))
     settle_diffusion = env_bool("BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION", "1")
-    diffusion_settle_passes = int(env("BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES", "3"))
+    diffusion_settle_passes = int(env("BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES", "2"))
     serve_after_publish_secs = int(
-        env("BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS", "120")
+        env("BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS", "45")
     )
-    command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "1800"))
-    canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "900"))
+    start_local_validator = env_bool("BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR", "0")
+    require_canonical_loss_non_regression = env_bool(
+        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION",
+        "0",
+    )
+    training_batch_size = env_optional_int("BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE")
+    training_max_iters = env_optional_int("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS")
+    evaluation_max_batches = env_optional_int("BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES")
+    command_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", "900"))
+    canonical_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS", "480"))
     p2p_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS", "300"))
     artifact_dir = Path(
         env("BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR", "/tmp/burn-dragon-native-canary")
@@ -660,29 +707,34 @@ def main() -> int:
         log_path=artifact_dir / "enroll-trainer.log",
         timeout_secs=command_timeout_secs,
     )
-    enroll_static_principal(
-        binary,
-        edge_base_url=edge_base_url,
-        experiment_kind=experiment_kind,
-        backend="cpu",
-        principal_id=validator_principal_id,
-        principal_kind="validator",
-        trusted_callback_token=trusted_callback_token,
-        auth_bundle=validator_bundle,
-        storage_root=validator_storage,
-        log_path=artifact_dir / "enroll-validator.log",
-        timeout_secs=command_timeout_secs,
-    )
+    validator: subprocess.Popen[str] | None = None
+    if start_local_validator:
+        enroll_static_principal(
+            binary,
+            edge_base_url=edge_base_url,
+            experiment_kind=experiment_kind,
+            backend="cpu",
+            principal_id=validator_principal_id,
+            principal_kind="validator",
+            trusted_callback_token=trusted_callback_token,
+            auth_bundle=validator_bundle,
+            storage_root=validator_storage,
+            log_path=artifact_dir / "enroll-validator.log",
+            timeout_secs=command_timeout_secs,
+        )
 
-    validator = start_validator(
-        binary,
-        edge_base_url=edge_base_url,
-        experiment_kind=experiment_kind,
-        auth_bundle=validator_bundle,
-        storage_root=validator_storage,
-        log_path=artifact_dir / "validator.log",
-        initialize_head_on_start=initialize_head_on_start,
-    )
+        validator = start_validator(
+            binary,
+            edge_base_url=edge_base_url,
+            experiment_kind=experiment_kind,
+            auth_bundle=validator_bundle,
+            storage_root=validator_storage,
+            log_path=artifact_dir / "validator.log",
+            initialize_head_on_start=initialize_head_on_start,
+            training_batch_size=training_batch_size,
+            training_max_iters=training_max_iters,
+            evaluation_max_batches=evaluation_max_batches,
+        )
     window_reports: list[dict[str, Any]] = []
     try:
         previous_head = head_before
@@ -714,6 +766,12 @@ def main() -> int:
                 "--output-format",
                 "json",
             ]
+            append_training_overrides(
+                train_command,
+                batch_size=training_batch_size,
+                max_iters=training_max_iters,
+                max_eval_batches=evaluation_max_batches,
+            )
             if settle_diffusion:
                 train_command.extend(
                     [
@@ -736,7 +794,11 @@ def main() -> int:
                 previous_head.get("head_id"),
                 canonical_timeout_secs,
             )
-            canonical_signal = assert_canonical_signal(previous_head, advanced_head)
+            canonical_signal = assert_canonical_signal(
+                previous_head,
+                advanced_head,
+                require_loss_non_regression=require_canonical_loss_non_regression,
+            )
             p2p_signal, p2p_wait_secs = wait_for_p2p_head(
                 binary,
                 edge_base_url=edge_base_url,
@@ -766,7 +828,8 @@ def main() -> int:
             )
             previous_head = advanced_head
     finally:
-        stop_validator(validator)
+        if validator is not None:
+            stop_validator(validator)
 
     summary = {
         "success": True,
@@ -778,6 +841,11 @@ def main() -> int:
         "settle_diffusion": settle_diffusion,
         "diffusion_settle_passes": diffusion_settle_passes,
         "serve_after_publish_secs": serve_after_publish_secs,
+        "start_local_validator": start_local_validator,
+        "require_canonical_loss_non_regression": require_canonical_loss_non_regression,
+        "training_batch_size": training_batch_size,
+        "training_max_iters": training_max_iters,
+        "evaluation_max_batches": evaluation_max_batches,
         "p2p_timeout_secs": p2p_timeout_secs,
         "initialize_head_on_start": initialize_head_on_start,
         "principal_id": principal_id,

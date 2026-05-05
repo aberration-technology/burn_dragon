@@ -24,12 +24,12 @@ def main() -> None:
         'uses: ./.github/workflows/live-browser-canary.yml',
         'environment: ${{ github.event.inputs.environment }}',
         'site_base_url: ${{ needs.build.outputs.site_base_url }}',
-        "edge_base_url: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
+        "edge_base_url: ${{ needs.build.outputs.edge_base_url }}",
         'principal_id: ${{ needs.build.outputs.canary_principal_id }}',
         'experiment_id: ${{ needs.build.outputs.selected_experiment_id }}',
         'secrets: inherit',
         'run: bash scripts/run_pages_predeploy_canary.sh',
-        "BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
+        "BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}",
         'BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR',
         'BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS',
         'name: burn-dragon-pages-predeploy-canary',
@@ -44,6 +44,8 @@ def main() -> None:
         'node scripts/live-browser-canary.mjs',
         'bash scripts/install_playwright_chromium.sh',
         'bash scripts/run_live_browser_canary.sh',
+        "BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
+        "edge_base_url: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
     ]
     for snippet in forbidden_snippets:
         assert snippet not in workflow_text, (

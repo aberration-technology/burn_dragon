@@ -204,5 +204,6 @@ jobs:
           gh workflow run .github/workflows/deploy-burn-dragon-p2p-aws.yml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${GITHUB_REF_NAME}" \
+            -f validated_sha="${GITHUB_SHA}" \
             -f environment=production \
             -f terraform_workspace=mainnet

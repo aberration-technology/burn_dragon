@@ -16,6 +16,11 @@ on:
         required: true
         default: mainnet
         type: string
+      validated_sha:
+        description: "Optional immutable burn_dragon commit SHA validated by CI for this deployment."
+        required: false
+        default: ""
+        type: string
       disaster_recovery_region:
         description: "Optional warm-disaster-recovery AWS region. Example: `us-west-2`. When set, Terraform enables cross-region artifact replication and, only when retained bootstrap storage is enabled, cross-region copies of retained bootstrap data snapshots into that region."
         required: false
@@ -146,6 +151,21 @@ jobs:
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.validated_sha != '' && github.event.inputs.validated_sha || github.sha }}
+
+      - name: verify validated sha is on main
+        if: ${{ github.event.inputs.validated_sha != '' }}
+        shell: bash
+        env:
+          VALIDATED_SHA: ${{ github.event.inputs.validated_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin main
+          if ! git merge-base --is-ancestor "$VALIDATED_SHA" origin/main; then
+            echo "validated_sha is not reachable from origin/main: $VALIDATED_SHA"
+            exit 1
+          fi
 
       - name: checkout burn_p2p sibling
         run: scripts/ensure-burn-p2p-sibling.sh

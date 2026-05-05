@@ -20,54 +20,27 @@ set -euo pipefail
 : "${BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION:=false}"
 : "${BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS:=60}"
 
-dispatch_started_at="$(date -u +%s)"
-
-gh workflow run .github/workflows/live-native-training-canary.yml \
+python3 scripts/agent_task.py gh-dispatch \
   --repo "${GITHUB_REPOSITORY}" \
+  --workflow .github/workflows/live-native-training-canary.yml \
   --ref "${GITHUB_REF_NAME}" \
-  -f environment="${BURN_DRAGON_NATIVE_CANARY_ENVIRONMENT}" \
-  -f edge_base_url="${BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL}" \
-  -f experiment_kind="${BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_KIND}" \
-  -f experiment_id="${BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_ID}" \
-  -f backend="${BURN_DRAGON_NATIVE_CANARY_BACKEND}" \
-  -f principal_id="${BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID}" \
-  -f windows="${BURN_DRAGON_NATIVE_CANARY_WINDOWS}" \
-  -f settle_diffusion="${BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION}" \
-  -f diffusion_settle_passes="${BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES}" \
-  -f serve_after_publish_secs="${BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS}" \
-  -f command_timeout_secs="${BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS}" \
-  -f start_validator="${BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR}" \
-  -f training_batch_size="${BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE}" \
-  -f training_max_iters="${BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS}" \
-  -f evaluation_max_batches="${BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES}" \
-  -f require_canonical_loss_non_regression="${BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION}"
-
-native_canary_run_id=""
-for _ in $(seq 1 30); do
-  native_canary_run_id="$(gh run list \
-    --repo "${GITHUB_REPOSITORY}" \
-    --workflow .github/workflows/live-native-training-canary.yml \
-    --limit 10 \
-    --json databaseId,createdAt,headBranch \
-    | DISPATCH_STARTED_AT="$dispatch_started_at" GITHUB_REF_NAME="$GITHUB_REF_NAME" python3 -c 'import datetime, json, os, sys; runs = json.load(sys.stdin); after = int(os.environ["DISPATCH_STARTED_AT"]); branch = os.environ["GITHUB_REF_NAME"]; matches = [run for run in runs if run.get("headBranch") == branch and int(datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00")).timestamp()) >= after]; matches.sort(key=lambda run: run.get("databaseId", 0), reverse=True); print(matches[0]["databaseId"] if matches else "")')"
-  if [ -n "$native_canary_run_id" ]; then
-    break
-  fi
-  sleep 5
-done
-
-if [ -z "$native_canary_run_id" ]; then
-  echo "failed to discover live-native-training-canary run dispatched for branch $GITHUB_REF_NAME" >&2
-  exit 1
-fi
-
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  echo "run_id=$native_canary_run_id" >>"$GITHUB_OUTPUT"
-fi
-
-python3 scripts/summarize_github_run.py \
-  --repo "${GITHUB_REPOSITORY}" \
-  --run-id "$native_canary_run_id" \
-  --watch \
+  --label live-native-training-canary \
+  --input environment="${BURN_DRAGON_NATIVE_CANARY_ENVIRONMENT}" \
+  --input edge_base_url="${BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL}" \
+  --input experiment_kind="${BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_KIND}" \
+  --input experiment_id="${BURN_DRAGON_NATIVE_CANARY_EXPERIMENT_ID}" \
+  --input backend="${BURN_DRAGON_NATIVE_CANARY_BACKEND}" \
+  --input principal_id="${BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID}" \
+  --input windows="${BURN_DRAGON_NATIVE_CANARY_WINDOWS}" \
+  --input settle_diffusion="${BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION}" \
+  --input diffusion_settle_passes="${BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES}" \
+  --input serve_after_publish_secs="${BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS}" \
+  --input command_timeout_secs="${BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS}" \
+  --input start_validator="${BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR}" \
+  --input training_batch_size="${BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE}" \
+  --input training_max_iters="${BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS}" \
+  --input evaluation_max_batches="${BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES}" \
+  --input require_canonical_loss_non_regression="${BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION}" \
+  --wait \
   --interval-secs "${BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS}" \
   --exit-status

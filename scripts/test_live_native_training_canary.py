@@ -182,15 +182,24 @@ def main() -> None:
     dispatch_script = DISPATCH_SCRIPT.read_text()
     for snippet in [
         ".github/workflows/live-native-training-canary.yml",
-        "gh workflow run",
-        "scripts/summarize_github_run.py",
+        "scripts/agent_task.py gh-dispatch",
         "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL",
         "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
         "serve_after_publish_secs",
         "training_batch_size",
         "BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS",
+        "--input experiment_id=",
+        "--wait",
+        "--exit-status",
     ]:
         assert snippet in dispatch_script, f"missing native canary dispatch snippet: {snippet}"
+
+    workflow_text = Path(".github/workflows/live-native-training-canary.yml").read_text()
+    for snippet in [
+        "agent_task_id:",
+        "run-name: Live Native Training Canary",
+    ]:
+        assert snippet in workflow_text, f"missing native canary workflow snippet: {snippet}"
 
     print("live-native-training-canary-ok")
 

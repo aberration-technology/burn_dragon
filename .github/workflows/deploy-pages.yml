@@ -1,8 +1,14 @@
 name: deploy github pages
+run-name: deploy github pages ${{ github.event.inputs.agent_task_id || github.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
+      agent_task_id:
+        description: Optional local agent task id used to discover this run without branch/time polling.
+        required: false
+        default: ""
+        type: string
       environment:
         description: GitHub environment suffix to deploy
         required: true

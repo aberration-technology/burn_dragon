@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 
 
-def load_module():
-    path = Path("scripts/summarize_github_run.py")
-    spec = importlib.util.spec_from_file_location("summarize_github_run", path)
+def load_agent_task():
+    path = Path("scripts/agent_task.py")
+    spec = importlib.util.spec_from_file_location("agent_task", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -17,7 +17,7 @@ def load_module():
 
 
 def main() -> None:
-    module = load_module()
+    module = load_agent_task()
     active_job = {
         "name": "deploy",
         "status": "in_progress",
@@ -46,10 +46,15 @@ def main() -> None:
     dispatch_pages = Path("scripts/dispatch_pages_deploy_and_wait.sh").read_text()
     dispatch_native = Path("scripts/dispatch_native_training_canary_and_wait.sh").read_text()
     for text in (dispatch_pages, dispatch_native):
-        assert "scripts/summarize_github_run.py" in text
+        assert "scripts/agent_task.py gh-dispatch" in text
+        assert "scripts/summarize_github_run.py" not in text
         assert "gh run watch" not in text
-        assert "--watch" in text
+        assert "--wait" in text
         assert "--exit-status" in text
+        assert "--input" in text
+
+    wrapper = Path("scripts/summarize_github_run.py").read_text()
+    assert 'main(["gh-wait", *sys.argv[1:]])' in wrapper
 
     print("summarize-github-run-ok")
 

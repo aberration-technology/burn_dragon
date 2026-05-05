@@ -638,16 +638,33 @@ That local gate runs the deployment config drift checks, a focused local edge/au
 
 For local production-edge triage, run the canary with `BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING=0`, `BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC=1`, and `BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE=webrtc-direct`. That path should fail if the browser falls back to edge artifact HTTP for the active head.
 
-For CI/deploy monitoring, prefer the sparse run summarizer over streaming full
-logs:
+For local agentic work, run long local commands and GitHub workflow waits
+through the local task broker instead of streaming logs into the agent session:
 
 ```bash
-python3 scripts/summarize_github_run.py --repo aberration-technology/burn_dragon --run-id RUN_ID --watch --exit-status
+python3 scripts/agent_task.py run \
+  --label local-browser-e2e \
+  --detach \
+  -- cargo run -p xtask -- local-browser-e2e
+
+python3 scripts/agent_task.py status
+python3 scripts/agent_task.py summarize TASK_ID
 ```
 
-It prints only status changes and failure snippets, and the deploy dispatch
-helpers use it by default. Pull full logs only after that summary identifies the
-failed job or step.
+For GitHub runs, dispatch or wait through the same broker:
+
+```bash
+python3 scripts/agent_task.py gh-wait \
+  --repo aberration-technology/burn_dragon \
+  --run-id RUN_ID \
+  --wait \
+  --exit-status
+```
+
+The deploy dispatch helpers use `agent_task.py gh-dispatch` internally and pass
+a generated `agent_task_id` into child workflows, so runs can be rediscovered by
+task id instead of branch/time polling. Pull full logs only after the broker
+summary identifies the failed job or step.
 
 ## Terraform Root
 

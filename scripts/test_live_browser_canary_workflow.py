@@ -135,6 +135,22 @@ def main() -> None:
                 "${{ runner.temp }}/bootstrap-install" not in workflow_text
             ), f"{workflow_path} should not cache bootstrap-install"
 
+    deploy_pages_text = Path(".github/workflows/deploy-pages.yml").read_text()
+    assert "agent_task_id:" in deploy_pages_text
+    assert "run-name: deploy github pages" in deploy_pages_text
+
+    dispatch_pages_text = Path("scripts/dispatch_pages_deploy_and_wait.sh").read_text()
+    for snippet in [
+        "scripts/agent_task.py gh-dispatch",
+        "--workflow .github/workflows/deploy-pages.yml",
+        "--input environment=",
+        "--wait",
+        "--exit-status",
+    ]:
+        assert snippet in dispatch_pages_text, (
+            f"dispatch pages helper missing agent task snippet: {snippet}"
+        )
+
     print("live-browser-canary-workflows-ok")
 
 

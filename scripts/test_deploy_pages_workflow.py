@@ -13,6 +13,8 @@ def main() -> None:
     workflow_text = workflow_path.read_text()
     required_snippets = [
         "python3 scripts/resolve_pages_deploy_settings.py",
+        "agent_task_id:",
+        "run-name: deploy github pages",
         '--environment "${{ github.event.inputs.environment }}"',
         '--edge-base-url-input "${{ github.event.inputs.edge_base_url }}"',
         '--seed-node-urls-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"',

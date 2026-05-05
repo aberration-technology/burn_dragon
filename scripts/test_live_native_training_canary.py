@@ -183,7 +183,7 @@ def main() -> None:
     for snippet in [
         ".github/workflows/live-native-training-canary.yml",
         "gh workflow run",
-        "gh run watch",
+        "scripts/summarize_github_run.py",
         "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL",
         "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
         "serve_after_publish_secs",

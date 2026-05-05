@@ -65,6 +65,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: bash -n scripts/sync-bootstrap-runtime-config.sh scripts/install_playwright_chromium.sh scripts/run_live_browser_canary.sh scripts/run_pages_predeploy_canary.sh scripts/dispatch_pages_deploy_and_wait.sh scripts/dispatch_native_training_canary_and_wait.sh scripts/resolve_bootstrap_stack_settings.sh
+      - run: python3 scripts/test_summarize_github_run.py
       - run: python3 scripts/test_bootstrap_runtime_sync.py
       - run: python3 scripts/test_bootstrap_instance_selection.py
       - run: python3 scripts/test_bootstrap_head_mirror_seed_urls.py

@@ -638,6 +638,17 @@ That local gate runs the deployment config drift checks, a focused local edge/au
 
 For local production-edge triage, run the canary with `BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING=0`, `BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC=1`, and `BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE=webrtc-direct`. That path should fail if the browser falls back to edge artifact HTTP for the active head.
 
+For CI/deploy monitoring, prefer the sparse run summarizer over streaming full
+logs:
+
+```bash
+python3 scripts/summarize_github_run.py --repo aberration-technology/burn_dragon --run-id RUN_ID --watch --exit-status
+```
+
+It prints only status changes and failure snippets, and the deploy dispatch
+helpers use it by default. Pull full logs only after that summary identifies the
+failed job or step.
+
 ## Terraform Root
 
 The AWS Terraform root lives at:

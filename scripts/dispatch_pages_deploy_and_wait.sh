@@ -42,7 +42,9 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "run_id=$pages_run_id" >>"$GITHUB_OUTPUT"
 fi
 
-gh run watch "$pages_run_id" \
+python3 scripts/summarize_github_run.py \
   --repo "${GITHUB_REPOSITORY}" \
-  --interval 15 \
+  --run-id "$pages_run_id" \
+  --watch \
+  --interval-secs "${BURN_DRAGON_DEPLOY_PAGES_WATCH_INTERVAL_SECS:-180}" \
   --exit-status

@@ -65,7 +65,9 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "run_id=$native_canary_run_id" >>"$GITHUB_OUTPUT"
 fi
 
-gh run watch "$native_canary_run_id" \
+python3 scripts/summarize_github_run.py \
   --repo "${GITHUB_REPOSITORY}" \
-  --interval "${BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS}" \
+  --run-id "$native_canary_run_id" \
+  --watch \
+  --interval-secs "${BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS}" \
   --exit-status

@@ -20,8 +20,6 @@ def main() -> None:
     assert dispatch_inputs["environment"]["default"] == "production"
     assert dispatch_inputs["experiment_id"]["default"] == "nca-prepretraining"
     assert dispatch_inputs["backend"]["default"] == "cpu"
-    assert dispatch_inputs["training_max_iters"]["default"] == "4"
-    assert dispatch_inputs["evaluation_max_batches"]["default"] == "1"
     assert dispatch_inputs["settle_diffusion"]["default"] == "true"
     assert dispatch_inputs["diffusion_settle_passes"]["default"] == "3"
     assert dispatch_inputs["serve_after_publish_secs"]["default"] == "120"
@@ -39,15 +37,6 @@ def main() -> None:
     )
     assert env["BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR"].startswith("/tmp/")
     assert env["BURN_DRAGON_NATIVE_CANARY_WINDOWS"] == "${{ github.event.inputs.windows || '2' }}"
-    assert env["BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE"] == "1"
-    assert (
-        env["BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS"]
-        == "${{ github.event.inputs.training_max_iters || '4' }}"
-    )
-    assert (
-        env["BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES"]
-        == "${{ github.event.inputs.evaluation_max_batches || '1' }}"
-    )
     assert env["BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS"] == "300"
     assert (
         env["BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION"]
@@ -109,9 +98,6 @@ def main() -> None:
         "comparable_loss_signal",
         "train_loss",
         "batch_count",
-        "training_batch_size",
-        "training_max_iters",
-        "evaluation_max_batches",
         "head_sync_timeout_secs",
         "settle_diffusion",
         "diffusion_settle_passes",
@@ -124,15 +110,11 @@ def main() -> None:
         "passes_completed",
         "initialize_head_on_start",
         'not bool(head_before.get("head_id"))',
-        "--training-batch-size",
-        "--training-max-iters",
-        "--evaluation-max-batches",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",
         "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID",
         "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
         "BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES",
         "BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS",
-        "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
     ]
     for snippet in required:
         assert snippet in script, f"missing native canary script snippet: {snippet}"
@@ -176,7 +158,6 @@ def main() -> None:
         "gh run watch",
         "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL",
         "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
-        "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
         "serve_after_publish_secs",
     ]:
         assert snippet in dispatch_script, f"missing native canary dispatch snippet: {snippet}"

@@ -39,14 +39,6 @@ on:
         description: Number of canonical windows to publish and observe
         required: false
         default: "2"
-      training_max_iters:
-        description: Per-window training iterations for the CPU canary
-        required: false
-        default: "4"
-      evaluation_max_batches:
-        description: Per-candidate validation batches for live diffusion promotion
-        required: false
-        default: "1"
       settle_diffusion:
         description: Run bounded diffusion promotion passes from the trainer after publishing
         required: false
@@ -88,9 +80,6 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'native-canary-mainnet-nca' }}
       BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '2' }}
-      BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: "1"
-      BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '4' }}
-      BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}
       BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "300"
       BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '3' }}
@@ -143,9 +132,6 @@ jobs:
           print(f"- Edge: `{report.get('edge_base_url')}`")
           print(f"- Experiment: `{report.get('experiment_id')}`")
           print(f"- Backend: `{report.get('backend')}`")
-          print(f"- Training batch size: `{report.get('training_batch_size')}`")
-          print(f"- Training max iters: `{report.get('training_max_iters')}`")
-          print(f"- Evaluation max batches: `{report.get('evaluation_max_batches')}`")
           print(f"- Head sync timeout: `{report.get('head_sync_timeout_secs')}s`")
           print(f"- Settle diffusion: `{report.get('settle_diffusion')}`")
           print(f"- Diffusion settle passes: `{report.get('diffusion_settle_passes')}`")

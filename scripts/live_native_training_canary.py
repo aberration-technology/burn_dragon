@@ -394,9 +394,6 @@ def start_validator(
     auth_bundle: Path,
     storage_root: Path,
     log_path: Path,
-    training_batch_size: int,
-    training_max_iters: int,
-    evaluation_max_batches: int,
     initialize_head_on_start: bool,
 ) -> subprocess.Popen[str]:
     proc_env = os.environ.copy()
@@ -419,12 +416,6 @@ def start_validator(
             "10",
             "--validation-interval-millis",
             "500",
-            "--training-batch-size",
-            str(training_batch_size),
-            "--training-max-iters",
-            str(training_max_iters),
-            "--evaluation-max-batches",
-            str(evaluation_max_batches),
             "--initialize-head-on-start",
             str(initialize_head_on_start).lower(),
             "--restore-head-on-start",
@@ -612,9 +603,6 @@ def main() -> int:
     )
     trusted_callback_token = env("BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN")
     windows = int(env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", "2"))
-    training_batch_size = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE", "1"))
-    training_max_iters = int(env("BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS", "4"))
-    evaluation_max_batches = int(env("BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES", "1"))
     head_sync_timeout_secs = int(env("BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS", "300"))
     settle_diffusion = env_bool("BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION", "1")
     diffusion_settle_passes = int(env("BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES", "3"))
@@ -693,9 +681,6 @@ def main() -> int:
         auth_bundle=validator_bundle,
         storage_root=validator_storage,
         log_path=artifact_dir / "validator.log",
-        training_batch_size=training_batch_size,
-        training_max_iters=training_max_iters,
-        evaluation_max_batches=evaluation_max_batches,
         initialize_head_on_start=initialize_head_on_start,
     )
     window_reports: list[dict[str, Any]] = []
@@ -719,12 +704,6 @@ def main() -> int:
                 str(initialize_head_on_start).lower(),
                 "--restore-head-on-start",
                 "true",
-                "--training-batch-size",
-                str(training_batch_size),
-                "--training-max-iters",
-                str(training_max_iters),
-                "--evaluation-max-batches",
-                str(evaluation_max_batches),
                 "--head-sync-timeout-secs",
                 str(head_sync_timeout_secs),
                 "--serve-after-publish-secs",
@@ -795,9 +774,6 @@ def main() -> int:
         "experiment_kind": experiment_kind,
         "experiment_id": experiment_id,
         "backend": backend,
-        "training_batch_size": training_batch_size,
-        "training_max_iters": training_max_iters,
-        "evaluation_max_batches": evaluation_max_batches,
         "head_sync_timeout_secs": head_sync_timeout_secs,
         "settle_diffusion": settle_diffusion,
         "diffusion_settle_passes": diffusion_settle_passes,

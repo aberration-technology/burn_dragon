@@ -157,7 +157,7 @@ def main() -> None:
         "diffusion_settle_passes",
         "serve_after_publish_secs",
         "mirror_live_head_to_edge",
-        "register_live_head_reference_with_edge",
+        "register_live_head_with_edge_options",
         "edge_registered_head",
         "advance_diffusion_steady_state(",
         "serving published artifact",

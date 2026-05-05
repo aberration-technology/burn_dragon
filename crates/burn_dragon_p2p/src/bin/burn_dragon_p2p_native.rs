@@ -3260,23 +3260,6 @@ fn diffusion_settlement_report(
     }
 }
 
-fn register_live_head_reference_with_edge(
-    runtime: &tokio::runtime::Runtime,
-    edge_base_url: &str,
-    session_id: &str,
-    directory_template: &ExperimentDirectoryEntry,
-    announcement: &HeadAnnouncement,
-) -> Result<()> {
-    register_edge_head_and_directory(
-        runtime,
-        edge_base_url,
-        session_id,
-        Some(directory_template),
-        announcement.clone(),
-        announcement.provider_peer_id.as_ref(),
-    )
-}
-
 fn mirror_live_head_with_edge(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
@@ -3504,11 +3487,11 @@ where
                         head: head.clone(),
                         announced_at: chrono::Utc::now(),
                     };
-                    if let Err(error) = register_live_head_reference_with_edge(
+                    if let Err(error) = register_live_head_with_edge_options(
                         registration_runtime,
                         edge_base_url,
                         session_id,
-                        &experiment_entry,
+                        Some(&experiment_entry),
                         &announcement,
                     ) {
                         eprintln!("head-mirror-edge-registration-failed: {error}");

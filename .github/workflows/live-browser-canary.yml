@@ -161,5 +161,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: burn-dragon-live-browser-canary-${{ matrix.lane }}
-          path: ${{ steps.live_browser_canary.outputs.artifact_dir }}
+          path: |
+            ${{ steps.live_browser_canary.outputs.artifact_dir }}
+            !${{ steps.live_browser_canary.outputs.artifact_dir }}/trace.zip
           if-no-files-found: ignore

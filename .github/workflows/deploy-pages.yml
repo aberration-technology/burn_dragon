@@ -163,7 +163,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: burn-dragon-pages-predeploy-canary
-          path: ${{ steps.predeploy_browser_canary.outputs.artifact_dir }}
+          path: |
+            ${{ steps.predeploy_browser_canary.outputs.artifact_dir }}
+            !${{ steps.predeploy_browser_canary.outputs.artifact_dir }}/trace.zip
           if-no-files-found: ignore
 
       - name: write pages cname

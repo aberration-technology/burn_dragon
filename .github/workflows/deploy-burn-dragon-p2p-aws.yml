@@ -1411,7 +1411,7 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
-        run: bash scripts/dispatch_pages_deploy_and_wait.sh
+        run: cargo run -p xtask -- dispatch-pages-deploy-and-wait
 
       - name: verify live native canonical training dynamics
         id: live_native_training_canary
@@ -1436,7 +1436,7 @@ jobs:
           BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: "1"
           BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION: "false"
           BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS: "60"
-        run: bash scripts/dispatch_native_training_canary_and_wait.sh
+        run: cargo run -p xtask -- dispatch-native-training-canary-and-wait
 
       - name: publish workflow summary
         if: ${{ always() }}

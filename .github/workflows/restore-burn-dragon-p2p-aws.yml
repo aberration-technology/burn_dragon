@@ -1049,7 +1049,7 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
-        run: bash scripts/dispatch_pages_deploy_and_wait.sh
+        run: cargo run -p xtask -- dispatch-pages-deploy-and-wait
 
       - name: publish workflow summary
         env:

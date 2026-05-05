@@ -164,7 +164,7 @@ The deploy path is now split more cleanly:
 - `scripts/resolve_pages_deploy_settings.py` resolves Pages defaults, signed browser seed derivation, and the "refuse degraded WSS-only publish when direct browser transports are advertised" guardrail without cold-compiling `xtask` before every Pages deploy
 - `xtask resolve-pages-deploy-settings` remains the Rust parity path for local and CI validation of the same settings contract
 - `xtask build-browser-site` is the authoritative browser bundle generator
-- `scripts/dispatch_pages_deploy_and_wait.sh` owns the child-workflow dispatch/watch logic used by deploy and restore
+- `cargo run -p xtask -- dispatch-pages-deploy-and-wait` owns the child-workflow dispatch/watch logic used by deploy and restore
 - `scripts/run_live_browser_canary.sh` and `scripts/summarize_live_browser_canary.py` own the shared canary execution and summary path used by Pages, deploy, restore, and the standalone live-canary workflow
 
 `deploy-pages.yml` runs a predeploy browser training canary against the freshly built Pages artifact before upload, then runs the live browser canary after the Pages publish completes. The workflow does not succeed unless the exact static bundle about to be published can boot, connect, train through the browser path, and reach the expected browser peer contract against the configured edge.
@@ -642,29 +642,29 @@ For local agentic work, run long local commands and GitHub workflow waits
 through the local task broker instead of streaming logs into the agent session:
 
 ```bash
-python3 scripts/agent_task.py run \
+cargo run -p xtask -- agent-task run \
   --label local-browser-e2e \
   --detach \
   -- cargo run -p xtask -- local-browser-e2e
 
-python3 scripts/agent_task.py status
-python3 scripts/agent_task.py summarize TASK_ID
+cargo run -p xtask -- agent-task status
+cargo run -p xtask -- agent-task summarize TASK_ID
 ```
 
 For GitHub runs, dispatch or wait through the same broker:
 
 ```bash
-python3 scripts/agent_task.py gh-wait \
+cargo run -p xtask -- agent-task gh-wait \
   --repo aberration-technology/burn_dragon \
   --run-id RUN_ID \
   --wait \
   --exit-status
 ```
 
-The deploy dispatch helpers use `agent_task.py gh-dispatch` internally and pass
-a generated `agent_task_id` into child workflows, so runs can be rediscovered by
-task id instead of branch/time polling. Pull full logs only after the broker
-summary identifies the failed job or step.
+The deploy dispatch commands use `xtask agent-task gh-dispatch` internally and
+pass a generated `agent_task_id` into child workflows, so runs can be
+rediscovered by task id instead of branch/time polling. Pull full logs only
+after the broker summary identifies the failed job or step.
 
 ## Terraform Root
 

@@ -181,18 +181,23 @@ def main() -> None:
 
     dispatch_script = DISPATCH_SCRIPT.read_text()
     for snippet in [
-        ".github/workflows/live-native-training-canary.yml",
-        "scripts/agent_task.py gh-dispatch",
-        "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL",
-        "BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION",
-        "serve_after_publish_secs",
-        "training_batch_size",
-        "BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS",
-        "--input experiment_id=",
-        "--wait",
-        "--exit-status",
+        "dispatch-native-training-canary-and-wait",
+        '"${CARGO:-cargo}" run -p xtask',
     ]:
         assert snippet in dispatch_script, f"missing native canary dispatch snippet: {snippet}"
+
+    xtask_text = Path("xtask/src/agent_task.rs").read_text()
+    for snippet in [
+        'workflow: ".github/workflows/live-native-training-canary.yml"',
+        'input_env("edge_base_url", "BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL")',
+        'input_env_default(\n                "settle_diffusion"',
+        '"serve_after_publish_secs"',
+        '"training_batch_size"',
+        'env_u64("BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS", 60)',
+        "wait: true",
+        "exit_status: true",
+    ]:
+        assert snippet in xtask_text, f"missing native canary xtask snippet: {snippet}"
 
     workflow_text = Path(".github/workflows/live-native-training-canary.yml").read_text()
     for snippet in [

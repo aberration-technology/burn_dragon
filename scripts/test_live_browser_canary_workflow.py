@@ -105,7 +105,7 @@ def main() -> None:
                 )
 
             workflow_snippets = [
-                'bash scripts/dispatch_pages_deploy_and_wait.sh',
+                'cargo run -p xtask -- dispatch-pages-deploy-and-wait',
                 'BURN_DRAGON_DEPLOY_PAGES_ENVIRONMENT: ${{ env.DEPLOY_ENVIRONMENT }}',
                 'BURN_DRAGON_DEPLOY_PAGES_EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}',
                 'BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}',
@@ -140,15 +140,22 @@ def main() -> None:
     assert "run-name: deploy github pages" in deploy_pages_text
 
     dispatch_pages_text = Path("scripts/dispatch_pages_deploy_and_wait.sh").read_text()
+    xtask_text = Path("xtask/src/agent_task.rs").read_text()
     for snippet in [
-        "scripts/agent_task.py gh-dispatch",
-        "--workflow .github/workflows/deploy-pages.yml",
-        "--input environment=",
-        "--wait",
-        "--exit-status",
+        "dispatch-pages-deploy-and-wait",
+        '"${CARGO:-cargo}" run -p xtask',
     ]:
         assert snippet in dispatch_pages_text, (
-            f"dispatch pages helper missing agent task snippet: {snippet}"
+            f"dispatch pages helper missing xtask wrapper snippet: {snippet}"
+        )
+    for snippet in [
+        'workflow: ".github/workflows/deploy-pages.yml"',
+        'input_env("environment", "BURN_DRAGON_DEPLOY_PAGES_ENVIRONMENT")',
+        "wait: true",
+        "exit_status: true",
+    ]:
+        assert snippet in xtask_text, (
+            f"xtask pages dispatch missing agent task snippet: {snippet}"
         )
 
     print("live-browser-canary-workflows-ok")

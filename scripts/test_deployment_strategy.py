@@ -71,7 +71,7 @@ def main() -> None:
     assert "aws route53 list-health-checks" in deploy_runs
     assert "aws route53 list-tags-for-resource" in deploy_runs
     assert "tf_import_if_missing aws_route53_health_check.edge_primary" in deploy_runs
-    assert "scripts/dispatch_native_training_canary_and_wait.sh" in deploy_runs
+    assert "cargo run -p xtask -- dispatch-native-training-canary-and-wait" in deploy_runs
     canary_step = next(
         step
         for step in deploy_workflow["jobs"]["deploy"]["steps"]

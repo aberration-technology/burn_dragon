@@ -12,12 +12,54 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-AGENT_TASK = REPO_ROOT / "scripts" / "agent_task.py"
+XTASK_TARGET = tempfile.TemporaryDirectory(prefix="burn-dragon-agent-task-")
+XTASK_BIN: Path | None = None
+
+
+def cargo_bin() -> str:
+    direct = Path("/home/mosure/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo")
+    if direct.exists():
+        return str(direct)
+    return os.environ.get("CARGO", "cargo")
+
+
+def ensure_xtask_bin() -> Path:
+    global XTASK_BIN
+    if XTASK_BIN is not None:
+        return XTASK_BIN
+    prebuilt = os.environ.get("BURN_DRAGON_XTASK_BIN")
+    if prebuilt:
+        XTASK_BIN = Path(prebuilt)
+        assert XTASK_BIN.exists(), f"BURN_DRAGON_XTASK_BIN does not exist: {XTASK_BIN}"
+        return XTASK_BIN
+    target_dir = Path(XTASK_TARGET.name)
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    completed = subprocess.run(
+        [
+            cargo_bin(),
+            "build",
+            "--manifest-path",
+            str(REPO_ROOT / "Cargo.toml"),
+            "-p",
+            "xtask",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    XTASK_BIN = target_dir / "debug" / "xtask"
+    assert XTASK_BIN.exists()
+    return XTASK_BIN
 
 
 def run_agent(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(AGENT_TASK), *args],
+        [str(ensure_xtask_bin()), "agent-task", *args],
         cwd=REPO_ROOT,
         env=env,
         stdout=subprocess.PIPE,
@@ -186,10 +228,51 @@ def test_github_dispatch_wait_uses_agent_task_id() -> None:
         assert task["inputs"]["agent_task_id"] == fake_state["agent_task_id"]
 
 
+def test_python_wrappers_delegate_to_xtask() -> None:
+    agent_wrapper = (REPO_ROOT / "scripts" / "agent_task.py").read_text()
+    summary_wrapper = (REPO_ROOT / "scripts" / "summarize_github_run.py").read_text()
+    for text in (agent_wrapper, summary_wrapper):
+        assert "BURN_DRAGON_XTASK_BIN" in text
+        assert '"agent-task"' in text
+        assert '"cargo"' in text
+    assert '"gh-wait"' in summary_wrapper
+    with tempfile.TemporaryDirectory() as tmp:
+        state_root = Path(tmp) / "agent-tasks"
+        env = os.environ.copy()
+        env["BURN_DRAGON_XTASK_BIN"] = str(ensure_xtask_bin())
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "agent_task.py"),
+                "run",
+                "--state-root",
+                str(state_root),
+                "--label",
+                "wrapper-ok",
+                "--",
+                sys.executable,
+                "-c",
+                "print('wrapped command output')",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "Conclusion: `success`" in completed.stdout
+        assert "\nwrapped command output\n" not in completed.stdout
+        task = json.loads(task_files(state_root)[0].read_text())
+        assert Path(task["stdout_path"]).read_text().strip() == "wrapped command output"
+
+
 def main() -> None:
     test_local_quiet_run()
     test_detached_local_run()
     test_github_dispatch_wait_uses_agent_task_id()
+    test_python_wrappers_delegate_to_xtask()
     print("agent-task-ok")
 
 

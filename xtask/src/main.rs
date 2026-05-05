@@ -1,3 +1,4 @@
+mod agent_task;
 mod browser_site;
 mod deploy_settings;
 
@@ -6,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -27,6 +28,12 @@ enum CommandKind {
     BuildBrowser,
     BuildBrowserSite(browser_site::BuildBrowserSiteArgs),
     ResolvePagesDeploySettings(deploy_settings::ResolvePagesDeploySettingsArgs),
+    AgentTask {
+        #[command(subcommand)]
+        command: agent_task::AgentTaskCommand,
+    },
+    DispatchPagesDeployAndWait,
+    DispatchNativeTrainingCanaryAndWait,
     BuildMatrix,
     NativeSmoke,
     NativeIntegration,
@@ -57,6 +64,11 @@ fn main() -> Result<()> {
         CommandKind::BuildBrowserSite(args) => browser_site::build_browser_site(&args),
         CommandKind::ResolvePagesDeploySettings(args) => {
             deploy_settings::resolve_pages_deploy_settings(&args)
+        }
+        CommandKind::AgentTask { command } => agent_task::run(command),
+        CommandKind::DispatchPagesDeployAndWait => agent_task::dispatch_pages_deploy_and_wait(),
+        CommandKind::DispatchNativeTrainingCanaryAndWait => {
+            agent_task::dispatch_native_training_canary_and_wait()
         }
         CommandKind::BuildMatrix => build_matrix(),
         CommandKind::ArtifactCheck => artifact_check(),

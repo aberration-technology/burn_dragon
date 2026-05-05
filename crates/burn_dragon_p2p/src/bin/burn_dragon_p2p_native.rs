@@ -3164,7 +3164,16 @@ where
     } else {
         None
     };
-    let head = if let Some(head) = restored {
+    let synced = running.sync_experiment_head(experiment)?;
+
+    let head = if let Some(head) = synced {
+        eprintln!(
+            "{log_prefix}-head-synced id={} global_step={}",
+            head.head_id.as_str(),
+            head.global_step,
+        );
+        head
+    } else if let Some(head) = restored {
         eprintln!(
             "{log_prefix}-head-restored id={} global_step={}",
             head.head_id.as_str(),
@@ -3172,30 +3181,10 @@ where
         );
         head
     } else if initialize_head_on_start {
-        match running.sync_experiment_head(experiment) {
-            Ok(Some(head)) => {
-                eprintln!(
-                    "{log_prefix}-head-synced id={} global_step={}",
-                    head.head_id.as_str(),
-                    head.global_step,
-                );
-                head
-            }
-            Ok(None) => {
-                eprintln!("{log_prefix}-initializing local genesis head");
-                let head = running.initialize_local_head(experiment)?;
-                eprintln!(
-                    "{log_prefix}-initialized genesis head id={} global_step={}",
-                    head.head_id.as_str(),
-                    head.global_step,
-                );
-                head
-            }
-            Err(error) => return Err(error),
-        }
-    } else if let Some(head) = running.sync_experiment_head(experiment)? {
+        eprintln!("{log_prefix}-initializing local genesis head");
+        let head = running.initialize_local_head(experiment)?;
         eprintln!(
-            "{log_prefix}-head-synced id={} global_step={}",
+            "{log_prefix}-initialized genesis head id={} global_step={}",
             head.head_id.as_str(),
             head.global_step,
         );

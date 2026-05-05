@@ -17,6 +17,7 @@ native = [
   "dep:burn-autodiff",
   "dep:burn-ndarray",
   "dep:burn-train",
+  "dep:burn_dragon_core",
   "dep:burn_dragon_language",
   "dep:burn_dragon_train",
   "dep:burn_dragon_universality",

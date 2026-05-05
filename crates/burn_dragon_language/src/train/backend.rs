@@ -587,6 +587,16 @@ where
         }
     };
     ensure_objective_supported(&resolved_config.training.objective, objective_trainer)?;
+    ensure_rollout_objective_runtime(
+        &resolved_config.training.objective,
+        RolloutObjectiveRuntimeConstraints {
+            uses_flat_token_logits: model_config.language_head.uses_flat_token_logits(),
+            distributed_pipeline: resolved_config.parallel.pipeline.enabled
+                && parallel_runtime.mode != ParallelismKind::Single,
+            tbptt_enabled: training.tbptt_chunk_size.is_some()
+                || training.tbptt_persist_across_steps,
+        },
+    )?;
     let summary_event_token_ids = model_config.summary_memory.write_trigger_token_ids.clone();
 
     let dataset_steps_per_epoch = datasets.train.steps_per_epoch(DatasetSplit::Train);
@@ -665,6 +675,7 @@ where
     )?;
     validate_dragon_continual_backprop(training, &base_model, parallel_runtime.world_size)?;
     let prepared_model = LanguageTrainModel::new(base_model)
+        .with_training_objective(training.objective.clone())
         .with_pipeline_plan(pipeline_plan.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size)
         .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)

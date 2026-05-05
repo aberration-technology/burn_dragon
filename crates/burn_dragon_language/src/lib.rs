@@ -44,8 +44,8 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            RepromptTruncation, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-            TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+            RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+            SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
             TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
         };
     }

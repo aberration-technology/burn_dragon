@@ -2,11 +2,12 @@ use crate::train::prelude::*;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type StreamingStateStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
+type TeacherModelStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
 
 fn streaming_state_store() -> &'static Mutex<StreamingStateStore> {
     static STORE: OnceLock<Mutex<StreamingStateStore>> = OnceLock::new();
@@ -17,6 +18,17 @@ fn lock_streaming_state_store() -> std::sync::MutexGuard<'static, StreamingState
     streaming_state_store()
         .lock()
         .expect("streaming tbptt runtime lock poisoned")
+}
+
+fn teacher_model_store() -> &'static Mutex<TeacherModelStore> {
+    static STORE: OnceLock<Mutex<TeacherModelStore>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_teacher_model_store() -> std::sync::MutexGuard<'static, TeacherModelStore> {
+    teacher_model_store()
+        .lock()
+        .expect("teacher model runtime lock poisoned")
 }
 
 fn next_streaming_runtime_key() -> usize {
@@ -254,6 +266,89 @@ fn scale_gradients_by_schedule<B, M>(
     module.visit(&mut visitor);
 }
 
+#[derive(Debug)]
+struct TeacherModelRuntime<B: BackendTrait> {
+    model: DragonModel<B>,
+    update_count: usize,
+}
+
+impl<B: BackendTrait> TeacherModelRuntime<B> {
+    fn new(model: DragonModel<B>) -> Self {
+        Self {
+            model,
+            update_count: 0,
+        }
+    }
+}
+
+fn ema_blend_model<B: BackendTrait>(
+    teacher: &DragonModel<B>,
+    online: &DragonModel<B>,
+    rate: f32,
+) -> DragonModel<B> {
+    let rate = rate.clamp(0.0, 1.0);
+    if rate <= f32::EPSILON {
+        return teacher.clone();
+    }
+    if (rate - 1.0).abs() <= f32::EPSILON {
+        return online.clone();
+    }
+
+    struct OnlineParamCollector<B: BackendTrait> {
+        params: VecDeque<Box<dyn Any>>,
+        _marker: std::marker::PhantomData<B>,
+    }
+
+    impl<B: BackendTrait> burn::module::ModuleVisitor<B> for OnlineParamCollector<B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            self.params.push_back(Box::new(param.val().detach()));
+        }
+    }
+
+    struct EmaParamMapper<B: BackendTrait> {
+        params: VecDeque<Box<dyn Any>>,
+        rate: f32,
+        _marker: std::marker::PhantomData<B>,
+    }
+
+    impl<B: BackendTrait> burn::module::ModuleMapper<B> for EmaParamMapper<B> {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let online = self
+                .params
+                .pop_front()
+                .expect("teacher EMA source parameter missing")
+                .downcast::<Tensor<B, D>>()
+                .unwrap_or_else(|_| panic!("teacher EMA source parameter shape mismatch"));
+            let (id, tensor, mapper) = param.consume();
+            let require_grad = tensor.is_require_grad();
+            let mut blended = (tensor.detach().mul_scalar(1.0 - self.rate)
+                + online.detach().mul_scalar(self.rate))
+            .detach();
+            if require_grad {
+                blended = blended.require_grad();
+            }
+            Param::from_mapped_value(id, blended, mapper)
+        }
+    }
+
+    let mut collector = OnlineParamCollector::<B> {
+        params: VecDeque::new(),
+        _marker: std::marker::PhantomData,
+    };
+    online.visit(&mut collector);
+    let mut mapper = EmaParamMapper::<B> {
+        params: collector.params,
+        rate,
+        _marker: std::marker::PhantomData,
+    };
+    let blended = teacher.clone().map(&mut mapper);
+    assert!(
+        mapper.params.is_empty(),
+        "teacher EMA source parameter count exceeded teacher parameter count"
+    );
+    blended
+}
+
 #[derive(Module, Debug)]
 pub struct LanguageTrainModel<B: BackendTrait> {
     pub model: DragonModel<B>,
@@ -263,11 +358,34 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     pub tbptt_persist_across_steps: bool,
     #[module(skip)]
+    pub objective: TrainingObjectiveConfig,
+    #[module(skip)]
+    teacher_model: Option<DragonModel<B>>,
+    #[module(skip)]
     streaming_runtime_key: usize,
     #[module(skip)]
     gradient_scale_schedule: GradientScaleSchedule,
     #[module(skip)]
     gradient_scale_step: Arc<AtomicUsize>,
+}
+
+struct ObjectiveScoreBatch<B: BackendTrait> {
+    student_inputs: Tensor<B, 2, Int>,
+    student_targets: Tensor<B, 2, Int>,
+    teacher_inputs: Tensor<B, 2, Int>,
+    teacher_targets: Tensor<B, 2, Int>,
+    mask: Tensor<B, 2, Int>,
+}
+
+#[derive(Clone, Copy)]
+struct RolloutScoreConfig {
+    max_completion_tokens: usize,
+    group_size: usize,
+    temperature: f32,
+    top_k: Option<usize>,
+    num_loss_tokens_to_skip: usize,
+    max_reprompt_len: usize,
+    reprompt_truncation: RepromptTruncation,
 }
 
 impl<B: BackendTrait> LanguageTrainModel<B> {
@@ -277,6 +395,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             tbptt_chunk_size: None,
             pipeline_plan: None,
             tbptt_persist_across_steps: false,
+            objective: TrainingObjectiveConfig::NextToken,
+            teacher_model: None,
             streaming_runtime_key: next_streaming_runtime_key(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
             gradient_scale_step: Arc::new(AtomicUsize::new(0)),
@@ -295,6 +415,18 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     pub fn with_tbptt_persist_across_steps(mut self, enabled: bool) -> Self {
         self.tbptt_persist_across_steps = enabled;
+        self
+    }
+
+    pub fn with_training_objective(mut self, objective: TrainingObjectiveConfig) -> Self {
+        self.teacher_model = (!objective.is_next_token()).then(|| self.model.clone());
+        let key = (self.streaming_runtime_key, TypeId::of::<B>());
+        let mut teachers = lock_teacher_model_store();
+        teachers.remove(&key);
+        if let Some(teacher_model) = self.teacher_model.clone() {
+            teachers.insert(key, Box::new(TeacherModelRuntime::new(teacher_model)));
+        }
+        self.objective = objective;
         self
     }
 
@@ -415,6 +547,404 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         targets: Tensor<B, 2, Int>,
     ) -> Tensor<B, 1> {
         self.model.language_loss_from_logits(logits, targets)
+    }
+
+    fn forward_hidden_with_pipeline_for_objective(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 3> {
+        let plan = self
+            .pipeline_plan
+            .as_ref()
+            .expect("pipeline objective forward requires a pipeline plan");
+        let [batch_size, _block_size] = inputs.shape().dims();
+        let ranges = split_microbatch_ranges(batch_size, plan.microbatches)
+            .expect("pipeline objective execution requires batch_size >= microbatches");
+        let chunk_inputs = ranges
+            .iter()
+            .map(|range| Self::slice_batch(inputs.clone(), range.start, range.end))
+            .collect::<Vec<_>>();
+
+        let mut chunk_states = (0..plan.microbatches)
+            .map(|_| self.model.init_state_ephemeral())
+            .collect::<Vec<_>>();
+        let mut pipeline_states = vec![None; plan.microbatches];
+
+        for event in plan.events.iter().filter(|event| {
+            matches!(
+                event.kind,
+                burn_dragon_train::train::pipeline::PipelineEventKind::Forward
+            )
+        }) {
+            let microbatch_id = event.microbatch_id;
+            if pipeline_states[microbatch_id].is_none() {
+                pipeline_states[microbatch_id] = Some(
+                    self.model
+                        .begin_language_pipeline(chunk_inputs[microbatch_id].clone()),
+                );
+            }
+            let assignment = plan.assignment(event.virtual_stage_id).clone();
+            let state = &mut chunk_states[microbatch_id];
+            let stage_state = pipeline_states[microbatch_id]
+                .take()
+                .expect("microbatch stage state");
+            pipeline_states[microbatch_id] =
+                Some(self.model.forward_language_pipeline_stage_with_state(
+                    stage_state,
+                    state,
+                    assignment.layer_range.clone(),
+                    None,
+                ));
+        }
+
+        let mut hidden_chunks = Vec::with_capacity(plan.microbatches);
+        for microbatch_id in 0..plan.microbatches {
+            hidden_chunks.push(
+                self.model.finish_language_pipeline_hidden_with_state(
+                    pipeline_states[microbatch_id]
+                        .take()
+                        .expect("pipeline state after scheduled forward"),
+                    &mut chunk_states[microbatch_id],
+                ),
+            );
+        }
+        Tensor::cat(hidden_chunks, 0)
+    }
+
+    fn forward_hidden_for_objective(&self, inputs: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        if self.pipeline_enabled() {
+            self.forward_hidden_with_pipeline_for_objective(inputs)
+        } else {
+            self.model.forward_hidden(inputs)
+        }
+    }
+
+    fn current_teacher_model(&self) -> DragonModel<B> {
+        let key = (self.streaming_runtime_key, TypeId::of::<B>());
+        let teachers = lock_teacher_model_store();
+        if let Some(runtime) = teachers
+            .get(&key)
+            .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
+        {
+            return runtime.model.clone();
+        }
+        self.teacher_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
+
+    fn objective_teacher_update_rate(&self) -> f32 {
+        match &self.objective {
+            TrainingObjectiveConfig::NextToken => 0.0,
+            TrainingObjectiveConfig::Sdft(config) => config.teacher_update_rate,
+            TrainingObjectiveConfig::Sdpo(config) => config.teacher_update_rate,
+            TrainingObjectiveConfig::SdftSdpo(config) => {
+                let sdft_weight = config.sdft_weight.max(0.0);
+                let sdpo_weight = config.sdpo_weight.max(0.0);
+                let weight_sum = sdft_weight + sdpo_weight;
+                if weight_sum <= f32::EPSILON {
+                    0.0
+                } else {
+                    (config.sdft.teacher_update_rate * sdft_weight
+                        + config.sdpo.teacher_update_rate * sdpo_weight)
+                        / weight_sum
+                }
+            }
+        }
+    }
+
+    fn update_teacher_runtime(&self) {
+        let rate = self.objective_teacher_update_rate().clamp(0.0, 1.0);
+        if rate <= f32::EPSILON {
+            return;
+        };
+        let key = (self.streaming_runtime_key, TypeId::of::<B>());
+        let mut teachers = lock_teacher_model_store();
+        let runtime = teachers.entry(key).or_insert_with(|| {
+            Box::new(TeacherModelRuntime::new(
+                self.teacher_model
+                    .clone()
+                    .unwrap_or_else(|| self.model.clone()),
+            ))
+        });
+        let Some(runtime) = runtime.downcast_mut::<TeacherModelRuntime<B>>() else {
+            return;
+        };
+        runtime.model = ema_blend_model(&runtime.model, &self.model, rate);
+        runtime.update_count = runtime.update_count.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn teacher_update_count_for_test(&self) -> Option<usize> {
+        let key = (self.streaming_runtime_key, TypeId::of::<B>());
+        lock_teacher_model_store()
+            .get(&key)
+            .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
+            .map(|runtime| runtime.update_count)
+    }
+
+    fn assert_flat_logits_for_rollout_objective(&self) {
+        assert_flat_logits_for_rollout_objective(
+            &self.objective,
+            self.model.uses_factorized_language_head(),
+        );
+    }
+
+    fn truncate_reprompt_tokens(
+        mut tokens: Vec<i64>,
+        max_len: usize,
+        truncation: RepromptTruncation,
+    ) -> Vec<i64> {
+        if tokens.len() <= max_len {
+            return tokens;
+        }
+        match truncation {
+            RepromptTruncation::Right => tokens.split_off(tokens.len() - max_len),
+            RepromptTruncation::Left => {
+                tokens.truncate(max_len);
+                tokens
+            }
+            RepromptTruncation::Error => {
+                panic!(
+                    "teacher-conditioned reprompt length {} exceeds max_reprompt_len {}",
+                    tokens.len(),
+                    max_len
+                )
+            }
+        }
+    }
+
+    fn rollout_score_batch(
+        &self,
+        generator_model: &DragonModel<B>,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        config: RolloutScoreConfig,
+    ) -> ObjectiveScoreBatch<B> {
+        let [batch_size, block_size] = inputs.shape().dims();
+        let device = inputs.device();
+        let completion_len = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_len = block_size.saturating_sub(completion_len).max(1);
+        let score_len = prompt_len + completion_len - 1;
+        let group_size = config.group_size.max(1);
+
+        let input_tokens = inputs
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("objective rollout inputs to host tokens");
+        let target_tokens = targets
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("objective rollout targets to host tokens");
+
+        let total_rows = batch_size * group_size;
+        let mut student_inputs = Vec::with_capacity(total_rows * score_len);
+        let mut student_targets = Vec::with_capacity(total_rows * score_len);
+        let mut teacher_inputs = Vec::with_capacity(total_rows * score_len);
+        let mut teacher_targets = Vec::with_capacity(total_rows * score_len);
+        let mut mask = Vec::with_capacity(total_rows * score_len);
+
+        for batch_idx in 0..batch_size {
+            let row_start = batch_idx * block_size;
+            let prompt = input_tokens[row_start..row_start + prompt_len].to_vec();
+            let completion_start = prompt_len.saturating_sub(1);
+            let golden_completion = target_tokens
+                [row_start + completion_start..row_start + completion_start + completion_len]
+                .to_vec();
+            for _ in 0..group_size {
+                let generated = crate::generation::generate_tokens(
+                    generator_model,
+                    prompt.clone(),
+                    &device,
+                    crate::generation::GenerationSettings {
+                        max_new_tokens: Some(completion_len),
+                        temperature: config.temperature,
+                        top_k: config.top_k,
+                        strategy: crate::generation::ContextStrategy::Infinite,
+                    },
+                    None,
+                )
+                .expect("objective rollout generation should succeed");
+                let completion = generated[prompt_len..prompt_len + completion_len].to_vec();
+                let mut teacher_sequence = prompt.clone();
+                teacher_sequence.extend_from_slice(&golden_completion);
+                teacher_sequence.extend_from_slice(&completion);
+                let teacher_sequence = Self::truncate_reprompt_tokens(
+                    teacher_sequence,
+                    config.max_reprompt_len.max(score_len + 1),
+                    config.reprompt_truncation,
+                );
+
+                student_inputs.extend_from_slice(&generated[..score_len]);
+                student_targets.extend_from_slice(&generated[1..score_len + 1]);
+                teacher_inputs.extend_from_slice(
+                    &teacher_sequence
+                        [teacher_sequence.len() - (score_len + 1)..teacher_sequence.len() - 1],
+                );
+                teacher_targets.extend_from_slice(
+                    &teacher_sequence[teacher_sequence.len() - score_len..teacher_sequence.len()],
+                );
+                let loss_start = prompt_len.saturating_sub(1)
+                    + config.num_loss_tokens_to_skip.min(completion_len);
+                for position in 0..score_len {
+                    mask.push((position >= loss_start) as i64);
+                }
+            }
+        }
+
+        ObjectiveScoreBatch {
+            student_inputs: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(student_inputs, [total_rows, score_len]),
+                &device,
+            ),
+            student_targets: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(student_targets, [total_rows, score_len]),
+                &device,
+            ),
+            teacher_inputs: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(teacher_inputs, [total_rows, score_len]),
+                &device,
+            ),
+            teacher_targets: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(teacher_targets, [total_rows, score_len]),
+                &device,
+            ),
+            mask: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(mask, [total_rows, score_len]),
+                &device,
+            ),
+        }
+    }
+
+    fn objective_loss(&self, inputs: Tensor<B, 2, Int>, targets: Tensor<B, 2, Int>) -> Tensor<B, 1>
+    where
+        B: AutodiffBackend,
+    {
+        assert!(
+            !(self.pipeline_enabled() && self.tbptt_persist_across_steps),
+            "pipeline objective execution does not support persistent stream state"
+        );
+        self.assert_flat_logits_for_rollout_objective();
+        match &self.objective {
+            TrainingObjectiveConfig::NextToken => unreachable!("next_token uses the CE fast path"),
+            TrainingObjectiveConfig::Sdft(config) => self.sdft_loss(inputs, targets, config),
+            TrainingObjectiveConfig::Sdpo(config) => self.sdpo_loss(inputs, targets, config),
+            TrainingObjectiveConfig::SdftSdpo(config) => {
+                self.composite_sdft_sdpo_loss(inputs, targets, config)
+            }
+        }
+    }
+
+    fn sdft_loss(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        config: &SdftObjectiveConfig,
+    ) -> Tensor<B, 1>
+    where
+        B: AutodiffBackend,
+    {
+        let teacher = self.current_teacher_model();
+        let generator_model = if config.generate_from_teacher {
+            &teacher
+        } else {
+            &self.model
+        };
+        let rollout = self.rollout_score_batch(
+            generator_model,
+            inputs,
+            targets,
+            RolloutScoreConfig {
+                max_completion_tokens: config.max_completion_tokens,
+                group_size: 1,
+                temperature: config.temperature,
+                top_k: config.top_k,
+                num_loss_tokens_to_skip: config.num_loss_tokens_to_skip,
+                max_reprompt_len: usize::MAX,
+                reprompt_truncation: RepromptTruncation::Right,
+            },
+        );
+        let student_hidden = self.forward_hidden_for_objective(rollout.student_inputs);
+        let teacher_hidden = teacher.forward_hidden(rollout.teacher_inputs);
+        self_distillation_loss_from_logits(
+            self.model.logits_from_hidden(student_hidden),
+            teacher.logits_from_hidden(teacher_hidden).detach(),
+            Some(rollout.mask),
+            config.kl,
+        )
+    }
+
+    fn sdpo_loss(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        config: &SdpoObjectiveConfig,
+    ) -> Tensor<B, 1>
+    where
+        B: AutodiffBackend,
+    {
+        let teacher = self.current_teacher_model();
+        let rollout = self.rollout_score_batch(
+            &self.model,
+            inputs,
+            targets,
+            RolloutScoreConfig {
+                max_completion_tokens: config.max_completion_tokens,
+                group_size: config.group_size,
+                temperature: config.temperature,
+                top_k: config.top_k,
+                num_loss_tokens_to_skip: 0,
+                max_reprompt_len: config.max_reprompt_len,
+                reprompt_truncation: config.reprompt_truncation,
+            },
+        );
+        let mask = rollout.mask;
+        let student_hidden = self.forward_hidden_for_objective(rollout.student_inputs);
+        let teacher_hidden = teacher.forward_hidden(rollout.teacher_inputs);
+        let student_logits = self.model.logits_from_hidden(student_hidden);
+        let teacher_logits = teacher.logits_from_hidden(teacher_hidden).detach();
+        let student_log_probs = log_probs_from_logits(student_logits);
+        let teacher_log_probs = log_probs_from_logits(teacher_logits);
+        let new_token_log_probs =
+            selected_token_log_probs(student_log_probs.clone(), rollout.student_targets);
+        let old_token_log_probs = new_token_log_probs.clone().detach();
+        let mut per_token_loss = self_distillation_per_token_from_log_probs(
+            student_log_probs,
+            teacher_log_probs,
+            SelfDistillationKlKind::from_sdpo_alpha(config.alpha),
+        );
+        if let Some(max_ratio) = config.is_clip.filter(|value| *value > 0.0) {
+            let log_ratio = (new_token_log_probs - old_token_log_probs)
+                .clamp_min(-20.0)
+                .clamp_max(20.0);
+            let ratio = log_ratio.exp().clamp_max(max_ratio);
+            per_token_loss = per_token_loss * ratio;
+        }
+        masked_token_mean(per_token_loss, Some(mask))
+    }
+
+    fn composite_sdft_sdpo_loss(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        config: &SdftSdpoObjectiveConfig,
+    ) -> Tensor<B, 1>
+    where
+        B: AutodiffBackend,
+    {
+        let sdft_weight = config.sdft_weight.max(0.0);
+        let sdpo_weight = config.sdpo_weight.max(0.0);
+        let weight_sum = (sdft_weight + sdpo_weight).max(1.0e-6);
+        self.sdft_loss(inputs.clone(), targets.clone(), &config.sdft)
+            .mul_scalar(sdft_weight / weight_sum)
+            + self
+                .sdpo_loss(inputs, targets, &config.sdpo)
+                .mul_scalar(sdpo_weight / weight_sum)
     }
 
     fn forward_loss_with_pipeline(
@@ -587,6 +1117,15 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let forward_start = prof_enabled.then(Instant::now);
         let inputs = batch.inputs;
         let targets = batch.targets;
+        if !self.objective.is_next_token() {
+            self.update_teacher_runtime();
+            let loss = self.objective_loss(inputs, targets);
+            let grads = loss.backward();
+            return TrainOutput {
+                grads: self.apply_gradient_scale_schedule(GradientsParams::from_grads(grads, self)),
+                item: LanguageModelTrainItem::new(loss),
+            };
+        }
         let summary_event_mask = batch.summary_event_mask;
         let reset_stream_state = batch.reset_stream_state;
         let step_device = memory_prof_enabled.then(|| inputs.device());
@@ -1033,5 +1572,239 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
             let loss = self.language_loss_from_hidden(hidden, batch.targets);
             LanguageModelOutput::new(loss)
         }
+    }
+}
+
+#[cfg(test)]
+mod objective_step_tests {
+    use super::*;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = Autodiff<NdArray<f32>>;
+    type TestInnerBackend = NdArray<f32>;
+
+    fn tiny_model_config() -> DragonConfig {
+        DragonConfig {
+            n_layer: 1,
+            n_embd: 8,
+            n_head: 1,
+            mlp_internal_dim_multiplier: 1,
+            dropout: 0.0,
+            vocab_size: 16,
+            ..Default::default()
+        }
+    }
+
+    fn tiny_factorized_model_config() -> DragonConfig {
+        let mut config = tiny_model_config();
+        config.vocab_size = 32;
+        config.language_head = burn_dragon_core::LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        config
+    }
+
+    fn tiny_pipeline_plan() -> PipelinePlan {
+        build_pipeline_plan(
+            2,
+            &burn_dragon_train::ParallelPipelineConfig {
+                enabled: true,
+                stage_count: 2,
+                virtual_stages_per_rank: 1,
+                schedule: burn_dragon_train::PipelineScheduleKind::Interleaved1f1b,
+                microbatches: 2,
+                ..Default::default()
+            },
+        )
+        .expect("pipeline plan")
+    }
+
+    fn batch(device: &<TestBackend as BackendTrait>::Device) -> SequenceBatch<TestBackend> {
+        SequenceBatch::new(
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(vec![0, 1, 2, 3, 4, 5, 6, 7], [2, 4]),
+                device,
+            ),
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(vec![1, 2, 3, 4, 5, 6, 7, 8], [2, 4]),
+                device,
+            ),
+            None,
+        )
+    }
+
+    fn scalar_loss(output: TrainOutput<LanguageModelTrainItem<TestBackend>>) -> f32 {
+        let synced = output.item.sync();
+        let loss: LossValue<TestInnerBackend> = synced.adapt();
+        loss.value()
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("loss vec")[0]
+    }
+
+    #[test]
+    fn sdft_train_step_runs_rollout_objective() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_training_objective(TrainingObjectiveConfig::Sdft(SdftObjectiveConfig {
+            max_completion_tokens: 2,
+            top_k: Some(1),
+            ..Default::default()
+        }));
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected SDFT loss: {loss}");
+    }
+
+    #[test]
+    fn sdpo_train_step_runs_rollout_objective() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_training_objective(TrainingObjectiveConfig::Sdpo(SdpoObjectiveConfig {
+            group_size: 2,
+            max_completion_tokens: 2,
+            top_k: Some(1),
+            ..Default::default()
+        }));
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected SDPO loss: {loss}");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "paper-aligned SDFT/SDPO rollout objectives require flat token logits"
+    )]
+    fn sdft_train_step_guards_factorized_language_head() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_factorized_model_config(),
+            &device,
+        ))
+        .with_training_objective(TrainingObjectiveConfig::Sdft(SdftObjectiveConfig {
+            max_completion_tokens: 2,
+            top_k: Some(1),
+            ..Default::default()
+        }));
+        let _ = TrainStep::step(&model, batch(&device));
+    }
+
+    #[test]
+    fn sdft_train_step_updates_teacher_runtime() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_training_objective(TrainingObjectiveConfig::Sdft(SdftObjectiveConfig {
+            max_completion_tokens: 2,
+            top_k: Some(1),
+            teacher_update_rate: 0.5,
+            ..Default::default()
+        }));
+        let _ = scalar_loss(TrainStep::step(&model, batch(&device)));
+        let update_count = model
+            .teacher_update_count_for_test()
+            .expect("teacher update count");
+        assert_eq!(update_count, 1);
+    }
+
+    #[test]
+    fn rollout_teacher_context_contains_gold_demonstration() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 9, 10], [1, 4]),
+            &device,
+        );
+        let rollout = model.rollout_score_batch(
+            &model.model,
+            inputs,
+            targets,
+            RolloutScoreConfig {
+                max_completion_tokens: 2,
+                group_size: 1,
+                temperature: 1.0,
+                top_k: Some(1),
+                num_loss_tokens_to_skip: 0,
+                max_reprompt_len: usize::MAX,
+                reprompt_truncation: RepromptTruncation::Right,
+            },
+        );
+        let teacher_inputs = rollout
+            .teacher_inputs
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("teacher input vec");
+        assert_eq!(teacher_inputs[0], 2);
+        assert_eq!(teacher_inputs[1], 9);
+    }
+
+    #[test]
+    fn sdft_sdpo_composite_train_step_runs() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_training_objective(TrainingObjectiveConfig::SdftSdpo(
+            SdftSdpoObjectiveConfig {
+                sdft: SdftObjectiveConfig {
+                    max_completion_tokens: 2,
+                    top_k: Some(1),
+                    ..Default::default()
+                },
+                sdpo: SdpoObjectiveConfig {
+                    group_size: 2,
+                    max_completion_tokens: 2,
+                    top_k: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected composite loss: {loss}");
+    }
+
+    #[test]
+    fn sdpo_train_step_runs_with_single_process_pipeline_plan() {
+        let device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.n_layer = 2;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_pipeline_plan(Some(tiny_pipeline_plan()))
+            .with_training_objective(TrainingObjectiveConfig::Sdpo(SdpoObjectiveConfig {
+                group_size: 2,
+                max_completion_tokens: 2,
+                top_k: Some(1),
+                ..Default::default()
+            }));
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected pipeline SDPO loss: {loss}");
     }
 }

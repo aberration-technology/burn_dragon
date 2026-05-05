@@ -13,7 +13,7 @@ use burn::record::{
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-use burn_dragon_core::DragonModel;
+use burn_dragon_core::{DragonModel, objective::window_self_distillation_smoke_loss};
 use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
@@ -497,6 +497,12 @@ where
             descriptor.artifact_id.as_str(),
         );
     }
+    context
+        .config
+        .training_objective
+        .ensure_browser_supported()
+        .map_err(anyhow::Error::msg)?;
+    let teacher_model = (!context.config.training_objective.is_next_token()).then(|| model.clone());
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(context.config.weight_decay)
         .init();
@@ -537,8 +543,12 @@ where
                 batch.token_count, context.config.block_size, context.config.batch_size,
             );
         }
-        let hidden = model.forward_hidden(batch.inputs);
-        let loss = model.language_loss_from_hidden(hidden, batch.targets);
+        let loss = browser_training_objective_loss(
+            &model,
+            teacher_model.as_ref(),
+            &batch,
+            &context.config.training_objective,
+        );
         if collect_loss_scalars {
             train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
             train_loss_count = train_loss_count.saturating_add(1);
@@ -721,12 +731,6 @@ fn validate_browser_training_config(config: &DragonBrowserTrainingConfig) -> Res
     }
     if config.model_config.vocab_size == 0 {
         bail!("browser training model_config.vocab_size must be > 0");
-    }
-    if !config.training_objective.is_next_token() {
-        bail!(
-            "browser training objective {} is not wired yet; browser training currently supports next_token only",
-            config.training_objective.label()
-        );
     }
     Ok(())
 }
@@ -1150,6 +1154,22 @@ async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
         .await
         .map(|scalar| scalar.elem::<f64>())
         .map_err(|error| anyhow!("failed to read browser loss scalar: {error}"))
+}
+
+fn browser_training_objective_loss<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    teacher: Option<&DragonModel<B>>,
+    batch: &TokenWindowBatch<B>,
+    objective: &crate::config::DragonBrowserTrainingObjectiveConfig,
+) -> Tensor<B, 1> {
+    let objective = objective.to_window_smoke_objective();
+    window_self_distillation_smoke_loss(
+        model,
+        teacher.unwrap_or(model),
+        batch.inputs.clone(),
+        batch.targets.clone(),
+        &objective,
+    )
 }
 
 struct BrowserTrainingContributionStats {
@@ -1772,6 +1792,43 @@ mod tests {
         assert!(result.train_batches >= 1);
         assert!(result.train_examples >= 1);
         assert!(result.train_loss_mean.is_finite());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn browser_training_guards_composite_self_distillation_objective() {
+        let config = DragonBrowserTrainingConfig {
+            experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
+            model_config: tiny_model_config(256),
+            training_objective: DragonBrowserTrainingObjectiveConfig::SdftSdpo(Default::default()),
+            execution_backend: DragonBrowserExecutionBackend::Cpu,
+            block_size: 8,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 2,
+            max_train_batches: Some(1),
+            max_eval_batches: Some(1),
+            capability_policy: Default::default(),
+            training_lease: None,
+            train_source: DragonBrowserTokenSource::GeneratedNca {
+                corpus: tiny_nca_corpus_config(),
+                split: DragonBrowserDatasetSplit::Train,
+                max_documents: Some(1),
+            },
+            eval_source: None,
+            live_participant: None,
+        };
+        let err = run_browser_training_with_release_manifest(
+            "https://example.invalid",
+            &config,
+            &dummy_release_manifest(),
+        )
+        .await
+        .expect_err("composite browser objective should be guarded");
+        assert!(
+            err.to_string()
+                .contains("browser training is only wired for next_token execution"),
+            "unexpected error: {err}"
+        );
     }
 
     #[wasm_bindgen_test(async)]

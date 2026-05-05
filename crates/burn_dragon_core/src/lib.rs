@@ -6,6 +6,7 @@ pub mod constants;
 pub mod experimental;
 pub mod kernel;
 pub mod model;
+pub mod objective;
 pub mod positional;
 
 pub use model::LanguageModuleLrScaleTarget;
@@ -84,6 +85,7 @@ pub mod api {
         pub use crate::constants;
         pub use crate::kernel;
         pub use crate::model;
+        pub use crate::objective;
         pub use crate::positional;
     }
 }

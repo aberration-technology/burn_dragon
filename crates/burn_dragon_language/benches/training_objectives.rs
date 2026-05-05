@@ -2,9 +2,7 @@ use burn::tensor::backend::Backend as BackendTrait;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_dragon_language::SelfDistillationKlKind;
 use burn_dragon_language::loss::language_model_loss;
-use burn_dragon_language::train::{
-    clipped_policy_loss, selected_token_log_probs, self_distillation_loss_from_logits,
-};
+use burn_dragon_language::train::self_distillation_loss_from_logits;
 use burn_ndarray::NdArray;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -60,25 +58,13 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
 
-    let old_log_probs = selected_token_log_probs(
-        burn_dragon_language::train::log_probs_from_logits(teacher_logits.clone()),
-        targets.clone(),
-    );
-    let new_log_probs = selected_token_log_probs(
-        burn_dragon_language::train::log_probs_from_logits(student_logits.clone()),
-        targets,
-    );
-    let advantage = Tensor::<BenchBackend, 2>::ones([batch, time], &device());
-
-    c.bench_function("sdpo_clipped_policy_loss", |b| {
+    c.bench_function("sdpo_js_distillation_flat_logits", |b| {
         b.iter(|| {
-            black_box(clipped_policy_loss::<BenchBackend>(
-                new_log_probs.clone(),
-                old_log_probs.clone(),
-                advantage.clone(),
+            black_box(self_distillation_loss_from_logits::<BenchBackend>(
+                student_logits.clone(),
+                teacher_logits.clone(),
                 None,
-                Some(0.2),
-                1.0,
+                SelfDistillationKlKind::JensenShannon,
             ))
             .to_data()
         })

@@ -11,8 +11,8 @@ pub use load::load_training_config;
 pub use schema::{
     DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
     ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, RepromptTruncation, SdftObjectiveConfig,
-    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
-    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
+    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
     ValidationDatasetConfig,
 };
 

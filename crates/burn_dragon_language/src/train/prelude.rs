@@ -53,7 +53,9 @@ pub(crate) use serde::Serialize;
 
 pub(crate) use crate::config::{
     DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    TrainingConfig, TrainingHyperparameters, ValidationDatasetConfig,
+    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
 };
 pub(crate) use crate::dataset::{
     Dataset, DatasetSplit, RandomDataLoader, SequenceBatch, StreamingDataLoader, build_dataset,
@@ -67,7 +69,15 @@ pub(crate) use crate::tokenizer::TokenizerConfig;
 pub(crate) use crate::{ContextStrategyConfig, GenerationConfig, ModelOverrides};
 
 pub(crate) use crate::loss::language_model_loss;
-pub(crate) use crate::train::objective::{ObjectiveTrainerKind, ensure_objective_supported};
+pub(crate) use crate::train::objective::{
+    ObjectiveTrainerKind, RolloutObjectiveRuntimeConstraints, SelectedTokenDistillationHiddenBatch,
+    SelectedTokenSdpoLossConfig, assert_flat_logits_for_rollout_objective, clipped_policy_loss,
+    ensure_objective_supported, ensure_rollout_objective_runtime, log_probs_from_logits,
+    masked_token_mean, sdpo_token_advantage, selected_token_distillation_loss_from_hidden,
+    selected_token_log_prob_mse_loss, selected_token_log_probs,
+    selected_token_log_probs_from_hidden, selected_token_sdpo_loss_from_hidden,
+    self_distillation_loss_from_logits, self_distillation_per_token_from_log_probs,
+};
 pub(crate) use crate::train::steps::LanguageTrainModel;
 pub(crate) use burn_dragon_core::{DragonConfig, DragonModel, LanguagePipelineState, ModelState};
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;

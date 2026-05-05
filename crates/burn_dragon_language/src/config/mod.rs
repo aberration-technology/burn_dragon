@@ -11,7 +11,7 @@ pub use core::{
 #[cfg(feature = "train")]
 pub use train::{
     DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
-    TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
+    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
 };

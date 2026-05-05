@@ -206,22 +206,10 @@ where
         ParallelismKind::Single => {
             LearningStrategy::Default(ExecutionStrategy::single(env.device.clone()))
         }
-        ParallelismKind::Ddp => {
-            #[cfg(feature = "ddp")]
-            {
-                LearningStrategy::Default(ExecutionStrategy::ddp(
-                    env.devices.to_vec(),
-                    resolve_collective_config(env.parallel_runtime, env.parallel_config)?,
-                ))
-            }
-            #[cfg(not(feature = "ddp"))]
-            {
-                LearningStrategy::Default(ExecutionStrategy::multi(
-                    env.devices.to_vec(),
-                    MultiDeviceOptim::OptimMainDevice,
-                ))
-            }
-        }
+        ParallelismKind::Ddp => LearningStrategy::Default(ExecutionStrategy::multi(
+            env.devices.to_vec(),
+            MultiDeviceOptim::OptimMainDevice,
+        )),
         mode => {
             return Err(anyhow!(
                 "parallel.mode={mode:?} is not wired into language training yet"
@@ -1299,15 +1287,10 @@ where
 }
 
 #[cfg(feature = "ddp")]
-fn train_with_collective_pipeline_scheduler<B, S>(
+fn train_with_collective_pipeline_scheduler<B, O, S>(
     env: &TrainEnvironment<'_, B>,
     mut learner: burn_train::Learner<
-        burn_train::LearningComponentsMarker<
-            B,
-            S,
-            LanguageTrainModel<B>,
-            OptimizerAdaptor<AdamW, LanguageTrainModel<B>, B>,
-        >,
+        burn_train::LearningComponentsMarker<B, S, LanguageTrainModel<B>, O>,
     >,
     local_train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
     peer_id: PeerId,
@@ -1317,6 +1300,7 @@ fn train_with_collective_pipeline_scheduler<B, S>(
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
+    O: Optimizer<LanguageTrainModel<B>, B> + 'static,
     S: LrScheduler + 'static,
 {
     let global_train_steps = env.train_loader.num_items();
@@ -2027,6 +2011,150 @@ mod tests {
         training.epochs = Some(epochs);
         training.resume_checkpoint_epoch = resume_checkpoint_epoch;
         training
+    }
+
+    fn objective_training_hparams(objective: TrainingObjectiveConfig) -> TrainingHyperparameters {
+        let mut training = tiny_training_hparams();
+        training.objective = objective;
+        training
+    }
+
+    fn single_device_scheduler_smoke(objective: TrainingObjectiveConfig, run_name: &str) -> f32 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+
+        let primary_device = <TestBackend as BackendTrait>::Device::default();
+        TestBackend::seed(&primary_device, 11);
+        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let train_batches = vec![
+            make_batch::<TestBackend>(
+                &primary_device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            ),
+            make_batch::<TestBackend>(
+                &primary_device,
+                &[7, 6, 5, 4, 3, 2, 1, 0],
+                &[6, 5, 4, 3, 2, 1, 0, 7],
+                [2, 4],
+            ),
+        ];
+        let valid_batches = vec![make_batch::<TestValidBackend>(
+            &valid_device,
+            &[0, 0, 1, 1, 2, 2, 3, 3],
+            &[0, 1, 1, 2, 2, 3, 3, 0],
+            [2, 4],
+        )];
+
+        let training = objective_training_hparams(objective.clone());
+        let model_config = tiny_model_config();
+        let devices = vec![primary_device.clone()];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name,
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &primary_device,
+            devices: &devices,
+            train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
+            valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            epochs: 1,
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &primary_device,
+        ))
+        .with_training_objective(objective);
+        let optimizer = AdamWConfig::new()
+            .with_weight_decay(0.0)
+            .init::<TestBackend, LanguageTrainModel<TestBackend>>();
+
+        let trained =
+            train_with_scheduler(&env, model, optimizer, 1e-3).expect("objective scheduler train");
+        assert!(run_dir.join("checkpoint").join("model-1.bin").is_file());
+
+        let probe = make_batch::<TestValidBackend>(
+            &valid_device,
+            &[1, 2, 3, 4, 4, 3, 2, 1],
+            &[2, 3, 4, 5, 3, 2, 1, 0],
+            [2, 4],
+        );
+        language_model_loss::<TestValidBackend>(trained.forward(probe.inputs), probe.targets)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("loss vec")[0]
+    }
+
+    #[test]
+    fn train_with_scheduler_accepts_next_token_objective_toggle() {
+        let loss = single_device_scheduler_smoke(
+            TrainingObjectiveConfig::NextToken,
+            "single-next-token-objective-smoke",
+        );
+        assert!(loss.is_finite(), "next_token smoke loss must be finite");
+    }
+
+    #[test]
+    fn train_with_scheduler_accepts_sdft_objective_toggle() {
+        let loss = single_device_scheduler_smoke(
+            TrainingObjectiveConfig::Sdft(SdftObjectiveConfig {
+                max_completion_tokens: 2,
+                top_k: Some(1),
+                generate_from_teacher: true,
+                num_loss_tokens_to_skip: 1,
+                ..Default::default()
+            }),
+            "single-sdft-objective-smoke",
+        );
+        assert!(loss.is_finite(), "SDFT smoke loss must be finite");
+    }
+
+    #[test]
+    fn train_with_scheduler_accepts_sdpo_objective_toggle() {
+        let loss = single_device_scheduler_smoke(
+            TrainingObjectiveConfig::Sdpo(SdpoObjectiveConfig {
+                group_size: 2,
+                max_completion_tokens: 2,
+                top_k: Some(1),
+                ..Default::default()
+            }),
+            "single-sdpo-objective-smoke",
+        );
+        assert!(loss.is_finite(), "SDPO smoke loss must be finite");
+    }
+
+    #[test]
+    fn train_with_scheduler_accepts_composite_sdft_sdpo_objective_toggle() {
+        let loss = single_device_scheduler_smoke(
+            TrainingObjectiveConfig::SdftSdpo(SdftSdpoObjectiveConfig {
+                sdft: SdftObjectiveConfig {
+                    max_completion_tokens: 2,
+                    top_k: Some(1),
+                    ..Default::default()
+                },
+                sdpo: SdpoObjectiveConfig {
+                    group_size: 2,
+                    max_completion_tokens: 2,
+                    top_k: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            "single-sdft-sdpo-objective-smoke",
+        );
+        assert!(
+            loss.is_finite(),
+            "composite SDFT/SDPO smoke loss must be finite"
+        );
     }
 
     #[cfg(feature = "ddp")]

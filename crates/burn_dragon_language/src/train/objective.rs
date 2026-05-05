@@ -1,202 +1,86 @@
-use crate::config::{SelfDistillationKlKind, TrainingObjectiveConfig, TrainingObjectiveKind};
-use burn::tensor::activation;
-use burn::tensor::backend::Backend as BackendTrait;
-use burn::tensor::{Int, Tensor};
+use crate::config::TrainingObjectiveConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectiveTrainerKind {
-    SingleDevice,
-    Browser,
-    Ddp,
-    Pipeline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectiveSupport {
-    FullySupported,
-    ConfigAndNumericsOnly,
-}
+pub use burn_dragon_core::objective::{
+    ObjectiveSupport, ObjectiveTrainerKind, SelectedTokenDistillationHiddenBatch,
+    SelectedTokenSdpoLossConfig, SelfDistillationObjectiveKind, WindowSelfDistillationObjective,
+    WindowSelfDistillationSmokeObjective, clipped_policy_loss,
+    ensure_objective_supported as ensure_objective_kind_supported, log_probs_from_logits,
+    masked_token_mean, objective_support as objective_kind_support, sdpo_token_advantage,
+    selected_token_distillation_loss_from_hidden, selected_token_log_prob_mse_loss,
+    selected_token_log_probs, selected_token_log_probs_from_hidden,
+    selected_token_sdpo_loss_from_hidden, self_distillation_loss_from_log_probs,
+    self_distillation_loss_from_logits, self_distillation_per_token_from_log_probs,
+    window_sdft_loss, window_sdpo_loss, window_self_distillation_loss,
+    window_self_distillation_smoke_loss, window_smoke_sdft_loss, window_smoke_sdpo_loss,
+};
 
 pub fn objective_support(
     objective: &TrainingObjectiveConfig,
     trainer: ObjectiveTrainerKind,
 ) -> ObjectiveSupport {
-    match (objective.kind(), trainer) {
-        (TrainingObjectiveKind::NextToken, _) => ObjectiveSupport::FullySupported,
-        (TrainingObjectiveKind::Sdft | TrainingObjectiveKind::Sdpo, _) => {
-            ObjectiveSupport::ConfigAndNumericsOnly
-        }
-    }
+    objective_kind_support(objective.kind(), trainer)
 }
 
 pub fn ensure_objective_supported(
     objective: &TrainingObjectiveConfig,
     trainer: ObjectiveTrainerKind,
 ) -> anyhow::Result<()> {
-    if objective_support(objective, trainer) == ObjectiveSupport::FullySupported {
+    ensure_objective_kind_supported(objective.kind(), trainer).map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RolloutObjectiveRuntimeConstraints {
+    pub uses_flat_token_logits: bool,
+    pub distributed_pipeline: bool,
+    pub tbptt_enabled: bool,
+}
+
+pub fn ensure_rollout_objective_runtime(
+    objective: &TrainingObjectiveConfig,
+    constraints: RolloutObjectiveRuntimeConstraints,
+) -> anyhow::Result<()> {
+    if objective.is_next_token() {
         return Ok(());
     }
-    let objective = match objective.kind() {
-        TrainingObjectiveKind::NextToken => "next_token",
-        TrainingObjectiveKind::Sdft => "sdft",
-        TrainingObjectiveKind::Sdpo => "sdpo",
-    };
-    let trainer = match trainer {
-        ObjectiveTrainerKind::SingleDevice => "single-device",
-        ObjectiveTrainerKind::Browser => "browser",
-        ObjectiveTrainerKind::Ddp => "ddp",
-        ObjectiveTrainerKind::Pipeline => "pipeline",
-    };
-    Err(anyhow::anyhow!(
-        "training.objective.type={objective} is configured, but {trainer} training is only wired for the next_token objective; SDFT/SDPO config and numerical kernels are available, and the rollout objective driver must be enabled before running this objective"
-    ))
-}
-
-pub fn log_probs_from_logits<B: BackendTrait>(logits: Tensor<B, 3>) -> Tensor<B, 3> {
-    let [batch, time, vocab] = logits.shape().dims();
-    activation::log_softmax(logits.reshape([batch * time, vocab]), 1).reshape([batch, time, vocab])
-}
-
-pub fn selected_token_log_probs<B: BackendTrait>(
-    log_probs: Tensor<B, 3>,
-    targets: Tensor<B, 2, Int>,
-) -> Tensor<B, 2> {
-    let [batch, time, _vocab] = log_probs.shape().dims();
-    log_probs
-        .gather(2, targets.reshape([batch, time, 1]))
-        .reshape([batch, time])
-}
-
-pub fn self_distillation_loss_from_log_probs<B: BackendTrait>(
-    student_log_probs: Tensor<B, 3>,
-    teacher_log_probs: Tensor<B, 3>,
-    mask: Option<Tensor<B, 2, Int>>,
-    kind: SelfDistillationKlKind,
-) -> Tensor<B, 1> {
-    let per_token = match kind {
-        SelfDistillationKlKind::Forward => {
-            kl_per_token(teacher_log_probs.clone(), student_log_probs.clone())
-        }
-        SelfDistillationKlKind::Reverse => kl_per_token(student_log_probs, teacher_log_probs),
-        SelfDistillationKlKind::JensenShannon => {
-            let student_prob = student_log_probs.clone().exp();
-            let teacher_prob = teacher_log_probs.clone().exp();
-            let mixture_log_probs = (student_prob + teacher_prob)
-                .mul_scalar(0.5)
-                .clamp_min(1e-12)
-                .log();
-            let teacher_kl = kl_per_token(teacher_log_probs, mixture_log_probs.clone());
-            let student_kl = kl_per_token(student_log_probs, mixture_log_probs);
-            (teacher_kl + student_kl).mul_scalar(0.5)
-        }
-    };
-    masked_token_mean(per_token, mask)
-}
-
-pub fn self_distillation_loss_from_logits<B: BackendTrait>(
-    student_logits: Tensor<B, 3>,
-    teacher_logits: Tensor<B, 3>,
-    mask: Option<Tensor<B, 2, Int>>,
-    kind: SelfDistillationKlKind,
-) -> Tensor<B, 1> {
-    self_distillation_loss_from_log_probs(
-        log_probs_from_logits(student_logits),
-        log_probs_from_logits(teacher_logits),
-        mask,
-        kind,
-    )
-}
-
-pub fn sdpo_token_advantage<B: BackendTrait>(
-    teacher_token_log_probs: Tensor<B, 2>,
-    student_token_log_probs: Tensor<B, 2>,
-    mask: Option<Tensor<B, 2, Int>>,
-    normalize: bool,
-    epsilon: f32,
-) -> Tensor<B, 2> {
-    let advantage = teacher_token_log_probs - student_token_log_probs;
-    let advantage = if let Some(mask) = mask {
-        advantage * mask.float()
-    } else {
-        advantage
-    };
-    if !normalize {
-        return advantage;
+    let kind = objective.kind();
+    if !constraints.uses_flat_token_logits {
+        return Err(anyhow::anyhow!(
+            "training.objective.type={:?} requires language_head.type=\"standard_token_classification\" for paper-aligned full-logit distillation",
+            kind
+        ));
     }
-    let [batch, time] = advantage.shape().dims();
-    let mean = advantage
-        .clone()
-        .mean_dim(0)
-        .mean_dim(1)
-        .repeat_dim(0, batch)
-        .repeat_dim(1, time);
-    let centered = advantage - mean;
-    let var = centered
-        .clone()
-        .powf_scalar(2.0)
-        .mean_dim(0)
-        .mean_dim(1)
-        .repeat_dim(0, batch)
-        .repeat_dim(1, time);
-    centered / var.add_scalar(epsilon.max(1e-12)).sqrt()
-}
-
-pub fn clipped_policy_loss<B: BackendTrait>(
-    log_prob_new: Tensor<B, 2>,
-    log_prob_old: Tensor<B, 2>,
-    advantage: Tensor<B, 2>,
-    mask: Option<Tensor<B, 2, Int>>,
-    clip_range: Option<f32>,
-    weight: f32,
-) -> Tensor<B, 1> {
-    let weight = weight.max(0.0);
-    if weight <= 0.0 {
-        return Tensor::<B, 1>::zeros([1], &log_prob_new.device());
+    if constraints.distributed_pipeline {
+        return Err(anyhow::anyhow!(
+            "training.objective.type={:?} with distributed process-group pipeline training is not wired yet; use single-process pipeline, single-device, or DDP objective training",
+            kind
+        ));
     }
-    let objective = if let Some(clip) = clip_range.filter(|clip| *clip > 0.0) {
-        let log_ratio = (log_prob_new - log_prob_old)
-            .clamp_min(-20.0)
-            .clamp_max(20.0);
-        let ratio = log_ratio.exp();
-        let clipped = ratio.clone().clamp_min(1.0 - clip).clamp_max(1.0 + clip);
-        let surrogate = ratio * advantage.clone();
-        let surrogate_clipped = clipped * advantage;
-        let use_clipped = surrogate_clipped.clone().lower_equal(surrogate.clone());
-        surrogate.mask_where(use_clipped, surrogate_clipped)
-    } else {
-        log_prob_new * advantage
-    };
-    masked_token_mean(objective.mul_scalar(-weight), mask)
-}
-
-fn kl_per_token<B: BackendTrait>(
-    left_log_probs: Tensor<B, 3>,
-    right_log_probs: Tensor<B, 3>,
-) -> Tensor<B, 2> {
-    let [batch, time, _vocab] = left_log_probs.shape().dims();
-    (left_log_probs.clone().exp() * (left_log_probs - right_log_probs))
-        .sum_dim(2)
-        .reshape([batch, time])
-}
-
-fn masked_token_mean<B: BackendTrait>(
-    values: Tensor<B, 2>,
-    mask: Option<Tensor<B, 2, Int>>,
-) -> Tensor<B, 1> {
-    if let Some(mask) = mask {
-        let mask = mask.float();
-        return (values * mask.clone())
-            .sum()
-            .div(mask.sum().clamp_min(1.0))
-            .reshape([1]);
+    if constraints.tbptt_enabled {
+        return Err(anyhow::anyhow!(
+            "training.objective.type={:?} does not yet support tbptt_chunk_size or tbptt_persist_across_steps",
+            kind
+        ));
     }
-    values.mean().reshape([1])
+    Ok(())
+}
+
+pub fn assert_flat_logits_for_rollout_objective(
+    objective: &TrainingObjectiveConfig,
+    uses_factorized_language_head: bool,
+) {
+    assert!(
+        objective.is_next_token() || !uses_factorized_language_head,
+        "paper-aligned SDFT/SDPO rollout objectives require flat token logits; factorized heads only expose selected-token smoke losses"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SelfDistillationKlKind;
     use burn::tensor::TensorData;
+    use burn::tensor::backend::Backend as BackendTrait;
+    use burn::tensor::{Int, Tensor};
     use burn_ndarray::NdArray;
 
     type TestBackend = NdArray<f32>;
@@ -219,6 +103,41 @@ mod tests {
             .convert::<f32>()
             .into_vec::<f32>()
             .expect("scalar vec")[0]
+    }
+
+    #[test]
+    fn support_matrix_distinguishes_active_native_rollouts_from_guarded_trainers() {
+        let sdft = TrainingObjectiveConfig::Sdft(Default::default());
+        let sdpo = TrainingObjectiveConfig::Sdpo(Default::default());
+        let composite = TrainingObjectiveConfig::SdftSdpo(Default::default());
+
+        assert_eq!(
+            objective_support(
+                &TrainingObjectiveConfig::NextToken,
+                ObjectiveTrainerKind::Browser
+            ),
+            ObjectiveSupport::FullySupported
+        );
+        assert_eq!(
+            objective_support(&sdft, ObjectiveTrainerKind::SingleDevice),
+            ObjectiveSupport::FullySupported
+        );
+        assert_eq!(
+            objective_support(&sdpo, ObjectiveTrainerKind::Ddp),
+            ObjectiveSupport::FullySupported
+        );
+        assert_eq!(
+            objective_support(&sdft, ObjectiveTrainerKind::Pipeline),
+            ObjectiveSupport::FullySupported
+        );
+        assert_eq!(
+            objective_support(&sdpo, ObjectiveTrainerKind::Browser),
+            ObjectiveSupport::ConfigAndNumericsOnly
+        );
+        assert_eq!(
+            objective_support(&composite, ObjectiveTrainerKind::SingleDevice),
+            ObjectiveSupport::FullySupported
+        );
     }
 
     #[test]
@@ -298,5 +217,15 @@ mod tests {
         assert!(advantage[0] < 0.0);
         assert!(advantage[1] > 0.0);
         assert!((advantage[0] + advantage[1]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn selected_token_distillation_matches_teacher_log_prob() {
+        let student =
+            Tensor::<TestBackend, 2>::from_data(TensorData::new(vec![-2.0], [1, 1]), &device());
+        let teacher =
+            Tensor::<TestBackend, 2>::from_data(TensorData::new(vec![-0.5], [1, 1]), &device());
+        let loss = scalar(selected_token_log_prob_mse_loss(student, teacher, None));
+        assert!((loss - 2.25).abs() < 1e-5);
     }
 }

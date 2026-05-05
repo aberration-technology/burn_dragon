@@ -1,116 +1,16 @@
 use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 
-use burn_dragon_core::{DragonConfig, ResidualConnectorKind};
+use burn_dragon_core::{
+    DragonConfig, ResidualConnectorKind, objective::validate_training_objective_config,
+};
 use burn_dragon_train::{
     LearningRateScheduleConfig, ParallelismKind, PipelineCommunicationKind, PipelineScheduleKind,
     TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
 };
 
-use super::{DatasetSourceConfig, TrainingConfig, TrainingObjectiveConfig};
+use super::{DatasetSourceConfig, TrainingConfig};
 use crate::tokenizer::TokenizerKind;
-
-fn validate_probability(value: f32, path: &str) -> Result<()> {
-    if !(0.0..=1.0).contains(&value) {
-        return Err(anyhow!("{path} must be in [0, 1] (got {value})"));
-    }
-    Ok(())
-}
-
-fn validate_positive_f32(value: f32, path: &str) -> Result<()> {
-    if value <= 0.0 || !value.is_finite() {
-        return Err(anyhow!("{path} must be finite and > 0 (got {value})"));
-    }
-    Ok(())
-}
-
-fn validate_optional_nonempty(value: Option<&String>, path: &str) -> Result<()> {
-    if let Some(value) = value
-        && value.trim().is_empty()
-    {
-        return Err(anyhow!("{path} must not be empty when set"));
-    }
-    Ok(())
-}
-
-fn validate_training_objective(objective: &TrainingObjectiveConfig) -> Result<()> {
-    match objective {
-        TrainingObjectiveConfig::NextToken => Ok(()),
-        TrainingObjectiveConfig::Sdft(config) => {
-            if config.max_completion_tokens == 0 {
-                return Err(anyhow!(
-                    "training.objective.max_completion_tokens must be > 0"
-                ));
-            }
-            validate_positive_f32(config.temperature, "training.objective.temperature")?;
-            if let Some(top_k) = config.top_k
-                && top_k == 0
-            {
-                return Err(anyhow!("training.objective.top_k must be > 0 when set"));
-            }
-            validate_probability(
-                config.teacher_update_rate,
-                "training.objective.teacher_update_rate",
-            )?;
-            if let Some(quantile) = config.top_entropy_quantile {
-                validate_probability(quantile, "training.objective.top_entropy_quantile")?;
-            }
-            Ok(())
-        }
-        TrainingObjectiveConfig::Sdpo(config) => {
-            if config.group_size == 0 {
-                return Err(anyhow!("training.objective.group_size must be > 0"));
-            }
-            if config.max_completion_tokens == 0 {
-                return Err(anyhow!(
-                    "training.objective.max_completion_tokens must be > 0"
-                ));
-            }
-            validate_positive_f32(config.temperature, "training.objective.temperature")?;
-            if let Some(top_k) = config.top_k
-                && top_k == 0
-            {
-                return Err(anyhow!("training.objective.top_k must be > 0 when set"));
-            }
-            validate_probability(config.alpha, "training.objective.alpha")?;
-            if !config.success_reward_threshold.is_finite() {
-                return Err(anyhow!(
-                    "training.objective.success_reward_threshold must be finite"
-                ));
-            }
-            validate_probability(
-                config.teacher_update_rate,
-                "training.objective.teacher_update_rate",
-            )?;
-            if let Some(topk) = config.distillation_topk
-                && topk == 0
-            {
-                return Err(anyhow!(
-                    "training.objective.distillation_topk must be > 0 when set"
-                ));
-            }
-            if let Some(is_clip) = config.is_clip {
-                validate_positive_f32(is_clip, "training.objective.is_clip")?;
-            }
-            if config.max_reprompt_len == 0 {
-                return Err(anyhow!("training.objective.max_reprompt_len must be > 0"));
-            }
-            validate_optional_nonempty(
-                config.reprompt_template.as_ref(),
-                "training.objective.reprompt_template",
-            )?;
-            validate_optional_nonempty(
-                config.solution_template.as_ref(),
-                "training.objective.solution_template",
-            )?;
-            validate_optional_nonempty(
-                config.feedback_template.as_ref(),
-                "training.objective.feedback_template",
-            )?;
-            Ok(())
-        }
-    }
-}
 
 impl TrainingConfig {
     pub fn validate(&self) -> Result<()> {
@@ -826,7 +726,7 @@ impl TrainingConfig {
             ));
         }
 
-        validate_training_objective(&self.training.objective)?;
+        validate_training_objective_config(&self.training.objective)?;
 
         if let Some(n_layer) = self.model.n_layer
             && n_layer == 0
@@ -1293,6 +1193,7 @@ impl TrainingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TrainingObjectiveConfig;
 
     fn parse_config(extra_training: &str) -> TrainingConfig {
         let toml = format!(
@@ -1360,6 +1261,89 @@ alpha = 1.25
             err.to_string().contains("training.objective.alpha"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sdft_rejects_unwired_top_entropy_quantile() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdft"
+top_entropy_quantile = 0.25
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("unwired SDFT entropy mask should fail");
+        assert!(
+            err.to_string().contains("top_entropy_quantile"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sdpo_rejects_unwired_reward_feedback_fields() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdpo"
+success_reward_threshold = 1.0
+include_environment_feedback = true
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("unwired SDPO reward/feedback fields should fail");
+        assert!(
+            err.to_string().contains("success_reward_threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sdpo_rejects_unwired_topk_fields() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdpo"
+distillation_topk = 100
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("unwired SDPO top-k distillation should fail");
+        assert!(
+            err.to_string().contains("distillation_topk"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sdft_sdpo_composite_objective_config_validates() {
+        let config = parse_config(
+            r#"
+[training.objective]
+type = "sdft_sdpo"
+sdft_weight = 0.25
+sdpo_weight = 0.75
+
+[training.objective.sdft]
+max_completion_tokens = 2
+generate_from_teacher = true
+
+[training.objective.sdpo]
+group_size = 2
+max_completion_tokens = 2
+alpha = 0.25
+"#,
+        );
+        assert!(matches!(
+            config.training.objective,
+            TrainingObjectiveConfig::SdftSdpo(_)
+        ));
+        config
+            .validate()
+            .expect("composite SDFT/SDPO objective validates");
     }
 
     #[test]

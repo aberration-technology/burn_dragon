@@ -1191,6 +1191,7 @@ impl TrainingConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::config::TrainingObjectiveConfig;
@@ -1344,6 +1345,39 @@ alpha = 0.25
         config
             .validate()
             .expect("composite SDFT/SDPO objective validates");
+    }
+
+    #[test]
+    fn reservoir_model_initialization_config_validates() {
+        let config = parse_config(
+            r#"
+[model]
+n_layer = 1
+n_embd = 32
+n_head = 4
+latent_total = 64
+
+[model.initialization]
+kind = "reservoir"
+
+[model.initialization.reservoir]
+seed = 1337
+density = 0.08
+encoder_value_scale = 0.70
+decoder_scale = 1.00
+
+[model.initialization.topology_prior]
+kind = "modular_bridges"
+community_count = 4
+bridge_fraction = 0.03
+intra_community_gain = 1.5
+inter_community_gain = 0.5
+bridge_gain = 1.0
+"#,
+        );
+        config
+            .validate()
+            .expect("reservoir model initialization validates");
     }
 
     #[test]

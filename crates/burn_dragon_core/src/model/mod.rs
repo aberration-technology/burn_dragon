@@ -45,9 +45,9 @@ pub use init::{
     DragonActivationThresholds, DragonFiringTargetConfig, DragonFiringTargetKind,
     DragonInitializationConfig, DragonInitializationKind, DragonInitializer,
     DragonNeuronGainConfig, DragonNeuronGainKind, DragonProjectionRole,
-    DragonResidualScalingConfig, DragonResidualScalingKind, DragonTopologyPriorConfig,
-    DragonTopologyPriorKind, near_critical_embedding_initializer, near_critical_embedding_std,
-    near_critical_projection_std, near_critical_residual_output_std,
+    DragonReservoirInitializationConfig, DragonResidualScalingConfig, DragonResidualScalingKind,
+    DragonTopologyPriorConfig, DragonTopologyPriorKind, near_critical_embedding_initializer,
+    near_critical_embedding_std, near_critical_projection_std, near_critical_residual_output_std,
 };
 pub use mhc::{
     ManifoldHyperConnectionCoefficientPolicy, ManifoldHyperConnectionCoefficients,

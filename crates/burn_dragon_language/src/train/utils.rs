@@ -213,6 +213,11 @@ pub(crate) fn build_model_spec(model_config: &DragonConfig) -> ModelSpec {
         dragon_neuron_gain_kind: model_config.initialization.neuron_gains.kind,
         dragon_topology_prior_kind: model_config.initialization.topology_prior.kind,
         dragon_firing_target_kind: model_config.initialization.firing_targets.kind,
+        dragon_reservoir_initialization: matches!(
+            model_config.initialization.kind,
+            DragonInitializationKind::Reservoir
+        )
+        .then(|| ReservoirInitializationSpec::from(&model_config.initialization.reservoir)),
     }
 }
 
@@ -249,6 +254,53 @@ pub(crate) fn build_parallel_spec(config: &TrainingConfig) -> ParallelSpec {
             .max_inflight_microbatches,
         pipeline_cache_eviction: config.parallel.pipeline.cache.eviction,
         pipeline_cache_transport_dtype: config.parallel.pipeline.cache.transport_dtype,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use burn_dragon_core::{
+        DragonInitializationConfig, DragonReservoirInitializationConfig, DragonTopologyPriorConfig,
+        DragonTopologyPriorKind,
+    };
+
+    #[test]
+    fn model_spec_records_reservoir_initialization_details_only_for_reservoir_runs() {
+        let baseline = DragonConfig::default();
+        assert!(
+            build_model_spec(&baseline)
+                .dragon_reservoir_initialization
+                .is_none()
+        );
+
+        let reservoir = DragonConfig {
+            initialization: DragonInitializationConfig {
+                kind: DragonInitializationKind::Reservoir,
+                topology_prior: DragonTopologyPriorConfig {
+                    kind: DragonTopologyPriorKind::ModularBridges,
+                    ..Default::default()
+                },
+                reservoir: DragonReservoirInitializationConfig {
+                    seed: 1337,
+                    density: 0.12,
+                    encoder_value_scale: 0.5,
+                    decoder_scale: 1.25,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let spec = build_model_spec(&reservoir);
+        let reservoir_spec = spec
+            .dragon_reservoir_initialization
+            .expect("reservoir metadata");
+        assert_eq!(reservoir_spec.seed, 1337);
+        assert_eq!(reservoir_spec.density, 0.12);
+        assert_eq!(reservoir_spec.encoder_value_scale, 0.5);
+        assert_eq!(reservoir_spec.decoder_scale, 1.25);
     }
 }
 

@@ -127,7 +127,6 @@ pub struct SharedLowrankFeatureMetrics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedLowrankParamIds {
-    pub rwkv_time_decay: burn::module::ParamId,
     pub encoder: burn::module::ParamId,
     pub encoder_v: burn::module::ParamId,
     pub decoder: burn::module::ParamId,
@@ -162,7 +161,6 @@ impl<B: Backend> DragonModel<B> {
 
     pub fn shared_lowrank_param_ids(&self) -> SharedLowrankParamIds {
         SharedLowrankParamIds {
-            rwkv_time_decay: self.rwkv_time_decay.id,
             encoder: self.encoder.id,
             encoder_v: self.encoder_v.id,
             decoder: self.decoder.id,
@@ -248,7 +246,7 @@ impl<B: Backend> DragonModel<B> {
         }
 
         let mut updated = self.clone();
-        let [heads, _embd, latent_per_head] = self.encoder.val().shape().dims::<3>();
+        let [_heads, _embd, latent_per_head] = self.encoder.val().shape().dims::<3>();
         let selected = feature_indices
             .iter()
             .copied()
@@ -273,15 +271,6 @@ impl<B: Backend> DragonModel<B> {
             &selected,
             latent_per_head,
         ));
-
-        let rwkv_shape = updated.rwkv_time_decay.val().shape().dims::<2>();
-        if rwkv_shape == [heads, latent_per_head] {
-            updated.rwkv_time_decay = Param::from_tensor(replace_selected_2d_features_from_fresh(
-                updated.rwkv_time_decay.val(),
-                fresh.rwkv_time_decay.val(),
-                &selected,
-            ));
-        }
 
         updated
     }
@@ -320,32 +309,6 @@ fn replace_selected_3d_features_from_fresh<B: Backend>(
         TensorData::new(current_values, [heads, embd, latent_per_head]),
         &device,
     )
-}
-
-fn replace_selected_2d_features_from_fresh<B: Backend>(
-    current: Tensor<B, 2>,
-    fresh: Tensor<B, 2>,
-    selected: &[usize],
-) -> Tensor<B, 2> {
-    let device = current.device();
-    let [rows, cols] = current.shape().dims::<2>();
-    let mut current_values = current
-        .to_data()
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .expect("2d tensor to vec");
-    let fresh_values = fresh
-        .to_data()
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .expect("fresh 2d tensor to vec");
-    for local_idx in selected.iter().copied().filter(|idx| *idx < cols) {
-        for row in 0..rows {
-            let flat = row * cols + local_idx;
-            current_values[flat] = fresh_values[flat];
-        }
-    }
-    Tensor::<B, 2>::from_data(TensorData::new(current_values, [rows, cols]), &device)
 }
 
 fn zero_selected_2d_rows<B: Backend>(

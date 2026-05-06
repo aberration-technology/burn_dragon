@@ -8,8 +8,8 @@ use burn_p2p::{
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentOptInPolicy,
     ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadPromotionMode,
     HeadPromotionPolicy, MergeStrategy, MergeTopologyPolicy, NetworkId, NetworkManifest, PeerRole,
-    PeerRoleSet, Precision, ProjectFamilyId, RevisionId, RevisionManifest, StudyId,
-    SupportedWorkload, TrainingProtocol, WindowActivation, WindowId, WorkloadId,
+    PeerRoleSet, Precision, ProjectFamilyId, RevisionId, RevisionManifest, RobustnessPolicy,
+    StudyId, SupportedWorkload, TrainingProtocol, WindowActivation, WindowId, WorkloadId,
 };
 use sha2::{Digest, Sha256};
 
@@ -95,6 +95,17 @@ fn dragon_diffusion_merge_topology(experiment_kind: DragonExperimentKind) -> Mer
             ..HeadPromotionPolicy::default()
         },
     }
+}
+
+fn dragon_robustness_policy(experiment_kind: DragonExperimentKind) -> RobustnessPolicy {
+    let mut policy = RobustnessPolicy::balanced();
+    policy.validator_canary_policy.minimum_evaluator_quorum = 1;
+
+    if matches!(experiment_kind, DragonExperimentKind::NcaPrepretraining) {
+        policy.validator_canary_policy.maximum_regression_delta = 1.0;
+    }
+
+    policy
 }
 
 fn browser_trainer_wgpu_enabled(
@@ -297,6 +308,7 @@ pub fn build_manifest_bundle(
         metadata,
     };
     profile.attach_to_entry(&mut experiment_directory_entry)?;
+    let robustness_policy = dragon_robustness_policy(experiment_kind);
     experiment_directory_entry.apply_revision_policy(&RevisionManifest {
         experiment_id: experiment_id.clone(),
         revision_id: RevisionId::new(&seed.revision_id),
@@ -325,7 +337,7 @@ pub fn build_manifest_bundle(
         },
         lag_policy: Default::default(),
         merge_window_miss_policy: Default::default(),
-        robustness_policy: None,
+        robustness_policy: Some(robustness_policy),
         browser_enabled: profile.browser.is_some(),
         browser_role_policy: BrowserRolePolicy {
             observer: true,
@@ -612,6 +624,16 @@ mod tests {
                 .expect("diffusion policy")
                 .artifact_sync_timeout_secs,
             DRAGON_DIFFUSION_ARTIFACT_SYNC_TIMEOUT_SECS
+        );
+
+        let robustness = entry.robustness_policy().expect("robustness policy");
+        assert_eq!(
+            robustness.validator_canary_policy.minimum_evaluator_quorum,
+            topology.promotion_policy.validator_quorum
+        );
+        assert_eq!(
+            robustness.validator_canary_policy.maximum_regression_delta,
+            1.0
         );
     }
 }

@@ -87,7 +87,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -449,7 +456,7 @@ jobs:
                 --output json | tee "$artifact_dir/repair-head-mirror-seed-urls-command.json" || true
             fi
 
-            python3 -c 'import json; from pathlib import Path; commands=[line.rstrip("\n") for line in Path("scripts/bootstrap-inspect-commands.txt").read_text().splitlines() if line.strip()]; Path("/tmp/burn-dragon-inspect-params.json").write_text(json.dumps({"commands": commands}))'
+            cargo run -p xtask -- write-bootstrap-inspect-params /tmp/burn-dragon-inspect-params.json
 
             command_id="$(aws ssm send-command \
               --region "$AWS_REGION" \

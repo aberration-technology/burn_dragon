@@ -14,7 +14,7 @@ on:
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
       - ".github/workflows/publish-crates.yml"
-      - "scripts/**"
+      - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "cubecl.toml"
@@ -35,7 +35,7 @@ on:
       - ".github/workflows/deploy-pages.yml"
       - ".github/workflows/publish-readiness.yml"
       - ".github/workflows/publish-crates.yml"
-      - "scripts/**"
+      - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "cubecl.toml"
@@ -63,7 +63,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -72,7 +79,7 @@ jobs:
       - run: cargo build --manifest-path Cargo.toml -p xtask
       - run: target/debug/xtask deployment-script-checks
       - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/deploy-pages.yml',\n  '.github/workflows/live-browser-canary.yml',\n  '.github/workflows/live-native-training-canary.yml',\n  '.github/workflows/p2p-validation.yml',\n  '.github/workflows/publish-crates.yml',\n  '.github/workflows/publish-readiness.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
-      - run: node --check scripts/live-browser-canary.mjs
+      - run: node --check xtask/assets/live-browser-canary.mjs
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_time -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings
@@ -95,7 +102,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -137,7 +151,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -163,7 +184,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

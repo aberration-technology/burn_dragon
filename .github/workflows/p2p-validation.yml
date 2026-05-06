@@ -37,7 +37,14 @@ jobs:
         with:
           repository: aberration-technology/burn_p2p
           ref: 87b9aabd49421088fd050695ee7553175d13eeb1
-          path: ../burn_p2p
+          path: burn_p2p-sibling
+      - name: link burn_p2p path dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_WORKSPACE}/../burn_p2p"
+          rm -rf "$target"
+          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
 
       - name: setup rust toolchain
         uses: dtolnay/rust-toolchain@stable

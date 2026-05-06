@@ -15370,6 +15370,7 @@ name = "xtask"
 version = "0.21.0-pre.33"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "burn_dragon_p2p",
  "burn_p2p",
  "burn_p2p_app",
@@ -15381,6 +15382,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "wasm-bindgen-cli-support",
 ]
 

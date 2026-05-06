@@ -1,6 +1,10 @@
 mod agent_task;
+mod bootstrap_runtime;
+mod bootstrap_settings;
 mod browser_site;
 mod deploy_settings;
+mod native_canary;
+mod workflow_contracts;
 mod workflow_tools;
 
 use std::ffi::OsString;
@@ -39,6 +43,9 @@ enum CommandKind {
     SummarizeInspection(workflow_tools::SummarizeInspectionArgs),
     ExtractDeploymentDiagnostics(workflow_tools::ExtractDeploymentDiagnosticsArgs),
     WriteInspectionSummary(workflow_tools::WriteInspectionSummaryArgs),
+    WriteBootstrapInspectParams {
+        output_path: PathBuf,
+    },
     RenderHeadMirrorSeedRepairCommands,
     CheckDeploymentGuardrails,
     DeploymentGuardrailReport,
@@ -105,6 +112,9 @@ fn main() -> Result<()> {
         }
         CommandKind::WriteInspectionSummary(args) => {
             workflow_tools::write_inspection_summary(&args)
+        }
+        CommandKind::WriteBootstrapInspectParams { output_path } => {
+            workflow_tools::write_bootstrap_inspect_params(&output_path)
         }
         CommandKind::RenderHeadMirrorSeedRepairCommands => {
             workflow_tools::render_head_mirror_seed_repair_commands()
@@ -459,36 +469,7 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn deployment_script_checks() -> Result<()> {
-    let xtask_bin = std::env::current_exe().context("resolve current xtask binary")?;
-    let xtask_env = [(
-        OsString::from("BURN_DRAGON_XTASK_BIN"),
-        xtask_bin.into_os_string(),
-    )];
-    for script in [
-        "scripts/test_agent_task.py",
-        "scripts/test_bootstrap_runtime_sync.py",
-        "scripts/test_bootstrap_instance_selection.py",
-        "scripts/test_bootstrap_head_mirror_seed_urls.py",
-        "scripts/test_head_mirror_admin_capability.py",
-        "scripts/test_cleanup_workflow.py",
-        "scripts/test_deployment_strategy.py",
-        "scripts/test_deployment_version_sync.py",
-        "scripts/test_deployment_guardrails.py",
-        "scripts/test_prod_low_resource_p2p_config.py",
-        "scripts/test_deploy_pages_workflow.py",
-        "scripts/test_browser_site_training_config.py",
-        "scripts/test_local_browser_e2e_plan.py",
-        "scripts/test_live_browser_canary_script.py",
-        "scripts/test_live_browser_canary_workflow.py",
-        "scripts/test_live_native_training_canary.py",
-        "scripts/test_browser_transport_terraform.py",
-        "scripts/test_browser_profile_budget.py",
-        "scripts/test_native_peer_transport_config.py",
-        "scripts/test_edge_caddyfile.py",
-    ] {
-        run_with_env("python3", &[script], &xtask_env)?;
-    }
-    Ok(())
+    workflow_contracts::run()
 }
 
 fn run_with_env(program: &str, args: &[&str], envs: &[(OsString, OsString)]) -> Result<()> {

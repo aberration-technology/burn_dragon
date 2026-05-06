@@ -241,7 +241,7 @@ fn run_live_browser_canary_with_env(overrides: &[(&str, String)]) -> Result<()> 
             format!("report_path={output_json}"),
         ],
     )?;
-    run("node", &["scripts/live-browser-canary.mjs"], overrides)
+    run("node", &["xtask/assets/live-browser-canary.mjs"], overrides)
 }
 
 pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> Result<()> {
@@ -681,6 +681,20 @@ pub fn write_inspection_summary(args: &WriteInspectionSummaryArgs) -> Result<()>
     Ok(())
 }
 
+pub fn write_bootstrap_inspect_params(output_path: &Path) -> Result<()> {
+    let commands = include_str!("../assets/bootstrap-inspect-commands.txt")
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    fs::write(
+        output_path,
+        serde_json::to_string(&json!({ "commands": commands }))?,
+    )
+    .with_context(|| format!("failed to write {}", output_path.display()))?;
+    Ok(())
+}
+
 pub fn render_head_mirror_seed_repair_commands() -> Result<()> {
     let private_ip = required_env("BOOTSTRAP_PRIVATE_IP")?;
     let replacement = format!("seed_node_urls = [\\n  \"/ip4/{private_ip}/tcp/4001\",\\n]\\n");
@@ -734,31 +748,15 @@ pub fn deployment_guardrail_report() -> Result<()> {
 }
 
 pub fn resolve_bootstrap_stack_settings(args: &BootstrapStackSettingsArgs) -> Result<()> {
-    // Keep the old shell implementation behind the xtask entrypoint until the
-    // large env-resolution surface is retired. Workflows should call this xtask
-    // command, not the script file directly.
-    let mode = match args.mode {
-        BootstrapStackSettingsMode::Deploy => "deploy",
-        BootstrapStackSettingsMode::Restore => "restore",
-    };
-    run(
-        "bash",
-        &["scripts/resolve_bootstrap_stack_settings.sh", mode],
-        &[],
-    )
+    crate::bootstrap_settings::resolve(args.mode)
 }
 
 pub fn sync_bootstrap_runtime_config() -> Result<()> {
-    // See note in resolve_bootstrap_stack_settings: this is intentionally
-    // centralized behind xtask while the remote AWS/SSM shell body is ported.
-    run("bash", &["scripts/sync-bootstrap-runtime-config.sh"], &[])
+    crate::bootstrap_runtime::sync_bootstrap_runtime_config()
 }
 
 pub fn run_live_native_training_canary() -> Result<()> {
-    // The native canary orchestrates multiple long-lived peer processes and is
-    // still backed by the existing Python implementation. The workflow entry
-    // point is xtask so this can be ported without touching CI YAML again.
-    run("python3", &["scripts/live_native_training_canary.py"], &[])
+    crate::native_canary::run()
 }
 
 pub fn publish_crates(args: &PublishCratesArgs) -> Result<()> {

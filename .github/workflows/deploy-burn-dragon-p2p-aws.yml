@@ -443,6 +443,18 @@ jobs:
             echo "head_mirror_binary_sha256=${head_mirror_binary_sha256}"
           } >>"$GITHUB_OUTPUT"
 
+      - name: build deployment xtask
+        run: cargo build --manifest-path Cargo.toml --locked -p xtask
+
+      - name: refresh aws credentials after local builds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: burn-dragon-deploy-builds-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
       - name: setup terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -832,6 +844,15 @@ jobs:
             echo "bootstrap_head_mirror_auth_bundle_parameter_name=$bootstrap_head_mirror_auth_bundle_parameter_name"
           } >>"$GITHUB_OUTPUT"
 
+      - name: refresh aws credentials before runtime sync
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: burn-dragon-runtime-sync-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
       - name: sync bootstrap runtime config and restart services
         shell: bash
         env:
@@ -859,7 +880,7 @@ jobs:
           HEAD_MIRROR_REINSTALL: "false"
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          cargo run -p xtask -- sync-bootstrap-runtime-config
+          target/debug/xtask sync-bootstrap-runtime-config
 
       - name: ensure bootstrap edge service is enabled and active
         shell: bash
@@ -1374,7 +1395,7 @@ jobs:
             exit 0
           fi
 
-          cargo run -p xtask -- summarize-deployment-diagnostics "$report_path" >>"$GITHUB_STEP_SUMMARY"
+          target/debug/xtask summarize-deployment-diagnostics "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload deployment diagnostics artifact
         if: ${{ always() && steps.deployment_diagnostics.outputs.report_path != '' }}
@@ -1395,7 +1416,7 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
-        run: cargo run -p xtask -- dispatch-pages-deploy-and-wait
+        run: target/debug/xtask dispatch-pages-deploy-and-wait
 
       - name: verify live native canonical training dynamics
         id: live_native_training_canary
@@ -1423,7 +1444,7 @@ jobs:
           BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION: "false"
           BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS: "60"
           BURN_DRAGON_NATIVE_CANARY_WATCH_TIMEOUT_SECS: "5400"
-        run: cargo run -p xtask -- dispatch-native-training-canary-and-wait
+        run: target/debug/xtask dispatch-native-training-canary-and-wait
 
       - name: publish workflow summary
         if: ${{ always() }}

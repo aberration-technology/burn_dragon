@@ -252,8 +252,13 @@ fn deployment_workflow_contracts() -> Result<()> {
         )?;
         require_contains(
             &text,
-            "cargo run -p xtask -- sync-bootstrap-runtime-config",
+            "target/debug/xtask sync-bootstrap-runtime-config",
             "bootstrap runtime sync is xtask owned",
+        )?;
+        require_contains(
+            &text,
+            "refresh aws credentials before runtime sync",
+            "runtime sync refreshes AWS credentials after long builds",
         )?;
         require_contains(
             &text,

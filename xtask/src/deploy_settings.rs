@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use burn_p2p::{BrowserEdgeSnapshot, ExperimentId, ExperimentScope};
 use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use clap::Args;
@@ -468,11 +468,11 @@ fn normalized_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_requested_scopes, canonicalize_browser_seed_urls, dedupe_csv_seed_urls,
-        default_canary_principal_id, edge_base_url_from_domain, first_nonempty,
-        is_dialable_browser_seed, is_direct_browser_seed, is_webrtc_direct_browser_seed,
-        prefer_validated_browser_seed_urls, resolve_pages_deploy_settings_inner,
-        ResolvePagesDeploySettingsArgs,
+        ResolvePagesDeploySettingsArgs, browser_requested_scopes, canonicalize_browser_seed_urls,
+        dedupe_csv_seed_urls, default_canary_principal_id, edge_base_url_from_domain,
+        first_nonempty, is_dialable_browser_seed, is_direct_browser_seed,
+        is_webrtc_direct_browser_seed, prefer_validated_browser_seed_urls,
+        resolve_pages_deploy_settings_inner,
     };
     use burn_p2p::ExperimentScope;
 
@@ -610,9 +610,11 @@ mod tests {
             vec!["/dns4/example.com/tcp/443/wss".to_owned()]
         );
         assert_eq!(settings.site_host, "dragon.example");
-        assert!(settings
-            .requested_scopes
-            .contains(&ExperimentScope::Connect));
+        assert!(
+            settings
+                .requested_scopes
+                .contains(&ExperimentScope::Connect)
+        );
         assert_eq!(
             settings.requested_scopes,
             browser_requested_scopes("climbmix-pretraining")

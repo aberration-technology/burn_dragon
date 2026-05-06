@@ -7,10 +7,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 const DEFAULT_INTERVAL_SECS: u64 = 180;
 const DEFAULT_DISCOVER_TIMEOUT_SECS: u64 = 150;
@@ -453,10 +453,11 @@ fn command_gh_dispatch(args: GhDispatchArgs) -> Result<i32> {
     );
     task.insert(
         "github_status".into(),
-        json!(run
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default()),
+        json!(
+            run.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ),
     );
     write_task(&task_dir, &task)?;
     write_github_output(&task)?;

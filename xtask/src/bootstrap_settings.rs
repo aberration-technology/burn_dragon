@@ -2,8 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, ensure, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
 
 use crate::workflow_tools::BootstrapStackSettingsMode;
 
@@ -937,7 +937,9 @@ fn resolve_artifact_settings(
         && create_replica_bucket != "true"
         && replica_bucket_name.is_empty()
     {
-        bail!("artifact_replica_bucket_name is required when disaster recovery is set and create_artifact_replica_bucket=false");
+        bail!(
+            "artifact_replica_bucket_name is required when disaster recovery is set and create_artifact_replica_bucket=false"
+        );
     }
     Ok(ArtifactSettings {
         create_bucket,
@@ -985,7 +987,9 @@ fn resolve_restore_snapshot_id(
         .to_owned();
     }
     if snapshot_id.is_empty() || snapshot_id == "None" {
-        bail!("missing bootstrap restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots");
+        bail!(
+            "missing bootstrap restore snapshot id; provide one explicitly or enable restore_from_latest_snapshots with matching tagged snapshots"
+        );
     }
     Ok(snapshot_id)
 }
@@ -1184,7 +1188,9 @@ fn validate_bootstrap_install(
         bail!("bootstrap_git_ref is required when bootstrap_install_source=git");
     }
     if auth_connector_kind == "github" && install_source == "crate" && version == "0.21.0-pre.15" {
-        bail!("burn_p2p_bootstrap 0.21.0-pre.15 is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate");
+        bail!(
+            "burn_p2p_bootstrap 0.21.0-pre.15 is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate"
+        );
     }
     Ok(())
 }

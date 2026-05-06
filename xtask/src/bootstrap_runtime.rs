@@ -4,9 +4,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 pub fn sync_bootstrap_runtime_config() -> Result<()> {
@@ -82,7 +82,9 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
             &format!("{}/portal/snapshot", edge_base_url.trim_end_matches('/')),
             true,
         ) {
-            eprintln!("warning: failed to preserve bootstrap current heads from {edge_base_url}: {error:#}");
+            eprintln!(
+                "warning: failed to preserve bootstrap current heads from {edge_base_url}: {error:#}"
+            );
         }
     }
 
@@ -784,10 +786,6 @@ trait IfEmpty {
 
 impl IfEmpty for String {
     fn if_empty(self, fallback: String) -> String {
-        if self.is_empty() {
-            fallback
-        } else {
-            self
-        }
+        if self.is_empty() { fallback } else { self }
     }
 }

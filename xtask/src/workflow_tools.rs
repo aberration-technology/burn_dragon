@@ -6,12 +6,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::deploy_settings::{resolve_pages_deploy_settings_inner, ResolvePagesDeploySettingsArgs};
+use crate::deploy_settings::{ResolvePagesDeploySettingsArgs, resolve_pages_deploy_settings_inner};
 
 const MONTHLY_HOURS: f64 = 730.0;
 const PUBLIC_IPV4_HOURLY_USD: f64 = 0.005;
@@ -482,8 +482,16 @@ pub fn summarize_live_native_training_canary(
             json_value_display(&window, "p2p_wait_secs", "n/a"),
             json_value_display(&p2p_signal, "head_announcements", "n/a"),
             json_value_display(&p2p_signal, "update_announcements", "n/a"),
-            json_value_display(&p2p_signal, "trainer_promotion_attestation_announcements", "n/a"),
-            json_value_display(&p2p_signal, "diffusion_promotion_certificate_announcements", "n/a"),
+            json_value_display(
+                &p2p_signal,
+                "trainer_promotion_attestation_announcements",
+                "n/a"
+            ),
+            json_value_display(
+                &p2p_signal,
+                "diffusion_promotion_certificate_announcements",
+                "n/a"
+            ),
         );
     }
     Ok(())

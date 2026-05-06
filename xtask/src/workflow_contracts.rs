@@ -360,12 +360,13 @@ fn native_canary_contracts() -> Result<()> {
     for snippet in [
         "repository: aberration-technology/burn_p2p",
         "cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native",
-        "cargo run -p xtask -- run-live-native-training-canary",
-        "cargo run -p xtask -- summarize-live-native-training-canary",
+        "cargo build --locked -p xtask",
+        "target/debug/xtask run-live-native-training-canary",
+        "target/debug/xtask summarize-live-native-training-canary",
         "BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}",
         "BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: \"300\"",
-        "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: \"480\"",
-        "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: \"300\"",
+        "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: ${{ github.event.inputs.canonical_timeout_secs || '480' }}",
+        "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}",
     ] {
         require_contains(&workflow, snippet, "live native canary workflow")?;
     }

@@ -373,6 +373,10 @@ jobs:
                 --command-id "$restart_command_id" \
                 --instance-id "$instance_id" \
                 --output json | tee "$artifact_dir/restart-edge-services-command.json" || true
+              if [ "${restart_invocation_status:-}" != "Success" ]; then
+                echo "restart edge services SSM command did not succeed: ${restart_invocation_status:-missing}" >&2
+                exit 1
+              fi
             fi
 
             if [ "${REPAIR_EDGE_TLS}" = "true" ]; then
@@ -412,6 +416,10 @@ jobs:
                 --command-id "$repair_command_id" \
                 --instance-id "$instance_id" \
                 --output json | tee "$artifact_dir/repair-edge-tls-command.json" || true
+              if [ "${repair_invocation_status:-}" != "Success" ]; then
+                echo "repair edge TLS SSM command did not succeed: ${repair_invocation_status:-missing}" >&2
+                exit 1
+              fi
             fi
 
             if [ "${REPAIR_HEAD_MIRROR_SEED_URLS}" = "true" ]; then
@@ -454,6 +462,10 @@ jobs:
                 --command-id "$repair_head_mirror_command_id" \
                 --instance-id "$instance_id" \
                 --output json | tee "$artifact_dir/repair-head-mirror-seed-urls-command.json" || true
+              if [ "${repair_head_mirror_invocation_status:-}" != "Success" ]; then
+                echo "repair head mirror seed URLs SSM command did not succeed: ${repair_head_mirror_invocation_status:-missing}" >&2
+                exit 1
+              fi
             fi
 
             cargo run -p xtask -- write-bootstrap-inspect-params /tmp/burn-dragon-inspect-params.json
@@ -488,6 +500,10 @@ jobs:
               --command-id "$command_id" \
               --instance-id "$instance_id" \
               --output json | tee "$artifact_dir/inspect-command-output.json" || true
+            if [ "${invocation_status:-}" != "Success" ]; then
+              echo "bootstrap inspection SSM command did not succeed: ${invocation_status:-missing}" >&2
+              exit 1
+            fi
 
             cargo run -p xtask -- extract-deployment-diagnostics "$artifact_dir/inspect-command-output.json" "$artifact_dir/bootstrap-deployment-diagnostics.json"
           fi

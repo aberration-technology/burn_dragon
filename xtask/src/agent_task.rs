@@ -242,6 +242,7 @@ pub fn dispatch_native_training_canary_and_wait() -> Result<()> {
         common: CommonTaskArgs::default(),
         wait_options: WaitOptions {
             interval_secs: env_u64("BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS", 60),
+            timeout_secs: env_u64("BURN_DRAGON_NATIVE_CANARY_WATCH_TIMEOUT_SECS", 5400),
             exit_status: true,
             wait: true,
             ..WaitOptions::default()
@@ -280,6 +281,16 @@ pub fn dispatch_native_training_canary_and_wait() -> Result<()> {
                 "command_timeout_secs",
                 "BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS",
                 "900",
+            ),
+            input_env_default(
+                "canonical_timeout_secs",
+                "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS",
+                "480",
+            ),
+            input_env_default(
+                "p2p_timeout_secs",
+                "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS",
+                "300",
             ),
             input_env_default(
                 "start_validator",

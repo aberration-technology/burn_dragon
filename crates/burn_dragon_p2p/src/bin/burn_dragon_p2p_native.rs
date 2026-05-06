@@ -56,9 +56,9 @@ use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ControlPlaneSnapshot,
-    ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentScope,
-    HeadAnnouncement, HeadPromotionMode, LiveControlPlaneEvent, MetricValue,
-    NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
+    ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentHandle, ExperimentId,
+    ExperimentScope, HeadAnnouncement, HeadDescriptor, HeadPromotionMode, LiveControlPlaneEvent,
+    MetricValue, NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
     RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
@@ -83,6 +83,8 @@ const NATIVE_AUTH_CALLBACK_MAX_BODY_BYTES: usize = 512 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const TRAIN_WINDOW_P2P_REDIAL_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_TRAIN_WINDOW_HEAD_SYNC_TIMEOUT_SECS: u64 = 300;
 const NATIVE_BROWSER_APP_BASE_URL_ENV: &str = "BURN_DRAGON_P2P_BROWSER_APP_BASE_URL";
 const NATIVE_STORAGE_ROOT_ENV: &str = "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT";
@@ -2793,6 +2795,12 @@ where
             local_peer_id,
             started.elapsed().as_millis()
         );
+        ensure_p2p_publication_connectivity(
+            &running,
+            config,
+            "before canonical head sync",
+            TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT,
+        )?;
         let experiment = running.mainnet().experiment(
             experiment_entry.study_id.clone(),
             experiment_entry.experiment_id.clone(),
@@ -2837,6 +2845,19 @@ where
             outcome.timing.publish_latency_ms,
             started.elapsed().as_millis()
         );
+        ensure_p2p_publication_connectivity(
+            &running,
+            config,
+            "after local training before diffusion publication",
+            TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT,
+        )?;
+        publish_train_window_head(
+            &running,
+            &experiment,
+            &local_peer_id,
+            &outcome.head,
+            "after local training",
+        )?;
         let mut diffusion_settlement = None;
         if options.settle_diffusion || options.serve_after_publish_secs > 0 {
             if directory_entry_promotes_with_diffusion(&experiment_entry) {
@@ -2853,6 +2874,19 @@ where
                             pass,
                             started.elapsed().as_millis(),
                         );
+                        ensure_p2p_publication_connectivity(
+                            &running,
+                            config,
+                            "before diffusion settle pass",
+                            TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT,
+                        )?;
+                        publish_train_window_head(
+                            &running,
+                            &experiment,
+                            &local_peer_id,
+                            &outcome.head,
+                            "before diffusion settle pass",
+                        )?;
                         running.advance_diffusion_steady_state(
                             &experiment,
                             Some(outcome.lease.window_id),
@@ -2887,12 +2921,38 @@ where
                     let mut last_status = Instant::now()
                         .checked_sub(status_interval)
                         .unwrap_or_else(Instant::now);
+                    let mut last_head_announcement = last_status;
                     eprintln!(
                         "train-window-once progress: serving published artifact for {}s elapsed_ms={}",
                         options.serve_after_publish_secs,
                         started.elapsed().as_millis()
                     );
+                    ensure_p2p_publication_connectivity(
+                        &running,
+                        config,
+                        "before serving published artifact",
+                        TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT,
+                    )?;
                     while Instant::now() < serve_deadline {
+                        let mut connected_peers = running.snapshot().connected_peers;
+                        if connected_peers == 0 {
+                            connected_peers = ensure_p2p_publication_connectivity(
+                                &running,
+                                config,
+                                "while serving published artifact",
+                                TRAIN_WINDOW_P2P_CONNECTIVITY_TIMEOUT,
+                            )?;
+                        }
+                        if last_head_announcement.elapsed() >= status_interval {
+                            publish_train_window_head(
+                                &running,
+                                &experiment,
+                                &local_peer_id,
+                                &outcome.head,
+                                "while serving published artifact",
+                            )?;
+                            last_head_announcement = Instant::now();
+                        }
                         if options.settle_diffusion {
                             eprintln!(
                                 "train-window-once progress: diffusion serve pass starting elapsed_ms={}",
@@ -2917,7 +2977,7 @@ where
                         if last_status.elapsed() >= status_interval {
                             eprintln!(
                                 "train-window-once progress: serving status connected_peers={} merge_windows={} updates={} attestations={} certificates={} merges={} last_error={} elapsed_ms={}",
-                                snapshot.connected_peers,
+                                connected_peers,
                                 snapshot.control_plane.merge_window_announcements.len(),
                                 snapshot.control_plane.update_announcements.len(),
                                 snapshot
@@ -3848,6 +3908,133 @@ where
         }
         thread::sleep(STATUS_POLL_INTERVAL);
     }
+}
+
+fn ensure_p2p_publication_connectivity<B>(
+    running: &ManagedRunningNativePeer<B>,
+    config: &DragonNativePeerConfig,
+    context: &str,
+    timeout: Duration,
+) -> Result<usize>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    let bootstrap_peers = config.effective_bootstrap_peers()?;
+    if bootstrap_peers.is_empty() {
+        let connected_peers = running.snapshot().connected_peers;
+        eprintln!(
+            "train-window-once progress: p2p connectivity check skipped context={context:?} reason=no-bootstrap-peers connected_peers={connected_peers}"
+        );
+        return Ok(connected_peers);
+    }
+
+    let control = running.control_handle();
+    let deadline = Instant::now() + timeout;
+    let mut last_dial = Instant::now()
+        .checked_sub(TRAIN_WINDOW_P2P_REDIAL_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_dial_errors = Vec::new();
+
+    loop {
+        let snapshot = running.snapshot();
+        if snapshot.connected_peers > 0 {
+            eprintln!(
+                "train-window-once progress: p2p connectivity ready context={context:?} connected_peers={} seeds={}",
+                snapshot.connected_peers,
+                bootstrap_peers.len(),
+            );
+            return Ok(snapshot.connected_peers);
+        }
+        match snapshot.status {
+            RuntimeStatus::Failed => {
+                bail!(
+                    "train-window-once runtime failed while waiting for p2p connectivity {context:?}: {}",
+                    snapshot.last_error.as_deref().unwrap_or("unknown error"),
+                );
+            }
+            RuntimeStatus::Stopped => {
+                bail!(
+                    "train-window-once runtime stopped while waiting for p2p connectivity {context:?}"
+                );
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            let last_error = operator_visible_last_error(snapshot.last_error.as_deref())
+                .unwrap_or_else(|| "-".into());
+            let seed_preview = bootstrap_peers
+                .iter()
+                .take(4)
+                .map(|address| address.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dial_errors = if last_dial_errors.is_empty() {
+                "-".to_owned()
+            } else {
+                last_dial_errors.join("; ")
+            };
+            bail!(
+                "train-window-once p2p connectivity unavailable {context:?} after {}s; connected_peers=0 seeds={} seed_preview=[{}] last_error={} dial_errors={}",
+                timeout.as_secs(),
+                bootstrap_peers.len(),
+                seed_preview,
+                last_error,
+                dial_errors,
+            );
+        }
+
+        if last_dial.elapsed() >= TRAIN_WINDOW_P2P_REDIAL_INTERVAL {
+            last_dial_errors.clear();
+            for address in &bootstrap_peers {
+                if let Err(error) = control.dial_address(address.clone()) {
+                    last_dial_errors.push(format!("{}: {error}", address.as_str()));
+                }
+            }
+            let last_error = operator_visible_last_error(snapshot.last_error.as_deref())
+                .unwrap_or_else(|| "-".into());
+            eprintln!(
+                "train-window-once progress: waiting for p2p connectivity context={context:?} connected_peers=0 seeds={} dial_errors={} last_error={}",
+                bootstrap_peers.len(),
+                last_dial_errors.len(),
+                last_error,
+            );
+            last_dial = Instant::now();
+        }
+
+        thread::sleep(STATUS_POLL_INTERVAL);
+    }
+}
+
+fn publish_train_window_head<B>(
+    running: &ManagedRunningNativePeer<B>,
+    experiment: &ExperimentHandle,
+    local_peer_id: &PeerId,
+    head: &HeadDescriptor,
+    context: &str,
+) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+{
+    running
+        .control_handle()
+        .publish_head(HeadAnnouncement {
+            overlay: experiment.overlay_set()?.heads,
+            provider_peer_id: Some(local_peer_id.clone()),
+            head: head.clone(),
+            announced_at: chrono::Utc::now(),
+        })
+        .with_context(|| {
+            format!(
+                "failed to announce train-window-once head {} {context}",
+                head.head_id.as_str()
+            )
+        })?;
+    eprintln!(
+        "train-window-once progress: announced published head context={context:?} head={} step={}",
+        head.head_id.as_str(),
+        head.global_step,
+    );
+    Ok(())
 }
 
 fn load_native_config(path: &Path, format: ConfigFormat) -> Result<DragonNativePeerConfig> {

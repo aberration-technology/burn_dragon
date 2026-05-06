@@ -61,6 +61,14 @@ on:
         description: Per native command timeout
         required: false
         default: "900"
+      canonical_timeout_secs:
+        description: Seconds to wait for canonical head advancement after a native training window
+        required: false
+        default: "480"
+      p2p_timeout_secs:
+        description: Seconds to wait for the canonical head to be visible through the P2P bootstrap snapshot
+        required: false
+        default: "300"
       start_validator:
         description: Start a colocated validator during the canary. Leave disabled for the standard trainer-only diffusion deployment.
         required: false
@@ -116,8 +124,8 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '2' }}
       BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}
       BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION: ${{ github.event.inputs.require_canonical_loss_non_regression || 'false' }}
-      BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "480"
-      BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
+      BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: ${{ github.event.inputs.canonical_timeout_secs || '480' }}
+      BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
       BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json
       BURN_DRAGON_NATIVE_CANARY_BINARY: target/debug/burn_dragon_p2p_native
@@ -146,12 +154,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: build native canary binary
-        run: cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native
+      - name: build native canary tools
+        run: |
+          cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native
+          cargo build --locked -p xtask
 
       - name: run live native training canary
         id: live_native_training_canary
-        run: cargo run -p xtask -- run-live-native-training-canary
+        run: target/debug/xtask run-live-native-training-canary
 
       - name: summarize live native training canary
         if: ${{ always() }}
@@ -162,7 +172,7 @@ jobs:
           if [ ! -f "$report_path" ]; then
             exit 0
           fi
-          cargo run -p xtask -- summarize-live-native-training-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"
+          target/debug/xtask summarize-live-native-training-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload live native training canary artifact
         if: ${{ always() }}

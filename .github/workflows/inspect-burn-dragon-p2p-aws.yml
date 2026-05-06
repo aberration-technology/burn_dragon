@@ -82,6 +82,14 @@ jobs:
 
       - name: checkout
         uses: actions/checkout@v4
+      - name: checkout burn_p2p sibling
+        uses: actions/checkout@v4
+        with:
+          repository: aberration-technology/burn_p2p
+          ref: 87b9aabd49421088fd050695ee7553175d13eeb1
+          path: ../burn_p2p
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: inspect bootstrap instance
         id: inspect
@@ -406,7 +414,7 @@ jobs:
               fi
 
               BOOTSTRAP_PRIVATE_IP="$bootstrap_private_ip" \
-                python3 scripts/render_head_mirror_seed_repair_commands.py \
+                cargo run -p xtask -- render-head-mirror-seed-repair-commands \
                 > /tmp/repair-head-mirror-seed-params.json
 
               repair_head_mirror_command_id="$(aws ssm send-command \
@@ -474,14 +482,12 @@ jobs:
               --instance-id "$instance_id" \
               --output json | tee "$artifact_dir/inspect-command-output.json" || true
 
-            python3 scripts/extract_deployment_diagnostics_from_ssm_output.py \
-              "$artifact_dir/inspect-command-output.json" \
-              "$artifact_dir/bootstrap-deployment-diagnostics.json"
+            cargo run -p xtask -- extract-deployment-diagnostics "$artifact_dir/inspect-command-output.json" "$artifact_dir/bootstrap-deployment-diagnostics.json"
           fi
 
           printf '%s\n' "${ssm_status:-missing}" >"$artifact_dir/ssm-status.txt"
 
-          python3 scripts/write_inspection_summary.py "$artifact_dir"
+          cargo run -p xtask -- write-inspection-summary "$artifact_dir"
 
       - name: summarize inspection
         if: ${{ always() && steps.inspect.outputs.artifact_dir != '' }}
@@ -494,24 +500,7 @@ jobs:
             exit 0
           fi
 
-          python3 - "$summary_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import sys
-
-          summary = json.load(open(sys.argv[1]))
-          print("## inspection summary")
-          print()
-          print(f"- Instance id: `{summary.get('instance_id') or 'unknown'}`")
-          print(f"- SSM status: `{summary.get('ssm_status') or 'unknown'}`")
-          print(f"- Deployment ready: `{summary.get('deployment_ready')}`")
-          print(f"- Profile source: `{summary.get('profile_source') or 'unknown'}`")
-          print(f"- Matching head present: `{summary.get('matching_head_present')}`")
-          print(f"- Matching head id: `{summary.get('matching_head_id') or 'none'}`")
-          blockers = summary.get("blocking_issues") or []
-          warnings = summary.get("observed_warnings") or []
-          print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")
-          print(f"- Warnings: `{', '.join(warnings) if warnings else 'none'}`")
-          PY
+          cargo run -p xtask -- summarize-inspection "$summary_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload inspection artifact bundle
         if: ${{ always() && steps.inspect.outputs.artifact_dir != '' }}

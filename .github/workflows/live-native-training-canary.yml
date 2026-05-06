@@ -128,7 +128,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: checkout burn_p2p sibling
-        run: scripts/ensure-burn-p2p-sibling.sh
+        uses: actions/checkout@v4
+        with:
+          repository: aberration-technology/burn_p2p
+          ref: 87b9aabd49421088fd050695ee7553175d13eeb1
+          path: ../burn_p2p
 
       - name: setup rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -140,7 +144,7 @@ jobs:
 
       - name: run live native training canary
         id: live_native_training_canary
-        run: python3 scripts/live_native_training_canary.py
+        run: cargo run -p xtask -- run-live-native-training-canary
 
       - name: summarize live native training canary
         if: ${{ always() }}
@@ -151,54 +155,7 @@ jobs:
           if [ ! -f "$report_path" ]; then
             exit 0
           fi
-          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import sys
-
-          report = json.load(open(sys.argv[1]))
-          windows = report.get("windows") or []
-          print("## live native training canary")
-          print()
-          print(f"- Success: `{report.get('success', False)}`")
-          print(f"- Edge: `{report.get('edge_base_url')}`")
-          print(f"- Experiment: `{report.get('experiment_id')}`")
-          print(f"- Backend: `{report.get('backend')}`")
-          print(f"- Head sync timeout: `{report.get('head_sync_timeout_secs')}s`")
-          print(f"- Settle diffusion: `{report.get('settle_diffusion')}`")
-          print(f"- Diffusion settle passes: `{report.get('diffusion_settle_passes')}`")
-          print(f"- Serve after publish: `{report.get('serve_after_publish_secs')}s`")
-          print(f"- Start local validator: `{report.get('start_local_validator')}`")
-          print(f"- Training batch size: `{report.get('training_batch_size')}`")
-          print(f"- Training max iters: `{report.get('training_max_iters')}`")
-          print(f"- Evaluation max batches: `{report.get('evaluation_max_batches')}`")
-          print(f"- Head before: `{(report.get('head_before') or {}).get('head_id')}`")
-          print(f"- Head after: `{(report.get('head_after') or {}).get('head_id')}`")
-          print(f"- Windows: `{len(windows)}`")
-          for window in windows:
-              before = (window.get("head_before") or {}).get("head_id")
-              after = (window.get("head_after") or {}).get("head_id")
-              train = window.get("train_report") or {}
-              settlement = train.get("diffusion_settlement") or {}
-              train_signal = window.get("train_signal") or {}
-              canonical_signal = window.get("canonical_signal") or {}
-              p2p_signal = window.get("p2p_signal") or {}
-              print(
-                  f"  - window `{window.get('window_index')}`: "
-                  f"`{before}` -> `{after}`, "
-                  f"published `{train.get('published_head_id')}`, "
-                  f"train loss `{train_signal.get('train_loss')}`, "
-                  f"canonical loss `{canonical_signal.get('canonical_loss_after')}`, "
-                  f"canonical improved `{canonical_signal.get('canonical_loss_improved')}`, "
-                  f"canonical wait `{window.get('canonical_wait_secs'):.1f}s`, "
-                  f"settlement passes `{settlement.get('passes_completed')}`, "
-                  f"settlement certs `{settlement.get('certificates')}`, "
-                  f"p2p wait `{window.get('p2p_wait_secs'):.1f}s`, "
-                  f"p2p heads `{p2p_signal.get('head_announcements')}`, "
-                  f"p2p updates `{p2p_signal.get('update_announcements')}`, "
-                  f"p2p attestations `{p2p_signal.get('trainer_promotion_attestation_announcements')}`, "
-                  f"p2p diffusion certs `{p2p_signal.get('diffusion_promotion_certificate_announcements')}`"
-              )
-          PY
+          cargo run -p xtask -- summarize-live-native-training-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload live native training canary artifact
         if: ${{ always() }}

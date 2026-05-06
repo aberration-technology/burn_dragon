@@ -76,7 +76,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: checkout burn_p2p sibling
-        run: scripts/ensure-burn-p2p-sibling.sh
+        uses: actions/checkout@v4
+        with:
+          repository: aberration-technology/burn_p2p
+          ref: 87b9aabd49421088fd050695ee7553175d13eeb1
+          path: ../burn_p2p
 
       - name: setup rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -99,8 +103,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          settings_path="$(mktemp)"
-          python3 scripts/resolve_pages_deploy_settings.py \
+          cargo run -p xtask -- resolve-pages-deploy-settings-outputs \
             --environment "${{ github.event.inputs.environment }}" \
             --edge-base-url-input "${{ github.event.inputs.edge_base_url }}" \
             --edge-base-url-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL }}" \
@@ -113,9 +116,7 @@ jobs:
             --canary-principal-id-input "${{ github.event.inputs.canary_principal_id }}" \
             --canary-principal-id-from-env "${{ vars.BURN_DRAGON_P2P_BROWSER_CANARY_PRINCIPAL_ID }}" \
             --browser-app-base-url-from-env "${{ vars.BURN_DRAGON_P2P_BROWSER_APP_BASE_URL }}" \
-            --edge-domain-name-from-env "${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}" \
-            >"$settings_path"
-          python3 scripts/write_pages_deploy_settings_outputs.py "$settings_path"
+            --edge-domain-name-from-env "${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
           echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}" >>"$GITHUB_ENV"
 
       - name: build browser site artifact
@@ -151,7 +152,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary/canary-summary.json
           BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR: target/browser-site
-        run: bash scripts/run_pages_predeploy_canary.sh
+        run: cargo run -p xtask -- run-pages-predeploy-canary
 
       - name: summarize predeploy browser canary
         if: ${{ always() && steps.predeploy_browser_canary.outputs.report_path != '' }}
@@ -162,7 +163,7 @@ jobs:
           if [ ! -f "$report_path" ]; then
             exit 0
           fi
-          python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"
+          cargo run -p xtask -- summarize-live-browser-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload predeploy browser canary artifact
         if: ${{ always() && steps.predeploy_browser_canary.outputs.artifact_dir != '' }}

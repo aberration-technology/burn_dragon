@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import importlib.util
+import json
+import os
 import pathlib
-import sys
+import subprocess
 import unittest
 
 import yaml
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "check_deployment_guardrails.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-burn-dragon-p2p-aws.yml"
 RESTORE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "restore-burn-dragon-p2p-aws.yml"
 CLEANUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "cleanup-burn-dragon-p2p-aws.yml"
@@ -21,21 +21,30 @@ PUBLISH_DATASET_WORKFLOW = (
 README = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "README.md"
 IAM_POLICY_DOC = REPO_ROOT / "crates" / "burn_dragon_p2p" / "deploy" / "aws" / "github-actions-iam.md"
 
-spec = importlib.util.spec_from_file_location("check_deployment_guardrails", SCRIPT_PATH)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-
 
 def workflow(path: pathlib.Path) -> dict:
     raw = yaml.safe_load(path.read_text())
     return raw
 
 
+def guardrail_report(env: dict[str, str]) -> dict:
+    xtask = pathlib.Path(os.environ["BURN_DRAGON_XTASK_BIN"])
+    completed = subprocess.run(
+        [str(xtask), "deployment-guardrail-report"],
+        cwd=REPO_ROOT,
+        env={**os.environ, **env},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
 class DeploymentGuardrailTests(unittest.TestCase):
     def test_default_production_profile_stays_under_cap(self) -> None:
-        report = module.build_report(
+        report = guardrail_report(
             {
                 "DEPLOY_ENVIRONMENT": "production",
                 "DEPLOYMENT_OPERATION": "deploy",
@@ -44,11 +53,11 @@ class DeploymentGuardrailTests(unittest.TestCase):
                 "TF_VAR_alarm_sns_topic_arn": "arn:aws:sns:us-east-2:123456789012:burn-dragon-p2p-alerts",
             }
         )
-        self.assertEqual(report.errors, [])
-        self.assertLess(report.fixed_monthly_cost_usd, 100.0)
+        self.assertEqual(report["errors"], [])
+        self.assertLess(report["fixed_monthly_cost_usd"], 100.0)
 
     def test_missing_production_alarm_route_is_rejected(self) -> None:
-        report = module.build_report(
+        report = guardrail_report(
             {
                 "DEPLOY_ENVIRONMENT": "production",
                 "DEPLOYMENT_OPERATION": "deploy",
@@ -59,11 +68,11 @@ class DeploymentGuardrailTests(unittest.TestCase):
         )
         self.assertIn(
             "production deployment must set BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN so CloudWatch alarms route somewhere actionable",
-            report.errors,
+            report["errors"],
         )
 
     def test_named_alarm_sns_env_also_satisfies_guardrail(self) -> None:
-        report = module.build_report(
+        report = guardrail_report(
             {
                 "DEPLOY_ENVIRONMENT": "production",
                 "DEPLOYMENT_OPERATION": "deploy",
@@ -72,10 +81,10 @@ class DeploymentGuardrailTests(unittest.TestCase):
                 "BURN_DRAGON_P2P_ALARM_SNS_TOPIC_ARN": "arn:aws:sns:us-east-2:123456789012:burn-dragon-p2p-alerts",
             }
         )
-        self.assertEqual(report.errors, [])
+        self.assertEqual(report["errors"], [])
 
     def test_production_git_bootstrap_is_rejected(self) -> None:
-        report = module.build_report(
+        report = guardrail_report(
             {
                 "DEPLOY_ENVIRONMENT": "production",
                 "DEPLOYMENT_OPERATION": "deploy",
@@ -86,11 +95,11 @@ class DeploymentGuardrailTests(unittest.TestCase):
         )
         self.assertIn(
             "production deployment must use bootstrap_install_source=crate, got `git`",
-            report.errors,
+            report["errors"],
         )
 
     def test_managed_trainer_pool_exceeding_cap_is_rejected(self) -> None:
-        report = module.build_report(
+        report = guardrail_report(
             {
                 "DEPLOY_ENVIRONMENT": "production",
                 "DEPLOYMENT_OPERATION": "deploy",
@@ -101,14 +110,14 @@ class DeploymentGuardrailTests(unittest.TestCase):
             }
         )
         self.assertTrue(
-            any("exceeds the hard cap" in error for error in report.errors),
-            report.errors,
+            any("exceeds the hard cap" in error for error in report["errors"]),
+            report["errors"],
         )
 
     def test_workflows_run_guardrail_script_and_cleanup_role_is_split(self) -> None:
         for path in (DEPLOY_WORKFLOW, RESTORE_WORKFLOW):
             text = path.read_text()
-            self.assertIn("scripts/check_deployment_guardrails.py", text, path.name)
+            self.assertIn("cargo run -p xtask -- check-deployment-guardrails", text, path.name)
             wf = workflow(path)
             self.assertEqual(
                 wf["permissions"],

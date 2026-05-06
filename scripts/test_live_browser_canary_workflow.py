@@ -22,9 +22,9 @@ def main() -> None:
         if workflow_path.name == "live-browser-canary.yml":
             required_snippets = [
                 "workflow_call:",
-                "bash scripts/install_playwright_chromium.sh",
-                "bash scripts/run_live_browser_canary.sh",
-                'python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"',
+                "cargo run -p xtask -- install-playwright-chromium",
+                "cargo run -p xtask -- run-live-browser-canary",
+                'cargo run -p xtask -- summarize-live-browser-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"',
                 "burn-dragon-live-browser-canary",
                 "default: browser-canary-mainnet-nca",
                 'BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"',
@@ -139,15 +139,7 @@ def main() -> None:
     assert "agent_task_id:" in deploy_pages_text
     assert "run-name: deploy github pages" in deploy_pages_text
 
-    dispatch_pages_text = Path("scripts/dispatch_pages_deploy_and_wait.sh").read_text()
     xtask_text = Path("xtask/src/agent_task.rs").read_text()
-    for snippet in [
-        "dispatch-pages-deploy-and-wait",
-        '"${CARGO:-cargo}" run -p xtask',
-    ]:
-        assert snippet in dispatch_pages_text, (
-            f"dispatch pages helper missing xtask wrapper snippet: {snippet}"
-        )
     for snippet in [
         'workflow: ".github/workflows/deploy-pages.yml"',
         'input_env("environment", "BURN_DRAGON_DEPLOY_PAGES_ENVIRONMENT")',

@@ -168,7 +168,11 @@ jobs:
           fi
 
       - name: checkout burn_p2p sibling
-        run: scripts/ensure-burn-p2p-sibling.sh
+        uses: actions/checkout@v4
+        with:
+          repository: aberration-technology/burn_p2p
+          ref: 87b9aabd49421088fd050695ee7553175d13eeb1
+          path: ../burn_p2p
 
       - name: resolve deployment settings
         shell: bash
@@ -265,13 +269,13 @@ jobs:
           VAR_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION: ${{ vars.BURN_DRAGON_P2P_ARTIFACT_BUCKET_SERVER_SIDE_ENCRYPTION }}
           GITHUB_REPOSITORY_OWNER_CONTEXT: ${{ github.repository_owner }}
           GITHUB_ACTOR_CONTEXT: ${{ github.actor }}
-        run: bash scripts/resolve_bootstrap_stack_settings.sh deploy
+        run: cargo run -p xtask -- resolve-bootstrap-stack-settings deploy
       - name: deployment guardrails
         id: guardrails
         shell: bash
         env:
           DEPLOYMENT_OPERATION: deploy
-        run: python3 scripts/check_deployment_guardrails.py
+        run: cargo run -p xtask -- check-deployment-guardrails
 
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -848,7 +852,7 @@ jobs:
           HEAD_MIRROR_REINSTALL: "false"
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          /home/runner/work/burn_dragon/burn_dragon/scripts/sync-bootstrap-runtime-config.sh
+          cargo run -p xtask -- sync-bootstrap-runtime-config
 
       - name: ensure bootstrap edge service is enabled and active
         shell: bash
@@ -1363,34 +1367,7 @@ jobs:
             exit 0
           fi
 
-          python3 - "$report_path" >>"$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import sys
-
-          report = json.load(open(sys.argv[1]))
-          readiness = report.get("readiness") or {}
-          profile_resolution = (report.get("profile_resolution") or {}).get("value") or {}
-          edge_snapshot = (report.get("edge_snapshot") or {}).get("value") or {}
-          artifact_head_check = report.get("artifact_head_view") or {}
-          artifact_head_view = artifact_head_check.get("value") or {}
-          blockers = readiness.get("blocking_issues") or []
-          warnings = readiness.get("observed_warnings") or []
-
-          print("## deployment diagnostics")
-          print()
-          print(f"- Ready: `{readiness.get('ready', False)}`")
-          print(f"- Profile source: `{profile_resolution.get('source', 'unknown')}`")
-          print(f"- Matching head present: `{edge_snapshot.get('matching_head_present', False)}`")
-          print(f"- Matching head id: `{edge_snapshot.get('matching_head_id') or 'none'}`")
-          print(f"- Directory current head id: `{edge_snapshot.get('matching_directory_current_head_id') or 'none'}`")
-          print(f"- Directory current head visible: `{edge_snapshot.get('matching_directory_current_head_visible', False)}`")
-          print(f"- Matching head global step: `{edge_snapshot.get('matching_head_global_step', 'n/a')}`")
-          print(f"- Matching directory entry present: `{edge_snapshot.get('matching_directory_entry_present', False)}`")
-          print(f"- Artifact head probe ok: `{artifact_head_check.get('ok', False)}`")
-          print(f"- Artifact connected providers: `{', '.join(artifact_head_view.get('connected_provider_peer_ids') or []) or 'none'}`")
-          print(f"- Blockers: `{', '.join(blockers) if blockers else 'none'}`")
-          print(f"- Warnings: `{', '.join(warnings) if warnings else 'none'}`")
-          PY
+          cargo run -p xtask -- summarize-deployment-diagnostics "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload deployment diagnostics artifact
         if: ${{ always() && steps.deployment_diagnostics.outputs.report_path != '' }}

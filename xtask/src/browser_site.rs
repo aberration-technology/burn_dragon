@@ -5,7 +5,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use burn_dragon_p2p::config::DragonBrowserTrainingConfig;
 use burn_dragon_p2p::profile::browser_training_config_from_directory_entries;
 use burn_p2p::{
@@ -1581,8 +1581,8 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_HTML_TEMPLATE, fetch_optional_browser_edge_snapshot, resolve_browser_training_config,
-        should_retry_edge_status, write_html_page, write_site_shell,
+        fetch_optional_browser_edge_snapshot, resolve_browser_training_config,
+        should_retry_edge_status, write_html_page, write_site_shell, INDEX_HTML_TEMPLATE,
     };
     use crate::browser_site::BuildBrowserSiteArgs;
     use crate::deploy_settings::{

@@ -115,6 +115,14 @@ jobs:
     continue-on-error: ${{ matrix.required == '0' }}
     steps:
       - uses: actions/checkout@v4
+      - name: checkout burn_p2p sibling
+        uses: actions/checkout@v4
+        with:
+          repository: aberration-technology/burn_p2p
+          ref: 87b9aabd49421088fd050695ee7553175d13eeb1
+          path: ../burn_p2p
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-node@v4
         with:
@@ -124,7 +132,7 @@ jobs:
         shell: bash
         env:
           PLAYWRIGHT_BROWSERS: ${{ matrix.browser }}
-        run: bash scripts/install_playwright_chromium.sh
+        run: cargo run -p xtask -- install-playwright-chromium
 
       - name: run live browser canary
         id: live_browser_canary
@@ -143,7 +151,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}/canary-summary.json
-        run: bash scripts/run_live_browser_canary.sh
+        run: cargo run -p xtask -- run-live-browser-canary
 
       - name: summarize live browser canary
         if: ${{ always() && steps.live_browser_canary.outputs.report_path != '' }}
@@ -154,7 +162,7 @@ jobs:
           if [ ! -f "$report_path" ]; then
             exit 0
           fi
-          python3 scripts/summarize_live_browser_canary.py "$report_path" >>"$GITHUB_STEP_SUMMARY"
+          cargo run -p xtask -- summarize-live-browser-canary "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
       - name: upload live browser canary artifact
         if: ${{ always() && steps.live_browser_canary.outputs.artifact_dir != '' }}

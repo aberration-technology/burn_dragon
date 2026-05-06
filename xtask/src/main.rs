@@ -1,6 +1,7 @@
 mod agent_task;
 mod browser_site;
 mod deploy_settings;
+mod workflow_tools;
 
 use std::ffi::OsString;
 use std::fs;
@@ -28,6 +29,23 @@ enum CommandKind {
     BuildBrowser,
     BuildBrowserSite(browser_site::BuildBrowserSiteArgs),
     ResolvePagesDeploySettings(deploy_settings::ResolvePagesDeploySettingsArgs),
+    ResolvePagesDeploySettingsOutputs(deploy_settings::ResolvePagesDeploySettingsArgs),
+    InstallPlaywrightChromium,
+    RunLiveBrowserCanary,
+    RunPagesPredeployCanary,
+    SummarizeLiveBrowserCanary(workflow_tools::SummarizeLiveBrowserCanaryArgs),
+    SummarizeLiveNativeTrainingCanary(workflow_tools::SummarizeLiveNativeTrainingCanaryArgs),
+    SummarizeDeploymentDiagnostics(workflow_tools::SummarizeDeploymentDiagnosticsArgs),
+    SummarizeInspection(workflow_tools::SummarizeInspectionArgs),
+    ExtractDeploymentDiagnostics(workflow_tools::ExtractDeploymentDiagnosticsArgs),
+    WriteInspectionSummary(workflow_tools::WriteInspectionSummaryArgs),
+    RenderHeadMirrorSeedRepairCommands,
+    CheckDeploymentGuardrails,
+    DeploymentGuardrailReport,
+    ResolveBootstrapStackSettings(workflow_tools::BootstrapStackSettingsArgs),
+    SyncBootstrapRuntimeConfig,
+    RunLiveNativeTrainingCanary,
+    PublishCrates(workflow_tools::PublishCratesArgs),
     AgentTask {
         #[command(subcommand)]
         command: agent_task::AgentTaskCommand,
@@ -49,6 +67,7 @@ enum CommandKind {
     CudaCheck,
     Smoke,
     DeployCheck,
+    DeploymentScriptChecks,
     All,
 }
 
@@ -65,6 +84,41 @@ fn main() -> Result<()> {
         CommandKind::ResolvePagesDeploySettings(args) => {
             deploy_settings::resolve_pages_deploy_settings(&args)
         }
+        CommandKind::ResolvePagesDeploySettingsOutputs(args) => {
+            workflow_tools::resolve_pages_deploy_settings_outputs(&args)
+        }
+        CommandKind::InstallPlaywrightChromium => workflow_tools::install_playwright_chromium(),
+        CommandKind::RunLiveBrowserCanary => workflow_tools::run_live_browser_canary(),
+        CommandKind::RunPagesPredeployCanary => workflow_tools::run_pages_predeploy_canary(),
+        CommandKind::SummarizeLiveBrowserCanary(args) => {
+            workflow_tools::summarize_live_browser_canary(&args)
+        }
+        CommandKind::SummarizeLiveNativeTrainingCanary(args) => {
+            workflow_tools::summarize_live_native_training_canary(&args)
+        }
+        CommandKind::SummarizeDeploymentDiagnostics(args) => {
+            workflow_tools::summarize_deployment_diagnostics(&args)
+        }
+        CommandKind::SummarizeInspection(args) => workflow_tools::summarize_inspection(&args),
+        CommandKind::ExtractDeploymentDiagnostics(args) => {
+            workflow_tools::extract_deployment_diagnostics(&args)
+        }
+        CommandKind::WriteInspectionSummary(args) => {
+            workflow_tools::write_inspection_summary(&args)
+        }
+        CommandKind::RenderHeadMirrorSeedRepairCommands => {
+            workflow_tools::render_head_mirror_seed_repair_commands()
+        }
+        CommandKind::CheckDeploymentGuardrails => workflow_tools::check_deployment_guardrails(),
+        CommandKind::DeploymentGuardrailReport => workflow_tools::deployment_guardrail_report(),
+        CommandKind::ResolveBootstrapStackSettings(args) => {
+            workflow_tools::resolve_bootstrap_stack_settings(&args)
+        }
+        CommandKind::SyncBootstrapRuntimeConfig => workflow_tools::sync_bootstrap_runtime_config(),
+        CommandKind::RunLiveNativeTrainingCanary => {
+            workflow_tools::run_live_native_training_canary()
+        }
+        CommandKind::PublishCrates(args) => workflow_tools::publish_crates(&args),
         CommandKind::AgentTask { command } => agent_task::run(command),
         CommandKind::DispatchPagesDeployAndWait => agent_task::dispatch_pages_deploy_and_wait(),
         CommandKind::DispatchNativeTrainingCanaryAndWait => {
@@ -86,6 +140,7 @@ fn main() -> Result<()> {
         CommandKind::CudaCheck => cuda_check(),
         CommandKind::Smoke => smoke(),
         CommandKind::DeployCheck => deploy_check(),
+        CommandKind::DeploymentScriptChecks => deployment_script_checks(),
         CommandKind::All => all(),
     }
 }
@@ -404,25 +459,34 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn deployment_script_checks() -> Result<()> {
+    let xtask_bin = std::env::current_exe().context("resolve current xtask binary")?;
+    let xtask_env = [(
+        OsString::from("BURN_DRAGON_XTASK_BIN"),
+        xtask_bin.into_os_string(),
+    )];
     for script in [
+        "scripts/test_agent_task.py",
         "scripts/test_bootstrap_runtime_sync.py",
-        "scripts/test_deployment_version_sync.py",
+        "scripts/test_bootstrap_instance_selection.py",
+        "scripts/test_bootstrap_head_mirror_seed_urls.py",
+        "scripts/test_head_mirror_admin_capability.py",
+        "scripts/test_cleanup_workflow.py",
         "scripts/test_deployment_strategy.py",
+        "scripts/test_deployment_version_sync.py",
         "scripts/test_deployment_guardrails.py",
         "scripts/test_prod_low_resource_p2p_config.py",
-        "scripts/test_bootstrap_instance_selection.py",
-        "scripts/test_head_mirror_admin_capability.py",
         "scripts/test_deploy_pages_workflow.py",
         "scripts/test_browser_site_training_config.py",
         "scripts/test_local_browser_e2e_plan.py",
         "scripts/test_live_browser_canary_script.py",
         "scripts/test_live_browser_canary_workflow.py",
+        "scripts/test_live_native_training_canary.py",
+        "scripts/test_browser_transport_terraform.py",
         "scripts/test_browser_profile_budget.py",
         "scripts/test_native_peer_transport_config.py",
         "scripts/test_edge_caddyfile.py",
-        "scripts/test_cleanup_workflow.py",
     ] {
-        run("python3", &[script])?;
+        run_with_env("python3", &[script], &xtask_env)?;
     }
     Ok(())
 }

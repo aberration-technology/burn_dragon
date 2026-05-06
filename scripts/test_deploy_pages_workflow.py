@@ -12,14 +12,13 @@ def main() -> None:
 
     workflow_text = workflow_path.read_text()
     required_snippets = [
-        "python3 scripts/resolve_pages_deploy_settings.py",
+        "cargo run -p xtask -- resolve-pages-deploy-settings-outputs",
         "agent_task_id:",
         "run-name: deploy github pages",
         '--environment "${{ github.event.inputs.environment }}"',
         '--edge-base-url-input "${{ github.event.inputs.edge_base_url }}"',
         '--seed-node-urls-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS }}"',
         '--selected-revision-id-from-env "${{ vars.BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID }}"',
-        'python3 scripts/write_pages_deploy_settings_outputs.py "$settings_path"',
         'canary_principal_id:',
         'selected_revision_id: ${{ steps.resolve_browser_shell_settings.outputs.selected_revision_id }}',
         'needs:\n      - build\n      - deploy',
@@ -30,7 +29,7 @@ def main() -> None:
         'principal_id: ${{ needs.build.outputs.canary_principal_id }}',
         'experiment_id: ${{ needs.build.outputs.selected_experiment_id }}',
         'secrets: inherit',
-        'run: bash scripts/run_pages_predeploy_canary.sh',
+        'run: cargo run -p xtask -- run-pages-predeploy-canary',
         "BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ steps.resolve_browser_shell_settings.outputs.edge_base_url }}",
         'BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR',
         'BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS',
@@ -46,6 +45,8 @@ def main() -> None:
         'node scripts/live-browser-canary.mjs',
         'bash scripts/install_playwright_chromium.sh',
         'bash scripts/run_live_browser_canary.sh',
+        'python3 scripts/resolve_pages_deploy_settings.py',
+        'python3 scripts/write_pages_deploy_settings_outputs.py',
         "BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
         "edge_base_url: ${{ vars.BURN_DRAGON_P2P_PAGES_EDGE_BASE_URL || format('https://{0}', vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME) || 'https://edge.dragon.aberration.technology' }}",
     ]

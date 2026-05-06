@@ -370,7 +370,7 @@ class BootstrapRuntimeSyncTests(unittest.TestCase):
                 path.name,
             )
             self.assertIn(
-                "scripts/sync-bootstrap-runtime-config.sh",
+                "cargo run -p xtask -- sync-bootstrap-runtime-config",
                 text,
                 path.name,
             )

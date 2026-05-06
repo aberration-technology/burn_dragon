@@ -228,22 +228,13 @@ def test_github_dispatch_wait_uses_agent_task_id() -> None:
         assert task["inputs"]["agent_task_id"] == fake_state["agent_task_id"]
 
 
-def test_python_wrappers_delegate_to_xtask() -> None:
-    agent_wrapper = (REPO_ROOT / "scripts" / "agent_task.py").read_text()
-    summary_wrapper = (REPO_ROOT / "scripts" / "summarize_github_run.py").read_text()
-    for text in (agent_wrapper, summary_wrapper):
-        assert "BURN_DRAGON_XTASK_BIN" in text
-        assert '"agent-task"' in text
-        assert '"cargo"' in text
-    assert '"gh-wait"' in summary_wrapper
+def test_xtask_binary_is_the_agent_entrypoint() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state_root = Path(tmp) / "agent-tasks"
-        env = os.environ.copy()
-        env["BURN_DRAGON_XTASK_BIN"] = str(ensure_xtask_bin())
         completed = subprocess.run(
             [
-                sys.executable,
-                str(REPO_ROOT / "scripts" / "agent_task.py"),
+                str(ensure_xtask_bin()),
+                "agent-task",
                 "run",
                 "--state-root",
                 str(state_root),
@@ -255,7 +246,6 @@ def test_python_wrappers_delegate_to_xtask() -> None:
                 "print('wrapped command output')",
             ],
             cwd=REPO_ROOT,
-            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -272,7 +262,7 @@ def main() -> None:
     test_local_quiet_run()
     test_detached_local_run()
     test_github_dispatch_wait_uses_agent_task_id()
-    test_python_wrappers_delegate_to_xtask()
+    test_xtask_binary_is_the_agent_entrypoint()
     print("agent-task-ok")
 
 

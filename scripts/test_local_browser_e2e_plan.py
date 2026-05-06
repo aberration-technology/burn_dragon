@@ -65,7 +65,7 @@ def main() -> None:
         "browserTrainingConfig?.live_participant?.load_active_head_artifact === true",
         "Training P2P checkpoint ready",
     ]
-    canary_and_summary = canary + "\n" + Path("scripts/summarize_live_browser_canary.py").read_text()
+    canary_and_summary = canary + "\n" + Path("xtask/src/workflow_tools.rs").read_text()
     for snippet in required_canary_snippets:
         assert snippet in canary_and_summary, f"browser training canary parity missing: {snippet}"
 

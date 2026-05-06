@@ -10,7 +10,6 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "live-native-training-canary.yml"
 SCRIPT = REPO_ROOT / "scripts" / "live_native_training_canary.py"
-DISPATCH_SCRIPT = REPO_ROOT / "scripts" / "dispatch_native_training_canary_and_wait.sh"
 
 
 def main() -> None:
@@ -71,9 +70,10 @@ def main() -> None:
     assert env["BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS"] == "480"
     assert env["BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS"] == "300"
     runs = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "scripts/ensure-burn-p2p-sibling.sh" in runs
+    assert "repository: aberration-technology/burn_p2p" in WORKFLOW.read_text()
     assert "cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native" in runs
-    assert "python3 scripts/live_native_training_canary.py" in runs
+    assert "cargo run -p xtask -- run-live-native-training-canary" in runs
+    assert "cargo run -p xtask -- summarize-live-native-training-canary" in runs
 
     script = SCRIPT.read_text()
     required = [
@@ -178,13 +178,6 @@ def main() -> None:
         "no experiment head became available within",
     ]:
         assert snippet in native_source, f"missing native head-sync readiness snippet: {snippet}"
-
-    dispatch_script = DISPATCH_SCRIPT.read_text()
-    for snippet in [
-        "dispatch-native-training-canary-and-wait",
-        '"${CARGO:-cargo}" run -p xtask',
-    ]:
-        assert snippet in dispatch_script, f"missing native canary dispatch snippet: {snippet}"
 
     xtask_text = Path("xtask/src/agent_task.rs").read_text()
     for snippet in [

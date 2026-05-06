@@ -898,13 +898,9 @@ fn canary_principals(workspace: &str) -> CanaryPrincipals {
 
 fn resolve_artifact_settings(
     disaster_recovery_region: &str,
-    restore: bool,
+    _restore: bool,
 ) -> Result<ArtifactSettings> {
-    let create_bucket = if restore {
-        env_or("INPUT_CREATE_ARTIFACT_BUCKET", "")
-    } else {
-        env_or("INPUT_CREATE_ARTIFACT_BUCKET", "")
-    };
+    let create_bucket = env_or("INPUT_CREATE_ARTIFACT_BUCKET", "");
     let bucket_name = first_env(
         &["INPUT_ARTIFACT_BUCKET_NAME", "VAR_ARTIFACT_BUCKET_NAME"],
         "",
@@ -1402,13 +1398,12 @@ fn workspace_version() -> Result<String> {
             in_workspace_package = trimmed == "[workspace.package]";
             continue;
         }
-        if in_workspace_package {
-            if let Some(raw) = trimmed
+        if in_workspace_package
+            && let Some(raw) = trimmed
                 .strip_prefix("version")
                 .and_then(|value| value.split_once('=').map(|(_, raw)| raw.trim()))
-            {
-                return Ok(raw.trim_matches('"').to_owned());
-            }
+        {
+            return Ok(raw.trim_matches('"').to_owned());
         }
     }
     bail!("missing workspace.package.version in Cargo.toml")

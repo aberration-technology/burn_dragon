@@ -35,7 +35,7 @@ pub enum AgentTaskCommand {
     GhWaitWorker(WorkerArgs),
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Default)]
 pub struct CommonTaskArgs {
     #[arg(long)]
     pub state_root: Option<PathBuf>,
@@ -608,10 +608,10 @@ fn run_local_worker(task_dir: &Path) -> Result<i32> {
         if child.try_wait()?.is_some() {
             break;
         }
-        if let Some(activity) = newest_activity(&[stdout_path.as_path(), stderr_path.as_path()]) {
-            if activity > last_activity {
-                last_activity = activity;
-            }
+        if let Some(activity) = newest_activity(&[stdout_path.as_path(), stderr_path.as_path()])
+            && activity > last_activity
+        {
+            last_activity = activity;
         }
         if timeout_secs > 0 && started.elapsed() > Duration::from_secs(timeout_secs) {
             let _ = child.kill();
@@ -1461,16 +1461,6 @@ fn shell_quote(value: &str) -> String {
         value.to_owned()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-impl Default for CommonTaskArgs {
-    fn default() -> Self {
-        Self {
-            state_root: None,
-            task_id: None,
-            cwd: None,
-        }
     }
 }
 

@@ -903,12 +903,13 @@ fn assert_canonical_signal(
     let before_loss = metric_number(&before_metrics, &["train_loss", "loss"]);
     let after_loss = require_metric_number(&after_metrics, &["train_loss", "loss"])?;
     let comparable = comparable_loss_signal(&before_metrics, &after_metrics);
-    if let Some((metric, before_value, after_value)) = comparable.as_ref() {
-        if require_loss_non_regression && *after_value > *before_value + 1e-6 {
-            bail!(
-                "canonical loss regressed after native training window: metric={metric} before={before_value} after={after_value}"
-            );
-        }
+    if let Some((metric, before_value, after_value)) = comparable.as_ref()
+        && require_loss_non_regression
+        && *after_value > *before_value + 1e-6
+    {
+        bail!(
+            "canonical loss regressed after native training window: metric={metric} before={before_value} after={after_value}"
+        );
     }
     Ok(json!({
         "canonical_loss_before": before_loss,
@@ -923,9 +924,9 @@ fn assert_canonical_signal(
 
 fn comparable_loss_signal(before: &Value, after: &Value) -> Option<(String, f64, f64)> {
     for key in ["train_loss", "loss"] {
-        let before_value = number(before, key)?;
-        let after_value = number(after, key)?;
-        return Some((key.to_owned(), before_value, after_value));
+        if let (Some(before_value), Some(after_value)) = (number(before, key), number(after, key)) {
+            return Some((key.to_owned(), before_value, after_value));
+        }
     }
     None
 }

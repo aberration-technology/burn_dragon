@@ -76,16 +76,16 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         &tmpdir.path().join("burn-dragon-p2p-head-mirror.service"),
     )?;
 
-    if !edge_base_url.is_empty() {
-        if let Err(error) = preserve_bootstrap_current_heads(
+    if !edge_base_url.is_empty()
+        && let Err(error) = preserve_bootstrap_current_heads(
             &bootstrap_config_path,
             &format!("{}/portal/snapshot", edge_base_url.trim_end_matches('/')),
             true,
-        ) {
-            eprintln!(
-                "warning: failed to preserve bootstrap current heads from {edge_base_url}: {error:#}"
-            );
-        }
+        )
+    {
+        eprintln!(
+            "warning: failed to preserve bootstrap current heads from {edge_base_url}: {error:#}"
+        );
     }
 
     let objects = RuntimeObjects::new(&artifact_bucket_name, &runtime_config_prefix);
@@ -425,11 +425,9 @@ pub fn preserve_current_heads(config: &mut Value, snapshot: &Value, recover_root
         if let Some(head_id) = live_current_head_for_entry(snapshot, entry) {
             entry["current_head_id"] = json!(head_id);
             preserved += 1;
-        } else if recover_roots {
-            if let Some(head_id) = recover_visible_root(snapshot, entry) {
-                entry["current_head_id"] = json!(head_id);
-                recovered += 1;
-            }
+        } else if recover_roots && let Some(head_id) = recover_visible_root(snapshot, entry) {
+            entry["current_head_id"] = json!(head_id);
+            recovered += 1;
         }
     }
     json!({ "preserved": preserved, "recovered": recovered })

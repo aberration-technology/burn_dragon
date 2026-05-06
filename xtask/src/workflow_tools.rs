@@ -1028,10 +1028,10 @@ fn write_guardrail_outputs(report: &GuardrailReport) -> Result<()> {
 
 fn env_first(names: &[&str], terraform_variable: &str) -> Result<String> {
     for name in names {
-        if let Ok(value) = std::env::var(name) {
-            if !value.is_empty() {
-                return Ok(value.trim().to_owned());
-            }
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            return Ok(value.trim().to_owned());
         }
     }
     terraform_default(terraform_variable)
@@ -1159,13 +1159,12 @@ fn read_json_like_toml_value(path: &str, dotted_key: &str) -> Result<String> {
             in_workspace_package = trimmed == "[workspace.package]";
             continue;
         }
-        if in_workspace_package {
-            if let Some(raw) = trimmed
+        if in_workspace_package
+            && let Some(raw) = trimmed
                 .strip_prefix(dotted_key.rsplit('.').next().unwrap_or(dotted_key))
                 .and_then(|value| value.split_once('=').map(|(_, raw)| raw.trim()))
-            {
-                return Ok(raw.trim_matches('"').to_owned());
-            }
+        {
+            return Ok(raw.trim_matches('"').to_owned());
         }
     }
     bail!("missing {dotted_key} in {path}")
@@ -1205,10 +1204,10 @@ fn run(program: &str, args: &[&str], envs: &[(&str, String)]) -> Result<()> {
 }
 
 fn cargo_bin() -> String {
-    if let Ok(path) = std::env::var("CARGO") {
-        if !path.is_empty() {
-            return path;
-        }
+    if let Ok(path) = std::env::var("CARGO")
+        && !path.is_empty()
+    {
+        return path;
     }
     let direct =
         Path::new("/home/mosure/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo");

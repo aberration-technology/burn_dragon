@@ -33,6 +33,9 @@ fn repository_has_no_scripts_tree() -> Result<()> {
             || path
                 .components()
                 .any(|component| component.as_os_str() == "target")
+            || path
+                .components()
+                .any(|component| component.as_os_str() == "burn_p2p-sibling")
         {
             continue;
         }

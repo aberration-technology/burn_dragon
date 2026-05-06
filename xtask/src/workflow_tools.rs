@@ -460,9 +460,10 @@ pub fn summarize_live_native_training_canary(
         let settlement = object_field(&train, "diffusion_settlement");
         let train_signal = object_field(&window, "train_signal");
         let canonical_signal = object_field(&window, "canonical_signal");
+        let published_p2p_signal = object_field(&window, "published_head_p2p_signal");
         let p2p_signal = object_field(&window, "p2p_signal");
         println!(
-            "  - window `{}`: `{}` -> `{}`, published `{}`, train loss `{}`, canonical loss `{}`, canonical improved `{}`, canonical wait `{}s`, settlement passes `{}`, settlement certs `{}`, p2p wait `{}s`, p2p heads `{}`, p2p updates `{}`, p2p attestations `{}`, p2p diffusion certs `{}`",
+            "  - window `{}`: `{}` -> `{}`, published `{}`, train loss `{}`, canonical loss `{}`, canonical improved `{}`, published p2p wait `{}s`, canonical wait `{}s`, settlement passes `{}`, settlement certs `{}`, canonical p2p wait `{}s`, published p2p heads `{}`, p2p updates `{}`, p2p attestations `{}`, p2p diffusion certs `{}`",
             json_value_display(&window, "window_index", "n/a"),
             object_field(&window, "head_before")
                 .get("head_id")
@@ -476,11 +477,12 @@ pub fn summarize_live_native_training_canary(
             json_value_display(&train_signal, "train_loss", "n/a"),
             json_value_display(&canonical_signal, "canonical_loss_after", "n/a"),
             json_value_display(&canonical_signal, "canonical_loss_improved", "n/a"),
+            json_value_display(&window, "published_head_p2p_wait_secs", "n/a"),
             json_value_display(&window, "canonical_wait_secs", "n/a"),
             json_value_display(&settlement, "passes_completed", "n/a"),
             json_value_display(&settlement, "certificates", "n/a"),
             json_value_display(&window, "p2p_wait_secs", "n/a"),
-            json_value_display(&p2p_signal, "head_announcements", "n/a"),
+            json_value_display(&published_p2p_signal, "head_announcements", "n/a"),
             json_value_display(&p2p_signal, "update_announcements", "n/a"),
             json_value_display(
                 &p2p_signal,

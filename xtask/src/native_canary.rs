@@ -175,6 +175,29 @@ fn run_windows(
         )?;
         let train_report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
         let train_signal = assert_train_report(&train_report)?;
+        let published_head_id = train_report
+            .get("published_head_id")
+            .and_then(Value::as_str)
+            .filter(|head_id| !head_id.is_empty())
+            .with_context(|| {
+                format!("native trainer did not report published_head_id: {train_report}")
+            })?;
+        let (published_head_p2p_signal, published_head_p2p_wait_secs) = wait_for_p2p_head(
+            &config.binary,
+            &config.edge_base_url,
+            published_head_id,
+            probe_storage,
+            &config.artifact_dir.join(format!(
+                "p2p-window-{}-published-head",
+                window_index + 1
+            )),
+            config.p2p_timeout_secs,
+        )
+        .with_context(|| {
+            format!(
+                "published native training head {published_head_id} did not become visible through the p2p bootstrap before edge canonical promotion"
+            )
+        })?;
         let previous_head_id = previous_head
             .get("head_id")
             .and_then(Value::as_str)
@@ -212,6 +235,8 @@ fn run_windows(
             "head_after": advanced_head,
             "canonical_wait_secs": wait_secs,
             "canonical_signal": canonical_signal,
+            "published_head_p2p_wait_secs": published_head_p2p_wait_secs,
+            "published_head_p2p_signal": published_head_p2p_signal,
             "p2p_wait_secs": p2p_wait_secs,
             "p2p_signal": p2p_signal,
             "head_provider_signal": head_provider_signal,

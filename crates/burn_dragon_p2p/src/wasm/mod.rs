@@ -78,10 +78,8 @@ const BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS: u32 = 4_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS: u32 = 8_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-const HERO_RATTLE_INTERVAL_MILLIS: u32 = 80;
-const HERO_RATTLE_FRAMES: &[&str] = &[
-    "⠉⠉", "⠈⠙", "⠀⠹", "⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁",
-];
+const HERO_RATTLE_INTERVAL_MILLIS: u32 = 90;
+const HERO_RATTLE_FRAMES: &[&str] = &["⣾", "⣷", "⣯", "⣟", "⣻", "⣽"];
 const DRAGON_UI_EVENT_LIMIT: usize = 5;
 
 #[cfg(feature = "wasm-peer")]
@@ -2007,6 +2005,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         HERO_RATTLE_FRAMES[*hero_rattle_index.read() % HERO_RATTLE_FRAMES.len()];
     #[cfg(not(all(feature = "wasm-ui", target_arch = "wasm32")))]
     let hero_rattle_frame = HERO_RATTLE_FRAMES[0];
+    let hero_rattle_class = if hero_rattle_active {
+        "dragon-eyebrow-rattle is-visible"
+    } else {
+        "dragon-eyebrow-rattle"
+    };
     #[cfg(feature = "wasm-peer")]
     let train_action = {
         let props = props.clone();
@@ -2378,11 +2381,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     div { class: "browser-hero-copy",
                         div { class: "dragon-eyebrow-row",
                             div { class: "eyebrow", "burn_dragon" }
-                            if hero_rattle_active {
-                                span {
-                                    class: "dragon-eyebrow-rattle",
-                                    "{hero_rattle_frame}"
-                                }
+                            span {
+                                class: "{hero_rattle_class}",
+                                "aria-hidden": "true",
+                                "{hero_rattle_frame}"
                             }
                         }
                         h1 { class: "app-title", "train the dragon" }

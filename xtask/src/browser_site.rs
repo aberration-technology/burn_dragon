@@ -208,12 +208,19 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 1.2ch;
+  width: 1.2ch;
   color: var(--accent);
   font-family: "Iosevka Etoile", "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.92em;
   line-height: 1;
+  opacity: 0;
   transform: translateY(-0.08em);
+  visibility: hidden;
+}
+
+.dragon-eyebrow-rattle.is-visible {
+  opacity: 1;
+  visibility: visible;
 }
 
 .dragon-browser-shell .browser-hero-bar {
@@ -1077,7 +1084,8 @@ main.dragon-browser-shell {
 
 @media (prefers-reduced-motion: reduce) {
   .dragon-eyebrow-rattle {
-    display: none;
+    opacity: 0;
+    visibility: hidden;
   }
 }
 "#;
@@ -1581,8 +1589,9 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_HTML_TEMPLATE, fetch_optional_browser_edge_snapshot, resolve_browser_training_config,
-        should_retry_edge_status, write_html_page, write_site_shell,
+        EXTRA_STYLESHEET, INDEX_HTML_TEMPLATE, fetch_optional_browser_edge_snapshot,
+        resolve_browser_training_config, should_retry_edge_status, write_html_page,
+        write_site_shell,
     };
     use crate::browser_site::BuildBrowserSiteArgs;
     use crate::deploy_settings::{
@@ -1625,6 +1634,14 @@ mod tests {
         assert!(temp.join("favicon.svg").is_file());
         assert!(temp.join("favicon.ico").is_file());
         std::fs::remove_dir_all(&temp).expect("remove temp dir");
+    }
+
+    #[test]
+    fn browser_spinner_visibility_reserves_layout_space() {
+        assert!(EXTRA_STYLESHEET.contains(".dragon-eyebrow-rattle.is-visible"));
+        assert!(EXTRA_STYLESHEET.contains("width: 1.2ch;"));
+        assert!(EXTRA_STYLESHEET.contains("visibility: hidden;"));
+        assert!(!EXTRA_STYLESHEET.contains("display: none;"));
     }
 
     #[test]

@@ -88,7 +88,7 @@ on:
       start_validator:
         description: Start a colocated validator during the canary. Leave disabled for the standard trainer-only diffusion deployment.
         required: false
-        default: "false"
+        default: "true"
       training_batch_size:
         description: Native canary batch size override. This is a resource knob and does not alter model compatibility.
         required: false
@@ -134,8 +134,8 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '2' }}
       BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '45' }}
-      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '900' }}
-      BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'false' }}
+      BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1200' }}
+      BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: ${{ github.event.inputs.training_batch_size || '1' }}
       BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '2' }}
       BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}

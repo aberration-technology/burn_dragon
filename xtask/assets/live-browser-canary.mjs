@@ -1092,6 +1092,17 @@ function resolveOverrideAssetPath(overrideDir, requestUrl, siteBaseUrl) {
   return path.join(overrideDir, normalized);
 }
 
+async function loadBrowserConfig() {
+  if (SITE_OVERRIDE_DIR) {
+    const configPath = path.join(SITE_OVERRIDE_DIR, "browser-app-config.json");
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  }
+  return await fetchJsonWithTransientRetry(endpoint(SITE_BASE_URL, "/browser-app-config.json"), {
+    method: "GET",
+    headers: {},
+  });
+}
+
 async function waitForVisible(locator, timeoutMs) {
   await locator.waitFor({ state: "visible", timeout: timeoutMs });
 }
@@ -1181,10 +1192,7 @@ async function runCanary() {
     ),
     { method: "GET", headers: {} },
   );
-  const browserConfig = await fetchJsonWithTransientRetry(endpoint(SITE_BASE_URL, "/browser-app-config.json"), {
-    method: "GET",
-    headers: {},
-  });
+  const browserConfig = await loadBrowserConfig();
   const liveSignedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
     (record) => record.multiaddrs ?? [],
   ) ?? [];

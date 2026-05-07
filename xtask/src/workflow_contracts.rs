@@ -336,6 +336,8 @@ fn browser_canary_contracts() -> Result<()> {
         "BURN_DRAGON_BROWSER_CANARY_DURABLE_RECEIPT_TIMEOUT_MS",
         "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
         "function assertBrowserE2eContract(report)",
+        "async function loadBrowserConfig()",
+        "path.join(SITE_OVERRIDE_DIR, \"browser-app-config.json\")",
         "report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);\n    assertBrowserE2eContract(report);",
     ] {
         require_contains(&script, snippet, "live browser canary script")?;
@@ -390,6 +392,8 @@ fn native_canary_contracts() -> Result<()> {
         "BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: \"300\"",
         "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: ${{ github.event.inputs.canonical_timeout_secs || '480' }}",
         "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}",
+        "BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1200' }}",
+        "BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'true' }}",
         "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}",
         "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'true' }}",
         "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'true' }}",

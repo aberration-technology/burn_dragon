@@ -74,9 +74,9 @@ on:
         required: false
         default: "15"
       mirror_live_head_to_edge:
-        description: Mirror each published canary head into the edge artifact provider before the canary exits
+        description: Mirror each published canary head into the edge artifact provider before the canary exits. Keep false for the normal p2p/head-mirror path; use true only to exercise the edge mirror fallback.
         required: false
-        default: "true"
+        default: "false"
       require_edge_head_provider:
         description: Require the canonical head to be restorable from the connected edge provider
         required: false
@@ -143,7 +143,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: ${{ github.event.inputs.canonical_timeout_secs || '480' }}
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}
       BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}
-      BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'true' }}
+      BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'false' }}
       BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: ${{ github.event.inputs.repair_current_head_to_visible_root || 'false' }}
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary

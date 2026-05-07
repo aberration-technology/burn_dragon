@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{json, Value};
 
 use crate::bootstrap_runtime::{
-    RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
+    preserve_current_heads, render_bootstrap_runtime_sync_commands, RuntimeCommandEnv,
 };
 
 pub fn run() -> Result<()> {
@@ -395,7 +395,7 @@ fn native_canary_contracts() -> Result<()> {
         "BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1200' }}",
         "BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'true' }}",
         "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}",
-        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'true' }}",
+        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'false' }}",
         "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'true' }}",
         "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: ${{ github.event.inputs.repair_current_head_to_visible_root || 'false' }}",
     ] {

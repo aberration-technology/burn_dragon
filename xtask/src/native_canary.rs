@@ -19,6 +19,27 @@ pub fn run() -> Result<()> {
     let trainer_bundle = config.artifact_dir.join("trainer-auth-bundle.json");
     let validator_bundle = config.artifact_dir.join("validator-auth-bundle.json");
 
+    let mut trainer_enrolled = false;
+    let repair_report = if config.repair_current_head_to_visible_root {
+        enroll_static_principal(
+            &config,
+            &config.principal_id,
+            "trainer",
+            &trainer_bundle,
+            &trainer_storage,
+            &config.artifact_dir.join("enroll-trainer.log"),
+            &config.backend,
+        )?;
+        trainer_enrolled = true;
+        Some(repair_current_head_to_visible_root(
+            &config,
+            &trainer_bundle,
+            &trainer_storage,
+        )?)
+    } else {
+        None
+    };
+
     let head_before = current_directory_head(&config.edge_base_url, &config.experiment_id)?;
     let p2p_before = p2p_probe_summary(&probe_p2p_snapshot(
         &config.binary,
@@ -31,22 +52,24 @@ pub fn run() -> Result<()> {
         Some(assert_head_provider_signal(
             &head_before,
             &p2p_before,
-            false,
+            config.require_edge_head_provider,
         )?)
     } else {
         None
     };
     let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none();
 
-    enroll_static_principal(
-        &config,
-        &config.principal_id,
-        "trainer",
-        &trainer_bundle,
-        &trainer_storage,
-        &config.artifact_dir.join("enroll-trainer.log"),
-        &config.backend,
-    )?;
+    if !trainer_enrolled {
+        enroll_static_principal(
+            &config,
+            &config.principal_id,
+            "trainer",
+            &trainer_bundle,
+            &trainer_storage,
+            &config.artifact_dir.join("enroll-trainer.log"),
+            &config.backend,
+        )?;
+    }
 
     let mut validator = None;
     if config.start_local_validator {
@@ -91,6 +114,9 @@ pub fn run() -> Result<()> {
         "diffusion_settle_passes": config.diffusion_settle_passes,
         "serve_after_publish_secs": config.serve_after_publish_secs,
         "start_local_validator": config.start_local_validator,
+        "mirror_live_head_to_edge": config.mirror_live_head_to_edge,
+        "require_edge_head_provider": config.require_edge_head_provider,
+        "repair_current_head_to_visible_root": config.repair_current_head_to_visible_root,
         "require_canonical_loss_non_regression": config.require_canonical_loss_non_regression,
         "training_batch_size": config.training_batch_size,
         "training_max_iters": config.training_max_iters,
@@ -102,6 +128,7 @@ pub fn run() -> Result<()> {
         "head_before": head_before,
         "p2p_before": p2p_before,
         "head_provider_before": head_provider_before,
+        "repair_report": repair_report,
         "windows": window_reports,
         "head_after": current_directory_head(&config.edge_base_url, &config.experiment_id)?,
         "catchup": fetch_json(&format!("{}/metrics/catchup/{}", config.edge_base_url, config.experiment_id), 30)?,
@@ -157,6 +184,9 @@ fn run_windows(
             "--output-format".to_owned(),
             "json".to_owned(),
         ];
+        if config.mirror_live_head_to_edge {
+            command.push("--mirror-live-head-to-edge".to_owned());
+        }
         append_training_overrides(config, &mut command);
         if config.settle_diffusion {
             command.extend([
@@ -226,7 +256,11 @@ fn run_windows(
                 .join(format!("p2p-window-{}", window_index + 1)),
             config.p2p_timeout_secs,
         )?;
-        let head_provider_signal = assert_head_provider_signal(&advanced_head, &p2p_signal, false)?;
+        let head_provider_signal = assert_head_provider_signal(
+            &advanced_head,
+            &p2p_signal,
+            config.require_edge_head_provider,
+        )?;
         reports.push(json!({
             "window_index": window_index + 1,
             "head_before": previous_head,
@@ -265,6 +299,9 @@ struct NativeCanaryConfig {
     diffusion_settle_passes: u64,
     serve_after_publish_secs: u64,
     start_local_validator: bool,
+    mirror_live_head_to_edge: bool,
+    require_edge_head_provider: bool,
+    repair_current_head_to_visible_root: bool,
     require_canonical_loss_non_regression: bool,
     training_batch_size: Option<u64>,
     training_max_iters: Option<u64>,
@@ -329,6 +366,18 @@ impl NativeCanaryConfig {
                 45,
             )?,
             start_local_validator: env_bool("BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR", false)?,
+            mirror_live_head_to_edge: env_bool(
+                "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE",
+                true,
+            )?,
+            require_edge_head_provider: env_bool(
+                "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER",
+                true,
+            )?,
+            repair_current_head_to_visible_root: env_bool(
+                "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT",
+                false,
+            )?,
             require_canonical_loss_non_regression: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION",
                 false,
@@ -358,6 +407,45 @@ impl NativeCanaryConfig {
             artifact_dir,
         })
     }
+}
+
+fn repair_current_head_to_visible_root(
+    config: &NativeCanaryConfig,
+    trainer_bundle: &Path,
+    storage_root: &Path,
+) -> Result<Value> {
+    let log_path = config.artifact_dir.join("repair-current-head.log");
+    run_native(
+        vec![
+            config.binary.clone(),
+            "admin-rollout-profile".to_owned(),
+            "--experiment-kind".to_owned(),
+            config.experiment_kind.clone(),
+            "--backend".to_owned(),
+            config.backend.clone(),
+            "--edge-url".to_owned(),
+            config.edge_base_url.clone(),
+            "--auth-bundle".to_owned(),
+            trainer_bundle.display().to_string(),
+            "--reset-current-head-to-visible-root".to_owned(),
+            "--output-format".to_owned(),
+            "json".to_owned(),
+        ],
+        storage_root,
+        config.command_timeout_secs,
+        &log_path,
+    )?;
+    let output = fs::read_to_string(&log_path)?;
+    serde_json::from_str(output.trim())
+        .or_else(|_| {
+            let start = output.find('{').unwrap_or(0);
+            let end = output
+                .rfind('}')
+                .map(|index| index + 1)
+                .unwrap_or(output.len());
+            serde_json::from_str(&output[start..end])
+        })
+        .context("failed to parse repair current head report")
 }
 
 fn enroll_static_principal(

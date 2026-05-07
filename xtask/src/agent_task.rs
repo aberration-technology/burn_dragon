@@ -293,6 +293,26 @@ pub fn dispatch_native_training_canary_and_wait() -> Result<()> {
                 "300",
             ),
             input_env_default(
+                "http_attempts",
+                "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS",
+                "15",
+            ),
+            input_env_default(
+                "mirror_live_head_to_edge",
+                "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE",
+                "true",
+            ),
+            input_env_default(
+                "require_edge_head_provider",
+                "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER",
+                "true",
+            ),
+            input_env_default(
+                "repair_current_head_to_visible_root",
+                "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT",
+                "false",
+            ),
+            input_env_default(
                 "start_validator",
                 "BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR",
                 "false",

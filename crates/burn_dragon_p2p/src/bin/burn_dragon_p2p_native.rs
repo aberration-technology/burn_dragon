@@ -481,7 +481,7 @@ struct AdminExportDirectoryArgs {
 #[derive(Debug, Parser)]
 struct AdminRolloutProfileArgs {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     config_format: ConfigFormat,
     #[arg(long, value_enum)]
@@ -496,6 +496,8 @@ struct AdminRolloutProfileArgs {
     edge_url: Option<String>,
     #[arg(long, action = ArgAction::SetTrue)]
     recover_current_head_from_visible_root: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    reset_current_head_to_visible_root: bool,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
 }
@@ -764,6 +766,7 @@ struct AdminRolloutReport {
     current_head_id: Option<String>,
     preserved_current_head_id: Option<String>,
     recovered_current_head_id: Option<String>,
+    reset_current_head_id: Option<String>,
     directory_entries: usize,
     result: AdminResult,
 }
@@ -1301,7 +1304,14 @@ fn admin_export_directory(args: AdminExportDirectoryArgs) -> Result<()> {
 }
 
 fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
-    let config = load_native_config(&args.config, args.config_format)?;
+    let requested_edge_url = args.edge_url.clone();
+    let config = resolved_config(
+        args.config.as_deref(),
+        args.config_format,
+        requested_edge_url.clone(),
+        Vec::new(),
+        None,
+    )?;
     let auth_bundle = resolve_or_login_native_auth_bundle(
         &config,
         args.experiment_kind.into_config(),
@@ -1314,8 +1324,7 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
             callback_timeout_secs: DEFAULT_AUTH_CALLBACK_TIMEOUT_SECS,
         },
     )?;
-    let edge_base_url = args
-        .edge_url
+    let edge_base_url = requested_edge_url
         .or_else(|| auth_bundle.edge_base_url.clone())
         .or_else(|| config.effective_edge_base_url().map(ToOwned::to_owned))
         .ok_or_else(|| anyhow!("no edge base URL configured for admin rollout"))?;
@@ -1342,20 +1351,35 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         .context("failed to build async runtime for admin rollout")?;
     let mut directory_entries =
         runtime.block_on(fetch_signed_directory_entries(&edge_base_url, &session_id))?;
-    let preserved_current_head_id =
-        preserve_directory_entry_current_head(&directory_entries, &mut replacement);
-    let recovered_current_head_id =
-        if replacement.current_head_id.is_none() && args.recover_current_head_from_visible_root {
-            let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
-            let recovered =
-                recover_directory_current_head_from_visible_roots(&replacement, &snapshot.heads);
-            if let Some(head_id) = recovered.as_ref() {
-                replacement.current_head_id = Some(head_id.clone());
-            }
-            recovered
+    let preserved_current_head_id = if args.reset_current_head_to_visible_root {
+        None
+    } else {
+        preserve_directory_entry_current_head(&directory_entries, &mut replacement)
+    };
+    let mut recovered_current_head_id = None;
+    let mut reset_current_head_id = None;
+    if args.reset_current_head_to_visible_root
+        || (replacement.current_head_id.is_none() && args.recover_current_head_from_visible_root)
+    {
+        let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
+        let recovered =
+            recover_directory_current_head_from_visible_roots(&replacement, &snapshot.heads);
+        if args.reset_current_head_to_visible_root && recovered.is_none() {
+            bail!(
+                "cannot reset current head for experiment={} revision={} because no visible root head was available",
+                replacement.experiment_id.as_str(),
+                replacement.current_revision_id.as_str()
+            );
+        }
+        if let Some(head_id) = recovered.as_ref() {
+            replacement.current_head_id = Some(head_id.clone());
+        }
+        if args.reset_current_head_to_visible_root {
+            reset_current_head_id = recovered;
         } else {
-            None
-        };
+            recovered_current_head_id = recovered;
+        }
+    }
     upsert_directory_entry(&mut directory_entries, replacement.clone());
     let result = runtime.block_on(rollout_directory_entries(
         &edge_base_url,
@@ -1378,6 +1402,9 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
                 .as_ref()
                 .map(|head_id| head_id.as_str().to_owned()),
             recovered_current_head_id: recovered_current_head_id
+                .as_ref()
+                .map(|head_id| head_id.as_str().to_owned()),
+            reset_current_head_id: reset_current_head_id
                 .as_ref()
                 .map(|head_id| head_id.as_str().to_owned()),
             directory_entries: directory_entries.len(),
@@ -4244,6 +4271,7 @@ mod tests {
             current_head_id: None,
             allowed_roles: PeerRoleSet::new([PeerRole::TrainerCpu]),
             allowed_scopes: BTreeSet::from([ExperimentScope::Connect]),
+            training_protocol: Default::default(),
             metadata: BTreeMap::new(),
         }
     }
@@ -4468,6 +4496,24 @@ mod tests {
         assert_eq!(no_restore.training_overrides.batch_size, Some(1));
         assert_eq!(no_restore.training_overrides.max_iters, Some(4));
         assert_eq!(no_restore.training_overrides.max_eval_batches, Some(1));
+
+        let admin_rollout = Cli::try_parse_from([
+            "burn_dragon_p2p_native",
+            "admin-rollout-profile",
+            "--experiment-kind",
+            "nca",
+            "--backend",
+            "cpu",
+            "--auth-bundle",
+            "/tmp/auth.json",
+            "--reset-current-head-to-visible-root",
+        ])
+        .expect("parse admin rollout repair flags");
+        let CommandKind::AdminRolloutProfile(admin_rollout) = admin_rollout.command else {
+            panic!("expected admin-rollout-profile command");
+        };
+        assert!(admin_rollout.config.is_none());
+        assert!(admin_rollout.reset_current_head_to_visible_root);
     }
 
     #[test]

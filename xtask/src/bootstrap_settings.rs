@@ -101,7 +101,7 @@ fn resolve_deploy() -> Result<()> {
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
     let bootstrap_version = first_env(
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
-        "0.21.0-pre.80",
+        "0.21.0-pre.83",
     );
     let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
     validate_bootstrap_install(
@@ -286,7 +286,7 @@ fn resolve_restore() -> Result<()> {
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
     let bootstrap_version = first_env(
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
-        "0.21.0-pre.80",
+        "0.21.0-pre.83",
     );
     let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
     validate_bootstrap_install(

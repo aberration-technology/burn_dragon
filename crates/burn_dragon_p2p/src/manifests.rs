@@ -305,6 +305,7 @@ pub fn build_manifest_bundle(
         current_head_id: None,
         allowed_roles,
         allowed_scopes,
+        training_protocol: Default::default(),
         metadata,
     };
     profile.attach_to_entry(&mut experiment_directory_entry)?;

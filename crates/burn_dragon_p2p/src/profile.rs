@@ -829,6 +829,7 @@ mod tests {
             current_head_id: None,
             allowed_roles: PeerRoleSet::new([PeerRole::TrainerGpu]),
             allowed_scopes: BTreeSet::from([ExperimentScope::Connect]),
+            training_protocol: Default::default(),
             metadata: BTreeMap::new(),
         }
     }

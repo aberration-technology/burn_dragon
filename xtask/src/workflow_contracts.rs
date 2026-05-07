@@ -59,7 +59,7 @@ fn runtime_sync_contract() -> Result<()> {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.0-pre.80".to_owned(),
+        bootstrap_crate_version: "0.21.0-pre.83".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),
@@ -82,7 +82,7 @@ fn runtime_sync_contract() -> Result<()> {
     )?;
     require_contains(
         &joined,
-        "cargo install --locked burn_p2p_bootstrap --version '0.21.0-pre.80'",
+        "cargo install --locked burn_p2p_bootstrap --version '0.21.0-pre.83'",
         "crate bootstrap install command",
     )?;
     require_contains(
@@ -372,12 +372,18 @@ fn native_canary_contracts() -> Result<()> {
         "BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: \"300\"",
         "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: ${{ github.event.inputs.canonical_timeout_secs || '480' }}",
         "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}",
+        "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}",
+        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'true' }}",
+        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'true' }}",
+        "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: ${{ github.event.inputs.repair_current_head_to_visible_root || 'false' }}",
     ] {
         require_contains(&workflow, snippet, "live native canary workflow")?;
     }
 
     let native = read("xtask/src/native_canary.rs")?;
     for snippet in [
+        "--mirror-live-head-to-edge",
+        "--reset-current-head-to-visible-root",
         "--require-head-advanced",
         "fn p2p_bootstrap_addresses",
         "BURN_DRAGON_NATIVE_CANARY_P2P_BOOTSTRAP_ADDRS",
@@ -385,6 +391,9 @@ fn native_canary_contracts() -> Result<()> {
         "p2p bootstrap snapshot did not advertise canonical head",
         "fn assert_head_provider_signal",
         "require_edge_provider: bool",
+        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE",
+        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER",
+        "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT",
         "require_canonical_loss_non_regression",
         "BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT",
         "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_PRINCIPAL_ID",
@@ -577,6 +586,8 @@ fn agent_task_contracts() -> Result<()> {
         "workflow: \".github/workflows/live-native-training-canary.yml\"",
         "input_env(\"environment\", \"BURN_DRAGON_DEPLOY_PAGES_ENVIRONMENT\")",
         "input_env(\"edge_base_url\", \"BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL\")",
+        "\"mirror_live_head_to_edge\"",
+        "\"repair_current_head_to_visible_root\"",
         "env_u64(\"BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS\", 60)",
     ] {
         require_contains(&source, snippet, "agent task dispatch helpers")?;
@@ -597,7 +608,7 @@ fn dummy_runtime_env() -> RuntimeCommandEnv {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.0-pre.80".to_owned(),
+        bootstrap_crate_version: "0.21.0-pre.83".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),

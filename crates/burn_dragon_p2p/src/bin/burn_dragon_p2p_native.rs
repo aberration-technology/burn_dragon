@@ -2980,26 +2980,6 @@ where
                             )?;
                             last_head_announcement = Instant::now();
                         }
-                        if options.settle_diffusion {
-                            eprintln!(
-                                "train-window-once progress: diffusion serve pass starting elapsed_ms={}",
-                                started.elapsed().as_millis(),
-                            );
-                            match running.advance_diffusion_steady_state(
-                                &experiment,
-                                Some(outcome.lease.window_id),
-                                Some(&base_head.head_id),
-                            ) {
-                                Ok(()) => {
-                                    passes_completed = passes_completed.saturating_add(1);
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "train-window-once diffusion serve-pass-error: {error}"
-                                    );
-                                }
-                            }
-                        }
                         let snapshot = running.snapshot();
                         if last_status.elapsed() >= status_interval {
                             eprintln!(

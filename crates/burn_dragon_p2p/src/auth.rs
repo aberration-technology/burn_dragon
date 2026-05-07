@@ -325,7 +325,7 @@ fn native_release_manifest_for_bridge(
             .map_err(|error| anyhow!("invalid app semver {}: {error}", bootstrap.app_semver))?,
         git_commit: bootstrap.git_commit.clone(),
         cargo_lock_hash: ContentId::new("dragon-native-auth-lock"),
-        burn_version_string: "0.21.0-pre.3".into(),
+        burn_version_string: "0.21.0".into(),
         enabled_features_hash: ContentId::new(bootstrap.enabled_features_label.clone()),
         protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),

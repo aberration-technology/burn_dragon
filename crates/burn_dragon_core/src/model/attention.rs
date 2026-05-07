@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn alibi_decay_matches_exp_neg_slope() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let mut kernel = FusedKernelConfig::default();
         kernel.set_rotary_embedding(RotaryEmbedding::Alibi);
         kernel.set_alibi_slopes(vec![0.5, 1.0]);
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn alibi_bias_applies_in_forward() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let mut kernel = FusedKernelConfig::default();
         kernel.set_rotary_embedding(RotaryEmbedding::Alibi);
         kernel.set_alibi_slopes(vec![0.5]);

@@ -312,13 +312,12 @@ fn nan_to_num_data(values: &mut [f32]) {
 mod tests {
     use crate::train::gdpo::*;
     use burn::tensor::Tensor;
-    use burn::tensor::backend::Backend as BackendTrait;
     use burn_ndarray::NdArray;
 
     #[test]
     fn gdpo_easy_gate_fixed_threshold() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let hard = Tensor::<Backend, 2>::from_data(
             TensorData::new(vec![0.1, 0.9, 0.5, 0.8], [2, 2]),
             &device,
@@ -342,7 +341,7 @@ mod tests {
     #[test]
     fn gdpo_advantage_zero_rewards_is_zero() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let hard = Tensor::<Backend, 2>::zeros([2, 3], &device);
         let easy = Tensor::<Backend, 2>::zeros([2, 3], &device);
         let config = GdpoConfig::default();
@@ -359,7 +358,7 @@ mod tests {
     #[test]
     fn gdpo_percentile_gate_uses_linear_interpolation() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let hard = Tensor::<Backend, 2>::from_data(
             TensorData::new(vec![0.0, 2.0, 4.0, 6.0], [1, 4]),
             &device,
@@ -376,7 +375,7 @@ mod tests {
     #[test]
     fn gdpo_percentile_gate_handles_nan_to_num() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let hard = Tensor::<Backend, 2>::from_data(
             TensorData::new(
                 vec![f32::NAN, 1.0, f32::INFINITY, f32::NEG_INFINITY],
@@ -396,7 +395,7 @@ mod tests {
     #[test]
     fn gdpo_policy_loss_clips_ratio() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let log_prob_new =
             Tensor::<Backend, 2>::from_data(TensorData::new(vec![0.3], [1, 1]), &device);
         let log_prob_old = Tensor::<Backend, 2>::zeros([1, 1], &device);

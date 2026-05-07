@@ -1,4 +1,3 @@
-use burn::tensor::backend::Backend as BackendTrait;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_dragon_language::SelfDistillationKlKind;
 use burn_dragon_language::loss::language_model_loss;
@@ -9,7 +8,7 @@ use std::hint::black_box;
 
 type BenchBackend = NdArray<f32>;
 
-fn device() -> <BenchBackend as BackendTrait>::Device {
+fn device() -> burn::tensor::Device<BenchBackend> {
     Default::default()
 }
 

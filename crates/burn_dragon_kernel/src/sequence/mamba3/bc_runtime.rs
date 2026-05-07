@@ -294,7 +294,7 @@ pub(crate) fn fused_mamba3_bc_backward_cuda(
 
 #[cfg(feature = "cuda")]
 fn params_tensor(
-    device: &<CudaCubeBackend as burn::tensor::backend::Backend>::Device,
+    device: &burn::tensor::Device<CudaCubeBackend>,
     values: [f32; BC_PARAMS_LEN],
 ) -> BurnTensor<CudaCubeBackend, 1> {
     BurnTensor::<CudaCubeBackend, 1>::from_data(
@@ -304,7 +304,7 @@ fn params_tensor(
 }
 
 fn params_tensor_wgpu(
-    device: &<WgpuCubeBackend as burn::tensor::backend::Backend>::Device,
+    device: &burn::tensor::Device<WgpuCubeBackend>,
     values: [f32; BC_PARAMS_LEN],
 ) -> BurnTensor<WgpuCubeBackend, 1> {
     BurnTensor::<WgpuCubeBackend, 1>::from_data(

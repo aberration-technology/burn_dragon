@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn loads_model_from_parts_manifest() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1337);
         let model = TinyModel::<TestBackend>::new(&device);
         let dir = tempdir().expect("tempdir");
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn load_model_from_part_bytes_matches_sequential_apply() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1337);
         let model = TinyModel::<TestBackend>::new(&device);
         let dir = tempdir().expect("tempdir");
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn load_model_from_candidates_falls_back_to_monolithic_burnpack() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1337);
         let model = TinyModel::<TestBackend>::new(&device);
         let dir = tempdir().expect("tempdir");

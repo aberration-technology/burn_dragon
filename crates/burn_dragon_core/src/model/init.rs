@@ -1265,7 +1265,7 @@ mod tests {
 
     #[test]
     fn semi_orthogonal_family_is_backend_seeded_and_finite() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1234);
         let config = DragonInitializationConfig {
             kind: DragonInitializationKind::HeadwiseSemiOrthogonal,
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn heavy_tailed_neuron_gains_increase_column_norm_dispersion() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let iid = DragonInitializationConfig {
             kind: DragonInitializationKind::SimpleNormal,
             simple_normal_std: 0.02,
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn reservoir_headwise_projection_is_deterministic_and_role_specific() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = reservoir_test_config(0.08, DragonTopologyPriorConfig::default());
         let initializer = DragonInitializer::new(&config);
 
@@ -1524,7 +1524,7 @@ mod tests {
 
     #[test]
     fn reservoir_projection_shapes_and_latent_coverage_are_valid() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = reservoir_test_config(0.01, DragonTopologyPriorConfig::default());
         let initializer = DragonInitializer::new(&config);
 
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn reservoir_projection_density_and_rms_track_config() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = reservoir_test_config(0.08, DragonTopologyPriorConfig::default());
         let initializer = DragonInitializer::new(&config);
         let tensor = initializer.headwise_projection_tensor::<TestBackend>(
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn reservoir_lm_head_uses_existing_dense_initializer_path() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = reservoir_test_config(0.01, DragonTopologyPriorConfig::default());
         let initializer = DragonInitializer::new(&config);
         let tensor = initializer.projection_tensor::<TestBackend>(
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[test]
     fn reservoir_modular_bridges_biases_same_community_density() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = reservoir_test_config(
             0.35,
             DragonTopologyPriorConfig {

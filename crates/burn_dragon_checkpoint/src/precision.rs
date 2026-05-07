@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn converts_burnpack_to_f16_metadata() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1337);
         let model = TinyModel::<TestBackend>::new(&device);
         let dir = tempdir().expect("tempdir");

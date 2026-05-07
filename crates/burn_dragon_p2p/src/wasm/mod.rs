@@ -593,7 +593,7 @@ fn browser_release_manifest_from_snapshot(snapshot: &BrowserEdgeSnapshot) -> Cli
         app_semver,
         git_commit: build_info::embedded_git_commit_or_unknown(),
         cargo_lock_hash: ContentId::new("dragon-browser-site-lock"),
-        burn_version_string: "0.21.0-pre.3".into(),
+        burn_version_string: "0.21.0".into(),
         enabled_features_hash: ContentId::new("dragon-browser-site-features"),
         protocol_major: snapshot.protocol_major,
         supported_workloads: Vec::new(),

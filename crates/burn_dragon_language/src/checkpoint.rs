@@ -203,7 +203,7 @@ pub fn export_language_checkpoint_to_burnpack(
         tokenizer.as_ref(),
     )?;
 
-    let device = <ExportBackend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<ExportBackend>::default();
     ExportBackend::seed(&device, 1337);
     let mut model = DragonModel::<ExportBackend>::new(model_config, &device);
     let record = BinFileRecorder::<FullPrecisionSettings>::new()

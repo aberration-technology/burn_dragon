@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn exports_f16_bundle_with_parts_and_removes_intermediate() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 1337);
         let model = TinyModel::<TestBackend>::new(&device);
         let dir = tempdir().expect("tempdir");

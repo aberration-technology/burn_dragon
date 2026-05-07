@@ -19,7 +19,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic payload".to_owned()
 }
 
-fn init_runtime(device: &<Backend as BackendTrait>::Device) -> Result<(), String> {
+fn init_runtime(device: &burn::tensor::Device<Backend>) -> Result<(), String> {
     static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let failure = INIT_FAILURE.get_or_init(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -78,7 +78,7 @@ struct MemorySnapshot {
     in_use: u64,
 }
 
-fn memory_snapshot(device: &<Backend as BackendTrait>::Device) -> MemorySnapshot {
+fn memory_snapshot(device: &burn::tensor::Device<Backend>) -> MemorySnapshot {
     let usage = <WgpuRuntime as Runtime>::client(device)
         .memory_usage()
         .expect("wgpu memory usage");
@@ -159,7 +159,7 @@ fn reference_recurrent_autodiff<B: BackendTrait>(
 
 #[test]
 fn fused_recurrent_matches_reference_with_decay() {
-    let device = <Backend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<Backend>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -185,7 +185,7 @@ fn fused_recurrent_matches_reference_with_decay() {
 
 #[test]
 fn fused_recurrent_matches_reference_without_decay() {
-    let device = <Backend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<Backend>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -209,7 +209,7 @@ fn fused_recurrent_matches_reference_without_decay() {
 
 #[test]
 fn fused_recurrent_matches_reference_query_value_gradients_on_wgpu_autodiff() {
-    let device = <AutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -291,7 +291,7 @@ fn fused_recurrent_matches_reference_query_value_gradients_on_wgpu_autodiff() {
 
 #[test]
 fn fused_recurrent_memory_stays_bounded_across_repeated_calls() {
-    let device = <Backend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<Backend>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -352,7 +352,7 @@ fn recurrent_attention_supports_cuda_backend_types() {
 fn fused_recurrent_matches_reference_with_decay_on_cuda() {
     type CudaBackend = Cuda<f32, i32>;
 
-    let device = <CudaBackend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<CudaBackend>::default();
     <CudaBackend as BackendTrait>::seed(&device, 7);
 
     let query =
@@ -378,7 +378,7 @@ fn fused_recurrent_matches_reference_query_value_gradients_on_cuda_autodiff() {
     type CudaBackend = Cuda<f32, i32>;
     type CudaAutodiffBackend = Autodiff<CudaBackend>;
 
-    let device = <CudaAutodiffBackend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<CudaAutodiffBackend>::default();
 
     let query = Tensor::<CudaAutodiffBackend, 4>::from_data(
         TensorData::new(

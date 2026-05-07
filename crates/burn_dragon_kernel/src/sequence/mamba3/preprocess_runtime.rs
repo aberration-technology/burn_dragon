@@ -64,7 +64,7 @@ fn reduce_partials_wgpu(
 }
 
 fn params_tensor_wgpu(
-    device: &<WgpuCubeBackend as burn::tensor::backend::Backend>::Device,
+    device: &burn::tensor::Device<WgpuCubeBackend>,
     values: [f32; PREPROCESS_PARAM_LEN],
 ) -> BurnTensor<WgpuCubeBackend, 1> {
     BurnTensor::<WgpuCubeBackend, 1>::from_data(
@@ -451,7 +451,6 @@ pub(crate) fn fused_mamba3_preprocess_backward_wgpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::backend::Backend as BackendTrait;
     use burn::tensor::{Tensor, TensorPrimitive};
 
     type WgpuBackend = WgpuCubeBackend;
@@ -466,7 +465,7 @@ mod tests {
         "unknown panic payload".to_owned()
     }
 
-    fn init_runtime(device: &<WgpuBackend as BackendTrait>::Device) -> Result<(), String> {
+    fn init_runtime(device: &burn::tensor::Device<WgpuBackend>) -> Result<(), String> {
         static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let failure = INIT_FAILURE.get_or_init(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -503,7 +502,7 @@ mod tests {
 
     #[test]
     fn mamba3_preprocess_runtime_matches_reference_on_wgpu() {
-        let device = <WgpuBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;

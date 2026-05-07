@@ -1805,8 +1805,7 @@ impl Backward<CudaCubeBackend, 4> for TensorizedMamba3StateUpdateBackward<CudaCu
 
 #[cfg(test)]
 impl Backward<NdArrayBackend, 9> for TensorizedMamba3Backward<NdArrayBackend> {
-    type State =
-        Mamba3TensorizedBackwardState<<NdArrayBackend as BackendTrait>::FloatTensorPrimitive>;
+    type State = Mamba3TensorizedBackwardState<burn::tensor::ops::FloatTensor<NdArrayBackend>>;
 
     fn backward(
         self,

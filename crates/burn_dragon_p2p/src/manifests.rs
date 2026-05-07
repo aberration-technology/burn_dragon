@@ -216,7 +216,7 @@ pub fn build_manifest_bundle(
         app_semver,
         git_commit: git_commit.into(),
         cargo_lock_hash: stable_content_id("dragon-cargo-lock", &"workspace"),
-        burn_version_string: "0.21.0-pre.3".into(),
+        burn_version_string: "0.21.0".into(),
         enabled_features_hash: stable_content_id("dragon-features", &enabled_features_label),
         protocol_major: seed.protocol_major,
         supported_workloads: vec![supported_workload.clone()],

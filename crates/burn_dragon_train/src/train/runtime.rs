@@ -3,7 +3,7 @@ use std::env;
 #[cfg(feature = "ddp")]
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use burn::tensor::backend::{Backend as BackendTrait, Device, DeviceId, DeviceOps};
 #[cfg(feature = "ddp")]
 use burn_collective::{AllReduceStrategy, CollectiveConfig};
@@ -427,9 +427,17 @@ where
         ));
     }
 
-    Ok((0..replica_count)
-        .map(|index| <B::Device as Device>::from_id(DeviceId::new(type_id, index as u32)))
-        .collect())
+    (0..replica_count)
+        .map(|index| {
+            let device_index = u16::try_from(index).with_context(|| {
+                format!("device index {index} exceeds CubeCL device id capacity")
+            })?;
+            Ok(<B::Device as Device>::from_id(DeviceId::new(
+                type_id,
+                device_index,
+            )))
+        })
+        .collect()
 }
 
 fn resolve_local_rank_device<B>(primary_device: &B::Device, local_rank: usize) -> Result<B::Device>
@@ -455,9 +463,11 @@ where
         ));
     }
 
+    let device_index = u16::try_from(local_rank)
+        .with_context(|| format!("LOCAL_RANK={local_rank} exceeds CubeCL device id capacity"))?;
     Ok(<B::Device as Device>::from_id(DeviceId::new(
         type_id,
-        local_rank as u32,
+        device_index,
     )))
 }
 
@@ -782,7 +792,7 @@ mod tests {
         };
         let devices = resolve_training_devices::<TestBackend>(
             &runtime,
-            &<TestBackend as burn::tensor::backend::Backend>::Device::default(),
+            &burn::tensor::Device::<TestBackend>::default(),
         )
         .expect("resolve devices");
 
@@ -806,15 +816,12 @@ mod tests {
         };
         let devices = resolve_training_devices::<TestBackend>(
             &runtime,
-            &<TestBackend as burn::tensor::backend::Backend>::Device::default(),
+            &burn::tensor::Device::<TestBackend>::default(),
         )
         .expect("resolve devices");
 
         assert_eq!(devices.len(), 1);
-        assert_eq!(
-            devices[0],
-            <TestBackend as burn::tensor::backend::Backend>::Device::default()
-        );
+        assert_eq!(devices[0], burn::tensor::Device::<TestBackend>::default());
     }
 
     #[cfg(feature = "ddp")]

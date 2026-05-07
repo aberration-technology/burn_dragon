@@ -2026,9 +2026,9 @@ mod tests {
         let parallel_runtime =
             resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
 
-        let primary_device = <TestBackend as BackendTrait>::Device::default();
+        let primary_device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&primary_device, 11);
-        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
         let train_batches = vec![
             make_batch::<TestBackend>(
                 &primary_device,
@@ -2321,12 +2321,12 @@ mod tests {
         let parallel_runtime =
             resolve_parallel_runtime(&parallel_config).expect("resolve local ddp runtime");
 
-        let primary_device = <TestBackend as BackendTrait>::Device::default();
+        let primary_device = burn::tensor::Device::<TestBackend>::default();
         let devices =
             resolve_training_devices::<TestBackend>(&parallel_runtime, &primary_device).unwrap();
         assert_eq!(devices.len(), 2, "expected 2 local replicas");
 
-        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
         let train_batches = vec![
             make_batch::<TestBackend>(
                 &primary_device,
@@ -2400,8 +2400,8 @@ mod tests {
         let parallel_runtime =
             resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
 
-        let primary_device = <TestBackend as BackendTrait>::Device::default();
-        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let primary_device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
         let train_batches = vec![
             make_batch::<TestBackend>(
                 &primary_device,
@@ -2491,7 +2491,7 @@ mod tests {
     #[cfg(feature = "ddp")]
     #[test]
     fn gradient_mean_matches_combined_batch_reference_in_module_order() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = tiny_model_config();
         let reference = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device));
         let combined_model = reference.clone();
@@ -2581,8 +2581,8 @@ mod tests {
             process_group_launch: false,
         };
 
-        let primary_device = <TestBackend as BackendTrait>::Device::default();
-        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let primary_device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
         let train_batches = vec![
             make_batch::<TestBackend>(
                 &primary_device,
@@ -2682,8 +2682,8 @@ mod tests {
             process_group_launch: false,
         };
 
-        let primary_device = <TestBackend as BackendTrait>::Device::default();
-        let valid_device = <TestValidBackend as BackendTrait>::Device::default();
+        let primary_device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
         let train_loader: Arc<dyn DataLoader<TestBackend, SequenceBatch<TestBackend>>> =
             Arc::new(StaticSequenceLoader::new(vec![
                 make_batch::<TestBackend>(
@@ -2804,7 +2804,7 @@ mod tests {
     #[cfg(feature = "ddp")]
     #[test]
     fn pipeline_stage_surrogate_backward_matches_full_pipeline_gradients() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let mut config = tiny_model_config();
         config.n_layer = 2;
         let pipeline = burn_dragon_train::ParallelPipelineConfig {
@@ -2849,7 +2849,7 @@ mod tests {
     #[cfg(feature = "ddp")]
     #[test]
     fn pipeline_stage_surrogate_mean_across_replicas_matches_full_batch_gradients() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let mut config = tiny_model_config();
         config.n_layer = 2;
         let pipeline = burn_dragon_train::ParallelPipelineConfig {
@@ -2989,7 +2989,7 @@ mod tests {
             }
         }
 
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = tiny_model_config();
         let model_a =
             LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device));

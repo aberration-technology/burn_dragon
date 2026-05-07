@@ -325,8 +325,8 @@ mod tests {
 
     type Backend = NdArray<f32>;
 
-    fn device() -> <Backend as burn::tensor::backend::Backend>::Device {
-        <Backend as burn::tensor::backend::Backend>::Device::default()
+    fn device() -> burn::tensor::Device<Backend> {
+        burn::tensor::Device::<Backend>::default()
     }
 
     #[test]

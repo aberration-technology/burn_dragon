@@ -188,13 +188,13 @@ mod tests {
     use std::sync::OnceLock;
 
     use super::*;
-    use burn::tensor::{TensorData, backend::Backend as BackendTrait};
+    use burn::tensor::TensorData;
     use burn_ndarray::NdArray;
 
     #[test]
     fn fused_forward_matches_reference_single_stream_projection() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let input = Tensor::<Backend, 4>::from_data(
             TensorData::new((1..=12).map(|v| v as f32).collect::<Vec<_>>(), [2, 1, 2, 3]),
             &device,
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn fused_forward_matches_reference_head_aligned_projection() {
         type Backend = NdArray<f32>;
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         let input = Tensor::<Backend, 4>::from_data(
             TensorData::new((1..=24).map(|v| v as f32).collect::<Vec<_>>(), [2, 2, 2, 3]),
             &device,
@@ -277,7 +277,7 @@ mod tests {
         type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
         static INIT_FAILURE: OnceLock<Option<String>> = OnceLock::new();
-        let device = <Backend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<Backend>::default();
         if let Some(reason) = INIT_FAILURE.get_or_init(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(

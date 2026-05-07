@@ -1,11 +1,10 @@
-use burn::tensor::backend::Backend as BackendTrait;
 use burn_dragon_core::DragonConfig;
 use burn_wgpu::{self, MemoryConfiguration, RuntimeOptions, Wgpu, graphics};
 
 use crate::config::{WgpuBackend, WgpuMemoryConfig, WgpuRuntimeConfig};
 
 /// The concrete device type used by the `Wgpu<f32>` backend.
-pub type WgpuDevice = <Wgpu<f32> as BackendTrait>::Device;
+pub type WgpuDevice = burn::tensor::Device<Wgpu<f32>>;
 
 pub fn is_wgpu_backend_name(backend_name: &str) -> bool {
     backend_name.eq_ignore_ascii_case("wgpu")

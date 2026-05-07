@@ -38,13 +38,13 @@ use crate::kernels::sequence::mamba3::rotary_runtime::fused_mamba3_rotary_forwar
 use crate::kernels::sequence::mamba3::rotary_runtime::fused_mamba3_rotary_forward_wgpu;
 type WgpuCubeBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 type WgpuCubeAutodiffBackend = Autodiff<WgpuCubeBackend>;
-type WgpuCubeAutodiffTensor = <WgpuCubeAutodiffBackend as BackendTrait>::FloatTensorPrimitive;
+type WgpuCubeAutodiffTensor = burn::tensor::ops::FloatTensor<WgpuCubeAutodiffBackend>;
 #[cfg(feature = "cuda")]
 type CudaCubeBackend = CubeBackend<CudaRuntime, f32, i32, u8>;
 #[cfg(feature = "cuda")]
 type CudaCubeAutodiffBackend = Autodiff<CudaCubeBackend>;
 #[cfg(feature = "cuda")]
-type CudaCubeAutodiffTensor = <CudaCubeAutodiffBackend as BackendTrait>::FloatTensorPrimitive;
+type CudaCubeAutodiffTensor = burn::tensor::ops::FloatTensor<CudaCubeAutodiffBackend>;
 
 const PI: f32 = std::f32::consts::PI;
 
@@ -2531,9 +2531,7 @@ mod wgpu_tests {
         "unknown panic payload".to_owned()
     }
 
-    fn init_runtime(
-        device: &<WgpuCubeAutodiffBackend as BackendTrait>::Device,
-    ) -> Result<(), String> {
+    fn init_runtime(device: &burn::tensor::Device<WgpuCubeAutodiffBackend>) -> Result<(), String> {
         static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let failure = INIT_FAILURE.get_or_init(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2575,7 +2573,7 @@ mod wgpu_tests {
         }
         set_mamba3_wgpu_bc_backward_runtime_for_tests(use_bc_runtime);
         set_mamba3_wgpu_rotary_backward_runtime_for_tests(use_rotary_runtime);
-        let device = <WgpuCubeAutodiffBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeAutodiffBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -2861,7 +2859,7 @@ mod wgpu_tests {
 
     #[test]
     fn wgpu_train_wrapper_defaults_to_direct_graph() {
-        let device = <WgpuCubeBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -2887,7 +2885,7 @@ mod wgpu_tests {
 
     #[test]
     fn state_update_runtime_heuristic_prefers_long_wgpu_chunks() {
-        let device = <WgpuCubeBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -2901,7 +2899,7 @@ mod wgpu_tests {
 
     #[test]
     fn wgpu_current_score_runtime_matches_direct_graph_reference() {
-        let device = <WgpuCubeAutodiffBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeAutodiffBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -3127,7 +3125,7 @@ mod wgpu_tests {
 
     #[test]
     fn wgpu_preprocess_runtime_matches_direct_graph_reference() {
-        let device = <WgpuCubeAutodiffBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeAutodiffBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -3307,7 +3305,7 @@ mod wgpu_tests {
 
     #[test]
     fn wgpu_state_update_runtime_matches_direct_graph_reference() {
-        let device = <WgpuCubeAutodiffBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<WgpuCubeAutodiffBackend>::default();
         if let Err(reason) = init_runtime(&device) {
             eprintln!("skipping WGPU test: {reason}");
             return;
@@ -3483,7 +3481,7 @@ mod cuda_tests {
 
     #[test]
     fn tensorized_mamba3_custom_backward_matches_direct_graph_on_cuda_autodiff() {
-        let device = <CudaCubeAutodiffBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<CudaCubeAutodiffBackend>::default();
         let batch = 1;
         let time = 32;
         let d_model = 128;

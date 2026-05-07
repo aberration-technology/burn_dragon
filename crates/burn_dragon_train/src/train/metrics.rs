@@ -595,7 +595,7 @@ mod tests {
     impl<B: BackendTrait> ScalarValue<B> for CountValue {
         fn value(&self) -> Tensor<B, 1> {
             self.counter.fetch_add(1, Ordering::SeqCst);
-            let device = <B as BackendTrait>::Device::default();
+            let device = burn::tensor::Device::<B>::default();
             Tensor::<B, 1>::zeros([1], &device)
         }
     }

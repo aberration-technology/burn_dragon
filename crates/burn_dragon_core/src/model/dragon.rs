@@ -1595,7 +1595,7 @@ mod tests {
 
     #[test]
     fn tiny_reservoir_model_constructs_and_runs_forward() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let config = DragonConfig {
             n_layer: 1,
             n_embd: 16,

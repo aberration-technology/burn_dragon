@@ -24,7 +24,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic payload".to_owned()
 }
 
-fn init_runtime(device: &<Backend as BackendTrait>::Device) -> Result<(), String> {
+fn init_runtime(device: &burn::tensor::Device<Backend>) -> Result<(), String> {
     static INIT_FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let failure = INIT_FAILURE.get_or_init(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -68,7 +68,7 @@ fn assert_close<const D: usize, B: BackendTrait>(
 
 #[test]
 fn fused_relu_lowrank_matches_reference_single_stream() {
-    let device = <Backend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<Backend>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -86,7 +86,7 @@ fn fused_relu_lowrank_matches_reference_single_stream() {
 
 #[test]
 fn fused_relu_lowrank_matches_reference_head_aligned() {
-    let device = <Backend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<Backend>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -102,7 +102,7 @@ fn fused_relu_lowrank_matches_reference_head_aligned() {
 
 #[test]
 fn fused_relu_lowrank_matches_reference_single_stream_query_weight_gradients_on_wgpu_autodiff() {
-    let device = <AutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -148,7 +148,7 @@ fn fused_relu_lowrank_matches_reference_single_stream_query_weight_gradients_on_
 #[test]
 fn fused_relu_lowrank_matches_reference_single_stream_query_weight_gradients_on_wgpu_autodiff_long_sequence()
  {
-    let device = <AutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -186,7 +186,7 @@ fn fused_relu_lowrank_matches_reference_single_stream_query_weight_gradients_on_
 
 #[test]
 fn fused_relu_lowrank_matches_reference_head_aligned_query_weight_gradients_on_wgpu_autodiff() {
-    let device = <AutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -225,7 +225,7 @@ fn fused_relu_lowrank_matches_reference_head_aligned_query_weight_gradients_on_w
 #[test]
 fn fused_relu_lowrank_matches_reference_head_aligned_query_weight_gradients_on_wgpu_fusion_autodiff()
  {
-    let device = <FusionAutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<FusionAutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -271,7 +271,7 @@ fn fused_relu_lowrank_matches_reference_head_aligned_query_weight_gradients_on_w
 #[test]
 fn fused_relu_lowrank_kernel_tiled_matches_reference_head_aligned_query_weight_gradients_on_wgpu_autodiff_long_sequence()
  {
-    let device = <AutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -315,7 +315,7 @@ fn fused_relu_lowrank_kernel_tiled_matches_reference_head_aligned_query_weight_g
 #[test]
 fn fused_relu_lowrank_kernel_tiled_matches_reference_head_aligned_query_weight_gradients_on_wgpu_fusion_autodiff_long_sequence()
  {
-    let device = <FusionAutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<FusionAutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
         eprintln!("skipping WGPU test: {reason}");
         return;
@@ -374,7 +374,7 @@ fn fused_relu_lowrank_supports_cuda_backend_types() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fused_relu_lowrank_matches_reference_single_stream_on_cuda() {
-    let device = <CudaBackend as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<CudaBackend>::default();
     let input = Tensor::<CudaBackend, 4>::random([2, 1, 7, 32], Distribution::Default, &device);
     let weight = Tensor::<CudaBackend, 4>::random([1, 4, 32, 16], Distribution::Default, &device);
     let mask = Tensor::<CudaBackend, 1>::from_floats([1.0; 16], &device).reshape([1, 1, 1, 16]);
@@ -388,7 +388,7 @@ fn fused_relu_lowrank_matches_reference_single_stream_on_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fused_relu_lowrank_matches_reference_gradients_on_cuda_autodiff() {
-    let device = <CudaAutodiffBackendImpl as BackendTrait>::Device::default();
+    let device = burn::tensor::Device::<CudaAutodiffBackendImpl>::default();
 
     let input =
         Tensor::<CudaAutodiffBackendImpl, 4>::random([1, 1, 5, 16], Distribution::Default, &device)

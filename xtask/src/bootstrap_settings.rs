@@ -101,7 +101,7 @@ fn resolve_deploy() -> Result<()> {
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
     let bootstrap_version = first_env(
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
-        "0.21.0-pre.84",
+        "0.21.0",
     );
     let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
     validate_bootstrap_install(
@@ -286,7 +286,7 @@ fn resolve_restore() -> Result<()> {
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
     let bootstrap_version = first_env(
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
-        "0.21.0-pre.84",
+        "0.21.0",
     );
     let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
     validate_bootstrap_install(
@@ -1183,9 +1183,18 @@ fn validate_bootstrap_install(
     if install_source == "git" && git_ref.is_empty() {
         bail!("bootstrap_git_ref is required when bootstrap_install_source=git");
     }
-    if auth_connector_kind == "github" && install_source == "crate" && version == "0.21.0-pre.15" {
+    let broken_github_auth_bootstrap = semver::Version::parse(version)
+        .map(|version| {
+            version.major == 0
+                && version.minor == 21
+                && version.patch == 0
+                && version.pre.as_str() == "pre.15"
+        })
+        .unwrap_or(false);
+    if auth_connector_kind == "github" && install_source == "crate" && broken_github_auth_bootstrap
+    {
         bail!(
-            "burn_p2p_bootstrap 0.21.0-pre.15 is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate"
+            "selected burn_p2p_bootstrap prerelease is not deployable with github auth; use bootstrap_install_source=git with a fixed burn_p2p ref or a newer published crate"
         );
     }
     Ok(())

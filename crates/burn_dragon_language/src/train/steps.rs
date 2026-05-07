@@ -1618,7 +1618,7 @@ mod objective_step_tests {
         .expect("pipeline plan")
     }
 
-    fn batch(device: &<TestBackend as BackendTrait>::Device) -> SequenceBatch<TestBackend> {
+    fn batch(device: &burn::tensor::Device<TestBackend>) -> SequenceBatch<TestBackend> {
         SequenceBatch::new(
             Tensor::<TestBackend, 2, Int>::from_data(
                 TensorData::new(vec![0, 1, 2, 3, 4, 5, 6, 7], [2, 4]),
@@ -1644,7 +1644,7 @@ mod objective_step_tests {
 
     #[test]
     fn sdft_train_step_runs_rollout_objective() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_model_config(),
@@ -1661,7 +1661,7 @@ mod objective_step_tests {
 
     #[test]
     fn sdpo_train_step_runs_rollout_objective() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_model_config(),
@@ -1682,7 +1682,7 @@ mod objective_step_tests {
         expected = "paper-aligned SDFT/SDPO rollout objectives require flat token logits"
     )]
     fn sdft_train_step_guards_factorized_language_head() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_factorized_model_config(),
@@ -1698,7 +1698,7 @@ mod objective_step_tests {
 
     #[test]
     fn sdft_train_step_updates_teacher_runtime() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_model_config(),
@@ -1719,7 +1719,7 @@ mod objective_step_tests {
 
     #[test]
     fn rollout_teacher_context_contains_gold_demonstration() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_model_config(),
@@ -1759,7 +1759,7 @@ mod objective_step_tests {
 
     #[test]
     fn sdft_sdpo_composite_train_step_runs() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             tiny_model_config(),
@@ -1787,7 +1787,7 @@ mod objective_step_tests {
 
     #[test]
     fn sdpo_train_step_runs_with_single_process_pipeline_plan() {
-        let device = <TestBackend as BackendTrait>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
         let mut config = tiny_model_config();
         config.n_layer = 2;

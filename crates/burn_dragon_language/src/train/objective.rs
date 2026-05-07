@@ -79,13 +79,12 @@ mod tests {
     use super::*;
     use crate::config::SelfDistillationKlKind;
     use burn::tensor::TensorData;
-    use burn::tensor::backend::Backend as BackendTrait;
     use burn::tensor::{Int, Tensor};
     use burn_ndarray::NdArray;
 
     type TestBackend = NdArray<f32>;
 
-    fn device() -> <TestBackend as BackendTrait>::Device {
+    fn device() -> burn::tensor::Device<TestBackend> {
         Default::default()
     }
 

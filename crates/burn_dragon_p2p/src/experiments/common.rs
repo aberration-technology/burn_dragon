@@ -583,7 +583,7 @@ where
 fn build_valid_loader<B>(
     datasets: &burn_dragon_language::train::utils::PreparedDatasets,
     _config: &TrainingConfig,
-    device: &<ValidBackend<B> as Backend>::Device,
+    device: &burn::tensor::Device<ValidBackend<B>>,
     summary_event_token_ids: Option<Vec<u32>>,
 ) -> BurnValidationLoader<DragonLearningComponents<B>>
 where
@@ -605,7 +605,7 @@ where
 
 fn build_valid_loader_for_dataset<B>(
     dataset: Arc<Dataset>,
-    device: &<ValidBackend<B> as Backend>::Device,
+    device: &burn::tensor::Device<ValidBackend<B>>,
     summary_event_token_ids: Option<Vec<u32>>,
 ) -> BurnValidationLoader<DragonLearningComponents<B>>
 where
@@ -859,7 +859,7 @@ fn ensure_tokenizer_compatible(
 
 fn prepare_validation_loader_only<B>(
     config: &TrainingConfig,
-    device: &<ValidBackend<B> as Backend>::Device,
+    device: &burn::tensor::Device<ValidBackend<B>>,
     base_tokenizer: &dyn Tokenizer,
     summary_event_token_ids: Option<Vec<u32>>,
 ) -> Result<Option<BurnValidationLoader<DragonLearningComponents<B>>>>

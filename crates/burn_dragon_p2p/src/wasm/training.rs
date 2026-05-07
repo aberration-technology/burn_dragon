@@ -59,7 +59,7 @@ type BrowserWgpuEvalBackend = burn_wgpu::Wgpu<f32>;
 #[cfg(feature = "wgpu")]
 type BrowserWgpuTrainBackend = Autodiff<BrowserWgpuEvalBackend>;
 #[cfg(feature = "wgpu")]
-type BrowserWgpuTrainDevice = <BrowserWgpuTrainBackend as Backend>::Device;
+type BrowserWgpuTrainDevice = burn::tensor::Device<BrowserWgpuTrainBackend>;
 
 #[cfg(feature = "wgpu")]
 static WEBGPU_RUNTIME_READY: AtomicBool = AtomicBool::new(false);
@@ -246,8 +246,8 @@ pub async fn run_browser_training_with_release_manifest(
     };
     let result = match backend_kind {
         BrowserTrainingBackendKind::Cpu => {
-            let train_device = <BrowserCpuTrainBackend as Backend>::Device::default();
-            let eval_device = <BrowserCpuEvalBackend as Backend>::Device::default();
+            let train_device = burn::tensor::Device::<BrowserCpuTrainBackend>::default();
+            let eval_device = burn::tensor::Device::<BrowserCpuEvalBackend>::default();
             let setup_started_at = Instant::now();
             BrowserCpuEvalBackend::seed(&eval_device, 1337);
             let setup_time_ms = elapsed_ms(setup_started_at);
@@ -269,7 +269,7 @@ pub async fn run_browser_training_with_release_manifest(
         #[cfg(feature = "wgpu")]
         BrowserTrainingBackendKind::Wgpu => {
             let train_device = BrowserWgpuTrainDevice::default();
-            let eval_device = <BrowserWgpuEvalBackend as Backend>::Device::default();
+            let eval_device = burn::tensor::Device::<BrowserWgpuEvalBackend>::default();
             let setup_started_at = Instant::now();
             ensure_webgpu_runtime_ready(&train_device).await;
             BrowserWgpuEvalBackend::seed(&eval_device, 1337);
@@ -2286,7 +2286,7 @@ mod tests {
             "app_semver": env!("CARGO_PKG_VERSION"),
             "git_commit": "smoke",
             "cargo_lock_hash": "browser-smoke-lock",
-            "burn_version_string": "0.21.0-pre.3",
+            "burn_version_string": "0.21.0",
             "enabled_features_hash": "browser-smoke-features",
             "protocol_major": 0,
             "supported_workloads": [],
@@ -2302,7 +2302,7 @@ mod tests {
                 .expect("valid burn_dragon version"),
             git_commit: "smoke".into(),
             cargo_lock_hash: ContentId::new("browser-smoke-lock"),
-            burn_version_string: "0.21.0-pre.3".into(),
+            burn_version_string: "0.21.0".into(),
             enabled_features_hash: ContentId::new("browser-smoke-features"),
             protocol_major: 0,
             supported_workloads: Vec::new(),

@@ -1115,7 +1115,7 @@ mod streaming_tests {
 
     #[test]
     fn streaming_loader_resets_only_on_new_logical_document() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let dataset = Arc::new(TinyDataset {
             tokens: Arc::new((0u32..65).collect()),
             train_len: 65,
@@ -1144,7 +1144,7 @@ mod streaming_tests {
 
     #[test]
     fn random_sampling_respects_preferred_logical_document_boundaries() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let dataset = Arc::new(TinyDataset {
             tokens: Arc::new(vec![
                 100, 101, 102, 103, 104, 105, 106, 107, 255, 200, 201, 202, 203, 204, 205, 206,
@@ -1194,7 +1194,7 @@ mod streaming_tests {
 
     #[test]
     fn streaming_loader_seed_is_stable_but_changes_document_order() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let dataset = Arc::new(TinyDataset {
             tokens: Arc::new((0u32..257).collect()),
             train_len: 257,
@@ -1372,7 +1372,7 @@ mod random_loader_tests {
 
     #[test]
     fn random_loader_resume_offset_advances_epoch_aware_samples() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = burn::tensor::Device::<TestBackend>::default();
         let dataset = Arc::new(EpochAwareDataset {
             block_size: 4,
             batch_size: 1,

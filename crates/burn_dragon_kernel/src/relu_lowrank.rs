@@ -47,24 +47,22 @@ const RELU_LOWRANK_GRAD_INPUT_TILED_SHADER: &str =
 
 type WgpuCubeBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 type WgpuCubeAutodiffBackend = Autodiff<WgpuCubeBackend>;
-type WgpuCubeAutodiffTensor = <WgpuCubeAutodiffBackend as BackendTrait>::FloatTensorPrimitive;
+type WgpuCubeAutodiffTensor = burn::tensor::ops::FloatTensor<WgpuCubeAutodiffBackend>;
 type WgpuFusionBackend<BT> = Fusion<CubeBackend<WgpuRuntime, f32, i32, BT>>;
 type WgpuFusionAutodiffBackend<BT> = Autodiff<WgpuFusionBackend<BT>>;
-type WgpuFusionAutodiffTensor<BT> =
-    <WgpuFusionAutodiffBackend<BT> as BackendTrait>::FloatTensorPrimitive;
+type WgpuFusionAutodiffTensor<BT> = burn::tensor::ops::FloatTensor<WgpuFusionAutodiffBackend<BT>>;
 #[cfg(feature = "cuda")]
 type CudaCubeBackend = CubeBackend<CudaRuntime, f32, i32, u8>;
 #[cfg(feature = "cuda")]
 type CudaCubeAutodiffBackend = Autodiff<CudaCubeBackend>;
 #[cfg(feature = "cuda")]
-type CudaCubeAutodiffTensor = <CudaCubeAutodiffBackend as BackendTrait>::FloatTensorPrimitive;
+type CudaCubeAutodiffTensor = burn::tensor::ops::FloatTensor<CudaCubeAutodiffBackend>;
 #[cfg(feature = "cuda")]
 type CudaFusionBackend<BT> = Fusion<CubeBackend<CudaRuntime, f32, i32, BT>>;
 #[cfg(feature = "cuda")]
 type CudaFusionAutodiffBackend<BT> = Autodiff<CudaFusionBackend<BT>>;
 #[cfg(feature = "cuda")]
-type CudaFusionAutodiffTensor<BT> =
-    <CudaFusionAutodiffBackend<BT> as BackendTrait>::FloatTensorPrimitive;
+type CudaFusionAutodiffTensor<BT> = burn::tensor::ops::FloatTensor<CudaFusionAutodiffBackend<BT>>;
 
 pub type LowrankProjectionProfileSnapshot = KernelProfileSnapshot;
 

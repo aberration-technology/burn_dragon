@@ -36,7 +36,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn init_wgpu_runtime(device: &<WgpuBackend as Backend>::Device) -> Result<(), String> {
+fn init_wgpu_runtime(device: &burn::tensor::Device<WgpuBackend>) -> Result<(), String> {
     static INIT_FAILURE: OnceLock<Option<String>> = OnceLock::new();
     let failure = INIT_FAILURE.get_or_init(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -52,7 +52,7 @@ fn init_wgpu_runtime(device: &<WgpuBackend as Backend>::Device) -> Result<(), St
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn memory_snapshot(device: &<WgpuBackend as Backend>::Device) -> MemorySnapshot {
+fn memory_snapshot(device: &burn::tensor::Device<WgpuBackend>) -> MemorySnapshot {
     let usage = <WgpuRuntime as Runtime>::client(device)
         .memory_usage()
         .expect("wgpu memory usage");
@@ -86,7 +86,7 @@ fn assert_memory_growth_bounded(
 
 #[test]
 fn mhc_sinkhorn_rows_cols_sum_close_to_one() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 3,
@@ -109,7 +109,7 @@ fn mhc_sinkhorn_rows_cols_sum_close_to_one() {
 
 #[test]
 fn mhc_coefficients_report_expected_shapes_and_policy() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 2,
@@ -143,7 +143,7 @@ fn mhc_coefficients_report_expected_shapes_and_policy() {
 
 #[test]
 fn mhc_width_connection_shapes_match_streams_and_views() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 2,
@@ -174,7 +174,7 @@ fn mhc_width_connection_shapes_match_streams_and_views() {
 
 #[test]
 fn dynamic_positive_stream_coefficients_preserve_positive_constraints_per_token() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 2,
@@ -252,7 +252,7 @@ fn dynamic_positive_stream_coefficients_preserve_positive_constraints_per_token(
 
 #[test]
 fn dynamic_positive_stream_wrapper_uses_single_dragon_branch() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 3,
@@ -279,7 +279,7 @@ fn dynamic_positive_stream_wrapper_uses_single_dragon_branch() {
 
 #[test]
 fn dynamic_positive_stream_coefficients_start_from_nonuniform_static_priors() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 3,
@@ -321,7 +321,7 @@ fn dynamic_positive_stream_coefficients_start_from_nonuniform_static_priors() {
 
 #[test]
 fn dynamic_positive_bootstrap_streams_break_initial_symmetry() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 3,
@@ -355,7 +355,7 @@ fn dynamic_positive_bootstrap_streams_break_initial_symmetry() {
 
 #[test]
 fn mhc_width_and_depth_with_explicit_coefficients_match_compatibility_path() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 2,
@@ -433,7 +433,7 @@ fn mhc_width_and_depth_with_explicit_coefficients_match_compatibility_path() {
 
 #[test]
 fn mhc_generic_mix_matches_manual_stream_weighting_for_reduce_case() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 2,
@@ -471,7 +471,7 @@ fn mhc_generic_mix_matches_manual_stream_weighting_for_reduce_case() {
 
 #[test]
 fn mhc_passthrough_single_stream_single_view_matches_split_merge_path() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 1,
@@ -504,7 +504,7 @@ fn mhc_passthrough_single_stream_single_view_matches_split_merge_path() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn mhc_passthrough_with_explicit_coefficients_matches_one_shot_path() {
-    let device = <TestBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<TestBackend>::default();
     let config = ManifoldHyperConnectionsConfig {
         enabled: true,
         num_streams: 4,
@@ -536,7 +536,7 @@ fn mhc_passthrough_with_explicit_coefficients_matches_one_shot_path() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn mhc_wgpu_passthrough_memory_stays_bounded_across_repeated_calls() {
-    let device = <WgpuBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<WgpuBackend>::default();
     if let Err(reason) = init_wgpu_runtime(&device) {
         eprintln!("skipping WGPU test without adapter: {reason}");
         return;
@@ -581,7 +581,7 @@ fn mhc_wgpu_passthrough_memory_stays_bounded_across_repeated_calls() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn mhc_wgpu_width_and_depth_are_autodiff_stable_after_one_step() {
-    let device = <WgpuAutodiffBackend as Backend>::Device::default();
+    let device = burn::tensor::Device::<WgpuAutodiffBackend>::default();
     if let Err(reason) = init_wgpu_runtime(&device) {
         eprintln!("skipping WGPU test without adapter: {reason}");
         return;

@@ -67,10 +67,6 @@ pub(crate) use crate::{
     ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget, GdpoHardGate,
     LearningRateScheduleConfig, OptimizerConfig, VisionArtifactOutputMode, VisionTeacherVariant,
 };
-#[cfg(feature = "burn_dino")]
-pub(crate) use burn_dino::correctness::load_model_from_checkpoint;
-#[cfg(feature = "burn_dino")]
-pub(crate) use burn_dino::model::dino::{DinoVisionTransformer, DinoVisionTransformerConfig};
 pub(crate) use serde::Serialize;
 
 pub(crate) use crate::train::constants::*;

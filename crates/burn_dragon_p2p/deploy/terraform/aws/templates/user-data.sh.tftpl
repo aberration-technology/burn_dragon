@@ -17,6 +17,22 @@ apt-get install -y --no-install-recommends \
   caddy \
   e2fsprogs
 
+if ! swapon --show --noheadings | grep -q .; then
+  if [ ! -f /swapfile ]; then
+    fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
+    chmod 0600 /swapfile
+    mkswap /swapfile
+  fi
+  swapon /swapfile
+fi
+if ! grep -q '^/swapfile ' /etc/fstab; then
+  echo "/swapfile none swap sw 0 0" >> /etc/fstab
+fi
+sysctl -w vm.swappiness=20
+cat >/etc/sysctl.d/99-burn-dragon-p2p-swap.conf <<'EOF_SWAP_SYSCTL'
+vm.swappiness = 20
+EOF_SWAP_SYSCTL
+
 if ! command -v aws >/dev/null 2>&1; then
   tmpdir="$(mktemp -d)"
   curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "$tmpdir/awscliv2.zip"

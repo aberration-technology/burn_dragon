@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{json, Value};
 
 use crate::bootstrap_runtime::{
-    RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
+    preserve_current_heads, render_bootstrap_runtime_sync_commands, RuntimeCommandEnv,
 };
 
 pub fn run() -> Result<()> {
@@ -303,6 +303,19 @@ fn deployment_workflow_contracts() -> Result<()> {
             "terraform public ip fallback",
         )?;
     }
+
+    let bootstrap_user_data =
+        read("crates/burn_dragon_p2p/deploy/terraform/aws/templates/user-data.sh.tftpl")?;
+    require_contains(
+        &bootstrap_user_data,
+        "fallocate -l 4G /swapfile",
+        "bootstrap host provisions swap for low-memory edge stability",
+    )?;
+    require_contains(
+        &bootstrap_user_data,
+        "vm.swappiness = 20",
+        "bootstrap swap swappiness is persisted",
+    )?;
     Ok(())
 }
 

@@ -9,6 +9,30 @@ echo "--- service status ---"
 systemctl status caddy --no-pager || true
 systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
+echo "--- socket listeners ---"
+ss -ltnup || true
+echo "--- caddy config ---"
+sed -n '1,220p' /etc/caddy/Caddyfile || true
+echo "--- bootstrap swarm addresses ---"
+python3 - <<'PY' || true
+from pathlib import Path
+import json
+
+path = Path("/etc/burn-dragon-p2p/bootstrap.json")
+if not path.exists():
+    print(f"missing {path}")
+    raise SystemExit(0)
+
+config = json.loads(path.read_text())
+for label, root in [
+    ("spec", config.get("spec", {})),
+    ("bootstrap_peer.node", config.get("bootstrap_peer", {}).get("node", {})),
+]:
+    print(label)
+    for key in ["listen_addresses", "external_addresses", "bootstrap_peers"]:
+        for value in root.get(key, []) or []:
+            print(f"  {key}: {value}")
+PY
 echo "--- binary presence ---"
 ls -l /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native /usr/local/bin/burn-dragon-p2p-sync-secrets 2>&1 || true
 echo "--- binary fingerprints ---"

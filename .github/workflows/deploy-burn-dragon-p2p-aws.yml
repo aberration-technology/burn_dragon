@@ -1364,8 +1364,29 @@ jobs:
             head_readiness_flags=()
           fi
 
+          summarize_readiness() {
+            local label="$1"
+            if [ ! -f "$report_path" ]; then
+              echo "${label}: diagnostics report missing"
+              return
+            fi
+            jq -c --arg label "$label" '{
+              label: $label,
+              ready: .readiness.ready,
+              blocking: .readiness.blocking_issues,
+              warnings: .readiness.observed_warnings,
+              current_head: .edge_snapshot.value.matching_directory_current_head_id,
+              matching_head: .edge_snapshot.value.matching_head_id,
+              artifact_head_view: (.artifact_head_view.ok // null),
+              connected_peers: ((.edge_snapshot.value.connected_peer_ids // []) | length),
+              local_peer: .edge_snapshot.value.edge_local_peer_id
+            }' "$report_path" || cat "$report_path"
+          }
+
           diagnostics_timeout_secs=90
-          for attempt in $(seq 1 80); do
+          diagnostics_attempts=180
+          diagnostics_sleep_secs=10
+          for attempt in $(seq 1 "$diagnostics_attempts"); do
             rm -f "$report_path"
             if timeout --foreground "${diagnostics_timeout_secs}s" \
               "${DRAGON_NATIVE_BINARY}" \
@@ -1381,14 +1402,18 @@ jobs:
               --assert-ready \
               --output "$report_path" \
               --output-format json; then
+              summarize_readiness "attempt=${attempt}"
               cat "$report_path"
               exit 0
             fi
-            cat "$report_path" || true
-            sleep 10
+            if [ "$attempt" -eq 1 ] || [ $((attempt % 6)) -eq 0 ]; then
+              summarize_readiness "attempt=${attempt}"
+            fi
+            sleep "$diagnostics_sleep_secs"
           done
 
           echo "bootstrap deployment diagnostics never reached ready" >&2
+          summarize_readiness "final"
           cat "$report_path" || true
           exit 1
 

@@ -1354,6 +1354,15 @@ jobs:
               auth_flags=(--check-auth-authorize --require-auth-authorize)
               ;;
           esac
+          head_readiness_flags=(
+            --check-artifact-head-view
+            --require-head-published
+            --require-artifact-head-view
+          )
+          if [ "${{ github.event.inputs.force_replace_bootstrap }}" = "true" ]; then
+            echo "force_replace_bootstrap=true; deferring strict head/artifact readiness to the live native canary"
+            head_readiness_flags=()
+          fi
 
           diagnostics_timeout_secs=90
           for attempt in $(seq 1 80); do
@@ -1365,11 +1374,9 @@ jobs:
               --experiment-kind nca \
               --backend cpu \
               --check-metrics-catchup \
-              --check-artifact-head-view \
-              --require-head-published \
               --require-directory-entry-published \
               --require-metrics-catchup \
-              --require-artifact-head-view \
+              "${head_readiness_flags[@]}" \
               "${auth_flags[@]}" \
               --assert-ready \
               --output "$report_path" \

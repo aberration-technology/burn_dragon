@@ -286,6 +286,11 @@ fn deployment_workflow_contracts() -> Result<()> {
 
     let deploy = read(".github/workflows/deploy-burn-dragon-p2p-aws.yml")?;
     let restore = read(".github/workflows/restore-burn-dragon-p2p-aws.yml")?;
+    require_contains(
+        &deploy,
+        "deferring strict head/artifact readiness to the live native canary",
+        "forced bootstrap replacement does not require a pre-existing head before the native canary",
+    )?;
     for text in [&deploy, &restore] {
         require_contains(
             text,

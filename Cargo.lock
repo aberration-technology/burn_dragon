@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_checkpoint"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_core"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_kernel"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn",
  "burn-autodiff",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_language"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_p2p"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn",
@@ -1826,14 +1826,14 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_time"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "web-time",
 ]
 
 [[package]]
 name = "burn_dragon_tokenizer"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "ahash",
  "compact_str",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_train"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "avirus",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_universality"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn_dragon_tokenizer",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_admin"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p",
  "burn_p2p_core",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_app"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_browser",
  "burn_p2p_views",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_bootstrap"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn_p2p",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_browser"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "base64 0.22.1",
  "burn_p2p",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_checkpoint"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_core"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "chrono",
  "ciborium",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_dataloader"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_engine"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn",
  "burn-store",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_experiment"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_limits"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_metrics"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "chrono",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_publish"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_security"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_swarm"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "async-trait",
  "burn_p2p_core",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_views"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "burn_p2p_core",
  "burn_p2p_experiment",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_webrtc"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_webrtc_websys"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "bytes",
  "futures",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "burn_p2p_workload"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "burn_p2p_checkpoint",
@@ -14867,7 +14867,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

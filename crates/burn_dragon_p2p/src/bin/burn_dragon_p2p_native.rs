@@ -2671,7 +2671,7 @@ where
             experiment_entry.current_revision_id.clone(),
         );
         let mut served_head_id = None;
-        let _ = sync_or_initialize_head_provider(
+        let _ = sync_or_initialize_latest_head_provider(
             &mut running,
             &experiment,
             initialize_head_on_start,
@@ -2715,7 +2715,7 @@ where
             && let Some(experiment) = experiment.as_ref()
             && last_head_sync.elapsed() >= head_sync_interval
         {
-            let _ = sync_or_initialize_head_provider(
+            let _ = sync_or_initialize_latest_head_provider(
                 &mut running,
                 experiment,
                 initialize_head_on_start,
@@ -3152,7 +3152,7 @@ where
     let mut last_error = None;
     loop {
         attempts += 1;
-        match sync_or_initialize_head_provider(
+        match sync_or_initialize_latest_head_provider(
             running,
             experiment,
             initialize_head_on_start,
@@ -3203,64 +3203,6 @@ where
         }
         thread::sleep(STATUS_POLL_INTERVAL);
     }
-}
-
-fn sync_or_initialize_head_provider<B>(
-    running: &mut ManagedRunningNativePeer<B>,
-    experiment: &burn_p2p::ExperimentHandle,
-    initialize_head_on_start: bool,
-    restore_head_on_start: bool,
-    served_head_id: &mut Option<burn_p2p::HeadId>,
-    log_prefix: &str,
-) -> Result<Option<burn_p2p::HeadDescriptor>>
-where
-    B: AutodiffBackend + Clone + 'static,
-{
-    let restored = if restore_head_on_start {
-        eprintln!("{log_prefix}-head-restore-start");
-        match running.restore_experiment_head(experiment) {
-            Ok(head) => head,
-            Err(error) if initialize_head_on_start => {
-                eprintln!(
-                    "{log_prefix}-head-restore-failed error={error}; falling back to sync/initialize"
-                );
-                None
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        None
-    };
-    let synced = running.sync_experiment_head(experiment)?;
-
-    let head = if let Some(head) = synced {
-        eprintln!(
-            "{log_prefix}-head-synced id={} global_step={}",
-            head.head_id.as_str(),
-            head.global_step,
-        );
-        head
-    } else if let Some(head) = restored {
-        eprintln!(
-            "{log_prefix}-head-restored id={} global_step={}",
-            head.head_id.as_str(),
-            head.global_step,
-        );
-        head
-    } else if initialize_head_on_start {
-        eprintln!("{log_prefix}-initializing local genesis head");
-        let head = running.initialize_local_head(experiment)?;
-        eprintln!(
-            "{log_prefix}-initialized genesis head id={} global_step={}",
-            head.head_id.as_str(),
-            head.global_step,
-        );
-        head
-    } else {
-        return Ok(None);
-    };
-
-    serve_head_provider(running, experiment, head, served_head_id, log_prefix).map(Some)
 }
 
 fn sync_or_initialize_latest_head_provider<B>(
@@ -3793,7 +3735,7 @@ where
     loop {
         if last_head_sync.elapsed() >= head_sync_interval {
             head_sync_attempts = head_sync_attempts.saturating_add(1);
-            match sync_or_initialize_head_provider(
+            match sync_or_initialize_latest_head_provider(
                 &mut running,
                 &experiment,
                 initialize_head_on_start,

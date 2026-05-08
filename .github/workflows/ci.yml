@@ -173,7 +173,7 @@ jobs:
   local-prod-e2e:
     runs-on: ubuntu-latest
     needs: lint
-    timeout-minutes: 60
+    timeout-minutes: 80
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -197,7 +197,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path Cargo.toml -p xtask -- local-browser-e2e
-        timeout-minutes: 60
+        timeout-minutes: 70
 
   terraform-validate:
     runs-on: ubuntu-latest

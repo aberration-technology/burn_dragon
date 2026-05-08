@@ -2677,6 +2677,7 @@ where
             initialize_head_on_start,
             restore_head_on_start,
             &mut served_head_id,
+            HeadProviderSyncMode::DirectoryCurrent,
             "peer",
         )?;
     }
@@ -2721,6 +2722,7 @@ where
                 initialize_head_on_start,
                 restore_head_on_start,
                 &mut served_head_id,
+                HeadProviderSyncMode::DirectoryCurrent,
                 "peer",
             )?;
             last_head_sync = Instant::now();
@@ -3158,6 +3160,7 @@ where
             initialize_head_on_start,
             restore_head_on_start,
             served_head_id,
+            HeadProviderSyncMode::DirectoryCurrent,
             log_prefix,
         ) {
             Ok(Some(head)) => return Ok(head),
@@ -3205,12 +3208,19 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+enum HeadProviderSyncMode {
+    DirectoryCurrent,
+    LatestPromoted,
+}
+
 fn sync_or_initialize_latest_head_provider<B>(
     running: &mut ManagedRunningNativePeer<B>,
     experiment: &burn_p2p::ExperimentHandle,
     initialize_head_on_start: bool,
     restore_head_on_start: bool,
     served_head_id: &mut Option<burn_p2p::HeadId>,
+    sync_mode: HeadProviderSyncMode,
     log_prefix: &str,
 ) -> Result<Option<burn_p2p::HeadDescriptor>>
 where
@@ -3241,7 +3251,13 @@ where
         None
     };
 
-    let synced = match running.sync_experiment_head(experiment) {
+    let synced_result = match sync_mode {
+        HeadProviderSyncMode::DirectoryCurrent => running.sync_experiment_head(experiment),
+        HeadProviderSyncMode::LatestPromoted => {
+            running.sync_latest_promoted_experiment_head(experiment)
+        }
+    };
+    let synced = match synced_result {
         Ok(Some(head)) => {
             eprintln!(
                 "{log_prefix}-head-synced id={} global_step={}",
@@ -3581,6 +3597,7 @@ where
                 initialize_head_on_start,
                 restore_head_on_start,
                 &mut served_head_id,
+                HeadProviderSyncMode::LatestPromoted,
                 "head-mirror",
             )?;
             if let (Some(head), Some((registration_runtime, edge_base_url, session_id))) =
@@ -3741,6 +3758,7 @@ where
                 initialize_head_on_start,
                 restore_head_on_start,
                 &mut served_head_id,
+                HeadProviderSyncMode::DirectoryCurrent,
                 "validator",
             ) {
                 Ok(Some(_)) => {}

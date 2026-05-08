@@ -59,7 +59,7 @@ use burn_p2p::{
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentHandle, ExperimentId,
     ExperimentScope, HeadAnnouncement, HeadDescriptor, HeadPromotionMode, LiveControlPlaneEvent,
     MetricValue, NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
-    RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
+    RuntimeStatus, RuntimeTransportPolicy, StudyId, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -241,6 +241,7 @@ macro_rules! with_prepared_native_peer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ManagedPrincipalKindArg {
+    Admin,
     Trainer,
     Validator,
 }
@@ -2112,7 +2113,9 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
         args.target_artifact_hash,
     )?;
     let experiment_id = ExperimentId::new(config.manifest.experiment_id.clone());
+    let study_id = StudyId::new(config.manifest.study_id.clone());
     let requested_scopes = match args.principal_kind {
+        ManagedPrincipalKindArg::Admin => managed_admin_scopes(&study_id, &experiment_id),
         ManagedPrincipalKindArg::Trainer => managed_trainer_scopes(&experiment_id),
         ManagedPrincipalKindArg::Validator => managed_validator_scopes(&experiment_id),
     };
@@ -2591,6 +2594,17 @@ fn standard_experiment_scopes(experiment_id: &ExperimentId) -> BTreeSet<Experime
 
 fn managed_trainer_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {
     standard_experiment_scopes(experiment_id)
+}
+
+fn managed_admin_scopes(
+    study_id: &StudyId,
+    experiment_id: &ExperimentId,
+) -> BTreeSet<ExperimentScope> {
+    let mut scopes = standard_experiment_scopes(experiment_id);
+    scopes.insert(ExperimentScope::Admin {
+        study_id: study_id.clone(),
+    });
+    scopes
 }
 
 fn managed_validator_scopes(experiment_id: &ExperimentId) -> BTreeSet<ExperimentScope> {

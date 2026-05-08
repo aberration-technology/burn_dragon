@@ -13,28 +13,28 @@ pub fn run() -> Result<()> {
     let config = NativeCanaryConfig::from_env()?;
     fs::create_dir_all(&config.artifact_dir)?;
 
+    let admin_storage = config.artifact_dir.join("admin-repair-storage");
     let trainer_storage = config.artifact_dir.join("trainer-enroll-storage");
     let validator_storage = config.artifact_dir.join("validator-storage");
     let probe_storage = config.artifact_dir.join("probe-storage");
+    let admin_bundle = config.artifact_dir.join("admin-repair-auth-bundle.json");
     let trainer_bundle = config.artifact_dir.join("trainer-auth-bundle.json");
     let validator_bundle = config.artifact_dir.join("validator-auth-bundle.json");
 
-    let mut trainer_enrolled = false;
     let repair_report = if config.repair_current_head_to_visible_root {
         enroll_static_principal(
             &config,
-            &config.principal_id,
-            "trainer",
-            &trainer_bundle,
-            &trainer_storage,
-            &config.artifact_dir.join("enroll-trainer.log"),
+            &format!("{}-admin", config.principal_id),
+            "admin",
+            &admin_bundle,
+            &admin_storage,
+            &config.artifact_dir.join("enroll-admin-repair.log"),
             &config.backend,
         )?;
-        trainer_enrolled = true;
         Some(repair_current_head_to_visible_root(
             &config,
-            &trainer_bundle,
-            &trainer_storage,
+            &admin_bundle,
+            &admin_storage,
         )?)
     } else {
         None
@@ -59,17 +59,15 @@ pub fn run() -> Result<()> {
     };
     let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none();
 
-    if !trainer_enrolled {
-        enroll_static_principal(
-            &config,
-            &config.principal_id,
-            "trainer",
-            &trainer_bundle,
-            &trainer_storage,
-            &config.artifact_dir.join("enroll-trainer.log"),
-            &config.backend,
-        )?;
-    }
+    enroll_static_principal(
+        &config,
+        &config.principal_id,
+        "trainer",
+        &trainer_bundle,
+        &trainer_storage,
+        &config.artifact_dir.join("enroll-trainer.log"),
+        &config.backend,
+    )?;
 
     let mut validator = None;
     if config.start_local_validator {

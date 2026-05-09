@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, ensure, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
 
 use crate::bootstrap_runtime::{
-    preserve_current_heads, render_bootstrap_runtime_sync_commands, RuntimeCommandEnv,
+    RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
 };
 
 const BURN_P2P_SIBLING_REF: &str = "fb094d68b38f6e726c4dabcfbb31feb90c98b82a";

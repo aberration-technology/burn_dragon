@@ -1,12 +1,14 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{json, Value};
 
 use crate::bootstrap_runtime::{
-    RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
+    preserve_current_heads, render_bootstrap_runtime_sync_commands, RuntimeCommandEnv,
 };
+
+const BURN_P2P_SIBLING_REF: &str = "fb094d68b38f6e726c4dabcfbb31feb90c98b82a";
 
 pub fn run() -> Result<()> {
     repository_has_no_scripts_tree()?;
@@ -219,6 +221,12 @@ fn workflow_sibling_checkout_contract() -> Result<()> {
     for path in workflow_paths()? {
         let text = read(&path)?;
         if text.contains("repository: aberration-technology/burn_p2p") {
+            let ref_snippet = format!("ref: {BURN_P2P_SIBLING_REF}");
+            require_contains(
+                &text,
+                &ref_snippet,
+                &format!("{path} pins the burn_p2p sibling revision"),
+            )?;
             require_contains(
                 &text,
                 "path: burn_p2p-sibling",

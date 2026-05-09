@@ -59,7 +59,7 @@ fn runtime_sync_contract() -> Result<()> {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.3".to_owned(),
+        bootstrap_crate_version: "0.21.4".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),
@@ -82,7 +82,7 @@ fn runtime_sync_contract() -> Result<()> {
     )?;
     require_contains(
         &joined,
-        "cargo install --locked burn_p2p_bootstrap --version '0.21.3'",
+        "cargo install --locked burn_p2p_bootstrap --version '0.21.4'",
         "crate bootstrap install command",
     )?;
     require_contains(
@@ -513,11 +513,16 @@ fn production_profile_contracts() -> Result<()> {
         "head_artifact_mirror_source_roots = [\n        local.bootstrap_head_mirror_storage_root,\n      ]",
         "preset = \"BootstrapOnly\"",
         "bootstrap_addresses = local.bootstrap_peer_internal_multiaddrs",
+        "low_resource_bootstrap_transport_policy = {",
+        "target_connected_peers            = 8",
+        "max_established_total             = 40",
+        "max_relay_circuits                = 16",
+        "transport_policy = local.low_resource_bootstrap_transport_policy",
+        "bootstrap_peers  = local.bootstrap_peer_internal_multiaddrs",
         "\"/ip4/0.0.0.0/tcp/${var.p2p_port}\"",
         "\"/ip4/0.0.0.0/udp/${local.p2p_webrtc_port}/webrtc-direct\"",
         "authority = null",
         "identity = \"Persistent\"",
-        "bootstrap_peers = local.bootstrap_peer_internal_multiaddrs",
         "\"/ip4/PUBLIC_IP/udp/${local.p2p_webrtc_port}/webrtc-direct\"",
         "limit_nofile       = 262144",
     ] {
@@ -538,6 +543,17 @@ fn production_profile_contracts() -> Result<()> {
         "bootstrap fd limit",
     )?;
     require_contains(&service, "TimeoutStartSec=90", "bounded bootstrap startup")?;
+    let deploy_workflow = read(".github/workflows/deploy-burn-dragon-p2p-aws.yml")?;
+    require_contains(
+        &deploy_workflow,
+        "verify bootstrap p2p handshakes",
+        "deploy verifies native and browser-direct p2p handshakes before canaries",
+    )?;
+    require_contains(
+        &deploy_workflow,
+        "--address \"$browser_seed\"",
+        "deploy probes the signed browser-direct seed",
+    )?;
 
     let profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json")?;
     let profile: Value = serde_json::from_str(&profile)?;
@@ -630,7 +646,7 @@ fn dummy_runtime_env() -> RuntimeCommandEnv {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.3".to_owned(),
+        bootstrap_crate_version: "0.21.4".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),

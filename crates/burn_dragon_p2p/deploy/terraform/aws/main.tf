@@ -620,6 +620,28 @@ locals {
     },
   ]
 
+  low_resource_bootstrap_transport_policy = {
+    environment                       = "Native"
+    preferred_transports              = ["Quic", "Tcp", "WebSocket"]
+    target_connected_peers            = 8
+    target_bootstrap_seed_connections = 0
+    supports_direct_streams           = true
+    max_established_incoming          = 32
+    max_established_total             = 40
+    max_established_per_peer          = 1
+    max_relay_circuits                = 16
+    max_relay_circuit_bytes           = 16777216
+    enable_local_discovery            = false
+    enable_relay_client               = false
+    enable_relay_server               = true
+    enable_hole_punching              = false
+    enable_autonat                    = false
+    enable_rendezvous_client          = false
+    enable_rendezvous_server          = true
+    enable_kademlia                   = true
+    export_openmetrics                = true
+  }
+
   bootstrap_daemon_config = {
     spec = {
       preset = "BootstrapOnly"
@@ -722,8 +744,9 @@ locals {
         storage = {
           root = local.bootstrap_peer_root
         }
-        dataset         = null
-        bootstrap_peers = local.bootstrap_peer_internal_multiaddrs
+        dataset          = null
+        transport_policy = local.low_resource_bootstrap_transport_policy
+        bootstrap_peers  = local.bootstrap_peer_internal_multiaddrs
         listen_addresses = [
           "/ip4/0.0.0.0/tcp/${var.p2p_port}",
           "/ip4/127.0.0.1/tcp/${var.p2p_port + 1}/ws",

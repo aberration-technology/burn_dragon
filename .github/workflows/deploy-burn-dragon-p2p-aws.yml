@@ -1429,6 +1429,55 @@ jobs:
 
           target/debug/xtask summarize-deployment-diagnostics "$report_path" >>"$GITHUB_STEP_SUMMARY"
 
+      - name: verify bootstrap p2p handshakes
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        env:
+          DRAGON_NATIVE_BINARY: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DRAGON_NATIVE_BINARY:-}" ] || [ ! -x "${DRAGON_NATIVE_BINARY}" ]; then
+            echo "missing burn_dragon_p2p_native binary for p2p handshake probes" >&2
+            exit 1
+          fi
+
+          native_ok=0
+          for address in "${{ steps.outputs.outputs.seed_tcp }}" "${{ steps.outputs.outputs.seed_quic }}"; do
+            echo "probing native seed ${address}"
+            if timeout --foreground 45s "${DRAGON_NATIVE_BINARY}" \
+              probe-swarm \
+              --address "$address" \
+              --timeout-secs 30 \
+              --max-events 64 \
+              --fetch-snapshot \
+              --snapshot-timeout-secs 10 \
+              --output-format json; then
+              native_ok=1
+              break
+            fi
+          done
+          if [ "$native_ok" -ne 1 ]; then
+            echo "no native p2p seed accepted a libp2p handshake" >&2
+            exit 1
+          fi
+
+          browser_seed="$(curl -fsSL "${{ steps.outputs.outputs.edge_url }}/browser/seeds/signed" \
+            | jq -r '.payload.payload.seeds[].multiaddrs[] | select(contains("/webrtc-direct/"))' \
+            | head -n 1)"
+          if [ -z "$browser_seed" ]; then
+            echo "signed browser seed advertisement did not include a webrtc-direct seed" >&2
+            exit 1
+          fi
+          echo "probing browser-direct seed ${browser_seed}"
+          timeout --foreground 60s "${DRAGON_NATIVE_BINARY}" \
+            probe-swarm \
+            --address "$browser_seed" \
+            --timeout-secs 45 \
+            --max-events 96 \
+            --fetch-snapshot \
+            --snapshot-timeout-secs 10 \
+            --output-format json
+
       - name: upload deployment diagnostics artifact
         if: ${{ always() && steps.deployment_diagnostics.outputs.report_path != '' }}
         uses: actions/upload-artifact@v4

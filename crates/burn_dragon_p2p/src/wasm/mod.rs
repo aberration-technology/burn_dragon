@@ -48,7 +48,7 @@ use crate::profile::{
 };
 #[cfg(feature = "wasm-peer")]
 use crate::wasm::training::{
-    DragonBrowserTrainingResult, run_browser_training_with_release_manifest,
+    DragonBrowserTrainingResult, DragonBrowserTrainingSession, run_browser_training_with_session,
 };
 
 #[cfg(feature = "wasm-peer")]
@@ -2065,6 +2065,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 };
                 let mut completed_windows = 0_u64;
                 let mut failed = false;
+                let mut training_session = DragonBrowserTrainingSession::default();
                 loop {
                     if *local_training_stop_requested.read() {
                         break;
@@ -2091,10 +2092,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     let next_window = completed_windows.saturating_add(1);
                     local_training_state.set(DragonLocalTrainingState::TrainingWindow);
                     status.set(format!("Running browser training window {}…", next_window));
-                    match run_browser_training_with_release_manifest(
+                    match run_browser_training_with_session(
                         &edge_base_url,
                         &training,
                         &release_manifest,
+                        &mut training_session,
                     )
                     .await
                     {

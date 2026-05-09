@@ -151,20 +151,86 @@ struct LiveBrowserParticipantHandle {
     training_budget: BrowserTrainingBudget,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+pub(crate) struct DragonBrowserTrainingSession {
+    live_browser_session: Option<BrowserSessionState>,
+    live_participant: Option<LiveBrowserParticipantHandle>,
+}
+
+impl DragonBrowserTrainingSession {
+    fn live_session_principal_id(&self) -> Option<&str> {
+        live_session_principal_id(self.live_browser_session.as_ref())
+    }
+
+    fn live_participant_matches_config(&self, config: &DragonBrowserTrainingConfig) -> bool {
+        let Some(live) = config.live_participant.as_ref() else {
+            return self.live_participant.is_none();
+        };
+        self.live_participant
+            .as_ref()
+            .and_then(|participant| {
+                participant
+                    .session_runtime
+                    .runtime
+                    .storage
+                    .active_assignment
+                    .as_ref()
+            })
+            .is_some_and(|assignment| {
+                assignment.study_id.as_str() == live.study_id
+                    && assignment.experiment_id.as_str() == live.experiment_id
+                    && assignment.revision_id.as_str() == live.revision_id
+            })
+    }
+
+    async fn ensure_live_participant(
+        &mut self,
+        edge_base_url: &str,
+        config: &DragonBrowserTrainingConfig,
+        release_manifest: &burn_p2p::ClientReleaseManifest,
+    ) -> Result<()> {
+        if config.live_participant.is_none() {
+            self.live_browser_session = None;
+            self.live_participant = None;
+            return Ok(());
+        }
+
+        if !self.live_participant_matches_config(config) {
+            self.live_participant = None;
+        }
+        if self.live_browser_session.is_none() {
+            info!("browser live participant session loading");
+            self.live_browser_session = Some(load_browser_session(edge_base_url).await?);
+        }
+        if self.live_participant.is_none() {
+            info!("browser live participant runtime starting");
+            self.live_participant = start_live_browser_participant(
+                edge_base_url,
+                config,
+                release_manifest,
+                self.live_browser_session.as_ref(),
+            )
+            .await?;
+        } else {
+            info!("browser live participant runtime reused");
+        }
+
+        Ok(())
+    }
+}
+
 struct BrowserTrainingRunContext<'a> {
     edge_base_url: &'a str,
     config: &'a DragonBrowserTrainingConfig,
-    release_manifest: &'a burn_p2p::ClientReleaseManifest,
     backend_label: &'a str,
     backend_kind: BrowserTrainingBackendKind,
     setup_time_ms: u64,
-    live_browser_session: Option<BrowserSessionState>,
+    live_session_principal_id: Option<String>,
 }
 
 impl<'a> BrowserTrainingRunContext<'a> {
     fn live_session_principal_id(&self) -> Option<&str> {
-        live_session_principal_id(self.live_browser_session.as_ref())
+        self.live_session_principal_id.as_deref()
     }
 
     fn token_record_load_policy(
@@ -201,6 +267,16 @@ pub async fn run_browser_training_with_release_manifest(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
     release_manifest: &burn_p2p::ClientReleaseManifest,
+) -> Result<DragonBrowserTrainingResult> {
+    let mut session = DragonBrowserTrainingSession::default();
+    run_browser_training_with_session(edge_base_url, config, release_manifest, &mut session).await
+}
+
+pub(crate) async fn run_browser_training_with_session(
+    edge_base_url: &str,
+    config: &DragonBrowserTrainingConfig,
+    release_manifest: &burn_p2p::ClientReleaseManifest,
+    session: &mut DragonBrowserTrainingSession,
 ) -> Result<DragonBrowserTrainingResult> {
     let backend_kind = resolve_browser_training_backend(config)?;
     let backend_label = match backend_kind {
@@ -239,11 +315,10 @@ pub async fn run_browser_training_with_release_manifest(
                 )
         );
     }
-    let live_browser_session = if config.live_participant.is_some() {
-        Some(load_browser_session(edge_base_url).await?)
-    } else {
-        None
-    };
+    session
+        .ensure_live_participant(edge_base_url, config, release_manifest)
+        .await?;
+    let live_session_principal_id = session.live_session_principal_id().map(str::to_owned);
     let result = match backend_kind {
         BrowserTrainingBackendKind::Cpu => {
             let train_device = burn::tensor::Device::<BrowserCpuTrainBackend>::default();
@@ -255,14 +330,14 @@ pub async fn run_browser_training_with_release_manifest(
                 BrowserTrainingRunContext {
                     edge_base_url,
                     config,
-                    release_manifest,
                     backend_label: "burn-ndarray-wasm",
                     backend_kind,
                     setup_time_ms,
-                    live_browser_session: live_browser_session.clone(),
+                    live_session_principal_id,
                 },
                 &train_device,
                 &eval_device,
+                session.live_participant.as_mut(),
             )
             .await
         }
@@ -278,14 +353,14 @@ pub async fn run_browser_training_with_release_manifest(
                 BrowserTrainingRunContext {
                     edge_base_url,
                     config,
-                    release_manifest,
                     backend_label: "burn-webgpu-wasm",
                     backend_kind,
                     setup_time_ms,
-                    live_browser_session,
+                    live_session_principal_id,
                 },
                 &train_device,
                 &eval_device,
+                session.live_participant.as_mut(),
             )
             .await
         }
@@ -356,6 +431,7 @@ async fn run_browser_training_inner<TrainB, EvalB>(
     context: BrowserTrainingRunContext<'_>,
     train_device: &TrainB::Device,
     eval_device: &EvalB::Device,
+    mut live_participant: Option<&mut LiveBrowserParticipantHandle>,
 ) -> Result<DragonBrowserTrainingResult>
 where
     TrainB: AutodiffBackend<InnerBackend = EvalB> + Clone,
@@ -422,13 +498,6 @@ where
         train_batches_len, eval_batches_len,
     );
 
-    let mut live_participant = start_live_browser_participant(
-        context.edge_base_url,
-        context.config,
-        context.release_manifest,
-        context.live_browser_session.as_ref(),
-    )
-    .await?;
     let training_window_budget_ms = live_participant
         .as_ref()
         .map(|handle| handle.training_budget.max_window_secs.saturating_mul(1000));
@@ -655,7 +724,7 @@ where
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
         context.config,
-        live_participant.as_mut(),
+        live_participant,
         contribution,
     )
     .await?;

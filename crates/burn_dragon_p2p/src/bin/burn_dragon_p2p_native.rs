@@ -981,6 +981,16 @@ fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
     let local_peer_id = shell.local_peer_id().to_string();
     let address = SwarmAddress::new(args.address.clone())
         .with_context(|| format!("invalid swarm address {}", args.address))?;
+    if let Some(listen_address) = probe_swarm_listen_address_for_target(address.as_str()) {
+        shell
+            .listen_on(SwarmAddress::new(listen_address)?)
+            .with_context(|| {
+                format!(
+                    "failed to open required local listener before probing {}",
+                    args.address
+                )
+            })?;
+    }
     shell
         .dial(address)
         .with_context(|| format!("failed to enqueue swarm dial to {}", args.address))?;
@@ -1051,6 +1061,14 @@ fn probe_swarm(args: ProbeSwarmArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn probe_swarm_listen_address_for_target(address: &str) -> Option<&'static str> {
+    if address.split('/').any(|segment| segment == "webrtc-direct") {
+        Some("/ip4/0.0.0.0/udp/0/webrtc-direct")
+    } else {
+        None
+    }
 }
 
 fn probe_swarm_snapshot_summary(snapshot: &ControlPlaneSnapshot) -> ProbeSwarmSnapshotSummary {
@@ -4722,6 +4740,20 @@ mod tests {
             resolve_browser_site_base_url("https://edge.dragon.example", None)
                 .expect("inferred browser site base url"),
             "https://dragon.example"
+        );
+    }
+
+    #[test]
+    fn probe_swarm_opens_listener_for_webrtc_direct_targets() {
+        assert_eq!(
+            probe_swarm_listen_address_for_target(
+                "/dns4/edge.dragon.example/udp/443/webrtc-direct/certhash/uEiabc"
+            ),
+            Some("/ip4/0.0.0.0/udp/0/webrtc-direct")
+        );
+        assert_eq!(
+            probe_swarm_listen_address_for_target("/dns4/edge.dragon.example/tcp/4001"),
+            None
         );
     }
 

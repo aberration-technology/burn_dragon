@@ -3600,7 +3600,49 @@ where
                 HeadProviderSyncMode::LatestPromoted,
                 "head-mirror",
             )?;
-            if let (Some(head), Some((registration_runtime, edge_base_url, session_id))) =
+            let snapshot = running.snapshot();
+            let visible_promoted = latest_visible_promoted_head_announcement(
+                &snapshot.control_plane,
+                &experiment,
+                head.as_ref(),
+            );
+            if let (Some(announcement), Some((registration_runtime, edge_base_url, session_id))) =
+                (visible_promoted.as_ref(), edge_registration.as_ref())
+            {
+                if edge_registered_head_id.as_ref() != Some(&announcement.head.head_id) {
+                    match register_live_head_with_edge_options(
+                        registration_runtime,
+                        edge_base_url,
+                        session_id,
+                        Some(&experiment_entry),
+                        announcement,
+                    ) {
+                        Ok(()) => {
+                            eprintln!(
+                                "head-mirror-edge-visible-head-registered head_id={} provider={}",
+                                announcement.head.head_id.as_str(),
+                                announcement
+                                    .provider_peer_id
+                                    .as_ref()
+                                    .map(|peer_id| peer_id.as_str())
+                                    .unwrap_or("-"),
+                            );
+                            edge_registered_head_id = Some(announcement.head.head_id.clone());
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "head-mirror-edge-visible-head-registration-failed head_id={} provider={} error={error}",
+                                announcement.head.head_id.as_str(),
+                                announcement
+                                    .provider_peer_id
+                                    .as_ref()
+                                    .map(|peer_id| peer_id.as_str())
+                                    .unwrap_or("-"),
+                            );
+                        }
+                    }
+                }
+            } else if let (Some(head), Some((registration_runtime, edge_base_url, session_id))) =
                 (head.as_ref(), edge_registration.as_ref())
             {
                 let snapshot = running.snapshot();
@@ -3668,6 +3710,42 @@ where
 
         thread::sleep(STATUS_POLL_INTERVAL);
     }
+}
+
+fn latest_visible_promoted_head_announcement(
+    snapshot: &ControlPlaneSnapshot,
+    experiment: &ExperimentHandle,
+    baseline: Option<&HeadDescriptor>,
+) -> Option<HeadAnnouncement> {
+    snapshot
+        .head_announcements
+        .iter()
+        .filter(|announcement| announcement.provider_peer_id.is_some())
+        .filter(|announcement| head_matches_experiment(&announcement.head, experiment))
+        .filter(|announcement| {
+            baseline.is_none_or(|baseline| head_is_newer_than(&announcement.head, baseline))
+        })
+        .max_by(|left, right| {
+            left.head
+                .global_step
+                .cmp(&right.head.global_step)
+                .then(left.head.created_at.cmp(&right.head.created_at))
+                .then(left.announced_at.cmp(&right.announced_at))
+        })
+        .cloned()
+}
+
+fn head_matches_experiment(head: &HeadDescriptor, experiment: &ExperimentHandle) -> bool {
+    head.study_id == experiment.study_id
+        && head.experiment_id == experiment.experiment_id
+        && head.revision_id == experiment.revision_id
+}
+
+fn head_is_newer_than(candidate: &HeadDescriptor, baseline: &HeadDescriptor) -> bool {
+    candidate.global_step > baseline.global_step
+        || (candidate.global_step == baseline.global_step
+            && candidate.created_at > baseline.created_at
+            && candidate.head_id != baseline.head_id)
 }
 
 fn run_prepared_validator_daemon<B>(
@@ -4270,6 +4348,27 @@ mod tests {
         }
     }
 
+    fn test_experiment_handle() -> ExperimentHandle {
+        ExperimentHandle {
+            network_id: NetworkId::new("burn-dragon-mainnet"),
+            study_id: StudyId::new("burn-dragon-mainnet"),
+            experiment_id: ExperimentId::new("nca-prepretraining"),
+            revision_id: RevisionId::new("nca-r1"),
+        }
+    }
+
+    fn test_head_announcement_for(
+        head: burn_p2p::HeadDescriptor,
+        provider: &str,
+    ) -> HeadAnnouncement {
+        HeadAnnouncement {
+            overlay: OverlayTopic::control(NetworkId::new("burn-dragon-mainnet")),
+            provider_peer_id: (!provider.is_empty()).then(|| PeerId::new(provider)),
+            head,
+            announced_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn latest_head_candidate_keeps_restored_head_when_network_is_stale() {
         let restored = test_head_descriptor("head-window-2", 2);
@@ -4294,6 +4393,39 @@ mod tests {
         assert_eq!(source, "synced");
         assert_eq!(selected.head_id.as_str(), "head-window-2");
         assert_eq!(selected.global_step, 2);
+    }
+
+    #[test]
+    fn visible_promoted_head_candidate_prefers_provider_backed_newer_head() {
+        let experiment = test_experiment_handle();
+        let mut served = test_head_descriptor("head-window-2", 2);
+        let mut stale = test_head_descriptor("head-window-1", 1);
+        let mut promoted = test_head_descriptor("head-window-3", 3);
+        let mut providerless = test_head_descriptor("head-window-4", 4);
+        let base_time = Utc::now();
+        served.created_at = base_time;
+        stale.created_at = base_time - chrono::Duration::seconds(1);
+        promoted.created_at = base_time + chrono::Duration::seconds(1);
+        providerless.created_at = base_time + chrono::Duration::seconds(2);
+
+        let snapshot = ControlPlaneSnapshot {
+            head_announcements: vec![
+                test_head_announcement_for(providerless, ""),
+                test_head_announcement_for(stale, "provider-stale"),
+                test_head_announcement_for(promoted, "provider-promoted"),
+            ],
+            ..ControlPlaneSnapshot::default()
+        };
+
+        let selected =
+            latest_visible_promoted_head_announcement(&snapshot, &experiment, Some(&served))
+                .expect("newer provider-backed head");
+
+        assert_eq!(selected.head.head_id.as_str(), "head-window-3");
+        assert_eq!(
+            selected.provider_peer_id.as_ref().map(|peer| peer.as_str()),
+            Some("provider-promoted"),
+        );
     }
 
     fn spawn_single_response_server(

@@ -155,6 +155,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
           BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID: ${{ steps.resolve_browser_shell_settings.outputs.selected_experiment_id }}
           BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: "2"
+          BURN_DRAGON_BROWSER_CANARY_CONNECT_TIMEOUT_MS: "240000"
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-pages-predeploy-canary/canary-summary.json

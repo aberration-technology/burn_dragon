@@ -365,6 +365,8 @@ fn browser_canary_contracts() -> Result<()> {
         "cargo run -p xtask -- run-live-browser-canary",
         "cargo run -p xtask -- summarize-live-browser-canary \"$report_path\" >>\"$GITHUB_STEP_SUMMARY\"",
         "burn-dragon-live-browser-canary",
+        "max-parallel: 2",
+        "BURN_DRAGON_BROWSER_CANARY_CONNECT_TIMEOUT_MS: \"240000\"",
         "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: \"300000\"",
         "chromium-webrtc-direct-connect",
         "chromium-webrtc-direct-checkpoint",

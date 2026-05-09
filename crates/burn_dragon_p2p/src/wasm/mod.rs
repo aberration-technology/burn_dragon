@@ -1249,6 +1249,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
+                        status.set("Connecting…".into());
                         let connect_config = match resolve_browser_app_runtime_config(
                             &config,
                             edge_snapshot.as_ref(),
@@ -1264,7 +1265,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 config.clone()
                             }
                         };
-                        if let Ok(view) = connect_browser_app(
+                        match connect_browser_app(
                             &bootstrap_config,
                             &connect_config,
                             edge_snapshot.as_ref(),
@@ -1272,19 +1273,25 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         )
                         .await
                         {
-                            current_view.set(Some(view));
-                            spawn_browser_app_refresh_loop(
-                                bootstrap_config.clone(),
-                                connect_config.clone(),
-                                edge_snapshot.clone(),
-                                signed_seed_advertisement.clone(),
-                                current_view,
-                                status,
-                                checkpoint_wait_generation,
-                            );
-                        }
-                        if provider_code_from_window_location().is_some() {
-                            status.set(String::new());
+                            Ok(view) => {
+                                current_view.set(Some(view));
+                                spawn_browser_app_refresh_loop(
+                                    bootstrap_config.clone(),
+                                    connect_config.clone(),
+                                    edge_snapshot.clone(),
+                                    signed_seed_advertisement.clone(),
+                                    current_view,
+                                    status,
+                                    checkpoint_wait_generation,
+                                );
+                                if provider_code_from_window_location().is_some() {
+                                    status.set(String::new());
+                                }
+                            }
+                            Err(error) => {
+                                warn!("browser app auto-connect failed: {error}");
+                                status.set(error.to_string());
+                            }
                         }
                     }
                     Ok(None) => {}

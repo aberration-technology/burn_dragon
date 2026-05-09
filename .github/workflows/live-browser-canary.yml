@@ -68,6 +68,7 @@ jobs:
     environment: burn-dragon-p2p-${{ inputs.environment || github.event.inputs.environment || 'production' }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - lane: chromium-auto-connect
@@ -155,6 +156,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}
           BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}
           BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: ${{ matrix.min_accepted_receipts }}
+          BURN_DRAGON_BROWSER_CANARY_CONNECT_TIMEOUT_MS: "240000"
           BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: "300000"
           BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}
           BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON: ${{ runner.temp }}/burn-dragon-live-browser-canary-${{ matrix.lane }}/canary-summary.json

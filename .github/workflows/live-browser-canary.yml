@@ -120,7 +120,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: aberration-technology/burn_p2p
-          ref: fb094d68b38f6e726c4dabcfbb31feb90c98b82a
+          ref: 68818312c750788e5d034bd96ce2a364921937a8
           path: burn_p2p-sibling
       - name: link burn_p2p path dependency
         shell: bash

@@ -389,7 +389,10 @@ impl NativeCanaryConfig {
             evaluation_max_batches: optional_positive_env(
                 "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
             )?,
-            command_timeout_secs: parse_env("BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS", 900)?,
+            command_timeout_secs: parse_env(
+                "BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS",
+                1800,
+            )?,
             canonical_timeout_secs: parse_env(
                 "BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS",
                 480,

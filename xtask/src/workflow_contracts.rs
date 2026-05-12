@@ -561,6 +561,11 @@ fn production_profile_contracts() -> Result<()> {
     )?;
     require_contains(
         &deploy_workflow,
+        "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: \"true\"",
+        "deploy canary repairs stale canonical heads before proving fresh p2p training",
+    )?;
+    require_contains(
+        &deploy_workflow,
         "--address \"$browser_seed\"",
         "deploy probes the signed browser-direct seed",
     )?;

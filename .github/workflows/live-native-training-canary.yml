@@ -105,9 +105,6 @@ on:
         description: Fail if canonical loss rises across the canary window.
         required: false
         default: "false"
-  schedule:
-    - cron: "43 */6 * * *"
-
 concurrency:
   group: live-native-training-canary-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false

@@ -1800,6 +1800,7 @@ dependencies = [
  "ctrlc",
  "dioxus",
  "env_logger",
+ "futures",
  "getrandom 0.4.2",
  "gloo-net",
  "gloo-timers 0.3.0",

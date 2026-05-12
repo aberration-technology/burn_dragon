@@ -419,6 +419,18 @@ fn browser_auth_contracts() -> Result<()> {
         "let session = load_or_enroll_browser_session(",
         "browser auth resume enrollment contract",
     )?;
+    for snippet in [
+        "const BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS: u32 = 30_000;",
+        "const BROWSER_APP_CONNECT_TIMEOUT_MILLIS: u32 = 75_000;",
+        "const BROWSER_APP_REFRESH_TIMEOUT_MILLIS: u32 = 45_000;",
+        "async fn browser_ui_deadline",
+        "\"browser auth resume\"",
+        "\"browser app peer connect\"",
+        "\"browser app refresh\"",
+        "checkpoint_wait_generation.set(connection_generation);",
+    ] {
+        require_contains(&browser, snippet, "browser connect state deadline contract")?;
+    }
 
     let training = read("crates/burn_dragon_p2p/src/wasm/training.rs")?;
     for snippet in [

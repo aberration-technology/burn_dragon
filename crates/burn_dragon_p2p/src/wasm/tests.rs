@@ -1,19 +1,19 @@
 // Browser UI and connect-state tests live here to keep wasm/mod.rs focused on runtime code.
 use super::{
     BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS, BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS,
-    BROWSER_APP_REFRESH_INTERVAL_MILLIS, DRAGON_UI_EVENT_LIMIT, DragonBrowserTransportOverride,
-    DragonHeroTone, DragonPeerUiContext, DragonReadinessStepId, DragonStepStatus,
-    DragonTrainingActionContext, DragonUiEventCandidate, DragonUiEventKind,
+    BROWSER_APP_REFRESH_INTERVAL_MILLIS, BROWSER_APP_REFRESH_TIMEOUT_MILLIS, DRAGON_UI_EVENT_LIMIT,
+    DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext, DragonReadinessStepId,
+    DragonStepStatus, DragonTrainingActionContext, DragonUiEventCandidate, DragonUiEventKind,
     browser_app_refresh_interval_millis, browser_session_is_authenticated,
-    browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
-    dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
-    dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
-    dragon_peer_ui_state, dragon_push_ui_event, dragon_runtime_mode_detail,
-    dragon_runtime_mode_summary, dragon_session_metric_view, dragon_slice_progress_summary,
-    dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
-    dragon_window_summary, filter_seed_urls_for_transport,
-    filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
-    retained_refresh_transport_warning,
+    browser_ui_timeout_message, browser_view_machine_state_json, connect_config,
+    dragon_browser_training_action_ready, dragon_global_training_detail,
+    dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
+    dragon_local_training_summary, dragon_network_detail, dragon_peer_ui_state,
+    dragon_push_ui_event, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
+    dragon_session_metric_view, dragon_slice_progress_summary, dragon_training_action_state,
+    dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
+    filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
+    normalized_browser_callback_url, retained_refresh_transport_warning,
 };
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
 use burn_p2p::{
@@ -616,6 +616,14 @@ fn browser_refresh_interval_slows_when_direct_transport_is_stuck() {
         browser_app_refresh_interval_millis(Some(&view)),
         BROWSER_APP_REFRESH_INTERVAL_MILLIS
     );
+}
+
+#[wasm_bindgen_test]
+fn browser_timeout_status_is_stage_specific_and_retryable() {
+    let message =
+        browser_ui_timeout_message("browser app refresh", BROWSER_APP_REFRESH_TIMEOUT_MILLIS);
+    assert!(message.contains("browser app refresh timed out after 45s"));
+    assert!(message.contains("retrying is safe"));
 }
 
 #[wasm_bindgen_test]

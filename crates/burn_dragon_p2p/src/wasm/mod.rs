@@ -17,9 +17,11 @@ use burn_p2p_browser::{
 use burn_p2p_core::BrowserSeedTransportKind;
 use dioxus::prelude::*;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use futures::future::{Either, select};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
 use log::{error, info, warn};
-use std::{cell::RefCell, collections::BTreeSet};
+use std::{cell::RefCell, collections::BTreeSet, future::Future};
 use url::form_urlencoded;
 
 use crate::admin::{
@@ -79,6 +81,12 @@ const BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS: u32 = 8_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS: u32 = 30_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_APP_CONNECT_TIMEOUT_MILLIS: u32 = 75_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_APP_REFRESH_TIMEOUT_MILLIS: u32 = 45_000;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const HERO_RATTLE_INTERVAL_MILLIS: u32 = 90;
 const HERO_RATTLE_FRAMES: &[&str] = &["⣾", "⣷", "⣯", "⣟", "⣻", "⣽"];
 const DRAGON_UI_EVENT_LIMIT: usize = 5;
@@ -117,6 +125,27 @@ impl DragonLocalTrainingState {
 
 thread_local! {
     static DRAGON_BROWSER_APP_CONTROLLER: RefCell<Option<DragonBrowserAppHandle>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_ui_timeout_message(label: &str, timeout_ms: u32) -> String {
+    let timeout_secs = timeout_ms.div_ceil(1_000);
+    format!(
+        "{label} timed out after {timeout_secs}s; retrying is safe if the browser network is still healthy"
+    )
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+async fn browser_ui_deadline<T, F>(label: &str, timeout_ms: u32, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match select(Box::pin(future), Box::pin(TimeoutFuture::new(timeout_ms))).await {
+        Either::Left((result, _timeout)) => result,
+        Either::Right((_elapsed, _future)) => {
+            Err(anyhow!(browser_ui_timeout_message(label, timeout_ms)))
+        }
+    }
 }
 
 fn current_app_semver() -> semver::Version {
@@ -730,12 +759,16 @@ async fn active_training_lease(
         return Ok(live_training_lease);
     }
 
-    let controller = DragonBrowserAppHandle::connect(connect_config(
-        bootstrap_config,
-        config,
-        edge_snapshot,
-        signed_seed_advertisement,
-    )?)
+    let controller = browser_ui_deadline(
+        "browser training lease connect",
+        BROWSER_APP_CONNECT_TIMEOUT_MILLIS,
+        DragonBrowserAppHandle::connect(connect_config(
+            bootstrap_config,
+            config,
+            edge_snapshot,
+            signed_seed_advertisement,
+        )?),
+    )
     .await?;
     Ok(controller.effective_active_training_lease())
 }
@@ -929,7 +962,12 @@ pub async fn connect_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
-    let effective_config = resolve_browser_app_runtime_config(config, edge_snapshot).await?;
+    let effective_config = browser_ui_deadline(
+        "browser runtime config resolution",
+        BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS,
+        resolve_browser_app_runtime_config(config, edge_snapshot),
+    )
+    .await?;
     let edge_base_url = resolved_edge_base_url(&effective_config)?;
     let (browser_host_capabilities, browser_capability_decision) =
         browser_capability_decision_for_config(&effective_config);
@@ -946,12 +984,16 @@ pub async fn connect_browser_app(
         effective_config.effective_seed_node_urls().len(),
         effective_config.require_edge_auth
     );
-    let controller = DragonBrowserAppHandle::connect(connect_config(
-        bootstrap_config,
-        &effective_config,
-        edge_snapshot,
-        signed_seed_advertisement,
-    )?)
+    let controller = browser_ui_deadline(
+        "browser app peer connect",
+        BROWSER_APP_CONNECT_TIMEOUT_MILLIS,
+        DragonBrowserAppHandle::connect(connect_config(
+            bootstrap_config,
+            &effective_config,
+            edge_snapshot,
+            signed_seed_advertisement,
+        )?),
+    )
     .await?;
     let view = controller.view();
     info!("browser app connected: {}", browser_view_log_summary(&view));
@@ -973,21 +1015,35 @@ pub async fn refresh_browser_app(
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
     signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<BrowserAppClientView> {
-    let effective_config = resolve_browser_app_runtime_config(config, edge_snapshot).await?;
+    let effective_config = browser_ui_deadline(
+        "browser runtime config refresh",
+        BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS,
+        resolve_browser_app_runtime_config(config, edge_snapshot),
+    )
+    .await?;
     let mut controller = if let Some(controller) =
         DRAGON_BROWSER_APP_CONTROLLER.with(|slot| slot.borrow_mut().take())
     {
         controller
     } else {
-        DragonBrowserAppHandle::connect(connect_config(
-            bootstrap_config,
-            &effective_config,
-            edge_snapshot,
-            signed_seed_advertisement,
-        )?)
+        browser_ui_deadline(
+            "browser app reconnect",
+            BROWSER_APP_CONNECT_TIMEOUT_MILLIS,
+            DragonBrowserAppHandle::connect(connect_config(
+                bootstrap_config,
+                &effective_config,
+                edge_snapshot,
+                signed_seed_advertisement,
+            )?),
+        )
         .await?
     };
-    let refresh_result = controller.refresh().await;
+    let refresh_result = browser_ui_deadline(
+        "browser app refresh",
+        BROWSER_APP_REFRESH_TIMEOUT_MILLIS,
+        controller.refresh(),
+    )
+    .await;
     DRAGON_BROWSER_APP_CONTROLLER.with(|slot| {
         *slot.borrow_mut() = Some(controller);
     });
@@ -1246,6 +1302,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         let mut runtime_config = runtime_config;
         let mut auth_bootstrap_started = auth_bootstrap_started;
         let mut auth_bootstrap_pending = auth_bootstrap_pending;
+        let mut checkpoint_wait_generation = checkpoint_wait_generation;
         use_effect(move || {
             if *auth_bootstrap_started.read() {
                 return;
@@ -1257,23 +1314,38 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let edge_snapshot = edge_snapshot.clone();
             let signed_seed_advertisement = signed_seed_advertisement.clone();
             spawn(async move {
-                match resume_or_complete_browser_auth(
-                    &config,
-                    release_manifest.as_ref(),
-                    edge_snapshot.as_ref(),
+                let connection_generation = (*checkpoint_wait_generation.read()).saturating_add(1);
+                checkpoint_wait_generation.set(connection_generation);
+                match browser_ui_deadline(
+                    "browser auth resume",
+                    BROWSER_APP_CONNECT_TIMEOUT_MILLIS,
+                    resume_or_complete_browser_auth(
+                        &config,
+                        release_manifest.as_ref(),
+                        edge_snapshot.as_ref(),
+                    ),
                 )
                 .await
                 {
                     Ok(Some(session)) => {
+                        if *checkpoint_wait_generation.read() != connection_generation {
+                            auth_bootstrap_pending.set(false);
+                            return;
+                        }
                         session_state.set(Some(session));
                         status.set("Connecting: loading edge config…".into());
-                        let connect_config = match resolve_browser_app_runtime_config(
-                            &config,
-                            edge_snapshot.as_ref(),
+                        let connect_config = match browser_ui_deadline(
+                            "browser runtime config resolution",
+                            BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS,
+                            resolve_browser_app_runtime_config(&config, edge_snapshot.as_ref()),
                         )
                         .await
                         {
                             Ok(config) => {
+                                if *checkpoint_wait_generation.read() != connection_generation {
+                                    auth_bootstrap_pending.set(false);
+                                    return;
+                                }
                                 runtime_config.set(config.clone());
                                 config
                             }
@@ -1282,6 +1354,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 config.clone()
                             }
                         };
+                        if *checkpoint_wait_generation.read() != connection_generation {
+                            auth_bootstrap_pending.set(false);
+                            return;
+                        }
                         status.set("Connecting: joining peer network…".into());
                         match connect_browser_app(
                             &bootstrap_config,
@@ -1292,7 +1368,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         .await
                         {
                             Ok(view) => {
+                                if *checkpoint_wait_generation.read() != connection_generation {
+                                    auth_bootstrap_pending.set(false);
+                                    return;
+                                }
                                 current_view.set(Some(view));
+                                status.set(String::new());
                                 spawn_browser_app_refresh_loop(
                                     bootstrap_config.clone(),
                                     connect_config.clone(),
@@ -1302,13 +1383,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                     status,
                                     checkpoint_wait_generation,
                                 );
-                                if provider_code_from_window_location().is_some() {
-                                    status.set(String::new());
-                                }
                             }
                             Err(error) => {
-                                warn!("browser app auto-connect failed: {error}");
-                                status.set(error.to_string());
+                                if *checkpoint_wait_generation.read() == connection_generation {
+                                    warn!("browser app auto-connect failed: {error}");
+                                    status.set(error.to_string());
+                                }
                             }
                         }
                     }
@@ -1317,7 +1397,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         if config.require_edge_auth
                             || provider_code_from_window_location().is_some()
                         {
-                            status.set(error.to_string());
+                            if *checkpoint_wait_generation.read() == connection_generation {
+                                status.set(error.to_string());
+                            }
                         }
                     }
                 }
@@ -1339,24 +1421,35 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut current_view = current_view;
             let mut session_state = session_state;
             let mut runtime_config = runtime_config;
-            let checkpoint_wait_generation = checkpoint_wait_generation;
+            let mut checkpoint_wait_generation = checkpoint_wait_generation;
             let edge_snapshot = props.edge_snapshot.clone();
             let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             spawn(async move {
+                let connection_generation = (*checkpoint_wait_generation.read()).saturating_add(1);
+                checkpoint_wait_generation.set(connection_generation);
                 status.set("Connecting: loading edge config…".into());
-                let next_config =
-                    match resolve_browser_app_runtime_config(&next_config, edge_snapshot.as_ref())
-                        .await
-                    {
-                        Ok(config) => {
-                            runtime_config.set(config.clone());
-                            config
+                let next_config = match browser_ui_deadline(
+                    "browser runtime config resolution",
+                    BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS,
+                    resolve_browser_app_runtime_config(&next_config, edge_snapshot.as_ref()),
+                )
+                .await
+                {
+                    Ok(config) => {
+                        if *checkpoint_wait_generation.read() != connection_generation {
+                            return;
                         }
-                        Err(error) => {
-                            warn!("browser runtime config resolution failed: {error}");
-                            next_config
-                        }
-                    };
+                        runtime_config.set(config.clone());
+                        config
+                    }
+                    Err(error) => {
+                        warn!("browser runtime config resolution failed: {error}");
+                        next_config
+                    }
+                };
+                if *checkpoint_wait_generation.read() != connection_generation {
+                    return;
+                }
                 status.set("Connecting: joining peer network…".into());
                 match connect_browser_app(
                     &bootstrap_config,
@@ -1367,14 +1460,25 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 .await
                 {
                     Ok(view) => {
+                        if *checkpoint_wait_generation.read() != connection_generation {
+                            return;
+                        }
                         current_view.set(Some(view));
+                        status.set(String::new());
                         let session = match resolved_edge_base_url(&next_config) {
-                            Ok(edge_base_url) => load_browser_session(&edge_base_url)
-                                .await
-                                .ok()
-                                .filter(browser_session_is_authenticated),
+                            Ok(edge_base_url) => browser_ui_deadline(
+                                "browser session refresh",
+                                BROWSER_APP_RUNTIME_CONFIG_TIMEOUT_MILLIS,
+                                load_browser_session(&edge_base_url),
+                            )
+                            .await
+                            .ok()
+                            .filter(browser_session_is_authenticated),
                             Err(_) => None,
                         };
+                        if *checkpoint_wait_generation.read() != connection_generation {
+                            return;
+                        }
                         if let Some(session) = session.as_ref() {
                             info!(
                                 "browser auth loaded for connect: principal={} peer_id={} reenrollment_required={} granted_scopes=[{}]",
@@ -1392,7 +1496,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             );
                         }
                         session_state.set(session);
-                        status.set(String::new());
                         spawn_browser_app_refresh_loop(
                             bootstrap_config.clone(),
                             next_config,
@@ -1403,7 +1506,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             checkpoint_wait_generation,
                         );
                     }
-                    Err(error) => status.set(error.to_string()),
+                    Err(error) => {
+                        if *checkpoint_wait_generation.read() == connection_generation {
+                            status.set(error.to_string());
+                        }
+                    }
                 }
             });
         }

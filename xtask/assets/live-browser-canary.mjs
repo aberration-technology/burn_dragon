@@ -480,7 +480,12 @@ function endpoint(baseUrl, relativePath) {
 }
 
 function requestedScopes(experimentId) {
-  return ["Connect", "Discover", { Train: { experiment_id: experimentId } }];
+  return [
+    "Connect",
+    "Discover",
+    { Train: { experiment_id: experimentId } },
+    { Archive: { experiment_id: experimentId } },
+  ];
 }
 
 function browserStorageSnapshot(networkId, sessionState) {

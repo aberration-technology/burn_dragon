@@ -339,6 +339,7 @@ fn browser_canary_contracts() -> Result<()> {
         "const EXPECT_TRAINING = parseBooleanEnv(\"BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING\", true);",
         "\"BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC\"",
         "expect_checkpoint_sync: EXPECT_CHECKPOINT_SYNC",
+        "{ Archive: { experiment_id: experimentId } }",
         "libp2p webrtc-direct: completed Noise handshake peer=",
         "function assertWebRtcDirectTransportPhases(report, consoleMessages)",
         "report.webrtc_direct_console_markers = webRtcDirectConsoleMarkerReport(consoleMessages);",

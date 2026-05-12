@@ -41,6 +41,10 @@ const EXPECT_CHECKPOINT_SYNC = parseBooleanEnv(
   "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC",
   false,
 );
+const USE_PRODUCTION_TRAINING_PROFILE = parseBooleanEnv(
+  "BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE",
+  false,
+);
 const EXPECT_CONNECTED_TRANSPORT =
   process.env.BURN_DRAGON_BROWSER_CANARY_EXPECT_CONNECTED_TRANSPORT?.trim().toLowerCase() ||
   null;
@@ -861,6 +865,14 @@ function applyBrowserTrainingCanaryProfile(browserConfig) {
   if (!training || typeof training !== "object") {
     return profiled;
   }
+  if (USE_PRODUCTION_TRAINING_PROFILE) {
+    training.max_train_batches = Math.min(Number(training.max_train_batches ?? 1) || 1, 1);
+    training.max_eval_batches = 0;
+    if (training.live_participant && typeof training.live_participant === "object") {
+      training.live_participant.publish_canonical_update = false;
+    }
+    return profiled;
+  }
   training.block_size = Math.min(Number(training.block_size ?? 32) || 32, 32);
   training.max_train_batches = 1;
   training.max_eval_batches = 0;
@@ -870,7 +882,6 @@ function applyBrowserTrainingCanaryProfile(browserConfig) {
     training.model_config.n_layer = 1;
     training.model_config.n_expert = 1;
     training.model_config.mlp_internal_dim_multiplier = 2;
-    training.model_config.language_head = { type: "standard_token_classification" };
     if (training.model_config.mhc && typeof training.model_config.mhc === "object") {
       training.model_config.mhc.enabled = false;
     }
@@ -1347,6 +1358,7 @@ async function runCanary() {
     browser_name: BROWSER_NAME,
     transport_mode: TRANSPORT_MODE,
     expect_training: EXPECT_TRAINING,
+    use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE,
     min_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
     expected_connected_transport: expectedTransport,
     expected_min_direct_peers: expectedMinDirectPeers,

@@ -7,9 +7,6 @@ use anyhow::{Result, anyhow, bail};
 use burn::backend::NdArray;
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
-use burn::record::{
-    BinBytesRecorder, FullPrecisionSettings, HalfPrecisionSettings, NamedMpkBytesRecorder, Recorder,
-};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
@@ -18,8 +15,8 @@ use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
     ArtifactId, ArtifactKind, ChunkingScheme, ContentId, ExperimentId, ExperimentScope, HeadId,
-    Precision, RevisionId, StudyId, WorkloadId, WorkloadTrainingArtifact,
-    WorkloadTrainingArtifactChunk, WorkloadTrainingContribution, WorkloadTrainingLease,
+    RevisionId, StudyId, WorkloadId, WorkloadTrainingArtifact, WorkloadTrainingArtifactChunk,
+    WorkloadTrainingContribution, WorkloadTrainingLease,
 };
 use burn_p2p_browser::{
     BrowserCapabilityReport, BrowserRuntimeRole, BrowserSessionRuntimeConfig,
@@ -39,6 +36,11 @@ use url::Url;
 
 use crate::auth::{browser_github_enrollment_config, fetch_edge_snapshot, load_browser_session};
 use crate::browser_data::deterministic_sample_indices;
+use crate::browser_record::{
+    BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_record_format_name,
+    browser_record_precision_descriptor, encode_browser_record_bytes,
+    load_browser_active_head_model,
+};
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 #[cfg(target_arch = "wasm32")]
 use crate::capability_state::{
@@ -1251,132 +1253,6 @@ struct BrowserTrainingContributionStats {
     training_time_ms: u64,
     eval_time_ms: u64,
     total_time_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrowserBurnRecordBytesFormat {
-    Bin,
-    NamedMpk,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrowserBurnRecordPrecision {
-    Full,
-    Half,
-}
-
-fn browser_record_bytes_format(record_format: &str) -> Result<BrowserBurnRecordBytesFormat> {
-    match record_format {
-        "burn-record:bytes-mpk" => Ok(BrowserBurnRecordBytesFormat::NamedMpk),
-        "burn-record:bytes-bin" => Ok(BrowserBurnRecordBytesFormat::Bin),
-        other => bail!("browser active head artifact format {other} is not supported"),
-    }
-}
-
-fn browser_record_precision(precision: &Precision) -> Result<BrowserBurnRecordPrecision> {
-    match precision {
-        Precision::Fp32 => Ok(BrowserBurnRecordPrecision::Full),
-        Precision::Fp16 => Ok(BrowserBurnRecordPrecision::Half),
-        other => bail!("browser active head artifact precision {other:?} is not supported"),
-    }
-}
-
-fn browser_record_precision_descriptor(precision: BrowserBurnRecordPrecision) -> Precision {
-    match precision {
-        BrowserBurnRecordPrecision::Full => Precision::Fp32,
-        BrowserBurnRecordPrecision::Half => Precision::Fp16,
-    }
-}
-
-fn browser_record_format_name(format: BrowserBurnRecordBytesFormat) -> &'static str {
-    match format {
-        BrowserBurnRecordBytesFormat::Bin => "burn-record:bytes-bin",
-        BrowserBurnRecordBytesFormat::NamedMpk => "burn-record:bytes-mpk",
-    }
-}
-
-fn encode_browser_record_bytes<B, M>(
-    module: M,
-    format: BrowserBurnRecordBytesFormat,
-    precision: BrowserBurnRecordPrecision,
-) -> Result<Vec<u8>>
-where
-    B: Backend,
-    M: Module<B>,
-{
-    match (format, precision) {
-        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Full) => {
-            record_browser_module::<B, M, BinBytesRecorder<FullPrecisionSettings>>(module)
-        }
-        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Half) => {
-            record_browser_module::<B, M, BinBytesRecorder<HalfPrecisionSettings>>(module)
-        }
-        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Full) => {
-            record_browser_module::<B, M, NamedMpkBytesRecorder<FullPrecisionSettings>>(module)
-        }
-        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Half) => {
-            record_browser_module::<B, M, NamedMpkBytesRecorder<HalfPrecisionSettings>>(module)
-        }
-    }
-}
-
-fn record_browser_module<B, M, R>(module: M) -> Result<Vec<u8>>
-where
-    B: Backend,
-    M: Module<B>,
-    R: Recorder<B, RecordArgs = (), RecordOutput = Vec<u8>, LoadArgs = Vec<u8>>,
-{
-    R::default()
-        .record(module.into_record(), ())
-        .map_err(|error| anyhow!("failed to encode browser model record: {error}"))
-}
-
-fn load_browser_record_bytes<B, M, R>(module: M, bytes: Vec<u8>, device: &B::Device) -> Result<M>
-where
-    B: Backend,
-    M: Module<B>,
-    R: Recorder<B, RecordArgs = (), RecordOutput = Vec<u8>, LoadArgs = Vec<u8>>,
-{
-    let record = R::default()
-        .load(bytes, device)
-        .map_err(|error| anyhow!("failed to decode browser model record: {error}"))?;
-    Ok(module.load_record(record))
-}
-
-fn load_browser_active_head_model<B>(
-    model: DragonModel<B>,
-    descriptor: &burn_p2p::ArtifactDescriptor,
-    bytes: Vec<u8>,
-    device: &B::Device,
-) -> Result<DragonModel<B>>
-where
-    B: Backend,
-    DragonModel<B>: Module<B>,
-{
-    let format = browser_record_bytes_format(&descriptor.record_format)?;
-    let precision = browser_record_precision(&descriptor.precision)?;
-    match (format, precision) {
-        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Full) => {
-            load_browser_record_bytes::<B, _, BinBytesRecorder<FullPrecisionSettings>>(
-                model, bytes, device,
-            )
-        }
-        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Half) => {
-            load_browser_record_bytes::<B, _, BinBytesRecorder<HalfPrecisionSettings>>(
-                model, bytes, device,
-            )
-        }
-        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Full) => {
-            load_browser_record_bytes::<B, _, NamedMpkBytesRecorder<FullPrecisionSettings>>(
-                model, bytes, device,
-            )
-        }
-        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Half) => {
-            load_browser_record_bytes::<B, _, NamedMpkBytesRecorder<HalfPrecisionSettings>>(
-                model, bytes, device,
-            )
-        }
-    }
 }
 
 fn browser_training_head_artifact<B>(

@@ -343,6 +343,8 @@ fn browser_canary_contracts() -> Result<()> {
         "report.webrtc_direct_console_markers = webRtcDirectConsoleMarkerReport(consoleMessages);",
         "BURN_DRAGON_BROWSER_CANARY_DURABLE_RECEIPT_TIMEOUT_MS",
         "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
+        "BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE",
+        "use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE",
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
         "path.join(SITE_OVERRIDE_DIR, \"browser-app-config.json\")",
@@ -350,11 +352,15 @@ fn browser_canary_contracts() -> Result<()> {
     ] {
         require_contains(&script, snippet, "live browser canary script")?;
     }
-    for forbidden in ["consumeCallbackToken", "/auth/browser/callback/consume"] {
+    for forbidden in [
+        "consumeCallbackToken",
+        "/auth/browser/callback/consume",
+        "training.model_config.language_head = { type: \"standard_token_classification\" };",
+    ] {
         require_absent(
             &script,
             forbidden,
-            "browser canary does not pre-consume callback",
+            "browser canary avoids stale auth or model-profile rewrites",
         )?;
     }
 

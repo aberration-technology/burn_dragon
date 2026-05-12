@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use burn_p2p::NetworkId;
 #[cfg(feature = "native")]
 use burn_p2p::create_peer_auth_envelope;
 use burn_p2p::{
@@ -27,7 +29,7 @@ use burn_p2p_browser::{
 use chrono::{DateTime, Duration, Utc};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use gloo_timers::future::TimeoutFuture;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", all(feature = "wasm-ui", target_arch = "wasm32")))]
 use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
@@ -672,6 +674,8 @@ const PENDING_GITHUB_LOGIN_KEY: &str = "burn-dragon-p2p.pending-github-login";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const TRUSTED_CALLBACK_TOKEN_KEY: &str = "burn-dragon-p2p.canary-callback-token";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+const BROWSER_WORKER_IDENTITY_KEY_PREFIX: &str = "burn-dragon-p2p.browser-worker-identity.";
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const DURABLE_BROWSER_STORAGE_PREFIX: &str = "burn-p2p.browser.storage.";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const DURABLE_BROWSER_RECEIPT_OUTBOX_PREFIX: &str = "burn-p2p.browser.receipt-outbox.";
@@ -689,6 +693,21 @@ struct PendingBrowserGitHubLogin {
     created_at: DateTime<Utc>,
     login: LoginStart,
     requested_scopes: BTreeSet<ExperimentScope>,
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredBrowserWorkerIdentity {
+    keypair_protobuf_hex: String,
+    #[serde(default = "default_browser_worker_identity_serial")]
+    serial: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_policy_hash: Option<ContentId>,
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn default_browser_worker_identity_serial() -> u64 {
+    1
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -802,6 +821,76 @@ fn browser_storage() -> Result<web_sys::Storage> {
         .local_storage()
         .map_err(|error| anyhow!("localStorage unavailable: {error:?}"))?
         .ok_or_else(|| anyhow!("localStorage unavailable"))
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_worker_identity_storage_key(network_id: &NetworkId) -> String {
+    format!(
+        "{}{}",
+        BROWSER_WORKER_IDENTITY_KEY_PREFIX,
+        network_id.as_str()
+    )
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_worker_identity_from_keypair(
+    keypair: &Keypair,
+    serial: u64,
+    client_policy_hash: Option<ContentId>,
+) -> BrowserWorkerIdentity {
+    BrowserWorkerIdentity {
+        peer_id: burn_p2p::PeerId::new(
+            libp2p_identity::PeerId::from_public_key(&keypair.public()).to_string(),
+        ),
+        peer_public_key_hex: hex::encode(keypair.public().encode_protobuf()),
+        serial,
+        client_policy_hash,
+    }
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn load_or_generate_browser_worker_identity(
+    network_id: &NetworkId,
+) -> Result<BrowserWorkerIdentity> {
+    let storage = browser_storage()?;
+    let key = browser_worker_identity_storage_key(network_id);
+    if let Some(raw) = storage
+        .get_item(&key)
+        .map_err(|error| anyhow!("failed to read browser worker identity: {error:?}"))?
+    {
+        let stored: StoredBrowserWorkerIdentity = serde_json::from_str(&raw)
+            .map_err(|error| anyhow!("failed to decode browser worker identity: {error}"))?;
+        let bytes = hex::decode(&stored.keypair_protobuf_hex).map_err(|error| {
+            anyhow!("failed to decode browser worker identity keypair: {error}")
+        })?;
+        let keypair = Keypair::from_protobuf_encoding(&bytes).map_err(|error| {
+            anyhow!("failed to restore browser worker identity keypair: {error}")
+        })?;
+        return Ok(browser_worker_identity_from_keypair(
+            &keypair,
+            stored.serial,
+            stored.client_policy_hash,
+        ));
+    }
+
+    let keypair = Keypair::generate_ed25519();
+    let stored = StoredBrowserWorkerIdentity {
+        keypair_protobuf_hex: hex::encode(
+            keypair
+                .to_protobuf_encoding()
+                .map_err(|error| anyhow!("failed to encode browser worker identity: {error}"))?,
+        ),
+        serial: 1,
+        client_policy_hash: None,
+    };
+    storage
+        .set_item(&key, &serde_json::to_string(&stored)?)
+        .map_err(|error| anyhow!("failed to persist browser worker identity: {error:?}"))?;
+    Ok(browser_worker_identity_from_keypair(
+        &keypair,
+        stored.serial,
+        stored.client_policy_hash,
+    ))
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -1389,22 +1478,85 @@ pub async fn complete_browser_github_login(
     let session = client
         .complete_provider_login(&pending.login, provider_code.to_owned())
         .await?;
-    let trust_bundle = client.fetch_trust_bundle().await.ok();
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await
         .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
-    durable.session = BrowserSessionState {
-        session: Some(session),
-        certificate: None,
-        trust_bundle,
-        enrolled_at: Some(Utc::now()),
-        reenrollment_required: false,
-    };
+    durable.session = enroll_browser_session(
+        &client,
+        &snapshot.network_id,
+        BrowserSessionState {
+            session: Some(session),
+            certificate: None,
+            trust_bundle: client.fetch_trust_bundle().await.ok(),
+            enrolled_at: Some(Utc::now()),
+            reenrollment_required: false,
+        },
+    )
+    .await?;
     persist_durable_browser_storage(&snapshot.network_id, &durable)
         .await
         .map_err(|error| anyhow!("failed to persist durable browser storage: {error}"))?;
     let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
     let _ = clear_trusted_callback_token();
+    Ok(durable.session)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+async fn enroll_browser_session(
+    client: &BrowserEdgeClient,
+    network_id: &NetworkId,
+    mut state: BrowserSessionState,
+) -> Result<BrowserSessionState> {
+    if state.certificate.is_some() && !state.reenrollment_required {
+        return Ok(state);
+    }
+    let Some(session) = state.session.clone() else {
+        return Ok(state);
+    };
+    let identity = load_or_generate_browser_worker_identity(network_id)?;
+    let certificate = client
+        .enroll(&client.build_enrollment_request(&session, &identity))
+        .await?;
+    state.session = Some(session);
+    state.certificate = Some(certificate);
+    state.trust_bundle = client
+        .fetch_trust_bundle()
+        .await
+        .ok()
+        .or(state.trust_bundle);
+    state.enrolled_at = Some(Utc::now());
+    state.refresh_reenrollment_requirement();
+    Ok(state)
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub async fn load_or_enroll_browser_session(
+    edge_base_url: &str,
+    release_manifest: &ClientReleaseManifest,
+    requested_scopes: BTreeSet<ExperimentScope>,
+    session_ttl_secs: i64,
+) -> Result<BrowserSessionState> {
+    let snapshot = BrowserEdgeClient::new(
+        BrowserUiBindings::new(edge_base_url),
+        BrowserEnrollmentConfig::for_runtime_sync(&fetch_edge_snapshot(edge_base_url).await?),
+    )
+    .fetch_browser_edge_snapshot()
+    .await?;
+    let enrollment = browser_github_enrollment_config(
+        &snapshot,
+        release_manifest,
+        requested_scopes,
+        session_ttl_secs,
+    )?;
+    let client = BrowserEdgeClient::new(BrowserUiBindings::new(edge_base_url), enrollment);
+    let mut durable = load_durable_browser_storage(&snapshot.network_id)
+        .await
+        .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
+    durable.session =
+        enroll_browser_session(&client, &snapshot.network_id, durable.session).await?;
+    persist_durable_browser_storage(&snapshot.network_id, &durable)
+        .await
+        .map_err(|error| anyhow!("failed to persist durable browser storage: {error}"))?;
     Ok(durable.session)
 }
 

@@ -16,6 +16,7 @@ pub fn run() -> Result<()> {
     bootstrap_head_preservation_contract()?;
     workflow_sibling_checkout_contract()?;
     deployment_workflow_contracts()?;
+    browser_auth_contracts()?;
     browser_canary_contracts()?;
     native_canary_contracts()?;
     browser_and_native_transport_contracts()?;
@@ -345,6 +346,8 @@ fn browser_canary_contracts() -> Result<()> {
         "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
         "BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE",
         "use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE",
+        "async function durableBrowserStorageSnapshot(page, networkId)",
+        "\"browser_session_enrolled_for_training\"",
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
         "path.join(SITE_OVERRIDE_DIR, \"browser-app-config.json\")",
@@ -394,6 +397,37 @@ fn browser_canary_contracts() -> Result<()> {
         concat!("bash ", "scripts", "/run_live_browser_canary.sh"),
         "browser canary workflow has no legacy script runner",
     )?;
+    Ok(())
+}
+
+fn browser_auth_contracts() -> Result<()> {
+    let auth = read("crates/burn_dragon_p2p/src/auth.rs")?;
+    for snippet in [
+        "const BROWSER_WORKER_IDENTITY_KEY_PREFIX: &str = \"burn-dragon-p2p.browser-worker-identity.\";",
+        "fn load_or_generate_browser_worker_identity(",
+        ".enroll(&client.build_enrollment_request(&session, &identity))",
+        "pub async fn load_or_enroll_browser_session(",
+        "enroll_browser_session(&client, &snapshot.network_id, durable.session).await?;",
+    ] {
+        require_contains(&auth, snippet, "browser auth enrollment contract")?;
+    }
+
+    let browser = read("crates/burn_dragon_p2p/src/wasm/mod.rs")?;
+    require_contains(
+        &browser,
+        "let session = load_or_enroll_browser_session(",
+        "browser auth resume enrollment contract",
+    )?;
+
+    let training = read("crates/burn_dragon_p2p/src/wasm/training.rs")?;
+    for snippet in [
+        "fn live_browser_training_requested_scopes(",
+        "ExperimentScope::Archive { experiment_id }",
+        "load_or_enroll_browser_session(",
+        "browser canonical training requires an enrolled node certificate",
+    ] {
+        require_contains(&training, snippet, "browser training enrollment contract")?;
+    }
     Ok(())
 }
 

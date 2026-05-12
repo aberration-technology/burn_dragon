@@ -28,7 +28,8 @@ use crate::admin::{
 };
 use crate::auth::{
     begin_browser_github_login, complete_browser_github_login, fetch_edge_snapshot,
-    load_browser_session, provider_code_from_window_location, reset_browser_runtime_state,
+    load_browser_session, load_or_enroll_browser_session, provider_code_from_window_location,
+    reset_browser_runtime_state,
 };
 use crate::build_info;
 use crate::capability::{
@@ -1086,12 +1087,16 @@ pub async fn resume_or_complete_browser_auth(
         )
         .await?;
         info!(
-            "browser auth completed: principal={} reenrollment_required={} granted_scopes=[{}]",
+            "browser auth completed: principal={} peer_id={} reenrollment_required={} granted_scopes=[{}]",
             session
                 .session
                 .as_ref()
                 .map(|session| session.claims.principal_id.as_str())
                 .unwrap_or("anonymous"),
+            session
+                .peer_id()
+                .map(|peer_id| peer_id.as_str())
+                .unwrap_or("unenrolled"),
             session.reenrollment_required,
             browser_session_scope_summary(&session),
         );
@@ -1099,15 +1104,27 @@ pub async fn resume_or_complete_browser_auth(
         return Ok(Some(session));
     }
     if config.require_edge_auth {
-        let session = load_browser_session(&edge_base_url).await?;
+        let release_manifest =
+            resolve_browser_release_manifest(config, release_manifest, edge_snapshot).await?;
+        let session = load_or_enroll_browser_session(
+            &edge_base_url,
+            &release_manifest,
+            config.requested_scopes.clone(),
+            3600,
+        )
+        .await?;
         if browser_session_is_authenticated(&session) {
             info!(
-                "browser auth resumed: principal={} reenrollment_required={} granted_scopes=[{}]",
+                "browser auth resumed: principal={} peer_id={} reenrollment_required={} granted_scopes=[{}]",
                 session
                     .session
                     .as_ref()
                     .map(|session| session.claims.principal_id.as_str())
                     .unwrap_or("anonymous"),
+                session
+                    .peer_id()
+                    .map(|peer_id| peer_id.as_str())
+                    .unwrap_or("unenrolled"),
                 session.reenrollment_required,
                 browser_session_scope_summary(&session),
             );
@@ -1360,12 +1377,16 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         };
                         if let Some(session) = session.as_ref() {
                             info!(
-                                "browser auth loaded for connect: principal={} reenrollment_required={} granted_scopes=[{}]",
+                                "browser auth loaded for connect: principal={} peer_id={} reenrollment_required={} granted_scopes=[{}]",
                                 session
                                     .session
                                     .as_ref()
                                     .map(|session| session.claims.principal_id.as_str())
                                     .unwrap_or("anonymous"),
+                                session
+                                    .peer_id()
+                                    .map(|peer_id| peer_id.as_str())
+                                    .unwrap_or("unenrolled"),
                                 session.reenrollment_required,
                                 browser_session_scope_summary(session),
                             );

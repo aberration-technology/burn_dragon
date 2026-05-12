@@ -400,6 +400,23 @@ async function waitForDurableReceiptCount(acceptedReceiptIds, baselineCount) {
   );
 }
 
+async function durableBrowserStorageSnapshot(page, networkId) {
+  return await page.evaluate((id) => {
+    const raw = window.localStorage.getItem(`burn-p2p.browser.storage.${id}`);
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      return {
+        decode_error: String(error),
+        raw_preview: raw.slice(0, 240),
+      };
+    }
+  }, networkId);
+}
+
 async function fetchOk(url, options = {}) {
   const response = await fetch(url, {
     cache: "no-store",
@@ -733,6 +750,8 @@ function buildBrowserE2eContract(report) {
   const requiresP2pCheckpoint = canaryRequiresP2pCheckpoint(report);
   const acceptedReceipts = acceptedReceiptCount(report);
   const artifactFallbackCount = report.artifact_http_fallback_requests?.length ?? 0;
+  const certificatePeerId =
+    report.durable_browser_storage_snapshot?.stored_certificate_peer_id ?? null;
   const invariants = [
     e2eInvariant(
       "expected_transport_connected",
@@ -757,6 +776,15 @@ function buildBrowserE2eContract(report) {
       artifactFallbackCount === 0,
       {
         artifact_http_fallback_requests: report.artifact_http_fallback_requests ?? [],
+      },
+    ),
+    e2eInvariant(
+      "browser_session_enrolled_for_training",
+      report.expect_training,
+      certificatePeerId != null,
+      {
+        stored_certificate_peer_id: certificatePeerId,
+        durable_browser_storage_snapshot: report.durable_browser_storage_snapshot,
       },
     ),
     e2eInvariant(
@@ -1398,6 +1426,7 @@ async function runCanary() {
     receipt_submission: null,
     accepted_receipts_before_training: acceptedReceiptsBeforeTraining,
     durable_receipt_snapshot: null,
+    durable_browser_storage_snapshot: null,
     e2e_contract: null,
     retained_transport_error: null,
     console_errors: [],
@@ -1744,6 +1773,10 @@ async function runCanary() {
     report.durable_receipt_snapshot = await waitForDurableReceiptCount(
       acceptedReceiptIds,
       acceptedReceiptsBeforeTraining,
+    );
+    report.durable_browser_storage_snapshot = await durableBrowserStorageSnapshot(
+      page,
+      snapshot.network_id,
     );
     report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
     assertBrowserE2eContract(report);

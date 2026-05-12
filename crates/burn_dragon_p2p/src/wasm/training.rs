@@ -34,7 +34,9 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::auth::{browser_github_enrollment_config, fetch_edge_snapshot, load_browser_session};
+use crate::auth::{
+    browser_github_enrollment_config, fetch_edge_snapshot, load_or_enroll_browser_session,
+};
 use crate::browser_data::deterministic_sample_indices;
 use crate::browser_record::{
     BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_record_format_name,
@@ -48,8 +50,9 @@ use crate::capability_state::{
     persist_browser_downgrade,
 };
 use crate::config::{
-    DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserShardSelectionPolicy,
-    DragonBrowserTokenSource, DragonBrowserTrainingConfig, TokenWindowRecord,
+    DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserLiveParticipantConfig,
+    DragonBrowserShardSelectionPolicy, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
+    TokenWindowRecord,
 };
 use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_policy};
 
@@ -202,7 +205,20 @@ impl DragonBrowserTrainingSession {
         }
         if self.live_browser_session.is_none() {
             info!("browser live participant session loading");
-            self.live_browser_session = Some(load_browser_session(edge_base_url).await?);
+            let requested_scopes = config
+                .live_participant
+                .as_ref()
+                .map(live_browser_training_requested_scopes)
+                .unwrap_or_else(|| BTreeSet::from([ExperimentScope::Connect]));
+            self.live_browser_session = Some(
+                load_or_enroll_browser_session(
+                    edge_base_url,
+                    release_manifest,
+                    requested_scopes,
+                    900,
+                )
+                .await?,
+            );
         }
         if self.live_participant.is_none() {
             info!("browser live participant runtime starting");
@@ -1408,6 +1424,19 @@ fn browser_training_contribution(
     }
 }
 
+fn live_browser_training_requested_scopes(
+    live: &DragonBrowserLiveParticipantConfig,
+) -> BTreeSet<ExperimentScope> {
+    let experiment_id = ExperimentId::new(live.experiment_id.clone());
+    BTreeSet::from([
+        ExperimentScope::Connect,
+        ExperimentScope::Train {
+            experiment_id: experiment_id.clone(),
+        },
+        ExperimentScope::Archive { experiment_id },
+    ])
+}
+
 async fn start_live_browser_participant(
     edge_base_url: &str,
     config: &DragonBrowserTrainingConfig,
@@ -1418,16 +1447,19 @@ async fn start_live_browser_participant(
         return Ok(None);
     };
     let snapshot = fetch_edge_snapshot(edge_base_url).await?;
-    let requested_scopes = BTreeSet::from([
-        ExperimentScope::Connect,
-        ExperimentScope::Train {
-            experiment_id: ExperimentId::new(live.experiment_id.clone()),
-        },
-    ]);
-    let _ = browser_github_enrollment_config(&snapshot, release_manifest, requested_scopes, 900)?;
+    let requested_scopes = live_browser_training_requested_scopes(live);
+    let _ = browser_github_enrollment_config(
+        &snapshot,
+        release_manifest,
+        requested_scopes.clone(),
+        900,
+    )?;
     let session = match preloaded_session {
         Some(session) => session.clone(),
-        None => load_browser_session(edge_base_url).await?,
+        None => {
+            load_or_enroll_browser_session(edge_base_url, release_manifest, requested_scopes, 900)
+                .await?
+        }
     };
     let _claims = session
         .session

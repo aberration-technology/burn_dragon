@@ -383,6 +383,7 @@ fn browser_canary_contracts() -> Result<()> {
         "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
         "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",
         "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}",
+        "BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE:",
         "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: ${{ matrix.min_accepted_receipts }}",
         "BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN:",
     ] {

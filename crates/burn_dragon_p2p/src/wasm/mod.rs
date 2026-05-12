@@ -1394,12 +1394,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        if config.require_edge_auth
-                            || provider_code_from_window_location().is_some()
+                        if (config.require_edge_auth
+                            || provider_code_from_window_location().is_some())
+                            && *checkpoint_wait_generation.read() == connection_generation
                         {
-                            if *checkpoint_wait_generation.read() == connection_generation {
-                                status.set(error.to_string());
-                            }
+                            status.set(error.to_string());
                         }
                     }
                 }

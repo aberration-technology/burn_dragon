@@ -74,7 +74,7 @@ use ui_state::{
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-const BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS: u32 = 4_000;
+const BROWSER_APP_CONNECTING_REFRESH_INTERVAL_MILLIS: u32 = 1_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const BROWSER_APP_DEGRADED_REFRESH_INTERVAL_MILLIS: u32 = 8_000;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -1249,7 +1249,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                 {
                     Ok(Some(session)) => {
                         session_state.set(Some(session));
-                        status.set("Connecting…".into());
+                        status.set("Connecting: loading edge config…".into());
                         let connect_config = match resolve_browser_app_runtime_config(
                             &config,
                             edge_snapshot.as_ref(),
@@ -1265,6 +1265,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 config.clone()
                             }
                         };
+                        status.set("Connecting: joining peer network…".into());
                         match connect_browser_app(
                             &bootstrap_config,
                             &connect_config,
@@ -1325,7 +1326,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let edge_snapshot = props.edge_snapshot.clone();
             let signed_seed_advertisement = props.signed_seed_advertisement.clone();
             spawn(async move {
-                status.set("Connecting…".into());
+                status.set("Connecting: loading edge config…".into());
                 let next_config =
                     match resolve_browser_app_runtime_config(&next_config, edge_snapshot.as_ref())
                         .await
@@ -1339,6 +1340,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             next_config
                         }
                     };
+                status.set("Connecting: joining peer network…".into());
                 match connect_browser_app(
                     &bootstrap_config,
                     &next_config,

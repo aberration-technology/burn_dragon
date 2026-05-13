@@ -401,19 +401,97 @@ async function waitForDurableReceiptCount(acceptedReceiptIds, baselineCount) {
 }
 
 async function durableBrowserStorageSnapshot(page, networkId) {
-  return await page.evaluate((id) => {
-    const raw = window.localStorage.getItem(`burn-p2p.browser.storage.${id}`);
-    if (!raw) {
-      return null;
-    }
-    try {
-      return JSON.parse(raw);
-    } catch (error) {
-      return {
-        decode_error: String(error),
-        raw_preview: raw.slice(0, 240),
-      };
-    }
+  return await page.evaluate(async (id) => {
+    const storageKey = `burn-p2p.browser.storage.${id}`;
+    const indexedDbStore = "storage_snapshots";
+    const indexedDbValueKey = "default";
+    const lookupErrors = [];
+    const decodeSnapshot = (raw, backend) => {
+      if (typeof raw !== "string" || raw.trim().length === 0) {
+        return null;
+      }
+      try {
+        return {
+          ...JSON.parse(raw),
+          durable_storage_backend: backend,
+        };
+      } catch (error) {
+        return {
+          durable_storage_backend: backend,
+          decode_error: String(error),
+          raw_preview: raw.slice(0, 240),
+        };
+      }
+    };
+    const localStorageSnapshot = () =>
+      decodeSnapshot(window.localStorage.getItem(storageKey), "localStorage");
+    const indexedDbExists = async () => {
+      if (typeof window.indexedDB?.databases !== "function") {
+        return true;
+      }
+      try {
+        const databases = await window.indexedDB.databases();
+        return databases.some((database) => database.name === storageKey);
+      } catch {
+        return true;
+      }
+    };
+    const indexedDbSnapshot = async () => {
+      if (!window.indexedDB || !(await indexedDbExists())) {
+        return null;
+      }
+      return await new Promise((resolve) => {
+        const openRequest = window.indexedDB.open(storageKey);
+        openRequest.onupgradeneeded = () => openRequest.transaction?.abort();
+        openRequest.onerror = () => {
+          lookupErrors.push(`indexedDB open failed: ${String(openRequest.error)}`);
+          resolve(null);
+        };
+        openRequest.onblocked = () => {
+          lookupErrors.push("indexedDB open blocked");
+          resolve(null);
+        };
+        openRequest.onsuccess = () => {
+          const database = openRequest.result;
+          try {
+            if (!database.objectStoreNames.contains(indexedDbStore)) {
+              database.close();
+              resolve(null);
+              return;
+            }
+            const transaction = database.transaction(indexedDbStore, "readonly");
+            transaction.onerror = () => {
+              lookupErrors.push(`indexedDB transaction failed: ${String(transaction.error)}`);
+              database.close();
+              resolve(null);
+            };
+            const store = transaction.objectStore(indexedDbStore);
+            const getRequest = store.get(indexedDbValueKey);
+            getRequest.onerror = () => {
+              lookupErrors.push(`indexedDB read failed: ${String(getRequest.error)}`);
+              database.close();
+              resolve(null);
+            };
+            getRequest.onsuccess = () => {
+              database.close();
+              resolve(decodeSnapshot(getRequest.result, "indexedDB"));
+            };
+          } catch {
+            database.close();
+            resolve(null);
+          }
+        };
+      });
+    };
+    return (
+      (await indexedDbSnapshot()) ??
+      localStorageSnapshot() ?? {
+        durable_storage_backend: null,
+        storage_key: storageKey,
+        storage_missing: true,
+        lookup_errors: lookupErrors,
+      }
+    );
   }, networkId);
 }
 

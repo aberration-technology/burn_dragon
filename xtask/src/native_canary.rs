@@ -176,7 +176,7 @@ fn run_windows(
             "--initialize-head-on-start".to_owned(),
             initialize_head_on_start.to_string(),
             "--restore-head-on-start".to_owned(),
-            "true".to_owned(),
+            restore_head_on_start(replace_unbacked_preflight_head, window_index).to_string(),
             "--head-sync-timeout-secs".to_owned(),
             config.head_sync_timeout_secs.to_string(),
             "--serve-after-publish-secs".to_owned(),
@@ -1006,6 +1006,10 @@ fn is_deferred_unbacked_preflight_head(signal: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+fn restore_head_on_start(replace_unbacked_preflight_head: bool, window_index: usize) -> bool {
+    !(replace_unbacked_preflight_head && window_index == 0)
+}
+
 fn head_provider_ids(head: &Value) -> Vec<String> {
     head.get("provider_peer_ids")
         .and_then(Value::as_array)
@@ -1366,5 +1370,12 @@ mod tests {
         let ordinary = canonical_baseline(&previous_head, &train_report, false);
         assert_eq!(ordinary["global_step"], 4);
         assert_eq!(ordinary["metrics"]["train_loss"], 3.0);
+    }
+
+    #[test]
+    fn replacement_window_skips_restore_only_for_first_window() {
+        assert!(!restore_head_on_start(true, 0));
+        assert!(restore_head_on_start(true, 1));
+        assert!(restore_head_on_start(false, 0));
     }
 }

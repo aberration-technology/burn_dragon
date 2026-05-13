@@ -23,7 +23,7 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
     );
 
     let bootstrap_install_source = env_or("BOOTSTRAP_INSTALL_SOURCE", "crate");
-    let bootstrap_crate_version = env_or("BOOTSTRAP_CRATE_VERSION", "0.21.7");
+    let bootstrap_crate_version = env_or("BOOTSTRAP_CRATE_VERSION", "0.21.8");
     let bootstrap_git_repository = env_or(
         "BOOTSTRAP_GIT_REPOSITORY",
         "https://github.com/aberration-technology/burn_p2p.git",

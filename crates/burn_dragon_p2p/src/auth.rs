@@ -1481,7 +1481,7 @@ pub async fn complete_browser_github_login(
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await
         .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
-    durable.session = enroll_browser_session(
+    let enrolled_session = enroll_browser_session(
         &client,
         &snapshot.network_id,
         BrowserSessionState {
@@ -1493,12 +1493,13 @@ pub async fn complete_browser_github_login(
         },
     )
     .await?;
+    durable.remember_session(enrolled_session.clone());
     persist_durable_browser_storage(&snapshot.network_id, &durable)
         .await
         .map_err(|error| anyhow!("failed to persist durable browser storage: {error}"))?;
     let _ = storage.remove_item(PENDING_GITHUB_LOGIN_KEY);
     let _ = clear_trusted_callback_token();
-    Ok(durable.session)
+    Ok(enrolled_session)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -1552,12 +1553,13 @@ pub async fn load_or_enroll_browser_session(
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await
         .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
-    durable.session =
-        enroll_browser_session(&client, &snapshot.network_id, durable.session).await?;
+    let enrolled_session =
+        enroll_browser_session(&client, &snapshot.network_id, durable.session.clone()).await?;
+    durable.remember_session(enrolled_session.clone());
     persist_durable_browser_storage(&snapshot.network_id, &durable)
         .await
         .map_err(|error| anyhow!("failed to persist durable browser storage: {error}"))?;
-    Ok(durable.session)
+    Ok(enrolled_session)
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]

@@ -812,6 +812,19 @@ function acceptedReceiptCount(report) {
   );
 }
 
+function durableBrowserCertificatePeerId(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return null;
+  }
+  return (
+    snapshot.stored_certificate_peer_id ??
+    snapshot.session?.certificate?.claims?.peer_id ??
+    snapshot.session?.certificate?.claims?.claims?.peer_id ??
+    snapshot.session?.certificate?.body?.payload?.payload?.peer_id ??
+    null
+  );
+}
+
 function canaryRequiresP2pCheckpoint(report) {
   return (
     report.expect_checkpoint_sync ||
@@ -833,8 +846,9 @@ function buildBrowserE2eContract(report) {
   const requiresP2pCheckpoint = canaryRequiresP2pCheckpoint(report);
   const acceptedReceipts = acceptedReceiptCount(report);
   const artifactFallbackCount = report.artifact_http_fallback_requests?.length ?? 0;
-  const certificatePeerId =
-    report.durable_browser_storage_snapshot?.stored_certificate_peer_id ?? null;
+  const certificatePeerId = durableBrowserCertificatePeerId(
+    report.durable_browser_storage_snapshot,
+  );
   const invariants = [
     e2eInvariant(
       "expected_transport_connected",

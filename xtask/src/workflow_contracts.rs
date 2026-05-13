@@ -352,6 +352,8 @@ fn browser_canary_contracts() -> Result<()> {
         "const indexedDbValueKey = \"default\";",
         "window.indexedDB.open(storageKey)",
         "durable_storage_backend: backend",
+        "function durableBrowserCertificatePeerId(snapshot)",
+        "snapshot.session?.certificate?.body?.payload?.payload?.peer_id",
         "\"browser_session_enrolled_for_training\"",
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
@@ -412,7 +414,8 @@ fn browser_auth_contracts() -> Result<()> {
         "fn load_or_generate_browser_worker_identity(",
         ".enroll(&client.build_enrollment_request(&session, &identity))",
         "pub async fn load_or_enroll_browser_session(",
-        "enroll_browser_session(&client, &snapshot.network_id, durable.session).await?;",
+        "let enrolled_session =\n        enroll_browser_session(&client, &snapshot.network_id, durable.session.clone()).await?;",
+        "durable.remember_session(enrolled_session.clone());",
     ] {
         require_contains(&auth, snippet, "browser auth enrollment contract")?;
     }

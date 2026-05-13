@@ -57,7 +57,8 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
-    let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none();
+    let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none()
+        || is_deferred_unbacked_preflight_head(head_provider_before.as_ref());
 
     enroll_static_principal(
         &config,
@@ -989,6 +990,13 @@ fn deferred_unbacked_preflight_head_signal(
     })
 }
 
+fn is_deferred_unbacked_preflight_head(signal: Option<&Value>) -> bool {
+    signal
+        .and_then(|signal| signal.get("deferred_unbacked_preflight_head"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn head_provider_ids(head: &Value) -> Vec<String> {
     head.get("provider_peer_ids")
         .and_then(Value::as_array)
@@ -1298,5 +1306,19 @@ mod tests {
             &providerless,
             &p2p_signal
         ));
+    }
+
+    #[test]
+    fn deferred_preflight_head_requests_replacement_initialization() {
+        let signal = json!({
+            "deferred_unbacked_preflight_head": true,
+        });
+        let ordinary_signal = json!({
+            "edge_provider": true,
+        });
+
+        assert!(is_deferred_unbacked_preflight_head(Some(&signal)));
+        assert!(!is_deferred_unbacked_preflight_head(Some(&ordinary_signal)));
+        assert!(!is_deferred_unbacked_preflight_head(None));
     }
 }

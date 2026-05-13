@@ -8,7 +8,7 @@ use crate::bootstrap_runtime::{
     RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
 };
 
-const BURN_P2P_SIBLING_REF: &str = "750c73dafa7d6fcb32b984b1da00548baea12383";
+const BURN_P2P_SIBLING_REF: &str = "a520f0daf0b9ee90634a51cb676ef597868302b7";
 
 pub fn run() -> Result<()> {
     repository_has_no_scripts_tree()?;
@@ -62,7 +62,7 @@ fn runtime_sync_contract() -> Result<()> {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.6".to_owned(),
+        bootstrap_crate_version: "0.21.7".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),
@@ -85,7 +85,7 @@ fn runtime_sync_contract() -> Result<()> {
     )?;
     require_contains(
         &joined,
-        "cargo install --locked burn_p2p_bootstrap --version '0.21.6'",
+        "cargo install --locked burn_p2p_bootstrap --version '0.21.7'",
         "crate bootstrap install command",
     )?;
     require_contains(
@@ -733,7 +733,7 @@ fn dummy_runtime_env() -> RuntimeCommandEnv {
         head_mirror_service_object_uri:
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
-        bootstrap_crate_version: "0.21.6".to_owned(),
+        bootstrap_crate_version: "0.21.7".to_owned(),
         bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
             .to_owned(),
         bootstrap_git_ref: String::new(),

@@ -59,6 +59,8 @@ pub fn run() -> Result<()> {
     };
     let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none()
         || is_deferred_unbacked_preflight_head(head_provider_before.as_ref());
+    let replace_unbacked_preflight_head =
+        is_deferred_unbacked_preflight_head(head_provider_before.as_ref());
 
     enroll_static_principal(
         &config,
@@ -96,6 +98,7 @@ pub fn run() -> Result<()> {
         &probe_storage,
         &head_before,
         initialize_head_on_start,
+        replace_unbacked_preflight_head,
     );
     if let Some(mut child) = validator {
         stop_child(&mut child);
@@ -148,6 +151,7 @@ fn run_windows(
     probe_storage: &Path,
     head_before: &Value,
     initialize_head_on_start: bool,
+    replace_unbacked_preflight_head: bool,
 ) -> Result<Vec<Value>> {
     let mut previous_head = head_before.clone();
     let mut reports = Vec::new();
@@ -237,8 +241,13 @@ fn run_windows(
             previous_head_id.as_deref(),
             config.canonical_timeout_secs,
         )?;
-        let canonical_signal = assert_canonical_signal(
+        let canonical_baseline = canonical_baseline(
             &previous_head,
+            &train_report,
+            replace_unbacked_preflight_head && window_index == 0,
+        );
+        let canonical_signal = assert_canonical_signal(
+            &canonical_baseline,
             &advanced_head,
             config.require_canonical_loss_non_regression,
         )?;
@@ -1081,6 +1090,21 @@ fn assert_train_report(report: &Value) -> Result<Value> {
     }))
 }
 
+fn canonical_baseline(
+    previous_head: &Value,
+    train_report: &Value,
+    replace_unbacked_preflight_head: bool,
+) -> Value {
+    if !replace_unbacked_preflight_head {
+        return previous_head.clone();
+    }
+    let mut baseline = previous_head.clone();
+    baseline["global_step"] = json!(number(train_report, "base_global_step").unwrap_or(0.0));
+    baseline["metrics"] = json!({});
+    baseline["replaced_unbacked_preflight_head"] = json!(true);
+    baseline
+}
+
 fn assert_canonical_signal(
     before: &Value,
     after: &Value,
@@ -1320,5 +1344,27 @@ mod tests {
         assert!(is_deferred_unbacked_preflight_head(Some(&signal)));
         assert!(!is_deferred_unbacked_preflight_head(Some(&ordinary_signal)));
         assert!(!is_deferred_unbacked_preflight_head(None));
+    }
+
+    #[test]
+    fn replacement_canonical_baseline_uses_local_base_step() {
+        let previous_head = json!({
+            "head_id": "stale-window-4",
+            "global_step": 4,
+            "metrics": {"train_loss": 3.0},
+        });
+        let train_report = json!({
+            "base_global_step": 0,
+        });
+
+        let baseline = canonical_baseline(&previous_head, &train_report, true);
+        assert_eq!(baseline["head_id"], "stale-window-4");
+        assert_eq!(baseline["global_step"], json!(0.0));
+        assert_eq!(baseline["metrics"], json!({}));
+        assert_eq!(baseline["replaced_unbacked_preflight_head"], true);
+
+        let ordinary = canonical_baseline(&previous_head, &train_report, false);
+        assert_eq!(ordinary["global_step"], 4);
+        assert_eq!(ordinary["metrics"]["train_loss"], 3.0);
     }
 }

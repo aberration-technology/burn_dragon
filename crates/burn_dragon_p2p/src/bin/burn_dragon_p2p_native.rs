@@ -3072,6 +3072,7 @@ where
                 registration_runtime,
                 edge_base_url,
                 session_id,
+                &experiment_entry,
                 &announcement,
             )
             .with_context(|| {
@@ -3405,9 +3406,16 @@ fn mirror_live_head_with_edge(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
     session_id: &str,
+    directory_template: &ExperimentDirectoryEntry,
     announcement: &HeadAnnouncement,
 ) -> Result<()> {
-    register_live_head_with_edge_options(runtime, edge_base_url, session_id, None, announcement)
+    register_live_head_with_edge_options(
+        runtime,
+        edge_base_url,
+        session_id,
+        Some(directory_template),
+        announcement,
+    )
 }
 
 fn register_live_head_with_edge_options(

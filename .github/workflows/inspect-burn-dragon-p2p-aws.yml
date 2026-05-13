@@ -36,6 +36,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_bootstrap_start_probe:
+        description: "Stop the flapping bootstrap service, run it once in the foreground to capture startup stderr, then restart it."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -468,7 +473,8 @@ jobs:
               fi
             fi
 
-            cargo run -p xtask -- write-bootstrap-inspect-params /tmp/burn-dragon-inspect-params.json
+            BURN_DRAGON_INSPECT_RUN_BOOTSTRAP_START_PROBE="${{ github.event.inputs.run_bootstrap_start_probe }}" \
+              cargo run -p xtask -- write-bootstrap-inspect-params /tmp/burn-dragon-inspect-params.json
 
             command_id="$(aws ssm send-command \
               --region "$AWS_REGION" \

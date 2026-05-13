@@ -904,8 +904,8 @@ jobs:
               "systemctl enable burn-p2p-bootstrap",
               "systemctl restart burn-p2p-bootstrap",
               "systemctl is-enabled burn-p2p-bootstrap",
-              "systemctl is-active caddy",
-              "systemctl is-active burn-p2p-bootstrap",
+              "systemctl is-active caddy || { systemctl status caddy --no-pager || true; journalctl -u caddy --no-pager -n 120 || true; exit 1; }",
+              "systemctl is-active burn-p2p-bootstrap || { systemctl status burn-p2p-bootstrap --no-pager || true; journalctl -u burn-p2p-bootstrap --no-pager -n 320 || true; exit 1; }",
               "journalctl -u burn-p2p-bootstrap --no-pager -n 200 || true",
               "journalctl -u caddy -u burn-p2p-bootstrap --no-pager -n 120 || true"
             ]' \

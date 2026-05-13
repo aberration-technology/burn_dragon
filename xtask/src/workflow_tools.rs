@@ -692,11 +692,18 @@ pub fn write_inspection_summary(args: &WriteInspectionSummaryArgs) -> Result<()>
 }
 
 pub fn write_bootstrap_inspect_params(output_path: &Path) -> Result<()> {
-    let commands = include_str!("../assets/bootstrap-inspect-commands.txt")
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
+    let run_bootstrap_start_probe =
+        env_or("BURN_DRAGON_INSPECT_RUN_BOOTSTRAP_START_PROBE", "false");
+    let mut commands = vec![format!(
+        "export BURN_DRAGON_INSPECT_RUN_BOOTSTRAP_START_PROBE={run_bootstrap_start_probe:?}"
+    )];
+    commands.extend(
+        include_str!("../assets/bootstrap-inspect-commands.txt")
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned),
+    );
     fs::write(
         output_path,
         serde_json::to_string(&json!({ "commands": commands }))?,

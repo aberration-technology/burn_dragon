@@ -9,6 +9,46 @@ echo "--- service status ---"
 systemctl status caddy --no-pager || true
 systemctl status burn-p2p-bootstrap --no-pager || true
 systemctl status burn-dragon-p2p-head-mirror --no-pager || true
+echo "--- bootstrap service unit ---"
+systemctl cat burn-p2p-bootstrap --no-pager || true
+systemctl show burn-p2p-bootstrap --no-pager -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts -p EnvironmentFiles || true
+echo "--- bootstrap focused journal ---"
+journalctl -u burn-p2p-bootstrap --no-pager -n 320 || true
+echo "--- bootstrap environment file probe ---"
+python3 - <<'PY' || true
+import shlex
+import subprocess
+
+show = subprocess.run(
+    ["systemctl", "show", "burn-p2p-bootstrap", "--no-pager", "-p", "EnvironmentFiles"],
+    check=False,
+    text=True,
+    capture_output=True,
+)
+line = show.stdout.strip()
+value = line.split("=", 1)[1] if "=" in line else ""
+paths = []
+for item in shlex.split(value):
+    path = item.split(":", 1)[0]
+    if path and path != "-":
+        paths.append(path)
+
+if not paths:
+    print("no environment files configured")
+for path in paths:
+    print(f"env_file={path}")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError as error:
+        print(f"  unreadable: {error}")
+        continue
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        print(f"  {key}=<redacted>")
+PY
 echo "--- socket listeners ---"
 ss -ltnup || true
 echo "--- caddy config ---"
@@ -39,6 +79,32 @@ echo "--- binary fingerprints ---"
 sha256sum /usr/local/bin/burn-p2p-bootstrap /usr/local/bin/burn_dragon_p2p_native 2>&1 || true
 echo "--- bootstrap binary transport strings ---"
 strings /usr/local/bin/burn-p2p-bootstrap 2>/dev/null | grep -E 'webrtc-direct|webtransport|wss|browser/seeds/signed|portal/snapshot' | sort -u || true
+echo "--- optional bootstrap startup probe ---"
+if [ "${BURN_DRAGON_INSPECT_RUN_BOOTSTRAP_START_PROBE:-false}" = "true" ]; then
+  echo "running isolated bootstrap startup probe"
+  systemctl stop burn-p2p-bootstrap || true
+  set +e
+  (
+    set -a
+    for env_file in $(systemctl show burn-p2p-bootstrap --no-pager -p EnvironmentFiles | sed 's/^EnvironmentFiles=//' | tr ' ' '\n' | cut -d: -f1); do
+      if [ -f "$env_file" ]; then
+        . "$env_file"
+      fi
+    done
+    set +a
+    timeout 20s /usr/local/bin/burn-p2p-bootstrap /etc/burn-dragon-p2p/bootstrap.json
+  )
+  probe_status=$?
+  set -e
+  echo "bootstrap_start_probe_exit_status=$probe_status"
+  systemctl reset-failed burn-p2p-bootstrap || true
+  systemctl restart burn-p2p-bootstrap || true
+  sleep 2
+  systemctl status burn-p2p-bootstrap --no-pager || true
+  journalctl -u burn-p2p-bootstrap --no-pager -n 320 || true
+else
+  echo "skipped; set BURN_DRAGON_INSPECT_RUN_BOOTSTRAP_START_PROBE=true for a one-shot foreground startup probe"
+fi
 echo "--- authenticated directory probe ---"
 auth_bundle_path="/var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json"
 if [ -f "$auth_bundle_path" ]; then
@@ -60,7 +126,8 @@ else
   echo "auth bundle not found at $auth_bundle_path"
 fi
 echo "--- recent journals ---"
-journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 160 || true
+journalctl -u burn-p2p-bootstrap --no-pager -n 320 || true
+journalctl -u caddy -u burn-p2p-bootstrap -u burn-dragon-p2p-head-mirror --no-pager -n 220 || true
 echo "--- local edge probes ---"
 curl -fsS http://127.0.0.1:8787/portal/snapshot || true
 curl -fsS http://127.0.0.1:8787/browser/seeds/signed || true

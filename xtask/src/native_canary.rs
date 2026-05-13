@@ -49,10 +49,10 @@ pub fn run() -> Result<()> {
         60,
     )?);
     let head_provider_before = if head_before.get("head_id").and_then(Value::as_str).is_some() {
-        Some(assert_head_provider_signal(
+        Some(initial_head_provider_signal(
+            &config,
             &head_before,
             &p2p_before,
-            config.require_edge_head_provider,
         )?)
     } else {
         None
@@ -894,14 +894,7 @@ fn assert_head_provider_signal(
         .get("head_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let providers = head
-        .get("provider_peer_ids")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::to_owned))
-        .collect::<Vec<_>>();
+    let providers = head_provider_ids(head);
     ensure!(
         !providers.is_empty(),
         "head {head_id} has no artifact provider peers: {head}"
@@ -925,6 +918,85 @@ fn assert_head_provider_signal(
         "published_artifacts": head.get("published_artifacts").cloned().unwrap_or_else(|| json!([])),
         "edge_provider": edge_provider,
     }))
+}
+
+fn initial_head_provider_signal(
+    config: &NativeCanaryConfig,
+    head: &Value,
+    p2p_signal: &Value,
+) -> Result<Value> {
+    match assert_head_provider_signal(head, p2p_signal, config.require_edge_head_provider) {
+        Ok(signal) => Ok(signal),
+        Err(error)
+            if should_defer_unbacked_preflight_head(
+                config.repair_current_head_to_visible_root,
+                config.require_edge_head_provider,
+                config.mirror_live_head_to_edge,
+                head,
+                p2p_signal,
+            ) =>
+        {
+            let signal = deferred_unbacked_preflight_head_signal(head, p2p_signal, &error);
+            eprintln!(
+                "native canary preflight head is p2p-visible but not edge-backed after repair; \
+                 continuing because this run will publish and mirror a replacement head: {error:#}"
+            );
+            Ok(signal)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_defer_unbacked_preflight_head(
+    repair_current_head_to_visible_root: bool,
+    require_edge_head_provider: bool,
+    mirror_live_head_to_edge: bool,
+    head: &Value,
+    p2p_signal: &Value,
+) -> bool {
+    if !(repair_current_head_to_visible_root
+        && require_edge_head_provider
+        && mirror_live_head_to_edge)
+    {
+        return false;
+    }
+    let providers = head_provider_ids(head);
+    let edge_peer_id = p2p_signal
+        .get("connected_peer_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !providers.is_empty()
+        && !edge_peer_id.is_empty()
+        && providers.iter().all(|provider| provider != edge_peer_id)
+}
+
+fn deferred_unbacked_preflight_head_signal(
+    head: &Value,
+    p2p_signal: &Value,
+    error: &anyhow::Error,
+) -> Value {
+    let providers = head_provider_ids(head);
+    json!({
+        "head_id": head.get("head_id").and_then(Value::as_str).unwrap_or_default(),
+        "edge_peer_id": p2p_signal.get("connected_peer_id").and_then(Value::as_str).unwrap_or_default(),
+        "provider_peer_ids": providers,
+        "connected_provider_peer_ids": head.get("connected_provider_peer_ids").cloned().unwrap_or_else(|| json!([])),
+        "available_profiles": head.get("available_profiles").cloned().unwrap_or_else(|| json!([])),
+        "published_artifacts": head.get("published_artifacts").cloned().unwrap_or_else(|| json!([])),
+        "edge_provider": false,
+        "deferred_unbacked_preflight_head": true,
+        "error": error.to_string(),
+    })
+}
+
+fn head_provider_ids(head: &Value) -> Vec<String> {
+    head.get("provider_peer_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn wait_for_head_advance(
@@ -1159,4 +1231,72 @@ fn optional_positive_env(name: &str) -> Result<Option<u64>> {
         "environment variable {name} must be > 0, got {value:?}"
     );
     Ok(Some(parsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defers_only_repairing_mirrored_preflight_head_without_edge_provider() {
+        let head = json!({
+            "head_id": "head-1",
+            "provider_peer_ids": ["native-trainer"],
+        });
+        let p2p_signal = json!({
+            "connected_peer_id": "edge-peer",
+        });
+
+        assert!(should_defer_unbacked_preflight_head(
+            true,
+            true,
+            true,
+            &head,
+            &p2p_signal
+        ));
+        assert!(!should_defer_unbacked_preflight_head(
+            true,
+            true,
+            false,
+            &head,
+            &p2p_signal
+        ));
+        assert!(!should_defer_unbacked_preflight_head(
+            false,
+            true,
+            true,
+            &head,
+            &p2p_signal
+        ));
+    }
+
+    #[test]
+    fn does_not_defer_when_edge_already_provides_head_or_providers_are_missing() {
+        let p2p_signal = json!({
+            "connected_peer_id": "edge-peer",
+        });
+        let edge_backed = json!({
+            "head_id": "head-1",
+            "provider_peer_ids": ["edge-peer"],
+        });
+        let providerless = json!({
+            "head_id": "head-1",
+            "provider_peer_ids": [],
+        });
+
+        assert!(!should_defer_unbacked_preflight_head(
+            true,
+            true,
+            true,
+            &edge_backed,
+            &p2p_signal
+        ));
+        assert!(!should_defer_unbacked_preflight_head(
+            true,
+            true,
+            true,
+            &providerless,
+            &p2p_signal
+        ));
+    }
 }

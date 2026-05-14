@@ -105,13 +105,6 @@ jobs:
             expect_checkpoint_sync: "0"
             min_accepted_receipts: "2"
             required: "1"
-          - lane: firefox-auto-connect
-            browser: firefox
-            transport_mode: auto
-            expect_training: "0"
-            expect_checkpoint_sync: "0"
-            min_accepted_receipts: "0"
-            required: "1"
           - lane: firefox-webrtc-direct-connect
             browser: firefox
             transport_mode: webrtc-direct

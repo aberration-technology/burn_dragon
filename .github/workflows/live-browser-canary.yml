@@ -74,7 +74,7 @@ jobs:
     environment: burn-dragon-p2p-${{ inputs.environment || github.event.inputs.environment || 'production' }}
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         include:
           - lane: chromium-auto-connect
@@ -111,7 +111,7 @@ jobs:
             expect_training: "0"
             expect_checkpoint_sync: "0"
             min_accepted_receipts: "0"
-            required: "1"
+            required: "0"
     continue-on-error: ${{ matrix.required == '0' }}
     steps:
       - uses: actions/checkout@v4

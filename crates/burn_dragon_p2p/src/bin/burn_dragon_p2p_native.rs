@@ -3667,42 +3667,41 @@ where
                             );
                             if let (Some(head), Some(local_peer_id)) =
                                 (head.as_ref(), snapshot.local_peer_id.clone())
-                            {
-                                if should_register_edge_local_fallback(
+                                && should_register_edge_local_fallback(
                                     &announcement.head,
                                     head,
                                     edge_registered_head_id.as_ref(),
+                                )
+                            {
+                                let local_announcement = edge_local_head_announcement(
+                                    head,
+                                    &experiment,
+                                    local_peer_id.clone(),
+                                )?;
+                                match register_live_head_with_edge_options(
+                                    registration_runtime,
+                                    edge_base_url,
+                                    session_id,
+                                    Some(&experiment_entry),
+                                    &local_announcement,
                                 ) {
-                                    let local_announcement = edge_local_head_announcement(
-                                        head,
-                                        &experiment,
-                                        local_peer_id.clone(),
-                                    )?;
-                                    match register_live_head_with_edge_options(
-                                        registration_runtime,
-                                        edge_base_url,
-                                        session_id,
-                                        Some(&experiment_entry),
-                                        &local_announcement,
-                                    ) {
-                                        Ok(()) => {
-                                            eprintln!(
-                                                "head-mirror-edge-local-fallback-registered head_id={} provider={} superseded_head={}",
-                                                local_announcement.head.head_id.as_str(),
-                                                local_peer_id.as_str(),
-                                                announcement.head.head_id.as_str(),
-                                            );
-                                            edge_registered_head_id =
-                                                Some(local_announcement.head.head_id.clone());
-                                        }
-                                        Err(fallback_error) => {
-                                            eprintln!(
-                                                "head-mirror-edge-local-fallback-registration-failed head_id={} provider={} superseded_head={} error={fallback_error}",
-                                                local_announcement.head.head_id.as_str(),
-                                                local_peer_id.as_str(),
-                                                announcement.head.head_id.as_str(),
-                                            );
-                                        }
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "head-mirror-edge-local-fallback-registered head_id={} provider={} superseded_head={}",
+                                            local_announcement.head.head_id.as_str(),
+                                            local_peer_id.as_str(),
+                                            announcement.head.head_id.as_str(),
+                                        );
+                                        edge_registered_head_id =
+                                            Some(local_announcement.head.head_id.clone());
+                                    }
+                                    Err(fallback_error) => {
+                                        eprintln!(
+                                            "head-mirror-edge-local-fallback-registration-failed head_id={} provider={} superseded_head={} error={fallback_error}",
+                                            local_announcement.head.head_id.as_str(),
+                                            local_peer_id.as_str(),
+                                            announcement.head.head_id.as_str(),
+                                        );
                                     }
                                 }
                             }
@@ -3713,30 +3712,30 @@ where
                 (head.as_ref(), edge_registration.as_ref())
             {
                 let snapshot = running.snapshot();
-                if let Some(local_peer_id) = snapshot.local_peer_id {
-                    if edge_registered_head_id.as_ref() != Some(&head.head_id) {
-                        let announcement =
-                            edge_local_head_announcement(head, &experiment, local_peer_id.clone())?;
-                        if let Err(error) = register_live_head_with_edge_options(
-                            registration_runtime,
-                            edge_base_url,
-                            session_id,
-                            Some(&experiment_entry),
-                            &announcement,
-                        ) {
-                            eprintln!(
-                                "head-mirror-edge-local-registration-failed head_id={} provider={} error={error}",
-                                head.head_id.as_str(),
-                                local_peer_id.as_str(),
-                            );
-                        } else {
-                            eprintln!(
-                                "head-mirror-edge-local-registered head_id={} provider={}",
-                                head.head_id.as_str(),
-                                local_peer_id.as_str(),
-                            );
-                            edge_registered_head_id = Some(head.head_id.clone());
-                        }
+                if let Some(local_peer_id) = snapshot.local_peer_id
+                    && edge_registered_head_id.as_ref() != Some(&head.head_id)
+                {
+                    let announcement =
+                        edge_local_head_announcement(head, &experiment, local_peer_id.clone())?;
+                    if let Err(error) = register_live_head_with_edge_options(
+                        registration_runtime,
+                        edge_base_url,
+                        session_id,
+                        Some(&experiment_entry),
+                        &announcement,
+                    ) {
+                        eprintln!(
+                            "head-mirror-edge-local-registration-failed head_id={} provider={} error={error}",
+                            head.head_id.as_str(),
+                            local_peer_id.as_str(),
+                        );
+                    } else {
+                        eprintln!(
+                            "head-mirror-edge-local-registered head_id={} provider={}",
+                            head.head_id.as_str(),
+                            local_peer_id.as_str(),
+                        );
+                        edge_registered_head_id = Some(head.head_id.clone());
                     }
                 }
             }
@@ -4537,7 +4536,10 @@ mod tests {
         assert_eq!(announcement.provider_peer_id, Some(local_peer_id));
         assert_eq!(
             announcement.overlay,
-            experiment.overlay_set().unwrap().heads
+            experiment
+                .overlay_set()
+                .expect("test experiment handle has an overlay")
+                .heads
         );
     }
 

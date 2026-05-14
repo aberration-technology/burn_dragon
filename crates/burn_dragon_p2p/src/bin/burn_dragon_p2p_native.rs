@@ -57,9 +57,9 @@ use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ControlPlaneSnapshot,
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentHandle, ExperimentId,
-    ExperimentScope, HeadAnnouncement, HeadDescriptor, HeadPromotionMode, LiveControlPlaneEvent,
-    MetricValue, NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet, PrincipalId, ProtocolSet,
-    RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
+    ExperimentScope, HeadAnnouncement, HeadDescriptor, HeadId, HeadPromotionMode,
+    LiveControlPlaneEvent, MetricValue, NativeControlPlaneShell, NetworkId, PeerId, PeerRoleSet,
+    PrincipalId, ProtocolSet, RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -3665,6 +3665,47 @@ where
                                     .map(|peer_id| peer_id.as_str())
                                     .unwrap_or("-"),
                             );
+                            if let (Some(head), Some(local_peer_id)) =
+                                (head.as_ref(), snapshot.local_peer_id.clone())
+                            {
+                                if should_register_edge_local_fallback(
+                                    &announcement.head,
+                                    head,
+                                    edge_registered_head_id.as_ref(),
+                                ) {
+                                    let local_announcement = edge_local_head_announcement(
+                                        head,
+                                        &experiment,
+                                        local_peer_id.clone(),
+                                    )?;
+                                    match register_live_head_with_edge_options(
+                                        registration_runtime,
+                                        edge_base_url,
+                                        session_id,
+                                        Some(&experiment_entry),
+                                        &local_announcement,
+                                    ) {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "head-mirror-edge-local-fallback-registered head_id={} provider={} superseded_head={}",
+                                                local_announcement.head.head_id.as_str(),
+                                                local_peer_id.as_str(),
+                                                announcement.head.head_id.as_str(),
+                                            );
+                                            edge_registered_head_id =
+                                                Some(local_announcement.head.head_id.clone());
+                                        }
+                                        Err(fallback_error) => {
+                                            eprintln!(
+                                                "head-mirror-edge-local-fallback-registration-failed head_id={} provider={} superseded_head={} error={fallback_error}",
+                                                local_announcement.head.head_id.as_str(),
+                                                local_peer_id.as_str(),
+                                                announcement.head.head_id.as_str(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3673,22 +3714,29 @@ where
             {
                 let snapshot = running.snapshot();
                 if let Some(local_peer_id) = snapshot.local_peer_id {
-                    let announcement = HeadAnnouncement {
-                        overlay: experiment.overlay_set()?.heads,
-                        provider_peer_id: Some(local_peer_id),
-                        head: head.clone(),
-                        announced_at: chrono::Utc::now(),
-                    };
-                    if let Err(error) = register_live_head_with_edge_options(
-                        registration_runtime,
-                        edge_base_url,
-                        session_id,
-                        Some(&experiment_entry),
-                        &announcement,
-                    ) {
-                        eprintln!("head-mirror-edge-registration-failed: {error}");
-                    } else {
-                        edge_registered_head_id = Some(head.head_id.clone());
+                    if edge_registered_head_id.as_ref() != Some(&head.head_id) {
+                        let announcement =
+                            edge_local_head_announcement(head, &experiment, local_peer_id.clone())?;
+                        if let Err(error) = register_live_head_with_edge_options(
+                            registration_runtime,
+                            edge_base_url,
+                            session_id,
+                            Some(&experiment_entry),
+                            &announcement,
+                        ) {
+                            eprintln!(
+                                "head-mirror-edge-local-registration-failed head_id={} provider={} error={error}",
+                                head.head_id.as_str(),
+                                local_peer_id.as_str(),
+                            );
+                        } else {
+                            eprintln!(
+                                "head-mirror-edge-local-registered head_id={} provider={}",
+                                head.head_id.as_str(),
+                                local_peer_id.as_str(),
+                            );
+                            edge_registered_head_id = Some(head.head_id.clone());
+                        }
                     }
                 }
             }
@@ -3736,6 +3784,28 @@ where
 
         thread::sleep(STATUS_POLL_INTERVAL);
     }
+}
+
+fn edge_local_head_announcement(
+    head: &HeadDescriptor,
+    experiment: &ExperimentHandle,
+    local_peer_id: PeerId,
+) -> Result<HeadAnnouncement> {
+    Ok(HeadAnnouncement {
+        overlay: experiment.overlay_set()?.heads,
+        provider_peer_id: Some(local_peer_id),
+        head: head.clone(),
+        announced_at: chrono::Utc::now(),
+    })
+}
+
+fn should_register_edge_local_fallback(
+    failed_visible_head: &HeadDescriptor,
+    local_head: &HeadDescriptor,
+    edge_registered_head_id: Option<&HeadId>,
+) -> bool {
+    failed_visible_head.head_id != local_head.head_id
+        && edge_registered_head_id != Some(&local_head.head_id)
 }
 
 fn latest_visible_promoted_head_announcement(
@@ -4452,6 +4522,39 @@ mod tests {
             selected.provider_peer_id.as_ref().map(|peer| peer.as_str()),
             Some("provider-promoted"),
         );
+    }
+
+    #[test]
+    fn edge_local_head_announcement_uses_local_provider() {
+        let experiment = test_experiment_handle();
+        let head = test_head_descriptor("head-window-2", 2);
+        let local_peer_id = PeerId::new("local-head-mirror");
+
+        let announcement = edge_local_head_announcement(&head, &experiment, local_peer_id.clone())
+            .expect("local head announcement");
+
+        assert_eq!(announcement.head, head);
+        assert_eq!(announcement.provider_peer_id, Some(local_peer_id));
+        assert_eq!(
+            announcement.overlay,
+            experiment.overlay_set().unwrap().heads
+        );
+    }
+
+    #[test]
+    fn edge_local_fallback_is_selected_after_unreachable_newer_head() {
+        let visible = test_head_descriptor("head-window-4", 4);
+        let local = test_head_descriptor("head-window-3", 3);
+
+        assert!(should_register_edge_local_fallback(&visible, &local, None));
+        assert!(!should_register_edge_local_fallback(
+            &visible,
+            &local,
+            Some(&local.head_id),
+        ));
+        assert!(!should_register_edge_local_fallback(
+            &visible, &visible, None,
+        ));
     }
 
     fn spawn_single_response_server(

@@ -633,8 +633,8 @@ fn production_profile_contracts() -> Result<()> {
     )?;
     require_contains(
         &deploy_workflow,
-        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: \"true\"",
-        "deploy canary mirrors its own p2p-published head before shutdown so fresh restores are edge-backed deterministically",
+        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: \"false\"",
+        "deploy canary proves the normal p2p/head-mirror path instead of using direct edge mirroring as a crutch",
     )?;
     require_contains(
         &deploy_workflow,

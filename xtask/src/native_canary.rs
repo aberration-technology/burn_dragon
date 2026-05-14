@@ -949,7 +949,8 @@ fn initial_head_provider_signal(
             let signal = deferred_unbacked_preflight_head_signal(head, p2p_signal, &error);
             eprintln!(
                 "native canary preflight head is p2p-visible but not edge-backed after repair; \
-                 continuing because this run will publish and mirror a replacement head: {error:#}"
+                 continuing because this run will publish a replacement head and require the deployed \
+                 head mirror to edge-back it: {error:#}"
             );
             Ok(signal)
         }
@@ -960,14 +961,11 @@ fn initial_head_provider_signal(
 fn should_defer_unbacked_preflight_head(
     repair_current_head_to_visible_root: bool,
     require_edge_head_provider: bool,
-    mirror_live_head_to_edge: bool,
+    _mirror_live_head_to_edge: bool,
     head: &Value,
     p2p_signal: &Value,
 ) -> bool {
-    if !(repair_current_head_to_visible_root
-        && require_edge_head_provider
-        && mirror_live_head_to_edge)
-    {
+    if !(repair_current_head_to_visible_root && require_edge_head_provider) {
         return false;
     }
     let providers = head_provider_ids(head);
@@ -1274,7 +1272,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defers_only_repairing_mirrored_preflight_head_without_edge_provider() {
+    fn defers_repairing_preflight_head_without_edge_provider() {
         let head = json!({
             "head_id": "head-1",
             "provider_peer_ids": ["native-trainer"],
@@ -1290,7 +1288,7 @@ mod tests {
             &head,
             &p2p_signal
         ));
-        assert!(!should_defer_unbacked_preflight_head(
+        assert!(should_defer_unbacked_preflight_head(
             true,
             true,
             false,

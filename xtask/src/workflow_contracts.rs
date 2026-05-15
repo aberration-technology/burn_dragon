@@ -630,12 +630,22 @@ fn production_profile_contracts() -> Result<()> {
     require_contains(
         &deploy_workflow,
         "BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: \"180\"",
-        "deploy canary keeps the trainer provider alive long enough for the bootstrap head mirror to edge-back the fresh head",
+        "deploy canary keeps the trainer provider alive long enough for browser and native p2p sync checks",
     )?;
     require_contains(
         &deploy_workflow,
         "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: \"false\"",
         "deploy canary proves the normal p2p/head-mirror path instead of using direct edge mirroring as a crutch",
+    )?;
+    require_contains(
+        &deploy_workflow,
+        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: \"false\"",
+        "deploy canary does not block low-resource production deploys on the edge fallback provider",
+    )?;
+    require_contains(
+        &deploy_workflow,
+        "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_AFTER_RUN: \"true\"",
+        "deploy canary repairs its synthetic head after proving native p2p training dynamics",
     )?;
     require_contains(
         &deploy_workflow,

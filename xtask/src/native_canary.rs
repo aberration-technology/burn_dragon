@@ -21,7 +21,9 @@ pub fn run() -> Result<()> {
     let trainer_bundle = config.artifact_dir.join("trainer-auth-bundle.json");
     let validator_bundle = config.artifact_dir.join("validator-auth-bundle.json");
 
-    let repair_report = if config.repair_current_head_to_visible_root {
+    let prepare_repair_principal =
+        config.repair_current_head_to_visible_root || config.repair_current_head_after_run;
+    if prepare_repair_principal {
         enroll_static_principal(
             &config,
             &config.principal_id,
@@ -31,10 +33,13 @@ pub fn run() -> Result<()> {
             &config.artifact_dir.join("enroll-repair.log"),
             &config.backend,
         )?;
+    }
+    let repair_report = if config.repair_current_head_to_visible_root {
         Some(repair_current_head_to_visible_root(
             &config,
             &repair_bundle,
             &repair_storage,
+            "repair-current-head.log",
         )?)
     } else {
         None
@@ -103,7 +108,32 @@ pub fn run() -> Result<()> {
     if let Some(mut child) = validator {
         stop_child(&mut child);
     }
-    let window_reports = result?;
+    let window_reports = match result {
+        Ok(reports) => reports,
+        Err(error) => {
+            if config.repair_current_head_after_run {
+                let _ = repair_current_head_to_visible_root(
+                    &config,
+                    &repair_bundle,
+                    &repair_storage,
+                    "repair-current-head-after-failure.log",
+                );
+            }
+            return Err(error);
+        }
+    };
+    let head_after_before_post_repair =
+        current_directory_head(&config.edge_base_url, &config.experiment_id)?;
+    let post_repair_report = if config.repair_current_head_after_run {
+        Some(repair_current_head_to_visible_root(
+            &config,
+            &repair_bundle,
+            &repair_storage,
+            "repair-current-head-after-run.log",
+        )?)
+    } else {
+        None
+    };
 
     let summary = json!({
         "success": true,
@@ -119,6 +149,7 @@ pub fn run() -> Result<()> {
         "mirror_live_head_to_edge": config.mirror_live_head_to_edge,
         "require_edge_head_provider": config.require_edge_head_provider,
         "repair_current_head_to_visible_root": config.repair_current_head_to_visible_root,
+        "repair_current_head_after_run": config.repair_current_head_after_run,
         "require_canonical_loss_non_regression": config.require_canonical_loss_non_regression,
         "training_batch_size": config.training_batch_size,
         "training_max_iters": config.training_max_iters,
@@ -132,6 +163,8 @@ pub fn run() -> Result<()> {
         "head_provider_before": head_provider_before,
         "repair_report": repair_report,
         "windows": window_reports,
+        "head_after_before_post_repair": head_after_before_post_repair,
+        "post_repair_report": post_repair_report,
         "head_after": current_directory_head(&config.edge_base_url, &config.experiment_id)?,
         "catchup": fetch_json(&format!("{}/metrics/catchup/{}", config.edge_base_url, config.experiment_id), 30)?,
         "live_latest": fetch_json(&format!("{}/metrics/live/latest", config.edge_base_url), 30)?,
@@ -310,6 +343,7 @@ struct NativeCanaryConfig {
     mirror_live_head_to_edge: bool,
     require_edge_head_provider: bool,
     repair_current_head_to_visible_root: bool,
+    repair_current_head_after_run: bool,
     require_canonical_loss_non_regression: bool,
     training_batch_size: Option<u64>,
     training_max_iters: Option<u64>,
@@ -386,6 +420,10 @@ impl NativeCanaryConfig {
                 "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT",
                 false,
             )?,
+            repair_current_head_after_run: env_bool(
+                "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_AFTER_RUN",
+                false,
+            )?,
             require_canonical_loss_non_regression: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_REQUIRE_CANONICAL_LOSS_NON_REGRESSION",
                 false,
@@ -424,8 +462,9 @@ fn repair_current_head_to_visible_root(
     config: &NativeCanaryConfig,
     trainer_bundle: &Path,
     storage_root: &Path,
+    log_name: &str,
 ) -> Result<Value> {
-    let log_path = config.artifact_dir.join("repair-current-head.log");
+    let log_path = config.artifact_dir.join(log_name);
     run_native(
         vec![
             config.binary.clone(),

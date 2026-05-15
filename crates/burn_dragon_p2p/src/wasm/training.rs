@@ -246,6 +246,13 @@ struct BrowserTrainingRunContext<'a> {
     live_session_principal_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrowserCanonicalArtifactPublicationDecision {
+    requested: bool,
+    should_publish: bool,
+    disabled_reason: Option<&'static str>,
+}
+
 impl<'a> BrowserTrainingRunContext<'a> {
     fn live_session_principal_id(&self) -> Option<&str> {
         self.live_session_principal_id.as_deref()
@@ -267,6 +274,55 @@ impl<'a> BrowserTrainingRunContext<'a> {
             )),
             training_lease,
         }
+    }
+}
+
+fn browser_canonical_artifact_publication_decision(
+    requested: bool,
+    backend_kind: BrowserTrainingBackendKind,
+) -> BrowserCanonicalArtifactPublicationDecision {
+    browser_canonical_artifact_publication_decision_for_platform(
+        requested,
+        backend_kind,
+        cfg!(target_arch = "wasm32"),
+    )
+}
+
+fn browser_canonical_artifact_publication_decision_for_platform(
+    requested: bool,
+    backend_kind: BrowserTrainingBackendKind,
+    target_arch_wasm32: bool,
+) -> BrowserCanonicalArtifactPublicationDecision {
+    if !requested {
+        return BrowserCanonicalArtifactPublicationDecision {
+            requested,
+            should_publish: false,
+            disabled_reason: None,
+        };
+    }
+
+    match backend_kind {
+        BrowserTrainingBackendKind::Cpu => BrowserCanonicalArtifactPublicationDecision {
+            requested,
+            should_publish: true,
+            disabled_reason: None,
+        },
+        #[cfg(feature = "wgpu")]
+        BrowserTrainingBackendKind::Wgpu if target_arch_wasm32 => {
+            BrowserCanonicalArtifactPublicationDecision {
+                requested,
+                should_publish: false,
+                disabled_reason: Some(
+                    "Burn 0.21 WebGPU recorder requires synchronous tensor reads, which are unsupported in WASM",
+                ),
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        BrowserTrainingBackendKind::Wgpu => BrowserCanonicalArtifactPublicationDecision {
+            requested,
+            should_publish: true,
+            disabled_reason: None,
+        },
     }
 }
 
@@ -525,12 +581,16 @@ where
         .live_participant
         .as_ref()
         .is_none_or(|config| config.load_active_head_artifact);
-    let publish_canonical_update = context
+    let requested_canonical_update = context
         .config
         .live_participant
         .as_ref()
         .is_some_and(|config| config.publish_canonical_update);
-    if publish_canonical_update && !load_active_head {
+    let artifact_publication_decision = browser_canonical_artifact_publication_decision(
+        requested_canonical_update,
+        context.backend_kind,
+    );
+    if artifact_publication_decision.should_publish && !load_active_head {
         bail!("browser canonical artifact publication requires loading the active head artifact");
     }
 
@@ -697,18 +757,27 @@ where
     );
 
     let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
-    let publish_canonical_update = context
-        .config
-        .live_participant
-        .as_ref()
-        .is_some_and(|live| live.publish_canonical_update);
     let published_artifact = if let Some(live) = live_participant.as_ref() {
-        if !publish_canonical_update {
-            info!(
-                "browser canonical artifact publication disabled for this training profile; submitting receipt only"
-            );
+        if !artifact_publication_decision.should_publish {
+            if artifact_publication_decision.requested {
+                info!(
+                    "browser canonical artifact publication skipped: {}; submitting receipt only",
+                    artifact_publication_decision
+                        .disabled_reason
+                        .unwrap_or("artifact publication disabled")
+                );
+            } else {
+                info!(
+                    "browser canonical artifact publication disabled for this training profile; submitting receipt only"
+                );
+            }
             None
         } else {
+            info!(
+                "browser canonical artifact publication starting: base_head_synced={} backend={}",
+                active_model_schema_hash.is_some(),
+                context.backend_label,
+            );
             let model_schema_hash = active_model_schema_hash.unwrap_or_else(|| {
                 ContentId::derive(&context.config.model_config)
                     .unwrap_or_else(|_| ContentId::new("dragon-browser-model-schema"))
@@ -1360,6 +1429,15 @@ fn browser_training_contribution(
         stats.train_token_count,
         now.timestamp_micros()
     ));
+    let requested_canonical_update = context
+        .config
+        .live_participant
+        .as_ref()
+        .is_some_and(|live| live.publish_canonical_update);
+    let artifact_publication_decision = browser_canonical_artifact_publication_decision(
+        requested_canonical_update,
+        context.backend_kind,
+    );
     let mut metadata = BTreeMap::from([
         ("contribution_kind".into(), "browser-local-window".into()),
         ("backend".into(), context.backend_label.into()),
@@ -1368,13 +1446,12 @@ fn browser_training_contribution(
             context.config.experiment_kind.workload_slug().into(),
         ),
         (
+            "publish_canonical_update_requested".into(),
+            artifact_publication_decision.requested.to_string(),
+        ),
+        (
             "publish_canonical_update".into(),
-            context
-                .config
-                .live_participant
-                .as_ref()
-                .is_some_and(|live| live.publish_canonical_update)
-                .to_string(),
+            artifact_publication_decision.should_publish.to_string(),
         ),
         (
             "load_active_head_artifact".into(),
@@ -1400,6 +1477,9 @@ fn browser_training_contribution(
     }
     if let Some(eval_loss) = stats.eval_loss {
         metadata.insert("eval_loss".into(), format!("{eval_loss:.8}"));
+    }
+    if let Some(reason) = artifact_publication_decision.disabled_reason {
+        metadata.insert("artifact_publication_disabled_reason".into(), reason.into());
     }
     let artifact_id = artifact
         .as_ref()
@@ -1624,6 +1704,123 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn canonical_artifact_publication_is_disabled_when_not_requested() {
+        let decision = browser_canonical_artifact_publication_decision_for_platform(
+            false,
+            BrowserTrainingBackendKind::Cpu,
+            true,
+        );
+
+        assert!(!decision.requested);
+        assert!(!decision.should_publish);
+        assert_eq!(decision.disabled_reason, None);
+    }
+
+    #[wasm_bindgen_test]
+    fn canonical_artifact_publication_allows_cpu_on_wasm() {
+        let decision = browser_canonical_artifact_publication_decision_for_platform(
+            true,
+            BrowserTrainingBackendKind::Cpu,
+            true,
+        );
+
+        assert!(decision.requested);
+        assert!(decision.should_publish);
+        assert_eq!(decision.disabled_reason, None);
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[wasm_bindgen_test]
+    fn canonical_artifact_publication_skips_wasm_webgpu_sync_recording() {
+        let decision = browser_canonical_artifact_publication_decision_for_platform(
+            true,
+            BrowserTrainingBackendKind::Wgpu,
+            true,
+        );
+
+        assert!(decision.requested);
+        assert!(!decision.should_publish);
+        assert!(
+            decision
+                .disabled_reason
+                .expect("disabled reason")
+                .contains("synchronous tensor reads")
+        );
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[wasm_bindgen_test]
+    fn canonical_artifact_publication_allows_native_webgpu() {
+        let decision = browser_canonical_artifact_publication_decision_for_platform(
+            true,
+            BrowserTrainingBackendKind::Wgpu,
+            false,
+        );
+
+        assert!(decision.requested);
+        assert!(decision.should_publish);
+        assert_eq!(decision.disabled_reason, None);
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[wasm_bindgen_test]
+    fn browser_training_contribution_marks_wasm_webgpu_publication_skipped() {
+        let mut config = sample_browser_training_config();
+        config.live_participant = Some(DragonBrowserLiveParticipantConfig {
+            principal_id: Some("browser-principal".into()),
+            study_id: "dragon-study".into(),
+            experiment_id: "dragon-experiment".into(),
+            revision_id: "dragon-revision".into(),
+            workload_id: "dragon-workload".into(),
+            publish_canonical_update: true,
+            load_active_head_artifact: true,
+        });
+        let context = BrowserTrainingRunContext {
+            edge_base_url: "https://edge.example.invalid",
+            config: &config,
+            backend_label: "burn-webgpu-wasm",
+            backend_kind: BrowserTrainingBackendKind::Wgpu,
+            setup_time_ms: 0,
+            live_session_principal_id: Some("browser-principal".into()),
+        };
+
+        let contribution = browser_training_contribution(
+            &context,
+            BrowserTrainingContributionStats {
+                train_batch_count: 1,
+                train_example_count: 1,
+                train_token_count: 8,
+                train_loss_observed: false,
+                train_loss_mean: 0.0,
+                eval_loss: None,
+                training_time_ms: 10,
+                eval_time_ms: 0,
+                total_time_ms: 10,
+            },
+            None,
+        );
+
+        assert_eq!(
+            contribution
+                .metadata
+                .get("publish_canonical_update_requested"),
+            Some(&"true".into())
+        );
+        assert_eq!(
+            contribution.metadata.get("publish_canonical_update"),
+            Some(&"false".into())
+        );
+        assert!(
+            contribution
+                .metadata
+                .get("artifact_publication_disabled_reason")
+                .expect("disabled reason")
+                .contains("synchronous tensor reads")
+        );
+        assert!(contribution.published_artifact.is_none());
+    }
 
     #[wasm_bindgen_test]
     fn browser_live_shard_selection_prefers_authenticated_session_principal() {

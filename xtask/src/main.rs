@@ -505,9 +505,6 @@ fn ensure_wasm_bindgen_test_runner() -> Result<PathBuf> {
     {
         return Ok(explicit);
     }
-    if let Some(found) = find_in_path(binary_name("wasm-bindgen-test-runner")) {
-        return Ok(found);
-    }
 
     let version = lockfile_package_version("wasm-bindgen")?;
     let install_root = workspace_root()
@@ -522,6 +519,8 @@ fn ensure_wasm_bindgen_test_runner() -> Result<PathBuf> {
         return Ok(runner);
     }
 
+    // wasm-bindgen test runners must exactly match the schema version linked
+    // into the wasm artifact. Prefer the lockfile-matched cache over PATH.
     fs::create_dir_all(&install_root).with_context(|| {
         format!(
             "failed to create wasm-bindgen-cli cache {}",

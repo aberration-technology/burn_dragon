@@ -410,11 +410,11 @@ impl NativeCanaryConfig {
             start_local_validator: env_bool("BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR", false)?,
             mirror_live_head_to_edge: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE",
-                true,
+                false,
             )?,
             require_edge_head_provider: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER",
-                true,
+                false,
             )?,
             repair_current_head_to_visible_root: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT",

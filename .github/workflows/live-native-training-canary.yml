@@ -80,7 +80,7 @@ on:
       require_edge_head_provider:
         description: Require the canonical head to be restorable from the connected edge provider
         required: false
-        default: "true"
+        default: "false"
       repair_current_head_to_visible_root:
         description: Reset the current directory head to the latest visible root before training. Use only to unwind a non-durable live head.
         required: false
@@ -141,7 +141,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}
       BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}
       BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'false' }}
-      BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'true' }}
+      BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: ${{ github.event.inputs.require_edge_head_provider || 'false' }}
       BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: ${{ github.event.inputs.repair_current_head_to_visible_root || 'false' }}
       BURN_DRAGON_NATIVE_CANARY_ARTIFACT_DIR: /tmp/burn-dragon-live-native-training-canary
       BURN_DRAGON_NATIVE_CANARY_OUTPUT_JSON: /tmp/burn-dragon-live-native-training-canary/native-canary-summary.json

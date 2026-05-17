@@ -28,7 +28,7 @@ use burn_p2p_core::codec::multihash_sha256;
 use burn_p2p_dataloader::ShardFetchManifest;
 #[cfg(feature = "wgpu")]
 use burn_wgpu::{RuntimeOptions, graphics};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use gloo_net::http::Request;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,8 @@ use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_p
 
 type BrowserCpuEvalBackend = NdArray<f32>;
 type BrowserCpuTrainBackend = Autodiff<BrowserCpuEvalBackend>;
+
+const BROWSER_LIVE_SESSION_REFRESH_GRACE_SECS: i64 = 120;
 
 #[cfg(feature = "wgpu")]
 type BrowserWgpuEvalBackend = burn_wgpu::Wgpu<f32>;
@@ -167,6 +169,15 @@ impl DragonBrowserTrainingSession {
         live_session_principal_id(self.live_browser_session.as_ref())
     }
 
+    fn live_session_refresh_deadline(&self) -> DateTime<Utc> {
+        let max_window_secs = self
+            .live_participant
+            .as_ref()
+            .map(|participant| participant.training_budget.max_window_secs)
+            .unwrap_or(30);
+        browser_live_session_refresh_deadline(max_window_secs)
+    }
+
     fn live_participant_matches_config(&self, config: &DragonBrowserTrainingConfig) -> bool {
         let Some(live) = config.live_participant.as_ref() else {
             return self.live_participant.is_none();
@@ -188,6 +199,45 @@ impl DragonBrowserTrainingSession {
             })
     }
 
+    async fn refresh_live_browser_session_if_needed(
+        &mut self,
+        edge_base_url: &str,
+        config: &DragonBrowserTrainingConfig,
+        release_manifest: &burn_p2p::ClientReleaseManifest,
+        deadline: DateTime<Utc>,
+    ) -> Result<bool> {
+        let should_refresh = self
+            .live_browser_session
+            .as_ref()
+            .is_none_or(|session| session.session_expires_before(deadline));
+        if !should_refresh {
+            return Ok(false);
+        }
+
+        info!("browser live participant session refresh starting");
+        let requested_scopes = config
+            .live_participant
+            .as_ref()
+            .map(live_browser_training_requested_scopes)
+            .unwrap_or_else(|| BTreeSet::from([ExperimentScope::Connect]));
+        let session =
+            load_or_enroll_browser_session(edge_base_url, release_manifest, requested_scopes, 900)
+                .await?;
+        if session.session.is_none() {
+            bail!("browser live training requires an authenticated session");
+        }
+        if let Some(participant) = self.live_participant.as_mut() {
+            participant.session_runtime.session = session.clone();
+            participant
+                .session_runtime
+                .runtime
+                .remember_session(session.clone());
+        }
+        self.live_browser_session = Some(session);
+        info!("browser live participant session refresh complete");
+        Ok(true)
+    }
+
     async fn ensure_live_participant(
         &mut self,
         edge_base_url: &str,
@@ -203,23 +253,14 @@ impl DragonBrowserTrainingSession {
         if !self.live_participant_matches_config(config) {
             self.live_participant = None;
         }
-        if self.live_browser_session.is_none() {
-            info!("browser live participant session loading");
-            let requested_scopes = config
-                .live_participant
-                .as_ref()
-                .map(live_browser_training_requested_scopes)
-                .unwrap_or_else(|| BTreeSet::from([ExperimentScope::Connect]));
-            self.live_browser_session = Some(
-                load_or_enroll_browser_session(
-                    edge_base_url,
-                    release_manifest,
-                    requested_scopes,
-                    900,
-                )
-                .await?,
-            );
-        }
+        let refresh_deadline = self.live_session_refresh_deadline();
+        self.refresh_live_browser_session_if_needed(
+            edge_base_url,
+            config,
+            release_manifest,
+            refresh_deadline,
+        )
+        .await?;
         if self.live_participant.is_none() {
             info!("browser live participant runtime starting");
             self.live_participant = start_live_browser_participant(
@@ -232,9 +273,24 @@ impl DragonBrowserTrainingSession {
         } else {
             info!("browser live participant runtime reused");
         }
+        let refresh_deadline = self.live_session_refresh_deadline();
+        self.refresh_live_browser_session_if_needed(
+            edge_base_url,
+            config,
+            release_manifest,
+            refresh_deadline,
+        )
+        .await?;
 
         Ok(())
     }
+}
+
+fn browser_live_session_refresh_deadline(max_window_secs: u64) -> DateTime<Utc> {
+    let max_window_secs = i64::try_from(max_window_secs)
+        .unwrap_or(i64::MAX.saturating_sub(BROWSER_LIVE_SESSION_REFRESH_GRACE_SECS));
+    Utc::now()
+        + Duration::seconds(max_window_secs.saturating_add(BROWSER_LIVE_SESSION_REFRESH_GRACE_SECS))
 }
 
 struct BrowserTrainingRunContext<'a> {
@@ -1612,6 +1668,15 @@ async fn finish_live_browser_participant(
         .active_assignment
         .clone()
         .ok_or_else(|| anyhow!("browser runtime has no active assignment for live training"))?;
+    if handle
+        .session_runtime
+        .refresh_session_if_expiring_before(
+            Utc::now() + Duration::seconds(BROWSER_LIVE_SESSION_REFRESH_GRACE_SECS),
+        )
+        .await?
+    {
+        info!("browser live participant session refreshed before receipt flush");
+    }
     let outcome = handle
         .session_runtime
         .run_training_plan(BrowserTrainingPlan {

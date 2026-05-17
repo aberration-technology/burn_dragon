@@ -5,20 +5,21 @@ use super::{
     DragonBrowserTransportOverride, DragonHeroTone, DragonPeerUiContext, DragonReadinessStepId,
     DragonStepStatus, DragonTrainingActionContext, DragonUiEventCandidate, DragonUiEventKind,
     browser_app_refresh_interval_millis, browser_session_is_authenticated,
-    browser_ui_timeout_message, browser_view_machine_state_json, connect_config,
-    dragon_browser_training_action_ready, dragon_global_training_detail,
-    dragon_global_training_summary, dragon_live_notice, dragon_local_training_detail,
-    dragon_local_training_summary, dragon_network_detail, dragon_peer_ui_state,
-    dragon_push_ui_event, dragon_runtime_mode_detail, dragon_runtime_mode_summary,
-    dragon_session_metric_view, dragon_slice_progress_summary, dragon_training_action_state,
-    dragon_transport_summary, dragon_window_progress_detail, dragon_window_summary,
-    filter_seed_urls_for_transport, filter_signed_seed_advertisement_for_transport,
-    normalized_browser_callback_url, retained_refresh_transport_warning,
+    browser_training_auth_failure_message, browser_ui_timeout_message,
+    browser_view_machine_state_json, connect_config, dragon_browser_training_action_ready,
+    dragon_global_training_detail, dragon_global_training_summary, dragon_live_notice,
+    dragon_local_training_detail, dragon_local_training_summary, dragon_network_detail,
+    dragon_peer_ui_state, dragon_push_ui_event, dragon_runtime_mode_detail,
+    dragon_runtime_mode_summary, dragon_session_metric_view, dragon_slice_progress_summary,
+    dragon_training_action_state, dragon_transport_summary, dragon_window_progress_detail,
+    dragon_window_summary, filter_seed_urls_for_transport,
+    filter_signed_seed_advertisement_for_transport, normalized_browser_callback_url,
+    retained_refresh_transport_warning,
 };
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
 use burn_p2p::{
-    AuthProvider, BrowserMode, ContentId, ExperimentScope, NetworkId, PeerId, PeerRoleSet,
-    PrincipalClaims, PrincipalId, PrincipalSession, ProfileMode, SocialMode,
+    AuthProvider, BrowserMode, ContentId, ExperimentId, ExperimentScope, NetworkId, PeerId,
+    PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession, ProfileMode, SocialMode,
 };
 use burn_p2p_app::AdminSessionSummaryView;
 use burn_p2p_browser::{
@@ -212,6 +213,7 @@ fn sample_browser_view() -> BrowserAppClientView {
 fn ready_training_action_context(view: &BrowserAppClientView) -> DragonTrainingActionContext<'_> {
     DragonTrainingActionContext {
         view: Some(view),
+        auth_ready: true,
         browser_can_attempt_dynamic_training: true,
         edge_configured: true,
         direct_transport_ready: true,
@@ -228,6 +230,36 @@ fn assign_training_work(view: &mut BrowserAppClientView) {
 
 fn set_current_head(view: &mut BrowserAppClientView) {
     view.training.latest_head_id = Some("head-1".into());
+}
+
+fn browser_session_with_scopes(
+    granted_scopes: BTreeSet<ExperimentScope>,
+    expires_at: chrono::DateTime<Utc>,
+) -> BrowserSessionState {
+    let now = Utc::now();
+    BrowserSessionState {
+        session: Some(PrincipalSession {
+            session_id: ContentId::new("session-browser-test"),
+            network_id: NetworkId::new("burn-dragon-mainnet"),
+            claims: PrincipalClaims {
+                principal_id: PrincipalId::new("principal-browser-test"),
+                provider: AuthProvider::Static {
+                    authority: "test".into(),
+                },
+                display_name: "Browser Test".into(),
+                org_memberships: BTreeSet::new(),
+                group_memberships: BTreeSet::new(),
+                granted_roles: PeerRoleSet::default(),
+                granted_scopes,
+                custom_claims: BTreeMap::new(),
+                issued_at: now,
+                expires_at,
+            },
+            issued_at: now,
+            expires_at,
+        }),
+        ..BrowserSessionState::default()
+    }
 }
 
 fn cache_current_head_from_p2p(view: &mut BrowserAppClientView) {
@@ -303,35 +335,64 @@ fn browser_transport_filter_keeps_only_selected_seed_family() {
 
 #[wasm_bindgen_test]
 fn browser_session_authentication_requires_session_claims() {
+    let requested_connect_scopes =
+        BTreeSet::from([ExperimentScope::Connect, ExperimentScope::Discover]);
     assert!(!browser_session_is_authenticated(
-        &BrowserSessionState::default()
+        &BrowserSessionState::default(),
+        &requested_connect_scopes,
     ));
 
     let now = Utc::now();
-    let session = BrowserSessionState {
-        session: Some(PrincipalSession {
-            session_id: ContentId::new("session-browser-test"),
-            network_id: NetworkId::new("burn-dragon-mainnet"),
-            claims: PrincipalClaims {
-                principal_id: PrincipalId::new("principal-browser-test"),
-                provider: AuthProvider::Static {
-                    authority: "test".into(),
-                },
-                display_name: "Browser Test".into(),
-                org_memberships: BTreeSet::new(),
-                group_memberships: BTreeSet::new(),
-                granted_roles: PeerRoleSet::default(),
-                granted_scopes: BTreeSet::new(),
-                custom_claims: BTreeMap::new(),
-                issued_at: now,
-                expires_at: now,
-            },
-            issued_at: now,
-            expires_at: now,
-        }),
-        ..BrowserSessionState::default()
+    let connect_session = browser_session_with_scopes(
+        requested_connect_scopes.clone(),
+        now + chrono::Duration::minutes(5),
+    );
+    assert!(browser_session_is_authenticated(
+        &connect_session,
+        &requested_connect_scopes,
+    ));
+
+    let train_scope = ExperimentScope::Train {
+        experiment_id: ExperimentId::new("nca-prepretraining"),
     };
-    assert!(browser_session_is_authenticated(&session));
+    let requested_training_scopes = BTreeSet::from([
+        ExperimentScope::Connect,
+        ExperimentScope::Discover,
+        train_scope.clone(),
+    ]);
+    assert!(!browser_session_is_authenticated(
+        &connect_session,
+        &requested_training_scopes,
+    ));
+
+    let training_session = browser_session_with_scopes(
+        requested_training_scopes.clone(),
+        now + chrono::Duration::minutes(5),
+    );
+    assert!(browser_session_is_authenticated(
+        &training_session,
+        &requested_training_scopes,
+    ));
+
+    let expired_training_session = browser_session_with_scopes(
+        requested_training_scopes.clone(),
+        now + chrono::Duration::seconds(10),
+    );
+    assert!(!browser_session_is_authenticated(
+        &expired_training_session,
+        &requested_training_scopes,
+    ));
+}
+
+#[wasm_bindgen_test]
+fn browser_training_receipt_unauthorized_errors_are_auth_failures() {
+    assert!(browser_training_auth_failure_message(
+        "http client error: HTTP status client error (401 Unauthorized) for url (https://edge.example/receipts/browser)"
+    ));
+    assert!(browser_training_auth_failure_message("unknown_session"));
+    assert!(!browser_training_auth_failure_message(
+        "active head artifact is unavailable after p2p sync"
+    ));
 }
 
 #[wasm_bindgen_test]
@@ -696,6 +757,53 @@ fn dragon_training_action_state_explains_observe_and_ready_modes() {
     assert!(ready.enabled);
     assert_eq!(ready.label, "run browser training");
     assert!(ready.detail.contains("downloads when the run starts"));
+}
+
+#[wasm_bindgen_test]
+fn dragon_training_action_state_requires_authenticated_training_scope() {
+    let mut view = sample_browser_view();
+    view.network.direct_peers = 1;
+    view.network.swarm_status.connected_transport = Some(BrowserTransportFamily::WebRtcDirect);
+    make_training_ready(&mut view);
+
+    let action = dragon_training_action_state(DragonTrainingActionContext {
+        auth_ready: false,
+        ..ready_training_action_context(&view)
+    })
+    .expect("missing auth training state");
+    assert!(!action.enabled);
+    assert_eq!(action.label, "sign in required");
+    assert!(action.detail.contains("training scope"));
+
+    let context = DragonPeerUiContext {
+        view: Some(&view),
+        status_message: "",
+        has_session: false,
+        auth_bootstrap_pending: false,
+        needs_sign_in: true,
+        ready_to_connect: false,
+        edge_configured: true,
+        browser_can_attempt_dynamic_training: true,
+        direct_transport_ready: true,
+        requires_active_head_artifact: true,
+        local_training_pending: false,
+        local_training_failure: None,
+        downgrade_reason: None,
+        training_action_state: Some(&action),
+        session_metric: None,
+    };
+    let ui = dragon_peer_ui_state(&context);
+    assert_eq!(ui.hero.label, "sign in required");
+    assert_ne!(ui.hero.label, "ready to train");
+    assert!(ui.hero.detail.contains("github session"));
+    assert_eq!(
+        ui.readiness
+            .iter()
+            .find(|step| step.id == DragonReadinessStepId::TrainingReady)
+            .expect("train step")
+            .status,
+        DragonStepStatus::Waiting
+    );
 }
 
 #[wasm_bindgen_test]

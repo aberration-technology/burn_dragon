@@ -273,6 +273,7 @@ pub(super) fn dragon_live_notice(
 #[derive(Clone, Copy)]
 pub(super) struct DragonTrainingActionContext<'a> {
     pub(super) view: Option<&'a BrowserAppClientView>,
+    pub(super) auth_ready: bool,
     pub(super) browser_can_attempt_dynamic_training: bool,
     pub(super) edge_configured: bool,
     pub(super) direct_transport_ready: bool,
@@ -287,6 +288,7 @@ pub(super) fn dragon_training_action_state(
 ) -> Option<DragonTrainingActionState> {
     let DragonTrainingActionContext {
         view,
+        auth_ready,
         browser_can_attempt_dynamic_training,
         edge_configured,
         direct_transport_ready,
@@ -304,6 +306,15 @@ pub(super) fn dragon_training_action_state(
             label: "stop training",
             detail: "training continues window by window until stopped".into(),
             enabled: true,
+        });
+    }
+    if !auth_ready {
+        return Some(DragonTrainingActionState {
+            label: "sign in required",
+            detail:
+                "github session with training scope is required before browser training can start"
+                    .into(),
+            enabled: false,
         });
     }
     if let Some(error) = local_training_failure {

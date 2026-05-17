@@ -23,8 +23,8 @@ use burn_p2p_browser::durability::{
 };
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 use burn_p2p_browser::{
-    BrowserEdgeClient, BrowserEnrollmentConfig, BrowserSessionState, BrowserUiBindings,
-    BrowserWorkerIdentity,
+    BrowserAuthClientError, BrowserEdgeClient, BrowserEnrollmentConfig, BrowserSessionState,
+    BrowserUiBindings, BrowserWorkerIdentity,
 };
 use chrono::{DateTime, Duration, Utc};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -1553,6 +1553,13 @@ pub async fn load_or_enroll_browser_session(
     let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await
         .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
+    refresh_durable_browser_session(
+        edge_base_url,
+        &snapshot,
+        &mut durable,
+        Utc::now() + Duration::seconds(30),
+    )
+    .await?;
     let enrolled_session =
         enroll_browser_session(&client, &snapshot.network_id, durable.session.clone()).await?;
     durable.remember_session(enrolled_session.clone());
@@ -1570,10 +1577,74 @@ pub async fn load_browser_session(edge_base_url: &str) -> Result<BrowserSessionS
     )
     .fetch_browser_edge_snapshot()
     .await?;
-    Ok(load_durable_browser_storage(&snapshot.network_id)
+    let mut durable = load_durable_browser_storage(&snapshot.network_id)
         .await
-        .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?
-        .session)
+        .map_err(|error| anyhow!("failed to load durable browser storage: {error}"))?;
+    refresh_durable_browser_session(
+        edge_base_url,
+        &snapshot,
+        &mut durable,
+        Utc::now() + Duration::seconds(30),
+    )
+    .await
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+async fn refresh_durable_browser_session(
+    edge_base_url: &str,
+    snapshot: &BrowserEdgeSnapshot,
+    durable: &mut burn_p2p_browser::BrowserStorageSnapshot,
+    valid_through: DateTime<Utc>,
+) -> Result<BrowserSessionState> {
+    let Some(session_id) = durable.session.session_id().cloned() else {
+        return Ok(durable.session.clone());
+    };
+
+    if durable.session.session.is_none() {
+        return Ok(durable.session.clone());
+    }
+    if durable.session.session_expires_before(valid_through) {
+        durable.remember_session(BrowserSessionState::default());
+        persist_durable_browser_storage(&snapshot.network_id, durable)
+            .await
+            .map_err(|error| anyhow!("failed to clear expired browser session: {error}"))?;
+        return Ok(durable.session.clone());
+    }
+
+    let client = BrowserEdgeClient::new(
+        BrowserUiBindings::new(edge_base_url),
+        BrowserEnrollmentConfig::for_runtime_sync(snapshot),
+    );
+    match client.refresh_session(&session_id).await {
+        Ok(refreshed) => {
+            durable.session.session = Some(refreshed);
+            durable.session.refresh_reenrollment_requirement();
+            durable.remember_session(durable.session.clone());
+            persist_durable_browser_storage(&snapshot.network_id, durable)
+                .await
+                .map_err(|error| anyhow!("failed to persist refreshed browser session: {error}"))?;
+            Ok(durable.session.clone())
+        }
+        Err(error) if browser_session_refresh_invalidates_cache(&error) => {
+            durable.remember_session(BrowserSessionState::default());
+            persist_durable_browser_storage(&snapshot.network_id, durable)
+                .await
+                .map_err(|error| anyhow!("failed to clear stale browser session: {error}"))?;
+            Ok(durable.session.clone())
+        }
+        Err(error) => Err(anyhow!("failed to refresh browser session: {error}")),
+    }
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+fn browser_session_refresh_invalidates_cache(error: &BrowserAuthClientError) -> bool {
+    matches!(
+        error,
+        BrowserAuthClientError::Http(error)
+            if error
+                .status()
+                .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 404))
+    )
 }
 
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]

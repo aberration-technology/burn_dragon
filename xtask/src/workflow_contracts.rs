@@ -8,7 +8,7 @@ use crate::bootstrap_runtime::{
     RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
 };
 
-const BURN_P2P_SIBLING_REF: &str = "5f14d0ebb028fd76878cb2f8ed4fee0c4b3536a8";
+const BURN_P2P_SIBLING_REF: &str = "a2ae3f27c3e3e1ef12bf9badfa1fca5fd6efec24";
 
 pub fn run() -> Result<()> {
     repository_has_no_scripts_tree()?;

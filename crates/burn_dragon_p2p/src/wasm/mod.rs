@@ -916,8 +916,21 @@ fn session_has_admin_scope(session: Option<&BrowserSessionState>, study_id: &str
             .any(|value| value == study_id)
 }
 
-fn browser_session_is_authenticated(session: &BrowserSessionState) -> bool {
-    session.session.is_some()
+fn browser_session_is_authenticated(
+    session: &BrowserSessionState,
+    requested_scopes: &BTreeSet<ExperimentScope>,
+) -> bool {
+    session.is_authenticated_for(
+        requested_scopes,
+        chrono::Utc::now() + chrono::Duration::seconds(30),
+    )
+}
+
+fn browser_training_auth_failure_message(message: &str) -> bool {
+    message.contains("401 Unauthorized")
+        || message.contains("missing_session")
+        || message.contains("unknown_session")
+        || message.contains("browser receipt session is missing or expired")
 }
 
 fn directory_entries_to_json(entries: &[ExperimentDirectoryEntry]) -> Result<String> {
@@ -1169,7 +1182,8 @@ pub async fn resume_or_complete_browser_auth(
             3600,
         )
         .await?;
-        if browser_session_is_authenticated(&session) {
+        let authenticated = browser_session_is_authenticated(&session, &config.requested_scopes);
+        if authenticated {
             info!(
                 "browser auth resumed: principal={} peer_id={} reenrollment_required={} granted_scopes=[{}]",
                 session
@@ -1185,7 +1199,7 @@ pub async fn resume_or_complete_browser_auth(
                 browser_session_scope_summary(&session),
             );
         }
-        return Ok(browser_session_is_authenticated(&session).then_some(session));
+        return Ok(authenticated.then_some(session));
     }
     Ok(None)
 }
@@ -1472,7 +1486,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             )
                             .await
                             .ok()
-                            .filter(browser_session_is_authenticated),
+                            .filter(|session| {
+                                browser_session_is_authenticated(
+                                    session,
+                                    &next_config.requested_scopes,
+                                )
+                            }),
                             Err(_) => None,
                         };
                         if *checkpoint_wait_generation.read() != connection_generation {
@@ -1836,7 +1855,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
 
     let view = current_view.read().clone();
     let callback_available = provider_code_from_window_location().is_some();
-    let auth_required = props.config.require_edge_auth;
+    let display_config = runtime_config.read().clone();
+    let auth_required = display_config.require_edge_auth;
     let admin_granted_studies = granted_admin_studies(session_state.read().as_ref());
     let admin_granted_studies_label = admin_granted_studies.join(", ");
     let admin_scope_ready = session_has_admin_scope(
@@ -1868,7 +1888,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let admin_rollout_status_view = admin_rollout_result.read().clone();
     let show_connection_settings_active = *show_connection_settings.read();
     let show_admin_tools_active = *show_admin_tools.read();
-    let display_config = runtime_config.read().clone();
     let (browser_host_capabilities, browser_capability_decision) =
         browser_capability_decision_for_config(&display_config);
     let browser_can_attempt_dynamic_training = display_config.training.is_some()
@@ -1953,11 +1972,9 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         .unwrap_or_else(|| "awaiting checkpoint".into());
     let network_summary = dragon_network_detail(view.as_ref());
     let transport_summary = dragon_transport_summary(view.as_ref());
-    let has_session = session_state
-        .read()
-        .as_ref()
-        .and_then(|session| session.session.as_ref())
-        .is_some();
+    let has_session = session_state.read().as_ref().is_some_and(|session| {
+        browser_session_is_authenticated(session, &display_config.requested_scopes)
+    });
     let session_metric_view = dragon_session_metric_view(
         &admin_session_card_view,
         view.as_ref().map(|view| view.session_label.as_str()),
@@ -2007,6 +2024,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         dragon_browser_training_requires_active_head_artifact(&initial_config);
     let training_action_state = dragon_training_action_state(DragonTrainingActionContext {
         view: view.as_ref(),
+        auth_ready: !auth_required || has_session,
         browser_can_attempt_dynamic_training,
         edge_configured,
         direct_transport_ready,
@@ -2164,6 +2182,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut local_training = local_training;
             let mut local_training_state = local_training_state;
             let mut local_training_stop_requested = local_training_stop_requested;
+            let mut session_state = session_state;
             if local_training_state.read().is_active() {
                 local_training_stop_requested.set(true);
                 local_training_state.set(DragonLocalTrainingState::Stopping);
@@ -2199,6 +2218,35 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         return;
                     }
                 };
+                if next_config.require_edge_auth {
+                    match load_browser_session(&edge_base_url).await {
+                        Ok(session)
+                            if browser_session_is_authenticated(
+                                &session,
+                                &next_config.requested_scopes,
+                            ) =>
+                        {
+                            session_state.set(Some(session));
+                        }
+                        Ok(_) => {
+                            let message =
+                                "GitHub sign-in is required before browser training can start"
+                                    .to_owned();
+                            warn!("browser training auth missing: {message}");
+                            status.set(message);
+                            session_state.set(None);
+                            local_training_state.set(DragonLocalTrainingState::Idle);
+                            return;
+                        }
+                        Err(error) => {
+                            let message = format!("failed to verify browser sign-in: {error}");
+                            error!("browser training auth check failed: {message}");
+                            status.set(message.clone());
+                            local_training_state.set(DragonLocalTrainingState::Failed { message });
+                            return;
+                        }
+                    }
+                }
                 let mut completed_windows = 0_u64;
                 let mut failed = false;
                 let mut training_session = DragonBrowserTrainingSession::default();
@@ -2265,8 +2313,23 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         Err(error) => {
                             let message = error.to_string();
                             error!("browser training window failed: {message}");
-                            status.set(message.clone());
-                            local_training_state.set(DragonLocalTrainingState::Failed { message });
+                            let auth_failure = browser_training_auth_failure_message(&message);
+                            if auth_failure {
+                                status.set(
+                                    "Browser sign-in expired. Sign in again before restarting browser training."
+                                        .into(),
+                                );
+                                session_state.set(None);
+                                clear_live_browser_app_controller();
+                                current_view.set(None);
+                            } else {
+                                status.set(message.clone());
+                                local_training_state
+                                    .set(DragonLocalTrainingState::Failed { message });
+                            }
+                            if auth_failure {
+                                local_training_state.set(DragonLocalTrainingState::Idle);
+                            }
                             if let Ok(view) = refresh_browser_app(
                                 &bootstrap_config,
                                 &next_config,

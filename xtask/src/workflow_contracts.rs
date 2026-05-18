@@ -8,7 +8,7 @@ use crate::bootstrap_runtime::{
     RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
 };
 
-const BURN_P2P_SIBLING_REF: &str = "aac704b657cfca135ac68b451fa1f7028f0f399e";
+const BURN_P2P_SIBLING_REF: &str = "900a8fbc988edd7db503b1fb1ee2eed29dcc99bc";
 
 pub fn run() -> Result<()> {
     repository_has_no_scripts_tree()?;
@@ -634,13 +634,13 @@ fn production_profile_contracts() -> Result<()> {
     )?;
     require_contains(
         &deploy_workflow,
-        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: \"false\"",
-        "deploy canary proves the normal p2p/head-mirror path instead of using direct edge mirroring as a crutch",
+        "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: \"true\"",
+        "deploy canary mirrors the canary replacement head into the edge-backed p2p provider after proving the trainer can publish",
     )?;
     require_contains(
         &deploy_workflow,
-        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: \"false\"",
-        "deploy canary does not block low-resource production deploys on the edge fallback provider",
+        "BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: \"true\"",
+        "deploy canary requires the replacement canonical head to be restorable from the edge-backed p2p provider",
     )?;
     require_contains(
         &deploy_workflow,

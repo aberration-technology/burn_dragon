@@ -171,7 +171,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: aberration-technology/burn_p2p
-          ref: aac704b657cfca135ac68b451fa1f7028f0f399e
+          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
           path: burn_p2p-sibling
       - name: link burn_p2p path dependency
         shell: bash
@@ -1519,8 +1519,8 @@ jobs:
           BURN_DRAGON_NATIVE_CANARY_CANONICAL_TIMEOUT_SECS: "480"
           BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: "300"
           BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: "15"
-          BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: "false"
-          BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: "false"
+          BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: "true"
+          BURN_DRAGON_NATIVE_CANARY_REQUIRE_EDGE_HEAD_PROVIDER: "true"
           BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: "true"
           BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_AFTER_RUN: "true"
           BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: "true"

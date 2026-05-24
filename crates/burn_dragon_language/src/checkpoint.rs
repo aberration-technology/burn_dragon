@@ -527,6 +527,9 @@ pub fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverride
     if let Some(value) = &incoming.mamba {
         base.mamba = Some(value.clone());
     }
+    if let Some(value) = &incoming.gated_deltanet2 {
+        base.gated_deltanet2 = Some(value.clone());
+    }
     if let Some(value) = incoming.residual_connector {
         base.residual_connector = Some(value);
     }

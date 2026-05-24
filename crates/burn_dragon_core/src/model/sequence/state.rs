@@ -11,6 +11,34 @@ pub struct Mamba3State<B: Backend> {
     pub v: Tensor<B, 3>,
 }
 
+pub fn gated_deltanet2_state<B: Backend>(
+    layer_state: &LayerState<B>,
+    batch: usize,
+    heads: usize,
+    latent: usize,
+    dense_dim: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    match layer_state.rho.as_ref() {
+        Some(state) if state.shape().dims::<4>() == [batch, heads, latent, dense_dim] => {
+            state.clone()
+        }
+        _ => Tensor::<B, 4>::zeros([batch, heads, latent, dense_dim], device),
+    }
+}
+
+pub fn write_gated_deltanet2_state<B: Backend>(
+    layer_state: &mut LayerState<B>,
+    state: Tensor<B, 4>,
+) {
+    layer_state.rho = Some(state);
+    layer_state.rho_norm = None;
+    layer_state.sequence_aux = None;
+    layer_state.mamba_angle_state = None;
+    layer_state.mamba_k_state = None;
+    layer_state.mamba_v_state = None;
+}
+
 pub fn mamba3_state<B: Backend>(
     layer_state: &LayerState<B>,
     batch: usize,

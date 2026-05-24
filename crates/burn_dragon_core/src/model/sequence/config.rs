@@ -13,6 +13,8 @@ pub enum SequenceMemorySystem {
     #[default]
     LinearAttention,
     Mamba3StateSpaceDuality,
+    #[serde(alias = "gated_deltanet2", alias = "gdn2")]
+    GatedDeltaNet2,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -21,12 +23,14 @@ pub enum SequenceTrainingExecutor {
     #[default]
     Reference,
     DenseScoreShortContext,
+    #[serde(alias = "gdn2_chunk_wy")]
+    GatedDeltaChunkWy,
 }
 
 impl SequenceMemorySystem {
     pub const fn default_executor(self) -> SequenceTrainingExecutor {
         match self {
-            Self::LinearAttention | Self::Mamba3StateSpaceDuality => {
+            Self::LinearAttention | Self::Mamba3StateSpaceDuality | Self::GatedDeltaNet2 => {
                 SequenceTrainingExecutor::Reference
             }
         }
@@ -65,6 +69,41 @@ impl SequenceKernelConfig {
             SequenceMemorySystem::LinearAttention,
             SequenceTrainingExecutor::DenseScoreShortContext,
         )
+    }
+
+    pub const fn gated_delta_chunk_wy() -> Self {
+        Self::new(
+            SequenceMemorySystem::GatedDeltaNet2,
+            SequenceTrainingExecutor::GatedDeltaChunkWy,
+        )
+    }
+
+    pub const fn is_supported(self) -> bool {
+        matches!(
+            (self.memory_system, self.executor),
+            (
+                SequenceMemorySystem::LinearAttention,
+                SequenceTrainingExecutor::Reference
+                    | SequenceTrainingExecutor::DenseScoreShortContext
+            ) | (
+                SequenceMemorySystem::Mamba3StateSpaceDuality,
+                SequenceTrainingExecutor::Reference
+            ) | (
+                SequenceMemorySystem::GatedDeltaNet2,
+                SequenceTrainingExecutor::Reference | SequenceTrainingExecutor::GatedDeltaChunkWy
+            )
+        )
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.is_supported() {
+            Ok(())
+        } else {
+            Err(format!(
+                "sequence kernel family {:?} with executor {:?} is not supported",
+                self.memory_system, self.executor
+            ))
+        }
     }
 }
 
@@ -302,5 +341,30 @@ mod tests {
                 executor: SequenceTrainingExecutor::DenseScoreShortContext
             },
         );
+    }
+
+    #[test]
+    fn gated_delta_chunk_wy_is_explicit() {
+        assert_eq!(
+            SequenceKernelConfig::gated_delta_chunk_wy(),
+            SequenceKernelConfig {
+                memory_system: SequenceMemorySystem::GatedDeltaNet2,
+                executor: SequenceTrainingExecutor::GatedDeltaChunkWy
+            },
+        );
+    }
+
+    #[test]
+    fn gated_delta_net2_aliases_parse() {
+        let bare: SequenceKernelConfig =
+            serde_json::from_str("\"gated_deltanet2\"").expect("gdn2 bare alias");
+        assert_eq!(
+            bare,
+            SequenceKernelConfig::reference(SequenceMemorySystem::GatedDeltaNet2)
+        );
+        let chunk: SequenceKernelConfig =
+            serde_json::from_str(r#"{"memory_system":"gdn2","executor":"gdn2_chunk_wy"}"#)
+                .expect("gdn2 chunk alias");
+        assert_eq!(chunk, SequenceKernelConfig::gated_delta_chunk_wy());
     }
 }

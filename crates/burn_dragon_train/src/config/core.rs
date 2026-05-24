@@ -4,7 +4,7 @@ use burn::module::{Content, ModuleDisplay, ModuleDisplayDefault};
 pub use burn_dragon_core::{
     DragonFiringTargetKind, DragonInitializationKind, DragonNeuronGainKind,
     DragonReservoirInitializationConfig, DragonResidualScalingKind, DragonTopologyPriorKind,
-    SequenceKernelConfig,
+    GatedDeltaNet2GateMode, GatedDeltaNet2StatePrecision, SequenceKernelConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -329,6 +329,20 @@ pub struct ModelSpec {
     pub dragon_firing_target_kind: DragonFiringTargetKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dragon_reservoir_initialization: Option<ReservoirInitializationSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated_deltanet2: Option<GatedDeltaNet2Spec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct GatedDeltaNet2Spec {
+    pub chunk_size: usize,
+    pub qk_l2_norm: bool,
+    pub allow_neg_eigval: bool,
+    pub erase_gate: GatedDeltaNet2GateMode,
+    pub write_gate: GatedDeltaNet2GateMode,
+    pub decay_gate: GatedDeltaNet2GateMode,
+    pub state_precision: GatedDeltaNet2StatePrecision,
+    pub state_epsilon: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

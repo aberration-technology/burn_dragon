@@ -243,6 +243,104 @@ impl<B: Backend> DragonModel<B> {
                 );
                 context
             }
+            (
+                SequenceMemorySystem::GatedDeltaNet2,
+                SequenceTrainingExecutor::Reference | SequenceTrainingExecutor::GatedDeltaChunkWy,
+            ) => {
+                let params = self
+                    .gated_deltanet2
+                    .as_ref()
+                    .expect("gated_deltanet2 sequence family requires initialized GD2 params");
+                let [batch, value_views, _time, dense_dim] = value.shape().dims::<4>();
+                assert_eq!(
+                    value_views, 1,
+                    "GatedDeltaNet2 expects one dense value view"
+                );
+                assert_eq!(
+                    dense_dim, self.n_embd,
+                    "GatedDeltaNet2 dense stream dim {} must match model dim {}",
+                    dense_dim, self.n_embd
+                );
+                let [query_batch, query_heads, _query_time, latent] = query.shape().dims::<4>();
+                assert_eq!(
+                    query_batch, batch,
+                    "GatedDeltaNet2 query/value batch mismatch"
+                );
+                assert_eq!(
+                    query_heads, self.n_head,
+                    "GatedDeltaNet2 query heads {} must match model heads {}",
+                    query_heads, self.n_head
+                );
+                let projected =
+                    params.project_inputs(value.clone(), latent, self.gated_deltanet2_config);
+                let mut query = match position_mode {
+                    RecurrentPositionMode::Sequential => {
+                        self.attention.rotate_positions(query, position)
+                    }
+                    RecurrentPositionMode::Fixed => {
+                        self.attention.rotate_positions_fixed(query, position)
+                    }
+                };
+                let mut key = match position_mode {
+                    RecurrentPositionMode::Sequential => {
+                        self.attention.rotate_positions(projected.key, position)
+                    }
+                    RecurrentPositionMode::Fixed => self
+                        .attention
+                        .rotate_positions_fixed(projected.key, position),
+                };
+                let device = value.device();
+                let initial_state = gated_deltanet2_state(
+                    layer_state,
+                    batch,
+                    self.n_head,
+                    latent,
+                    dense_dim,
+                    &device,
+                );
+                let value = expand_attention_values_to_heads(value, self.n_head);
+                if self.gated_deltanet2_config.qk_l2_norm {
+                    query = l2_normalize_last(query, self.gated_deltanet2_config.state_epsilon);
+                    key = l2_normalize_last(key, self.gated_deltanet2_config.state_epsilon);
+                }
+                if matches!(
+                    self.sequence_kernel.executor,
+                    SequenceTrainingExecutor::GatedDeltaChunkWy
+                ) {
+                    if let Some(output) = try_gdn2_chunk_wy_custom_backward(
+                        query.clone(),
+                        key.clone(),
+                        value.clone(),
+                        projected.erase.clone(),
+                        projected.write.clone(),
+                        projected.log_decay.clone(),
+                        initial_state.clone(),
+                        self.gated_deltanet2_config.chunk_size,
+                    ) {
+                        write_gated_deltanet2_state(layer_state, output.state);
+                        return output.context;
+                    }
+                    static GDN2_CHUNK_WY_FALLBACK_WARN: Once = Once::new();
+                    GDN2_CHUNK_WY_FALLBACK_WARN.call_once(|| {
+                        eprintln!(
+                            "notice: gated_deltanet2 chunk-WY custom backward unavailable or not needed for this call; using the direct recurrence"
+                        );
+                    });
+                }
+                let (context, next_state) = gated_deltanet2_reference(
+                    query,
+                    key,
+                    value,
+                    projected.erase,
+                    projected.write,
+                    projected.log_decay,
+                    Some(initial_state),
+                    false,
+                    self.gated_deltanet2_config.state_epsilon,
+                );
+                write_gated_deltanet2_state(layer_state, next_state);
+                context
+            }
             (family, executor) => panic!(
                 "sequence kernel family {:?} with executor {:?} is not implemented in DragonModel yet",
                 family, executor

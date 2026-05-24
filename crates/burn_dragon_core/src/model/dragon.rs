@@ -31,6 +31,7 @@ use burn_dragon_kernel::api::recurrent::{
     CompiledRecurrentAttentionPlan, supports_recurrent_backend, try_fused_recurrent_attention_wgpu,
     try_fused_recurrent_attention_wgpu_with_plan,
 };
+use burn_dragon_kernel::kernels::sequence::gdn2::try_gdn2_chunk_wy_custom_backward;
 use burn_dragon_kernel::kernels::sequence::mamba3::forward::{
     Mamba3TensorizedState, tensorized_mamba3_forward, use_tensorized_mamba3_forward_experimental,
 };
@@ -40,6 +41,7 @@ use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::sync::Once;
 
 use super::attention::Attention;
 use super::attention_residual::{
@@ -71,15 +73,21 @@ use super::residual_stream::lowrank_residual_step_next_branch_thresholds;
 use super::residual_stream::lowrank_residual_step_next_branch_thresholds_relu_native;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds;
+use super::sequence::gdn2::{
+    GatedDeltaNet2Parameters, ResolvedGatedDeltaNet2Config, gated_deltanet2_reference,
+    l2_normalize_last,
+};
 use super::sequence::linear::{
-    recurrent_attention_dense_score_final_rho_reference,
+    expand_attention_values_to_heads, recurrent_attention_dense_score_final_rho_reference,
     recurrent_attention_dense_score_initial_context_reference,
     recurrent_attention_dense_score_reference, recurrent_attention_reference,
 };
 use super::sequence::mamba::{
     MambaReferenceState, MambaSequenceParameters, ResolvedMambaSequenceConfig, mamba_reference,
 };
-use super::sequence::state::{mamba3_state, write_mamba3_state};
+use super::sequence::state::{
+    gated_deltanet2_state, mamba3_state, write_gated_deltanet2_state, write_mamba3_state,
+};
 use super::sequence::{SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor};
 #[cfg(any(feature = "viz", feature = "probe"))]
 use super::state::LayerVizState;
@@ -124,6 +132,9 @@ pub struct DragonModel<B: Backend> {
     #[module(skip)]
     mamba_config: ResolvedMambaSequenceConfig,
     mamba: Option<MambaSequenceParameters<B>>,
+    #[module(skip)]
+    gated_deltanet2_config: ResolvedGatedDeltaNet2Config,
+    gated_deltanet2: Option<GatedDeltaNet2Parameters<B>>,
     lm_head: Option<Param<Tensor<B, 2>>>,
     nca_factorized_lm_head: Option<Param<Tensor<B, 2>>>,
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
@@ -171,6 +182,7 @@ pub enum LanguageModuleLrScaleTarget {
     SharedLowrankDecoder,
     Attention,
     Mamba,
+    GatedDeltaNet2,
     ResidualModules,
     OtherBackbone,
 }
@@ -379,6 +391,15 @@ impl<B: Backend> DragonModel<B> {
             SequenceMemorySystem::Mamba3StateSpaceDuality
         )
         .then(|| MambaSequenceParameters::new(mamba_config, sequence_kernel.memory_system, device));
+        let gated_deltanet2_config =
+            config
+                .gated_deltanet2
+                .resolve(config.n_head, config.n_embd, config.latent_per_head());
+        let gated_deltanet2 = matches!(
+            sequence_kernel.memory_system,
+            SequenceMemorySystem::GatedDeltaNet2
+        )
+        .then(|| GatedDeltaNet2Parameters::new(gated_deltanet2_config, device));
         let language_head = LanguageHeadRuntimeKind::from_config(&config.language_head);
         let nca_factorized_head_tables = NcaFactorizedHeadTables::from_language_head_config(
             &config.language_head,
@@ -461,6 +482,8 @@ impl<B: Backend> DragonModel<B> {
             decoder,
             mamba_config,
             mamba,
+            gated_deltanet2_config,
+            gated_deltanet2,
             lm_head,
             nca_factorized_lm_head,
             nca_special_lm_head,
@@ -1612,6 +1635,34 @@ mod tests {
                 },
                 ..Default::default()
             },
+            ..Default::default()
+        };
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+        let logits = model.forward(tokens);
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        let values = logits
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("logits");
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn tiny_gated_deltanet2_model_constructs_and_runs_forward() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            sequence_kernel: SequenceKernelConfig::reference(SequenceMemorySystem::GatedDeltaNet2),
             ..Default::default()
         };
         let model = DragonModel::<TestBackend>::new(config, &device);

@@ -1,0 +1,12 @@
+extends = "nca-r1.training.toml"
+
+[model]
+sequence_kernel = "gated_delta_net2"
+
+[model.gated_deltanet2]
+chunk_size = 64
+qk_l2_norm = true
+erase_gate = "scalar"
+write_gate = "channel"
+decay_gate = "channel"
+

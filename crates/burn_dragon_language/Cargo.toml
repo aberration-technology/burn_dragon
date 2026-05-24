@@ -86,6 +86,10 @@ name = "training_objectives"
 harness = false
 required-features = ["train"]
 
+[[bench]]
+name = "gdn2_sequence"
+harness = false
+
 [dev-dependencies]
 burn-autodiff.workspace = true
 burn-ndarray.workspace = true

@@ -11,8 +11,8 @@ pub use continual_backprop::{
     ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget,
 };
 pub use core::{
-    FsdpMixedPrecisionKind, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec, ModelSpec,
-    OptimizerSpec, ParallelCheckpointConfig, ParallelCheckpointFormat,
+    FsdpMixedPrecisionKind, GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec,
+    LayerStateSpec, ModelSpec, OptimizerSpec, ParallelCheckpointConfig, ParallelCheckpointFormat,
     ParallelCommunicationBackend, ParallelConfig, ParallelDataConfig, ParallelFsdpConfig,
     ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec, ParallelTensorConfig,
     ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy, PipelineCommunicationKind,

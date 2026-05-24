@@ -65,6 +65,8 @@ impl<B: Backend> DragonModel<B> {
         let shared_lowrank_decoder = HashSet::from([self.decoder.id]);
         let attention = Self::collect_param_ids_from_module(&self.attention);
         let mamba = Self::collect_optional_param_ids_from_module(self.mamba.as_ref());
+        let gated_deltanet2 =
+            Self::collect_optional_param_ids_from_module(self.gated_deltanet2.as_ref());
         let mut residual_modules =
             Self::collect_optional_param_ids_from_module(self.mhc_shared.as_ref());
         residual_modules.extend(Self::collect_optional_param_ids_from_module(
@@ -82,6 +84,7 @@ impl<B: Backend> DragonModel<B> {
             LanguageModuleLrScaleTarget::SharedLowrankDecoder => shared_lowrank_decoder,
             LanguageModuleLrScaleTarget::Attention => attention,
             LanguageModuleLrScaleTarget::Mamba => mamba,
+            LanguageModuleLrScaleTarget::GatedDeltaNet2 => gated_deltanet2,
             LanguageModuleLrScaleTarget::ResidualModules => residual_modules,
             LanguageModuleLrScaleTarget::OtherBackbone => {
                 let mut remaining = Self::collect_param_ids_from_module(self);
@@ -93,6 +96,7 @@ impl<B: Backend> DragonModel<B> {
                     .chain(shared_lowrank_decoder)
                     .chain(attention)
                     .chain(mamba)
+                    .chain(gated_deltanet2)
                     .chain(residual_modules)
                 {
                     remaining.remove(&excluded);

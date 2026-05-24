@@ -218,6 +218,20 @@ pub(crate) fn build_model_spec(model_config: &DragonConfig) -> ModelSpec {
             DragonInitializationKind::Reservoir
         )
         .then(|| ReservoirInitializationSpec::from(&model_config.initialization.reservoir)),
+        gated_deltanet2: matches!(
+            model_config.sequence_kernel.memory_system,
+            burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2
+        )
+        .then(|| GatedDeltaNet2Spec {
+            chunk_size: model_config.gated_deltanet2.chunk_size,
+            qk_l2_norm: model_config.gated_deltanet2.qk_l2_norm,
+            allow_neg_eigval: model_config.gated_deltanet2.allow_neg_eigval,
+            erase_gate: model_config.gated_deltanet2.erase_gate,
+            write_gate: model_config.gated_deltanet2.write_gate,
+            decay_gate: model_config.gated_deltanet2.decay_gate,
+            state_precision: model_config.gated_deltanet2.state_precision,
+            state_epsilon: model_config.gated_deltanet2.state_epsilon,
+        }),
     }
 }
 
@@ -414,6 +428,29 @@ pub(crate) fn build_state_layout(model_config: &DragonConfig) -> StateLayout {
                             ],
                         },
                     ]
+                }
+                burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2 => {
+                    vec![StateTensorSpec {
+                        name: "rho".to_string(),
+                        axes: vec![
+                            StateAxisSpec {
+                                name: "batch_views".to_string(),
+                                size: None,
+                            },
+                            StateAxisSpec {
+                                name: "gdn2_heads".to_string(),
+                                size: Some(model_config.n_head),
+                            },
+                            StateAxisSpec {
+                                name: "gdn2_latent_per_head".to_string(),
+                                size: Some(latent_per_head),
+                            },
+                            StateAxisSpec {
+                                name: "dense_dim".to_string(),
+                                size: Some(model_config.n_embd),
+                            },
+                        ],
+                    }]
                 }
                 _ => {
                     vec![StateTensorSpec {

@@ -792,7 +792,15 @@ impl TrainingConfig {
             resolved_model.initialization = initialization.clone();
         }
         if let Some(sequence_kernel) = self.model.sequence_kernel {
+            sequence_kernel
+                .validate()
+                .map_err(|message| anyhow!("model.sequence_kernel {message}"))?;
             resolved_model.sequence_kernel = sequence_kernel;
+        }
+        if let Some(sequence_kernel) = self.training.sequence_kernel_override {
+            sequence_kernel
+                .validate()
+                .map_err(|message| anyhow!("training.sequence_kernel_override {message}"))?;
         }
         if let Some(mamba) = &self.model.mamba {
             let memory_system = self
@@ -809,6 +817,16 @@ impl TrainingConfig {
                 .map_err(|message| anyhow!("model.mamba {message}"))?;
             resolved_model.mamba = mamba.clone();
         }
+        if let Some(gated_deltanet2) = &self.model.gated_deltanet2 {
+            gated_deltanet2
+                .validate(
+                    resolved_model.n_head,
+                    resolved_model.n_embd,
+                    resolved_model.latent_per_head(),
+                )
+                .map_err(|message| anyhow!("model.gated_deltanet2 {message}"))?;
+            resolved_model.gated_deltanet2 = gated_deltanet2.clone();
+        }
         if matches!(
             self.training
                 .sequence_kernel_override
@@ -823,6 +841,22 @@ impl TrainingConfig {
                     resolved_model.n_embd,
                 )
                 .map_err(|message| anyhow!("resolved model.mamba {message}"))?;
+        }
+        if matches!(
+            self.training
+                .sequence_kernel_override
+                .unwrap_or(resolved_model.sequence_kernel)
+                .memory_system,
+            burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2
+        ) {
+            resolved_model
+                .gated_deltanet2
+                .validate(
+                    resolved_model.n_head,
+                    resolved_model.n_embd,
+                    resolved_model.latent_per_head(),
+                )
+                .map_err(|message| anyhow!("resolved model.gated_deltanet2 {message}"))?;
         }
         if resolved_model.latent_total() % self.parallel.tensor.size != 0 {
             return Err(anyhow!(

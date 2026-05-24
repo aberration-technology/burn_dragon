@@ -1,0 +1,9 @@
+extends = "nca-r1.training.toml"
+
+[model]
+sequence_kernel = "linear_attention"
+
+[training.sequence_kernel_override]
+memory_system = "linear_attention"
+executor = "dense_score_short_context"
+

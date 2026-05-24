@@ -48,6 +48,9 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
         model_config.initialization = initialization.clone();
     }
     if let Some(sequence_kernel) = overrides.sequence_kernel {
+        sequence_kernel
+            .validate()
+            .unwrap_or_else(|message| panic!("invalid model.sequence_kernel override: {message}"));
         model_config.sequence_kernel = sequence_kernel;
     }
     if let Some(mamba) = &overrides.mamba {
@@ -59,6 +62,16 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
             .validate(memory_system, model_config.n_embd)
             .unwrap_or_else(|message| panic!("invalid model.mamba override: {message}"));
         model_config.mamba = mamba.clone();
+    }
+    if let Some(gated_deltanet2) = &overrides.gated_deltanet2 {
+        gated_deltanet2
+            .validate(
+                model_config.n_head,
+                model_config.n_embd,
+                model_config.latent_per_head(),
+            )
+            .unwrap_or_else(|message| panic!("invalid model.gated_deltanet2 override: {message}"));
+        model_config.gated_deltanet2 = gated_deltanet2.clone();
     }
     if let Some(residual_connector) = overrides.residual_connector {
         model_config.residual_connector = residual_connector;
@@ -120,6 +133,21 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
                 model_config.n_embd,
             )
             .unwrap_or_else(|message| panic!("invalid Mamba sequence kernel config: {message}"));
+    }
+    if matches!(
+        model_config.sequence_kernel.memory_system,
+        burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2
+    ) {
+        model_config
+            .gated_deltanet2
+            .validate(
+                model_config.n_head,
+                model_config.n_embd,
+                model_config.latent_per_head(),
+            )
+            .unwrap_or_else(|message| {
+                panic!("invalid GatedDeltaNet2 sequence kernel config: {message}")
+            });
     }
 
     match overrides.residual_connector {
@@ -347,6 +375,35 @@ mod tests {
             burn_dragon_core::SequenceKernelConfig::reference(
                 burn_dragon_core::SequenceMemorySystem::LinearAttention,
             )
+        );
+    }
+
+    #[test]
+    fn model_override_applies_gated_deltanet2_config() {
+        let overrides = ModelOverrides {
+            n_head: Some(8),
+            n_embd: Some(512),
+            latent_total: Some(1024),
+            sequence_kernel: Some(burn_dragon_core::SequenceKernelConfig::reference(
+                burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2,
+            )),
+            gated_deltanet2: Some(burn_dragon_core::GatedDeltaNet2Config {
+                qk_l2_norm: false,
+                write_gate: burn_dragon_core::GatedDeltaNet2GateMode::Disabled,
+                ..Default::default()
+            }),
+            ..ModelOverrides::default()
+        };
+
+        let config = build_model_config(&overrides, 512);
+        assert_eq!(
+            config.sequence_kernel.memory_system,
+            burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2
+        );
+        assert!(!config.gated_deltanet2.qk_l2_norm);
+        assert_eq!(
+            config.gated_deltanet2.write_gate,
+            burn_dragon_core::GatedDeltaNet2GateMode::Disabled
         );
     }
 

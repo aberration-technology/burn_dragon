@@ -13,7 +13,7 @@ use crate::model::attention_residual::{
 use crate::model::init::DragonInitializationConfig;
 use crate::model::mhc::ManifoldHyperConnectionsConfig;
 use crate::model::norm::DragonNormConfig;
-use crate::model::sequence::{MambaSequenceConfig, SequenceKernelConfig};
+use crate::model::sequence::{GatedDeltaNet2Config, MambaSequenceConfig, SequenceKernelConfig};
 use crate::positional::RotaryEmbedding;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -626,6 +626,8 @@ pub struct DragonConfig {
     pub latent_fanout_schedule: Option<LatentFanoutScheduleConfig>,
     #[serde(default)]
     pub mamba: MambaSequenceConfig,
+    #[serde(default)]
+    pub gated_deltanet2: GatedDeltaNet2Config,
     pub n_expert: usize,
     pub vocab_size: usize,
     #[serde(default)]
@@ -659,6 +661,7 @@ impl Default for DragonConfig {
             sequence_kernel: SequenceKernelConfig::default(),
             latent_fanout_schedule: None,
             mamba: MambaSequenceConfig::default(),
+            gated_deltanet2: GatedDeltaNet2Config::default(),
             n_expert: 1,
             vocab_size: 256,
             language_head: LanguageHeadConfig::default(),

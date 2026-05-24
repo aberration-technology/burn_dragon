@@ -9,7 +9,7 @@ use crate::train::startup_autotune::{
 use crate::train::utils::{build_training_execution_form, write_run_config};
 use crate::train::{resolve_dragon_language_optimizer, validate_dragon_continual_backprop};
 use crate::write_training_snapshot;
-use burn_dragon_core::SequenceMemorySystem;
+use burn_dragon_core::{SequenceMemorySystem, SequenceTrainingExecutor};
 use serde::Serialize;
 use std::fs;
 
@@ -479,6 +479,28 @@ where
         warn!(
             "cuda mamba3 training defaults to the tensorized custom analytical backward wrapper over the chunked SISO path; set BURN_DRAGON_MAMBA3_CUDA_TENSORIZED_TRAIN_WRAPPER=0 to force the direct graph baseline"
         );
+    }
+    if matches!(
+        model_config.sequence_kernel.memory_system,
+        SequenceMemorySystem::GatedDeltaNet2
+    ) {
+        info!(
+            "gated_deltanet2 config: chunk_size={} qk_l2_norm={} erase_gate={:?} write_gate={:?} decay_gate={:?} allow_neg_eigval={}",
+            model_config.gated_deltanet2.chunk_size,
+            model_config.gated_deltanet2.qk_l2_norm,
+            model_config.gated_deltanet2.erase_gate,
+            model_config.gated_deltanet2.write_gate,
+            model_config.gated_deltanet2.decay_gate,
+            model_config.gated_deltanet2.allow_neg_eigval,
+        );
+        if matches!(
+            model_config.sequence_kernel.executor,
+            SequenceTrainingExecutor::GatedDeltaChunkWy
+        ) {
+            let message = "gated_deltanet2 chunk-WY executor uses the CUDA fused WY solver/backward on CUDA autodiff calls; WGPU autodiff uses the chunked analytic wrapper, and non-autodiff eval calls use the direct recurrence";
+            info!("{message}");
+            eprintln!("{message}");
+        }
     }
     let pipeline_plan = if resolved_config.parallel.pipeline.enabled {
         let pipeline_plan =

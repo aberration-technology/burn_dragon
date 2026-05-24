@@ -1,0 +1,5 @@
+extends = "nca-r1.training.toml"
+
+[model]
+sequence_kernel = "mamba3_state_space_duality"
+

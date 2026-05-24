@@ -29,17 +29,18 @@ pub mod api {
     pub mod config {
         pub use crate::config::{
             ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget,
-            FsdpMixedPrecisionKind, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec,
-            ModelSpec, OptimizerSpec, ParallelCheckpointConfig, ParallelCheckpointFormat,
-            ParallelCommunicationBackend, ParallelConfig, ParallelDataConfig, ParallelFsdpConfig,
-            ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec,
-            ParallelTensorConfig, ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy,
-            PipelineCommunicationKind, PipelinePartitionKind, PipelineScheduleKind,
-            PipelineSharedWeightSyncKind, PipelineTransportDtype, ReservoirInitializationSpec,
-            RunLayoutConfig, SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec,
-            TensorParallelAxis, TensorParallelPartitionKind, VisionTeacherVariant, WgpuBackend,
-            WgpuGenerationExecutor, WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig,
-            WgpuStartupAutotuneConfig, WgpuTrainingConfig,
+            FsdpMixedPrecisionKind, GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec,
+            LayerStateSpec, ModelSpec, OptimizerSpec, ParallelCheckpointConfig,
+            ParallelCheckpointFormat, ParallelCommunicationBackend, ParallelConfig,
+            ParallelDataConfig, ParallelFsdpConfig, ParallelPipelineCacheConfig,
+            ParallelPipelineConfig, ParallelSpec, ParallelTensorConfig, ParallelismKind,
+            PipelineCacheEvictionKind, PipelineCachePolicy, PipelineCommunicationKind,
+            PipelinePartitionKind, PipelineScheduleKind, PipelineSharedWeightSyncKind,
+            PipelineTransportDtype, ReservoirInitializationSpec, RunLayoutConfig,
+            SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec, TensorParallelAxis,
+            TensorParallelPartitionKind, VisionTeacherVariant, WgpuBackend, WgpuGenerationExecutor,
+            WgpuInferenceConfig, WgpuMemoryConfig, WgpuRuntimeConfig, WgpuStartupAutotuneConfig,
+            WgpuTrainingConfig,
         };
         #[cfg(feature = "train")]
         pub use crate::config::{
@@ -75,8 +76,8 @@ pub mod api {
 
 pub use config::{
     ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget,
-    FsdpMixedPrecisionKind, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec, ModelSpec,
-    OptimizerSpec, ParallelCheckpointConfig, ParallelCheckpointFormat,
+    FsdpMixedPrecisionKind, GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec,
+    LayerStateSpec, ModelSpec, OptimizerSpec, ParallelCheckpointConfig, ParallelCheckpointFormat,
     ParallelCommunicationBackend, ParallelConfig, ParallelDataConfig, ParallelFsdpConfig,
     ParallelPipelineCacheConfig, ParallelPipelineConfig, ParallelSpec, ParallelTensorConfig,
     ParallelismKind, PipelineCacheEvictionKind, PipelineCachePolicy, PipelineCommunicationKind,

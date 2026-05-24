@@ -101,8 +101,8 @@ pub(crate) use burn_dragon_train::train::runtime::{
     resolve_pipeline_parallel_layout, resolve_training_devices,
 };
 pub(crate) use burn_dragon_train::{
-    GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec, LearningRateScheduleConfig, ModelSpec,
-    OptimizerConfig, OptimizerKind, OptimizerScheduleMode, OptimizerSpec, ParallelConfig,
-    ParallelSpec, ParallelismKind, ReservoirInitializationSpec, SequenceKernelConfig,
-    StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
+    GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec,
+    LearningRateScheduleConfig, ModelSpec, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    OptimizerSpec, ParallelConfig, ParallelSpec, ParallelismKind, ReservoirInitializationSpec,
+    SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
 };

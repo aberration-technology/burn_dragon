@@ -84,7 +84,8 @@ pub mod api {
 }
 
 pub use burn_dragon_core::{
-    DragonConfig, DragonModel, ModelState, SequenceKernelConfig, SequenceMemorySystem,
+    DragonConfig, DragonModel, GatedDeltaNet2Config, GatedDeltaNet2GateMode,
+    GatedDeltaNet2StatePrecision, ModelState, SequenceKernelConfig, SequenceMemorySystem,
     SequenceTrainingExecutor,
 };
 #[cfg(feature = "train")]

@@ -1,7 +1,8 @@
 #![allow(clippy::collapsible_if)]
 use burn_dragon_time::Instant;
 use std::any::Any;
-use std::sync::Once;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicI8, Ordering};
@@ -358,8 +359,15 @@ where
 }
 
 fn log_mamba3_path_selection_once(message: &str) {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| eprintln!("{message}"));
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        eprintln!("{message}");
+        return;
+    };
+    if seen.insert(message.to_string()) {
+        eprintln!("{message}");
+    }
 }
 
 fn mamba3_chunk_size_override(env_key: &str) -> Option<usize> {

@@ -33,7 +33,7 @@ pub mod api {
 pub mod kernels {
     /// Sequence-kernel family namespace used by the language line.
     pub mod sequence {
-        pub use crate::sequence::{gdn2, linear, mamba3};
+        pub use crate::sequence::{linear, mamba3};
     }
 
     /// Dense causal attention kernels used by the focused linear-attention path.

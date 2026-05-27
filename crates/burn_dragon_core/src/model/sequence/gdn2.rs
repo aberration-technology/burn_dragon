@@ -1,6 +1,7 @@
 use burn::module::{Module, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution as TensorDistribution, Tensor, activation};
+pub use burn_gdn::GatedDeltaNet2GateMode;
 use serde::{Deserialize, Serialize};
 
 use super::linear::expand_attention_values_to_heads;
@@ -15,15 +16,6 @@ fn default_true() -> bool {
 
 fn default_state_epsilon() -> f32 {
     1.0e-6
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GatedDeltaNet2GateMode {
-    #[default]
-    Channel,
-    Scalar,
-    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -323,13 +315,7 @@ fn apply_gate_mode<B: Backend>(
 }
 
 pub(crate) fn l2_normalize_last<B: Backend>(values: Tensor<B, 4>, epsilon: f32) -> Tensor<B, 4> {
-    let norm = values
-        .clone()
-        .powf_scalar(2.0)
-        .sum_dim(3)
-        .add_scalar(epsilon)
-        .sqrt();
-    values.div(norm)
+    burn_gdn::l2_normalize_last(values, epsilon as f64)
 }
 
 pub fn gated_deltanet2_reference<B: Backend>(
@@ -357,42 +343,22 @@ pub fn gated_deltanet2_reference<B: Backend>(
     } else {
         key
     };
-    let output_scale = (latent as f32).sqrt().recip();
-    let mut state = match state {
+    let state = match state {
         Some(existing) if existing.shape().dims::<4>() == [batch, heads, latent, dense_dim] => {
             existing
         }
         _ => Tensor::<B, 4>::zeros([batch, heads, latent, dense_dim], &device),
     };
-    let mut outputs = Vec::with_capacity(time);
-
-    for t in 0..time {
-        let q_t = query.clone().slice_dim(2, t..t + 1);
-        let k_t = key.clone().slice_dim(2, t..t + 1);
-        let v_t = value.clone().slice_dim(2, t..t + 1);
-        let b_t = erase.clone().slice_dim(2, t..t + 1);
-        let w_t = write.clone().slice_dim(2, t..t + 1);
-        let decay_t = log_decay
-            .clone()
-            .slice_dim(2, t..t + 1)
-            .exp()
-            .swap_dims(2, 3);
-
-        state = state * decay_t;
-        let erased_key = b_t * k_t.clone();
-        let erased_value = (state.clone() * erased_key.swap_dims(2, 3))
-            .sum_dim(2)
-            .reshape([batch, heads, 1, dense_dim]);
-        let write_value = w_t * v_t - erased_value;
-        state = state + k_t.swap_dims(2, 3) * write_value;
-        let output = (state.clone() * q_t.swap_dims(2, 3))
-            .sum_dim(2)
-            .reshape([batch, heads, 1, dense_dim])
-            .mul_scalar(output_scale);
-        outputs.push(output);
-    }
-
-    (Tensor::cat(outputs, 2), state)
+    burn_gdn::gated_deltanet2_reference(
+        query,
+        key,
+        value,
+        erase,
+        write,
+        log_decay,
+        state,
+        time.max(1),
+    )
 }
 
 #[cfg(test)]

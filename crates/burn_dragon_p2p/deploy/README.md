@@ -635,6 +635,30 @@ cargo run -p xtask -- local-browser-e2e
 
 That local gate runs the deployment config drift checks, a focused local edge/auth/browser training receipt e2e, and a single generated-NCA Chrome/WebGPU training smoke. It is intentionally narrower than `xtask smoke` and `xtask deploy-check` so browser/bootstrap changes can fail locally before the long native + wasm CI lanes or the AWS/Pages deployment workflows.
 
+For deployment-shaped browser peer triage, run the same Playwright canary contract
+against a locally built browser artifact before publishing Pages:
+
+```bash
+export BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL=https://edge.dragon.aberration.technology
+export BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID=browser-canary-mainnet-nca
+export BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN=...
+export BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID=nca-prepretraining
+cargo run -p xtask -- local-browser-e2e --lane canary-webrtc-direct-training --build-site
+```
+
+Use `--lane canary-auto-connect`, `--lane canary-webrtc-direct-connect`,
+`--lane canary-webrtc-direct-checkpoint`, or `--lane canary-all` to stop at the
+network/checkpoint boundary before spending time on receipt training. These
+lanes write replayable artifacts to `target/test-artifacts/browser-peer-e2e/`:
+the report JSON, console/network logs, trace, screenshot, effective canary
+config, portal snapshot, signed seed advertisement, and browser config.
+
+If `../burn_p2p` is intentionally dirty or on a different version than Dragon's
+path dependency expects, run `cargo run -p xtask -- local-browser-e2e-ci-sibling`
+with the same lane flags. The command creates temporary Dragon and `burn_p2p`
+worktrees, applies the current Dragon diff, checks out the CI-pinned `burn_p2p`
+ref, and keeps build outputs in `target/local-browser-e2e-ci-sibling/`.
+
 For local production-edge triage, run the canary with `BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING=0`, `BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC=1`, and `BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE=webrtc-direct`. That path should fail if the browser falls back to edge artifact HTTP for the active head.
 
 For local agentic work, run long local commands and GitHub workflow waits

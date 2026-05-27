@@ -3,6 +3,7 @@ mod bootstrap_runtime;
 mod bootstrap_settings;
 mod browser_site;
 mod deploy_settings;
+mod local_browser_e2e;
 mod native_canary;
 mod workflow_contracts;
 mod workflow_tools;
@@ -67,8 +68,9 @@ enum CommandKind {
     DowngradeSmoke,
     MixedFleet,
     EdgeDrill,
-    LocalProdE2e,
-    LocalBrowserE2e,
+    LocalProdE2e(local_browser_e2e::LocalBrowserE2eArgs),
+    LocalBrowserE2e(local_browser_e2e::LocalBrowserE2eArgs),
+    LocalBrowserE2eCiSibling(local_browser_e2e::LocalBrowserE2eCiSiblingArgs),
     WasmTrainingSmoke,
     WasmSmoke,
     CudaCheck,
@@ -143,8 +145,13 @@ fn main() -> Result<()> {
         CommandKind::DowngradeSmoke => downgrade_smoke(),
         CommandKind::MixedFleet => mixed_fleet(),
         CommandKind::EdgeDrill => edge_drill(),
-        CommandKind::LocalProdE2e => local_prod_e2e(),
-        CommandKind::LocalBrowserE2e => local_browser_e2e(),
+        CommandKind::LocalProdE2e(args) => {
+            local_browser_e2e::run(args, true, local_browser_e2e_runner())
+        }
+        CommandKind::LocalBrowserE2e(args) => {
+            local_browser_e2e::run(args, false, local_browser_e2e_runner())
+        }
+        CommandKind::LocalBrowserE2eCiSibling(args) => local_browser_e2e::run_ci_sibling(&args),
         CommandKind::WasmTrainingSmoke => wasm_training_smoke(),
         CommandKind::WasmSmoke => wasm_smoke(),
         CommandKind::CudaCheck => cuda_check(),
@@ -305,21 +312,12 @@ fn edge_drill() -> Result<()> {
     cargo_native_test(Some("edge_drill"), true)
 }
 
-fn local_browser_e2e() -> Result<()> {
-    local_browser_contract_e2e(false)
-}
-
-fn local_prod_e2e() -> Result<()> {
-    local_browser_contract_e2e(true)
-}
-
-fn local_browser_contract_e2e(build_site: bool) -> Result<()> {
-    deployment_script_checks()?;
-    if build_site {
-        browser_site::build_browser_site_default()?;
+fn local_browser_e2e_runner() -> local_browser_e2e::LocalBrowserE2eRunner {
+    local_browser_e2e::LocalBrowserE2eRunner {
+        deployment_script_checks,
+        cargo_native_test,
+        wasm_training_smoke,
     }
-    cargo_native_test(Some("local_browser_training_e2e"), false)?;
-    wasm_training_smoke()
 }
 
 fn wasm_training_smoke() -> Result<()> {

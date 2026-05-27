@@ -13,6 +13,7 @@ const PRINCIPAL_ID = requiredEnv("BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID");
 const CALLBACK_TOKEN = requiredEnv("BURN_DRAGON_BROWSER_CANARY_CALLBACK_TOKEN");
 const EXPERIMENT_ID =
   process.env.BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID ?? "nca-prepretraining";
+const LANE = process.env.BURN_DRAGON_BROWSER_CANARY_LANE?.trim() || "live-browser-canary";
 const QUIET_WINDOW_MS = parseIntegerEnv("BURN_DRAGON_BROWSER_CANARY_QUIET_WINDOW_MS", 8_000);
 const CONNECT_TIMEOUT_MS = parseIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_CONNECT_TIMEOUT_MS",
@@ -633,6 +634,77 @@ function classifyEdgeRequest(urlString, edgeHost) {
 
 function fail(message) {
   throw new Error(message);
+}
+
+function classifyCanaryFailure(error, report = {}) {
+  const message = String(error?.message ?? error ?? "");
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes("missing required environment variable") ||
+    normalized.includes("playwright package not found") ||
+    normalized.includes("browser type") ||
+    normalized.includes("webgpu unavailable") ||
+    normalized.includes("downgrading browser peer")
+  ) {
+    return "environment";
+  }
+  if (
+    normalized.includes("login") ||
+    normalized.includes("callback") ||
+    normalized.includes("session") ||
+    normalized.includes("principal") ||
+    normalized.includes("enroll") ||
+    normalized.includes("certificate") ||
+    normalized.includes("unauthorized")
+  ) {
+    return "auth/session";
+  }
+  if (
+    normalized.includes("signed browser seeds") ||
+    normalized.includes("webrtc") ||
+    normalized.includes("transport") ||
+    normalized.includes("direct connect") ||
+    normalized.includes("connected without complete") ||
+    normalized.includes("did not connect")
+  ) {
+    return "network";
+  }
+  if (
+    normalized.includes("checkpoint") ||
+    normalized.includes("active head") ||
+    normalized.includes("artifact fallback")
+  ) {
+    return "checkpoint-sync";
+  }
+  if (
+    normalized.includes("receipt") ||
+    normalized.includes("training-ready") ||
+    normalized.includes("train loss") ||
+    normalized.includes("browser training")
+  ) {
+    return "training";
+  }
+  if (
+    normalized.includes("browser-app-config.json") ||
+    normalized.includes("burn_dragon_p2p_browser") ||
+    normalized.includes("site asset") ||
+    normalized.includes("404") ||
+    normalized.includes("github pages")
+  ) {
+    return "site-artifact";
+  }
+  if (
+    normalized.includes("dns") ||
+    normalized.includes("tls") ||
+    normalized.includes("certificate") ||
+    normalized.includes("certhash")
+  ) {
+    return "deployment-only";
+  }
+  if ((report.page_errors ?? []).length > 0 || (report.console_errors ?? []).length > 0) {
+    return "browser-runtime";
+  }
+  return "unknown";
 }
 
 function statTileValue(tiles, label) {
@@ -1329,6 +1401,18 @@ async function runCanary() {
     { method: "GET", headers: {} },
   );
   const browserConfig = await loadBrowserConfig();
+  fs.writeFileSync(
+    path.join(ARTIFACT_DIR, "portal-snapshot.json"),
+    JSON.stringify(snapshot, null, 2),
+  );
+  fs.writeFileSync(
+    path.join(ARTIFACT_DIR, "signed-browser-seeds.json"),
+    JSON.stringify(signedSeedsEnvelope, null, 2),
+  );
+  fs.writeFileSync(
+    path.join(ARTIFACT_DIR, "browser-app-config.json"),
+    JSON.stringify(browserConfig, null, 2),
+  );
   const liveSignedSeeds = signedSeedsEnvelope?.payload?.payload?.seeds?.flatMap(
     (record) => record.multiaddrs ?? [],
   ) ?? [];
@@ -1365,7 +1449,8 @@ async function runCanary() {
   const signedHasWebRtcDirect = signedSeeds.some(isDialableWebRtcSeed);
   const signedHasWebTransport = signedSeeds.some(isDialableWebTransportSeed);
   const signedHasWss = signedSeeds.some((value) => value.includes("/wss"));
-  const browserCapableSeedCount = Number(signedHasWebRtcDirect) + Number(signedHasWebTransport) + Number(signedHasWss);
+  const browserCapableSeedCount =
+    Number(signedHasWebRtcDirect) + Number(signedHasWebTransport) + Number(signedHasWss);
   if (!signedSeeds.length || browserCapableSeedCount === 0) {
     fail(`signed browser seeds are missing browser-capable addresses: ${JSON.stringify(signedSeeds)}`);
   }
@@ -1476,8 +1561,10 @@ async function runCanary() {
   let tracePath = null;
   let screenshotPath = path.join(ARTIFACT_DIR, "canary.png");
   const report = {
+    lane: LANE,
     site_base_url: SITE_BASE_URL,
     edge_base_url: EDGE_BASE_URL,
+    site_override_dir: SITE_OVERRIDE_DIR,
     principal_id: PRINCIPAL_ID,
     experiment_id: EXPERIMENT_ID,
     browser_name: BROWSER_NAME,
@@ -1528,11 +1615,34 @@ async function runCanary() {
     retained_transport_error: null,
     console_errors: [],
     page_errors: [],
+    failure_classification: null,
     success: false,
   };
 
   const context = await browser.newContext();
   try {
+    fs.writeFileSync(
+      path.join(ARTIFACT_DIR, "effective-canary-config.json"),
+      JSON.stringify(
+        {
+          lane: LANE,
+          site_base_url: SITE_BASE_URL,
+          edge_base_url: EDGE_BASE_URL,
+          site_override_dir: SITE_OVERRIDE_DIR,
+          browser_name: BROWSER_NAME,
+          transport_mode: TRANSPORT_MODE,
+          expect_training: EXPECT_TRAINING,
+          expect_checkpoint_sync: EXPECT_CHECKPOINT_SYNC,
+          min_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
+          use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE,
+          connect_timeout_ms: CONNECT_TIMEOUT_MS,
+          train_timeout_ms: TRAIN_TIMEOUT_MS,
+          quiet_window_ms: QUIET_WINDOW_MS,
+        },
+        null,
+        2,
+      ),
+    );
     if (ARTIFACT_DIR) {
       await context.tracing.start({ screenshots: true, snapshots: true });
       tracePath = path.join(ARTIFACT_DIR, "trace.zip");
@@ -1586,7 +1696,24 @@ async function runCanary() {
           await route.continue();
           return;
         }
+        const playwrightRequest = route.request();
+        const indexPath = path.join(SITE_OVERRIDE_DIR, "index.html");
+        const canServeIndex =
+          playwrightRequest.isNavigationRequest() ||
+          playwrightRequest.resourceType() === "document" ||
+          new URL(requestUrl).pathname.includes("/callback/");
         if (!fs.existsSync(overridePath) || fs.statSync(overridePath).isDirectory()) {
+          if (canServeIndex && fs.existsSync(indexPath)) {
+            await route.fulfill({
+              status: 200,
+              body: fs.readFileSync(indexPath),
+              headers: {
+                "content-type": contentTypeForPath(indexPath),
+                "cache-control": "no-store",
+              },
+            });
+            return;
+          }
           await route.fallback();
           return;
         }
@@ -1882,6 +2009,7 @@ async function runCanary() {
   } catch (error) {
     report.success = false;
     report.error = String(error);
+    report.failure_classification = classifyCanaryFailure(error, report);
     try {
       const failurePage = context.pages()[0];
       if (failurePage) {
@@ -1898,6 +2026,9 @@ async function runCanary() {
       consoleMessages.filter((entry) => entry.type === "error").map((entry) => entry.text),
     );
     report.page_errors = uniqueStrings(pageErrors);
+    if (!report.success) {
+      report.failure_classification = classifyCanaryFailure(report.error, report);
+    }
     fs.writeFileSync(path.join(ARTIFACT_DIR, "requests.json"), JSON.stringify(requests, null, 2));
     fs.writeFileSync(
       path.join(ARTIFACT_DIR, "console.json"),

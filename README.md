@@ -31,3 +31,23 @@ Use `local-browser-e2e` as the first browser/p2p production-parity gate. It runs
 the deployment config drift checks, a local edge/auth/browser training receipt
 e2e, and the smallest real Chrome/WebGPU browser training smoke without forcing
 the full CI build matrix.
+
+For the slow browser peer loop, run the lane you need instead of waiting for a
+Pages deploy. The offline default remains:
+
+```bash
+cargo run -p xtask -- local-browser-e2e --lane all
+```
+
+To test the exact browser artifact locally against a live or staging edge, set
+the browser canary edge/principal/callback environment variables and run:
+
+```bash
+cargo run -p xtask -- local-browser-e2e --lane canary-webrtc-direct-training --build-site
+```
+
+Canary artifacts are written under `target/test-artifacts/browser-peer-e2e/`.
+If the local `../burn_p2p` checkout is on an in-flight branch that does not
+match Dragon's pinned CI version, use `cargo run -p xtask -- local-browser-e2e-ci-sibling`
+with the same lane flags. It runs the command in a temporary Dragon worktree
+paired with the CI-pinned `burn_p2p` sibling and applies the current Dragon diff.

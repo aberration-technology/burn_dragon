@@ -685,12 +685,25 @@ fn browser_site_contracts() -> Result<()> {
         require_contains(&source, snippet, "browser site config")?;
     }
     let xtask = read("xtask/src/main.rs")?;
-    for snippet in [
-        "fn local_browser_e2e() -> Result<()>",
+    require_contains(
+        &xtask,
+        "LocalBrowserE2eCiSibling",
+        "local browser e2e xtask command",
+    )?;
+    require_contains(
+        &xtask,
         "Self::Wgpu => \"wasm-ui,wasm-peer,wgpu\"",
-        "wasm_training_smoke()",
+        "local browser e2e browser build target",
+    )?;
+    let local_e2e = read("xtask/src/local_browser_e2e.rs")?;
+    for snippet in [
+        "pub fn run(",
+        "pub fn run_ci_sibling",
+        "CanaryWebrtcDirectTraining",
+        "BURN_DRAGON_BROWSER_CANARY_SITE_OVERRIDE_DIR",
+        "runner.wasm_training_smoke",
     ] {
-        require_contains(&xtask, snippet, "local browser e2e plan")?;
+        require_contains(&local_e2e, snippet, "local browser e2e plan")?;
     }
     Ok(())
 }

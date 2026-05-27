@@ -171,6 +171,10 @@ pub fn run_live_browser_canary() -> Result<()> {
     run_live_browser_canary_with_env(&[])
 }
 
+pub fn run_live_browser_canary_with_overrides(overrides: &[(&str, String)]) -> Result<()> {
+    run_live_browser_canary_with_env(overrides)
+}
+
 pub fn run_pages_predeploy_canary() -> Result<()> {
     for name in [
         "BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL",
@@ -206,6 +210,10 @@ pub fn run_pages_predeploy_canary() -> Result<()> {
     let output_json = std::env::var("BURN_DRAGON_BROWSER_CANARY_OUTPUT_JSON")
         .unwrap_or_else(|_| format!("{artifact_dir}/canary-summary.json"));
     let overrides = [
+        (
+            "BURN_DRAGON_BROWSER_CANARY_LANE",
+            "pages-predeploy-webrtc-direct-training".to_owned(),
+        ),
         ("PLAYWRIGHT_BROWSERS", "chromium".to_owned()),
         ("BURN_DRAGON_BROWSER_CANARY_BROWSER", "chromium".to_owned()),
         (
@@ -272,6 +280,7 @@ pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> R
         .filter_map(|item| item.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     println!("## live browser canary\n");
+    println!("- Lane: `{}`", json_string_or(&report, "lane", "n/a"));
     println!("- Success: `{}`", bool_field(&report, "success"));
     println!(
         "- Principal id: `{}`",
@@ -284,6 +293,10 @@ pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> R
     println!(
         "- Transport mode: `{}`",
         json_string_or(&report, "transport_mode", "n/a")
+    );
+    println!(
+        "- Site override dir: `{}`",
+        json_string_or(&report, "site_override_dir", "none")
     );
     println!(
         "- Expected connected transport: `{}`",
@@ -384,6 +397,10 @@ pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> R
     println!(
         "- Failed required invariants: `{}`",
         missing_contract.join(", ").if_empty("none")
+    );
+    println!(
+        "- Failure classification: `{}`",
+        json_string_or(&report, "failure_classification", "none")
     );
     Ok(())
 }

@@ -1696,6 +1696,7 @@ dependencies = [
  "burn-wgpu",
  "burn_dragon_kernel",
  "burn_dragon_time",
+ "burn_gdn",
  "clap 4.6.1",
  "image",
  "rand 0.8.6",
@@ -1894,6 +1895,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "burn_gdn"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f207b5e40ab1ec6e45cce506ab59aded886873360e3ad77c47c8ebb717b95ce7"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-wgpu",
+ "serde",
 ]
 
 [[package]]

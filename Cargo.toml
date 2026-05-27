@@ -39,6 +39,7 @@ burn-std = "0.21.0"
 burn-store = { version = "0.21.0", default-features = false }
 burn-train = { version = "0.21.0", default-features = false }
 burn-wgpu = { version = "0.21.0", default-features = false }
+burn_gdn = { version = "0.21.0", default-features = false }
 
 burn_dragon_checkpoint = { version = "=0.21.8", path = "crates/burn_dragon_checkpoint", default-features = false }
 burn_dragon_core = { version = "=0.21.8", path = "crates/burn_dragon_core", default-features = false }

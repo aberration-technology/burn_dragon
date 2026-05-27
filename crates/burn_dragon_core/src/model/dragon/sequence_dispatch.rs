@@ -307,7 +307,7 @@ impl<B: Backend> DragonModel<B> {
                     self.sequence_kernel.executor,
                     SequenceTrainingExecutor::GatedDeltaChunkWy
                 ) {
-                    if let Some(output) = try_gdn2_chunk_wy_custom_backward(
+                    if let Some(output) = try_gdn2_chunk_wy(
                         query.clone(),
                         key.clone(),
                         value.clone(),

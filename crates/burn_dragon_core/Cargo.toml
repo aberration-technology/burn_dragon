@@ -41,7 +41,7 @@ benchmark = [
 ]
 probe = ["dep:burn-autodiff", "dep:burn-ndarray", "dep:clap", "dep:serde_json"]
 train = ["burn/dataset", "dep:image", "dep:burn-cubecl", "dep:burn-wgpu"]
-cuda = ["burn-cuda", "dep:burn-cubecl", "burn_dragon_kernel/cuda"]
+cuda = ["burn-cuda", "dep:burn-cubecl", "burn_dragon_kernel/cuda", "burn_gdn/cuda-kernel"]
 viz = []
 web = []
 
@@ -53,6 +53,7 @@ burn-cubecl = { workspace = true, optional = true, features = ["std", "fusion"] 
 burn-cuda = { workspace = true, optional = true, features = ["std"] }
 burn-ndarray = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true, features = ["fusion", "std"] }
+burn_gdn.workspace = true
 burn_dragon_kernel.workspace = true
 burn_dragon_time.workspace = true
 clap = { workspace = true, optional = true }

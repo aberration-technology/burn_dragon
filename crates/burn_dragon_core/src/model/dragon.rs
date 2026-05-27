@@ -31,11 +31,11 @@ use burn_dragon_kernel::api::recurrent::{
     CompiledRecurrentAttentionPlan, supports_recurrent_backend, try_fused_recurrent_attention_wgpu,
     try_fused_recurrent_attention_wgpu_with_plan,
 };
-use burn_dragon_kernel::kernels::sequence::gdn2::try_gdn2_chunk_wy_custom_backward;
 use burn_dragon_kernel::kernels::sequence::mamba3::forward::{
     Mamba3TensorizedState, tensorized_mamba3_forward, use_tensorized_mamba3_forward_experimental,
 };
 use burn_dragon_time::Instant;
+use burn_gdn::try_gdn2_chunk_wy;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};

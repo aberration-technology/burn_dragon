@@ -201,6 +201,9 @@ pub fn estimate_language_training_footprint(
         SequenceMemorySystem::Mamba3StateSpaceDuality => {
             6 * embed * embed + 2 * embed * latent_total
         }
+        SequenceMemorySystem::GatedDeltaNet2 => {
+            heads * embed * embed + 3 * embed * latent_total + 4 * latent_total + heads * embed
+        }
     };
     let parameter_count: u64 =
         embedding_params + layers * (projection_params + residual_params + sequence_params);
@@ -219,10 +222,12 @@ pub fn estimate_language_training_footprint(
     let activation_width = match model_config.sequence_kernel.memory_system {
         SequenceMemorySystem::LinearAttention => 8 * embed + 4 * latent_total,
         SequenceMemorySystem::Mamba3StateSpaceDuality => 14 * embed + 8 * latent_total,
+        SequenceMemorySystem::GatedDeltaNet2 => 12 * embed + 10 * latent_total,
     };
     let executor_multiplier = match model_config.sequence_kernel.executor {
         SequenceTrainingExecutor::Reference => 2,
         SequenceTrainingExecutor::DenseScoreShortContext => 1,
+        SequenceTrainingExecutor::GatedDeltaChunkWy => 1,
     };
     let activation_bytes = tokens
         .saturating_mul(layers)
@@ -244,6 +249,11 @@ pub fn estimate_language_training_footprint(
                     SequenceMemorySystem::LinearAttention => 2 * heads * block * latent_per_head,
                     SequenceMemorySystem::Mamba3StateSpaceDuality => {
                         6 * embed * embed + 2 * embed * latent_total
+                    }
+                    SequenceMemorySystem::GatedDeltaNet2 => {
+                        heads * embed * embed
+                            + 3 * embed * latent_total
+                            + heads * block * latent_per_head * embed
                     }
                 },
         )

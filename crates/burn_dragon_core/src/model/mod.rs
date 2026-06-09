@@ -65,9 +65,9 @@ pub use residual_stream::{
     lowrank_residual_profile_snapshot, lowrank_residual_step, lowrank_residual_step_next,
 };
 pub use sequence::{
-    GatedDeltaNet2Config, GatedDeltaNet2GateMode, GatedDeltaNet2StatePrecision,
-    MambaSequenceConfig, SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor,
-    gated_deltanet2_reference,
+    GatedDeltaNet2Config, GatedDeltaNet2GateMode, GatedDeltaNet2Implementation,
+    GatedDeltaNet2StatePrecision, MambaSequenceConfig, SequenceKernelConfig, SequenceMemorySystem,
+    SequenceTrainingExecutor, gated_deltanet2_reference,
 };
 #[cfg(any(feature = "viz", feature = "probe"))]
 pub use state::LayerVizState;

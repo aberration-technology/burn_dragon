@@ -29,6 +29,8 @@ pub enum GatedDeltaNet2StatePrecision {
 pub struct GatedDeltaNet2Config {
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    #[serde(default)]
+    pub implementation: GatedDeltaNet2Implementation,
     #[serde(default = "default_true")]
     pub qk_l2_norm: bool,
     #[serde(default)]
@@ -43,12 +45,15 @@ pub struct GatedDeltaNet2Config {
     pub state_precision: GatedDeltaNet2StatePrecision,
     #[serde(default = "default_state_epsilon")]
     pub state_epsilon: f32,
+    #[serde(default = "default_output_scale")]
+    pub output_scale: f32,
 }
 
 impl Default for GatedDeltaNet2Config {
     fn default() -> Self {
         Self {
             chunk_size: default_chunk_size(),
+            implementation: GatedDeltaNet2Implementation::default(),
             qk_l2_norm: default_true(),
             allow_neg_eigval: false,
             erase_gate: GatedDeltaNet2GateMode::Channel,
@@ -56,8 +61,22 @@ impl Default for GatedDeltaNet2Config {
             decay_gate: GatedDeltaNet2GateMode::Channel,
             state_precision: GatedDeltaNet2StatePrecision::F32,
             state_epsilon: default_state_epsilon(),
+            output_scale: default_output_scale(),
         }
     }
+}
+
+fn default_output_scale() -> f32 {
+    1.0
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatedDeltaNet2Implementation {
+    #[default]
+    BdhAdapterLegacy,
+    #[serde(alias = "upstream")]
+    UpstreamFull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,6 +85,7 @@ pub struct ResolvedGatedDeltaNet2Config {
     pub dense_dim: usize,
     pub max_latent_per_head: usize,
     pub chunk_size: usize,
+    pub implementation: GatedDeltaNet2Implementation,
     pub qk_l2_norm: bool,
     pub allow_neg_eigval: bool,
     pub erase_gate: GatedDeltaNet2GateMode,
@@ -73,6 +93,7 @@ pub struct ResolvedGatedDeltaNet2Config {
     pub decay_gate: GatedDeltaNet2GateMode,
     pub state_precision: GatedDeltaNet2StatePrecision,
     pub state_epsilon: f32,
+    pub output_scale: f32,
 }
 
 impl GatedDeltaNet2Config {
@@ -97,6 +118,9 @@ impl GatedDeltaNet2Config {
         if self.state_epsilon <= 0.0 || !self.state_epsilon.is_finite() {
             return Err("gated_deltanet2.state_epsilon must be finite and > 0".to_string());
         }
+        if !self.output_scale.is_finite() {
+            return Err("gated_deltanet2.output_scale must be finite".to_string());
+        }
         Ok(())
     }
 
@@ -113,6 +137,7 @@ impl GatedDeltaNet2Config {
             dense_dim,
             max_latent_per_head,
             chunk_size: self.chunk_size,
+            implementation: self.implementation,
             qk_l2_norm: self.qk_l2_norm,
             allow_neg_eigval: self.allow_neg_eigval,
             erase_gate: self.erase_gate,
@@ -120,6 +145,28 @@ impl GatedDeltaNet2Config {
             decay_gate: self.decay_gate,
             state_precision: self.state_precision,
             state_epsilon: self.state_epsilon.max(1.0e-12),
+            output_scale: self.output_scale,
+        }
+    }
+}
+
+impl ResolvedGatedDeltaNet2Config {
+    pub fn upstream_config(
+        self,
+        executor: burn_gdn::GatedDeltaNet2Executor,
+    ) -> burn_gdn::GatedDeltaNet2Config {
+        burn_gdn::GatedDeltaNet2Config {
+            heads: self.n_head,
+            latent_per_head: self.max_latent_per_head,
+            chunk_size: self.chunk_size,
+            qk_l2_norm: self.qk_l2_norm,
+            allow_neg_eigval: self.allow_neg_eigval,
+            erase_gate: self.erase_gate,
+            write_gate: self.write_gate,
+            decay_gate: self.decay_gate,
+            state_epsilon: self.state_epsilon,
+            output_scale: self.output_scale,
+            executor,
         }
     }
 }
@@ -318,6 +365,7 @@ pub(crate) fn l2_normalize_last<B: Backend>(values: Tensor<B, 4>, epsilon: f32) 
     burn_gdn::l2_normalize_last(values, epsilon as f64)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn gated_deltanet2_reference<B: Backend>(
     query: Tensor<B, 4>,
     key: Tensor<B, 4>,

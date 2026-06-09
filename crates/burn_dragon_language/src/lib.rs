@@ -85,8 +85,8 @@ pub mod api {
 
 pub use burn_dragon_core::{
     DragonConfig, DragonModel, GatedDeltaNet2Config, GatedDeltaNet2GateMode,
-    GatedDeltaNet2StatePrecision, ModelState, SequenceKernelConfig, SequenceMemorySystem,
-    SequenceTrainingExecutor,
+    GatedDeltaNet2Implementation, GatedDeltaNet2StatePrecision, ModelState, SequenceKernelConfig,
+    SequenceMemorySystem, SequenceTrainingExecutor,
 };
 #[cfg(feature = "train")]
 pub use checkpoint::{

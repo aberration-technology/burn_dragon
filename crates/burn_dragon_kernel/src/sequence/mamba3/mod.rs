@@ -9,9 +9,9 @@ pub mod rotary_runtime;
 /// Mamba-3 currently follows the upstream SISO formulation exactly at the tensorized level.
 /// The best current WGPU training path is direct graph with the fused preprocess and long-chunk
 /// state-update boundaries enabled. The custom analytical wrapper remains available, but it is
-/// not the default on WGPU because it is slower on real training shapes. CUDA keeps the custom
-/// wrapper as the stronger experimental path.
-pub const STATUS: &str = "wgpu_direct_graph_preprocess_state_update_cuda_custom_wrapper";
+/// not the default because it is slower on real training shapes. CUDA also defaults to direct
+/// graph; the analytical wrapper remains available behind an explicit environment override.
+pub const STATUS: &str = "direct_graph_preprocess_state_update_cuda_direct_graph";
 pub const FORWARD_ACCELERATION_AVAILABLE: bool = true;
 pub const BACKWARD_ACCELERATION_AVAILABLE: bool = true;
 pub const UPSTREAM_REPO: &str = "https://github.com/state-spaces/mamba";

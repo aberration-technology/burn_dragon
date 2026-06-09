@@ -35,7 +35,7 @@ use burn_dragon_kernel::kernels::sequence::mamba3::forward::{
     Mamba3TensorizedState, tensorized_mamba3_forward, use_tensorized_mamba3_forward_experimental,
 };
 use burn_dragon_time::Instant;
-use burn_gdn::try_gdn2_chunk_wy;
+use burn_gdn::{GatedDeltaNet2Executor, GatedDeltaNet2Memory, try_gdn2_chunk_wy};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -74,8 +74,8 @@ use super::residual_stream::lowrank_residual_step_next_branch_thresholds_relu_na
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds;
 use super::sequence::gdn2::{
-    GatedDeltaNet2Parameters, ResolvedGatedDeltaNet2Config, gated_deltanet2_reference,
-    l2_normalize_last,
+    GatedDeltaNet2Implementation, GatedDeltaNet2Parameters, ResolvedGatedDeltaNet2Config,
+    gated_deltanet2_reference, l2_normalize_last,
 };
 use super::sequence::linear::{
     expand_attention_values_to_heads, recurrent_attention_dense_score_final_rho_reference,
@@ -135,6 +135,7 @@ pub struct DragonModel<B: Backend> {
     #[module(skip)]
     gated_deltanet2_config: ResolvedGatedDeltaNet2Config,
     gated_deltanet2: Option<GatedDeltaNet2Parameters<B>>,
+    gated_deltanet2_upstream: Option<GatedDeltaNet2Memory<B>>,
     lm_head: Option<Param<Tensor<B, 2>>>,
     nca_factorized_lm_head: Option<Param<Tensor<B, 2>>>,
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
@@ -395,11 +396,28 @@ impl<B: Backend> DragonModel<B> {
             config
                 .gated_deltanet2
                 .resolve(config.n_head, config.n_embd, config.latent_per_head());
-        let gated_deltanet2 = matches!(
+        let gated_deltanet2_executor = match sequence_kernel.executor {
+            SequenceTrainingExecutor::GatedDeltaChunkWy => GatedDeltaNet2Executor::ChunkWy,
+            _ => GatedDeltaNet2Executor::Reference,
+        };
+        let use_gdn2 = matches!(
             sequence_kernel.memory_system,
             SequenceMemorySystem::GatedDeltaNet2
-        )
-        .then(|| GatedDeltaNet2Parameters::new(gated_deltanet2_config, device));
+        );
+        let gated_deltanet2 = (use_gdn2
+            && gated_deltanet2_config.implementation
+                == GatedDeltaNet2Implementation::BdhAdapterLegacy)
+            .then(|| GatedDeltaNet2Parameters::new(gated_deltanet2_config, device));
+        let gated_deltanet2_upstream = (use_gdn2
+            && gated_deltanet2_config.implementation == GatedDeltaNet2Implementation::UpstreamFull)
+            .then(|| {
+                GatedDeltaNet2Memory::new(
+                    config.n_embd,
+                    gated_deltanet2_config.upstream_config(gated_deltanet2_executor),
+                    device,
+                )
+                .unwrap_or_else(|error| panic!("invalid upstream gated_deltanet2 config: {error}"))
+            });
         let language_head = LanguageHeadRuntimeKind::from_config(&config.language_head);
         let nca_factorized_head_tables = NcaFactorizedHeadTables::from_language_head_config(
             &config.language_head,
@@ -484,6 +502,7 @@ impl<B: Backend> DragonModel<B> {
             mamba,
             gated_deltanet2_config,
             gated_deltanet2,
+            gated_deltanet2_upstream,
             lm_head,
             nca_factorized_lm_head,
             nca_special_lm_head,
@@ -1663,6 +1682,39 @@ mod tests {
             vocab_size: 32,
             dropout: 0.0,
             sequence_kernel: SequenceKernelConfig::reference(SequenceMemorySystem::GatedDeltaNet2),
+            ..Default::default()
+        };
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+        let logits = model.forward(tokens);
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        let values = logits
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("logits");
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn tiny_upstream_gated_deltanet2_model_constructs_and_runs_forward() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            sequence_kernel: SequenceKernelConfig::gated_delta_chunk_wy(),
+            gated_deltanet2: super::super::sequence::gdn2::GatedDeltaNet2Config {
+                implementation: GatedDeltaNet2Implementation::UpstreamFull,
+                chunk_size: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let model = DragonModel::<TestBackend>::new(config, &device);

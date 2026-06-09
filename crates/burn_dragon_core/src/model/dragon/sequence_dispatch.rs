@@ -247,11 +247,7 @@ impl<B: Backend> DragonModel<B> {
                 SequenceMemorySystem::GatedDeltaNet2,
                 SequenceTrainingExecutor::Reference | SequenceTrainingExecutor::GatedDeltaChunkWy,
             ) => {
-                let params = self
-                    .gated_deltanet2
-                    .as_ref()
-                    .expect("gated_deltanet2 sequence family requires initialized GD2 params");
-                let [batch, value_views, _time, dense_dim] = value.shape().dims::<4>();
+                let [batch, value_views, time, dense_dim] = value.shape().dims::<4>();
                 assert_eq!(
                     value_views, 1,
                     "GatedDeltaNet2 expects one dense value view"
@@ -261,6 +257,27 @@ impl<B: Backend> DragonModel<B> {
                     "GatedDeltaNet2 dense stream dim {} must match model dim {}",
                     dense_dim, self.n_embd
                 );
+                if self.gated_deltanet2_config.implementation
+                    == GatedDeltaNet2Implementation::UpstreamFull
+                {
+                    let block = self.gated_deltanet2_upstream.as_ref().expect(
+                        "upstream gated_deltanet2 sequence family requires initialized block",
+                    );
+                    let mut upstream_state = layer_state.rho.take();
+                    let context = block.forward(
+                        value.reshape([batch, time, dense_dim]),
+                        &mut upstream_state,
+                        true,
+                    );
+                    if let Some(state) = upstream_state {
+                        write_gated_deltanet2_state(layer_state, state);
+                    }
+                    return context.reshape([batch, 1, time, dense_dim]);
+                }
+                let params = self
+                    .gated_deltanet2
+                    .as_ref()
+                    .expect("gated_deltanet2 sequence family requires initialized GD2 params");
                 let [query_batch, query_heads, _query_time, latent] = query.shape().dims::<4>();
                 assert_eq!(
                     query_batch, batch,

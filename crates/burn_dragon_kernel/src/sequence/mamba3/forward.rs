@@ -595,13 +595,19 @@ where
 
 #[cfg(feature = "cuda")]
 fn use_tensorized_mamba3_cuda_train_wrapper() -> bool {
-    match std::env::var("BURN_DRAGON_MAMBA3_CUDA_TENSORIZED_TRAIN_WRAPPER")
-        .ok()
-        .as_deref()
-    {
+    use_tensorized_mamba3_cuda_train_wrapper_env(
+        std::env::var("BURN_DRAGON_MAMBA3_CUDA_TENSORIZED_TRAIN_WRAPPER")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn use_tensorized_mamba3_cuda_train_wrapper_env(value: Option<&str>) -> bool {
+    match value {
         Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => false,
         Some(_) => true,
-        None => true,
+        None => false,
     }
 }
 
@@ -2877,6 +2883,17 @@ mod wgpu_tests {
 
         assert!(!use_tensorized_mamba3_wgpu_train_wrapper(&single_chunk));
         assert!(!use_tensorized_mamba3_wgpu_train_wrapper(&multi_chunk));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_train_wrapper_defaults_to_direct_graph_path() {
+        assert!(!use_tensorized_mamba3_cuda_train_wrapper_env(None));
+        assert!(!use_tensorized_mamba3_cuda_train_wrapper_env(Some("0")));
+        assert!(!use_tensorized_mamba3_cuda_train_wrapper_env(Some("false")));
+        assert!(!use_tensorized_mamba3_cuda_train_wrapper_env(Some("OFF")));
+        assert!(use_tensorized_mamba3_cuda_train_wrapper_env(Some("1")));
+        assert!(use_tensorized_mamba3_cuda_train_wrapper_env(Some("true")));
     }
 
     #[test]

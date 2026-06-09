@@ -1,7 +1,7 @@
 use burn::tensor::{Tensor, TensorData};
 use burn_dragon_core::gated_deltanet2_reference;
 use burn_ndarray::NdArray;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion};
 
 type BenchBackend = NdArray<f32>;
 
@@ -52,5 +52,19 @@ fn bench_reference(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_reference);
-criterion_main!(benches);
+fn cargo_test_invocation() -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--test-threads" || arg.starts_with("--test-threads="))
+    })
+}
+
+fn main() {
+    if cargo_test_invocation() {
+        return;
+    }
+
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_reference(&mut criterion);
+    criterion.final_summary();
+}

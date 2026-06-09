@@ -3,7 +3,7 @@ use burn_dragon_language::SelfDistillationKlKind;
 use burn_dragon_language::loss::language_model_loss;
 use burn_dragon_language::train::self_distillation_loss_from_logits;
 use burn_ndarray::NdArray;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::Criterion;
 use std::hint::black_box;
 
 type BenchBackend = NdArray<f32>;
@@ -70,5 +70,19 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, criterion_benchmark);
-criterion_main!(benches);
+fn cargo_test_invocation() -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--test-threads" || arg.starts_with("--test-threads="))
+    })
+}
+
+fn main() {
+    if cargo_test_invocation() {
+        return;
+    }
+
+    let mut criterion = Criterion::default().configure_from_args();
+    criterion_benchmark(&mut criterion);
+    criterion.final_summary();
+}

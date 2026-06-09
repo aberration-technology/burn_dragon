@@ -1,13 +1,18 @@
-#![cfg(feature = "train")]
-
+#[cfg(feature = "train")]
 use std::path::PathBuf;
+#[cfg(feature = "train")]
 use std::time::Instant;
 
+#[cfg(feature = "train")]
 use anyhow::{Result, anyhow};
+#[cfg(feature = "train")]
 use burn_autodiff::Autodiff;
+#[cfg(feature = "train")]
 use burn_dragon_language::{TrainingConfig, load_training_config, train};
+#[cfg(feature = "train")]
 use burn_ndarray::NdArray;
 
+#[cfg(feature = "train")]
 #[derive(Debug, Default)]
 struct TrainingOverrides {
     n_layer: Option<usize>,
@@ -20,6 +25,7 @@ struct TrainingOverrides {
     checkpoint_interval_iters: Option<usize>,
 }
 
+#[cfg(feature = "train")]
 #[derive(Debug)]
 struct RunArgs {
     backend: String,
@@ -27,6 +33,7 @@ struct RunArgs {
     overrides: TrainingOverrides,
 }
 
+#[cfg(feature = "train")]
 fn parse_usize_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize> {
     args.next()
         .ok_or_else(|| anyhow!("{name} requires a value"))?
@@ -34,6 +41,7 @@ fn parse_usize_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Resul
         .map_err(|err| anyhow!("{name} requires a positive integer: {err}"))
 }
 
+#[cfg(feature = "train")]
 fn parse_args() -> Result<RunArgs> {
     let mut backend = String::from("cpu");
     let mut config_paths = Vec::new();
@@ -91,6 +99,7 @@ fn parse_args() -> Result<RunArgs> {
     })
 }
 
+#[cfg(feature = "train")]
 fn apply_overrides(config: &mut TrainingConfig, overrides: &TrainingOverrides) -> Result<()> {
     if let Some(n_layer) = overrides.n_layer {
         config.model.n_layer = Some(n_layer);
@@ -129,32 +138,35 @@ fn apply_overrides(config: &mut TrainingConfig, overrides: &TrainingOverrides) -
     Ok(())
 }
 
+#[cfg(feature = "train")]
 fn load_config(config_paths: &[PathBuf], overrides: &TrainingOverrides) -> Result<TrainingConfig> {
     let mut config = load_training_config(config_paths)?;
     apply_overrides(&mut config, overrides)?;
     Ok(config)
 }
 
+#[cfg(feature = "train")]
 fn train_cpu(args: &RunArgs) -> Result<()> {
     let config = load_config(&args.config_paths, &args.overrides)?;
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
     train::train_backend::<Autodiff<NdArray<f32>>, _>(&config, dataset, "cpu", |_| {})
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "train", feature = "cuda"))]
 fn train_cuda(args: &RunArgs) -> Result<()> {
     let config = load_config(&args.config_paths, &args.overrides)?;
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
     train::train_backend::<Autodiff<burn_cuda::Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(all(feature = "train", not(feature = "cuda")))]
 fn train_cuda(_args: &RunArgs) -> Result<()> {
     Err(anyhow!(
         "the train_language example was built without the cuda feature"
     ))
 }
 
+#[cfg(feature = "train")]
 fn main() -> Result<()> {
     let args = parse_args()?;
     let started = Instant::now();

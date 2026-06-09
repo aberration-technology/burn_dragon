@@ -405,7 +405,8 @@ fn cargo_native_test(filter: Option<&str>, ignored: bool) -> Result<()> {
     }
     args.push("--test-threads=1");
     args.push("--nocapture");
-    run("cargo", &args)
+    let envs = [(OsString::from("RUST_MIN_STACK"), OsString::from("16777216"))];
+    run_with_env("cargo", &args, &envs)
 }
 
 fn build_native_target(target: NativeBuildTarget) -> Result<()> {

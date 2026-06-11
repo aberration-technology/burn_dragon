@@ -1469,6 +1469,16 @@ fn validate_dataset_source(
                 ));
             }
         }
+        DatasetSourceConfig::UniversalityRuliad { config } => {
+            if config.as_os_str().is_empty() {
+                return Err(anyhow!("{label}.config must not be empty"));
+            }
+            if !matches!(tokenizer_kind, TokenizerKind::Pretokenized(_)) {
+                return Err(anyhow!(
+                    "{label}.tokenizer.type must be `pretokenized` for on-the-fly universality ruliad datasets"
+                ));
+            }
+        }
     }
     Ok(())
 }

@@ -5,7 +5,6 @@ use burn::tensor::TensorPrimitive;
 use std::collections::BTreeSet;
 #[cfg(feature = "ddp")]
 use std::collections::HashMap;
-#[cfg(feature = "ddp")]
 use std::marker::PhantomData;
 
 const CHECKPOINT_KEEP_LAST: usize = 2;
@@ -17,6 +16,118 @@ struct FileMetricBestCheckpointingStrategy {
     split: burn_train::metric::store::Split,
     best_epoch: Option<usize>,
     best_value: Option<f64>,
+}
+
+struct RuliadSourceSelectionLossMetric<B: BackendTrait> {
+    name: Arc<String>,
+    dataset: Arc<Dataset>,
+    steps_per_epoch: usize,
+    every: usize,
+    last: f64,
+    initialized: bool,
+    _marker: PhantomData<B>,
+}
+
+impl<B: BackendTrait> Clone for RuliadSourceSelectionLossMetric<B> {
+    fn clone(&self) -> Self {
+        Self {
+            name: Arc::clone(&self.name),
+            dataset: Arc::clone(&self.dataset),
+            steps_per_epoch: self.steps_per_epoch,
+            every: self.every,
+            last: self.last,
+            initialized: self.initialized,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B: BackendTrait> RuliadSourceSelectionLossMetric<B> {
+    fn new(name: &str, dataset: Arc<Dataset>, steps_per_epoch: usize, every: usize) -> Self {
+        Self {
+            name: Arc::new(name.to_string()),
+            dataset,
+            steps_per_epoch: steps_per_epoch.max(1),
+            every: every.max(1),
+            last: 0.0,
+            initialized: false,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B: BackendTrait> burn_train::metric::Metric for RuliadSourceSelectionLossMetric<B> {
+    type Input = LossValue<B>;
+
+    fn name(&self) -> burn_train::metric::MetricName {
+        Arc::clone(&self.name)
+    }
+
+    fn update(
+        &mut self,
+        item: &Self::Input,
+        metadata: &burn_train::metric::MetricMetadata,
+    ) -> burn_train::metric::SerializedEntry {
+        if !local_metric_should_emit(metadata, self.every) && self.initialized {
+            return local_serialized_entry(
+                burn_train::metric::format_float(self.last, 4),
+                self.last.to_string(),
+            );
+        }
+        let value = item
+            .value()
+            .mean()
+            .into_data()
+            .iter::<f64>()
+            .next()
+            .unwrap_or(0.0);
+        let epoch_index = metadata.global_progress.items_processed.saturating_sub(1);
+        let step_in_epoch = metadata
+            .iteration
+            .unwrap_or(metadata.progress.items_processed)
+            .saturating_sub(1);
+        let absolute_step = epoch_index
+            .saturating_mul(self.steps_per_epoch)
+            .saturating_add(step_in_epoch);
+        let _ = self
+            .dataset
+            .record_source_selection_loss(absolute_step, value as f32);
+        self.last = value;
+        self.initialized = true;
+        local_serialized_entry(
+            burn_train::metric::format_float(value, 4),
+            value.to_string(),
+        )
+    }
+
+    fn clear(&mut self) {
+        self.last = 0.0;
+        self.initialized = false;
+    }
+}
+
+impl<B: BackendTrait> burn_train::metric::Numeric for RuliadSourceSelectionLossMetric<B> {
+    fn value(&self) -> burn_train::metric::NumericEntry {
+        burn_train::metric::NumericEntry::Value(self.last)
+    }
+
+    fn running_value(&self) -> burn_train::metric::NumericEntry {
+        burn_train::metric::NumericEntry::Value(self.last)
+    }
+}
+
+fn local_metric_should_emit(metadata: &burn_train::metric::MetricMetadata, every: usize) -> bool {
+    every <= 1
+        || metadata
+            .iteration
+            .is_some_and(|iteration| iteration % every == 0)
+}
+
+fn local_serialized_entry(
+    formatted: impl Into<String>,
+    serialized: impl Into<String>,
+) -> burn_train::metric::SerializedEntry {
+    burn_train::metric::SerializedEntry::new(formatted.into(), serialized.into())
 }
 
 impl FileMetricBestCheckpointingStrategy {
@@ -178,6 +289,7 @@ where
     pub devices: &'a [B::Device],
     pub train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
     pub valid_loader: Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
+    pub source_selection_dataset: Option<Arc<Dataset>>,
     pub epochs: usize,
 }
 
@@ -231,17 +343,31 @@ where
         &LossMetric::<ValidBackend<B>>::new(),
         burn_train::metric::store::Direction::Lowest,
         burn_train::metric::store::Split::Valid,
-    ))
-    .metric_train_numeric(
-        ScalarMetric::<ValidBackend<B>, LossValue<ValidBackend<B>>>::new_every(
+    ));
+    let builder = if let Some(dataset) = env
+        .source_selection_dataset
+        .as_ref()
+        .filter(|dataset| dataset.uses_live_source_selection())
+    {
+        builder.metric_train_numeric(RuliadSourceSelectionLossMetric::<ValidBackend<B>>::new(
             "Loss",
+            Arc::clone(dataset),
+            env.train_loader.num_items(),
             metric_every,
-        ),
-    )
-    .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
-    .metric_train_numeric(LearningRateMetric::new())
-    .metric_train(DeviceMetric::new("device", env.backend_name))
-    .metric_valid(DeviceMetric::new("device", env.backend_name));
+        ))
+    } else {
+        builder.metric_train_numeric(
+            ScalarMetric::<ValidBackend<B>, LossValue<ValidBackend<B>>>::new_every(
+                "Loss",
+                metric_every,
+            ),
+        )
+    };
+    let builder = builder
+        .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
+        .metric_train_numeric(LearningRateMetric::new())
+        .metric_train(DeviceMetric::new("device", env.backend_name))
+        .metric_valid(DeviceMetric::new("device", env.backend_name));
     #[cfg(feature = "rerun")]
     let builder = crate::train::rerun::attach_metric_loggers(builder, env.run_dir);
     let builder = builder.summary();
@@ -1549,6 +1675,17 @@ where
                 "process-group DDP rank={} iteration={} completed scalar loss all-reduce",
                 env.parallel_runtime.global_rank, iteration
             );
+            if let Some(dataset) = env
+                .source_selection_dataset
+                .as_ref()
+                .filter(|dataset| dataset.uses_live_source_selection())
+            {
+                let absolute_step = epoch
+                    .saturating_sub(1)
+                    .saturating_mul(local_train_steps)
+                    .saturating_add(iteration.saturating_sub(1));
+                let _ = dataset.record_source_selection_loss(absolute_step, mean_train_loss as f32);
+            }
 
             accumulator.accumulate(&learner.model(), item.grads);
             accumulation_current += 1;
@@ -2066,6 +2203,7 @@ mod tests {
             devices: &devices,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
             epochs: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2439,6 +2577,7 @@ mod tests {
             devices: &devices,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
             epochs: 4,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2727,6 +2866,7 @@ mod tests {
             devices: &devices,
             train_loader: Arc::clone(&train_loader),
             valid_loader: Arc::clone(&valid_loader),
+            source_selection_dataset: None,
             epochs: 1,
         };
         let model_first = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2763,6 +2903,7 @@ mod tests {
             devices: &devices,
             train_loader,
             valid_loader,
+            source_selection_dataset: None,
             epochs: 2,
         };
         let model_resume = LanguageTrainModel::new(DragonModel::<TestBackend>::new(

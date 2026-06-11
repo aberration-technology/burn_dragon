@@ -137,6 +137,92 @@ rotary_embedding = "alibi"
 }
 
 #[test]
+fn prepare_universality_stage_config_accepts_ruliad_corpus() {
+    let dir = tempdir().expect("tempdir");
+    let bundle_path = dir.path().join("bundle.toml");
+    fs::write(
+        &bundle_path,
+        "name = \"demo\"\noutput_dir = \"runs/demo\"\n",
+    )
+    .expect("write bundle");
+    let corpus_cfg = dir.path().join("ruliad.toml");
+    fs::write(
+        &corpus_cfg,
+        r#"
+output_dir = "ignored"
+seed = 1337
+name = "stage-ruliad"
+train_samples = 4
+validation_samples = 2
+chunk_token_capacity = 256
+
+[serialization]
+document_tokens = 96
+preview_samples = 1
+
+[tokenization]
+type = "gpt2_byte_compatible"
+vocab_size = 50257
+eos_id = 50256
+
+[[families]]
+kind = "eca"
+weight = 1
+width = { min = 12, max = 12 }
+steps = { min = 4, max = 4 }
+"#,
+    )
+    .expect("write corpus config");
+
+    let prepared = prepare_universality_stage_config(
+        &bundle_path,
+        &dir.path().join("stage"),
+        Path::new("ruliad.toml"),
+    )
+    .expect("prepare ruliad stage");
+
+    match prepared {
+        PreparedUniversalityCorpusConfig::Ruliad(config) => {
+            assert_eq!(config.output_dir, dir.path().join("stage/output"));
+            assert_eq!(config.name, "stage-ruliad");
+        }
+        PreparedUniversalityCorpusConfig::Nca(_) => panic!("expected ruliad config"),
+    }
+}
+
+#[test]
+fn generate_prepared_universality_stage_corpus_handles_ruliad() {
+    let dir = tempdir().expect("tempdir");
+    let config =
+        PreparedUniversalityCorpusConfig::Ruliad(burn_dragon_universality::RuliadCorpusConfig {
+            output_dir: dir.path().join("out"),
+            seed: 7,
+            name: "stage-ruliad-generate".to_string(),
+            train_samples: 2,
+            validation_samples: 1,
+            chunk_token_capacity: 256,
+            serialization: burn_dragon_universality::RuliadSerializationConfig {
+                document_tokens: 96,
+                preview_samples: 1,
+            },
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::default(),
+            source_selection: burn_dragon_universality::RuliadSourceSelectionConfig::default(),
+            families: vec![burn_dragon_universality::RuliadFamilyConfig {
+                kind: burn_dragon_universality::RuliadFamilyKind::Eca,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 12, max: 12 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+            }],
+            proof_tasks: None,
+            lean_task_limit: None,
+        });
+    let report =
+        generate_prepared_universality_stage_corpus(&config).expect("generate ruliad corpus");
+    assert!(report.manifest_path().is_file());
+    assert!(report.sample_records_path().is_file());
+}
+
+#[test]
 fn relative_bundle_output_dir_resolves_from_cwd() {
     let config = ExperimentBundleConfig {
         name: "demo".to_string(),

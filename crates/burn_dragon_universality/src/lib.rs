@@ -9,6 +9,7 @@ pub mod config;
 pub mod generate;
 pub mod manifest;
 pub mod nca;
+pub mod ruliad;
 pub mod runtime;
 pub mod stats;
 pub mod tokenize;
@@ -23,6 +24,13 @@ pub mod api {
             NcaTokenizationConfig, UsizeRangeConfig, default_families,
             default_rule_filter_for_band, load_nca_config,
         };
+        pub use crate::ruliad::config::{
+            LeanMode, RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES,
+            RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain,
+            RuliadReasoningMode, RuliadSerializationConfig, RuliadSourceSemantics, RuliadTaskKind,
+            RuliadTokenizationConfig, default_ruliad_families, load_ruliad_config,
+            ruliad_source_semantics,
+        };
     }
 
     pub mod manifest {
@@ -34,13 +42,21 @@ pub mod api {
 
     pub mod generate {
         pub use crate::generate::{GeneratedCorpusReport, generate_nca_corpus};
+        pub use crate::ruliad::generate::{GeneratedRuliadCorpusReport, generate_ruliad_corpus};
     }
 
     pub mod runtime {
+        pub use crate::ruliad::runtime::{
+            OnlineRuliadCorpus, RuliadRuntimeSampleDocument, fixed_ruliad_document_token_count,
+        };
         pub use crate::runtime::{
             OnlineNcaCorpus, RuntimeCorpusSummary, RuntimeSampleDocument,
             fixed_document_token_count,
         };
+    }
+
+    pub mod ruliad {
+        pub use crate::ruliad::*;
     }
 
     pub mod stats {
@@ -50,7 +66,7 @@ pub mod api {
     }
 
     pub mod expert {
-        pub use crate::{config, generate, manifest, nca, stats, tokenize};
+        pub use crate::{config, generate, manifest, nca, ruliad, stats, tokenize};
     }
 }
 
@@ -63,6 +79,19 @@ pub use generate::{GeneratedCorpusReport, generate_nca_corpus};
 pub use manifest::{
     CorpusKind, SampleSplit, UniversalityChunkManifest, UniversalityCorpusManifest,
     UniversalitySampleRecord, UniversalityTokenizerManifest, load_manifest,
+};
+pub use ruliad::{
+    GeneratedRuliadCorpusReport, LeanMode, LeanProofTask, OnlineRuliadCorpus,
+    RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RULIAD_VERIFIER_VERSION,
+    RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadFrontierSampler,
+    RuliadMathDomain, RuliadMetricSnapshot, RuliadReasoningMode, RuliadRuntimeSampleDocument,
+    RuliadSampleSpec, RuliadSampleTelemetry, RuliadSamplerCandidate, RuliadSamplerConfig,
+    RuliadSerializationConfig, RuliadSourceBucket, RuliadSourceBucketId,
+    RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind, RuliadTokenizationConfig,
+    RuliadVerificationReport, default_ruliad_families, fixed_ruliad_document_token_count,
+    generate_ruliad_corpus, load_proof_tasks, load_ruliad_config, plan_epoch_source_buckets,
+    ruliad_sampler_candidates, ruliad_source_buckets, ruliad_source_semantics, verify_manifest,
+    verify_sample,
 };
 pub use runtime::{
     OnlineNcaCorpus, RuntimeCorpusSummary, RuntimeSampleDocument, fixed_document_token_count,

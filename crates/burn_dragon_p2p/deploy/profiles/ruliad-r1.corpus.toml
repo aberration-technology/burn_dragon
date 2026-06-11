@@ -1,0 +1,63 @@
+output_dir = "./generated/ruliad-r1"
+seed = 1337
+name = "burn-dragon-mainnet-ruliad-r1"
+train_samples = 256
+validation_samples = 64
+chunk_token_capacity = 4096
+proof_tasks = "crates/burn_dragon_universality/data/ruliad_seed/proof_tasks.jsonl"
+lean_task_limit = 128
+
+[serialization]
+document_tokens = 384
+preview_samples = 4
+
+[tokenization]
+type = "gpt2_byte_compatible"
+vocab_size = 50257
+eos_id = 50256
+
+[source_selection]
+enabled = true
+
+[[families]]
+kind = "eca"
+weight = 4
+width = { min = 16, max = 32 }
+steps = { min = 4, max = 10 }
+
+[[families]]
+kind = "simulation"
+weight = 2
+width = { min = 16, max = 32 }
+steps = { min = 4, max = 8 }
+
+[[families]]
+kind = "automaton"
+weight = 2
+width = { min = 3, max = 8 }
+steps = { min = 6, max = 20 }
+
+[[families]]
+kind = "rewrite"
+weight = 2
+width = { min = 8, max = 20 }
+steps = { min = 4, max = 12 }
+
+[[families]]
+kind = "algebra"
+weight = 2
+width = { min = 2, max = 6 }
+
+[[families]]
+kind = "category"
+weight = 1
+width = { min = 3, max = 7 }
+steps = { min = 3, max = 6 }
+
+[[families]]
+kind = "lean_task"
+weight = 1
+
+[[families]]
+kind = "hash_noise"
+weight = 1

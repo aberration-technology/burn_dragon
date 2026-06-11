@@ -47,6 +47,9 @@ pub enum DatasetSourceConfig {
     UniversalityNca {
         config: PathBuf,
     },
+    UniversalityRuliad {
+        config: PathBuf,
+    },
 }
 
 impl Default for DatasetSourceConfig {

@@ -50,6 +50,37 @@ pub trait TokenSequenceDataset: Send + Sync {
     /// Datasets without epoch-aware generation can ignore this.
     fn prefetch_epoch(&self, _split: DatasetSplit, _epoch_index: usize) {}
 
+    /// Whether this dataset uses live source selection and should avoid preparing unbounded
+    /// future train batches before loss telemetry arrives.
+    fn uses_live_source_selection(&self) -> bool {
+        false
+    }
+
+    /// Return document indices for a source-homogeneous batch, if the dataset supports live
+    /// source selection for this split/epoch/step.
+    fn source_selected_document_indices(
+        &self,
+        _split: DatasetSplit,
+        _epoch_index: usize,
+        _absolute_step: usize,
+        _batch_size: usize,
+    ) -> Option<Vec<usize>> {
+        None
+    }
+
+    /// Feed aggregate loss telemetry for a previously selected source bucket.
+    fn record_source_selection_loss(
+        &self,
+        _absolute_step: usize,
+        _loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        None
+    }
+
+    fn source_selection_snapshot(&self) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        None
+    }
+
     /// Number of tokens reserved for the training split from the start of the corpus.
     fn train_len(&self) -> usize;
 
@@ -132,6 +163,7 @@ fn sample_host_batch_with_shape<T>(
     batch_size: usize,
     block_size: usize,
     epoch_index: usize,
+    absolute_step: usize,
 ) -> HostSequenceBatch
 where
     T: TokenSequenceDataset + ?Sized,
@@ -150,6 +182,8 @@ where
     if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
         let num_documents = (span / document_span).max(1);
+        let source_selected_documents =
+            dataset.source_selected_document_indices(split, epoch_index, absolute_step, batch_size);
         let max_start_in_document = logical_document_tokens
             .saturating_sub(block_size)
             .min(document_span.saturating_sub(block_size + 1));
@@ -158,13 +192,20 @@ where
             inputs
                 .par_chunks_mut(block_size)
                 .zip(targets.par_chunks_mut(block_size))
-                .for_each(|(input_row, target_row)| {
+                .enumerate()
+                .for_each(|(batch_idx, (input_row, target_row))| {
                     let mut rng = thread_rng();
-                    let doc_index = if num_documents <= 1 {
-                        0
-                    } else {
-                        rng.gen_range(0..num_documents)
-                    };
+                    let doc_index = source_selected_documents
+                        .as_ref()
+                        .and_then(|indices| indices.get(batch_idx))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            if num_documents <= 1 {
+                                0
+                            } else {
+                                rng.gen_range(0..num_documents)
+                            }
+                        });
                     let start_in_document = if max_start_in_document == 0 {
                         0
                     } else {
@@ -182,11 +223,17 @@ where
         }
         #[cfg(not(feature = "train"))]
         for batch_idx in 0..batch_size {
-            let doc_index = if num_documents <= 1 {
-                0
-            } else {
-                rng.gen_range(0..num_documents)
-            };
+            let doc_index = source_selected_documents
+                .as_ref()
+                .and_then(|indices| indices.get(batch_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    if num_documents <= 1 {
+                        0
+                    } else {
+                        rng.gen_range(0..num_documents)
+                    }
+                });
             let start_in_document = if max_start_in_document == 0 {
                 0
             } else {
@@ -258,7 +305,7 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
     epoch_index: usize,
     device: &B::Device,
 ) -> SequenceBatch<B> {
-    let host = sample_host_batch_with_shape(dataset, split, batch_size, block_size, epoch_index);
+    let host = sample_host_batch_with_shape(dataset, split, batch_size, block_size, epoch_index, 0);
     finalize_host_batch_on_device::<B>(
         host,
         batch_size,
@@ -333,6 +380,7 @@ impl RandomPrefetch {
                         batch_size,
                         block_size,
                         epoch_index,
+                        task_index,
                     );
                     if sender.send((task_index, batch)).is_err() {
                         return;
@@ -720,8 +768,10 @@ where
             .as_ref()
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or_default();
-        let use_persistent_prefetch =
-            dataset_prefetch_depth() > 0 && steps_total > 1 && self.split == DatasetSplit::Train;
+        let use_persistent_prefetch = dataset_prefetch_depth() > 0
+            && steps_total > 1
+            && self.split == DatasetSplit::Train
+            && !self.dataset.uses_live_source_selection();
         if use_persistent_prefetch {
             let mut slot = self.prefetch.lock().expect("random prefetch lock");
             if slot.is_none() {
@@ -1258,12 +1308,18 @@ impl<B: Backend> Iterator for RandomIterator<B> {
             let mut slot = prefetch.lock().expect("random prefetch lock");
             slot.as_mut()?.recv()?
         } else {
+            let absolute_step = self
+                .consumed_steps
+                .as_ref()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .unwrap_or(self.step);
             sample_host_batch_with_shape(
                 &*self.dataset,
                 self.split,
                 self.batch_size,
                 self.block_size,
                 self.epoch_index,
+                absolute_step,
             )
         };
 

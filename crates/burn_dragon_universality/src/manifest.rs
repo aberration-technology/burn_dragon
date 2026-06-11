@@ -13,6 +13,7 @@ pub const UNIVERSALITY_MANIFEST_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum CorpusKind {
     Nca,
+    Ruliad,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -98,6 +99,18 @@ pub struct UniversalitySampleRecord {
     pub preview_path: Option<PathBuf>,
     pub serialized_char_count: usize,
     pub stats: SampleStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_spec: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub math_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_modes: Vec<String>,
 }
 
 pub fn load_manifest(path: &Path) -> Result<UniversalityCorpusManifest> {

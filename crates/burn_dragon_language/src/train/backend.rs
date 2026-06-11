@@ -805,6 +805,10 @@ where
         devices: &devices,
         train_loader,
         valid_loader,
+        source_selection_dataset: datasets
+            .train
+            .uses_live_source_selection()
+            .then(|| Arc::clone(&datasets.train)),
         epochs: total_epochs,
     };
     let _model = train_with_resolved_scheduler(

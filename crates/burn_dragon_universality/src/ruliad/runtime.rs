@@ -6,8 +6,8 @@ use anyhow::{Result, anyhow};
 use crate::manifest::{SampleSplit, UniversalityTokenizerManifest};
 use crate::ruliad::config::{RuliadCorpusConfig, load_ruliad_config, ruliad_source_semantics};
 use crate::ruliad::oracles::{
-    GeneratedRuliadSample, LeanProofTask, RuliadSampleSpec, default_proof_tasks, generate_sample,
-    generate_sample_for_source_bucket, load_proof_tasks,
+    GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
+    default_proof_tasks, generate_sample, generate_sample_for_source_bucket, load_proof_tasks,
 };
 use crate::ruliad::search::RuliadSamplerCandidate;
 use crate::ruliad::source_selection::{
@@ -23,6 +23,7 @@ pub struct RuliadRuntimeSampleDocument {
     pub split: SampleSplit,
     pub sample_index: usize,
     pub spec: RuliadSampleSpec,
+    pub categorical_presentation: RuliadCategoricalPresentation,
     pub family: String,
     pub task_kind: String,
     pub oracle_hash: String,
@@ -245,6 +246,7 @@ impl OnlineRuliadCorpus {
             split,
             sample_index,
             spec: sample.spec,
+            categorical_presentation: sample.categorical_presentation,
             family: sample.family.label().to_string(),
             task_kind: sample.task_kind.label().to_string(),
             oracle_hash: sample.oracle_hash,

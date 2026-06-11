@@ -102,6 +102,8 @@ pub struct UniversalitySampleRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ruliad_spec: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_categorical_view: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_kind: Option<String>,

@@ -142,9 +142,25 @@ pub enum RuliadSampleSpec {
     },
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RuliadCategoricalPresentation {
+    pub abstraction: String,
+    pub source_family: String,
+    pub task_kind: String,
+    pub presentation: String,
+    pub objects: Vec<String>,
+    pub morphisms: Vec<String>,
+    pub functors: Vec<String>,
+    pub laws: Vec<String>,
+    pub query: String,
+    pub answer: String,
+    pub categorical_core: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratedRuliadSample {
     pub spec: RuliadSampleSpec,
+    pub categorical_presentation: RuliadCategoricalPresentation,
     pub family: RuliadFamilyKind,
     pub task_kind: RuliadTaskKind,
     pub verifier_version: u32,
@@ -278,10 +294,12 @@ fn finalize_generated_spec(spec: RuliadSampleSpec) -> Result<GeneratedRuliadSamp
     if !report.ok {
         return Err(anyhow!("generated ruliad sample failed verifier"));
     }
+    let categorical_presentation = ruliad_categorical_presentation(&spec);
     let text = sample_text(&spec, &report.oracle_hash);
     let stats = sample_stats(&spec, &text);
     Ok(GeneratedRuliadSample {
         spec,
+        categorical_presentation,
         family: report.family,
         task_kind: report.task_kind,
         verifier_version: RULIAD_VERIFIER_VERSION,
@@ -289,6 +307,155 @@ fn finalize_generated_spec(spec: RuliadSampleSpec) -> Result<GeneratedRuliadSamp
         text,
         stats,
     })
+}
+
+pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategoricalPresentation {
+    match spec {
+        RuliadSampleSpec::Eca {
+            rule,
+            steps,
+            trace,
+            task,
+            ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Eca.label().to_string(),
+            task_kind: task.label().to_string(),
+            presentation: "trajectory_category".to_string(),
+            objects: vec!["time_indexed_binary_states".to_string()],
+            morphisms: vec![
+                format!("rule_{rule}_step"),
+                format!("step_path_len_{steps}"),
+            ],
+            functors: Vec::new(),
+            laws: vec!["path_composition_is_associative".to_string()],
+            query: "compose the local-rule step morphism along a bounded trajectory".to_string(),
+            answer: format!("target={}", trace.last().cloned().unwrap_or_default()),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::Simulation {
+            source_rule,
+            target_rule,
+            steps,
+            ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Simulation.label().to_string(),
+            task_kind: RuliadTaskKind::VerifySimulation.label().to_string(),
+            presentation: "commuting_trajectory_functor".to_string(),
+            objects: vec![
+                "source_trajectory".to_string(),
+                "target_trajectory".to_string(),
+            ],
+            morphisms: vec![
+                format!("source_rule_{source_rule}_step"),
+                format!("target_rule_{target_rule}_step"),
+                format!("step_path_len_{steps}"),
+            ],
+            functors: vec!["complement_map".to_string()],
+            laws: vec!["map_after_source_step_equals_target_step_after_map".to_string()],
+            query: "verify that the map preserves bounded trajectory composition".to_string(),
+            answer: "commutes=true".to_string(),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::Automaton {
+            input, accepted, ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Automaton.label().to_string(),
+            task_kind: RuliadTaskKind::EvaluateAutomaton.label().to_string(),
+            presentation: "free_monoid_action_category".to_string(),
+            objects: vec!["finite_states".to_string(), "input_prefixes".to_string()],
+            morphisms: vec![
+                "symbol_0_transition".to_string(),
+                "symbol_1_transition".to_string(),
+                format!("word_action_len_{}", input.len()),
+            ],
+            functors: Vec::new(),
+            laws: vec!["word_actions_compose_by_concatenation".to_string()],
+            query: "evaluate the composed input-word morphism and acceptance predicate".to_string(),
+            answer: format!("accepted={accepted}"),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::Rewrite {
+            steps, normal_form, ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Rewrite.label().to_string(),
+            task_kind: RuliadTaskKind::RewriteNormalForm.label().to_string(),
+            presentation: "rewrite_path_category".to_string(),
+            objects: vec!["terms".to_string()],
+            morphisms: vec![format!("rewrite_path_len_at_most_{steps}")],
+            functors: Vec::new(),
+            laws: vec!["rewrite_paths_compose".to_string()],
+            query: "compose rewrite morphisms until no reducing rule applies".to_string(),
+            answer: format!("normal_form={normal_form}"),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::Algebra { law, holds, .. } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Algebra.label().to_string(),
+            task_kind: RuliadTaskKind::CheckAlgebraLaw.label().to_string(),
+            presentation: "one_object_category_law_probe".to_string(),
+            objects: vec!["single_object".to_string()],
+            morphisms: vec!["carrier_elements_as_candidate_endomorphisms".to_string()],
+            functors: Vec::new(),
+            laws: vec![law.label().to_string()],
+            query:
+                "check whether the finite operation table satisfies the requested categorical law"
+                    .to_string(),
+            answer: format!("holds={holds}"),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::Category {
+            path,
+            composed,
+            associative,
+            ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::Category.label().to_string(),
+            task_kind: RuliadTaskKind::ComposeCategoryPath.label().to_string(),
+            presentation: "finite_thin_category".to_string(),
+            objects: vec!["finite_poset_objects".to_string()],
+            morphisms: vec![format!("monotone_path_len_{}", path.len())],
+            functors: Vec::new(),
+            laws: vec!["identity".to_string(), "associativity".to_string()],
+            query: "compose a path of arrows in a finite thin category".to_string(),
+            answer: format!("composed={composed:?};associative={associative}"),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::LeanTask {
+            task_id,
+            payload_hash,
+            ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::LeanTask.label().to_string(),
+            task_kind: RuliadTaskKind::CompleteProof.label().to_string(),
+            presentation: "proof_category".to_string(),
+            objects: vec!["propositions".to_string()],
+            morphisms: vec!["proof_terms".to_string(), task_id.clone()],
+            functors: vec!["lean_kernel_check".to_string()],
+            laws: vec!["proof_composition".to_string()],
+            query: "validate a proof payload anchored by the Lean seed project".to_string(),
+            answer: format!("payload_hash={payload_hash}"),
+            categorical_core: true,
+        },
+        RuliadSampleSpec::HashNoise { payload_hash, .. } => RuliadCategoricalPresentation {
+            abstraction: "source_selection_canary".to_string(),
+            source_family: RuliadFamilyKind::HashNoise.label().to_string(),
+            task_kind: RuliadTaskKind::HashCanary.label().to_string(),
+            presentation: "entropy_control_payload".to_string(),
+            objects: Vec::new(),
+            morphisms: Vec::new(),
+            functors: Vec::new(),
+            laws: vec!["sha256_payload_integrity".to_string()],
+            query: "verify high-entropy canary payload integrity".to_string(),
+            answer: format!("payload_hash={payload_hash}"),
+            categorical_core: false,
+        },
+    }
 }
 
 fn sample_rng(
@@ -505,6 +672,7 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
 }
 
 pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
+    let header = categorical_text_header(spec, oracle_hash);
     match spec {
         RuliadSampleSpec::Eca {
             rule,
@@ -512,13 +680,10 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             steps,
             initial,
             trace,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"eca\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\nrule={}\nwidth={}\nsteps={}\ninitial={}\ntrace={}\ntarget={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::Eca, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
+            "{}rule={}\nwidth={}\nsteps={}\ninitial={}\ntrace={}\ntarget={}\n</ruliad>\n",
+            header,
             rule,
             width,
             steps,
@@ -536,13 +701,10 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             source_trace,
             target_trace,
             mapped_source_trace,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"simulation\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\nsource_rule={}\ntarget_rule={}\nwidth={}\nsteps={}\nsource_initial={}\ntarget_initial={}\nsource_trace={}\ntarget_trace={}\nmapped_source_trace={}\nclaim=map(step_source^t(x)) == step_target^t(map(x))\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::Simulation, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
+            "{}source_rule={}\ntarget_rule={}\nwidth={}\nsteps={}\nsource_initial={}\ntarget_initial={}\nsource_trace={}\ntarget_trace={}\nmapped_source_trace={}\nclaim=map(step_source^t(x)) == step_target^t(map(x))\n</ruliad>\n",
+            header,
             source_rule,
             target_rule,
             width,
@@ -561,20 +723,10 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             input,
             trace,
             accepted,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"automaton\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\nstates={}\nstart={}\naccept_states={:?}\ninput={}\ntransitions={:?}\ntrace={:?}\naccepted={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::Automaton, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
-            state_count,
-            start_state,
-            accept_states,
-            input,
-            transitions,
-            trace,
-            accepted
+            "{}states={}\nstart={}\naccept_states={:?}\ninput={}\ntransitions={:?}\ntrace={:?}\naccepted={}\n</ruliad>\n",
+            header, state_count, start_state, accept_states, input, transitions, trace, accepted
         ),
         RuliadSampleSpec::Rewrite {
             alphabet,
@@ -583,7 +735,7 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             steps,
             trace,
             normal_form,
-            task,
+            ..
         } => {
             let rule_text = rules
                 .iter()
@@ -591,11 +743,8 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                "<ruliad family=\"rewrite\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\nalphabet={}\nrules={}\ninitial={}\nsteps={}\ntrace={}\nnormal_form={}\n</ruliad>\n",
-                task.label(),
-                semantic_text_attributes(RuliadFamilyKind::Rewrite, *task),
-                RULIAD_VERIFIER_VERSION,
-                oracle_hash,
+                "{}alphabet={}\nrules={}\ninitial={}\nsteps={}\ntrace={}\nnormal_form={}\n</ruliad>\n",
+                header,
                 alphabet,
                 rule_text,
                 initial,
@@ -612,13 +761,10 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             lhs,
             rhs,
             holds,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"algebra\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\ncarrier_size={}\nlaw={}\noperands={:?}\noperation_table={:?}\nlhs={}\nrhs={}\nholds={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::Algebra, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
+            "{}carrier_size={}\nlaw={}\noperands={:?}\noperation_table={:?}\nlhs={}\nrhs={}\nholds={}\n</ruliad>\n",
+            header,
             carrier_size,
             law.label(),
             operands,
@@ -632,52 +778,36 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             path,
             composed,
             associative,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"category\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\nobjects={}\npath={:?}\ncomposed={:?}\nassociative={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::Category, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
-            object_count,
-            path,
-            composed,
-            associative
+            "{}object_count={}\npath={:?}\ncomposed={:?}\nassociative={}\n</ruliad>\n",
+            header, object_count, path, composed, associative
         ),
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
             proof,
             payload_hash,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"lean_task\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\ntask_id={}\npayload_hash={}\nstatement={}\nproof={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::LeanTask, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
-            task_id,
-            payload_hash,
-            statement,
-            proof
+            "{}task_id={}\npayload_hash={}\nstatement={}\nproof={}\n</ruliad>\n",
+            header, task_id, payload_hash, statement, proof
         ),
         RuliadSampleSpec::HashNoise {
             bytes_hex,
             payload_hash,
-            task,
+            ..
         } => format!(
-            "<ruliad family=\"hash_noise\" task=\"{}\"{} verifier=\"{}\" hash=\"{}\">\npayload_hash={}\nbytes={}\n</ruliad>\n",
-            task.label(),
-            semantic_text_attributes(RuliadFamilyKind::HashNoise, *task),
-            RULIAD_VERIFIER_VERSION,
-            oracle_hash,
-            payload_hash,
-            bytes_hex
+            "{}payload_hash={}\nbytes={}\n</ruliad>\n",
+            header, payload_hash, bytes_hex
         ),
     }
 }
 
-fn semantic_text_attributes(family: RuliadFamilyKind, task_kind: RuliadTaskKind) -> String {
+fn categorical_text_header(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
+    let view = ruliad_categorical_presentation(spec);
+    let family = family_of_spec(spec);
+    let task_kind = task_kind_of_spec(spec);
     let semantics = ruliad_source_semantics(family, task_kind);
     let domains = semantics
         .math_domains
@@ -691,7 +821,56 @@ fn semantic_text_attributes(family: RuliadFamilyKind, task_kind: RuliadTaskKind)
         .map(|mode| mode.label())
         .collect::<Vec<_>>()
         .join(",");
-    format!(" domains=\"{}\" reasoning_modes=\"{}\"", domains, modes)
+    format!(
+        "<ruliad abstraction=\"{}\" source=\"{}\" presentation=\"{}\" task=\"{}\" domains=\"{}\" reasoning_modes=\"{}\" verifier=\"{}\" hash=\"{}\">\nquery={}\nanswer={}\ncategory_objects={}\ncategory_morphisms={}\ncategory_laws={}\n",
+        view.abstraction,
+        view.source_family,
+        view.presentation,
+        view.task_kind,
+        domains,
+        modes,
+        RULIAD_VERIFIER_VERSION,
+        oracle_hash,
+        view.query,
+        view.answer,
+        join_or_dash(&view.objects),
+        join_or_dash(&view.morphisms),
+        join_or_dash(&view.laws)
+    )
+}
+
+fn join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn family_of_spec(spec: &RuliadSampleSpec) -> RuliadFamilyKind {
+    match spec {
+        RuliadSampleSpec::Eca { .. } => RuliadFamilyKind::Eca,
+        RuliadSampleSpec::Simulation { .. } => RuliadFamilyKind::Simulation,
+        RuliadSampleSpec::Automaton { .. } => RuliadFamilyKind::Automaton,
+        RuliadSampleSpec::Rewrite { .. } => RuliadFamilyKind::Rewrite,
+        RuliadSampleSpec::Algebra { .. } => RuliadFamilyKind::Algebra,
+        RuliadSampleSpec::Category { .. } => RuliadFamilyKind::Category,
+        RuliadSampleSpec::LeanTask { .. } => RuliadFamilyKind::LeanTask,
+        RuliadSampleSpec::HashNoise { .. } => RuliadFamilyKind::HashNoise,
+    }
+}
+
+fn task_kind_of_spec(spec: &RuliadSampleSpec) -> RuliadTaskKind {
+    match spec {
+        RuliadSampleSpec::Eca { task, .. }
+        | RuliadSampleSpec::Simulation { task, .. }
+        | RuliadSampleSpec::Automaton { task, .. }
+        | RuliadSampleSpec::Rewrite { task, .. }
+        | RuliadSampleSpec::Algebra { task, .. }
+        | RuliadSampleSpec::Category { task, .. }
+        | RuliadSampleSpec::LeanTask { task, .. }
+        | RuliadSampleSpec::HashNoise { task, .. } => *task,
+    }
 }
 
 fn choose_family<'a>(
@@ -1330,6 +1509,64 @@ mod tests {
     }
 
     #[test]
+    fn serialized_samples_use_categorical_abstraction_as_primary_view() {
+        for family in [
+            RuliadFamilyKind::Eca,
+            RuliadFamilyKind::Simulation,
+            RuliadFamilyKind::Automaton,
+            RuliadFamilyKind::Rewrite,
+            RuliadFamilyKind::Algebra,
+            RuliadFamilyKind::Category,
+            RuliadFamilyKind::LeanTask,
+        ] {
+            let mut config = config();
+            config.families = vec![RuliadFamilyConfig {
+                kind: family,
+                weight: 1,
+                width: match family {
+                    RuliadFamilyKind::Eca | RuliadFamilyKind::Simulation => {
+                        Some(UsizeRangeConfig { min: 8, max: 8 })
+                    }
+                    RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 8, max: 8 }),
+                    RuliadFamilyKind::Algebra => Some(UsizeRangeConfig { min: 3, max: 3 }),
+                    RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => None,
+                },
+                steps: match family {
+                    RuliadFamilyKind::Eca | RuliadFamilyKind::Simulation => {
+                        Some(UsizeRangeConfig { min: 4, max: 4 })
+                    }
+                    RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 6, max: 6 }),
+                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 3, max: 3 }),
+                    RuliadFamilyKind::Algebra
+                    | RuliadFamilyKind::LeanTask
+                    | RuliadFamilyKind::HashNoise => None,
+                },
+            }];
+            let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
+            assert!(sample.categorical_presentation.categorical_core);
+            assert_eq!(
+                sample.categorical_presentation.abstraction,
+                "finite_category_reasoning"
+            );
+            assert_eq!(
+                sample.categorical_presentation.source_family,
+                family.label()
+            );
+            assert!(
+                sample
+                    .text
+                    .starts_with("<ruliad abstraction=\"finite_category_reasoning\"")
+            );
+            assert!(!sample.text.contains("<ruliad family="));
+            assert!(sample.text.contains("query="));
+            assert!(sample.text.contains("answer="));
+        }
+    }
+
+    #[test]
     fn default_distribution_spans_computable_families() {
         let mut family_counts = std::collections::HashMap::new();
         let mut task_counts = std::collections::HashMap::new();
@@ -1352,6 +1589,24 @@ mod tests {
             let semantics = ruliad_source_semantics(sample.family, sample.task_kind);
             math_domains.extend(semantics.math_domains.iter().copied());
             reasoning_modes.extend(semantics.reasoning_modes.iter().copied());
+            assert_eq!(
+                sample.categorical_presentation.source_family,
+                sample.family.label()
+            );
+            assert!(!sample.categorical_presentation.presentation.is_empty());
+            if sample.family == RuliadFamilyKind::HashNoise {
+                assert!(!sample.categorical_presentation.categorical_core);
+                assert_eq!(
+                    sample.categorical_presentation.abstraction,
+                    "source_selection_canary"
+                );
+            } else {
+                assert!(sample.categorical_presentation.categorical_core);
+                assert_eq!(
+                    sample.categorical_presentation.abstraction,
+                    "finite_category_reasoning"
+                );
+            }
 
             match &sample.spec {
                 RuliadSampleSpec::Eca {

@@ -105,6 +105,9 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
                 serialized_char_count: document.serialized_preview.len(),
                 stats: document.stats,
                 ruliad_spec: Some(serde_json::to_value(document.spec)?),
+                ruliad_categorical_view: Some(serde_json::to_value(
+                    document.categorical_presentation,
+                )?),
                 oracle_hash: Some(document.oracle_hash),
                 task_kind: Some(document.task_kind),
                 verifier_version: Some(document.verifier_version),

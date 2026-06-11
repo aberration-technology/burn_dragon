@@ -30,8 +30,8 @@ pub use config::{
 pub use generate::{GeneratedRuliadCorpusReport, generate_ruliad_corpus};
 pub use metrics::{RuliadMetricSnapshot, RuliadSampleTelemetry};
 pub use oracles::{
-    GeneratedRuliadSample, LeanProofTask, RULIAD_VERIFIER_VERSION, RuliadSampleSpec,
-    load_proof_tasks,
+    GeneratedRuliadSample, LeanProofTask, RULIAD_VERIFIER_VERSION, RuliadCategoricalPresentation,
+    RuliadSampleSpec, load_proof_tasks, ruliad_categorical_presentation,
 };
 pub use runtime::{
     OnlineRuliadCorpus, RuliadRuntimeSampleDocument, fixed_ruliad_document_token_count,

@@ -83,15 +83,15 @@ pub use manifest::{
 pub use ruliad::{
     GeneratedRuliadCorpusReport, LeanMode, LeanProofTask, OnlineRuliadCorpus,
     RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RULIAD_VERIFIER_VERSION,
-    RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadFrontierSampler,
-    RuliadMathDomain, RuliadMetricSnapshot, RuliadReasoningMode, RuliadRuntimeSampleDocument,
-    RuliadSampleSpec, RuliadSampleTelemetry, RuliadSamplerCandidate, RuliadSamplerConfig,
-    RuliadSerializationConfig, RuliadSourceBucket, RuliadSourceBucketId,
+    RuliadCategoricalPresentation, RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind,
+    RuliadFrontierSampler, RuliadMathDomain, RuliadMetricSnapshot, RuliadReasoningMode,
+    RuliadRuntimeSampleDocument, RuliadSampleSpec, RuliadSampleTelemetry, RuliadSamplerCandidate,
+    RuliadSamplerConfig, RuliadSerializationConfig, RuliadSourceBucket, RuliadSourceBucketId,
     RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind, RuliadTokenizationConfig,
     RuliadVerificationReport, default_ruliad_families, fixed_ruliad_document_token_count,
     generate_ruliad_corpus, load_proof_tasks, load_ruliad_config, plan_epoch_source_buckets,
-    ruliad_sampler_candidates, ruliad_source_buckets, ruliad_source_semantics, verify_manifest,
-    verify_sample,
+    ruliad_categorical_presentation, ruliad_sampler_candidates, ruliad_source_buckets,
+    ruliad_source_semantics, verify_manifest, verify_sample,
 };
 pub use runtime::{
     OnlineNcaCorpus, RuntimeCorpusSummary, RuntimeSampleDocument, fixed_document_token_count,

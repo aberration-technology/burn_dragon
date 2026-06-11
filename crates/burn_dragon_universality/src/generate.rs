@@ -278,6 +278,7 @@ fn generate_sample_record(
         serialized_char_count: serialized.len(),
         stats,
         ruliad_spec: None,
+        ruliad_categorical_view: None,
         oracle_hash: None,
         task_kind: None,
         verifier_version: None,

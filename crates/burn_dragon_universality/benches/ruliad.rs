@@ -15,7 +15,7 @@ fn ruliad_config() -> RuliadCorpusConfig {
         validation_samples: 32,
         chunk_token_capacity: 4096,
         serialization: RuliadSerializationConfig {
-            document_tokens: 384,
+            document_tokens: 513,
             preview_samples: 1,
         },
         tokenization: RuliadTokenizationConfig::default(),

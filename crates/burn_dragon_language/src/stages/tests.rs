@@ -202,7 +202,7 @@ fn generate_prepared_universality_stage_corpus_handles_ruliad() {
             validation_samples: 1,
             chunk_token_capacity: 256,
             serialization: burn_dragon_universality::RuliadSerializationConfig {
-                document_tokens: 96,
+                document_tokens: 513,
                 preview_samples: 1,
             },
             tokenization: burn_dragon_universality::RuliadTokenizationConfig::default(),

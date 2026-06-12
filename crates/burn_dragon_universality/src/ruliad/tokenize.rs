@@ -37,9 +37,12 @@ impl RuliadByteTokenizer {
         }
     }
 
+    pub fn payload_token_capacity(&self, document_tokens: usize) -> usize {
+        document_tokens.saturating_sub(usize::from(self.eos_id.is_some()))
+    }
+
     pub fn encode_document(&self, text: &str, document_tokens: usize) -> Vec<u32> {
-        let eos_tokens = usize::from(self.eos_id.is_some());
-        let payload_len = document_tokens.saturating_sub(eos_tokens);
+        let payload_len = self.payload_token_capacity(document_tokens);
         let mut tokens = Vec::with_capacity(document_tokens);
         tokens.extend(text.bytes().take(payload_len).map(u32::from));
         const FILLER: &[u8] = b"\n.\n";

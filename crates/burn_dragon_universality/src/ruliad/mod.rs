@@ -4,7 +4,13 @@
 //! heterogeneous stream of exact finite rule systems, simulations, proof tasks,
 //! and canaries. The hot path remains Rust-native; Lean is only an optional
 //! external trust anchor during explicit verification.
+//!
+//! The ruliad profile is a trace-pretraining source: generated documents are
+//! compact next-token sequences with verifier-backed question/proof/answer
+//! slots. Live source selection is a curriculum policy over source buckets, not
+//! a long-rollout reinforcement objective.
 
+pub mod category;
 pub mod config;
 pub mod eca;
 pub mod generate;
@@ -21,6 +27,7 @@ pub mod verification;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+pub use category::{RuliadCategoryFunctor, RuliadCategoryMorphism, RuliadNaturalityCheck};
 pub use config::{
     LeanMode, RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RuliadCorpusConfig,
     RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain, RuliadReasoningMode,

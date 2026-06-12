@@ -220,6 +220,18 @@ impl OnlineRuliadCorpus {
         sample_index: usize,
         sample: GeneratedRuliadSample,
     ) -> Result<RuliadRuntimeSampleDocument> {
+        let payload_capacity = self
+            .tokenizer
+            .payload_token_capacity(self.document_token_count);
+        if sample.text.len() > payload_capacity {
+            return Err(anyhow!(
+                "ruliad sample text exceeds document payload capacity (family={} task={} text_bytes={} payload_tokens={})",
+                sample.family.label(),
+                sample.task_kind.label(),
+                sample.text.len(),
+                payload_capacity
+            ));
+        }
         let tokens = self
             .tokenizer
             .encode_document(&sample.text, self.document_token_count);
@@ -348,7 +360,7 @@ mod tests {
             validation_samples: 2,
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig {
-                document_tokens: 96,
+                document_tokens: 513,
                 preview_samples: 2,
             },
             tokenization: RuliadTokenizationConfig::default(),
@@ -391,7 +403,7 @@ mod tests {
         let doc = corpus
             .generate_document(SampleSplit::Train, 0)
             .expect("document");
-        assert_eq!(doc.tokens.len(), 96);
+        assert_eq!(doc.tokens.len(), 513);
     }
 
     #[test]

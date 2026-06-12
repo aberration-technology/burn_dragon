@@ -198,7 +198,7 @@ mod tests {
             validation_samples: 1,
             chunk_token_capacity: 512,
             serialization: RuliadSerializationConfig {
-                document_tokens: 96,
+                document_tokens: 513,
                 preview_samples: 1,
             },
             tokenization: RuliadTokenizationConfig::default(),

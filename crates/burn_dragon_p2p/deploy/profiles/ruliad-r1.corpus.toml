@@ -8,7 +8,7 @@ proof_tasks = "crates/burn_dragon_universality/data/ruliad_seed/proof_tasks.json
 lean_task_limit = 128
 
 [serialization]
-document_tokens = 384
+document_tokens = 513
 preview_samples = 4
 
 [tokenization]

@@ -1243,6 +1243,68 @@ mod streaming_tests {
     }
 
     #[test]
+    fn random_sampling_uses_full_document_when_block_matches_logical_length() {
+        let dataset = TinyDataset {
+            tokens: Arc::new(vec![
+                10, 11, 12, 13, 14, 15, 16, 17, 255, 20, 21, 22, 23, 24, 25, 26, 27, 255,
+            ]),
+            train_len: 18,
+            block_size: 8,
+            batch_size: 4,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: Some(8),
+        };
+
+        for absolute_step in 0..16 {
+            let host = sample_host_batch_with_shape(
+                &dataset,
+                DatasetSplit::Train,
+                dataset.batch_size,
+                dataset.block_size,
+                0,
+                absolute_step,
+            );
+            for row in 0..dataset.batch_size {
+                let input_row =
+                    &host.inputs[row * dataset.block_size..(row + 1) * dataset.block_size];
+                let target_row =
+                    &host.targets[row * dataset.block_size..(row + 1) * dataset.block_size];
+                let base = input_row[0];
+                assert!(
+                    base == 10 || base == 20,
+                    "full-document sample should start at document boundary, got {base}"
+                );
+                assert_eq!(
+                    input_row,
+                    &[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                        base + 7
+                    ]
+                );
+                assert_eq!(
+                    target_row,
+                    &[
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                        base + 7,
+                        255
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn streaming_loader_seed_is_stable_but_changes_document_order() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let dataset = Arc::new(TinyDataset {

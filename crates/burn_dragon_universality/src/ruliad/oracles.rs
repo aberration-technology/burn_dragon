@@ -5,6 +5,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::SampleSplit;
+use crate::ruliad::category::{
+    RuliadCategoryFunctor, RuliadCategoryMorphism, RuliadNaturalityCheck, compose_path,
+    generate_category_fields, naturality_commutes, valid_finite_category, valid_functor,
+};
 use crate::ruliad::config::{
     RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadTaskKind,
     ruliad_source_semantics,
@@ -123,9 +127,17 @@ pub enum RuliadSampleSpec {
     },
     Category {
         object_count: usize,
+        morphisms: Vec<RuliadCategoryMorphism>,
+        identities: Vec<usize>,
+        composition: Vec<Vec<Option<usize>>>,
         path: Vec<usize>,
-        composed: Vec<usize>,
-        associative: bool,
+        composed: usize,
+        lhs: usize,
+        rhs: usize,
+        holds: bool,
+        proof_steps: Vec<String>,
+        functor: Option<RuliadCategoryFunctor>,
+        naturality: Option<RuliadNaturalityCheck>,
         task: RuliadTaskKind,
     },
     LeanTask {
@@ -282,7 +294,9 @@ pub fn generate_sample_for_source_bucket(
         RuliadFamilyKind::Automaton => generate_automaton_spec(&bucket.family_config, &mut rng),
         RuliadFamilyKind::Rewrite => generate_rewrite_spec(&bucket.family_config, &mut rng),
         RuliadFamilyKind::Algebra => generate_algebra_spec(&bucket.family_config, &mut rng),
-        RuliadFamilyKind::Category => generate_category_spec(&bucket.family_config, &mut rng),
+        RuliadFamilyKind::Category => {
+            generate_category_spec_for_task(&bucket.family_config, bucket.id.task_kind, &mut rng)
+        }
         RuliadFamilyKind::LeanTask => generate_lean_spec(proof_tasks, &mut rng),
         RuliadFamilyKind::HashNoise => generate_hash_noise_spec(&mut rng),
     }?;
@@ -408,23 +422,67 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             categorical_core: true,
         },
         RuliadSampleSpec::Category {
+            object_count,
+            morphisms,
             path,
             composed,
-            associative,
+            holds,
+            functor,
+            naturality,
+            task,
             ..
-        } => RuliadCategoricalPresentation {
-            abstraction: "finite_category_reasoning".to_string(),
-            source_family: RuliadFamilyKind::Category.label().to_string(),
-            task_kind: RuliadTaskKind::ComposeCategoryPath.label().to_string(),
-            presentation: "finite_thin_category".to_string(),
-            objects: vec!["finite_poset_objects".to_string()],
-            morphisms: vec![format!("monotone_path_len_{}", path.len())],
-            functors: Vec::new(),
-            laws: vec!["identity".to_string(), "associativity".to_string()],
-            query: "compose a path of arrows in a finite thin category".to_string(),
-            answer: format!("composed={composed:?};associative={associative}"),
-            categorical_core: true,
-        },
+        } => {
+            let presentation = match task {
+                RuliadTaskKind::ComposeCategoryPath => "finite_category_path",
+                RuliadTaskKind::VerifyCategoryLaw => "finite_category_law",
+                RuliadTaskKind::VerifyFunctorPreservation => "finite_functor_preservation",
+                RuliadTaskKind::VerifyNaturalitySquare => "finite_naturality_square",
+                _ => "finite_category",
+            };
+            let query = match task {
+                RuliadTaskKind::ComposeCategoryPath => {
+                    "compose a path of arrows in a finite category"
+                }
+                RuliadTaskKind::VerifyCategoryLaw => {
+                    "verify a finite category identity or associativity equation"
+                }
+                RuliadTaskKind::VerifyFunctorPreservation => {
+                    "verify that a finite functor preserves an arrow composition"
+                }
+                RuliadTaskKind::VerifyNaturalitySquare => {
+                    "verify that the selected naturality square commutes"
+                }
+                _ => "verify a finite categorical reasoning trace",
+            };
+            let mut laws = vec!["identity".to_string(), "associativity".to_string()];
+            if functor.is_some() {
+                laws.push("functor_preserves_identity_and_composition".to_string());
+            }
+            if naturality.is_some() {
+                laws.push("naturality_square_commutes".to_string());
+            }
+            RuliadCategoricalPresentation {
+                abstraction: "finite_category_reasoning".to_string(),
+                source_family: RuliadFamilyKind::Category.label().to_string(),
+                task_kind: task.label().to_string(),
+                presentation: presentation.to_string(),
+                objects: (0..*object_count)
+                    .map(|object| format!("o{object}"))
+                    .collect(),
+                morphisms: morphisms
+                    .iter()
+                    .map(|morphism| morphism.name.clone())
+                    .collect(),
+                functors: functor
+                    .as_ref()
+                    .map(|functor| vec![functor.name.clone()])
+                    .unwrap_or_default(),
+                laws,
+                query: query.to_string(),
+                answer: format!("holds={holds};composed={composed};path={path:?}"),
+                categorical_core: true,
+            }
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             payload_hash,
@@ -617,17 +675,47 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
         }
         RuliadSampleSpec::Category {
             object_count,
+            morphisms,
+            identities,
+            composition,
             path,
             composed,
-            associative,
+            lhs,
+            rhs,
+            holds,
+            functor,
+            naturality,
             task,
+            ..
         } => {
-            let ok = *object_count > 0
-                && path.len() >= 2
-                && path.iter().all(|object| *object < *object_count)
-                && path.windows(2).all(|pair| pair[0] <= pair[1])
-                && composed == &vec![path[0], *path.last().unwrap_or(&path[0])]
-                && *associative;
+            let recomposed = compose_path(morphisms, composition, path);
+            let task_ok = match task {
+                RuliadTaskKind::ComposeCategoryPath | RuliadTaskKind::VerifyCategoryLaw => {
+                    recomposed.is_some_and(|expected| expected == *composed)
+                        && (*lhs == *rhs) == *holds
+                }
+                RuliadTaskKind::VerifyFunctorPreservation => {
+                    functor.as_ref().is_some_and(|functor| {
+                        valid_functor(*object_count, morphisms, identities, composition, functor)
+                            && (*lhs == *rhs) == *holds
+                    })
+                }
+                RuliadTaskKind::VerifyNaturalitySquare => functor
+                    .as_ref()
+                    .zip(naturality.as_ref())
+                    .is_some_and(|(functor, naturality)| {
+                        valid_functor(*object_count, morphisms, identities, composition, functor)
+                            && naturality_commutes(morphisms, composition, functor, naturality)
+                            && (*lhs == *rhs) == *holds
+                    }),
+                _ => false,
+            };
+            let ok = valid_finite_category(*object_count, morphisms, identities, composition)
+                && task_ok
+                && *holds
+                && *lhs < morphisms.len()
+                && *rhs < morphisms.len()
+                && *composed < morphisms.len();
             (ok, RuliadFamilyKind::Category, *task)
         }
         RuliadSampleSpec::LeanTask {
@@ -672,7 +760,186 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
 }
 
 pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
-    let header = categorical_text_header(spec, oracle_hash);
+    trace_document(spec, oracle_hash).to_text()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuliadTraceDocument {
+    abstraction: String,
+    source_family: String,
+    task_kind: String,
+    presentation: String,
+    domains: Vec<String>,
+    reasoning_modes: Vec<String>,
+    verifier_version: u32,
+    oracle_hash: String,
+    query: String,
+    proof_steps: Vec<String>,
+    answer: String,
+    data: Vec<String>,
+}
+
+impl RuliadTraceDocument {
+    fn to_text(&self) -> String {
+        let proof = if self.proof_steps.is_empty() {
+            "-".to_string()
+        } else {
+            self.proof_steps.join(";")
+        };
+        let data = if self.data.is_empty() {
+            "-".to_string()
+        } else {
+            self.data.join(";")
+        };
+        format!(
+            "<ruliad a={} src={} pres={} task={} v={} h={}>\nsem:{}|{}\nq:{}\np:{}\na:{}\nd:{}\n</ruliad>\n",
+            self.abstraction,
+            self.source_family,
+            self.presentation,
+            self.task_kind,
+            self.verifier_version,
+            self.oracle_hash,
+            compact_labels(&self.domains),
+            compact_labels(&self.reasoning_modes),
+            self.query,
+            proof,
+            self.answer,
+            data
+        )
+    }
+}
+
+fn trace_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadTraceDocument {
+    let view = ruliad_categorical_presentation(spec);
+    let family = family_of_spec(spec);
+    let task_kind = task_kind_of_spec(spec);
+    let semantics = ruliad_source_semantics(family, task_kind);
+    RuliadTraceDocument {
+        abstraction: view.abstraction,
+        source_family: view.source_family,
+        task_kind: view.task_kind,
+        presentation: view.presentation,
+        domains: semantics
+            .math_domains
+            .iter()
+            .map(|domain| domain.label().to_string())
+            .collect(),
+        reasoning_modes: semantics
+            .reasoning_modes
+            .iter()
+            .map(|mode| mode.label().to_string())
+            .collect(),
+        verifier_version: RULIAD_VERIFIER_VERSION,
+        oracle_hash: oracle_hash.to_string(),
+        query: compact_query(spec),
+        proof_steps: compact_proof_steps(spec),
+        answer: compact_answer(spec),
+        data: compact_data(spec),
+    }
+}
+
+fn compact_query(spec: &RuliadSampleSpec) -> String {
+    match spec {
+        RuliadSampleSpec::Eca { steps, .. } => format!("compose local rule for {steps} steps"),
+        RuliadSampleSpec::Simulation {
+            source_rule,
+            target_rule,
+            steps,
+            ..
+        } => format!("verify complement functor rule {source_rule}->{target_rule} for {steps}"),
+        RuliadSampleSpec::Automaton { input, .. } => format!("evaluate word action {}", input),
+        RuliadSampleSpec::Rewrite { initial, steps, .. } => {
+            format!("normalize {initial} in <= {steps} rewrites")
+        }
+        RuliadSampleSpec::Algebra { law, operands, .. } => {
+            format!("check {} on {}", law.label(), compact_usize_list(operands))
+        }
+        RuliadSampleSpec::Category { task, .. } => match task {
+            RuliadTaskKind::ComposeCategoryPath => "compose finite-category path".to_string(),
+            RuliadTaskKind::VerifyCategoryLaw => "verify finite-category associativity".to_string(),
+            RuliadTaskKind::VerifyFunctorPreservation => {
+                "verify functor preserves composition".to_string()
+            }
+            RuliadTaskKind::VerifyNaturalitySquare => "verify finite naturality square".to_string(),
+            _ => "verify finite category trace".to_string(),
+        },
+        RuliadSampleSpec::LeanTask { task_id, .. } => format!("validate proof payload {task_id}"),
+        RuliadSampleSpec::HashNoise { .. } => "verify entropy canary hash".to_string(),
+    }
+}
+
+fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
+    match spec {
+        RuliadSampleSpec::Eca {
+            initial,
+            trace,
+            steps,
+            ..
+        } => vec![
+            format!("start={initial}"),
+            format!(
+                "path_len={steps};target={}",
+                trace.last().cloned().unwrap_or_default()
+            ),
+        ],
+        RuliadSampleSpec::Simulation {
+            target_initial,
+            mapped_source_trace,
+            target_trace,
+            ..
+        } => vec![
+            format!("map(source0)={target_initial}"),
+            format!(
+                "mapped_last={};target_last={}",
+                mapped_source_trace.last().cloned().unwrap_or_default(),
+                target_trace.last().cloned().unwrap_or_default()
+            ),
+        ],
+        RuliadSampleSpec::Automaton {
+            start_state, trace, ..
+        } => vec![format!(
+            "q{}=>q{}",
+            start_state,
+            trace.last().copied().unwrap_or(*start_state)
+        )],
+        RuliadSampleSpec::Rewrite {
+            initial,
+            trace,
+            normal_form,
+            ..
+        } => vec![format!(
+            "{}=>{} in {} steps",
+            initial,
+            normal_form,
+            trace.len() - 1
+        )],
+        RuliadSampleSpec::Algebra { law, lhs, rhs, .. } => {
+            vec![format!("{} lhs={lhs};rhs={rhs}", law.label())]
+        }
+        RuliadSampleSpec::Category { proof_steps, .. } => proof_steps.clone(),
+        RuliadSampleSpec::LeanTask { .. } => vec!["payload_hash_matches=true".to_string()],
+        RuliadSampleSpec::HashNoise { .. } => vec!["sha256_matches=true".to_string()],
+    }
+}
+
+fn compact_answer(spec: &RuliadSampleSpec) -> String {
+    match spec {
+        RuliadSampleSpec::Eca { trace, .. } => {
+            format!("target={}", trace.last().cloned().unwrap_or_default())
+        }
+        RuliadSampleSpec::Simulation { .. } => "commutes=true".to_string(),
+        RuliadSampleSpec::Automaton { accepted, .. } => format!("accepted={accepted}"),
+        RuliadSampleSpec::Rewrite { normal_form, .. } => format!("normal_form={normal_form}"),
+        RuliadSampleSpec::Algebra { holds, .. } => format!("holds={holds}"),
+        RuliadSampleSpec::Category {
+            lhs, rhs, holds, ..
+        } => format!("holds={holds};lhs={lhs};rhs={rhs}"),
+        RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("payload_hash={payload_hash}"),
+        RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("payload_hash={payload_hash}"),
+    }
+}
+
+fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
     match spec {
         RuliadSampleSpec::Eca {
             rule,
@@ -681,16 +948,14 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             initial,
             trace,
             ..
-        } => format!(
-            "{}rule={}\nwidth={}\nsteps={}\ninitial={}\ntrace={}\ntarget={}\n</ruliad>\n",
-            header,
-            rule,
-            width,
-            steps,
-            initial,
-            trace.join(","),
-            trace.last().cloned().unwrap_or_default()
-        ),
+        } => vec![
+            format!("rule={rule};w={width};steps={steps}"),
+            format!(
+                "edge={}=>{}",
+                initial,
+                trace.last().cloned().unwrap_or_default()
+            ),
+        ],
         RuliadSampleSpec::Simulation {
             source_rule,
             target_rule,
@@ -698,153 +963,174 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
             steps,
             source_initial,
             target_initial,
-            source_trace,
-            target_trace,
-            mapped_source_trace,
             ..
-        } => format!(
-            "{}source_rule={}\ntarget_rule={}\nwidth={}\nsteps={}\nsource_initial={}\ntarget_initial={}\nsource_trace={}\ntarget_trace={}\nmapped_source_trace={}\nclaim=map(step_source^t(x)) == step_target^t(map(x))\n</ruliad>\n",
-            header,
-            source_rule,
-            target_rule,
-            width,
-            steps,
-            source_initial,
-            target_initial,
-            source_trace.join(","),
-            target_trace.join(","),
-            mapped_source_trace.join(",")
-        ),
+        } => vec![
+            format!("rules={source_rule}->{target_rule};w={width};steps={steps}"),
+            format!("x={source_initial};Fx={target_initial}"),
+        ],
         RuliadSampleSpec::Automaton {
             state_count,
             transitions,
             start_state,
             accept_states,
             input,
-            trace,
-            accepted,
             ..
-        } => format!(
-            "{}states={}\nstart={}\naccept_states={:?}\ninput={}\ntransitions={:?}\ntrace={:?}\naccepted={}\n</ruliad>\n",
-            header, state_count, start_state, accept_states, input, transitions, trace, accepted
-        ),
+        } => vec![
+            format!("states={state_count};start={start_state};accept={accept_states:?}"),
+            format!("input={input};delta={transitions:?}"),
+        ],
         RuliadSampleSpec::Rewrite {
-            alphabet,
-            rules,
-            initial,
-            steps,
-            trace,
-            normal_form,
-            ..
-        } => {
-            let rule_text = rules
-                .iter()
-                .map(|rule| format!("{}->{}", rule.from, rule.to))
-                .collect::<Vec<_>>()
-                .join(",");
+            alphabet, rules, ..
+        } => vec![
+            format!("alphabet={alphabet}"),
             format!(
-                "{}alphabet={}\nrules={}\ninitial={}\nsteps={}\ntrace={}\nnormal_form={}\n</ruliad>\n",
-                header,
-                alphabet,
-                rule_text,
-                initial,
-                steps,
-                trace.join(","),
-                normal_form
-            )
-        }
+                "rules={}",
+                rules
+                    .iter()
+                    .map(|rule| format!("{}>{}", rule.from, rule.to))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ],
         RuliadSampleSpec::Algebra {
             carrier_size,
             operation_table,
-            law,
             operands,
-            lhs,
-            rhs,
-            holds,
             ..
-        } => format!(
-            "{}carrier_size={}\nlaw={}\noperands={:?}\noperation_table={:?}\nlhs={}\nrhs={}\nholds={}\n</ruliad>\n",
-            header,
-            carrier_size,
-            law.label(),
-            operands,
-            operation_table,
-            lhs,
-            rhs,
-            holds
-        ),
+        } => vec![
+            format!(
+                "carrier={carrier_size};operands={}",
+                compact_usize_list(operands)
+            ),
+            format!("table={}", compact_table(operation_table)),
+        ],
         RuliadSampleSpec::Category {
             object_count,
+            morphisms,
+            identities,
             path,
             composed,
-            associative,
+            functor,
+            naturality,
             ..
-        } => format!(
-            "{}object_count={}\npath={:?}\ncomposed={:?}\nassociative={}\n</ruliad>\n",
-            header, object_count, path, composed, associative
-        ),
+        } => {
+            let mut data = vec![
+                format!(
+                    "objects={object_count};ids={}",
+                    compact_usize_list(identities)
+                ),
+                format!("path={};composed={composed}", compact_usize_list(path)),
+                format!("arrows={}", compact_morphism_summary(morphisms)),
+            ];
+            if let Some(functor) = functor {
+                data.push(format!(
+                    "{}:obj={}",
+                    functor.name,
+                    compact_usize_list(&functor.object_map)
+                ));
+            }
+            if let Some(naturality) = naturality {
+                data.push(format!(
+                    "nat:f={};l={};r={}",
+                    naturality.source_morphism,
+                    compact_usize_list(&naturality.left_path),
+                    compact_usize_list(&naturality.right_path)
+                ));
+            }
+            data
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
             proof,
-            payload_hash,
             ..
-        } => format!(
-            "{}task_id={}\npayload_hash={}\nstatement={}\nproof={}\n</ruliad>\n",
-            header, task_id, payload_hash, statement, proof
-        ),
-        RuliadSampleSpec::HashNoise {
-            bytes_hex,
-            payload_hash,
-            ..
-        } => format!(
-            "{}payload_hash={}\nbytes={}\n</ruliad>\n",
-            header, payload_hash, bytes_hex
-        ),
+        } => vec![
+            format!("task_id={task_id}"),
+            format!("stmt={}", compact_text(statement, 40)),
+            format!("proof={}", compact_text(proof, 40)),
+        ],
+        RuliadSampleSpec::HashNoise { bytes_hex, .. } => {
+            vec![format!("bytes={}", compact_text(bytes_hex, 64))]
+        }
     }
 }
 
-fn categorical_text_header(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
-    let view = ruliad_categorical_presentation(spec);
-    let family = family_of_spec(spec);
-    let task_kind = task_kind_of_spec(spec);
-    let semantics = ruliad_source_semantics(family, task_kind);
-    let domains = semantics
-        .math_domains
-        .iter()
-        .map(|domain| domain.label())
-        .collect::<Vec<_>>()
-        .join(",");
-    let modes = semantics
-        .reasoning_modes
-        .iter()
-        .map(|mode| mode.label())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "<ruliad abstraction=\"{}\" source=\"{}\" presentation=\"{}\" task=\"{}\" domains=\"{}\" reasoning_modes=\"{}\" verifier=\"{}\" hash=\"{}\">\nquery={}\nanswer={}\ncategory_objects={}\ncategory_morphisms={}\ncategory_laws={}\n",
-        view.abstraction,
-        view.source_family,
-        view.presentation,
-        view.task_kind,
-        domains,
-        modes,
-        RULIAD_VERIFIER_VERSION,
-        oracle_hash,
-        view.query,
-        view.answer,
-        join_or_dash(&view.objects),
-        join_or_dash(&view.morphisms),
-        join_or_dash(&view.laws)
-    )
-}
-
-fn join_or_dash(values: &[String]) -> String {
-    if values.is_empty() {
-        "-".to_string()
+fn compact_text(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        value.to_string()
     } else {
-        values.join(",")
+        format!(
+            "{}..",
+            value
+                .chars()
+                .take(max_len.saturating_sub(2))
+                .collect::<String>()
+        )
     }
+}
+
+fn compact_labels(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| compact_label(value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compact_label(value: &str) -> &str {
+    match value {
+        "discrete_dynamics" => "dd",
+        "computation_theory" => "ct",
+        "symbolic_rewriting" => "sr",
+        "universal_algebra" => "ua",
+        "category_theory" => "cat",
+        "formal_proof" => "fp",
+        "information_theory" => "it",
+        "local_rule_evaluation" => "lre",
+        "iterated_dynamics" => "iter",
+        "state_machine_execution" => "sm",
+        "simulation_equivalence" => "sim",
+        "structure_preservation" => "struct",
+        "normalization" => "norm",
+        "equational_reasoning" => "eq",
+        "counterexample_evaluation" => "cex",
+        "compositional_reasoning" => "comp",
+        "associativity" => "assoc",
+        "formal_deduction" => "proof",
+        "entropy_canary" => "entropy",
+        other => other,
+    }
+}
+
+fn compact_usize_list(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compact_table(table: &[Vec<usize>]) -> String {
+    table
+        .iter()
+        .map(|row| compact_usize_list(row))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn compact_morphism_summary(morphisms: &[RuliadCategoryMorphism]) -> String {
+    let first = morphisms
+        .first()
+        .map(|morphism| morphism.name.as_str())
+        .unwrap_or("-");
+    let last = morphisms
+        .last()
+        .map(|morphism| morphism.name.as_str())
+        .unwrap_or("-");
+    format!(
+        "count={};thin_total_order;first={first};last={last}",
+        morphisms.len()
+    )
 }
 
 fn family_of_spec(spec: &RuliadSampleSpec) -> RuliadFamilyKind {
@@ -1115,23 +1401,35 @@ fn generate_category_spec(
     family: &RuliadFamilyConfig,
     rng: &mut SplitMix64,
 ) -> Result<RuliadSampleSpec> {
-    let object_count = range_or(family.width, 3, 7, rng);
-    let path_len = range_or(family.steps, 3, 6, rng).max(2);
-    let mut path = Vec::with_capacity(path_len);
-    let mut current = rng.next_usize(object_count);
-    path.push(current);
-    for _ in 1..path_len {
-        let remaining = object_count.saturating_sub(current + 1);
-        current += rng.next_usize(remaining + 1);
-        path.push(current);
-    }
-    let composed = vec![path[0], *path.last().unwrap_or(&path[0])];
+    let task = match rng.next_usize(4) {
+        0 => RuliadTaskKind::ComposeCategoryPath,
+        1 => RuliadTaskKind::VerifyCategoryLaw,
+        2 => RuliadTaskKind::VerifyFunctorPreservation,
+        _ => RuliadTaskKind::VerifyNaturalitySquare,
+    };
+    generate_category_spec_for_task(family, task, rng)
+}
+
+fn generate_category_spec_for_task(
+    family: &RuliadFamilyConfig,
+    task: RuliadTaskKind,
+    rng: &mut SplitMix64,
+) -> Result<RuliadSampleSpec> {
+    let fields = generate_category_fields(family, task, rng)?;
     Ok(RuliadSampleSpec::Category {
-        object_count,
-        path,
-        composed,
-        associative: true,
-        task: RuliadTaskKind::ComposeCategoryPath,
+        object_count: fields.object_count,
+        morphisms: fields.morphisms,
+        identities: fields.identities,
+        composition: fields.composition,
+        path: fields.path,
+        composed: fields.composed,
+        lhs: fields.lhs,
+        rhs: fields.rhs,
+        holds: fields.holds,
+        proof_steps: fields.proof_steps,
+        functor: fields.functor,
+        naturality: fields.naturality,
+        task: fields.task,
     })
 }
 
@@ -1242,13 +1540,13 @@ fn apply_rewrite_once(value: &str, rules: &[RuliadRewriteRule]) -> Option<String
         if rule.from.is_empty() {
             continue;
         }
-        if let Some(position) = value.find(&rule.from) {
-            if best_match.is_none_or(|(best_position, best_rule_index)| {
+        if let Some(position) = value.find(&rule.from)
+            && best_match.is_none_or(|(best_position, best_rule_index)| {
                 position < best_position
                     || (position == best_position && rule_index < best_rule_index)
-            }) {
-                best_match = Some((position, rule_index));
-            }
+            })
+        {
+            best_match = Some((position, rule_index));
         }
     }
     let (position, rule_index) = best_match?;
@@ -1365,11 +1663,14 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             65.0,
         ),
         RuliadSampleSpec::Category {
-            object_count, path, ..
+            object_count,
+            morphisms,
+            path,
+            ..
         } => (
             *object_count,
             path.len().saturating_sub(1),
-            *object_count,
+            morphisms.len(),
             finite_state_transition_rate(path),
             70.0,
         ),
@@ -1558,12 +1859,121 @@ mod tests {
             assert!(
                 sample
                     .text
-                    .starts_with("<ruliad abstraction=\"finite_category_reasoning\"")
+                    .starts_with("<ruliad a=finite_category_reasoning")
             );
             assert!(!sample.text.contains("<ruliad family="));
-            assert!(sample.text.contains("query="));
-            assert!(sample.text.contains("answer="));
+            assert!(sample.text.contains("\nq:"));
+            assert!(sample.text.contains("\na:"));
+            assert!(
+                sample.text.len() <= 512,
+                "{} sample exceeded trace-pretraining payload budget: {} bytes",
+                family.label(),
+                sample.text.len()
+            );
         }
+    }
+
+    #[test]
+    fn generated_category_tasks_verify_and_exercise_laws() {
+        for task_kind in [
+            RuliadTaskKind::ComposeCategoryPath,
+            RuliadTaskKind::VerifyCategoryLaw,
+            RuliadTaskKind::VerifyFunctorPreservation,
+            RuliadTaskKind::VerifyNaturalitySquare,
+        ] {
+            let mut rng = sample_rng(42, SampleSplit::Train, 0, task_kind as usize, 0);
+            let sample = generate_category_spec_for_task(
+                &RuliadFamilyConfig {
+                    kind: RuliadFamilyKind::Category,
+                    weight: 1,
+                    width: Some(UsizeRangeConfig { min: 5, max: 5 }),
+                    steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                },
+                task_kind,
+                &mut rng,
+            )
+            .expect("category spec");
+            let report = verify_spec(&sample).expect("verify");
+            assert!(report.ok, "task {} should verify", task_kind.label());
+            let text = sample_text(&sample, &report.oracle_hash);
+            assert!(
+                text.len() <= 512,
+                "task {} text exceeded payload budget: {} bytes",
+                task_kind.label(),
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_category_composition_is_rejected() {
+        let mut rng = sample_rng(43, SampleSplit::Train, 0, 0, 0);
+        let mut sample = generate_category_spec_for_task(
+            &RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Category,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(UsizeRangeConfig { min: 3, max: 3 }),
+            },
+            RuliadTaskKind::VerifyCategoryLaw,
+            &mut rng,
+        )
+        .expect("category spec");
+        let RuliadSampleSpec::Category { composition, .. } = &mut sample else {
+            panic!("expected category");
+        };
+        composition[0][0] = Some(1);
+        assert!(!verify_spec(&sample).expect("verify").ok);
+    }
+
+    #[test]
+    fn corrupted_functor_and_naturality_are_rejected() {
+        let family = RuliadFamilyConfig {
+            kind: RuliadFamilyKind::Category,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 5, max: 5 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+        };
+        let mut functor_rng = sample_rng(44, SampleSplit::Train, 0, 0, 0);
+        let mut functor_sample = generate_category_spec_for_task(
+            &family,
+            RuliadTaskKind::VerifyFunctorPreservation,
+            &mut functor_rng,
+        )
+        .expect("functor spec");
+        let RuliadSampleSpec::Category { functor, .. } = &mut functor_sample else {
+            panic!("expected category");
+        };
+        let functor = functor.as_mut().expect("functor");
+        functor.morphism_map[0] = functor.morphism_map[0].saturating_add(1);
+        assert!(!verify_spec(&functor_sample).expect("verify").ok);
+
+        let mut short_map_sample = generate_category_spec_for_task(
+            &family,
+            RuliadTaskKind::VerifyFunctorPreservation,
+            &mut sample_rng(46, SampleSplit::Train, 0, 0, 0),
+        )
+        .expect("functor spec");
+        let RuliadSampleSpec::Category { functor, .. } = &mut short_map_sample else {
+            panic!("expected category");
+        };
+        let functor = functor.as_mut().expect("functor");
+        functor.object_map.pop();
+        assert!(!verify_spec(&short_map_sample).expect("verify").ok);
+
+        let mut naturality_rng = sample_rng(45, SampleSplit::Train, 0, 0, 0);
+        let mut naturality_sample = generate_category_spec_for_task(
+            &family,
+            RuliadTaskKind::VerifyNaturalitySquare,
+            &mut naturality_rng,
+        )
+        .expect("naturality spec");
+        let RuliadSampleSpec::Category { naturality, .. } = &mut naturality_sample else {
+            panic!("expected category");
+        };
+        let naturality = naturality.as_mut().expect("naturality");
+        naturality.right_path.reverse();
+        assert!(!verify_spec(&naturality_sample).expect("verify").ok);
     }
 
     #[test]
@@ -1645,9 +2055,13 @@ mod tests {
                     algebra_outcomes.insert(*holds);
                 }
                 RuliadSampleSpec::Category {
-                    object_count, path, ..
+                    object_count,
+                    morphisms,
+                    path,
+                    ..
                 } => {
                     widths.insert(*object_count);
+                    widths.insert(morphisms.len());
                     step_counts.insert(path.len().saturating_sub(1));
                 }
                 RuliadSampleSpec::LeanTask { .. } | RuliadSampleSpec::HashNoise { .. } => {}
@@ -1678,6 +2092,9 @@ mod tests {
             RuliadTaskKind::RewriteNormalForm,
             RuliadTaskKind::CheckAlgebraLaw,
             RuliadTaskKind::ComposeCategoryPath,
+            RuliadTaskKind::VerifyCategoryLaw,
+            RuliadTaskKind::VerifyFunctorPreservation,
+            RuliadTaskKind::VerifyNaturalitySquare,
             RuliadTaskKind::CompleteProof,
             RuliadTaskKind::HashCanary,
         ] {

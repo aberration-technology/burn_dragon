@@ -71,6 +71,9 @@ pub enum RuliadTaskKind {
     RewriteNormalForm,
     CheckAlgebraLaw,
     ComposeCategoryPath,
+    VerifyCategoryLaw,
+    VerifyFunctorPreservation,
+    VerifyNaturalitySquare,
     CompleteProof,
     HashCanary,
 }
@@ -85,6 +88,9 @@ impl RuliadTaskKind {
             Self::RewriteNormalForm => "rewrite_normal_form",
             Self::CheckAlgebraLaw => "check_algebra_law",
             Self::ComposeCategoryPath => "compose_category_path",
+            Self::VerifyCategoryLaw => "verify_category_law",
+            Self::VerifyFunctorPreservation => "verify_functor_preservation",
+            Self::VerifyNaturalitySquare => "verify_naturality_square",
             Self::CompleteProof => "complete_proof",
             Self::HashCanary => "hash_canary",
         }
@@ -244,7 +250,34 @@ pub fn ruliad_source_semantics(
                 Mode::Associativity,
                 Mode::StructurePreservation,
             ],
-            description: "composition in a finite thin category",
+            description: "path composition in a finite category",
+        },
+        (Family::Category, Task::VerifyCategoryLaw) => RuliadSourceSemantics {
+            math_domains: &[Domain::CategoryTheory],
+            reasoning_modes: &[
+                Mode::Associativity,
+                Mode::EquationalReasoning,
+                Mode::StructurePreservation,
+            ],
+            description: "identity or associativity law verification in a finite category",
+        },
+        (Family::Category, Task::VerifyFunctorPreservation) => RuliadSourceSemantics {
+            math_domains: &[Domain::CategoryTheory],
+            reasoning_modes: &[
+                Mode::StructurePreservation,
+                Mode::CompositionalReasoning,
+                Mode::EquationalReasoning,
+            ],
+            description: "verification that a finite functor preserves composition",
+        },
+        (Family::Category, Task::VerifyNaturalitySquare) => RuliadSourceSemantics {
+            math_domains: &[Domain::CategoryTheory],
+            reasoning_modes: &[
+                Mode::StructurePreservation,
+                Mode::CompositionalReasoning,
+                Mode::FormalDeduction,
+            ],
+            description: "verification that a finite naturality square commutes",
         },
         (Family::LeanTask, Task::CompleteProof) => RuliadSourceSemantics {
             math_domains: &[Domain::FormalProof, Domain::CategoryTheory],
@@ -291,6 +324,9 @@ fn task_default_reasoning_modes(task_kind: RuliadTaskKind) -> &'static [RuliadRe
         RuliadTaskKind::RewriteNormalForm => &[RuliadReasoningMode::Normalization],
         RuliadTaskKind::CheckAlgebraLaw => &[RuliadReasoningMode::EquationalReasoning],
         RuliadTaskKind::ComposeCategoryPath => &[RuliadReasoningMode::CompositionalReasoning],
+        RuliadTaskKind::VerifyCategoryLaw => &[RuliadReasoningMode::Associativity],
+        RuliadTaskKind::VerifyFunctorPreservation => &[RuliadReasoningMode::StructurePreservation],
+        RuliadTaskKind::VerifyNaturalitySquare => &[RuliadReasoningMode::StructurePreservation],
         RuliadTaskKind::CompleteProof => &[RuliadReasoningMode::FormalDeduction],
         RuliadTaskKind::HashCanary => &[RuliadReasoningMode::EntropyCanary],
     }
@@ -344,21 +380,12 @@ impl Default for RuliadTokenizationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSourceSelectionConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub sampler: RuliadSamplerConfig,
-}
-
-impl Default for RuliadSourceSelectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sampler: RuliadSamplerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -516,7 +543,7 @@ fn default_weight() -> usize {
 }
 
 fn default_document_tokens() -> usize {
-    384
+    513
 }
 
 fn default_preview_samples() -> usize {

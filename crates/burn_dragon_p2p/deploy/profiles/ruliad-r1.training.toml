@@ -19,7 +19,7 @@ latent_total = 1024
 type = "standard_token_classification"
 
 [training]
-block_size = 256
+block_size = 512
 batch_size = 6
 max_iters = 24
 checkpoint_interval_iters = 8

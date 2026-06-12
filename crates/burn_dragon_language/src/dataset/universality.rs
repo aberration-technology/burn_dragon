@@ -1449,7 +1449,7 @@ mod tests {
             validation_samples: 4,
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig {
-                document_tokens: 96,
+                document_tokens: 513,
                 preview_samples: 2,
             },
             tokenization: RuliadTokenizationConfig::default(),
@@ -1679,7 +1679,7 @@ mod tests {
         );
         assert_eq!(
             dataset.preferred_logical_document_tokens(DatasetSplit::Train),
-            Some(95)
+            Some(512)
         );
 
         let mut first = vec![0u32; 64];

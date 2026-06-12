@@ -100,11 +100,7 @@ pub fn ruliad_source_buckets(config: &RuliadCorpusConfig) -> Vec<RuliadSourceBuc
                 RuliadTaskKind::CheckAlgebraLaw,
                 family.weight as f32,
             )),
-            RuliadFamilyKind::Category => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::ComposeCategoryPath,
-                family.weight as f32,
-            )),
+            RuliadFamilyKind::Category => add_category_buckets(&mut buckets, family),
             RuliadFamilyKind::LeanTask => buckets.push(single_bucket(
                 family,
                 RuliadTaskKind::CompleteProof,
@@ -208,6 +204,18 @@ fn add_eca_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyC
             family_config,
             prior: family.weight as f32 * multi_count / total,
         });
+    }
+}
+
+fn add_category_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyConfig) {
+    let prior = family.weight as f32 / 4.0;
+    for task_kind in [
+        RuliadTaskKind::ComposeCategoryPath,
+        RuliadTaskKind::VerifyCategoryLaw,
+        RuliadTaskKind::VerifyFunctorPreservation,
+        RuliadTaskKind::VerifyNaturalitySquare,
+    ] {
+        buckets.push(single_bucket(family, task_kind, prior));
     }
 }
 

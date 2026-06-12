@@ -83,8 +83,9 @@ pub use manifest::{
 pub use ruliad::{
     GeneratedRuliadCorpusReport, LeanMode, LeanProofTask, OnlineRuliadCorpus,
     RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RULIAD_VERIFIER_VERSION,
-    RuliadCategoricalPresentation, RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind,
-    RuliadFrontierSampler, RuliadMathDomain, RuliadMetricSnapshot, RuliadReasoningMode,
+    RuliadCategoricalPresentation, RuliadCategoryFunctor, RuliadCategoryMorphism,
+    RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadFrontierSampler,
+    RuliadMathDomain, RuliadMetricSnapshot, RuliadNaturalityCheck, RuliadReasoningMode,
     RuliadRuntimeSampleDocument, RuliadSampleSpec, RuliadSampleTelemetry, RuliadSamplerCandidate,
     RuliadSamplerConfig, RuliadSerializationConfig, RuliadSourceBucket, RuliadSourceBucketId,
     RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind, RuliadTokenizationConfig,

@@ -57,9 +57,11 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
                     &chunk_dir,
                     &mut chunks,
                     &mut chunk_tokens,
-                    chunk_split,
-                    chunk_start,
-                    chunk_sample_count,
+                    ChunkMetadata {
+                        split: chunk_split,
+                        token_offset: chunk_start,
+                        sample_count: chunk_sample_count,
+                    },
                     &mut chunk_index,
                 )?;
                 chunk_start = token_offset;
@@ -125,9 +127,11 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
             &chunk_dir,
             &mut chunks,
             &mut chunk_tokens,
-            chunk_split,
-            chunk_start,
-            chunk_sample_count,
+            ChunkMetadata {
+                split: chunk_split,
+                token_offset: chunk_start,
+                sample_count: chunk_sample_count,
+            },
             &mut chunk_index,
         )?;
     }
@@ -166,14 +170,19 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChunkMetadata {
+    split: SampleSplit,
+    token_offset: usize,
+    sample_count: usize,
+}
+
 fn flush_chunk(
     output_dir: &std::path::Path,
     chunk_dir: &std::path::Path,
     chunks: &mut Vec<UniversalityChunkManifest>,
     chunk_tokens: &mut Vec<u32>,
-    split: SampleSplit,
-    token_offset: usize,
-    sample_count: usize,
+    metadata: ChunkMetadata,
     chunk_index: &mut usize,
 ) -> Result<()> {
     let file_name = format!("chunk-{chunk_index:05}.bin");
@@ -185,10 +194,10 @@ fn flush_chunk(
     fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     chunks.push(UniversalityChunkManifest {
         file_name,
-        split,
-        token_offset,
+        split: metadata.split,
+        token_offset: metadata.token_offset,
         token_count: chunk_tokens.len(),
-        sample_count,
+        sample_count: metadata.sample_count,
     });
     chunk_tokens.clear();
     *chunk_index += 1;
@@ -285,7 +294,7 @@ mod tests {
             validation_samples: 2,
             chunk_token_capacity: 512,
             serialization: RuliadSerializationConfig {
-                document_tokens: 96,
+                document_tokens: 513,
                 preview_samples: 1,
             },
             tokenization: RuliadTokenizationConfig::default(),

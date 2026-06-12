@@ -13,6 +13,7 @@
 pub mod category;
 pub mod config;
 pub mod eca;
+pub mod eval;
 pub mod generate;
 pub mod metrics;
 pub mod oracles;
@@ -34,11 +35,21 @@ pub use config::{
     RuliadSerializationConfig, RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind,
     RuliadTokenizationConfig, default_ruliad_families, load_ruliad_config, ruliad_source_semantics,
 };
+pub use eval::{
+    RULIAD_DIAGNOSTIC_REPORT_VERSION, RULIAD_EVAL_REPORT_VERSION, RuliadCompletionRecord,
+    RuliadCountShare, RuliadDiagnosticReport, RuliadDiagnosticThresholds, RuliadEvalBaseline,
+    RuliadEvalConfig, RuliadEvalFailure, RuliadEvalGroupScore, RuliadEvalItem, RuliadEvalReport,
+    RuliadSourceBucketDiagnostic, baseline_completions, build_eval_items_from_manifest,
+    diagnose_config, diagnose_manifest, evaluate_completions, extract_ruliad_answer,
+    read_completion_records, ruliad_answers_exact_match, ruliad_answers_semantic_match,
+    write_completion_records_jsonl, write_eval_items_jsonl,
+};
 pub use generate::{GeneratedRuliadCorpusReport, generate_ruliad_corpus};
 pub use metrics::{RuliadMetricSnapshot, RuliadSampleTelemetry};
 pub use oracles::{
     GeneratedRuliadSample, LeanProofTask, RULIAD_VERIFIER_VERSION, RuliadCategoricalPresentation,
-    RuliadSampleSpec, load_proof_tasks, ruliad_categorical_presentation,
+    RuliadSampleSpec, load_proof_tasks, ruliad_categorical_presentation, ruliad_expected_answer,
+    ruliad_prompt_prefix,
 };
 pub use runtime::{
     OnlineRuliadCorpus, RuliadRuntimeSampleDocument, fixed_ruliad_document_token_count,

@@ -763,6 +763,19 @@ pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
     trace_document(spec, oracle_hash).to_text()
 }
 
+pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
+    compact_answer(spec)
+}
+
+pub fn ruliad_prompt_prefix(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
+    let text = sample_text(spec, oracle_hash);
+    if let Some(answer_offset) = text.find("\na:") {
+        text[..answer_offset + 3].to_string()
+    } else {
+        text
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuliadTraceDocument {
     abstraction: String,
@@ -888,11 +901,10 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             target_trace,
             ..
         } => vec![
-            format!("map(source0)={target_initial}"),
+            format!("F0={target_initial}"),
             format!(
-                "mapped_last={};target_last={}",
-                mapped_source_trace.last().cloned().unwrap_or_default(),
-                target_trace.last().cloned().unwrap_or_default()
+                "last_ok={}",
+                mapped_source_trace.last() == target_trace.last()
             ),
         ],
         RuliadSampleSpec::Automaton {
@@ -962,11 +974,10 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             width,
             steps,
             source_initial,
-            target_initial,
             ..
         } => vec![
             format!("rules={source_rule}->{target_rule};w={width};steps={steps}"),
-            format!("x={source_initial};Fx={target_initial}"),
+            format!("x0={source_initial};F=complement"),
         ],
         RuliadSampleSpec::Automaton {
             state_count,

@@ -130,6 +130,24 @@ jobs:
         timeout-minutes: 15
       - run: cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets -- --test-threads=1
         timeout-minutes: 15
+      - name: ruliad diagnostic and eval smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            generate --out target/ruliad-ci-smoke/manifest.json -n 32
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            diagnose --manifest target/ruliad-ci-smoke/manifest.json \
+            --fail-on-gates --out target/ruliad-ci-smoke/diagnose.json
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            eval --manifest target/ruliad-ci-smoke/manifest.json --max-items 8 \
+            --items-out target/ruliad-ci-smoke/items.jsonl \
+            --min-semantic-accuracy 1.0 --out target/ruliad-ci-smoke/eval-oracle.json
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            eval --manifest target/ruliad-ci-smoke/manifest.json --max-items 8 \
+            --baseline corrupt --max-semantic-accuracy 0.0 \
+            --out target/ruliad-ci-smoke/eval-corrupt.json
+        timeout-minutes: 10
       - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib deployment::tests:: -- --nocapture"
         timeout-minutes: 25
       - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"

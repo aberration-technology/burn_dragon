@@ -87,6 +87,11 @@ harness = false
 required-features = ["train"]
 
 [[bench]]
+name = "universality_loader"
+harness = false
+required-features = ["train"]
+
+[[bench]]
 name = "gdn2_sequence"
 harness = false
 

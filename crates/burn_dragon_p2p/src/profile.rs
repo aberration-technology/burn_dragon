@@ -25,7 +25,7 @@ use burn_dragon_language::{
     DatasetSourceConfig, DragonConfig, TrainingConfig, load_training_config,
 };
 #[cfg(feature = "native")]
-use burn_dragon_universality::NcaCorpusConfig;
+use burn_dragon_universality::{NcaCorpusConfig, RuliadCorpusConfig};
 #[cfg(feature = "native")]
 use burn_p2p::BrowserEdgeSnapshot;
 
@@ -61,9 +61,110 @@ const NCA_BROWSER_MIN_EVAL_DOCUMENT_POOL: usize = 8;
 #[cfg(feature = "native")]
 const PORTABLE_NCA_CORPUS_FILE_NAME: &str = "nca-corpus.toml";
 #[cfg(feature = "native")]
+const PORTABLE_RULIAD_CORPUS_FILE_NAME: &str = "ruliad-corpus.toml";
+#[cfg(feature = "native")]
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
 #[cfg(feature = "native")]
 const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r1.profile.json");
+
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortableUniversalityCorpusKind {
+    Nca,
+    Ruliad,
+}
+
+#[cfg(feature = "native")]
+impl PortableUniversalityCorpusKind {
+    fn from_source(source: &DatasetSourceConfig) -> Option<Self> {
+        match source {
+            DatasetSourceConfig::UniversalityNca { .. } => Some(Self::Nca),
+            DatasetSourceConfig::UniversalityRuliad { .. } => Some(Self::Ruliad),
+            _ => None,
+        }
+    }
+
+    fn config_path(self, source: &DatasetSourceConfig) -> Option<&Path> {
+        match (self, source) {
+            (Self::Nca, DatasetSourceConfig::UniversalityNca { config })
+            | (Self::Ruliad, DatasetSourceConfig::UniversalityRuliad { config }) => {
+                Some(config.as_path())
+            }
+            _ => None,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Nca => PORTABLE_NCA_CORPUS_FILE_NAME,
+            Self::Ruliad => PORTABLE_RULIAD_CORPUS_FILE_NAME,
+        }
+    }
+
+    fn generated_dir_name(self) -> &'static str {
+        match self {
+            Self::Nca => "nca-generated",
+            Self::Ruliad => "ruliad-generated",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nca => "NCA",
+            Self::Ruliad => "ruliad",
+        }
+    }
+
+    fn source_config(self, path: PathBuf) -> DatasetSourceConfig {
+        match self {
+            Self::Nca => DatasetSourceConfig::UniversalityNca { config: path },
+            Self::Ruliad => DatasetSourceConfig::UniversalityRuliad { config: path },
+        }
+    }
+
+    fn matches_source(self, source: &DatasetSourceConfig) -> bool {
+        matches!(
+            (self, source),
+            (Self::Nca, DatasetSourceConfig::UniversalityNca { .. })
+                | (Self::Ruliad, DatasetSourceConfig::UniversalityRuliad { .. })
+        )
+    }
+
+    fn apply_source_path(self, config: &mut TrainingConfig, path: PathBuf) {
+        config.dataset.source = self.source_config(path.clone());
+        if let Some(validation) = config.dataset.validation.as_mut()
+            && self.matches_source(&validation.source)
+        {
+            validation.source = self.source_config(path);
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+struct PortableUniversalityCorpus {
+    kind: PortableUniversalityCorpusKind,
+    toml: String,
+}
+
+#[cfg(feature = "native")]
+fn portable_universality_corpus(
+    config: &TrainingConfig,
+) -> Result<Option<PortableUniversalityCorpus>> {
+    let Some(kind) = PortableUniversalityCorpusKind::from_source(&config.dataset.source) else {
+        return Ok(None);
+    };
+    let config_path = kind
+        .config_path(&config.dataset.source)
+        .expect("portable corpus source path");
+    let toml = fs::read_to_string(config_path).map_err(|error| {
+        anyhow!(
+            "failed to read portable {} corpus config {}: {error}",
+            kind.label(),
+            config_path.display()
+        )
+    })?;
+    Ok(Some(PortableUniversalityCorpus { kind, toml }))
+}
 
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +230,8 @@ pub struct DragonNativeExperimentProfile {
     pub training_toml: String,
     #[serde(default)]
     pub nca_corpus_toml: Option<String>,
+    #[serde(default)]
+    pub ruliad_corpus_toml: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -257,11 +360,15 @@ fn ensure_portable_native_profile(
     match (&config.dataset.source, experiment_kind) {
         (DatasetSourceConfig::UniversalityNca { .. }, DragonExperimentKind::NcaPrepretraining)
         | (
+            DatasetSourceConfig::UniversalityRuliad { .. },
+            DragonExperimentKind::NcaPrepretraining,
+        )
+        | (
             DatasetSourceConfig::NemotronClimbMix { .. },
             DragonExperimentKind::ClimbMixPretraining,
         ) => {}
         _ => bail!(
-            "network-published Dragon profiles currently support only universality_nca and nemotron_climb_mix datasets"
+            "network-published Dragon profiles currently support only universality_nca, universality_ruliad, and nemotron_climb_mix datasets"
         ),
     }
 
@@ -287,27 +394,15 @@ fn ensure_portable_native_profile(
 #[cfg(feature = "native")]
 fn portable_training_template(
     config: &TrainingConfig,
-    nca_corpus_toml: Option<&str>,
+    corpus_kind: Option<PortableUniversalityCorpusKind>,
 ) -> Result<String> {
     let mut portable = config.clone();
     portable.dataset.cache_dir = PathBuf::from(PORTABLE_CACHE_DIR_NAME);
     if let Some(validation) = portable.dataset.validation.as_mut() {
         validation.cache_dir = None;
     }
-    if nca_corpus_toml.is_some() {
-        portable.dataset.source = DatasetSourceConfig::UniversalityNca {
-            config: PathBuf::from(PORTABLE_NCA_CORPUS_FILE_NAME),
-        };
-        if let Some(validation) = portable.dataset.validation.as_mut()
-            && matches!(
-                validation.source,
-                DatasetSourceConfig::UniversalityNca { .. }
-            )
-        {
-            validation.source = DatasetSourceConfig::UniversalityNca {
-                config: PathBuf::from(PORTABLE_NCA_CORPUS_FILE_NAME),
-            };
-        }
+    if let Some(kind) = corpus_kind {
+        kind.apply_source_path(&mut portable, PathBuf::from(kind.file_name()));
     }
     toml::to_string(&portable).map_err(Into::into)
 }
@@ -317,6 +412,7 @@ fn browser_profile_from_native_config(
     config: &TrainingConfig,
     experiment_kind: DragonExperimentKind,
     model_config: &DragonConfig,
+    portable_corpus: Option<&PortableUniversalityCorpus>,
     revision_id: Option<&str>,
     browser_climbmix_manifest_url: Option<&str>,
 ) -> Result<Option<DragonBrowserExperimentProfile>> {
@@ -327,12 +423,18 @@ fn browser_profile_from_native_config(
             },
             DragonExperimentKind::NcaPrepretraining,
         ) => {
-            let corpus_toml = fs::read_to_string(nca_config_path).map_err(|error| {
-                anyhow!(
-                    "failed to read portable NCA corpus config {}: {error}",
-                    nca_config_path.display()
-                )
-            })?;
+            let corpus_toml = match portable_corpus {
+                Some(PortableUniversalityCorpus {
+                    kind: PortableUniversalityCorpusKind::Nca,
+                    toml,
+                }) => toml.clone(),
+                _ => fs::read_to_string(nca_config_path).map_err(|error| {
+                    anyhow!(
+                        "failed to read portable NCA corpus config {}: {error}",
+                        nca_config_path.display()
+                    )
+                })?,
+            };
             let window_tuning = DragonBrowserWindowTuning::nca_wgpu_from_native(config);
             let capability_policy = DragonCapabilityPolicy {
                 browser_wgpu_memory_budget_bytes: Some(
@@ -427,28 +529,29 @@ pub fn build_profile_from_local_config(
             .fit(std::iter::empty::<&str>())?
             .as_ref(),
     )?;
-    let nca_corpus_toml = match &config.dataset.source {
-        DatasetSourceConfig::UniversalityNca {
-            config: nca_config_path,
-        } => Some(fs::read_to_string(nca_config_path).map_err(|error| {
-            anyhow!(
-                "failed to read portable NCA corpus config {}: {error}",
-                nca_config_path.display()
-            )
-        })?),
-        _ => None,
-    };
+    let portable_corpus = portable_universality_corpus(config)?;
+    let portable_kind = portable_corpus.as_ref().map(|corpus| corpus.kind);
+    let nca_corpus_toml = portable_corpus
+        .as_ref()
+        .filter(|corpus| corpus.kind == PortableUniversalityCorpusKind::Nca)
+        .map(|corpus| corpus.toml.clone());
+    let ruliad_corpus_toml = portable_corpus
+        .as_ref()
+        .filter(|corpus| corpus.kind == PortableUniversalityCorpusKind::Ruliad)
+        .map(|corpus| corpus.toml.clone());
     Ok(DragonExperimentProfile {
         version: DRAGON_PROFILE_VERSION,
         experiment_kind,
         native: DragonNativeExperimentProfile {
-            training_toml: portable_training_template(config, nca_corpus_toml.as_deref())?,
+            training_toml: portable_training_template(config, portable_kind)?,
             nca_corpus_toml,
+            ruliad_corpus_toml,
         },
         browser: browser_profile_from_native_config(
             config,
             experiment_kind,
             &model_config,
+            portable_corpus.as_ref(),
             revision_id,
             browser_climbmix_manifest_url,
         )?,
@@ -472,6 +575,44 @@ fn profile_storage_root_for_ids(
 #[cfg(feature = "native")]
 fn validation_cache_dir_for(cache_dir: &Path, validation: &mut ValidationDatasetConfig) {
     validation.cache_dir = Some(cache_dir.join("validation"));
+}
+
+#[cfg(feature = "native")]
+fn materialize_portable_universality_corpus(
+    config: &mut TrainingConfig,
+    profile_root: &Path,
+    experiment_id: &str,
+    kind: PortableUniversalityCorpusKind,
+    corpus_toml: &str,
+) -> Result<()> {
+    let output_dir = profile_root.join(kind.generated_dir_name());
+    let corpus_path = profile_root.join(kind.file_name());
+    let serialized = match kind {
+        PortableUniversalityCorpusKind::Nca => {
+            let mut corpus = toml::from_str::<NcaCorpusConfig>(corpus_toml).map_err(|error| {
+                anyhow!(
+                    "failed to decode portable {} corpus config for {experiment_id}: {error}",
+                    kind.label()
+                )
+            })?;
+            corpus.output_dir = output_dir;
+            toml::to_string(&corpus)?
+        }
+        PortableUniversalityCorpusKind::Ruliad => {
+            let mut corpus =
+                toml::from_str::<RuliadCorpusConfig>(corpus_toml).map_err(|error| {
+                    anyhow!(
+                        "failed to decode portable {} corpus config for {experiment_id}: {error}",
+                        kind.label()
+                    )
+                })?;
+            corpus.output_dir = output_dir;
+            toml::to_string(&corpus)?
+        }
+    };
+    fs::write(&corpus_path, serialized)?;
+    kind.apply_source_path(config, corpus_path);
+    Ok(())
 }
 
 #[cfg(feature = "native")]
@@ -509,27 +650,29 @@ fn materialize_native_training_config_for_ids(
     if let Some(validation) = config.dataset.validation.as_mut() {
         validation_cache_dir_for(&cache_dir, validation);
     }
+    if profile.native.nca_corpus_toml.is_some() && profile.native.ruliad_corpus_toml.is_some() {
+        bail!(
+            "native Dragon profile for {experiment_id} must include at most one portable universality corpus"
+        );
+    }
 
     if let Some(corpus_toml) = profile.native.nca_corpus_toml.as_ref() {
-        let mut corpus = toml::from_str::<NcaCorpusConfig>(corpus_toml).map_err(|error| {
-            anyhow!("failed to decode portable NCA corpus config for {experiment_id}: {error}")
-        })?;
-        corpus.output_dir = profile_root.join("nca-generated");
-        let corpus_path = profile_root.join(PORTABLE_NCA_CORPUS_FILE_NAME);
-        fs::write(&corpus_path, toml::to_string(&corpus)?)?;
-        config.dataset.source = DatasetSourceConfig::UniversalityNca {
-            config: corpus_path.clone(),
-        };
-        if let Some(validation) = config.dataset.validation.as_mut()
-            && matches!(
-                validation.source,
-                DatasetSourceConfig::UniversalityNca { .. }
-            )
-        {
-            validation.source = DatasetSourceConfig::UniversalityNca {
-                config: corpus_path,
-            };
-        }
+        materialize_portable_universality_corpus(
+            &mut config,
+            &profile_root,
+            experiment_id,
+            PortableUniversalityCorpusKind::Nca,
+            corpus_toml,
+        )?;
+    }
+    if let Some(corpus_toml) = profile.native.ruliad_corpus_toml.as_ref() {
+        materialize_portable_universality_corpus(
+            &mut config,
+            &profile_root,
+            experiment_id,
+            PortableUniversalityCorpusKind::Ruliad,
+            corpus_toml,
+        )?;
     }
 
     Ok(config)
@@ -842,6 +985,7 @@ mod tests {
             native: DragonNativeExperimentProfile {
                 training_toml: "[training]\nblock_size = 64\nbatch_size = 2\n".into(),
                 nca_corpus_toml: Some("seed = 1337\n".into()),
+                ruliad_corpus_toml: None,
             },
             browser: None,
         };
@@ -928,6 +1072,125 @@ prompt = "1 2 3"
             }
             other => panic!("expected shard-manifest browser source, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn ruliad_profile_materializes_portable_native_corpus() {
+        use burn_dragon_universality::{
+            RuliadSerializationConfig, RuliadSourceSelectionConfig, RuliadTokenizationConfig,
+            compact_ruliad_families,
+        };
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("config dir");
+        let ruliad_config_path = dir.path().join("ruliad.toml");
+        let ruliad_corpus = RuliadCorpusConfig {
+            output_dir: dir.path().join("generated"),
+            seed: 1337,
+            name: "profile-ruliad".into(),
+            train_samples: 8,
+            validation_samples: 4,
+            chunk_token_capacity: 1024,
+            serialization: RuliadSerializationConfig {
+                document_tokens: 513,
+                preview_samples: 1,
+            },
+            tokenization: RuliadTokenizationConfig::default(),
+            source_selection: RuliadSourceSelectionConfig {
+                enabled: true,
+                ..RuliadSourceSelectionConfig::default()
+            },
+            families: compact_ruliad_families(),
+            proof_tasks: None,
+            lean_task_limit: None,
+        };
+        fs::write(
+            &ruliad_config_path,
+            toml::to_string_pretty(&ruliad_corpus).expect("ruliad corpus toml"),
+        )
+        .expect("write ruliad corpus config");
+        let config: TrainingConfig = toml::from_str(&format!(
+            r#"
+[dataset]
+cache_dir = "./cache/ruliad"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "{}"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 50257
+eos_id = 50256
+
+[model]
+n_layer = 2
+n_embd = 64
+n_head = 4
+latent_total = 128
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = 512
+batch_size = 2
+max_iters = 8
+checkpoint_interval_iters = 4
+log_frequency = 1
+seed = 1337
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "<ruliad"
+"#,
+            ruliad_config_path.display()
+        ))
+        .expect("training config");
+
+        let profile = build_profile_from_local_config(
+            &config,
+            DragonExperimentKind::NcaPrepretraining,
+            Some("ruliad-r1"),
+            None,
+        )
+        .expect("profile");
+
+        assert!(profile.native.nca_corpus_toml.is_none());
+        assert!(profile.native.ruliad_corpus_toml.is_some());
+        assert!(profile.browser.is_none());
+        let portable_training: TrainingConfig =
+            toml::from_str(&profile.native.training_toml).expect("portable training config");
+        assert!(matches!(
+            &portable_training.dataset.source,
+            DatasetSourceConfig::UniversalityRuliad { .. }
+        ));
+        if let DatasetSourceConfig::UniversalityRuliad { config } =
+            &portable_training.dataset.source
+        {
+            assert_eq!(config, &PathBuf::from(PORTABLE_RULIAD_CORPUS_FILE_NAME));
+        }
+
+        let storage = tempdir().expect("storage");
+        let materialized = materialize_native_training_config_for_ids(
+            storage.path(),
+            "study",
+            "experiment",
+            "r1",
+            &profile,
+        )
+        .expect("materialized config");
+        let DatasetSourceConfig::UniversalityRuliad { config } = materialized.dataset.source else {
+            panic!("expected materialized ruliad source");
+        };
+        assert!(config.is_file());
+        let corpus: burn_dragon_universality::RuliadCorpusConfig =
+            toml::from_str(&fs::read_to_string(&config).expect("read corpus"))
+                .expect("materialized corpus config");
+        assert!(corpus.output_dir.ends_with("ruliad-generated"));
     }
 
     #[cfg(feature = "native")]

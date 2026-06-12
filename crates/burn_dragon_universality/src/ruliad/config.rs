@@ -530,6 +530,39 @@ pub fn default_ruliad_families() -> Vec<RuliadFamilyConfig> {
     ]
 }
 
+pub fn compact_ruliad_families() -> Vec<RuliadFamilyConfig> {
+    let mut families = default_ruliad_families();
+    for family in &mut families {
+        match family.kind {
+            RuliadFamilyKind::Eca | RuliadFamilyKind::Simulation => {
+                family.width = Some(UsizeRangeConfig { min: 12, max: 16 });
+                family.steps = Some(UsizeRangeConfig { min: 4, max: 6 });
+            }
+            RuliadFamilyKind::Automaton => {
+                family.width = Some(UsizeRangeConfig { min: 3, max: 6 });
+                family.steps = Some(UsizeRangeConfig { min: 4, max: 8 });
+            }
+            RuliadFamilyKind::Rewrite => {
+                family.width = Some(UsizeRangeConfig { min: 8, max: 12 });
+                family.steps = Some(UsizeRangeConfig { min: 4, max: 8 });
+            }
+            RuliadFamilyKind::Algebra => {
+                family.width = Some(UsizeRangeConfig { min: 2, max: 5 });
+                family.steps = None;
+            }
+            RuliadFamilyKind::Category => {
+                family.width = Some(UsizeRangeConfig { min: 3, max: 5 });
+                family.steps = Some(UsizeRangeConfig { min: 3, max: 5 });
+            }
+            RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => {
+                family.width = None;
+                family.steps = None;
+            }
+        }
+    }
+    families
+}
+
 fn default_seed() -> u64 {
     1337
 }
@@ -586,5 +619,43 @@ mod tests {
         };
 
         config.validate().expect("valid config");
+    }
+
+    #[test]
+    fn compact_families_preserve_default_span_with_small_bounds() {
+        let families = compact_ruliad_families();
+        let default_kinds = default_ruliad_families()
+            .into_iter()
+            .map(|family| family.kind)
+            .collect::<Vec<_>>();
+        let compact_kinds = families
+            .iter()
+            .map(|family| family.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(compact_kinds, default_kinds);
+
+        let config = RuliadCorpusConfig {
+            output_dir: "target/test-ruliad-compact".into(),
+            seed: 1,
+            name: "compact".to_string(),
+            train_samples: 8,
+            validation_samples: 2,
+            chunk_token_capacity: 1024,
+            serialization: RuliadSerializationConfig::default(),
+            tokenization: RuliadTokenizationConfig::default(),
+            source_selection: RuliadSourceSelectionConfig::default(),
+            families,
+            proof_tasks: None,
+            lean_task_limit: None,
+        };
+        config.validate().expect("valid compact config");
+        for family in &config.families {
+            if let Some(width) = family.width {
+                assert!(width.max <= 16);
+            }
+            if let Some(steps) = family.steps {
+                assert!(steps.max <= 8);
+            }
+        }
     }
 }

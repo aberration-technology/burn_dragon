@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::TcpListener;
-use std::path::Path;
+use std::panic::resume_unwind;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -55,6 +56,11 @@ use semver::Version;
 use tempfile::tempdir;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use burn_dragon_universality::{
+    RuliadCorpusConfig, RuliadSerializationConfig, RuliadSourceSelectionConfig,
+    RuliadTokenizationConfig, compact_ruliad_families,
+};
+
 #[derive(Clone, Copy)]
 struct SmokeModelSpec {
     n_layer: usize,
@@ -72,6 +78,16 @@ const SMALL_SPEC: SmokeModelSpec = SmokeModelSpec {
     n_head: 4,
     latent_total: 64,
     block_size: 64,
+    batch_size: 2,
+    max_iters: 8,
+};
+
+const MATCHED_512_SMALL_SPEC: SmokeModelSpec = SmokeModelSpec {
+    n_layer: 2,
+    n_embd: 64,
+    n_head: 4,
+    latent_total: 128,
+    block_size: 512,
     batch_size: 2,
     max_iters: 8,
 };
@@ -97,6 +113,17 @@ const LARGE_SPEC: SmokeModelSpec = SmokeModelSpec {
 };
 
 const TEST_WEBRTC_DIRECT_SEED: &str = "/dns4/edge.example/udp/443/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn run_with_large_stack(name: &'static str, test: impl FnOnce() + Send + 'static) {
+    let handle = thread::Builder::new()
+        .name(name.into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(test)
+        .expect("spawn large-stack test thread");
+    if let Err(payload) = handle.join() {
+        resume_unwind(payload);
+    }
+}
 
 fn dummy_auth_bundle() -> DragonNativeAuthBundle {
     DragonNativeAuthBundle {
@@ -215,6 +242,160 @@ prompt = "0 0 0"
     )
 }
 
+fn ruliad_corpus_config_toml(output_dir: &Path) -> String {
+    let config = RuliadCorpusConfig {
+        output_dir: output_dir.into(),
+        seed: 1337,
+        name: "dragon-p2p-ruliad-smoke".into(),
+        train_samples: 32,
+        validation_samples: 8,
+        chunk_token_capacity: 4096,
+        serialization: RuliadSerializationConfig {
+            document_tokens: 513,
+            preview_samples: 2,
+        },
+        tokenization: RuliadTokenizationConfig::default(),
+        source_selection: RuliadSourceSelectionConfig {
+            enabled: true,
+            ..RuliadSourceSelectionConfig::default()
+        },
+        families: compact_ruliad_families(),
+        proof_tasks: None,
+        lean_task_limit: None,
+    };
+    toml::to_string_pretty(&config).expect("ruliad smoke corpus config")
+}
+
+fn ruliad_training_config_toml(
+    cache_dir: &Path,
+    ruliad_config_path: &Path,
+    spec: SmokeModelSpec,
+) -> String {
+    format!(
+        r#"
+[dataset]
+cache_dir = "{}"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "{}"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 50257
+eos_id = 50256
+
+[model]
+n_layer = {}
+n_embd = {}
+n_head = {}
+latent_total = {}
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = {}
+batch_size = {}
+max_iters = {}
+checkpoint_interval_iters = 4
+log_frequency = 1
+seed = 1337
+
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0001
+maturity_steps = 100
+sample_interval_steps = 8
+replace_interval_steps = 64
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "<ruliad"
+"#,
+        cache_dir.display(),
+        ruliad_config_path.display(),
+        spec.n_layer,
+        spec.n_embd,
+        spec.n_head,
+        spec.latent_total,
+        spec.block_size,
+        spec.batch_size,
+        spec.max_iters,
+    )
+}
+
+fn write_nca_smoke_training_config(root: &Path, spec: SmokeModelSpec) -> PathBuf {
+    let nca_config_path = root.join("nca.toml");
+    let training_config_path = root.join("nca-train.toml");
+    write(&nca_config_path, &nca_corpus_config_toml(root));
+    write(
+        &training_config_path,
+        &nca_training_config_toml(&root.join("nca-cache"), &nca_config_path, spec),
+    );
+    training_config_path
+}
+
+fn write_ruliad_smoke_training_config(root: &Path, spec: SmokeModelSpec) -> PathBuf {
+    let ruliad_config_path = root.join("ruliad.toml");
+    let training_config_path = root.join("ruliad-train.toml");
+    write(&ruliad_config_path, &ruliad_corpus_config_toml(root));
+    write(
+        &training_config_path,
+        &ruliad_training_config_toml(&root.join("ruliad-cache"), &ruliad_config_path, spec),
+    );
+    training_config_path
+}
+
+fn native_smoke_peer_config(
+    root: &Path,
+    training_config_path: PathBuf,
+    storage_name: &str,
+    git_commit: &str,
+    shard_export: Option<DragonShardExportConfig>,
+) -> DragonNativePeerConfig {
+    DragonNativePeerConfig {
+        training_overrides: Default::default(),
+        training_config_paths: vec![training_config_path],
+        storage_root: root.join(storage_name),
+        network: Default::default(),
+        target: None,
+        identity: Default::default(),
+        bootstrap_peers: Vec::new(),
+        manifest: native_manifest_seed(),
+        app_semver: semver::Version::parse("0.21.0").expect("valid burn_dragon version"),
+        git_commit: Some(git_commit.into()),
+        enabled_features_label: Some("native-cpu".into()),
+        auth: None,
+        capability_policy: Default::default(),
+        shard_export,
+        existing_shard_dataset: None,
+    }
+}
+
+fn smoke_shard_export(
+    root: &Path,
+    shard_dir_name: &str,
+    dataset_name: &str,
+    microshards: u32,
+    max_records: usize,
+) -> DragonShardExportConfig {
+    DragonShardExportConfig {
+        root: root.join(shard_dir_name),
+        dataset_name: Some(dataset_name.into()),
+        microshards: Some(microshards),
+        max_records: Some(max_records),
+        http_upstream: None,
+    }
+}
+
 fn climbmix_training_config_toml(cache_dir: &Path, spec: SmokeModelSpec) -> String {
     format!(
         r#"
@@ -316,6 +497,18 @@ fn metric_float_any(stats: &std::collections::BTreeMap<String, MetricValue>, key
         }
     }
     panic!("missing any metric in {:?}", keys);
+}
+
+fn optional_metric_float(
+    stats: &std::collections::BTreeMap<String, MetricValue>,
+    key: &str,
+) -> Option<f64> {
+    match stats.get(key) {
+        Some(MetricValue::Float(value)) => Some(*value),
+        Some(MetricValue::Integer(value)) => Some(*value as f64),
+        Some(other) => panic!("expected numeric metric for {key}, got {other:?}"),
+        None => None,
+    }
 }
 
 fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &str) {
@@ -518,6 +711,99 @@ fn shard_manifest_url(base_url: &str) -> String {
 struct NativeWindowObservation {
     head: HeadDescriptor,
     loss: f64,
+    elapsed: Duration,
+}
+
+fn assert_ruliad_source_selection_metrics(
+    label: &str,
+    stats: &std::collections::BTreeMap<String, MetricValue>,
+) {
+    let entropy = metric_float(stats, "ruliad_source_selection_entropy_bits");
+    let hash_noise = metric_float(stats, "ruliad_source_selection_hash_noise_probability");
+    let mean_loss = metric_float(stats, "ruliad_source_selection_mean_loss");
+    let progress = metric_float(stats, "ruliad_source_selection_mean_learning_progress");
+    let verifier_failures = metric_integer(stats, "ruliad_source_selection_verifier_failures");
+    assert!(entropy.is_finite(), "{label} entropy must be finite");
+    assert!(
+        (0.0..=1.0).contains(&hash_noise),
+        "{label} hash-noise probability must be in [0, 1], got {hash_noise}"
+    );
+    assert!(
+        mean_loss.is_finite(),
+        "{label} source mean loss must be finite"
+    );
+    assert!(
+        progress.is_finite(),
+        "{label} source learning progress must be finite"
+    );
+    assert_eq!(
+        verifier_failures, 0,
+        "{label} source selection should not record verifier failures"
+    );
+}
+
+fn best_loss(losses: &[f64]) -> f64 {
+    losses.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+fn assert_material_best_improvement(label: &str, losses: &[f64]) {
+    assert!(losses.len() >= 2, "{label} needs at least two windows");
+    assert!(losses.iter().all(|loss| loss.is_finite()));
+    let first = losses[0];
+    let best = best_loss(losses);
+    let absolute = first - best;
+    let relative = if first.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        absolute / first.abs()
+    };
+    assert!(
+        relative >= 0.05 || absolute >= 0.1,
+        "{label} should improve by at least 5% or 0.1 absolute loss (first={first:.4}, best={best:.4}, relative={relative:.4})"
+    );
+}
+
+fn observation_report_json(
+    label: &str,
+    spec: SmokeModelSpec,
+    observations: &[NativeWindowObservation],
+) -> serde_json::Value {
+    let windows = observations
+        .iter()
+        .enumerate()
+        .map(|(index, obs)| {
+            let train_steps = metric_integer(&obs.head.metrics, "train_steps");
+            let elapsed_secs = obs.elapsed.as_secs_f64();
+            let tokens = train_steps.max(0) as f64 * spec.batch_size as f64 * spec.block_size as f64;
+            serde_json::json!({
+                "window": index + 1,
+                "loss": obs.loss,
+                "train_steps": train_steps,
+                "elapsed_secs": elapsed_secs,
+                "tokens_per_sec": if elapsed_secs > 0.0 { tokens / elapsed_secs } else { 0.0 },
+                "source_selection_entropy_bits": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_entropy_bits"),
+                "source_selection_hash_noise_probability": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_hash_noise_probability"),
+                "source_selection_mean_loss": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_mean_loss"),
+                "source_selection_mean_learning_progress": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_mean_learning_progress"),
+                "source_selection_verifier_failures": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_verifier_failures"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let losses = observations.iter().map(|obs| obs.loss).collect::<Vec<_>>();
+    let first = losses.first().copied().unwrap_or(f64::NAN);
+    let best = best_loss(&losses);
+    serde_json::json!({
+        "label": label,
+        "first_loss": first,
+        "best_loss": best,
+        "absolute_improvement": first - best,
+        "relative_improvement": if first.is_finite() && first.abs() > f64::EPSILON {
+            (first - best) / first.abs()
+        } else {
+            0.0
+        },
+        "windows": windows,
+    })
 }
 
 fn local_browser_training_and_verification_pair(
@@ -700,7 +986,9 @@ where
             cached_microshards: cached,
             batches,
         };
+        let train_start = Instant::now();
         let report = project.train_window(&mut ctx).expect("train window");
+        let elapsed = train_start.elapsed();
         let train_steps = metric_integer(&report.stats, "train_steps");
         assert!(train_steps > 0);
         let loss = metric_float(&report.stats, "train_loss");
@@ -721,7 +1009,11 @@ where
             metrics: report.stats.clone(),
         };
         parent_head_id = Some(head.head_id.clone());
-        observations.push(NativeWindowObservation { head, loss });
+        observations.push(NativeWindowObservation {
+            head,
+            loss,
+            elapsed,
+        });
         model = ctx.model;
     }
 
@@ -1703,6 +1995,40 @@ fn nca_native_peer_exports_shards_and_executes_training_windows() {
     let losses = run_training_windows(&prepared, 3);
     log_loss_series("nca_native_smoke", &losses);
     assert!(losses.last().copied().unwrap_or(f64::INFINITY) <= losses[0] + 0.5);
+}
+
+#[test]
+fn ruliad_native_peer_executes_live_source_training_window() {
+    run_with_large_stack("ruliad-live-source-smoke", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+        let training_config_path =
+            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let native = native_smoke_peer_config(
+            root.path(),
+            training_config_path,
+            "storage-ruliad-live",
+            "ruliad-live",
+            None,
+        );
+
+        let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+        assert_eq!(
+            prepared.project.data_pipeline_kind(),
+            burn_p2p::LeaseDataPipelineKind::IndexedDataset
+        );
+        let observations = run_training_windows_with_heads(&prepared, 1, "ruliad-live");
+        let losses = observations.iter().map(|obs| obs.loss).collect::<Vec<_>>();
+        log_loss_series("ruliad_native_live_source_smoke", &losses);
+        assert!(losses.iter().all(|loss| loss.is_finite()));
+        assert!(losses.iter().copied().fold(f64::INFINITY, f64::min) <= losses[0] + 0.5);
+        for (index, observation) in observations.iter().enumerate() {
+            assert_ruliad_source_selection_metrics(
+                &format!("ruliad live source window {}", index + 1),
+                &observation.head.metrics,
+            );
+        }
+    });
 }
 
 #[test]
@@ -4070,6 +4396,114 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
         losses.iter().copied().fold(f64::INFINITY, f64::min) <= losses[0] - 0.5,
         "medium NCA rung should show a material best-window improvement"
     );
+}
+
+#[test]
+#[ignore = "covered by the explicit ruliad convergence validation rung"]
+fn ruliad_native_peer_small_model_converges_over_more_windows() {
+    run_with_large_stack("ruliad-small-convergence", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+        let training_config_path =
+            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let native = native_smoke_peer_config(
+            root.path(),
+            training_config_path,
+            "storage-ruliad-small",
+            "ruliad-small-scale",
+            Some(smoke_shard_export(
+                root.path(),
+                "ruliad-shards-small",
+                "dragon-ruliad-small",
+                4,
+                64,
+            )),
+        );
+
+        let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+        let losses = run_training_windows(&prepared, 4);
+        log_loss_series("ruliad_native_small_scale", &losses);
+        assert_material_best_improvement("small ruliad rung", &losses);
+    });
+}
+
+#[test]
+#[ignore = "covered by the explicit ruliad convergence validation rung"]
+fn nca_vs_ruliad_small_model_convergence_report() {
+    run_with_large_stack("nca-vs-ruliad-report", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+
+        let nca_training_config_path =
+            write_nca_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let nca_native = native_smoke_peer_config(
+            root.path(),
+            nca_training_config_path,
+            "storage-nca-report",
+            "nca-ruliad-report",
+            Some(smoke_shard_export(
+                root.path(),
+                "nca-report-shards",
+                "dragon-nca-report",
+                4,
+                64,
+            )),
+        );
+
+        let ruliad_training_config_path =
+            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let ruliad_native = native_smoke_peer_config(
+            root.path(),
+            ruliad_training_config_path,
+            "storage-ruliad-report",
+            "nca-ruliad-report",
+            Some(smoke_shard_export(
+                root.path(),
+                "ruliad-report-shards",
+                "dragon-ruliad-report",
+                4,
+                64,
+            )),
+        );
+
+        let nca =
+            prepare_nca_native_cpu(&nca_native, Some(&dummy_auth_bundle())).expect("nca peer");
+        let ruliad = prepare_nca_native_cpu(&ruliad_native, Some(&dummy_auth_bundle()))
+            .expect("ruliad peer");
+        let nca_observations = run_training_windows_with_heads(&nca, 4, "nca-report");
+        let ruliad_observations = run_training_windows_with_heads(&ruliad, 4, "ruliad-report");
+        let nca_losses = nca_observations
+            .iter()
+            .map(|obs| obs.loss)
+            .collect::<Vec<_>>();
+        let ruliad_losses = ruliad_observations
+            .iter()
+            .map(|obs| obs.loss)
+            .collect::<Vec<_>>();
+        log_loss_series("nca_vs_ruliad_report_nca", &nca_losses);
+        log_loss_series("nca_vs_ruliad_report_ruliad", &ruliad_losses);
+        assert!(nca_losses.iter().all(|loss| loss.is_finite()));
+        assert!(ruliad_losses.iter().all(|loss| loss.is_finite()));
+
+        let report = serde_json::json!({
+            "comparison": "nca_vs_ruliad_small_model_convergence_report",
+            "matched_spec": {
+                "n_layer": MATCHED_512_SMALL_SPEC.n_layer,
+                "n_embd": MATCHED_512_SMALL_SPEC.n_embd,
+                "n_head": MATCHED_512_SMALL_SPEC.n_head,
+                "latent_total": MATCHED_512_SMALL_SPEC.latent_total,
+                "block_size": MATCHED_512_SMALL_SPEC.block_size,
+                "batch_size": MATCHED_512_SMALL_SPEC.batch_size,
+                "max_iters": MATCHED_512_SMALL_SPEC.max_iters,
+            },
+            "nca": observation_report_json("nca", MATCHED_512_SMALL_SPEC, &nca_observations),
+            "ruliad": observation_report_json("ruliad", MATCHED_512_SMALL_SPEC, &ruliad_observations),
+        });
+        eprintln!(
+            "nca_vs_ruliad_small_model_convergence_report={}",
+            serde_json::to_string_pretty(&report).expect("report json")
+        );
+    });
 }
 
 #[test]

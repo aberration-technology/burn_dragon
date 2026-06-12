@@ -28,8 +28,8 @@ pub mod api {
             LeanMode, RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES,
             RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain,
             RuliadReasoningMode, RuliadSerializationConfig, RuliadSourceSemantics, RuliadTaskKind,
-            RuliadTokenizationConfig, default_ruliad_families, load_ruliad_config,
-            ruliad_source_semantics,
+            RuliadTokenizationConfig, compact_ruliad_families, default_ruliad_families,
+            load_ruliad_config, ruliad_source_semantics,
         };
     }
 
@@ -93,13 +93,14 @@ pub use ruliad::{
     RuliadSerializationConfig, RuliadSourceBucket, RuliadSourceBucketDiagnostic,
     RuliadSourceBucketId, RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind,
     RuliadTokenizationConfig, RuliadVerificationReport, baseline_completions,
-    build_eval_items_from_manifest, default_ruliad_families, diagnose_config, diagnose_manifest,
-    evaluate_completions, extract_ruliad_answer, fixed_ruliad_document_token_count,
-    generate_ruliad_corpus, load_proof_tasks, load_ruliad_config, plan_epoch_source_buckets,
-    read_completion_records, ruliad_answers_exact_match, ruliad_answers_semantic_match,
-    ruliad_categorical_presentation, ruliad_expected_answer, ruliad_prompt_prefix,
-    ruliad_sampler_candidates, ruliad_source_buckets, ruliad_source_semantics, verify_manifest,
-    verify_sample, write_completion_records_jsonl, write_eval_items_jsonl,
+    build_eval_items_from_manifest, compact_ruliad_families, default_ruliad_families,
+    diagnose_config, diagnose_manifest, evaluate_completions, extract_ruliad_answer,
+    fixed_ruliad_document_token_count, generate_ruliad_corpus, load_proof_tasks,
+    load_ruliad_config, plan_epoch_source_buckets, read_completion_records,
+    ruliad_answers_exact_match, ruliad_answers_semantic_match, ruliad_categorical_presentation,
+    ruliad_expected_answer, ruliad_prompt_prefix, ruliad_sampler_candidates, ruliad_source_buckets,
+    ruliad_source_semantics, verify_manifest, verify_sample, write_completion_records_jsonl,
+    write_eval_items_jsonl,
 };
 pub use runtime::{
     OnlineNcaCorpus, RuntimeCorpusSummary, RuntimeSampleDocument, fixed_document_token_count,

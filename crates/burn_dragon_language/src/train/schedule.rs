@@ -306,12 +306,16 @@ where
     pub model_config: &'a DragonConfig,
     pub device: &'a B::Device,
     pub devices: &'a [B::Device],
+    pub train_dataset: Option<Arc<Dataset>>,
+    pub valid_dataset: Option<Arc<Dataset>>,
     pub train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
     pub valid_loader: Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
     pub source_selection_dataset: Option<Arc<Dataset>>,
     pub summary_event_token_ids: Option<Vec<u32>>,
     pub neuron_scaling_slot: Option<crate::train::neuron_scaling::NeuronScaleRequestSlot>,
     pub epochs: usize,
+    pub total_steps: usize,
+    pub valid_steps: usize,
 }
 
 pub(crate) fn train_with_scheduler<B, O, S>(
@@ -431,6 +435,74 @@ where
     Ok(model.model)
 }
 
+fn build_dynamic_train_loader<B>(
+    env: &TrainEnvironment<'_, B>,
+    batch_size: usize,
+    consumed_steps: usize,
+) -> Arc<dyn DataLoader<B, SequenceBatch<B>>>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let batch_size = batch_size.max(1);
+    let Some(train_dataset) = env.train_dataset.as_ref() else {
+        return Arc::clone(&env.train_loader);
+    };
+    if env.training.tbptt_persist_across_steps {
+        Arc::new(
+            StreamingDataLoader::<B>::new(
+                Arc::clone(train_dataset),
+                DatasetSplit::Train,
+                env.device,
+                env.train_loader.num_items().max(1),
+                Some(env.total_steps),
+                env.training.min_logical_block_size,
+                env.training.seed,
+            )
+            .with_batch_size(batch_size)
+            .with_initial_consumed_steps(consumed_steps)
+            .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
+        )
+    } else {
+        Arc::new(
+            RandomDataLoader::<B>::new(
+                Arc::clone(train_dataset),
+                DatasetSplit::Train,
+                env.device,
+                env.train_loader.num_items().max(1),
+                Some(env.total_steps),
+            )
+            .with_batch_size(batch_size)
+            .with_initial_consumed_steps(consumed_steps)
+            .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
+        )
+    }
+}
+
+fn build_dynamic_valid_loader<B>(
+    env: &TrainEnvironment<'_, B>,
+    batch_size: usize,
+) -> Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let Some(valid_dataset) = env.valid_dataset.as_ref() else {
+        return Arc::clone(&env.valid_loader);
+    };
+    Arc::new(
+        RandomDataLoader::<ValidBackend<B>>::new(
+            Arc::clone(valid_dataset),
+            DatasetSplit::Val,
+            env.device,
+            env.valid_steps.max(1),
+            None,
+        )
+        .with_batch_size(batch_size.max(1))
+        .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
+    )
+}
+
 pub(crate) fn train_with_dynamic_neuron_scaling_scheduler<B, S>(
     env: &TrainEnvironment<'_, B>,
     mut model: LanguageTrainModel<B>,
@@ -456,11 +528,14 @@ where
     )?;
     let bus = event_handles.metric_logger.bus();
     let steps_per_epoch = env.train_loader.num_items().max(1);
-    let grad_accumulation = env.training.gradient_accumulation_steps.max(1);
     let start_epoch = env
         .resume_checkpoint_epoch
         .map(|epoch| epoch + 1)
         .unwrap_or(1);
+    let mut active_batch_size = env.training.batch_size.max(1);
+    let mut active_grad_accumulation = env.training.gradient_accumulation_steps.max(1);
+    let mut active_train_loader = Arc::clone(&env.train_loader);
+    let mut active_valid_loader = Arc::clone(&env.valid_loader);
     let mut current_model_config = env.model_config.clone();
     let mut scale_generation = 0usize;
     let mut stability = ContinualLearningStabilityState::default();
@@ -499,7 +574,7 @@ where
             break;
         }
 
-        let mut iterator = env.train_loader.iter();
+        let mut iterator = active_train_loader.iter();
         let mut iteration = 0usize;
         let mut accumulator = GradientsAccumulator::new();
         let mut accumulation_current = 0usize;
@@ -524,7 +599,7 @@ where
             accumulator.accumulate(&model, item.grads);
             accumulation_current += 1;
 
-            if grad_accumulation <= accumulation_current {
+            if active_grad_accumulation <= accumulation_current {
                 let lr = scheduler.step();
                 let grads = accumulator.grads();
                 model = optimizer.step(lr, model, grads);
@@ -596,13 +671,22 @@ where
                 &mut last_cbp_telemetry_step,
             );
         }
+        drop(iterator);
         let _ = bus.send_epoch_summary(TrainingEpochSummary {
             run_id: env.run_name.to_string(),
             split: TrainingMetricSplit::Train,
             epoch,
         });
 
-        let validation = run_dynamic_validation(env, &model, epoch, &bus)?;
+        let validation = run_dynamic_validation(
+            env,
+            &active_valid_loader,
+            &model,
+            epoch,
+            steps_per_epoch,
+            active_batch_size,
+            &bus,
+        )?;
         let valid_loss = validation.loss;
         info!("valid epoch={} loss={valid_loss:.4}", epoch);
         if let Some(source_weighted_loss) = validation.source_weighted_loss {
@@ -625,7 +709,6 @@ where
             epoch,
             absolute_step,
             &mut stability,
-            &mut optimizer,
             &bus,
         );
         let _ = bus.send_checkpoint(CheckpointEvent {
@@ -642,7 +725,7 @@ where
             .as_ref()
             .and_then(|slot| slot.take())
         {
-            apply_dynamic_neuron_scale(
+            if let Some((old_capacity_units, new_capacity_units)) = apply_dynamic_neuron_scale(
                 env,
                 &mut model,
                 &mut optimizer,
@@ -652,7 +735,54 @@ where
                 epoch,
                 absolute_step,
                 &bus,
-            )?;
+                active_batch_size,
+                active_grad_accumulation,
+            )? {
+                let next_batch_size =
+                    crate::train::startup_autotune::resolve_scaled_auto_batch_size(
+                        &env.training.auto_batch_size,
+                        active_batch_size,
+                        old_capacity_units,
+                        new_capacity_units,
+                    );
+                let next_grad_accumulation =
+                    crate::train::startup_autotune::resolve_gradient_accumulation_steps(
+                        next_batch_size,
+                        env.training.gradient_accumulation_steps,
+                        env.training.target_effective_batch_size,
+                    );
+                if next_batch_size != active_batch_size
+                    || next_grad_accumulation != active_grad_accumulation
+                {
+                    active_batch_size = next_batch_size;
+                    active_grad_accumulation = next_grad_accumulation;
+                    let consumed_steps = epoch.saturating_mul(steps_per_epoch);
+                    active_train_loader =
+                        build_dynamic_train_loader(env, active_batch_size, consumed_steps);
+                    active_valid_loader = build_dynamic_valid_loader(env, active_batch_size);
+                    info!(
+                        "auto batch after neuron scale: batch_size={} gradient_accumulation_steps={} effective_batch_size={} consumed_steps={}",
+                        active_batch_size,
+                        active_grad_accumulation,
+                        active_batch_size.saturating_mul(active_grad_accumulation),
+                        consumed_steps
+                    );
+                    emit_policy_gate(
+                        env,
+                        &bus,
+                        "auto_batch_size_after_neuron_scale",
+                        epoch,
+                        absolute_step,
+                        format!(
+                            "auto batch selected batch_size={} gradient_accumulation_steps={} after capacity {} -> {}",
+                            active_batch_size,
+                            active_grad_accumulation,
+                            old_capacity_units,
+                            new_capacity_units
+                        ),
+                    );
+                }
+            }
             let pause_steps = env
                 .training
                 .neuron_scaling
@@ -672,9 +802,7 @@ where
 
     log_theoretical_profile(
         &current_model_config,
-        env.training
-            .batch_size
-            .saturating_mul(env.training.gradient_accumulation_steps.max(1)),
+        active_batch_size.saturating_mul(active_grad_accumulation),
         env.training.block_size,
         env.backend_name,
     );
@@ -684,8 +812,11 @@ where
 
 fn run_dynamic_validation<B>(
     env: &TrainEnvironment<'_, B>,
+    valid_loader: &Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
     model: &LanguageTrainModel<B>,
     epoch: usize,
+    steps_per_epoch: usize,
+    batch_size: usize,
     bus: &TrainingEventBus,
 ) -> Result<DynamicValidationReport>
 where
@@ -693,7 +824,7 @@ where
     B::Device: Clone,
 {
     let valid_model = model.valid();
-    let mut iterator = env.valid_loader.iter();
+    let mut iterator = valid_loader.iter();
     let mut total = 0.0;
     let mut count = 0usize;
     let mut output_degeneracy = None;
@@ -716,7 +847,7 @@ where
         if let Some(degeneracy) = degeneracy {
             let absolute_step = epoch
                 .saturating_sub(1)
-                .saturating_mul(env.train_loader.num_items().max(1))
+                .saturating_mul(steps_per_epoch)
                 .saturating_add(count.saturating_sub(1));
             emit_output_degeneracy(env, epoch, absolute_step, &degeneracy, bus);
             output_degeneracy = Some(degeneracy);
@@ -728,7 +859,7 @@ where
             step_in_epoch: count,
             absolute_step: epoch
                 .saturating_sub(1)
-                .saturating_mul(env.train_loader.num_items().max(1))
+                .saturating_mul(steps_per_epoch)
                 .saturating_add(count.saturating_sub(1)),
             name: "Loss".to_string(),
             value: loss,
@@ -740,7 +871,8 @@ where
     } else {
         total / count as f64
     };
-    let source_weighted_loss = run_source_weighted_validation(env, &valid_model, epoch, bus)?;
+    let source_weighted_loss =
+        run_source_weighted_validation(env, &valid_model, epoch, steps_per_epoch, batch_size, bus)?;
     if let Some(source_weighted_loss) = source_weighted_loss {
         let delta = source_weighted_loss - mean;
         let ratio = if mean.abs() <= f64::EPSILON {
@@ -750,7 +882,7 @@ where
         };
         let absolute_step = epoch
             .saturating_sub(1)
-            .saturating_mul(env.train_loader.num_items().max(1))
+            .saturating_mul(steps_per_epoch)
             .saturating_add(count);
         for (name, value) in [
             ("Source Weighted Loss Delta", delta),
@@ -789,6 +921,8 @@ fn run_source_weighted_validation<B>(
     env: &TrainEnvironment<'_, B>,
     valid_model: &LanguageTrainModel<ValidBackend<B>>,
     epoch: usize,
+    steps_per_epoch: usize,
+    batch_size: usize,
     bus: &TrainingEventBus,
 ) -> Result<Option<f64>>
 where
@@ -806,7 +940,6 @@ where
         return Ok(None);
     }
 
-    let steps_per_epoch = env.train_loader.num_items().max(1);
     let base_absolute_step = epoch.saturating_sub(1).saturating_mul(steps_per_epoch);
     let mut total = 0.0;
     let mut count = 0usize;
@@ -815,6 +948,7 @@ where
         let Some(batch) = dataset.sample_source_weighted_validation_batch::<ValidBackend<B>>(
             epoch,
             absolute_step,
+            batch_size,
             env.summary_event_token_ids.as_deref(),
             env.device,
         ) else {
@@ -940,7 +1074,6 @@ fn apply_continual_learning_stability_policy<B>(
     epoch: usize,
     absolute_step: usize,
     state: &mut ContinualLearningStabilityState,
-    optimizer: &mut crate::train::continual_backprop::LanguageOptimizer<B>,
     bus: &TrainingEventBus,
 ) where
     B: AutodiffBackend + Clone + 'static,
@@ -970,13 +1103,9 @@ fn apply_continual_learning_stability_policy<B>(
                 epoch,
                 absolute_step,
                 format!(
-                    "pausing continual backprop for {} steps after validation regression: best {:.6}, current {:.6}",
-                    env.training.continual_backprop.regression_pause_steps, best, valid_loss
+                    "validation regression detected while leaving continual backprop active: best {:.6}, current {:.6}",
+                    best, valid_loss
                 ),
-            );
-            optimizer.pause_continual_backprop_for_steps(
-                env.training.continual_backprop.regression_pause_steps,
-                "validation_regression",
             );
         }
     }
@@ -1002,17 +1131,12 @@ fn apply_continual_learning_stability_policy<B>(
             epoch,
             absolute_step,
             format!(
-                "pausing continual backprop for {} steps after output degeneracy: entropy {:.3}, max_prob {:.3}, unique {:.3}, repetition {:.3}",
-                env.training.continual_backprop.regression_pause_steps,
+                "output degeneracy detected while leaving continual backprop active: entropy {:.3}, max_prob {:.3}, unique {:.3}, repetition {:.3}",
                 degeneracy.entropy_bits,
                 degeneracy.mean_max_probability,
                 degeneracy.argmax_unique_fraction,
                 degeneracy.repetition_fraction
             ),
-        );
-        optimizer.pause_continual_backprop_for_steps(
-            env.training.continual_backprop.regression_pause_steps,
-            "output_degeneracy",
         );
     }
 }
@@ -1137,7 +1261,9 @@ fn apply_dynamic_neuron_scale<B>(
     epoch: usize,
     absolute_step: usize,
     bus: &TrainingEventBus,
-) -> Result<()>
+    batch_size: usize,
+    gradient_accumulation_steps: usize,
+) -> Result<Option<(usize, usize)>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
@@ -1162,7 +1288,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.from_capacity_units != current_latent_total {
         skip(
@@ -1172,7 +1298,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.to_capacity_units <= current_latent_total {
         skip(
@@ -1182,7 +1308,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.to_capacity_units > env.training.neuron_scaling.max_latent_total {
         skip(
@@ -1192,7 +1318,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.to_capacity_units % current_model_config.n_embd != 0 {
         skip(
@@ -1202,7 +1328,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.to_capacity_units % current_model_config.n_head != 0 {
         skip(
@@ -1212,7 +1338,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
     if request.to_capacity_units % env.parallel_config.tensor.size != 0 {
         skip(
@@ -1222,7 +1348,7 @@ where
             ),
             bus,
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let mut target_config = current_model_config.clone();
@@ -1256,8 +1382,8 @@ where
         from_capacity_units: report.old_latent_total,
         to_capacity_units: report.new_latent_total,
         scale_generation: *scale_generation,
-        batch_size: Some(env.training.batch_size),
-        gradient_accumulation_steps: Some(env.training.gradient_accumulation_steps),
+        batch_size: Some(batch_size),
+        gradient_accumulation_steps: Some(gradient_accumulation_steps),
         message: format!(
             "applied Dragon neuron scaling {} -> {} in-process; optimizer_state_policy=drop_widened_param_moments; stabilization_freeze_base_steps={} stabilization_unfreeze_ramp_steps={}",
             report.old_latent_total,
@@ -1270,7 +1396,7 @@ where
         "applied in-process Dragon neuron scaling {} -> {} at epoch={} absolute_step={}",
         report.old_latent_total, report.new_latent_total, epoch, absolute_step
     );
-    Ok(())
+    Ok(Some((report.old_latent_total, report.new_latent_total)))
 }
 
 #[cfg(feature = "ddp")]
@@ -3025,6 +3151,7 @@ mod tests {
             events: Default::default(),
             gates: Default::default(),
             neuron_scaling: Default::default(),
+            auto_batch_size: Default::default(),
         }
     }
 
@@ -3114,12 +3241,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 1,
+            total_steps: 2,
+            valid_steps: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3250,12 +3381,16 @@ mod tests {
             model_config: &model_config,
             device: &device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 1,
+            total_steps: 1,
+            valid_steps: 1,
         };
         let mut model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3276,7 +3411,7 @@ mod tests {
         let mut current_model_config = model_config.clone();
         let mut scale_generation = 0usize;
 
-        apply_dynamic_neuron_scale(
+        let scale_result = apply_dynamic_neuron_scale(
             &env,
             &mut model,
             &mut optimizer,
@@ -3293,10 +3428,13 @@ mod tests {
             1,
             0,
             &bus,
+            training.batch_size,
+            training.gradient_accumulation_steps,
         )
         .expect("apply scale");
 
         let _ = bus.flush();
+        assert_eq!(scale_result, Some((8, 16)));
         assert_eq!(model.model.latent_total_capacity(), 16);
         assert_eq!(current_model_config.latent_total(), 16);
         assert_eq!(scale_generation, 1);
@@ -3349,12 +3487,16 @@ mod tests {
             model_config: &model_config,
             device: &device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: Some(request_slot.clone()),
             epochs: 1,
+            total_steps: 1,
+            valid_steps: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3575,12 +3717,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 1,
+            total_steps: 2,
+            valid_steps: 1,
         };
 
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -3654,12 +3800,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 4,
+            total_steps: 8,
+            valid_steps: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3826,12 +3976,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 1,
+            total_steps: 2,
+            valid_steps: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3936,12 +4090,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader: Arc::clone(&train_loader),
             valid_loader: Arc::clone(&valid_loader),
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 1,
+            total_steps: 2,
+            valid_steps: 1,
         };
         let model_first = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),
@@ -3975,12 +4133,16 @@ mod tests {
             model_config: &model_config,
             device: &primary_device,
             devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
             train_loader,
             valid_loader,
             source_selection_dataset: None,
             summary_event_token_ids: None,
             neuron_scaling_slot: None,
             epochs: 2,
+            total_steps: 4,
+            valid_steps: 1,
         };
         let model_resume = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
             model_config.clone(),

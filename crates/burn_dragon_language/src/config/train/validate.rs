@@ -47,6 +47,71 @@ impl TrainingConfig {
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
+        if self.training.auto_batch_size.enabled {
+            let auto_batch = &self.training.auto_batch_size;
+            if auto_batch.min_batch_size == 0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.min_batch_size must be > 0 when enabled"
+                ));
+            }
+            if matches!(auto_batch.max_batch_size, Some(0)) {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be > 0 when set"
+                ));
+            }
+            if matches!(auto_batch.max_probe_batch_size, Some(0)) {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_probe_batch_size must be > 0 when set"
+                ));
+            }
+            if let Some(max_batch_size) = auto_batch.max_batch_size
+                && max_batch_size < auto_batch.min_batch_size
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be >= min_batch_size"
+                ));
+            }
+            if let Some(max_probe_batch_size) = auto_batch.max_probe_batch_size
+                && max_probe_batch_size < auto_batch.min_batch_size
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_probe_batch_size must be >= min_batch_size"
+                ));
+            }
+            if auto_batch.probe_steps == 0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.probe_steps must be > 0 when enabled"
+                ));
+            }
+            if !auto_batch.scale_memory_exponent.is_finite()
+                || auto_batch.scale_memory_exponent < 0.0
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.scale_memory_exponent must be finite and >= 0"
+                ));
+            }
+            if !auto_batch.max_system_memory_fraction.is_finite()
+                || !(0.0..=0.9).contains(&auto_batch.max_system_memory_fraction)
+                || auto_batch.max_system_memory_fraction == 0.0
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_system_memory_fraction must be finite and in (0, 0.9]"
+                ));
+            }
+            if !auto_batch.probe_safety_margin.is_finite() || auto_batch.probe_safety_margin < 1.0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.probe_safety_margin must be finite and >= 1"
+                ));
+            }
+            if self.parallel.pipeline.enabled
+                && let Some(max_batch_size) = auto_batch.max_batch_size
+                && max_batch_size < self.parallel.pipeline.microbatches
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be >= parallel.pipeline.microbatches when pipeline is enabled"
+                ));
+            }
+        }
         if self.training.neuron_scaling.enabled {
             if self.parallel.mode != ParallelismKind::Single {
                 return Err(anyhow!(
@@ -1430,6 +1495,82 @@ prompt = ""
         let config = parse_config("");
         assert!(config.training.objective.is_next_token());
         config.validate().expect("default objective validates");
+    }
+
+    #[test]
+    fn auto_batch_size_config_validates() {
+        parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 1
+max_batch_size = 32
+target_device_memory_mb = 90000
+probe_steps = 1
+recompute_on_neuron_scale = true
+"#,
+        )
+        .validate()
+        .expect("auto batch config should validate");
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_inverted_bounds() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 8
+max_batch_size = 4
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("inverted auto batch bounds should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_batch_size must be >= min_batch_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_probe_cap_below_min_batch() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 8
+max_probe_batch_size = 4
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("probe cap below min batch should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_probe_batch_size must be >= min_batch_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_host_fraction_above_ninety_percent() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+max_system_memory_fraction = 0.95
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("host memory fraction above 90% should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_system_memory_fraction"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

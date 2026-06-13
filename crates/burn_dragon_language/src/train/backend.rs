@@ -363,7 +363,7 @@ where
     Ok(())
 }
 
-fn resolve_effective_training_sequence_kernel(
+pub(crate) fn resolve_effective_training_sequence_kernel(
     configured_kernel: SequenceKernelConfig,
     training_override: Option<SequenceKernelConfig>,
     backend_name: &str,
@@ -780,7 +780,8 @@ where
     info!("run name: {run_name}");
     if let Some(report) = &startup_autotune {
         info!(
-            "startup autotune: backend={} target_device_memory_mb={} resolved_batch_size={} resolved_gradient_accumulation_steps={} resolved_effective_batch_size={} probes={}",
+            "startup autotune: source={} backend={} target_device_memory_mb={} resolved_batch_size={} resolved_gradient_accumulation_steps={} resolved_effective_batch_size={} probes={}",
+            report.config_source,
             report.backend_name,
             report.target_device_memory_mb,
             report.resolved_batch_size,
@@ -794,6 +795,8 @@ where
                         "bs{}:{}:{reserved:.1}/{in_use:.1}MiB",
                         probe.batch_size, probe.status
                     ),
+                    (Some(reserved), None) =>
+                        format!("bs{}:{}:{reserved:.1}MiB", probe.batch_size, probe.status),
                     _ => format!("bs{}:{}", probe.batch_size, probe.status),
                 })
                 .collect::<Vec<_>>()
@@ -846,6 +849,8 @@ where
         model_config: &model_config,
         device: &device,
         devices: &devices,
+        train_dataset: Some(Arc::clone(&datasets.train)),
+        valid_dataset: Some(Arc::clone(&datasets.valid)),
         train_loader,
         valid_loader,
         source_selection_dataset: datasets
@@ -855,6 +860,8 @@ where
         summary_event_token_ids,
         neuron_scaling_slot: neuron_scaling_slot.clone(),
         epochs: total_epochs,
+        total_steps,
+        valid_steps,
     };
     let _model = train_with_resolved_scheduler(
         &context,

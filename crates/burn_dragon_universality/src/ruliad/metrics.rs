@@ -24,6 +24,14 @@ pub struct RuliadMetricSnapshot {
     pub hash_noise_probability: f32,
     pub mean_loss: f32,
     pub mean_learning_progress: f32,
+    #[serde(default)]
+    pub frontier_loss: f32,
+    #[serde(default)]
+    pub target_loss: f32,
+    #[serde(default)]
+    pub target_difficulty_score: f32,
+    #[serde(default)]
+    pub mastered_probability: f32,
 }
 
 fn default_cost() -> f32 {

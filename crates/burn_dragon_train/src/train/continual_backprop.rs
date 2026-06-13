@@ -505,14 +505,16 @@ where
             * eligible.len() as f32
             * self.config.replace_interval_steps as f32;
         telemetry.replacement_budget = state.replacement_budget;
-        let n_replace = (state.replacement_budget.floor() as usize)
-            .min(self.config.max_replacements_per_interval);
-        if n_replace == 0 {
-            return (Vec::new(), telemetry);
-        }
         let epsilon = self.config.utility_epsilon;
         let mut ranked = eligible
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|idx| {
+                *idx < avg.len()
+                    && *idx < avg_abs.len()
+                    && *idx < metrics.incoming_l1.len()
+                    && *idx < metrics.outgoing_l1.len()
+            })
             .map(|idx| {
                 let centered = (avg_abs[idx] - avg[idx].abs()).max(0.0);
                 let score =
@@ -524,6 +526,11 @@ where
         telemetry.utility_min = min_f32(&utility_values);
         telemetry.utility_mean = mean_f32(&utility_values);
         telemetry.utility_max = max_f32(&utility_values);
+        let n_replace = (state.replacement_budget.floor() as usize)
+            .min(self.config.max_replacements_per_interval);
+        if n_replace == 0 {
+            return (Vec::new(), telemetry);
+        }
         ranked.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let selected = ranked
             .into_iter()
@@ -729,9 +736,6 @@ where
             .pause_until_step
             .max(current_step.saturating_add(steps));
         self.pause_reason = Some(reason.into());
-        if let Some(state) = &mut self.state {
-            state.replacement_budget = 0.0;
-        }
     }
 
     fn clear_pause(&mut self) {
@@ -1054,4 +1058,190 @@ fn zero_selected_2d_feature_tensor<B: BackendTrait>(
         }
     }
     Tensor::<B, 2>::from_data(TensorData::new(values, [rows, cols]), &device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = Autodiff<NdArray<f32>>;
+
+    #[derive(Clone, Debug)]
+    struct TestBatchStats {
+        mean: Vec<f32>,
+        mean_abs: Vec<f32>,
+    }
+
+    #[derive(Module, Debug)]
+    struct TestModule<B: BackendTrait> {
+        anchor: Param<Tensor<B, 1>>,
+        #[module(skip)]
+        stats: Option<TestBatchStats>,
+    }
+
+    #[derive(Clone)]
+    struct TestAdapter;
+
+    impl ContinualBackpropAdapter<TestBackend, TestModule<TestBackend>> for TestAdapter {
+        type FreshModel = TestModule<TestBackend>;
+        type BatchStats = TestBatchStats;
+
+        fn validate_config(
+            _config: &ContinualBackpropConfig,
+            _fresh_model: &Self::FreshModel,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn attach_runtime(
+            module: TestModule<TestBackend>,
+            _config: &ContinualBackpropConfig,
+        ) -> TestModule<TestBackend> {
+            module
+        }
+
+        fn take_batch_stats(module: &TestModule<TestBackend>) -> Option<Self::BatchStats> {
+            module.stats.clone()
+        }
+
+        fn batch_stats_mean(batch_stats: &Self::BatchStats) -> Vec<f32> {
+            batch_stats.mean.clone()
+        }
+
+        fn batch_stats_mean_abs(batch_stats: &Self::BatchStats) -> Vec<f32> {
+            batch_stats.mean_abs.clone()
+        }
+
+        fn feature_count(_module: &TestModule<TestBackend>) -> usize {
+            2
+        }
+
+        fn device(module: &TestModule<TestBackend>) -> burn::tensor::Device<TestBackend> {
+            module.anchor.val().device()
+        }
+
+        fn target_lr_scale(_module: &TestModule<TestBackend>) -> f32 {
+            1.0
+        }
+
+        fn feature_metrics(_module: &TestModule<TestBackend>) -> ContinualBackpropFeatureMetrics {
+            ContinualBackpropFeatureMetrics {
+                incoming_l1: vec![1.0, 1.0],
+                outgoing_l1: vec![1.0, 1.0],
+            }
+        }
+
+        fn reinitialize_features(
+            module: TestModule<TestBackend>,
+            _fresh_model: &Self::FreshModel,
+            _selected: &[usize],
+        ) -> TestModule<TestBackend> {
+            module
+        }
+
+        fn optimizer_reset_targets(
+            _module: &TestModule<TestBackend>,
+        ) -> ContinualBackpropParamResetTargets {
+            ContinualBackpropParamResetTargets::default()
+        }
+    }
+
+    fn test_module() -> TestModule<TestBackend> {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestModule {
+            anchor: Param::from_tensor(Tensor::<TestBackend, 1>::zeros([1], &device)),
+            stats: None,
+        }
+    }
+
+    fn test_state(step: usize, replacement_budget: f32) -> ContinualBackpropState<TestBackend> {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        ContinualBackpropState {
+            step,
+            replacement_budget,
+            age: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![2048.0, 2048.0], [2]),
+                &device,
+            ),
+            avg_activation: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![0.0, 0.0], [2]),
+                &device,
+            ),
+            avg_abs_activation: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![1.0, 2.0], [2]),
+                &device,
+            ),
+        }
+    }
+
+    fn test_optimizer(
+        config: ContinualBackpropConfig,
+    ) -> ContinualBackpropAdamWOptimizer<TestBackend, TestModule<TestBackend>, TestAdapter> {
+        ContinualBackpropAdamWOptimizer {
+            optimizer: DragonAdamW {
+                beta_1: 0.9,
+                beta_2: 0.999,
+                epsilon: 1.0e-5,
+                weight_decay: 0.0,
+            },
+            records: HashMap::new(),
+            grad_clipping: None,
+            state: None,
+            config,
+            base_learning_rate: 1.0e-3,
+            fresh_model: test_module(),
+            pause_until_step: 0,
+            pause_reason: None,
+            cooldown_until_step: 0,
+            last_telemetry: None,
+            _adapter: PhantomData,
+            module: PhantomData,
+        }
+    }
+
+    #[test]
+    fn pause_preserves_replacement_budget() {
+        let mut optimizer = test_optimizer(ContinualBackpropConfig::default());
+        optimizer.state = Some(test_state(2048, 0.75));
+
+        optimizer.pause_for_steps(512, "structural_stabilization");
+
+        assert_eq!(
+            optimizer
+                .state
+                .as_ref()
+                .expect("continual backprop state")
+                .replacement_budget,
+            0.75
+        );
+    }
+
+    #[test]
+    fn utility_telemetry_updates_before_replacement_threshold() {
+        let mut config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 0,
+            maturity_steps: 1,
+            cooldown_steps: 0,
+            replacement_rate: 1.0e-5,
+            replace_interval_steps: 256,
+            ..ContinualBackpropConfig::default()
+        };
+        config.max_replacements_per_interval = 1;
+        let mut optimizer = test_optimizer(config);
+        let mut state = test_state(2048, 0.0);
+        let module = test_module();
+
+        let (selected, telemetry) =
+            optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert!(selected.is_empty());
+        assert_eq!(telemetry.replacement_count, 0);
+        assert!(telemetry.replacement_budget > 0.0);
+        assert_eq!(telemetry.utility_min, 1.0);
+        assert_eq!(telemetry.utility_mean, 1.5);
+        assert_eq!(telemetry.utility_max, 2.0);
+    }
 }

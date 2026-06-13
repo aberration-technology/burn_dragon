@@ -679,6 +679,7 @@ impl UniversalityDataset {
         &self,
         epoch_index: usize,
         absolute_step: usize,
+        batch_size: usize,
         summary_event_token_ids: Option<&[u32]>,
         device: &B::Device,
     ) -> Option<SequenceBatch<B>> {
@@ -689,7 +690,7 @@ impl UniversalityDataset {
         let documents = storage.source_weighted_validation_documents(
             epoch_index,
             absolute_step,
-            self.batch_size,
+            batch_size.max(1),
         )?;
         let document_token_count = documents.first()?.len();
         let logical_document_tokens = document_token_count.checked_sub(1)?;
@@ -700,8 +701,9 @@ impl UniversalityDataset {
         let max_start_in_document = logical_document_tokens
             .saturating_sub(self.block_size)
             .min(document_token_count.saturating_sub(self.block_size + 1));
-        let mut inputs = vec![0i64; self.batch_size * self.block_size];
-        let mut targets = vec![0i64; self.batch_size * self.block_size];
+        let batch_size = batch_size.max(1);
+        let mut inputs = vec![0i64; batch_size * self.block_size];
+        let mut targets = vec![0i64; batch_size * self.block_size];
         for (batch_idx, document) in documents.iter().enumerate() {
             if document.len() <= self.block_size {
                 return None;
@@ -725,17 +727,17 @@ impl UniversalityDataset {
 
         let summary_event_mask = summary_event_mask_tensor::<B>(
             &inputs,
-            self.batch_size,
+            batch_size,
             self.block_size,
             summary_event_token_ids,
             device,
         );
         let inputs_tensor = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(inputs, [self.batch_size, self.block_size]),
+            TensorData::new(inputs, [batch_size, self.block_size]),
             device,
         );
         let targets_tensor = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(targets, [self.batch_size, self.block_size]),
+            TensorData::new(targets, [batch_size, self.block_size]),
             device,
         );
         Some(SequenceBatch::new(
@@ -1941,10 +1943,10 @@ mod tests {
         let device = burn::tensor::Device::<TestBackend>::default();
 
         let first = dataset
-            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, None, &device)
+            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, 2, None, &device)
             .expect("source-weighted validation batch");
         let second = dataset
-            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, None, &device)
+            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, 2, None, &device)
             .expect("repeated source-weighted validation batch");
         assert_eq!(first.inputs.shape().dims::<2>(), [2, 32]);
         assert_eq!(

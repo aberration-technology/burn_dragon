@@ -148,6 +148,10 @@ fn record_ruliad_source_selection_from_loss(
             hash_noise_probability: snapshot.hash_noise_probability as f64,
             mean_loss: snapshot.mean_loss as f64,
             mean_learning_progress: snapshot.mean_learning_progress as f64,
+            frontier_loss: snapshot.frontier_loss as f64,
+            target_loss: snapshot.target_loss as f64,
+            target_difficulty_score: snapshot.target_difficulty_score as f64,
+            mastered_probability: snapshot.mastered_probability as f64,
             verifier_failures: snapshot.verifier_failures as u64,
         });
     }

@@ -47,7 +47,7 @@ pub struct RuliadSamplerCandidate {
 impl RuliadSamplerCandidate {
     pub fn utility(&self, config: RuliadSamplerConfig) -> f32 {
         let learning_progress = (self.previous_loss_ema - self.loss_ema).max(0.0);
-        let difficulty_gate = 1.0 / (1.0 + (self.loss_ema - config.target_loss).abs());
+        let difficulty_gate = difficulty_gate(self.loss_ema, config.target_loss);
         let gradient = self.gradient_alignment.max(0.0);
         let hash_penalty = if self.is_hash_noise {
             config.hash_noise_penalty
@@ -151,6 +151,25 @@ impl RuliadFrontierSampler {
                 .iter()
                 .map(|candidate| (candidate.previous_loss_ema - candidate.loss_ema).max(0.0)),
         );
+        let frontier_loss = probs
+            .iter()
+            .zip(&self.candidates)
+            .map(|(prob, candidate)| prob * candidate.loss_ema)
+            .sum::<f32>();
+        let target_difficulty_score = probs
+            .iter()
+            .zip(&self.candidates)
+            .map(|(prob, candidate)| {
+                prob * difficulty_gate(candidate.loss_ema, self.config.target_loss)
+            })
+            .sum::<f32>();
+        let mastered_probability = probs
+            .iter()
+            .zip(&self.candidates)
+            .filter_map(|(prob, candidate)| {
+                (candidate.loss_ema <= self.config.target_loss).then_some(*prob)
+            })
+            .sum::<f32>();
         RuliadMetricSnapshot {
             sample_count: self.candidates.len(),
             verifier_failures: self.verifier_failures,
@@ -158,8 +177,16 @@ impl RuliadFrontierSampler {
             hash_noise_probability,
             mean_loss,
             mean_learning_progress,
+            frontier_loss,
+            target_loss: self.config.target_loss,
+            target_difficulty_score,
+            mastered_probability,
         }
     }
+}
+
+fn difficulty_gate(loss_ema: f32, target_loss: f32) -> f32 {
+    1.0 / (1.0 + (loss_ema - target_loss).abs())
 }
 
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
@@ -232,5 +259,48 @@ mod tests {
         let probs = sampler.probabilities();
         assert!(probs[0] > probs[1]);
         assert!(sampler.snapshot().hash_noise_probability < 0.5);
+    }
+
+    #[test]
+    fn snapshot_reports_weighted_difficulty_frontier() {
+        let sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                temperature: 100.0,
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                hash_noise_penalty: 4.0,
+            },
+            vec![
+                RuliadSamplerCandidate {
+                    oracle_hash: "easy".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "trace".to_string(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 1.0,
+                    previous_loss_ema: 1.5,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+                RuliadSamplerCandidate {
+                    oracle_hash: "hard".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "proof".to_string(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 3.0,
+                    previous_loss_ema: 3.5,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+            ],
+        );
+
+        let snapshot = sampler.snapshot();
+
+        assert!((snapshot.frontier_loss - 2.0).abs() < 0.05);
+        assert_eq!(snapshot.target_loss, 2.0);
+        assert!((snapshot.target_difficulty_score - 0.5).abs() < 0.02);
+        assert!((snapshot.mastered_probability - 0.5).abs() < 0.05);
     }
 }

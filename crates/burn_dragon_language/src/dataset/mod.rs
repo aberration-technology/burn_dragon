@@ -74,6 +74,7 @@ impl Dataset {
         &self,
         epoch_index: usize,
         absolute_step: usize,
+        batch_size: usize,
         summary_event_token_ids: Option<&[u32]>,
         device: &B::Device,
     ) -> Option<SequenceBatch<B>> {
@@ -82,6 +83,7 @@ impl Dataset {
             Dataset::Universality(dataset) => dataset.sample_source_weighted_validation_batch(
                 epoch_index,
                 absolute_step,
+                batch_size,
                 summary_event_token_ids,
                 device,
             ),

@@ -10,8 +10,9 @@ pub use core::{
 };
 #[cfg(feature = "train")]
 pub use train::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
+    AutoBatchSizeConfig, DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig,
+    HuggingFaceRecordFormat, RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig,
+    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    ValidationDatasetConfig, load_training_config,
 };

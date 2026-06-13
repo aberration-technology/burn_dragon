@@ -553,6 +553,8 @@ pub struct RandomDataLoader<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
     split: DatasetSplit,
     device: B::Device,
+    batch_size: usize,
+    block_size: usize,
     steps_per_epoch: usize,
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
@@ -565,6 +567,8 @@ pub struct StreamingDataLoader<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
     split: DatasetSplit,
     device: B::Device,
+    batch_size: usize,
+    block_size: usize,
     steps_per_epoch: usize,
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
@@ -579,6 +583,8 @@ impl<B: Backend> Clone for RandomDataLoader<B> {
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: self.steps_per_epoch,
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
@@ -595,6 +601,8 @@ impl<B: Backend> Clone for StreamingDataLoader<B> {
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: self.steps_per_epoch,
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
@@ -620,11 +628,15 @@ impl<B: Backend> RandomDataLoader<B> {
         let steps_per_epoch = steps_per_epoch.max(1);
         let total_steps = total_steps.filter(|value| *value > 0);
         let consumed_steps = total_steps.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
+        let batch_size = dataset.batch_size().max(1);
+        let block_size = dataset.block_size().max(1);
 
         Self {
             dataset,
             split,
             device: device.clone(),
+            batch_size,
+            block_size,
             steps_per_epoch,
             total_steps,
             consumed_steps,
@@ -639,6 +651,12 @@ impl<B: Backend> RandomDataLoader<B> {
         summary_event_token_ids: Option<Vec<u32>>,
     ) -> Self {
         self.summary_event_token_ids = summary_event_token_ids;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
+        self.prefetch = Arc::new(Mutex::new(None));
         self
     }
 
@@ -721,11 +739,15 @@ impl<B: Backend> StreamingDataLoader<B> {
         let consumed_steps = total_steps.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
         let logical_document_tokens =
             resolve_stream_logical_document_tokens(dataset.as_ref(), split, min_logical_block_size);
+        let batch_size = dataset.batch_size().max(1);
+        let block_size = dataset.block_size().max(1);
 
         Self {
             dataset,
             split,
             device: device.clone(),
+            batch_size,
+            block_size,
             steps_per_epoch,
             total_steps,
             consumed_steps,
@@ -740,6 +762,11 @@ impl<B: Backend> StreamingDataLoader<B> {
         summary_event_token_ids: Option<Vec<u32>>,
     ) -> Self {
         self.summary_event_token_ids = summary_event_token_ids;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
         self
     }
 
@@ -794,8 +821,8 @@ where
                 *slot = Some(RandomPrefetch::spawn(
                     Arc::clone(&self.dataset),
                     self.split,
-                    self.dataset.batch_size(),
-                    self.dataset.block_size(),
+                    self.batch_size,
+                    self.block_size,
                     self.steps_per_epoch,
                     absolute_step_start,
                     self.total_steps,
@@ -811,8 +838,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
-            batch_size: self.dataset.batch_size(),
-            block_size: self.dataset.block_size(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_total,
             step: 0,
             total_steps: self.total_steps,
@@ -836,6 +863,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: self.steps_per_epoch,
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
@@ -856,6 +885,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: steps,
             total_steps,
             consumed_steps,
@@ -870,6 +901,8 @@ struct StreamingIterator<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
     split: DatasetSplit,
     device: B::Device,
+    batch_size: usize,
+    block_size: usize,
     steps_total: usize,
     step: usize,
     total_steps: Option<usize>,
@@ -908,8 +941,8 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let prof_enabled = crate::train::profile::enabled();
         let cpu_start = prof_enabled.then(Instant::now);
         let (offset, _span) = self.dataset.split_offset_and_span(self.split);
-        let batch_size = self.dataset.batch_size();
-        let block_size = self.dataset.block_size();
+        let batch_size = self.batch_size;
+        let block_size = self.block_size;
         let mut inputs = vec![0i64; batch_size * block_size];
         let mut targets = vec![0i64; batch_size * block_size];
         #[cfg(not(feature = "train"))]
@@ -1039,7 +1072,7 @@ where
 
         let (offset, span) = self.dataset.split_offset_and_span(self.split);
         let _ = offset;
-        let block_size = self.dataset.block_size().max(1);
+        let block_size = self.block_size.max(1);
         let logical_document_tokens = self.logical_document_tokens.max(block_size);
         let chunks_per_document = logical_document_tokens.div_ceil(block_size).max(1);
         let document_span = logical_document_tokens + 1;
@@ -1057,6 +1090,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
+            batch_size: self.batch_size,
+            block_size,
             steps_total,
             step: 0,
             total_steps: self.total_steps,
@@ -1082,6 +1117,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: self.steps_per_epoch,
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
@@ -1102,6 +1139,8 @@ where
             dataset: Arc::clone(&self.dataset),
             split: self.split,
             device: self.device.clone(),
+            batch_size: self.batch_size,
+            block_size: self.block_size,
             steps_per_epoch: steps,
             total_steps,
             consumed_steps,
@@ -1256,6 +1295,58 @@ mod streaming_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn random_loader_batch_override_controls_emitted_shape() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let dataset = Arc::new(TinyDataset {
+            tokens: Arc::new((0u32..128).collect()),
+            train_len: 128,
+            block_size: 4,
+            batch_size: 2,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: None,
+        });
+        let batch = RandomDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            1,
+            Some(1),
+        )
+        .with_batch_size(5)
+        .iter()
+        .next()
+        .expect("batch");
+        assert_eq!(batch.inputs.shape().dims::<2>(), [5, 4]);
+    }
+
+    #[test]
+    fn streaming_loader_batch_override_controls_emitted_shape() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let dataset = Arc::new(TinyDataset {
+            tokens: Arc::new((0u32..129).collect()),
+            train_len: 129,
+            block_size: 4,
+            batch_size: 2,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: None,
+        });
+        let batch = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            1,
+            Some(1),
+            Some(8),
+            1337,
+        )
+        .with_batch_size(6)
+        .iter()
+        .next()
+        .expect("batch");
+        assert_eq!(batch.inputs.shape().dims::<2>(), [6, 4]);
     }
 
     #[test]

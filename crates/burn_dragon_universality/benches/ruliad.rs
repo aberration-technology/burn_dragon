@@ -17,6 +17,7 @@ fn ruliad_config() -> RuliadCorpusConfig {
         serialization: RuliadSerializationConfig {
             document_tokens: 513,
             preview_samples: 1,
+            ..RuliadSerializationConfig::default()
         },
         tokenization: RuliadTokenizationConfig::default(),
         source_selection: RuliadSourceSelectionConfig::default(),
@@ -65,6 +66,8 @@ fn sampler_candidates(count: usize) -> Vec<RuliadSamplerCandidate> {
             } else {
                 "multi_step_state".to_string()
             },
+            difficulty_level: index % 4,
+            params_hash: format!("{index:016x}"),
             prior: 1.0,
             cost: 1.0 + (index % 8) as f32,
             loss_ema: 1.0 + (index % 13) as f32 * 0.25,

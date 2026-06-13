@@ -30,6 +30,10 @@ pub struct RuliadSamplerCandidate {
     pub oracle_hash: String,
     pub family: String,
     pub task_kind: String,
+    #[serde(default)]
+    pub difficulty_level: usize,
+    #[serde(default)]
+    pub params_hash: String,
     #[serde(default = "default_prior")]
     pub prior: f32,
     #[serde(default = "default_cost")]
@@ -236,6 +240,8 @@ mod tests {
                     oracle_hash: "structured".to_string(),
                     family: "eca".to_string(),
                     task_kind: "multi_step_state".to_string(),
+                    difficulty_level: 0,
+                    params_hash: String::new(),
                     prior: 1.0,
                     cost: 1.0,
                     loss_ema: 2.0,
@@ -247,6 +253,8 @@ mod tests {
                     oracle_hash: "noise".to_string(),
                     family: "hash_noise".to_string(),
                     task_kind: "hash_canary".to_string(),
+                    difficulty_level: 0,
+                    params_hash: String::new(),
                     prior: 1.0,
                     cost: 1.0,
                     loss_ema: 8.0,
@@ -275,6 +283,8 @@ mod tests {
                     oracle_hash: "easy".to_string(),
                     family: "category".to_string(),
                     task_kind: "trace".to_string(),
+                    difficulty_level: 0,
+                    params_hash: String::new(),
                     prior: 1.0,
                     cost: 1.0,
                     loss_ema: 1.0,
@@ -286,6 +296,8 @@ mod tests {
                     oracle_hash: "hard".to_string(),
                     family: "category".to_string(),
                     task_kind: "proof".to_string(),
+                    difficulty_level: 1,
+                    params_hash: String::new(),
                     prior: 1.0,
                     cost: 1.0,
                     loss_ema: 3.0,

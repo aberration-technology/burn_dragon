@@ -5,6 +5,7 @@ use crate::ruliad::config::{
     RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadSourceSemantics,
     RuliadTaskKind, ruliad_source_semantics,
 };
+use crate::ruliad::oracles::scale_family_for_difficulty;
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::search::{RuliadSamplerCandidate, RuliadSamplerConfig};
 
@@ -12,11 +13,19 @@ use crate::ruliad::search::{RuliadSamplerCandidate, RuliadSamplerConfig};
 pub struct RuliadSourceBucketId {
     pub family: RuliadFamilyKind,
     pub task_kind: RuliadTaskKind,
+    pub difficulty_level: usize,
+    pub params_hash: u64,
 }
 
 impl RuliadSourceBucketId {
     pub fn label(&self) -> String {
-        format!("{}:{}", self.family.label(), self.task_kind.label())
+        format!(
+            "{}:{}@d{}#{:08x}",
+            self.family.label(),
+            self.task_kind.label(),
+            self.difficulty_level,
+            (self.params_hash & 0xffff_ffff) as u32
+        )
     }
 
     pub fn seed_tag(&self) -> u64 {
@@ -54,10 +63,12 @@ impl RuliadSourceBucket {
             oracle_hash: self.label(),
             family: self.id.family.label().to_string(),
             task_kind: self.id.task_kind.label().to_string(),
+            difficulty_level: self.id.difficulty_level,
+            params_hash: format!("{:016x}", self.id.params_hash),
             prior: self.prior.max(1e-9),
-            cost: 1.0,
-            loss_ema: config.target_loss,
-            previous_loss_ema: config.target_loss,
+            cost: 1.0 + self.id.difficulty_level as f32 * 0.15,
+            loss_ema: config.target_loss + self.id.difficulty_level as f32 * 0.15,
+            previous_loss_ema: config.target_loss + self.id.difficulty_level as f32 * 0.15,
             gradient_alignment: 0.0,
             is_hash_noise: self.is_hash_noise(),
         }
@@ -78,39 +89,60 @@ impl RuliadEpochSourcePlan {
 pub fn ruliad_source_buckets(config: &RuliadCorpusConfig) -> Vec<RuliadSourceBucket> {
     let mut buckets = Vec::new();
     for family in &config.families {
-        match family.kind {
-            RuliadFamilyKind::Eca => add_eca_buckets(&mut buckets, family),
-            RuliadFamilyKind::Simulation => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::VerifySimulation,
-                family.weight as f32,
-            )),
-            RuliadFamilyKind::Automaton => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::EvaluateAutomaton,
-                family.weight as f32,
-            )),
-            RuliadFamilyKind::Rewrite => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::RewriteNormalForm,
-                family.weight as f32,
-            )),
-            RuliadFamilyKind::Algebra => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::CheckAlgebraLaw,
-                family.weight as f32,
-            )),
-            RuliadFamilyKind::Category => add_category_buckets(&mut buckets, family),
-            RuliadFamilyKind::LeanTask => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::CompleteProof,
-                family.weight as f32,
-            )),
-            RuliadFamilyKind::HashNoise => buckets.push(single_bucket(
-                family,
-                RuliadTaskKind::HashCanary,
-                family.weight as f32,
-            )),
+        for difficulty_level in config.source_selection.difficulty_levels.min
+            ..=config.source_selection.difficulty_levels.max
+        {
+            let family_config = scale_family_for_difficulty(family, difficulty_level);
+            match family.kind {
+                RuliadFamilyKind::Eca => {
+                    add_eca_buckets(&mut buckets, &family_config, difficulty_level)
+                }
+                RuliadFamilyKind::Simulation => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::VerifySimulation,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::Automaton => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::EvaluateAutomaton,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::Rewrite => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::RewriteNormalForm,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::Algebra => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::CheckAlgebraLaw,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::Category => {
+                    add_category_buckets(&mut buckets, &family_config, difficulty_level)
+                }
+                RuliadFamilyKind::ProofTree => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::ProveTheorem,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::LeanTask => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::CompleteProof,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+                RuliadFamilyKind::HashNoise => buckets.push(single_bucket(
+                    &family_config,
+                    RuliadTaskKind::HashCanary,
+                    family.weight as f32,
+                    difficulty_level,
+                )),
+            }
         }
     }
     buckets
@@ -173,7 +205,11 @@ pub fn plan_epoch_source_buckets(
     }
 }
 
-fn add_eca_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyConfig) {
+fn add_eca_buckets(
+    buckets: &mut Vec<RuliadSourceBucket>,
+    family: &RuliadFamilyConfig,
+    difficulty_level: usize,
+) {
     let steps = family.steps.unwrap_or(UsizeRangeConfig { min: 4, max: 10 });
     let total = steps.max.saturating_sub(steps.min).saturating_add(1).max(1) as f32;
     if steps.min <= 1 && steps.max >= 1 {
@@ -183,6 +219,8 @@ fn add_eca_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyC
             id: RuliadSourceBucketId {
                 family: RuliadFamilyKind::Eca,
                 task_kind: RuliadTaskKind::NextState,
+                difficulty_level,
+                params_hash: family_config_hash(&family_config, RuliadTaskKind::NextState),
             },
             family_config,
             prior: family.weight as f32 / total,
@@ -200,6 +238,8 @@ fn add_eca_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyC
             id: RuliadSourceBucketId {
                 family: RuliadFamilyKind::Eca,
                 task_kind: RuliadTaskKind::MultiStepState,
+                difficulty_level,
+                params_hash: family_config_hash(&family_config, RuliadTaskKind::MultiStepState),
             },
             family_config,
             prior: family.weight as f32 * multi_count / total,
@@ -207,7 +247,11 @@ fn add_eca_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyC
     }
 }
 
-fn add_category_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFamilyConfig) {
+fn add_category_buckets(
+    buckets: &mut Vec<RuliadSourceBucket>,
+    family: &RuliadFamilyConfig,
+    difficulty_level: usize,
+) {
     let prior = family.weight as f32 / 4.0;
     for task_kind in [
         RuliadTaskKind::ComposeCategoryPath,
@@ -215,7 +259,7 @@ fn add_category_buckets(buckets: &mut Vec<RuliadSourceBucket>, family: &RuliadFa
         RuliadTaskKind::VerifyFunctorPreservation,
         RuliadTaskKind::VerifyNaturalitySquare,
     ] {
-        buckets.push(single_bucket(family, task_kind, prior));
+        buckets.push(single_bucket(family, task_kind, prior, difficulty_level));
     }
 }
 
@@ -223,15 +267,34 @@ fn single_bucket(
     family: &RuliadFamilyConfig,
     task_kind: RuliadTaskKind,
     prior: f32,
+    difficulty_level: usize,
 ) -> RuliadSourceBucket {
     RuliadSourceBucket {
         id: RuliadSourceBucketId {
             family: family.kind,
             task_kind,
+            difficulty_level,
+            params_hash: family_config_hash(family, task_kind),
         },
         family_config: family.clone(),
         prior,
     }
+}
+
+fn family_config_hash(family: &RuliadFamilyConfig, task_kind: RuliadTaskKind) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let label = format!(
+        "{}:{}:{:?}:{:?}",
+        family.kind.label(),
+        task_kind.label(),
+        family.width,
+        family.steps
+    );
+    for byte in label.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
 }
 
 fn normalize_weights(weights: &mut [f32]) {
@@ -288,7 +351,10 @@ mod tests {
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig::default(),
             tokenization: RuliadTokenizationConfig::default(),
-            source_selection: RuliadSourceSelectionConfig::default(),
+            source_selection: RuliadSourceSelectionConfig {
+                difficulty_levels: UsizeRangeConfig { min: 0, max: 0 },
+                ..RuliadSourceSelectionConfig::default()
+            },
             families: vec![RuliadFamilyConfig {
                 kind: RuliadFamilyKind::Eca,
                 weight: 4,
@@ -317,12 +383,17 @@ mod tests {
         let first = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 8, 42, 7, 2);
         let second = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 8, 42, 7, 2);
         assert_eq!(first, second);
-        assert!(first.bucket_ids.iter().any(|id| id == "eca:next_state"));
         assert!(
             first
                 .bucket_ids
                 .iter()
-                .any(|id| id == "eca:multi_step_state")
+                .any(|id| id.starts_with("eca:next_state@d0#"))
+        );
+        assert!(
+            first
+                .bucket_ids
+                .iter()
+                .any(|id| id.starts_with("eca:multi_step_state@d0#"))
         );
     }
 
@@ -398,6 +469,40 @@ mod tests {
             max_run < 32,
             "source plan has suspiciously long same-source run: {}",
             max_run
+        );
+    }
+
+    #[test]
+    fn source_buckets_materialize_difficulty_frontier_levels() {
+        let mut config = config_with_eca_steps(2, 3);
+        config.source_selection.difficulty_levels = UsizeRangeConfig { min: 0, max: 2 };
+        let buckets = ruliad_source_buckets(&config);
+        assert_eq!(buckets.len(), 3);
+        assert!(
+            buckets
+                .iter()
+                .any(|bucket| bucket.label().starts_with("eca:multi_step_state@d0#"))
+        );
+        assert!(
+            buckets
+                .iter()
+                .any(|bucket| bucket.label().starts_with("eca:multi_step_state@d2#"))
+        );
+        let easy = buckets
+            .iter()
+            .find(|bucket| bucket.id.difficulty_level == 0)
+            .expect("easy bucket");
+        let hard = buckets
+            .iter()
+            .find(|bucket| bucket.id.difficulty_level == 2)
+            .expect("hard bucket");
+        assert!(hard.family_config.steps.unwrap().max > easy.family_config.steps.unwrap().max);
+        assert!(
+            hard.to_sampler_candidate(RuliadSamplerConfig::default())
+                .cost
+                > easy
+                    .to_sampler_candidate(RuliadSamplerConfig::default())
+                    .cost
         );
     }
 

@@ -200,6 +200,7 @@ mod tests {
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 1,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),

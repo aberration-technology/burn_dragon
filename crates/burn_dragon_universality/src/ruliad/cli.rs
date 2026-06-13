@@ -260,6 +260,8 @@ pub fn main() -> Result<()> {
                     } else {
                         "multi_step_state".to_string()
                     },
+                    difficulty_level: index % 4,
+                    params_hash: format!("{index:016x}"),
                     prior: 1.0,
                     cost: 1.0 + (index % 5) as f32,
                     loss_ema: 1.0 + (index % 7) as f32 * 0.5,

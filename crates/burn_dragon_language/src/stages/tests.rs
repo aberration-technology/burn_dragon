@@ -204,6 +204,7 @@ fn generate_prepared_universality_stage_corpus_handles_ruliad() {
             serialization: burn_dragon_universality::RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 1,
+                ..burn_dragon_universality::RuliadSerializationConfig::default()
             },
             tokenization: burn_dragon_universality::RuliadTokenizationConfig::default(),
             source_selection: burn_dragon_universality::RuliadSourceSelectionConfig::default(),

@@ -14,7 +14,7 @@ use crate::ruliad::config::{
     RuliadMathDomain, RuliadReasoningMode,
 };
 use crate::ruliad::oracles::{
-    RuliadSampleSpec, ruliad_categorical_presentation, ruliad_expected_answer,
+    RuliadSampleSpec, is_degenerate_spec, ruliad_categorical_presentation, ruliad_expected_answer,
     ruliad_prompt_prefix, sample_text, verify_spec,
 };
 use crate::ruliad::runtime::OnlineRuliadCorpus;
@@ -87,6 +87,9 @@ pub struct RuliadDiagnosticReport {
     pub answer_slot_coverage: f32,
     pub proof_trace_count: usize,
     pub proof_trace_coverage: f32,
+    pub degenerate_sample_count: usize,
+    pub multi_chunk_document_count: usize,
+    pub multi_chunk_document_coverage: f32,
     pub categorical_core_count: usize,
     pub hash_canary_count: usize,
     pub token_count_drift_count: usize,
@@ -214,6 +217,8 @@ struct DiagnosticSample {
     oracle_hash: Option<String>,
     math_domains: Vec<String>,
     reasoning_modes: Vec<String>,
+    serialized_preview: Option<String>,
+    multi_chunk_document: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -281,6 +286,8 @@ pub fn diagnose_config(
                 oracle_hash: Some(document.oracle_hash),
                 math_domains: document.math_domains,
                 reasoning_modes: document.reasoning_modes,
+                multi_chunk_document: document.serialized_preview.contains("[RTREE"),
+                serialized_preview: Some(document.serialized_preview),
             });
         }
     }
@@ -399,7 +406,7 @@ pub fn baseline_completions(
             };
             RuliadCompletionRecord {
                 oracle_hash: item.oracle_hash.clone(),
-                completion: format!("a:{answer}"),
+                completion: format!("!:{answer}"),
             }
         })
         .collect()
@@ -503,11 +510,18 @@ pub fn evaluate_completions(
 }
 
 pub fn extract_ruliad_answer(completion: &str) -> Option<String> {
-    let answer_start = completion.find("a:").map(|offset| offset + 2).unwrap_or(0);
+    let answer_start = completion.find("!:").map(|offset| offset + 2).unwrap_or(0);
     completion[answer_start..]
         .lines()
         .filter_map(|line| {
-            let candidate = line.split("</ruliad>").next().unwrap_or_default().trim();
+            let candidate = line
+                .split("[/R2]")
+                .next()
+                .unwrap_or_default()
+                .split("[/RTREE]")
+                .next()
+                .unwrap_or_default()
+                .trim();
             (!candidate.is_empty()).then_some(candidate.to_string())
         })
         .next()
@@ -547,6 +561,8 @@ fn diagnose_samples(
     let mut verifier_failure_count = 0usize;
     let mut answer_slot_count = 0usize;
     let mut proof_trace_count = 0usize;
+    let mut degenerate_sample_count = 0usize;
+    let mut multi_chunk_document_count = 0usize;
     let mut categorical_core_count = 0usize;
     let mut hash_canary_count = 0usize;
     let mut token_count_drift_count = 0usize;
@@ -593,15 +609,21 @@ fn diagnose_samples(
         } else {
             verifier_failure_count += 1;
         }
+        degenerate_sample_count += usize::from(is_degenerate_spec(spec));
         let expected_answer = ruliad_expected_answer(spec);
         answer_slot_count += usize::from(!expected_answer.trim().is_empty());
-        let text = sample_text(spec, oracle_hash);
+        let text = sample
+            .serialized_preview
+            .clone()
+            .unwrap_or_else(|| sample_text(spec, oracle_hash));
         if text.len() > payload_token_capacity {
             payload_overflow_count += 1;
         }
-        if trace_line_value(&text, "p:").is_some_and(|proof| proof != "-") {
+        if text.lines().any(|line| line.starts_with('>')) {
             proof_trace_count += 1;
         }
+        multi_chunk_document_count +=
+            usize::from(sample.multi_chunk_document || text.contains("[RTREE"));
         let view = ruliad_categorical_presentation(spec);
         categorical_core_count += usize::from(view.categorical_core);
     }
@@ -632,6 +654,9 @@ fn diagnose_samples(
     }
     if token_count_drift_count > 0 {
         gate_failures.push(format!("token_count_drift_count={token_count_drift_count}"));
+    }
+    if degenerate_sample_count > 0 {
+        gate_failures.push(format!("degenerate_sample_count={degenerate_sample_count}"));
     }
     if payload_overflow_count > 0 {
         gate_failures.push(format!("payload_overflow_count={payload_overflow_count}"));
@@ -679,6 +704,9 @@ fn diagnose_samples(
         answer_slot_coverage: ratio(answer_slot_count, samples.len()),
         proof_trace_count,
         proof_trace_coverage: ratio(proof_trace_count, samples.len()),
+        degenerate_sample_count,
+        multi_chunk_document_count,
+        multi_chunk_document_coverage: ratio(multi_chunk_document_count, samples.len()),
         categorical_core_count,
         hash_canary_count,
         token_count_drift_count,
@@ -707,6 +735,12 @@ fn diagnostic_sample_from_record(record: UniversalitySampleRecord) -> Result<Dia
         oracle_hash: record.oracle_hash,
         math_domains: record.math_domains,
         reasoning_modes: record.reasoning_modes,
+        multi_chunk_document: record
+            .ruliad_document_mode
+            .as_deref()
+            .is_some_and(|mode| mode == "multi_chunk_proof_tree")
+            || record.ruliad_node_count.is_some_and(|count| count > 1),
+        serialized_preview: None,
     })
 }
 
@@ -900,11 +934,6 @@ fn record_missing_required_modes(
     }
 }
 
-fn trace_line_value<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(prefix).map(str::trim))
-}
-
 fn corrupt_answer(answer: &str) -> String {
     if answer.contains("true") {
         answer.replacen("true", "false", 1)
@@ -920,7 +949,8 @@ fn corrupt_answer(answer: &str) -> String {
 fn normalize_answer(value: &str) -> String {
     value
         .trim()
-        .trim_end_matches("</ruliad>")
+        .trim_end_matches("[/R2]")
+        .trim_end_matches("[/RTREE]")
         .trim()
         .to_string()
 }
@@ -990,7 +1020,7 @@ mod tests {
     use super::*;
     use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
-        RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
+        RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
         RuliadSourceSelectionConfig, RuliadTokenizationConfig, default_ruliad_families,
     };
     use crate::ruliad::generate::generate_ruliad_corpus;
@@ -1007,6 +1037,7 @@ mod tests {
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 2,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: RuliadSourceSelectionConfig::default(),
@@ -1019,7 +1050,7 @@ mod tests {
     #[test]
     fn answer_extraction_handles_full_document_and_answer_only() {
         assert_eq!(
-            extract_ruliad_answer("a:holds=true;rhs=1;lhs=1\n</ruliad>"),
+            extract_ruliad_answer("!:holds=true;rhs=1;lhs=1\n[/R2]"),
             Some("holds=true;rhs=1;lhs=1".to_string())
         );
         assert_eq!(
@@ -1027,7 +1058,11 @@ mod tests {
             Some("holds=true;rhs=1;lhs=1".to_string())
         );
         assert_eq!(
-            extract_ruliad_answer("a:\nholds=true;rhs=1;lhs=1"),
+            extract_ruliad_answer("!:\nholds=true;rhs=1;lhs=1"),
+            Some("holds=true;rhs=1;lhs=1".to_string())
+        );
+        assert_eq!(
+            extract_ruliad_answer("[R2 h=x]\n!:holds=true;rhs=1;lhs=1\n[/R2]"),
             Some("holds=true;rhs=1;lhs=1".to_string())
         );
         assert!(ruliad_answers_semantic_match(
@@ -1112,6 +1147,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut config = test_config();
         config.output_dir = dir.path().join("out");
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 2, max: 2 };
         let report = generate_ruliad_corpus(&config).expect("generate");
         let diagnostic = diagnose_manifest(
             &report.manifest_path,
@@ -1128,6 +1165,7 @@ mod tests {
         assert_eq!(diagnostic.missing_ruliad_spec_count, 0);
         assert_eq!(diagnostic.answer_slot_coverage, 1.0);
         assert_eq!(diagnostic.payload_overflow_count, 0);
+        assert_eq!(diagnostic.multi_chunk_document_coverage, 1.0);
 
         let config_diagnostic = diagnose_config(
             &config,
@@ -1165,6 +1203,8 @@ mod tests {
             oracle_hash: Some(document.oracle_hash),
             math_domains: document.math_domains,
             reasoning_modes: document.reasoning_modes,
+            multi_chunk_document: document.serialized_preview.contains("[RTREE"),
+            serialized_preview: Some(document.serialized_preview),
         };
         let diagnostic = diagnose_samples(
             "duplicates".to_string(),

@@ -1095,6 +1095,7 @@ prompt = "1 2 3"
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 1,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: RuliadSourceSelectionConfig {
@@ -1145,7 +1146,7 @@ learning_rate = 0.001
 weight_decay = 0.0
 
 [generation]
-prompt = "<ruliad"
+prompt = "[R2"
 "#,
             ruliad_config_path.display()
         ))

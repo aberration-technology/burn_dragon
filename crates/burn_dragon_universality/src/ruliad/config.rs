@@ -41,6 +41,7 @@ pub enum RuliadFamilyKind {
     Rewrite,
     Algebra,
     Category,
+    ProofTree,
     LeanTask,
     HashNoise,
 }
@@ -54,6 +55,7 @@ impl RuliadFamilyKind {
             Self::Rewrite => "rewrite",
             Self::Algebra => "algebra",
             Self::Category => "category",
+            Self::ProofTree => "proof_tree",
             Self::LeanTask => "lean_task",
             Self::HashNoise => "hash_noise",
         }
@@ -74,6 +76,7 @@ pub enum RuliadTaskKind {
     VerifyCategoryLaw,
     VerifyFunctorPreservation,
     VerifyNaturalitySquare,
+    ProveTheorem,
     CompleteProof,
     HashCanary,
 }
@@ -91,6 +94,7 @@ impl RuliadTaskKind {
             Self::VerifyCategoryLaw => "verify_category_law",
             Self::VerifyFunctorPreservation => "verify_functor_preservation",
             Self::VerifyNaturalitySquare => "verify_naturality_square",
+            Self::ProveTheorem => "prove_theorem",
             Self::CompleteProof => "complete_proof",
             Self::HashCanary => "hash_canary",
         }
@@ -279,6 +283,20 @@ pub fn ruliad_source_semantics(
             ],
             description: "verification that a finite naturality square commutes",
         },
+        (Family::ProofTree, Task::ProveTheorem) => RuliadSourceSemantics {
+            math_domains: &[
+                Domain::UniversalAlgebra,
+                Domain::CategoryTheory,
+                Domain::FormalProof,
+            ],
+            reasoning_modes: &[
+                Mode::EquationalReasoning,
+                Mode::CompositionalReasoning,
+                Mode::FormalDeduction,
+                Mode::StructurePreservation,
+            ],
+            description: "verified synthetic theorem DAG over unnamed algebraic structure",
+        },
         (Family::LeanTask, Task::CompleteProof) => RuliadSourceSemantics {
             math_domains: &[Domain::FormalProof, Domain::CategoryTheory],
             reasoning_modes: &[
@@ -310,6 +328,7 @@ fn family_default_domains(family: RuliadFamilyKind) -> &'static [RuliadMathDomai
         RuliadFamilyKind::Rewrite => &[RuliadMathDomain::SymbolicRewriting],
         RuliadFamilyKind::Algebra => &[RuliadMathDomain::UniversalAlgebra],
         RuliadFamilyKind::Category => &[RuliadMathDomain::CategoryTheory],
+        RuliadFamilyKind::ProofTree => &[RuliadMathDomain::FormalProof],
         RuliadFamilyKind::LeanTask => &[RuliadMathDomain::FormalProof],
         RuliadFamilyKind::HashNoise => &[RuliadMathDomain::InformationTheory],
     }
@@ -327,6 +346,7 @@ fn task_default_reasoning_modes(task_kind: RuliadTaskKind) -> &'static [RuliadRe
         RuliadTaskKind::VerifyCategoryLaw => &[RuliadReasoningMode::Associativity],
         RuliadTaskKind::VerifyFunctorPreservation => &[RuliadReasoningMode::StructurePreservation],
         RuliadTaskKind::VerifyNaturalitySquare => &[RuliadReasoningMode::StructurePreservation],
+        RuliadTaskKind::ProveTheorem => &[RuliadReasoningMode::FormalDeduction],
         RuliadTaskKind::CompleteProof => &[RuliadReasoningMode::FormalDeduction],
         RuliadTaskKind::HashCanary => &[RuliadReasoningMode::EntropyCanary],
     }
@@ -343,12 +363,33 @@ pub struct RuliadFamilyConfig {
     pub steps: Option<UsizeRangeConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadDocumentMode {
+    #[default]
+    SingleSample,
+    MultiChunkProofTree,
+}
+
+impl RuliadDocumentMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SingleSample => "single_sample",
+            Self::MultiChunkProofTree => "multi_chunk_proof_tree",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSerializationConfig {
     #[serde(default = "default_document_tokens")]
     pub document_tokens: usize,
     #[serde(default = "default_preview_samples")]
     pub preview_samples: usize,
+    #[serde(default)]
+    pub document_mode: RuliadDocumentMode,
+    #[serde(default = "default_document_chunks")]
+    pub document_chunks: UsizeRangeConfig,
 }
 
 impl Default for RuliadSerializationConfig {
@@ -356,6 +397,8 @@ impl Default for RuliadSerializationConfig {
         Self {
             document_tokens: default_document_tokens(),
             preview_samples: default_preview_samples(),
+            document_mode: RuliadDocumentMode::default(),
+            document_chunks: default_document_chunks(),
         }
     }
 }
@@ -380,12 +423,24 @@ impl Default for RuliadTokenizationConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSourceSelectionConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub sampler: RuliadSamplerConfig,
+    #[serde(default = "default_difficulty_levels")]
+    pub difficulty_levels: UsizeRangeConfig,
+}
+
+impl Default for RuliadSourceSelectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sampler: RuliadSamplerConfig::default(),
+            difficulty_levels: default_difficulty_levels(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -430,6 +485,15 @@ impl RuliadCorpusConfig {
         if self.serialization.preview_samples == 0 {
             return Err(anyhow!("serialization.preview_samples must be > 0"));
         }
+        self.serialization
+            .document_chunks
+            .validate("serialization.document_chunks")?;
+        if self.serialization.document_chunks.min == 0 {
+            return Err(anyhow!("serialization.document_chunks bounds must be > 0"));
+        }
+        self.source_selection
+            .difficulty_levels
+            .validate("source_selection.difficulty_levels")?;
         if self.families.is_empty() {
             return Err(anyhow!("families must not be empty"));
         }
@@ -516,6 +580,12 @@ pub fn default_ruliad_families() -> Vec<RuliadFamilyConfig> {
             steps: Some(UsizeRangeConfig { min: 3, max: 6 }),
         },
         RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 2,
+            width: Some(UsizeRangeConfig { min: 5, max: 13 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 9 }),
+        },
+        RuliadFamilyConfig {
             kind: RuliadFamilyKind::LeanTask,
             weight: 1,
             width: None,
@@ -554,6 +624,10 @@ pub fn compact_ruliad_families() -> Vec<RuliadFamilyConfig> {
                 family.width = Some(UsizeRangeConfig { min: 3, max: 5 });
                 family.steps = Some(UsizeRangeConfig { min: 3, max: 5 });
             }
+            RuliadFamilyKind::ProofTree => {
+                family.width = Some(UsizeRangeConfig { min: 5, max: 8 });
+                family.steps = Some(UsizeRangeConfig { min: 4, max: 6 });
+            }
             RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => {
                 family.width = None;
                 family.steps = None;
@@ -581,6 +655,14 @@ fn default_document_tokens() -> usize {
 
 fn default_preview_samples() -> usize {
     4
+}
+
+fn default_document_chunks() -> UsizeRangeConfig {
+    UsizeRangeConfig { min: 1, max: 1 }
+}
+
+fn default_difficulty_levels() -> UsizeRangeConfig {
+    UsizeRangeConfig { min: 0, max: 0 }
 }
 
 fn default_chunk_token_capacity() -> usize {

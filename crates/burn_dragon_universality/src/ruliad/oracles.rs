@@ -140,6 +140,22 @@ pub enum RuliadSampleSpec {
         naturality: Option<RuliadNaturalityCheck>,
         task: RuliadTaskKind,
     },
+    ProofTree {
+        modulus: usize,
+        u: [usize; 2],
+        v: [usize; 2],
+        sum: [usize; 2],
+        dot: usize,
+        norm_u: usize,
+        norm_v: usize,
+        norm_sum: usize,
+        lhs: usize,
+        rhs: usize,
+        holds: bool,
+        lemmas: Vec<String>,
+        proof_steps: Vec<String>,
+        task: RuliadTaskKind,
+    },
     LeanTask {
         task_id: String,
         statement: String,
@@ -260,13 +276,21 @@ pub fn generate_sample(
 ) -> Result<GeneratedRuliadSample> {
     let mut rng = sample_rng(config.seed, split, epoch_index, sample_index, 0);
     let family = choose_family(&config.families, &mut rng)?;
+    let difficulty_level = range_or(
+        Some(config.source_selection.difficulty_levels),
+        0,
+        0,
+        &mut rng,
+    );
+    let family_config = scale_family_for_difficulty(family, difficulty_level);
     let spec = match family.kind {
-        RuliadFamilyKind::Eca => generate_eca_spec(family, &mut rng),
-        RuliadFamilyKind::Simulation => generate_simulation_spec(family, &mut rng),
-        RuliadFamilyKind::Automaton => generate_automaton_spec(family, &mut rng),
-        RuliadFamilyKind::Rewrite => generate_rewrite_spec(family, &mut rng),
-        RuliadFamilyKind::Algebra => generate_algebra_spec(family, &mut rng),
-        RuliadFamilyKind::Category => generate_category_spec(family, &mut rng),
+        RuliadFamilyKind::Eca => generate_eca_spec(&family_config, &mut rng),
+        RuliadFamilyKind::Simulation => generate_simulation_spec(&family_config, &mut rng),
+        RuliadFamilyKind::Automaton => generate_automaton_spec(&family_config, &mut rng),
+        RuliadFamilyKind::Rewrite => generate_rewrite_spec(&family_config, &mut rng),
+        RuliadFamilyKind::Algebra => generate_algebra_spec(&family_config, &mut rng),
+        RuliadFamilyKind::Category => generate_category_spec(&family_config, &mut rng),
+        RuliadFamilyKind::ProofTree => generate_proof_tree_spec(&family_config, &mut rng),
         RuliadFamilyKind::LeanTask => generate_lean_spec(proof_tasks, &mut rng),
         RuliadFamilyKind::HashNoise => generate_hash_noise_spec(&mut rng),
     }?;
@@ -297,6 +321,7 @@ pub fn generate_sample_for_source_bucket(
         RuliadFamilyKind::Category => {
             generate_category_spec_for_task(&bucket.family_config, bucket.id.task_kind, &mut rng)
         }
+        RuliadFamilyKind::ProofTree => generate_proof_tree_spec(&bucket.family_config, &mut rng),
         RuliadFamilyKind::LeanTask => generate_lean_spec(proof_tasks, &mut rng),
         RuliadFamilyKind::HashNoise => generate_hash_noise_spec(&mut rng),
     }?;
@@ -483,6 +508,37 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
                 categorical_core: true,
             }
         }
+        RuliadSampleSpec::ProofTree {
+            modulus,
+            lemmas,
+            proof_steps,
+            holds,
+            lhs,
+            rhs,
+            ..
+        } => RuliadCategoricalPresentation {
+            abstraction: "finite_category_reasoning".to_string(),
+            source_family: RuliadFamilyKind::ProofTree.label().to_string(),
+            task_kind: RuliadTaskKind::ProveTheorem.label().to_string(),
+            presentation: "verified_theorem_dependency_category".to_string(),
+            objects: (0..lemmas.len())
+                .map(|index| format!("lemma_{index}"))
+                .collect(),
+            morphisms: proof_steps
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("deduction_step_{index}"))
+                .collect(),
+            functors: vec!["semantic_verifier".to_string()],
+            laws: vec![
+                "proof_dependencies_compose".to_string(),
+                format!("orthogonal_square_sum_mod_{modulus}"),
+            ],
+            query: "prove the unnamed finite square-sum theorem from its dependency DAG"
+                .to_string(),
+            answer: format!("holds={holds};lhs={lhs};rhs={rhs}"),
+            categorical_core: true,
+        },
         RuliadSampleSpec::LeanTask {
             task_id,
             payload_hash,
@@ -718,6 +774,43 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
                 && *composed < morphisms.len();
             (ok, RuliadFamilyKind::Category, *task)
         }
+        RuliadSampleSpec::ProofTree {
+            modulus,
+            u,
+            v,
+            sum,
+            dot,
+            norm_u,
+            norm_v,
+            norm_sum,
+            lhs,
+            rhs,
+            holds,
+            lemmas,
+            proof_steps,
+            task,
+        } => {
+            let recomputed_sum = [(u[0] + v[0]) % modulus, (u[1] + v[1]) % modulus];
+            let recomputed_dot = mod_dot(*u, *v, *modulus);
+            let recomputed_norm_u = mod_norm(*u, *modulus);
+            let recomputed_norm_v = mod_norm(*v, *modulus);
+            let recomputed_norm_sum = mod_norm(*sum, *modulus);
+            let recomputed_rhs = (recomputed_norm_u + recomputed_norm_v) % modulus;
+            let theorem_holds = recomputed_dot == 0 && recomputed_norm_sum == recomputed_rhs;
+            let ok = *modulus >= 2
+                && sum == &recomputed_sum
+                && *dot == recomputed_dot
+                && *norm_u == recomputed_norm_u
+                && *norm_v == recomputed_norm_v
+                && *norm_sum == recomputed_norm_sum
+                && *lhs == recomputed_norm_sum
+                && *rhs == recomputed_rhs
+                && *holds == theorem_holds
+                && *holds
+                && lemmas.len() >= 4
+                && proof_steps.len() >= 4;
+            (ok, RuliadFamilyKind::ProofTree, *task)
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
@@ -760,7 +853,7 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
 }
 
 pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
-    trace_document(spec, oracle_hash).to_text()
+    proof_tape_document(spec, oracle_hash).to_text()
 }
 
 pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
@@ -769,7 +862,7 @@ pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
 
 pub fn ruliad_prompt_prefix(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
     let text = sample_text(spec, oracle_hash);
-    if let Some(answer_offset) = text.find("\na:") {
+    if let Some(answer_offset) = text.find("\n!:") {
         text[..answer_offset + 3].to_string()
     } else {
         text
@@ -777,8 +870,7 @@ pub fn ruliad_prompt_prefix(spec: &RuliadSampleSpec, oracle_hash: &str) -> Strin
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RuliadTraceDocument {
-    abstraction: String,
+struct RuliadProofTapeDocument {
     source_family: String,
     task_kind: String,
     presentation: String,
@@ -792,43 +884,34 @@ struct RuliadTraceDocument {
     data: Vec<String>,
 }
 
-impl RuliadTraceDocument {
+impl RuliadProofTapeDocument {
     fn to_text(&self) -> String {
-        let proof = if self.proof_steps.is_empty() {
-            "-".to_string()
-        } else {
-            self.proof_steps.join(";")
-        };
-        let data = if self.data.is_empty() {
-            "-".to_string()
-        } else {
-            self.data.join(";")
-        };
-        format!(
-            "<ruliad a={} src={} pres={} task={} v={} h={}>\nsem:{}|{}\nq:{}\np:{}\na:{}\nd:{}\n</ruliad>\n",
-            self.abstraction,
-            self.source_family,
-            self.presentation,
-            self.task_kind,
+        let hash = compact_text(&self.oracle_hash, 16);
+        let domains = compact_labels(&self.domains);
+        let modes = compact_labels(&self.reasoning_modes);
+        let mut out = format!(
+            "[R2 h={hash} v={} f={} t={} p={}]\nS:{domains}|{modes}\nG:{}\n?:{}\n",
             self.verifier_version,
-            self.oracle_hash,
-            compact_labels(&self.domains),
-            compact_labels(&self.reasoning_modes),
-            self.query,
-            proof,
-            self.answer,
-            data
-        )
+            compact_label(&self.source_family),
+            compact_label(&self.task_kind),
+            compact_label(&self.presentation),
+            self.data.join("|"),
+            self.query
+        );
+        for (index, step) in self.proof_steps.iter().enumerate() {
+            out.push_str(&format!(">{index}:{}\n", compact_text(step, 96)));
+        }
+        out.push_str(&format!("!:{}\n[/R2]\n", self.answer));
+        out
     }
 }
 
-fn trace_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadTraceDocument {
+fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProofTapeDocument {
     let view = ruliad_categorical_presentation(spec);
     let family = family_of_spec(spec);
     let task_kind = task_kind_of_spec(spec);
     let semantics = ruliad_source_semantics(family, task_kind);
-    RuliadTraceDocument {
-        abstraction: view.abstraction,
+    RuliadProofTapeDocument {
         source_family: view.source_family,
         task_kind: view.task_kind,
         presentation: view.presentation,
@@ -876,6 +959,9 @@ fn compact_query(spec: &RuliadSampleSpec) -> String {
             RuliadTaskKind::VerifyNaturalitySquare => "verify finite naturality square".to_string(),
             _ => "verify finite category trace".to_string(),
         },
+        RuliadSampleSpec::ProofTree { modulus, .. } => {
+            format!("prove unnamed square-sum theorem over Z/{modulus}Z")
+        }
         RuliadSampleSpec::LeanTask { task_id, .. } => format!("validate proof payload {task_id}"),
         RuliadSampleSpec::HashNoise { .. } => "verify entropy canary hash".to_string(),
     }
@@ -888,47 +974,80 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             trace,
             steps,
             ..
-        } => vec![
-            format!("start={initial}"),
-            format!(
-                "path_len={steps};target={}",
+        } => {
+            let mut steps_out = vec![format!("x0={initial}")];
+            if trace.len() > 2 {
+                let mid = trace.len() / 2;
+                steps_out.push(format!("x{mid}={}", trace[mid]));
+            }
+            steps_out.push(format!(
+                "x{steps}={}",
                 trace.last().cloned().unwrap_or_default()
-            ),
-        ],
+            ));
+            steps_out
+        }
         RuliadSampleSpec::Simulation {
-            target_initial,
             mapped_source_trace,
             target_trace,
             ..
-        } => vec![
-            format!("F0={target_initial}"),
-            format!(
+        } => {
+            let mut steps = vec!["F0=complement(x0)".to_string()];
+            if mapped_source_trace.len() > 2 && target_trace.len() > 2 {
+                let mid = mapped_source_trace.len() / 2;
+                steps.push(format!(
+                    "F{mid}_ok={}",
+                    mapped_source_trace.get(mid) == target_trace.get(mid)
+                ));
+            }
+            steps.push(format!(
                 "last_ok={}",
                 mapped_source_trace.last() == target_trace.last()
-            ),
-        ],
+            ));
+            steps
+        }
         RuliadSampleSpec::Automaton {
             start_state, trace, ..
-        } => vec![format!(
-            "q{}=>q{}",
-            start_state,
-            trace.last().copied().unwrap_or(*start_state)
-        )],
+        } => vec![
+            format!(
+                "q{}=>q{}",
+                start_state,
+                trace.last().copied().unwrap_or(*start_state)
+            ),
+            format!("trace={}", compact_state_trace(trace)),
+        ],
         RuliadSampleSpec::Rewrite {
             initial,
             trace,
             normal_form,
             ..
-        } => vec![format!(
-            "{}=>{} in {} steps",
-            initial,
-            normal_form,
-            trace.len() - 1
-        )],
+        } => vec![
+            format!("{}=>{} in {} steps", initial, normal_form, trace.len() - 1),
+            format!("trace={}", compact_string_trace(trace)),
+        ],
         RuliadSampleSpec::Algebra { law, lhs, rhs, .. } => {
             vec![format!("{} lhs={lhs};rhs={rhs}", law.label())]
         }
         RuliadSampleSpec::Category { proof_steps, .. } => proof_steps.clone(),
+        RuliadSampleSpec::ProofTree {
+            lemmas,
+            proof_steps,
+            ..
+        } => {
+            let mut steps = vec![format!(
+                "dag=L0..L{};deps=chain,expand,subst",
+                lemmas.len().saturating_sub(1)
+            )];
+            if let Some(step) = proof_steps.get(1) {
+                steps.push(step.clone());
+            }
+            if let Some(step) = proof_steps.get(2) {
+                steps.push(step.clone());
+            }
+            if let Some(step) = proof_steps.last() {
+                steps.push(step.clone());
+            }
+            steps
+        }
         RuliadSampleSpec::LeanTask { .. } => vec!["payload_hash_matches=true".to_string()],
         RuliadSampleSpec::HashNoise { .. } => vec!["sha256_matches=true".to_string()],
     }
@@ -946,6 +1065,11 @@ fn compact_answer(spec: &RuliadSampleSpec) -> String {
         RuliadSampleSpec::Category {
             lhs, rhs, holds, ..
         } => format!("holds={holds};lhs={lhs};rhs={rhs}"),
+        RuliadSampleSpec::ProofTree {
+            holds, lhs, rhs, ..
+        } => {
+            format!("holds={holds};lhs={lhs};rhs={rhs}")
+        }
         RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("payload_hash={payload_hash}"),
         RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("payload_hash={payload_hash}"),
     }
@@ -958,15 +1082,11 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             width,
             steps,
             initial,
-            trace,
+            trace: _,
             ..
         } => vec![
             format!("rule={rule};w={width};steps={steps}"),
-            format!(
-                "edge={}=>{}",
-                initial,
-                trace.last().cloned().unwrap_or_default()
-            ),
+            format!("x0={initial}"),
         ],
         RuliadSampleSpec::Simulation {
             source_rule,
@@ -1013,7 +1133,7 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
                 "carrier={carrier_size};operands={}",
                 compact_usize_list(operands)
             ),
-            format!("table={}", compact_table(operation_table)),
+            format!("op={}", compact_operation_descriptor(operation_table)),
         ],
         RuliadSampleSpec::Category {
             object_count,
@@ -1050,6 +1170,21 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             }
             data
         }
+        RuliadSampleSpec::ProofTree {
+            modulus,
+            u,
+            v,
+            sum,
+            dot,
+            norm_u,
+            norm_v,
+            norm_sum,
+            ..
+        } => vec![
+            format!("m={modulus};u={},{};v={},{}", u[0], u[1], v[0], v[1]),
+            format!("sum={},{};dot={dot}", sum[0], sum[1]),
+            format!("norms={norm_u},{norm_v},{norm_sum}"),
+        ],
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
@@ -1109,6 +1244,9 @@ fn compact_label(value: &str) -> &str {
         "associativity" => "assoc",
         "formal_deduction" => "proof",
         "entropy_canary" => "entropy",
+        "proof_tree" => "pt",
+        "prove_theorem" => "thm",
+        "verified_theorem_dependency_category" => "thm_cat",
         other => other,
     }
 }
@@ -1121,12 +1259,64 @@ fn compact_usize_list(values: &[usize]) -> String {
         .join(",")
 }
 
+fn compact_state_trace(trace: &[usize]) -> String {
+    if trace.len() <= 8 {
+        return compact_usize_list(trace);
+    }
+    let mid = trace.len() / 2;
+    format!(
+        "{},{},{}..{},{}",
+        trace[0],
+        trace[1],
+        trace[mid],
+        trace[trace.len() - 2],
+        trace[trace.len() - 1]
+    )
+}
+
+fn compact_string_trace(trace: &[String]) -> String {
+    if trace.len() <= 5 {
+        return trace.join(">");
+    }
+    let mid = trace.len() / 2;
+    format!(
+        "{}>{}>{}..>{}",
+        trace[0],
+        trace[1],
+        trace[mid],
+        trace.last().cloned().unwrap_or_default()
+    )
+}
+
 fn compact_table(table: &[Vec<usize>]) -> String {
     table
         .iter()
         .map(|row| compact_usize_list(row))
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn compact_operation_descriptor(table: &[Vec<usize>]) -> String {
+    let carrier_size = table.len();
+    if table == add_mod_table(carrier_size) {
+        return format!("add_mod_{carrier_size}");
+    }
+    if table == affine_mod_table(carrier_size, 1, 2, 1) {
+        return format!("affine_mod_{carrier_size}(x+2y+1)");
+    }
+    if carrier_size <= 6 {
+        return compact_table(table);
+    }
+    let hash = stable_json_hash(&table).unwrap_or_else(|_| "unknown".to_string());
+    let row0 = table
+        .first()
+        .map(|row| compact_usize_list(row))
+        .unwrap_or_default();
+    format!(
+        "table_hash={};row0={}",
+        compact_text(&hash, 16),
+        compact_text(&row0, 64)
+    )
 }
 
 fn compact_morphism_summary(morphisms: &[RuliadCategoryMorphism]) -> String {
@@ -1152,6 +1342,7 @@ fn family_of_spec(spec: &RuliadSampleSpec) -> RuliadFamilyKind {
         RuliadSampleSpec::Rewrite { .. } => RuliadFamilyKind::Rewrite,
         RuliadSampleSpec::Algebra { .. } => RuliadFamilyKind::Algebra,
         RuliadSampleSpec::Category { .. } => RuliadFamilyKind::Category,
+        RuliadSampleSpec::ProofTree { .. } => RuliadFamilyKind::ProofTree,
         RuliadSampleSpec::LeanTask { .. } => RuliadFamilyKind::LeanTask,
         RuliadSampleSpec::HashNoise { .. } => RuliadFamilyKind::HashNoise,
     }
@@ -1165,6 +1356,7 @@ fn task_kind_of_spec(spec: &RuliadSampleSpec) -> RuliadTaskKind {
         | RuliadSampleSpec::Rewrite { task, .. }
         | RuliadSampleSpec::Algebra { task, .. }
         | RuliadSampleSpec::Category { task, .. }
+        | RuliadSampleSpec::ProofTree { task, .. }
         | RuliadSampleSpec::LeanTask { task, .. }
         | RuliadSampleSpec::HashNoise { task, .. } => *task,
     }
@@ -1188,30 +1380,87 @@ fn choose_family<'a>(
     Ok(&families[families.len() - 1])
 }
 
+pub(crate) fn scale_family_for_difficulty(
+    family: &RuliadFamilyConfig,
+    difficulty_level: usize,
+) -> RuliadFamilyConfig {
+    if difficulty_level == 0 {
+        return family.clone();
+    }
+    let mut scaled = family.clone();
+    let level = difficulty_level.min(32);
+    if let Some(width) = scaled.width.as_mut() {
+        let stride = (width.max.saturating_sub(width.min).max(1) / 2).max(1);
+        let bump = stride.saturating_mul(level);
+        width.min = width.min.saturating_add(bump);
+        width.max = width.max.saturating_add(bump.saturating_mul(2));
+    }
+    if let Some(steps) = scaled.steps.as_mut() {
+        let stride = (steps.max.saturating_sub(steps.min).max(1) / 2).max(1);
+        let bump = stride.saturating_mul(level);
+        steps.min = steps.min.saturating_add(bump);
+        steps.max = steps.max.saturating_add(bump.saturating_mul(2));
+    }
+    cap_scaled_family_for_payload(&mut scaled);
+    scaled
+}
+
+fn cap_scaled_family_for_payload(family: &mut RuliadFamilyConfig) {
+    let (max_width, max_steps) = match family.kind {
+        RuliadFamilyKind::Eca => (Some(128), Some(64)),
+        RuliadFamilyKind::Simulation => (Some(128), Some(64)),
+        RuliadFamilyKind::Automaton => (Some(48), Some(128)),
+        RuliadFamilyKind::Rewrite => (Some(128), Some(96)),
+        RuliadFamilyKind::Algebra => (Some(64), None),
+        RuliadFamilyKind::Category => (Some(48), Some(64)),
+        RuliadFamilyKind::ProofTree => (Some(512), Some(512)),
+        RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => (None, None),
+    };
+    if let (Some(width), Some(max_width)) = (family.width.as_mut(), max_width) {
+        cap_range(width, max_width);
+    }
+    if let (Some(steps), Some(max_steps)) = (family.steps.as_mut(), max_steps) {
+        cap_range(steps, max_steps);
+    }
+}
+
+fn cap_range(range: &mut crate::config::UsizeRangeConfig, max_value: usize) {
+    range.min = range.min.min(max_value);
+    range.max = range.max.min(max_value).max(range.min);
+}
+
 fn generate_eca_spec(
     family: &RuliadFamilyConfig,
     rng: &mut SplitMix64,
 ) -> Result<RuliadSampleSpec> {
-    let width = range_or(family.width, 16, 32, rng);
-    let steps = range_or(family.steps, 4, 10, rng);
-    let rule = rng.next_u8();
-    let initial = eca::random_state(width, rng);
-    let trace = eca::trace(rule, &initial, steps)
-        .iter()
-        .map(|state| eca::format_state(state))
-        .collect::<Vec<_>>();
-    Ok(RuliadSampleSpec::Eca {
-        rule,
-        width,
-        steps,
-        initial: eca::format_state(&initial),
-        trace,
-        task: if steps <= 1 {
-            RuliadTaskKind::NextState
-        } else {
-            RuliadTaskKind::MultiStepState
-        },
-    })
+    let mut fallback = None;
+    for _ in 0..64 {
+        let width = range_or(family.width, 16, 32, rng);
+        let steps = range_or(family.steps, 4, 10, rng);
+        let rule = rng.next_u8();
+        let initial = eca::random_state(width, rng);
+        let trace = eca::trace(rule, &initial, steps)
+            .iter()
+            .map(|state| eca::format_state(state))
+            .collect::<Vec<_>>();
+        let spec = RuliadSampleSpec::Eca {
+            rule,
+            width,
+            steps,
+            initial: eca::format_state(&initial),
+            trace,
+            task: if steps <= 1 {
+                RuliadTaskKind::NextState
+            } else {
+                RuliadTaskKind::MultiStepState
+            },
+        };
+        if !is_degenerate_spec(&spec) {
+            return Ok(spec);
+        }
+        fallback = Some(spec);
+    }
+    fallback.ok_or_else(|| anyhow!("failed to generate ECA ruliad sample"))
 }
 
 fn generate_simulation_spec(
@@ -1257,42 +1506,50 @@ fn generate_automaton_spec(
     family: &RuliadFamilyConfig,
     rng: &mut SplitMix64,
 ) -> Result<RuliadSampleSpec> {
-    let state_count = range_or(family.width, 3, 8, rng);
-    let input_len = range_or(family.steps, 6, 20, rng);
-    let transitions = (0..state_count)
-        .map(|_| {
-            (0..2)
-                .map(|_| rng.next_usize(state_count))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let start_state = rng.next_usize(state_count);
-    let mut accept_states = (0..state_count)
-        .filter(|_| rng.next_bool())
-        .collect::<Vec<_>>();
-    if accept_states.is_empty() {
-        accept_states.push(rng.next_usize(state_count));
+    let mut fallback = None;
+    for _ in 0..64 {
+        let state_count = range_or(family.width, 3, 8, rng);
+        let input_len = range_or(family.steps, 6, 20, rng);
+        let transitions = (0..state_count)
+            .map(|_| {
+                (0..2)
+                    .map(|_| rng.next_usize(state_count))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let start_state = rng.next_usize(state_count);
+        let mut accept_states = (0..state_count)
+            .filter(|_| rng.next_bool())
+            .collect::<Vec<_>>();
+        if accept_states.is_empty() || accept_states.len() == state_count {
+            accept_states = (0..state_count).filter(|state| state % 2 == 0).collect();
+        }
+        accept_states.sort_unstable();
+        accept_states.dedup();
+        let input = (0..input_len)
+            .map(|_| if rng.next_bool() { '1' } else { '0' })
+            .collect::<String>();
+        let trace = automaton_trace(state_count, &transitions, start_state, &input)
+            .ok_or_else(|| anyhow!("generated invalid automaton trace"))?;
+        let accepted = trace
+            .last()
+            .is_some_and(|state| accept_states.contains(state));
+        let spec = RuliadSampleSpec::Automaton {
+            state_count,
+            transitions,
+            start_state,
+            accept_states,
+            input,
+            trace,
+            accepted,
+            task: RuliadTaskKind::EvaluateAutomaton,
+        };
+        if !is_degenerate_spec(&spec) {
+            return Ok(spec);
+        }
+        fallback = Some(spec);
     }
-    accept_states.sort_unstable();
-    accept_states.dedup();
-    let input = (0..input_len)
-        .map(|_| if rng.next_bool() { '1' } else { '0' })
-        .collect::<String>();
-    let trace = automaton_trace(state_count, &transitions, start_state, &input)
-        .ok_or_else(|| anyhow!("generated invalid automaton trace"))?;
-    let accepted = trace
-        .last()
-        .is_some_and(|state| accept_states.contains(state));
-    Ok(RuliadSampleSpec::Automaton {
-        state_count,
-        transitions,
-        start_state,
-        accept_states,
-        input,
-        trace,
-        accepted,
-        task: RuliadTaskKind::EvaluateAutomaton,
-    })
+    fallback.ok_or_else(|| anyhow!("failed to generate automaton ruliad sample"))
 }
 
 fn generate_rewrite_spec(
@@ -1344,20 +1601,28 @@ fn generate_rewrite_spec(
     let rule_count = rng.range_usize(3, 5).min(candidates.len());
     let rules = candidates.into_iter().take(rule_count).collect::<Vec<_>>();
     let symbols = alphabet.chars().collect::<Vec<_>>();
-    let initial = (0..initial_len)
-        .map(|_| symbols[rng.next_usize(symbols.len())])
-        .collect::<String>();
-    let trace = rewrite_trace(&initial, &rules, steps);
-    let normal_form = trace.last().cloned().unwrap_or_else(|| initial.clone());
-    Ok(RuliadSampleSpec::Rewrite {
-        alphabet,
-        rules,
-        initial,
-        steps,
-        trace,
-        normal_form,
-        task: RuliadTaskKind::RewriteNormalForm,
-    })
+    let mut fallback = None;
+    for _ in 0..64 {
+        let initial = (0..initial_len)
+            .map(|_| symbols[rng.next_usize(symbols.len())])
+            .collect::<String>();
+        let trace = rewrite_trace(&initial, &rules, steps);
+        let normal_form = trace.last().cloned().unwrap_or_else(|| initial.clone());
+        let spec = RuliadSampleSpec::Rewrite {
+            alphabet: alphabet.clone(),
+            rules: rules.clone(),
+            initial,
+            steps,
+            trace,
+            normal_form,
+            task: RuliadTaskKind::RewriteNormalForm,
+        };
+        if !is_degenerate_spec(&spec) {
+            return Ok(spec);
+        }
+        fallback = Some(spec);
+    }
+    fallback.ok_or_else(|| anyhow!("failed to generate rewrite ruliad sample"))
 }
 
 fn generate_algebra_spec(
@@ -1365,22 +1630,10 @@ fn generate_algebra_spec(
     rng: &mut SplitMix64,
 ) -> Result<RuliadSampleSpec> {
     let carrier_size = range_or(family.width, 2, 6, rng);
-    let operation_table = if rng.next_bool() {
-        (0..carrier_size)
-            .map(|left| {
-                (0..carrier_size)
-                    .map(|right| (left + right) % carrier_size)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+    let operation_table = if rng.next_bool() || carrier_size <= 2 {
+        add_mod_table(carrier_size)
     } else {
-        (0..carrier_size)
-            .map(|_| {
-                (0..carrier_size)
-                    .map(|_| rng.next_usize(carrier_size))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+        affine_mod_table(carrier_size, 1, 2, 1)
     };
     let law = if rng.next_bool() {
         RuliadAlgebraLaw::Associativity
@@ -1444,6 +1697,63 @@ fn generate_category_spec_for_task(
     })
 }
 
+fn generate_proof_tree_spec(
+    family: &RuliadFamilyConfig,
+    rng: &mut SplitMix64,
+) -> Result<RuliadSampleSpec> {
+    let modulus = next_prime_at_least(range_or(family.width, 5, 13, rng).max(5));
+    let depth = range_or(family.steps, 4, 9, rng).max(4);
+    let u = [
+        rng.range_usize(1, modulus.saturating_sub(1)),
+        rng.range_usize(1, modulus.saturating_sub(1)),
+    ];
+    let scale = rng.range_usize(1, modulus.saturating_sub(1));
+    let v = [
+        (u[1] * scale) % modulus,
+        (modulus - ((u[0] * scale) % modulus)) % modulus,
+    ];
+    let sum = [(u[0] + v[0]) % modulus, (u[1] + v[1]) % modulus];
+    let dot = mod_dot(u, v, modulus);
+    let norm_u = mod_norm(u, modulus);
+    let norm_v = mod_norm(v, modulus);
+    let norm_sum = mod_norm(sum, modulus);
+    let rhs = (norm_u + norm_v) % modulus;
+    let mut lemmas = vec![
+        format!("L0:def dot(x,y)=x0*y0+x1*y1 mod {modulus}"),
+        format!("L1:def n(x)=x0*x0+x1*x1 mod {modulus}"),
+        "L2:expand n(x+y)=n(x)+n(y)+2*dot(x,y)".to_string(),
+        "L3:orthogonal vectors cancel cross term".to_string(),
+    ];
+    for lemma_index in 4..depth {
+        lemmas.push(format!(
+            "L{lemma_index}:substitute previous equality into goal term"
+        ));
+    }
+    let proof_steps = vec![
+        format!("u=({},{});v=({},{});m={modulus}", u[0], u[1], v[0], v[1]),
+        format!("dot={}*{}+{}*{}={dot}", u[0], v[0], u[1], v[1]),
+        format!("sum=({},{});n(sum)={norm_sum}", sum[0], sum[1]),
+        format!("n(u)+n(v)={norm_u}+{norm_v}={rhs}"),
+        "close by L2 and dot=0".to_string(),
+    ];
+    Ok(RuliadSampleSpec::ProofTree {
+        modulus,
+        u,
+        v,
+        sum,
+        dot,
+        norm_u,
+        norm_v,
+        norm_sum,
+        lhs: norm_sum,
+        rhs,
+        holds: dot == 0 && norm_sum == rhs,
+        lemmas,
+        proof_steps,
+        task: RuliadTaskKind::ProveTheorem,
+    })
+}
+
 fn generate_lean_spec(
     proof_tasks: &[LeanProofTask],
     rng: &mut SplitMix64,
@@ -1454,14 +1764,21 @@ fn generate_lean_spec(
         proof_tasks.to_vec()
     };
     let proof_task = tasks[rng.next_usize(tasks.len())].clone();
-    let payload_hash = proof_task
-        .payload_hash
-        .clone()
-        .unwrap_or_else(|| proof_task.computed_payload_hash());
-    Ok(RuliadSampleSpec::LeanTask {
-        task_id: proof_task.id,
-        statement: proof_task.statement,
+    let renaming = rng.next_u64();
+    let instantiated = LeanProofTask {
+        id: format!("{}__r{renaming:016x}", proof_task.id),
+        statement: format!(
+            "{} [symbolic_renaming={renaming:016x}]",
+            proof_task.statement
+        ),
         proof: proof_task.proof,
+        payload_hash: None,
+    };
+    let payload_hash = instantiated.computed_payload_hash();
+    Ok(RuliadSampleSpec::LeanTask {
+        task_id: instantiated.id,
+        statement: instantiated.statement,
+        proof: instantiated.proof,
         payload_hash,
         task: RuliadTaskKind::CompleteProof,
     })
@@ -1577,6 +1894,31 @@ fn valid_operation_table(carrier_size: usize, operation_table: &[Vec<usize>]) ->
             .all(|row| row.len() == carrier_size && row.iter().all(|value| *value < carrier_size))
 }
 
+fn add_mod_table(carrier_size: usize) -> Vec<Vec<usize>> {
+    (0..carrier_size)
+        .map(|left| {
+            (0..carrier_size)
+                .map(|right| (left + right) % carrier_size)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn affine_mod_table(
+    carrier_size: usize,
+    left_weight: usize,
+    right_weight: usize,
+    bias: usize,
+) -> Vec<Vec<usize>> {
+    (0..carrier_size)
+        .map(|left| {
+            (0..carrier_size)
+                .map(|right| (left_weight * left + right_weight * right + bias) % carrier_size)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn algebra_law_result(
     carrier_size: usize,
     operation_table: &[Vec<usize>],
@@ -1610,6 +1952,50 @@ fn algebra_law_result(
     }
 }
 
+fn mod_dot(left: [usize; 2], right: [usize; 2], modulus: usize) -> usize {
+    if modulus == 0 {
+        return 0;
+    }
+    (left[0] * right[0] + left[1] * right[1]) % modulus
+}
+
+fn mod_norm(value: [usize; 2], modulus: usize) -> usize {
+    if modulus == 0 {
+        return 0;
+    }
+    (value[0] * value[0] + value[1] * value[1]) % modulus
+}
+
+fn next_prime_at_least(value: usize) -> usize {
+    let mut candidate = value.max(2);
+    loop {
+        if is_prime(candidate) {
+            return candidate;
+        }
+        candidate = candidate.saturating_add(1);
+    }
+}
+
+fn is_prime(value: usize) -> bool {
+    if value < 2 {
+        return false;
+    }
+    if value == 2 {
+        return true;
+    }
+    if value.is_multiple_of(2) {
+        return false;
+    }
+    let mut divisor = 3usize;
+    while divisor.saturating_mul(divisor) <= value {
+        if value.is_multiple_of(divisor) {
+            return false;
+        }
+        divisor = divisor.saturating_add(2);
+    }
+    true
+}
+
 fn shuffle_rules(rules: &mut [RuliadRewriteRule], rng: &mut SplitMix64) {
     for index in (1..rules.len()).rev() {
         let swap_index = rng.next_usize(index + 1);
@@ -1630,14 +2016,19 @@ fn range_or(
 }
 
 fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
-    let (width, steps, state_count, transition_rate, complexity_score) = match spec {
+    let (width, steps, state_count, transition_rate) = match spec {
         RuliadSampleSpec::Eca {
             width,
             steps,
             trace,
             ..
-        } => (*width, *steps, 2, trace_transition_rate(trace), 35.0),
-        RuliadSampleSpec::Simulation { width, steps, .. } => (*width, *steps, 2, 0.5, 60.0),
+        } => (*width, *steps, 2, trace_transition_rate(trace)),
+        RuliadSampleSpec::Simulation {
+            width,
+            steps,
+            source_trace,
+            ..
+        } => (*width, *steps, 2, trace_transition_rate(source_trace)),
         RuliadSampleSpec::Automaton {
             state_count,
             input,
@@ -1648,7 +2039,6 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             input.len(),
             *state_count,
             finite_state_transition_rate(trace),
-            45.0,
         ),
         RuliadSampleSpec::Rewrite {
             alphabet,
@@ -1660,7 +2050,6 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             *steps,
             alphabet.len(),
             string_trace_change_rate(trace),
-            55.0,
         ),
         RuliadSampleSpec::Algebra {
             carrier_size,
@@ -1671,7 +2060,6 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             1,
             *carrier_size,
             if *holds { 0.0 } else { 1.0 },
-            65.0,
         ),
         RuliadSampleSpec::Category {
             object_count,
@@ -1683,16 +2071,27 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             path.len().saturating_sub(1),
             morphisms.len(),
             finite_state_transition_rate(path),
-            70.0,
         ),
-        RuliadSampleSpec::LeanTask { .. } => (1, 1, 2, 0.0, 75.0),
-        RuliadSampleSpec::HashNoise { .. } => (1, 1, 256, 1.0, 100.0),
+        RuliadSampleSpec::ProofTree {
+            modulus,
+            lemmas,
+            proof_steps,
+            ..
+        } => (
+            *modulus,
+            lemmas.len().saturating_add(proof_steps.len()),
+            *modulus,
+            0.75,
+        ),
+        RuliadSampleSpec::LeanTask { proof, .. } => (1, proof.lines().count().max(1), 2, 0.25),
+        RuliadSampleSpec::HashNoise { .. } => (1, 1, 256, 1.0),
     };
     let unique_bytes = text
         .bytes()
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let gzip_complexity_ratio = (unique_bytes as f32 / 256.0).clamp(0.0, 1.0);
+    let complexity_score = semantic_difficulty_score(spec, transition_rate, gzip_complexity_ratio);
     SampleStats {
         grid_width: width,
         grid_height: 1,
@@ -1709,6 +2108,105 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
         patch_uniqueness_ratio: gzip_complexity_ratio,
         gzip_complexity_ratio,
         complexity_score,
+    }
+}
+
+fn semantic_difficulty_score(
+    spec: &RuliadSampleSpec,
+    transition_rate: f32,
+    gzip_complexity_ratio: f32,
+) -> f32 {
+    let (structural, depth, branching, abstraction) = match spec {
+        RuliadSampleSpec::Eca { width, steps, .. } => (*width, *steps, 2, 1),
+        RuliadSampleSpec::Simulation { width, steps, .. } => (*width * 2, *steps, 2, 3),
+        RuliadSampleSpec::Automaton {
+            state_count, input, ..
+        } => (*state_count, input.len(), 2, 2),
+        RuliadSampleSpec::Rewrite { rules, trace, .. } => {
+            (rules.len(), trace.len(), rules.len(), 3)
+        }
+        RuliadSampleSpec::Algebra {
+            carrier_size,
+            operation_table,
+            ..
+        } => (
+            *carrier_size,
+            2,
+            operation_table.len().saturating_mul(operation_table.len()),
+            4,
+        ),
+        RuliadSampleSpec::Category {
+            object_count,
+            morphisms,
+            proof_steps,
+            ..
+        } => (*object_count, proof_steps.len().max(1), morphisms.len(), 5),
+        RuliadSampleSpec::ProofTree {
+            modulus,
+            lemmas,
+            proof_steps,
+            ..
+        } => (
+            *modulus,
+            lemmas.len().saturating_add(proof_steps.len()),
+            lemmas.len(),
+            7,
+        ),
+        RuliadSampleSpec::LeanTask { proof, .. } => (2, proof.lines().count().max(1), 2, 6),
+        RuliadSampleSpec::HashNoise { bytes_hex, .. } => (bytes_hex.len(), 1, 256, 0),
+    };
+    let structural_score = (structural.max(1) as f32).log2() * 5.0;
+    let depth_score = (depth.max(1) as f32).log2() * 6.0;
+    let branching_score = (branching.max(1) as f32).log2() * 4.0;
+    let abstraction_score = abstraction as f32 * 3.0;
+    let dynamic_score = transition_rate.clamp(0.0, 1.0) * 12.0;
+    let text_score = gzip_complexity_ratio.clamp(0.0, 1.0) * 6.0;
+    (structural_score
+        + depth_score
+        + branching_score
+        + abstraction_score
+        + dynamic_score
+        + text_score)
+        .clamp(0.0, 100.0)
+}
+
+pub(crate) fn is_degenerate_spec(spec: &RuliadSampleSpec) -> bool {
+    match spec {
+        RuliadSampleSpec::Eca { trace, steps, .. } => {
+            let unique = trace
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let collapsed_final = trace.last().is_some_and(|state| {
+                state.bytes().all(|byte| byte == b'0') || state.bytes().all(|byte| byte == b'1')
+            });
+            *steps > 1 && (unique <= 2 || trace_transition_rate(trace) < 0.03 || collapsed_final)
+        }
+        RuliadSampleSpec::Simulation {
+            source_trace,
+            target_trace,
+            steps,
+            ..
+        } => {
+            *steps > 1
+                && (trace_transition_rate(source_trace) < 0.03
+                    || trace_transition_rate(target_trace) < 0.03)
+        }
+        RuliadSampleSpec::Automaton {
+            state_count, trace, ..
+        } => {
+            let unique = trace
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            *state_count > 2 && unique < (*state_count).min(3)
+        }
+        RuliadSampleSpec::Rewrite { trace, .. } => trace.len() <= 2,
+        RuliadSampleSpec::Algebra { .. }
+        | RuliadSampleSpec::Category { .. }
+        | RuliadSampleSpec::ProofTree { .. }
+        | RuliadSampleSpec::LeanTask { .. }
+        | RuliadSampleSpec::HashNoise { .. } => false,
     }
 }
 
@@ -1829,6 +2327,7 @@ mod tests {
             RuliadFamilyKind::Rewrite,
             RuliadFamilyKind::Algebra,
             RuliadFamilyKind::Category,
+            RuliadFamilyKind::ProofTree,
             RuliadFamilyKind::LeanTask,
         ] {
             let mut config = config();
@@ -1843,6 +2342,7 @@ mod tests {
                     RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 8, max: 8 }),
                     RuliadFamilyKind::Algebra => Some(UsizeRangeConfig { min: 3, max: 3 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 5, max: 5 }),
                     RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => None,
                 },
                 steps: match family {
@@ -1852,6 +2352,7 @@ mod tests {
                     RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 6, max: 6 }),
                     RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 4, max: 4 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 3, max: 3 }),
+                    RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 4, max: 4 }),
                     RuliadFamilyKind::Algebra
                     | RuliadFamilyKind::LeanTask
                     | RuliadFamilyKind::HashNoise => None,
@@ -1867,14 +2368,9 @@ mod tests {
                 sample.categorical_presentation.source_family,
                 family.label()
             );
-            assert!(
-                sample
-                    .text
-                    .starts_with("<ruliad a=finite_category_reasoning")
-            );
-            assert!(!sample.text.contains("<ruliad family="));
-            assert!(sample.text.contains("\nq:"));
-            assert!(sample.text.contains("\na:"));
+            assert!(sample.text.starts_with("[R2 "));
+            assert!(sample.text.contains("\n?:"));
+            assert!(sample.text.contains("\n!:"));
             assert!(
                 sample.text.len() <= 512,
                 "{} sample exceeded trace-pretraining payload budget: {} bytes",
@@ -1882,6 +2378,22 @@ mod tests {
                 sample.text.len()
             );
         }
+    }
+
+    #[test]
+    fn prompt_prefix_ends_at_canonical_answer_slot() {
+        let mut config = config();
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 5, max: 5 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+        }];
+        let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
+        let prompt = ruliad_prompt_prefix(&sample.spec, &sample.oracle_hash);
+        assert!(prompt.ends_with("!:"));
+        assert!(!prompt.contains("holds=true"));
+        assert!(!prompt.contains("[/R2]"));
     }
 
     #[test]
@@ -1914,6 +2426,63 @@ mod tests {
                 text.len()
             );
         }
+    }
+
+    #[test]
+    fn proof_tree_theorem_verifies_without_named_memorization_target() {
+        let mut rng = sample_rng(61, SampleSplit::Train, 0, 0, 0);
+        let spec = generate_proof_tree_spec(
+            &RuliadFamilyConfig {
+                kind: RuliadFamilyKind::ProofTree,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 11, max: 11 }),
+                steps: Some(UsizeRangeConfig { min: 8, max: 8 }),
+            },
+            &mut rng,
+        )
+        .expect("proof tree");
+        let report = verify_spec(&spec).expect("verify");
+        assert!(report.ok);
+        let text = sample_text(&spec, &report.oracle_hash);
+        assert!(text.starts_with("[R2 "));
+        assert!(text.contains("\n!:holds=true"));
+        assert!(!text.to_lowercase().contains("pythag"));
+    }
+
+    #[test]
+    fn semantic_difficulty_increases_with_theorem_tree_depth() {
+        let mut easy_rng = sample_rng(62, SampleSplit::Train, 0, 0, 0);
+        let easy = generate_proof_tree_spec(
+            &RuliadFamilyConfig {
+                kind: RuliadFamilyKind::ProofTree,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 5, max: 5 }),
+                steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+            },
+            &mut easy_rng,
+        )
+        .expect("easy proof tree");
+        let mut hard_rng = sample_rng(62, SampleSplit::Train, 0, 0, 0);
+        let hard = generate_proof_tree_spec(
+            &RuliadFamilyConfig {
+                kind: RuliadFamilyKind::ProofTree,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 29, max: 29 }),
+                steps: Some(UsizeRangeConfig { min: 16, max: 16 }),
+            },
+            &mut hard_rng,
+        )
+        .expect("hard proof tree");
+        let easy_hash = verify_spec(&easy).expect("verify easy").oracle_hash;
+        let hard_hash = verify_spec(&hard).expect("verify hard").oracle_hash;
+        let easy_stats = sample_stats(&easy, &sample_text(&easy, &easy_hash));
+        let hard_stats = sample_stats(&hard, &sample_text(&hard, &hard_hash));
+        assert!(
+            hard_stats.complexity_score > easy_stats.complexity_score,
+            "hard={} easy={}",
+            hard_stats.complexity_score,
+            easy_stats.complexity_score
+        );
     }
 
     #[test]
@@ -2075,6 +2644,17 @@ mod tests {
                     widths.insert(morphisms.len());
                     step_counts.insert(path.len().saturating_sub(1));
                 }
+                RuliadSampleSpec::ProofTree {
+                    modulus,
+                    lemmas,
+                    proof_steps,
+                    holds,
+                    ..
+                } => {
+                    widths.insert(*modulus);
+                    step_counts.insert(lemmas.len().saturating_add(proof_steps.len()));
+                    algebra_outcomes.insert(*holds);
+                }
                 RuliadSampleSpec::LeanTask { .. } | RuliadSampleSpec::HashNoise { .. } => {}
             }
         }
@@ -2086,6 +2666,7 @@ mod tests {
             RuliadFamilyKind::Rewrite,
             RuliadFamilyKind::Algebra,
             RuliadFamilyKind::Category,
+            RuliadFamilyKind::ProofTree,
             RuliadFamilyKind::LeanTask,
             RuliadFamilyKind::HashNoise,
         ] {
@@ -2106,6 +2687,7 @@ mod tests {
             RuliadTaskKind::VerifyCategoryLaw,
             RuliadTaskKind::VerifyFunctorPreservation,
             RuliadTaskKind::VerifyNaturalitySquare,
+            RuliadTaskKind::ProveTheorem,
             RuliadTaskKind::CompleteProof,
             RuliadTaskKind::HashCanary,
         ] {

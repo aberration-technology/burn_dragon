@@ -77,6 +77,7 @@ fn ruliad_config(output_dir: &Path) -> RuliadCorpusConfig {
         serialization: RuliadSerializationConfig {
             document_tokens: 513,
             preview_samples: 1,
+            ..RuliadSerializationConfig::default()
         },
         tokenization: RuliadTokenizationConfig::default(),
         source_selection,

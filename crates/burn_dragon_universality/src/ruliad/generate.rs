@@ -113,6 +113,8 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
                 oracle_hash: Some(document.oracle_hash),
                 task_kind: Some(document.task_kind),
                 verifier_version: Some(document.verifier_version),
+                ruliad_document_mode: Some(config.serialization.document_mode.label().to_string()),
+                ruliad_node_count: Some(document.serialized_preview.matches("[R2 ").count()),
                 math_domains: document.math_domains,
                 reasoning_modes: document.reasoning_modes,
             });
@@ -296,6 +298,7 @@ mod tests {
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 1,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),

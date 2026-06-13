@@ -10,6 +10,8 @@ lean_task_limit = 128
 [serialization]
 document_tokens = 513
 preview_samples = 4
+document_mode = "multi_chunk_proof_tree"
+document_chunks = { min = 4, max = 8 }
 
 [tokenization]
 type = "gpt2_byte_compatible"
@@ -18,6 +20,7 @@ eos_id = 50256
 
 [source_selection]
 enabled = true
+difficulty_levels = { min = 0, max = 6 }
 
 [[families]]
 kind = "eca"
@@ -53,6 +56,12 @@ kind = "category"
 weight = 1
 width = { min = 3, max = 7 }
 steps = { min = 3, max = 6 }
+
+[[families]]
+kind = "proof_tree"
+weight = 3
+width = { min = 5, max = 17 }
+steps = { min = 4, max = 12 }
 
 [[families]]
 kind = "lean_task"

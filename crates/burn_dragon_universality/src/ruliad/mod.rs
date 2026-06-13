@@ -31,10 +31,10 @@ pub mod cli;
 pub use category::{RuliadCategoryFunctor, RuliadCategoryMorphism, RuliadNaturalityCheck};
 pub use config::{
     LeanMode, RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RuliadCorpusConfig,
-    RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain, RuliadReasoningMode,
-    RuliadSerializationConfig, RuliadSourceSelectionConfig, RuliadSourceSemantics, RuliadTaskKind,
-    RuliadTokenizationConfig, compact_ruliad_families, default_ruliad_families, load_ruliad_config,
-    ruliad_source_semantics,
+    RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain,
+    RuliadReasoningMode, RuliadSerializationConfig, RuliadSourceSelectionConfig,
+    RuliadSourceSemantics, RuliadTaskKind, RuliadTokenizationConfig, compact_ruliad_families,
+    default_ruliad_families, load_ruliad_config, ruliad_source_semantics,
 };
 pub use eval::{
     RULIAD_DIAGNOSTIC_REPORT_VERSION, RULIAD_EVAL_REPORT_VERSION, RuliadCompletionRecord,

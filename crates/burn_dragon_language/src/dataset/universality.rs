@@ -1570,8 +1570,9 @@ mod tests {
     use crate::tokenizer::{PretokenizedTokenizerConfig, TokenizerConfig};
     use burn_dragon_universality::config::NcaCorpusConfig;
     use burn_dragon_universality::{
-        NcaSerializationConfig, NcaTokenizationConfig, RuliadCorpusConfig, RuliadFamilyConfig,
-        RuliadFamilyKind, RuliadSerializationConfig, RuliadTokenizationConfig, generate_nca_corpus,
+        NcaSerializationConfig, NcaTokenizationConfig, RuliadCorpusConfig, RuliadDocumentMode,
+        RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig, RuliadTokenizationConfig,
+        generate_nca_corpus,
     };
     use burn_ndarray::NdArray;
     use tempfile::tempdir;
@@ -1629,6 +1630,7 @@ mod tests {
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 2,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: burn_dragon_universality::RuliadSourceSelectionConfig::default(),
@@ -1869,6 +1871,37 @@ mod tests {
         let mut next_epoch = vec![0u32; 64];
         dataset.copy_token_range_with_epoch(DatasetSplit::Train, 3, 0, &mut next_epoch);
         assert_ne!(first, next_epoch);
+    }
+
+    #[test]
+    fn on_the_fly_ruliad_dataset_exposes_multi_chunk_documents() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-multichunk.toml");
+        let mut config = fixed_ruliad_runtime_config();
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks =
+            burn_dragon_universality::UsizeRangeConfig { min: 3, max: 3 };
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            512,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        assert_eq!(
+            dataset.preferred_logical_document_tokens(DatasetSplit::Train),
+            Some(1538)
+        );
+
+        let mut prefix = vec![0u32; 128];
+        let mut later = vec![0u32; 128];
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 0, 0, &mut prefix);
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 0, 700, &mut later);
+        assert_ne!(prefix, later);
+        assert!(later.iter().any(|token| *token != 0));
     }
 
     #[test]

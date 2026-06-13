@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::manifest::{SampleSplit, UniversalityTokenizerManifest};
-use crate::ruliad::config::{RuliadCorpusConfig, load_ruliad_config, ruliad_source_semantics};
+use crate::ruliad::config::{
+    RuliadCorpusConfig, RuliadDocumentMode, load_ruliad_config, ruliad_source_semantics,
+};
 use crate::ruliad::oracles::{
     GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
     default_proof_tasks, generate_sample, generate_sample_for_source_bucket, load_proof_tasks,
@@ -144,8 +146,12 @@ impl OnlineRuliadCorpus {
         epoch_index: usize,
         sample_index: usize,
     ) -> Result<RuliadRuntimeSampleDocument> {
+        if self.config.serialization.document_mode == RuliadDocumentMode::MultiChunkProofTree {
+            return self.generate_multi_chunk_document_for_epoch(split, epoch_index, sample_index);
+        }
         let sample = self.generate_raw_sample(split, epoch_index, sample_index)?;
-        self.document_from_sample(split, sample_index, sample)
+        let text = sample.text.clone();
+        self.document_from_sample_text(split, sample_index, sample, text)
     }
 
     pub fn generate_document_for_source_bucket(
@@ -159,7 +165,24 @@ impl OnlineRuliadCorpus {
             .source_buckets
             .iter()
             .find(|bucket| bucket.label() == bucket_label)
+            .or_else(|| {
+                self.source_buckets.iter().find(|bucket| {
+                    bucket
+                        .label()
+                        .split('@')
+                        .next()
+                        .is_some_and(|prefix| prefix == bucket_label)
+                })
+            })
             .ok_or_else(|| anyhow!("unknown ruliad source bucket `{bucket_label}`"))?;
+        if self.config.serialization.document_mode == RuliadDocumentMode::MultiChunkProofTree {
+            return self.generate_multi_chunk_document_for_source_bucket(
+                split,
+                epoch_index,
+                sample_index,
+                bucket,
+            );
+        }
         let sample = generate_sample_for_source_bucket(
             &self.config,
             self.proof_tasks.as_slice(),
@@ -168,7 +191,8 @@ impl OnlineRuliadCorpus {
             sample_index,
             bucket,
         )?;
-        self.document_from_sample(split, sample_index, sample)
+        let text = sample.text.clone();
+        self.document_from_sample_text(split, sample_index, sample, text)
     }
 
     pub fn generate_document_tokens(
@@ -214,27 +238,84 @@ impl OnlineRuliadCorpus {
         )
     }
 
-    fn document_from_sample(
+    fn generate_multi_chunk_document_for_epoch(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> Result<RuliadRuntimeSampleDocument> {
+        let chunk_count = self.config.serialization.document_chunks.min.max(1);
+        let mut samples = Vec::with_capacity(chunk_count);
+        for node_index in 0..chunk_count {
+            samples.push(generate_sample(
+                &self.config,
+                self.proof_tasks.as_slice(),
+                split,
+                epoch_index,
+                sample_index
+                    .saturating_mul(chunk_count)
+                    .saturating_add(node_index),
+            )?);
+        }
+        let root = samples
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("multi-chunk ruliad document has no root sample"))?;
+        let text = multi_chunk_proof_tree_text(&samples);
+        self.document_from_sample_text(split, sample_index, root, text)
+    }
+
+    fn generate_multi_chunk_document_for_source_bucket(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket: &RuliadSourceBucket,
+    ) -> Result<RuliadRuntimeSampleDocument> {
+        let chunk_count = self.config.serialization.document_chunks.min.max(1);
+        let mut samples = Vec::with_capacity(chunk_count);
+        for node_index in 0..chunk_count {
+            samples.push(generate_sample_for_source_bucket(
+                &self.config,
+                self.proof_tasks.as_slice(),
+                split,
+                epoch_index,
+                sample_index
+                    .saturating_mul(chunk_count)
+                    .saturating_add(node_index),
+                bucket,
+            )?);
+        }
+        let root = samples
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("multi-chunk ruliad source document has no root sample"))?;
+        let text = multi_chunk_proof_tree_text(&samples);
+        self.document_from_sample_text(split, sample_index, root, text)
+    }
+
+    fn document_from_sample_text(
         &self,
         split: SampleSplit,
         sample_index: usize,
         sample: GeneratedRuliadSample,
+        text: String,
     ) -> Result<RuliadRuntimeSampleDocument> {
         let payload_capacity = self
             .tokenizer
             .payload_token_capacity(self.document_token_count);
-        if sample.text.len() > payload_capacity {
+        if text.len() > payload_capacity {
             return Err(anyhow!(
                 "ruliad sample text exceeds document payload capacity (family={} task={} text_bytes={} payload_tokens={})",
                 sample.family.label(),
                 sample.task_kind.label(),
-                sample.text.len(),
+                text.len(),
                 payload_capacity
             ));
         }
         let tokens = self
             .tokenizer
-            .encode_document(&sample.text, self.document_token_count);
+            .encode_document(&text, self.document_token_count);
         if tokens.len() != self.document_token_count {
             return Err(anyhow!(
                 "ruliad document token length drifted (expected={} actual={})",
@@ -267,7 +348,7 @@ impl OnlineRuliadCorpus {
             reasoning_modes,
             token_count,
             tokens,
-            serialized_preview: sample.text,
+            serialized_preview: text,
             stats: sample.stats,
         })
     }
@@ -311,7 +392,38 @@ pub fn fixed_ruliad_document_token_count(config: &RuliadCorpusConfig) -> Result<
     if config.serialization.document_tokens <= 1 {
         return Err(anyhow!("ruliad document token count must be > 1"));
     }
-    Ok(config.serialization.document_tokens)
+    Ok(config
+        .serialization
+        .document_tokens
+        .saturating_mul(config.serialization.document_chunks.max.max(1)))
+}
+
+fn multi_chunk_proof_tree_text(samples: &[GeneratedRuliadSample]) -> String {
+    let root_hash = samples
+        .last()
+        .map(|sample| sample.oracle_hash.as_str())
+        .unwrap_or("-");
+    let mut text = format!(
+        "[RTREE h={} nodes={}]\n",
+        root_hash.chars().take(16).collect::<String>(),
+        samples.len()
+    );
+    for (node_index, sample) in samples.iter().enumerate() {
+        let dependency = if node_index == 0 {
+            "-".to_string()
+        } else {
+            format!("n{}", node_index - 1)
+        };
+        text.push_str(&format!(
+            "N{node_index}:dep={dependency};fam={};task={};h={}\n",
+            sample.family.label(),
+            sample.task_kind.label(),
+            sample.oracle_hash.chars().take(12).collect::<String>()
+        ));
+        text.push_str(&sample.text);
+    }
+    text.push_str("[/RTREE]\n");
+    text
 }
 
 fn load_configured_proof_tasks(config: &RuliadCorpusConfig) -> Result<Vec<LeanProofTask>> {
@@ -347,8 +459,10 @@ fn _assert_histogram_type(_: Vec<ComplexityHistogramBin>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
-        RuliadSerializationConfig, RuliadTokenizationConfig, default_ruliad_families,
+        RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
+        RuliadTokenizationConfig, default_ruliad_families,
     };
 
     fn config() -> RuliadCorpusConfig {
@@ -362,6 +476,7 @@ mod tests {
             serialization: RuliadSerializationConfig {
                 document_tokens: 513,
                 preview_samples: 2,
+                ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
@@ -404,6 +519,51 @@ mod tests {
             .generate_document(SampleSplit::Train, 0)
             .expect("document");
         assert_eq!(doc.tokens.len(), 513);
+    }
+
+    #[test]
+    fn multi_chunk_ruliad_documents_span_tbptt_chunks() {
+        let mut config = config();
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 3, max: 3 };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 5, max: 7 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 6 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+        assert_eq!(corpus.document_token_count(), 1539);
+        let doc = corpus
+            .generate_document(SampleSplit::Train, 0)
+            .expect("document");
+        assert_eq!(doc.tokens.len(), 1539);
+        assert!(doc.serialized_preview.contains("[RTREE"));
+        assert!(doc.serialized_preview.matches("[R2 ").count() >= 3);
+    }
+
+    #[test]
+    fn far_out_mixed_difficulty_stays_within_fixed_payload() {
+        let mut config = config();
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 4, max: 8 };
+        config.source_selection.difficulty_levels = UsizeRangeConfig { min: 24, max: 24 };
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+        assert_eq!(corpus.document_token_count(), 4104);
+        let payload_capacity = corpus
+            .tokenizer_manifest()
+            .eos_id
+            .map_or(corpus.document_token_count(), |_| {
+                corpus.document_token_count().saturating_sub(1)
+            });
+        for sample_index in 0..8 {
+            let doc = corpus
+                .generate_document(SampleSplit::Train, sample_index)
+                .expect("far-out mixed document");
+            assert_eq!(doc.tokens.len(), 4104);
+            assert!(doc.serialized_preview.len() <= payload_capacity);
+            assert!(doc.serialized_preview.contains("[RTREE"));
+        }
     }
 
     #[test]

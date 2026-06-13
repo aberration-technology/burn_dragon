@@ -109,6 +109,10 @@ pub struct UniversalitySampleRecord {
     pub task_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verifier_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_document_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_node_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub math_domains: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

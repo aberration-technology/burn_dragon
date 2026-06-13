@@ -792,6 +792,10 @@ where
         training.continual_backprop.lr_coupling,
         training.continual_backprop.lr_coupling_power,
     );
+    let neuron_scaling_slot = training
+        .neuron_scaling
+        .enabled
+        .then(crate::train::neuron_scaling::NeuronScaleRequestSlot::default);
     let context = TrainEnvironment {
         parallel_runtime: &parallel_runtime,
         parallel_config: &resolved_config.parallel,
@@ -809,6 +813,7 @@ where
             .train
             .uses_live_source_selection()
             .then(|| Arc::clone(&datasets.train)),
+        neuron_scaling_slot: neuron_scaling_slot.clone(),
         epochs: total_epochs,
     };
     let _model = train_with_resolved_scheduler(
@@ -817,6 +822,18 @@ where
         optim.take().expect("optimizer initialized"),
         scheduler,
     )?;
+    if let Some(request) = neuron_scaling_slot.and_then(|slot| slot.take()) {
+        let path = crate::train::neuron_scaling::write_neuron_scale_request_artifact(
+            &run_dir,
+            &model_config,
+            &training.neuron_scaling,
+            request,
+        )?;
+        warn!(
+            "Dragon neuron scaling was requested; wrote restart artifact to {}",
+            path.display()
+        );
+    }
 
     info!("Training complete on {backend_name}");
 

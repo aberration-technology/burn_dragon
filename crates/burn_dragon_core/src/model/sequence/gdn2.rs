@@ -1,9 +1,16 @@
-use burn::module::{Module, Param};
-use burn::tensor::backend::Backend;
+use burn::module::{
+    AutodiffModule, Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
+    ModuleVisitor, Param,
+};
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Distribution as TensorDistribution, Tensor, activation};
 pub use burn_gdn::GatedDeltaNet2GateMode;
 use serde::{Deserialize, Serialize};
 
+use super::super::widen::{
+    widen_2d_last_dim_prefix, widen_2d_last_dim_prefix_zero_tail,
+    widen_3d_last_dim_prefix_zero_tail,
+};
 use super::linear::expand_attention_values_to_heads;
 
 fn default_chunk_size() -> usize {
@@ -96,6 +103,80 @@ pub struct ResolvedGatedDeltaNet2Config {
     pub output_scale: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GatedDeltaNet2OutputScale {
+    value: f32,
+}
+
+impl GatedDeltaNet2OutputScale {
+    fn new(value: f32) -> Self {
+        Self { value }
+    }
+
+    fn value(self) -> f32 {
+        self.value
+    }
+
+    fn scaled(self, scale: f32) -> Self {
+        Self {
+            value: self.value * scale,
+        }
+    }
+}
+
+impl<B: Backend> Module<B> for GatedDeltaNet2OutputScale {
+    type Record = f32;
+
+    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
+        devices
+    }
+
+    fn fork(self, _device: &B::Device) -> Self {
+        self
+    }
+
+    fn to_device(self, _device: &B::Device) -> Self {
+        self
+    }
+
+    fn visit<Visitor: ModuleVisitor<B>>(&self, _visitor: &mut Visitor) {}
+
+    fn map<Mapper: ModuleMapper<B>>(self, _mapper: &mut Mapper) -> Self {
+        self
+    }
+
+    fn load_record(self, record: Self::Record) -> Self {
+        Self { value: record }
+    }
+
+    fn into_record(self) -> Self::Record {
+        self.value
+    }
+}
+
+impl<B: AutodiffBackend> AutodiffModule<B> for GatedDeltaNet2OutputScale {
+    type InnerModule = GatedDeltaNet2OutputScale;
+
+    fn valid(&self) -> Self::InnerModule {
+        *self
+    }
+
+    fn from_inner(module: Self::InnerModule) -> Self {
+        module
+    }
+}
+
+impl ModuleDisplayDefault for GatedDeltaNet2OutputScale {
+    fn content(&self, content: Content) -> Option<Content> {
+        content
+            .set_top_level_type("GatedDeltaNet2OutputScale")
+            .add("value", &self.value)
+            .optional()
+    }
+}
+
+impl ModuleDisplay for GatedDeltaNet2OutputScale {}
+
 impl GatedDeltaNet2Config {
     pub fn validate(
         &self,
@@ -184,6 +265,7 @@ pub struct GatedDeltaNet2Parameters<B: Backend> {
     decay_bias: Param<Tensor<B, 2>>,
     write_proj: Param<Tensor<B, 3>>,
     write_bias: Param<Tensor<B, 2>>,
+    output_scale: GatedDeltaNet2OutputScale,
 }
 
 #[derive(Debug)]
@@ -234,7 +316,85 @@ impl<B: Backend> GatedDeltaNet2Parameters<B> {
                 [config.n_head, config.dense_dim],
                 device,
             )),
+            output_scale: GatedDeltaNet2OutputScale::new(config.output_scale),
         }
+    }
+
+    pub fn widened_from_prefix(
+        &self,
+        fresh: &Self,
+        old_latent_per_head: usize,
+        new_latent_per_head: usize,
+    ) -> Result<Self, String> {
+        if self.n_head != fresh.n_head || self.dense_dim != fresh.dense_dim {
+            return Err(format!(
+                "cannot widen gated_deltanet2 with incompatible dense shape (current_heads={} fresh_heads={} current_dense={} fresh_dense={})",
+                self.n_head, fresh.n_head, self.dense_dim, fresh.dense_dim
+            ));
+        }
+        if self.max_latent_per_head != old_latent_per_head
+            || fresh.max_latent_per_head != new_latent_per_head
+            || old_latent_per_head > new_latent_per_head
+        {
+            return Err(format!(
+                "cannot widen gated_deltanet2 with incompatible latent shape (current={} fresh={} old={} new={})",
+                self.max_latent_per_head,
+                fresh.max_latent_per_head,
+                old_latent_per_head,
+                new_latent_per_head
+            ));
+        }
+        let mut widened = fresh.clone();
+        widened.key_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.key_proj.val(),
+            fresh.key_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.erase_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.erase_proj.val(),
+            fresh.erase_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.decay_proj.val(),
+            fresh.decay_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.erase_bias = Param::from_tensor(widen_2d_last_dim_prefix_zero_tail(
+            self.erase_bias.val(),
+            fresh.erase_bias.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_log = Param::from_tensor(widen_2d_last_dim_prefix(
+            self.decay_log.val(),
+            fresh.decay_log.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_bias = Param::from_tensor(widen_2d_last_dim_prefix(
+            self.decay_bias.val(),
+            fresh.decay_bias.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.write_proj = Param::from_tensor(self.write_proj.val());
+        widened.write_bias = Param::from_tensor(self.write_bias.val());
+        let scale = (new_latent_per_head as f32 / old_latent_per_head.max(1) as f32).sqrt();
+        widened.output_scale = self.output_scale.scaled(scale);
+        Ok(widened)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_proj_tensor(&self) -> Tensor<B, 3> {
+        self.key_proj.val()
+    }
+
+    pub(crate) fn output_scale(&self) -> f32 {
+        self.output_scale.value()
     }
 
     pub fn project_inputs(

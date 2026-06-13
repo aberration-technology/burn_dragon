@@ -140,6 +140,52 @@ impl<B: Backend> Attention<B> {
         }
     }
 
+    pub(crate) fn widened_from_prefix(
+        &self,
+        fresh: &Self,
+        old_latent: usize,
+        new_latent: usize,
+    ) -> Result<Self, String> {
+        let current_shape = self.freqs.shape().dims::<4>();
+        let fresh_shape = fresh.freqs.shape().dims::<4>();
+        if self.n_head != fresh.n_head
+            || self.fused != fresh.fused
+            || self.use_alibi != fresh.use_alibi
+            || self.rotary_embedding != fresh.rotary_embedding
+        {
+            return Err(format!(
+                "cannot widen attention with incompatible config (current_heads={} fresh_heads={} current_rotary={:?} fresh_rotary={:?})",
+                self.n_head, fresh.n_head, self.rotary_embedding, fresh.rotary_embedding
+            ));
+        }
+        if current_shape != [1, 1, 1, old_latent]
+            || fresh_shape != [1, 1, 1, new_latent]
+            || old_latent > new_latent
+        {
+            return Err(format!(
+                "cannot widen attention frequencies with incompatible latent shape (current={current_shape:?}, fresh={fresh_shape:?}, old={old_latent}, new={new_latent})"
+            ));
+        }
+        if old_latent == new_latent {
+            return Ok(self.clone());
+        }
+        let mut widened = fresh.clone();
+        widened.freqs = Tensor::cat(
+            vec![
+                self.freqs.clone(),
+                fresh
+                    .freqs
+                    .clone()
+                    .slice([0..1, 0..1, 0..1, old_latent..new_latent]),
+            ],
+            3,
+        )
+        .detach();
+        widened.alibi_slopes = self.alibi_slopes.clone();
+        widened.block_pattern = self.block_pattern.clone();
+        Ok(widened)
+    }
+
     pub fn forward(&self, query: Tensor<B, 4>, value: Tensor<B, 4>) -> Tensor<B, 4> {
         if self.fused {
             return linear_attention::fused_state_aligned(
@@ -364,7 +410,9 @@ impl<B: Backend> Attention<B> {
     }
 
     fn rotate_with_positions(&self, values: Tensor<B, 4>, positions: Tensor<B, 4>) -> Tensor<B, 4> {
-        let raw = positions * self.freqs.clone();
+        let latent = values.shape().dims::<4>()[3];
+        let freqs = self.freqs.clone().slice([0..1, 0..1, 0..1, 0..latent]);
+        let raw = positions * freqs;
         let phases = (raw.clone() - raw.clone().detach().floor()) * (2.0 * PI);
         match self.rotary_embedding {
             RotaryEmbedding::Rope => self.rope(phases, values),

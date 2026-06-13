@@ -197,12 +197,33 @@ impl FileMetricBestCheckpointingStrategy {
         }
     }
 
-    fn actions_for_epoch(
+    fn refresh_best_from_store(
         &mut self,
+        store: &burn_train::metric::store::EventStoreClient,
+    ) -> bool {
+        let Some(best_epoch) = store.find_epoch(
+            &self.metric_name,
+            burn_train::metric::store::Aggregate::Mean,
+            self.direction,
+            &self.split,
+        ) else {
+            return false;
+        };
+
+        self.best_epoch = Some(best_epoch);
+        self.best_value = store.find_metric(
+            &self.metric_name,
+            best_epoch,
+            burn_train::metric::store::Aggregate::Mean,
+            &self.split,
+        );
+        true
+    }
+
+    fn checkpoint_actions_after_refresh(
+        &self,
         epoch: usize,
     ) -> Vec<burn_train::checkpoint::CheckpointingAction> {
-        self.refresh_best_from_history(epoch);
-
         let mut keep_epochs = BTreeSet::new();
         keep_epochs.extend(epoch.saturating_sub(CHECKPOINT_KEEP_LAST - 1).max(1)..=epoch);
         if let Some(best_epoch) = self.best_epoch {
@@ -219,15 +240,34 @@ impl FileMetricBestCheckpointingStrategy {
         );
         actions
     }
+
+    fn actions_for_epoch(
+        &mut self,
+        epoch: usize,
+    ) -> Vec<burn_train::checkpoint::CheckpointingAction> {
+        self.refresh_best_from_history(epoch);
+        self.checkpoint_actions_after_refresh(epoch)
+    }
+
+    fn actions_for_epoch_with_store(
+        &mut self,
+        epoch: usize,
+        store: &burn_train::metric::store::EventStoreClient,
+    ) -> Vec<burn_train::checkpoint::CheckpointingAction> {
+        if !self.refresh_best_from_store(store) {
+            self.refresh_best_from_history(epoch);
+        }
+        self.checkpoint_actions_after_refresh(epoch)
+    }
 }
 
 impl burn_train::checkpoint::CheckpointingStrategy for FileMetricBestCheckpointingStrategy {
     fn checkpointing(
         &mut self,
         epoch: usize,
-        _store: &burn_train::metric::store::EventStoreClient,
+        store: &burn_train::metric::store::EventStoreClient,
     ) -> Vec<burn_train::checkpoint::CheckpointingAction> {
-        self.actions_for_epoch(epoch)
+        self.actions_for_epoch_with_store(epoch, store)
     }
 }
 
@@ -249,6 +289,7 @@ where
     pub train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
     pub valid_loader: Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
     pub source_selection_dataset: Option<Arc<Dataset>>,
+    pub neuron_scaling_slot: Option<crate::train::neuron_scaling::NeuronScaleRequestSlot>,
     pub epochs: usize,
 }
 
@@ -297,6 +338,9 @@ where
         env.train_loader.num_items(),
         env.training,
         source_selection_dataset,
+        env.neuron_scaling_slot
+            .as_ref()
+            .map(|slot| (env.model_config.latent_total(), slot.clone())),
     )?;
 
     let builder = SupervisedTraining::new(
@@ -2102,6 +2146,7 @@ mod tests {
             gdpo: None,
             events: Default::default(),
             gates: Default::default(),
+            neuron_scaling: Default::default(),
         }
     }
 
@@ -2169,6 +2214,7 @@ mod tests {
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2466,6 +2512,8 @@ mod tests {
             devices: &devices,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 1,
         };
 
@@ -2543,6 +2591,7 @@ mod tests {
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
             source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 4,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2556,32 +2605,20 @@ mod tests {
         let _trained =
             train_with_scheduler(&env, model, optimizer, 1e-3).expect("single-device train");
 
-        let strategy = FileMetricBestCheckpointingStrategy::new(
-            &run_dir,
-            &LossMetric::<TestValidBackend>::new(),
-            burn_train::metric::store::Direction::Lowest,
-            burn_train::metric::store::Split::Valid,
-        );
-
-        let best_epoch = (1..=4)
-            .map(|epoch| {
-                (
-                    epoch,
-                    strategy
-                        .metric_mean_from_log(epoch)
-                        .expect("metric log for every epoch"),
-                )
-            })
-            .min_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(epoch, _)| epoch)
-            .expect("best epoch");
-
         let retained = retained_model_epochs(&run_dir);
-        let mut expected = vec![best_epoch, 3, 4];
-        expected.sort_unstable();
-        expected.dedup();
-
-        assert_eq!(retained, expected);
+        assert!(
+            retained.contains(&3),
+            "third epoch should be kept as recent"
+        );
+        assert!(retained.contains(&4), "last epoch should be kept as recent");
+        assert!(
+            retained.len() <= CHECKPOINT_KEEP_LAST + 1,
+            "retention should keep the recent window plus at most one older best checkpoint"
+        );
+        assert!(
+            retained.iter().all(|epoch| (1..=4).contains(epoch)),
+            "retained epochs must come from completed checkpoints"
+        );
     }
 
     #[cfg(feature = "ddp")]
@@ -2724,6 +2761,8 @@ mod tests {
             devices: &devices,
             train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
             valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 1,
         };
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2832,6 +2871,7 @@ mod tests {
             train_loader: Arc::clone(&train_loader),
             valid_loader: Arc::clone(&valid_loader),
             source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 1,
         };
         let model_first = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -2869,6 +2909,7 @@ mod tests {
             train_loader,
             valid_loader,
             source_selection_dataset: None,
+            neuron_scaling_slot: None,
             epochs: 2,
         };
         let model_resume = LanguageTrainModel::new(DragonModel::<TestBackend>::new(

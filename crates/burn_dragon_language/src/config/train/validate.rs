@@ -47,6 +47,80 @@ impl TrainingConfig {
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
+        if self.training.neuron_scaling.enabled {
+            if self.training.neuron_scaling.max_latent_total == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be > 0"
+                ));
+            }
+            if self.training.neuron_scaling.max_scale_events == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_scale_events must be > 0"
+                ));
+            }
+            if self.training.neuron_scaling.capacity_patience_epochs == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.capacity_patience_epochs must be > 0"
+                ));
+            }
+            if self.training.neuron_scaling.batch_fit.min_batch_size == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.batch_fit.min_batch_size must be > 0"
+                ));
+            }
+            if self
+                .training
+                .neuron_scaling
+                .batch_fit
+                .target_device_memory_mb
+                == 0
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.batch_fit.target_device_memory_mb must be > 0"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.training.neuron_scaling.batch_fit.batch_safety_margin)
+                || self.training.neuron_scaling.batch_fit.batch_safety_margin <= 0.0
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.batch_fit.batch_safety_margin must be in (0, 1]"
+                ));
+            }
+            if self
+                .training
+                .neuron_scaling
+                .stabilization
+                .new_slice_lr_scale
+                < 0.0
+                || !self
+                    .training
+                    .neuron_scaling
+                    .stabilization
+                    .new_slice_lr_scale
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.stabilization.new_slice_lr_scale must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .neuron_scaling
+                .stabilization
+                .base_lr_scale_after_ramp
+                < 0.0
+                || !self
+                    .training
+                    .neuron_scaling
+                    .stabilization
+                    .base_lr_scale_after_ramp
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.stabilization.base_lr_scale_after_ramp must be finite and >= 0"
+                ));
+            }
+        }
         if self.training.events.flush_every_steps == 0 {
             return Err(anyhow!("training.events.flush_every_steps must be > 0"));
         }
@@ -891,6 +965,37 @@ impl TrainingConfig {
                 self.parallel.tensor.size
             ));
         }
+        if self.training.neuron_scaling.enabled {
+            let max_latent_total = self.training.neuron_scaling.max_latent_total;
+            if max_latent_total < resolved_model.latent_total() {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be >= resolved model.latent_total (got max={} current={})",
+                    max_latent_total,
+                    resolved_model.latent_total()
+                ));
+            }
+            if max_latent_total % resolved_model.n_embd != 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be divisible by model.n_embd (got max={} n_embd={})",
+                    max_latent_total,
+                    resolved_model.n_embd
+                ));
+            }
+            if max_latent_total % resolved_model.n_head != 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be divisible by model.n_head (got max={} n_head={})",
+                    max_latent_total,
+                    resolved_model.n_head
+                ));
+            }
+            if max_latent_total % self.parallel.tensor.size != 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be divisible by parallel.tensor.size (got max={} tensor_size={})",
+                    max_latent_total,
+                    self.parallel.tensor.size
+                ));
+            }
+        }
         if matches!(
             self.parallel.tensor.partition,
             TensorParallelPartitionKind::HeadAligned
@@ -1287,6 +1392,173 @@ prompt = ""
         let config = parse_config("");
         assert!(config.training.objective.is_next_token());
         config.validate().expect("default objective validates");
+    }
+
+    #[test]
+    fn neuron_scaling_config_validates_across_memory_kernels() {
+        let cases = [
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = { memory_system = "linear_attention", executor = "dense_score_short_context" }
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = "mamba3_state_space_duality"
+
+[model.mamba]
+headdim = 8
+chunk_size = 4
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = "gated_deltanet2"
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = { memory_system = "gated_deltanet2", executor = "gated_delta_chunk_wy" }
+
+[model.gated_deltanet2]
+implementation = "upstream_full"
+chunk_size = 4
+"#,
+        ];
+
+        for case in cases {
+            parse_config(case)
+                .validate()
+                .unwrap_or_else(|err| panic!("neuron scaling config should validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_max_below_current_latent_total() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 16
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("max below current should fail");
+        assert!(
+            err.to_string()
+                .contains("max_latent_total must be >= resolved model.latent_total"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_max_not_divisible_by_head_count() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 3
+latent_total = 48
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("head-incompatible max should fail");
+        assert!(
+            err.to_string()
+                .contains("max_latent_total must be divisible by model.n_head"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_max_not_divisible_by_tensor_parallel_size() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 50
+
+[model]
+n_layer = 1
+n_embd = 10
+n_head = 2
+latent_total = 40
+
+[parallel]
+mode = "tensor_parallel_neuron"
+world_size = 4
+
+[parallel.data]
+size = 1
+
+[parallel.tensor]
+size = 4
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("tensor-parallel-incompatible max should fail");
+        assert!(
+            err.to_string()
+                .contains("max_latent_total must be divisible by parallel.tensor.size"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

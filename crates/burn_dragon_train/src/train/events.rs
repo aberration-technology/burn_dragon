@@ -1,5 +1,7 @@
 pub use burn_ecs::{
-    CheckpointEvent, ControlRequest, EventBusConfig, MetricAggregate, MonitorRunOptions,
+    CapacityPlateauDetected, CapacityPlateauPlugin, CapacityPlateauState, CapacityScalingPolicy,
+    CheckpointEvent, ControlRequest, EventBusConfig, MetricAggregate, ModelCapacityState,
+    ModelScaleApplied, ModelScaleEvent, ModelScaleRequest, ModelScaleSkipped, MonitorRunOptions,
     RuliadSourceSelectionSample, SourceSelectionSample, StepFinished, StepStarted,
     TrainingAppBuilder, TrainingAppConfig, TrainingControlHandle, TrainingControlResource,
     TrainingCorePlugin, TrainingDashboardResource, TrainingDashboardState, TrainingEcsRuntime,

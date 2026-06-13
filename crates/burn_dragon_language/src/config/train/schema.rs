@@ -148,6 +148,131 @@ pub struct ModuleLrScaleEntry {
     pub schedule: Option<ModuleLrScaleScheduleConfig>,
 }
 
+fn default_neuron_scaling_max_latent_total() -> usize {
+    8192
+}
+
+fn default_neuron_scaling_min_steps_between_scales() -> usize {
+    2_000
+}
+
+fn default_neuron_scaling_max_scale_events() -> usize {
+    4
+}
+
+fn default_neuron_scaling_capacity_patience_epochs() -> usize {
+    2
+}
+
+fn default_neuron_scaling_target_device_memory_mb() -> usize {
+    100_000
+}
+
+fn default_neuron_scaling_batch_safety_margin() -> f32 {
+    0.90
+}
+
+fn default_neuron_scaling_freeze_base_steps() -> usize {
+    256
+}
+
+fn default_neuron_scaling_unfreeze_ramp_steps() -> usize {
+    256
+}
+
+fn default_neuron_scaling_lr_scale() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NeuronScalingGrowth {
+    #[default]
+    Double,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NeuronScalingBatchFitConfig {
+    pub enabled: bool,
+    #[serde(default = "default_neuron_scaling_target_device_memory_mb")]
+    pub target_device_memory_mb: usize,
+    pub min_batch_size: usize,
+    #[serde(default = "default_neuron_scaling_batch_safety_margin")]
+    pub batch_safety_margin: f32,
+    pub preserve_effective_batch_size: bool,
+}
+
+impl Default for NeuronScalingBatchFitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_device_memory_mb: default_neuron_scaling_target_device_memory_mb(),
+            min_batch_size: 1,
+            batch_safety_margin: default_neuron_scaling_batch_safety_margin(),
+            preserve_effective_batch_size: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NeuronScalingStabilizationConfig {
+    #[serde(default = "default_neuron_scaling_freeze_base_steps")]
+    pub freeze_base_steps: usize,
+    #[serde(default = "default_neuron_scaling_unfreeze_ramp_steps")]
+    pub unfreeze_ramp_steps: usize,
+    #[serde(default = "default_neuron_scaling_lr_scale")]
+    pub new_slice_lr_scale: f32,
+    #[serde(default = "default_neuron_scaling_lr_scale")]
+    pub base_lr_scale_after_ramp: f32,
+}
+
+impl Default for NeuronScalingStabilizationConfig {
+    fn default() -> Self {
+        Self {
+            freeze_base_steps: default_neuron_scaling_freeze_base_steps(),
+            unfreeze_ramp_steps: default_neuron_scaling_unfreeze_ramp_steps(),
+            new_slice_lr_scale: default_neuron_scaling_lr_scale(),
+            base_lr_scale_after_ramp: default_neuron_scaling_lr_scale(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NeuronScalingConfig {
+    pub enabled: bool,
+    #[serde(default = "default_neuron_scaling_max_latent_total")]
+    pub max_latent_total: usize,
+    pub growth: NeuronScalingGrowth,
+    #[serde(default = "default_neuron_scaling_min_steps_between_scales")]
+    pub min_steps_between_scales: usize,
+    #[serde(default = "default_neuron_scaling_max_scale_events")]
+    pub max_scale_events: usize,
+    #[serde(default = "default_neuron_scaling_capacity_patience_epochs")]
+    pub capacity_patience_epochs: usize,
+    pub require_live_source_selection: bool,
+    pub batch_fit: NeuronScalingBatchFitConfig,
+    pub stabilization: NeuronScalingStabilizationConfig,
+}
+
+impl Default for NeuronScalingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_latent_total: default_neuron_scaling_max_latent_total(),
+            growth: NeuronScalingGrowth::default(),
+            min_steps_between_scales: default_neuron_scaling_min_steps_between_scales(),
+            max_scale_events: default_neuron_scaling_max_scale_events(),
+            capacity_patience_epochs: default_neuron_scaling_capacity_patience_epochs(),
+            require_live_source_selection: true,
+            batch_fit: NeuronScalingBatchFitConfig::default(),
+            stabilization: NeuronScalingStabilizationConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
     pub block_size: usize,
@@ -184,6 +309,8 @@ pub struct TrainingHyperparameters {
     pub init_transfer: InitTransferConfig,
     #[serde(default)]
     pub continual_backprop: ContinualBackpropConfig,
+    #[serde(default)]
+    pub neuron_scaling: NeuronScalingConfig,
     #[serde(default)]
     pub module_lr_scales: Vec<ModuleLrScaleEntry>,
     #[serde(default = "default_context_strategy")]

@@ -10,10 +10,11 @@ pub use burn_dragon_train::{
 pub use load::load_training_config;
 pub use schema::{
     DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, RepromptTruncation, SdftObjectiveConfig,
-    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
-    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    ValidationDatasetConfig,
+    ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, NeuronScalingBatchFitConfig,
+    NeuronScalingConfig, NeuronScalingGrowth, NeuronScalingStabilizationConfig, RepromptTruncation,
+    SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, ValidationDatasetConfig,
 };
 
 use crate::tokenizer::TokenizerConfig;

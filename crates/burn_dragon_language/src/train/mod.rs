@@ -5,6 +5,7 @@ mod prelude;
 pub mod backend;
 mod continual_backprop;
 pub mod events;
+pub mod neuron_scaling;
 pub mod objective;
 pub mod profile;
 #[cfg(feature = "rerun")]
@@ -18,6 +19,8 @@ pub mod utils;
 pub use backend::*;
 #[allow(unused_imports)]
 pub use continual_backprop::*;
+#[allow(unused_imports)]
+pub use neuron_scaling::*;
 #[allow(unused_imports)]
 pub use objective::*;
 #[allow(unused_imports)]

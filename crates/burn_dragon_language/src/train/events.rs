@@ -12,6 +12,7 @@ use burn_ecs::prelude::{
 
 use crate::config::TrainingHyperparameters;
 use crate::dataset::Dataset;
+use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
 
 #[derive(Clone)]
 pub struct RuliadSourceSelectionResource {
@@ -55,6 +56,7 @@ pub fn build_training_event_handles(
     steps_per_epoch: usize,
     training: &TrainingHyperparameters,
     source_selection_dataset: Option<Arc<Dataset>>,
+    neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
 ) -> Result<TrainingEventHandles> {
     let interrupter = burn_train::Interrupter::new();
     let mut event_app = TrainingAppBuilder::new(TrainingAppConfig {
@@ -72,6 +74,16 @@ pub fn build_training_event_handles(
         event_app = event_app.with_plugin(RuliadSourceSelectionTelemetryPlugin::new(
             dataset,
             source_selection_every_steps,
+        ));
+    }
+
+    if training.neuron_scaling.enabled
+        && let Some((current_latent_total, request_slot)) = neuron_scaling_slot
+    {
+        event_app = event_app.with_plugin(DragonNeuronScalingPlugin::new(
+            training.neuron_scaling.clone(),
+            current_latent_total,
+            request_slot,
         ));
     }
 

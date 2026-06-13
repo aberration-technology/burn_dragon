@@ -1,3 +1,4 @@
+use crate::config::train::NeuronScalingStabilizationConfig;
 use crate::train::prelude::*;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
@@ -43,6 +44,7 @@ struct GradientScaleSchedule {
     backbone_grad_scale: Option<f32>,
     backbone_grad_scale_steps: usize,
     backbone_param_ids: Arc<HashSet<burn::module::ParamId>>,
+    neuron_scale_stabilization: Option<NeuronScaleGradientStabilization>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +103,48 @@ impl ParamScaleScheduleRule {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NeuronScaleGradientStabilization {
+    start_step_index: usize,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    freeze_base_steps: usize,
+    unfreeze_ramp_steps: usize,
+    new_slice_lr_scale: f32,
+    base_lr_scale_after_ramp: f32,
+    base_param_ids: Arc<HashSet<burn::module::ParamId>>,
+    shared_encoder: burn::module::ParamId,
+    shared_encoder_v: burn::module::ParamId,
+    shared_decoder: burn::module::ParamId,
+}
+
+impl NeuronScaleGradientStabilization {
+    fn base_scale_for_step_index(&self, step_index: usize) -> f32 {
+        let elapsed = step_index.saturating_sub(self.start_step_index);
+        if elapsed < self.freeze_base_steps {
+            return 0.0;
+        }
+        if self.unfreeze_ramp_steps == 0 {
+            return self.base_lr_scale_after_ramp;
+        }
+        let ramp_elapsed = elapsed.saturating_sub(self.freeze_base_steps);
+        if ramp_elapsed >= self.unfreeze_ramp_steps {
+            return self.base_lr_scale_after_ramp;
+        }
+        self.base_lr_scale_after_ramp * (ramp_elapsed as f32 / self.unfreeze_ramp_steps as f32)
+    }
+
+    fn is_active_for_step_index(&self, step_index: usize) -> bool {
+        let elapsed = step_index.saturating_sub(self.start_step_index);
+        elapsed
+            < self
+                .freeze_base_steps
+                .saturating_add(self.unfreeze_ramp_steps)
+            || (self.base_lr_scale_after_ramp - 1.0).abs() > f32::EPSILON
+            || (self.new_slice_lr_scale - 1.0).abs() > f32::EPSILON
+    }
+}
+
 impl GradientScaleSchedule {
     fn from_training<B: BackendTrait>(
         model: &DragonModel<B>,
@@ -149,6 +193,7 @@ impl GradientScaleSchedule {
             backbone_grad_scale: Some(backbone_grad_scale),
             backbone_grad_scale_steps,
             backbone_param_ids: Arc::new(backbone_param_ids),
+            neuron_scale_stabilization: None,
         }
     }
 
@@ -201,6 +246,51 @@ impl GradientScaleSchedule {
             step_index,
         )
     }
+
+    fn with_neuron_scale_stabilization<B: BackendTrait>(
+        mut self,
+        model: &DragonModel<B>,
+        old_latent_total: usize,
+        new_latent_total: usize,
+        start_step_index: usize,
+        config: &NeuronScalingStabilizationConfig,
+    ) -> Self {
+        if new_latent_total <= old_latent_total {
+            return self;
+        }
+        let new_latent_per_head = model.latent_per_head_capacity();
+        if new_latent_per_head == 0 {
+            return self;
+        }
+        let n_head = new_latent_total / new_latent_per_head;
+        if n_head == 0 {
+            return self;
+        }
+        let old_latent_per_head = old_latent_total / n_head;
+        if old_latent_per_head >= new_latent_per_head {
+            return self;
+        }
+        let shared = model.shared_lowrank_param_ids();
+        let shared_ids = HashSet::from([shared.encoder, shared.encoder_v, shared.decoder]);
+        let mut base_param_ids = collect_model_param_ids(model);
+        for param_id in &shared_ids {
+            base_param_ids.remove(param_id);
+        }
+        self.neuron_scale_stabilization = Some(NeuronScaleGradientStabilization {
+            start_step_index,
+            old_latent_per_head,
+            new_latent_per_head,
+            freeze_base_steps: config.freeze_base_steps,
+            unfreeze_ramp_steps: config.unfreeze_ramp_steps,
+            new_slice_lr_scale: config.new_slice_lr_scale,
+            base_lr_scale_after_ramp: config.base_lr_scale_after_ramp,
+            base_param_ids: Arc::new(base_param_ids),
+            shared_encoder: shared.encoder,
+            shared_encoder_v: shared.encoder_v,
+            shared_decoder: shared.decoder,
+        });
+        self
+    }
 }
 
 fn scale_gradients_by_schedule<B, M>(
@@ -210,6 +300,7 @@ fn scale_gradients_by_schedule<B, M>(
     step_index: usize,
     extra_param_ids: &HashSet<burn::module::ParamId>,
     extra_scale: Option<f32>,
+    neuron_scale_stabilization: Option<&NeuronScaleGradientStabilization>,
 ) where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
@@ -219,7 +310,9 @@ fn scale_gradients_by_schedule<B, M>(
         .any(|rule| (rule.scale_for_step_index(step_index) - 1.0).abs() > f32::EPSILON);
     let has_extra_scale = extra_scale
         .is_some_and(|scale| (scale - 1.0).abs() > f32::EPSILON && !extra_param_ids.is_empty());
-    if !has_static_scales && !has_extra_scale {
+    let has_neuron_scale_stabilization = neuron_scale_stabilization
+        .is_some_and(|schedule| schedule.is_active_for_step_index(step_index));
+    if !has_static_scales && !has_extra_scale && !has_neuron_scale_stabilization {
         return;
     }
 
@@ -229,6 +322,7 @@ fn scale_gradients_by_schedule<B, M>(
         step_index: usize,
         extra_param_ids: &'a HashSet<burn::module::ParamId>,
         extra_scale: Option<f32>,
+        neuron_scale_stabilization: Option<&'a NeuronScaleGradientStabilization>,
         _marker: std::marker::PhantomData<B>,
     }
 
@@ -245,6 +339,11 @@ fn scale_gradients_by_schedule<B, M>(
             {
                 scale *= extra_scale;
             }
+            if let Some(schedule) = self.neuron_scale_stabilization
+                && schedule.base_param_ids.contains(&param.id)
+            {
+                scale *= schedule.base_scale_for_step_index(self.step_index);
+            }
             if (scale - 1.0).abs() <= f32::EPSILON {
                 return;
             }
@@ -260,9 +359,169 @@ fn scale_gradients_by_schedule<B, M>(
         step_index,
         extra_param_ids,
         extra_scale,
+        neuron_scale_stabilization,
         _marker: std::marker::PhantomData,
     };
     module.visit(&mut visitor);
+    if let Some(schedule) = neuron_scale_stabilization {
+        scale_shared_lowrank_gradients::<B, M>(module, grads, schedule, step_index);
+    }
+}
+
+#[derive(Default)]
+struct ParamIdCollector {
+    ids: HashSet<burn::module::ParamId>,
+}
+
+impl<B: BackendTrait> burn::module::ModuleVisitor<B> for ParamIdCollector {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.ids.insert(param.id);
+    }
+}
+
+fn collect_model_param_ids<B: BackendTrait>(
+    model: &DragonModel<B>,
+) -> HashSet<burn::module::ParamId> {
+    let mut collector = ParamIdCollector::default();
+    model.visit(&mut collector);
+    collector.ids
+}
+
+fn scale_shared_lowrank_gradients<B, M>(
+    module: &M,
+    grads: &mut GradientsParams,
+    schedule: &NeuronScaleGradientStabilization,
+    step_index: usize,
+) where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let base_scale = schedule.base_scale_for_step_index(step_index);
+    let tail_scale = schedule.new_slice_lr_scale;
+    if (base_scale - 1.0).abs() <= f32::EPSILON && (tail_scale - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+
+    struct SharedLowrankGradientVisitor<'a, B: AutodiffBackend> {
+        grads: &'a mut GradientsParams,
+        schedule: &'a NeuronScaleGradientStabilization,
+        base_scale: f32,
+        tail_scale: f32,
+        _marker: std::marker::PhantomData<B>,
+    }
+
+    impl<B: AutodiffBackend> burn::module::ModuleVisitor<B> for SharedLowrankGradientVisitor<'_, B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if param.id == self.schedule.shared_encoder
+                || param.id == self.schedule.shared_encoder_v
+            {
+                if let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id) {
+                    let scaled = scale_3d_latent_tail(
+                        grad,
+                        self.schedule.old_latent_per_head,
+                        self.schedule.new_latent_per_head,
+                        self.base_scale,
+                        self.tail_scale,
+                    );
+                    self.grads.register(param.id, scaled);
+                }
+            } else if param.id == self.schedule.shared_decoder
+                && let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id)
+            {
+                let scaled = scale_2d_headed_latent_rows(
+                    grad,
+                    self.schedule.old_latent_per_head,
+                    self.schedule.new_latent_per_head,
+                    self.base_scale,
+                    self.tail_scale,
+                );
+                self.grads.register(param.id, scaled);
+            }
+        }
+    }
+
+    let mut visitor = SharedLowrankGradientVisitor::<B> {
+        grads,
+        schedule,
+        base_scale,
+        tail_scale,
+        _marker: std::marker::PhantomData,
+    };
+    module.visit(&mut visitor);
+}
+
+fn scale_3d_latent_tail<B: BackendTrait, const D: usize>(
+    tensor: Tensor<B, D>,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+) -> Tensor<B, D> {
+    if D != 3 || old_latent_per_head >= new_latent_per_head {
+        return tensor.mul_scalar(base_scale);
+    }
+    let dims: [usize; D] = tensor.shape().dims();
+    let device = tensor.device();
+    let mut values = tensor
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("3d shared lowrank gradient vec");
+    let heads = dims[0];
+    let embd = dims[1];
+    let latent = dims[2];
+    if latent != new_latent_per_head {
+        return Tensor::<B, D>::from_data(TensorData::new(values, dims), &device);
+    }
+    for h in 0..heads {
+        for e in 0..embd {
+            for l in 0..latent {
+                let idx = (h * embd + e) * latent + l;
+                values[idx] *= if l < old_latent_per_head {
+                    base_scale
+                } else {
+                    tail_scale
+                };
+            }
+        }
+    }
+    Tensor::<B, D>::from_data(TensorData::new(values, dims), &device)
+}
+
+fn scale_2d_headed_latent_rows<B: BackendTrait, const D: usize>(
+    tensor: Tensor<B, D>,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+) -> Tensor<B, D> {
+    if D != 2 || old_latent_per_head >= new_latent_per_head {
+        return tensor.mul_scalar(base_scale);
+    }
+    let dims: [usize; D] = tensor.shape().dims();
+    let device = tensor.device();
+    let mut values = tensor
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("2d shared lowrank decoder gradient vec");
+    let rows = dims[0];
+    let cols = dims[1];
+    if rows % new_latent_per_head != 0 {
+        return Tensor::<B, D>::from_data(TensorData::new(values, dims), &device);
+    }
+    for row in 0..rows {
+        let local = row % new_latent_per_head;
+        let scale = if local < old_latent_per_head {
+            base_scale
+        } else {
+            tail_scale
+        };
+        for col in 0..cols {
+            values[row * cols + col] *= scale;
+        }
+    }
+    Tensor::<B, D>::from_data(TensorData::new(values, dims), &device)
 }
 
 #[derive(Debug)]
@@ -368,6 +627,16 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     gradient_scale_step: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputDegeneracyStats {
+    pub token_count: usize,
+    pub entropy_bits: f64,
+    pub mean_max_probability: f64,
+    pub argmax_unique_fraction: f64,
+    pub eos_fraction: f64,
+    pub repetition_fraction: f64,
+}
+
 struct ObjectiveScoreBatch<B: BackendTrait> {
     student_inputs: Tensor<B, 2, Int>,
     student_targets: Tensor<B, 2, Int>,
@@ -439,6 +708,31 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub fn gradient_scale_step_index(&self) -> usize {
+        self.gradient_scale_step
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+
+    pub fn with_neuron_scale_stabilization(
+        mut self,
+        old_latent_total: usize,
+        new_latent_total: usize,
+        config: &NeuronScalingStabilizationConfig,
+    ) -> Self {
+        let start_step_index = self.gradient_scale_step_index().saturating_add(1);
+        self.gradient_scale_schedule = self
+            .gradient_scale_schedule
+            .with_neuron_scale_stabilization(
+                &self.model,
+                old_latent_total,
+                new_latent_total,
+                start_step_index,
+                config,
+            );
+        self
+    }
+
     pub fn continual_backprop_target_lr_scale(&self) -> f32 {
         let step_index = self
             .gradient_scale_step
@@ -465,6 +759,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             step_index,
             self.gradient_scale_schedule.backbone_param_ids.as_ref(),
             extra_scale,
+            self.gradient_scale_schedule
+                .neuron_scale_stabilization
+                .as_ref(),
         );
         grads
     }
@@ -667,6 +964,51 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         };
         runtime.model = ema_blend_model(&runtime.model, &self.model, rate);
         runtime.update_count = runtime.update_count.saturating_add(1);
+    }
+
+    pub(crate) fn validation_loss_and_output_degeneracy(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+    ) -> (Tensor<B, 1>, Option<OutputDegeneracyStats>) {
+        let output = <Self as ValidStep>::step(self, batch.clone());
+        let loss_value: LossValue<B> = output.adapt();
+        let stats = self.output_degeneracy_for_batch(batch, probe_tokens, eos_id);
+        (loss_value.value(), stats)
+    }
+
+    fn output_degeneracy_for_batch(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+    ) -> Option<OutputDegeneracyStats> {
+        if probe_tokens == 0
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+        {
+            return None;
+        }
+        let [batch_size, block_size] = batch.inputs.shape().dims::<2>();
+        if batch_size == 0 || block_size == 0 {
+            return None;
+        }
+        let probe_batch = 1usize;
+        let probe_time = probe_tokens.min(block_size).max(1);
+        let inputs = batch.inputs.slice([0..probe_batch, 0..probe_time]);
+        let summary_event_mask = batch
+            .summary_event_mask
+            .map(|mask| mask.slice([0..probe_batch, 0..probe_time]));
+        let mut state = self.model.init_state();
+        let hidden = if let Some(mask) = summary_event_mask {
+            self.model
+                .forward_hidden_with_state_and_summary_event_mask(inputs, mask, &mut state)
+        } else {
+            self.model.forward_hidden_with_state(inputs, &mut state)
+        };
+        let logits = self.model.logits_from_hidden(hidden);
+        Some(output_degeneracy_from_logits(logits, eos_id)).filter(|stats| stats.token_count > 0)
     }
 
     #[cfg(test)]
@@ -1567,6 +1909,89 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
             let loss = self.language_loss_from_hidden(hidden, batch.targets);
             LanguageModelOutput::new(loss)
         }
+    }
+}
+
+fn output_degeneracy_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    eos_id: Option<i64>,
+) -> OutputDegeneracyStats {
+    let [batch, time, vocab] = logits.shape().dims::<3>();
+    if batch == 0 || time == 0 || vocab == 0 {
+        return OutputDegeneracyStats::default();
+    }
+    let values = logits
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("validation degeneracy logits vec");
+    let mut token_count = 0usize;
+    let mut entropy_sum = 0.0f64;
+    let mut max_probability_sum = 0.0f64;
+    let mut eos_count = 0usize;
+    let mut repetition_count = 0usize;
+    let mut repetition_denominator = 0usize;
+    let mut unique = HashSet::new();
+
+    for b in 0..batch {
+        let mut previous = None;
+        for t in 0..time {
+            let start = (b * time + t) * vocab;
+            let row = &values[start..start + vocab];
+            let Some((argmax, max_logit)) = row
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .max_by(|(_, left), (_, right)| {
+                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            else {
+                continue;
+            };
+            let mut exp_sum = 0.0f64;
+            let mut weighted_logit_sum = 0.0f64;
+            for value in row.iter().copied().filter(|value| value.is_finite()) {
+                let weight = (value as f64 - max_logit as f64).exp();
+                exp_sum += weight;
+                weighted_logit_sum += weight * value as f64;
+            }
+            if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                continue;
+            }
+            let logsumexp = max_logit as f64 + exp_sum.ln();
+            let entropy_nats = logsumexp - weighted_logit_sum / exp_sum;
+            entropy_sum += entropy_nats.max(0.0) / std::f64::consts::LN_2;
+            max_probability_sum += 1.0 / exp_sum;
+            if eos_id.is_some_and(|id| id >= 0 && argmax == id as usize) {
+                eos_count = eos_count.saturating_add(1);
+            }
+            if let Some(previous) = previous {
+                repetition_denominator = repetition_denominator.saturating_add(1);
+                if previous == argmax {
+                    repetition_count = repetition_count.saturating_add(1);
+                }
+            }
+            previous = Some(argmax);
+            unique.insert(argmax);
+            token_count = token_count.saturating_add(1);
+        }
+    }
+
+    if token_count == 0 {
+        return OutputDegeneracyStats::default();
+    }
+    OutputDegeneracyStats {
+        token_count,
+        entropy_bits: entropy_sum / token_count as f64,
+        mean_max_probability: max_probability_sum / token_count as f64,
+        argmax_unique_fraction: unique.len() as f64 / token_count as f64,
+        eos_fraction: eos_count as f64 / token_count as f64,
+        repetition_fraction: if repetition_denominator == 0 {
+            0.0
+        } else {
+            repetition_count as f64 / repetition_denominator as f64
+        },
     }
 }
 

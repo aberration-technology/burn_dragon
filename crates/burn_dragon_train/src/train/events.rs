@@ -1,16 +1,17 @@
 pub use burn_ecs::{
     CapacityPlateauDetected, CapacityPlateauPlugin, CapacityPlateauState, CapacityScalingPolicy,
-    CheckpointEvent, ControlRequest, EventBusConfig, MetricAggregate, ModelCapacityState,
-    ModelScaleApplied, ModelScaleEvent, ModelScaleRequest, ModelScaleSkipped, MonitorRunOptions,
-    RuliadSourceSelectionSample, SourceSelectionSample, StepFinished, StepStarted,
-    TrainingAppBuilder, TrainingAppConfig, TrainingControlHandle, TrainingControlResource,
-    TrainingCorePlugin, TrainingDashboardResource, TrainingDashboardState, TrainingEcsRuntime,
-    TrainingEcsThread, TrainingEpochSummary, TrainingEventBus, TrainingEventFiles,
-    TrainingEventRuntimeConfig, TrainingEventsConfig, TrainingGateAction, TrainingGateEvent,
-    TrainingGateSeverity, TrainingGatesConfig, TrainingJsonEvent, TrainingMetricSample,
-    TrainingMetricSplit, TrainingRunConfig as TrainingRunContext, TrainingRunResource,
-    TrainingRuntimeConfig, TrainingSet as TrainingEventSet, TrainingWindowFinished,
-    TrainingWindowMode, TrainingWindowStarted, ValidationFinished, monitor_run, render_dashboard,
+    CheckpointEvent, ContinualBackpropSample, ControlRequest, EventBusConfig, MetricAggregate,
+    ModelCapacityState, ModelScaleApplied, ModelScaleEvent, ModelScaleRequest, ModelScaleSkipped,
+    MonitorRunOptions, OutputDegeneracySample, RuliadSourceSelectionSample, SourceSelectionSample,
+    StepFinished, StepStarted, TrainingAppBuilder, TrainingAppConfig, TrainingControlHandle,
+    TrainingControlResource, TrainingCorePlugin, TrainingDashboardResource, TrainingDashboardState,
+    TrainingEcsRuntime, TrainingEcsThread, TrainingEpochSummary, TrainingEventBus,
+    TrainingEventFiles, TrainingEventRuntimeConfig, TrainingEventsConfig, TrainingGateAction,
+    TrainingGateEvent, TrainingGateSeverity, TrainingGatesConfig, TrainingJsonEvent,
+    TrainingMetricSample, TrainingMetricSplit, TrainingRunConfig as TrainingRunContext,
+    TrainingRunResource, TrainingRuntimeConfig, TrainingSet as TrainingEventSet,
+    TrainingWindowFinished, TrainingWindowMode, TrainingWindowStarted, ValidationFinished,
+    monitor_run, render_dashboard,
 };
 
 pub type TrainingEventRuntime = TrainingEcsRuntime;

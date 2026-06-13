@@ -48,6 +48,11 @@ impl TrainingConfig {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
         if self.training.neuron_scaling.enabled {
+            if self.parallel.mode != ParallelismKind::Single {
+                return Err(anyhow!(
+                    "training.neuron_scaling.enabled currently requires parallel.mode=single"
+                ));
+            }
             if self.training.neuron_scaling.max_latent_total == 0 {
                 return Err(anyhow!(
                     "training.neuron_scaling.max_latent_total must be > 0"
@@ -61,29 +66,6 @@ impl TrainingConfig {
             if self.training.neuron_scaling.capacity_patience_epochs == 0 {
                 return Err(anyhow!(
                     "training.neuron_scaling.capacity_patience_epochs must be > 0"
-                ));
-            }
-            if self.training.neuron_scaling.batch_fit.min_batch_size == 0 {
-                return Err(anyhow!(
-                    "training.neuron_scaling.batch_fit.min_batch_size must be > 0"
-                ));
-            }
-            if self
-                .training
-                .neuron_scaling
-                .batch_fit
-                .target_device_memory_mb
-                == 0
-            {
-                return Err(anyhow!(
-                    "training.neuron_scaling.batch_fit.target_device_memory_mb must be > 0"
-                ));
-            }
-            if !(0.0..=1.0).contains(&self.training.neuron_scaling.batch_fit.batch_safety_margin)
-                || self.training.neuron_scaling.batch_fit.batch_safety_margin <= 0.0
-            {
-                return Err(anyhow!(
-                    "training.neuron_scaling.batch_fit.batch_safety_margin must be in (0, 1]"
                 ));
             }
             if self
@@ -129,6 +111,16 @@ impl TrainingConfig {
                 "training.events.source_selection_every_steps must be > 0"
             ));
         }
+        if self.training.events.continual_backprop_every_steps == 0 {
+            return Err(anyhow!(
+                "training.events.continual_backprop_every_steps must be > 0"
+            ));
+        }
+        if self.training.events.degeneracy_probe_every_epochs == 0 {
+            return Err(anyhow!(
+                "training.events.degeneracy_probe_every_epochs must be > 0"
+            ));
+        }
         if self.training.gates.plateau_patience_epochs == 0 {
             return Err(anyhow!(
                 "training.gates.plateau_patience_epochs must be > 0"
@@ -146,6 +138,49 @@ impl TrainingConfig {
         }
         if self.training.gates.difficulty_patience == 0 {
             return Err(anyhow!("training.gates.difficulty_patience must be > 0"));
+        }
+        if self.training.gates.degeneracy_patience == 0 {
+            return Err(anyhow!("training.gates.degeneracy_patience must be > 0"));
+        }
+        if self.training.gates.degeneracy_entropy_min_bits < 0.0
+            || !self.training.gates.degeneracy_entropy_min_bits.is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_entropy_min_bits must be finite and >= 0"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_max_probability_max)
+            || !self
+                .training
+                .gates
+                .degeneracy_max_probability_max
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_max_probability_max must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_argmax_unique_min_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_argmax_unique_min_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_argmax_unique_min_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_repetition_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_repetition_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_repetition_max_fraction must be finite and in [0, 1]"
+            ));
         }
         if self.parallel.world_size == 0 {
             return Err(anyhow!("parallel.world_size must be > 0"));
@@ -606,6 +641,16 @@ impl TrainingConfig {
                     "training.continual_backprop.lr_coupling_power must be finite and >= 0"
                 ));
             }
+            if self
+                .training
+                .continual_backprop
+                .max_replacements_per_interval
+                == 0
+            {
+                return Err(anyhow!(
+                    "training.continual_backprop.max_replacements_per_interval must be > 0"
+                ));
+            }
         }
         let mut seen_module_lr_targets = HashSet::new();
         for entry in &self.training.module_lr_scales {
@@ -986,13 +1031,6 @@ impl TrainingConfig {
                     "training.neuron_scaling.max_latent_total must be divisible by model.n_head (got max={} n_head={})",
                     max_latent_total,
                     resolved_model.n_head
-                ));
-            }
-            if max_latent_total % self.parallel.tensor.size != 0 {
-                return Err(anyhow!(
-                    "training.neuron_scaling.max_latent_total must be divisible by parallel.tensor.size (got max={} tensor_size={})",
-                    max_latent_total,
-                    self.parallel.tensor.size
                 ));
             }
         }
@@ -1526,12 +1564,12 @@ latent_total = 48
     }
 
     #[test]
-    fn neuron_scaling_rejects_max_not_divisible_by_tensor_parallel_size() {
+    fn neuron_scaling_rejects_non_single_parallel_mode() {
         let config = parse_config(
             r#"
 [training.neuron_scaling]
 enabled = true
-max_latent_total = 50
+max_latent_total = 80
 
 [model]
 n_layer = 1
@@ -1553,10 +1591,10 @@ size = 4
 
         let err = config
             .validate()
-            .expect_err("tensor-parallel-incompatible max should fail");
+            .expect_err("tensor-parallel neuron scaling should fail");
         assert!(
             err.to_string()
-                .contains("max_latent_total must be divisible by parallel.tensor.size"),
+                .contains("neuron_scaling.enabled currently requires parallel.mode=single"),
             "unexpected error: {err}"
         );
     }

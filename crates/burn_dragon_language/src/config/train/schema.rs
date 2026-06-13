@@ -164,14 +164,6 @@ fn default_neuron_scaling_capacity_patience_epochs() -> usize {
     2
 }
 
-fn default_neuron_scaling_target_device_memory_mb() -> usize {
-    100_000
-}
-
-fn default_neuron_scaling_batch_safety_margin() -> f32 {
-    0.90
-}
-
 fn default_neuron_scaling_freeze_base_steps() -> usize {
     256
 }
@@ -189,30 +181,6 @@ fn default_neuron_scaling_lr_scale() -> f32 {
 pub enum NeuronScalingGrowth {
     #[default]
     Double,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(default)]
-pub struct NeuronScalingBatchFitConfig {
-    pub enabled: bool,
-    #[serde(default = "default_neuron_scaling_target_device_memory_mb")]
-    pub target_device_memory_mb: usize,
-    pub min_batch_size: usize,
-    #[serde(default = "default_neuron_scaling_batch_safety_margin")]
-    pub batch_safety_margin: f32,
-    pub preserve_effective_batch_size: bool,
-}
-
-impl Default for NeuronScalingBatchFitConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            target_device_memory_mb: default_neuron_scaling_target_device_memory_mb(),
-            min_batch_size: 1,
-            batch_safety_margin: default_neuron_scaling_batch_safety_margin(),
-            preserve_effective_batch_size: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -253,7 +221,6 @@ pub struct NeuronScalingConfig {
     #[serde(default = "default_neuron_scaling_capacity_patience_epochs")]
     pub capacity_patience_epochs: usize,
     pub require_live_source_selection: bool,
-    pub batch_fit: NeuronScalingBatchFitConfig,
     pub stabilization: NeuronScalingStabilizationConfig,
 }
 
@@ -267,7 +234,6 @@ impl Default for NeuronScalingConfig {
             max_scale_events: default_neuron_scaling_max_scale_events(),
             capacity_patience_epochs: default_neuron_scaling_capacity_patience_epochs(),
             require_live_source_selection: true,
-            batch_fit: NeuronScalingBatchFitConfig::default(),
             stabilization: NeuronScalingStabilizationConfig::default(),
         }
     }

@@ -1,7 +1,8 @@
 use crate::checkpoint::{RUN_DIR_ENV, RUN_NAME_ENV};
 use crate::train::prelude::*;
 use crate::train::schedule::{
-    TrainEnvironment, resolve_lr_scheduler, resolve_train_schedule, train_with_scheduler,
+    TrainEnvironment, resolve_lr_scheduler, resolve_train_schedule,
+    train_with_dynamic_neuron_scaling_scheduler, train_with_scheduler,
 };
 use crate::train::startup_autotune::{
     resolve_gradient_accumulation_steps, resolve_startup_batch_size,
@@ -190,33 +191,71 @@ fn initialize_model_from_checkpoint<B: BackendTrait>(
     Ok(())
 }
 
-fn train_with_resolved_scheduler<B, O>(
+fn train_with_resolved_scheduler<B>(
     context: &TrainEnvironment<'_, B>,
     model: LanguageTrainModel<B>,
-    optimizer: O,
+    optimizer: crate::train::continual_backprop::LanguageOptimizer<B>,
     scheduler: ResolvedLrScheduler,
 ) -> Result<DragonModel<ValidBackend<B>>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
-    O: Optimizer<LanguageTrainModel<B>, B> + 'static,
 {
+    let use_dynamic_scaling = context.training.neuron_scaling.enabled;
+    if use_dynamic_scaling && context.parallel_runtime.mode != ParallelismKind::Single {
+        return Err(anyhow!(
+            "training.neuron_scaling.enabled currently requires parallel.mode=single; in-process Dragon neuron scaling mutates model and optimizer state between validation epochs"
+        ));
+    }
+    let use_event_scheduler = use_dynamic_scaling
+        || (context.parallel_runtime.mode == ParallelismKind::Single
+            && context.training.events.source_weighted_validation_batches > 0
+            && context
+                .source_selection_dataset
+                .as_ref()
+                .is_some_and(|dataset| dataset.uses_live_source_selection()));
     match scheduler {
-        ResolvedLrScheduler::Constant(lr) => train_with_scheduler(context, model, optimizer, lr),
+        ResolvedLrScheduler::Constant(lr) => {
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, lr)
+            } else {
+                train_with_scheduler(context, model, optimizer, lr)
+            }
+        }
         ResolvedLrScheduler::Cosine(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Linear(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Exponential(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Step(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Noam(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
     }
 }
@@ -683,7 +722,7 @@ where
                 valid_steps,
                 None,
             )
-            .with_summary_event_token_ids(summary_event_token_ids),
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 
     let mut base_model = DragonModel::<B>::new(model_config.clone(), &device);
@@ -813,6 +852,7 @@ where
             .train
             .uses_live_source_selection()
             .then(|| Arc::clone(&datasets.train)),
+        summary_event_token_ids,
         neuron_scaling_slot: neuron_scaling_slot.clone(),
         epochs: total_epochs,
     };
@@ -822,18 +862,6 @@ where
         optim.take().expect("optimizer initialized"),
         scheduler,
     )?;
-    if let Some(request) = neuron_scaling_slot.and_then(|slot| slot.take()) {
-        let path = crate::train::neuron_scaling::write_neuron_scale_request_artifact(
-            &run_dir,
-            &model_config,
-            &training.neuron_scaling,
-            request,
-        )?;
-        warn!(
-            "Dragon neuron scaling was requested; wrote restart artifact to {}",
-            path.display()
-        );
-    }
 
     info!("Training complete on {backend_name}");
 

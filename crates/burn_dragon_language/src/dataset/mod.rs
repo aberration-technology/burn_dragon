@@ -5,6 +5,7 @@ pub mod scheduler;
 mod universality;
 
 use crate::tokenizer::SharedTokenizer;
+use burn::tensor::backend::Backend;
 
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
@@ -67,6 +68,24 @@ impl Dataset {
         &self,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         TokenSequenceDataset::source_selection_snapshot(self)
+    }
+
+    pub fn sample_source_weighted_validation_batch<B: Backend>(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        summary_event_token_ids: Option<&[u32]>,
+        device: &B::Device,
+    ) -> Option<SequenceBatch<B>> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.sample_source_weighted_validation_batch(
+                epoch_index,
+                absolute_step,
+                summary_event_token_ids,
+                device,
+            ),
+        }
     }
 }
 

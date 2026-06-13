@@ -266,17 +266,11 @@ where
 {
     fs::create_dir_all(env.run_dir)?;
 
-    let metric_every = env.training.log_frequency.max(1);
-    let source_selection_dataset = env
-        .source_selection_dataset
-        .as_ref()
-        .filter(|dataset| dataset.uses_live_source_selection())
-        .cloned();
-    let train_loss_metric_every = if source_selection_dataset.is_some() {
-        env.training.events.source_selection_every_steps.max(1)
-    } else {
-        metric_every
-    };
+    let source_selection_dataset = env.source_selection_dataset.as_ref().cloned();
+    let train_loss_metric_every = crate::train::events::train_loss_metric_frequency(
+        env.training,
+        source_selection_dataset.as_ref(),
+    );
     #[cfg(feature = "ddp")]
     if env.parallel_runtime.mode == ParallelismKind::Ddp
         && env.parallel_runtime.is_process_group_launch()
@@ -297,40 +291,13 @@ where
             ));
         }
     };
-    let event_interrupter = burn_train::Interrupter::new();
-    let mut event_app = burn_dragon_train::train::events::TrainingAppBuilder::new(
-        burn_dragon_train::train::events::TrainingAppConfig {
-            run: burn_dragon_train::train::events::TrainingRunContext::new(
-                env.run_name,
-                env.run_name,
-                env.run_dir,
-                env.train_loader.num_items(),
-            ),
-            events: env.training.events.clone(),
-            gates: env.training.gates.clone(),
-            bus: Default::default(),
-        },
-    )
-    .with_control(
-        burn_dragon_train::train::events::BurnInterrupterControl::new(event_interrupter.clone()),
-    );
-    if let Some(dataset) = &source_selection_dataset {
-        let dataset = Arc::clone(dataset);
-        let source_selection_every_steps = env.training.events.source_selection_every_steps;
-        event_app = event_app.with_setup(move |app| {
-            app.insert_resource(crate::train::events::RuliadSourceSelectionResource::new(
-                Arc::clone(&dataset),
-                source_selection_every_steps,
-            ))
-            .add_plugins(crate::train::events::RuliadSourceSelectionTelemetryPlugin);
-        });
-    }
-    let event_thread = event_app.spawn_threaded()?;
-    let event_logger = burn_dragon_train::train::events::TrainingEventMetricLogger::with_thread(
-        event_thread,
+    let event_handles = crate::train::events::build_training_event_handles(
         env.run_name,
+        env.run_dir,
         env.train_loader.num_items(),
-    );
+        env.training,
+        source_selection_dataset,
+    )?;
 
     let builder = SupervisedTraining::new(
         env.run_dir,
@@ -341,8 +308,8 @@ where
     .grads_accumulation(env.training.gradient_accumulation_steps.max(1))
     .with_training_strategy(training_strategy)
     .with_application_logger(None)
-    .with_interrupter(event_interrupter)
-    .with_metric_logger(event_logger)
+    .with_interrupter(event_handles.interrupter)
+    .with_metric_logger(event_handles.metric_logger)
     .with_file_checkpointer(BinFileRecorder::<FullPrecisionSettings>::new())
     .with_checkpointing_strategy(FileMetricBestCheckpointingStrategy::new(
         env.run_dir,

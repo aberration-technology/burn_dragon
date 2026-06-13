@@ -36,6 +36,7 @@ train = [
   "dep:memmap2",
   "dep:tempfile",
   "dep:burn_dragon_universality",
+  "dep:burn_ecs",
 ]
 rerun = ["train", "dep:rerun", "dep:urlencoding"]
 cuda = ["burn-cuda", "burn_dragon_core/cuda", "burn_dragon_train/cuda"]
@@ -45,6 +46,7 @@ web = ["burn_dragon_core/web"]
 [dependencies]
 anyhow.workspace = true
 burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
+burn_ecs = { workspace = true, optional = true }
 burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true, features = ["std"] }

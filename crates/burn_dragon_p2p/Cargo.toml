@@ -87,7 +87,7 @@ url = "2"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 burn_dragon_language = { workspace = true, optional = true, default-features = false, features = ["train"] }
 burn_dragon_train = { workspace = true, optional = true, default-features = false, features = ["train"] }
-burn_p2p = { workspace = true, default-features = false, features = ["burn"] }
+burn_p2p = { workspace = true, default-features = false, features = ["burn", "ecs"] }
 burn_p2p_bootstrap.workspace = true
 burn_p2p_core.workspace = true
 ctrlc = "3.4"

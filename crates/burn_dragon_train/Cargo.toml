@@ -26,6 +26,7 @@ cli = [
 ]
 train = [
   "burn/dataset",
+  "burn_ecs/burn-train-adapter",
   "dep:burn-autodiff",
   "dep:burn-ndarray",
   "dep:burn-train",
@@ -40,6 +41,7 @@ integration_test = ["train"]
 [dependencies]
 anyhow.workspace = true
 burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
+burn_ecs.workspace = true
 burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-communication = { workspace = true, optional = true }
@@ -69,6 +71,11 @@ avirus = "0.2"
 burn-ndarray.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "training_events"
+harness = false
+required-features = ["train"]
 
 [lints]
 workspace = true

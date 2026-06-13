@@ -5,9 +5,80 @@ use burn::tensor::TensorPrimitive;
 use std::collections::BTreeSet;
 #[cfg(feature = "ddp")]
 use std::collections::HashMap;
+#[cfg(feature = "ddp")]
 use std::marker::PhantomData;
 
 const CHECKPOINT_KEEP_LAST: usize = 2;
+
+struct QuietMetricsRenderer;
+
+impl burn_train::renderer::MetricsRendererTraining for QuietMetricsRenderer {
+    fn update_train(&mut self, _state: burn_train::renderer::MetricState) {}
+
+    fn update_valid(&mut self, _state: burn_train::renderer::MetricState) {}
+
+    fn render_train(
+        &mut self,
+        _item: burn_train::renderer::TrainingProgress,
+        _progress_indicators: Vec<burn_train::renderer::ProgressType>,
+    ) {
+    }
+
+    fn render_valid(
+        &mut self,
+        _item: burn_train::renderer::TrainingProgress,
+        _progress_indicators: Vec<burn_train::renderer::ProgressType>,
+    ) {
+    }
+
+    fn on_train_end(
+        &mut self,
+        _summary: Option<burn_train::LearnerSummary>,
+    ) -> std::result::Result<(), Box<dyn core::error::Error>> {
+        Ok(())
+    }
+}
+
+impl burn_train::renderer::MetricsRendererEvaluation for QuietMetricsRenderer {
+    fn update_test(
+        &mut self,
+        _name: burn_train::renderer::EvaluationName,
+        _state: burn_train::renderer::MetricState,
+    ) {
+    }
+
+    fn render_test(
+        &mut self,
+        _item: burn_train::renderer::EvaluationProgress,
+        _progress_indicators: Vec<burn_train::renderer::ProgressType>,
+    ) {
+    }
+
+    fn on_test_end(
+        &mut self,
+        _summary: Option<burn_train::LearnerSummary>,
+    ) -> std::result::Result<(), Box<dyn core::error::Error>> {
+        Ok(())
+    }
+}
+
+impl burn_train::renderer::MetricsRenderer for QuietMetricsRenderer {
+    fn manual_close(&mut self) {}
+
+    fn register_metric(&mut self, _definition: burn_train::metric::MetricDefinition) {}
+}
+
+fn quiet_progress_renderer_enabled() -> bool {
+    std::env::var("DragonModel_TRAINING_PROGRESS_RENDERER")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "quiet" | "none" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
 
 struct FileMetricBestCheckpointingStrategy {
     run_dir: PathBuf,
@@ -16,118 +87,6 @@ struct FileMetricBestCheckpointingStrategy {
     split: burn_train::metric::store::Split,
     best_epoch: Option<usize>,
     best_value: Option<f64>,
-}
-
-struct RuliadSourceSelectionLossMetric<B: BackendTrait> {
-    name: Arc<String>,
-    dataset: Arc<Dataset>,
-    steps_per_epoch: usize,
-    every: usize,
-    last: f64,
-    initialized: bool,
-    _marker: PhantomData<B>,
-}
-
-impl<B: BackendTrait> Clone for RuliadSourceSelectionLossMetric<B> {
-    fn clone(&self) -> Self {
-        Self {
-            name: Arc::clone(&self.name),
-            dataset: Arc::clone(&self.dataset),
-            steps_per_epoch: self.steps_per_epoch,
-            every: self.every,
-            last: self.last,
-            initialized: self.initialized,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<B: BackendTrait> RuliadSourceSelectionLossMetric<B> {
-    fn new(name: &str, dataset: Arc<Dataset>, steps_per_epoch: usize, every: usize) -> Self {
-        Self {
-            name: Arc::new(name.to_string()),
-            dataset,
-            steps_per_epoch: steps_per_epoch.max(1),
-            every: every.max(1),
-            last: 0.0,
-            initialized: false,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<B: BackendTrait> burn_train::metric::Metric for RuliadSourceSelectionLossMetric<B> {
-    type Input = LossValue<B>;
-
-    fn name(&self) -> burn_train::metric::MetricName {
-        Arc::clone(&self.name)
-    }
-
-    fn update(
-        &mut self,
-        item: &Self::Input,
-        metadata: &burn_train::metric::MetricMetadata,
-    ) -> burn_train::metric::SerializedEntry {
-        if !local_metric_should_emit(metadata, self.every) && self.initialized {
-            return local_serialized_entry(
-                burn_train::metric::format_float(self.last, 4),
-                self.last.to_string(),
-            );
-        }
-        let value = item
-            .value()
-            .mean()
-            .into_data()
-            .iter::<f64>()
-            .next()
-            .unwrap_or(0.0);
-        let epoch_index = metadata.global_progress.items_processed.saturating_sub(1);
-        let step_in_epoch = metadata
-            .iteration
-            .unwrap_or(metadata.progress.items_processed)
-            .saturating_sub(1);
-        let absolute_step = epoch_index
-            .saturating_mul(self.steps_per_epoch)
-            .saturating_add(step_in_epoch);
-        let _ = self
-            .dataset
-            .record_source_selection_loss(absolute_step, value as f32);
-        self.last = value;
-        self.initialized = true;
-        local_serialized_entry(
-            burn_train::metric::format_float(value, 4),
-            value.to_string(),
-        )
-    }
-
-    fn clear(&mut self) {
-        self.last = 0.0;
-        self.initialized = false;
-    }
-}
-
-impl<B: BackendTrait> burn_train::metric::Numeric for RuliadSourceSelectionLossMetric<B> {
-    fn value(&self) -> burn_train::metric::NumericEntry {
-        burn_train::metric::NumericEntry::Value(self.last)
-    }
-
-    fn running_value(&self) -> burn_train::metric::NumericEntry {
-        burn_train::metric::NumericEntry::Value(self.last)
-    }
-}
-
-fn local_metric_should_emit(metadata: &burn_train::metric::MetricMetadata, every: usize) -> bool {
-    every <= 1
-        || metadata
-            .iteration
-            .is_some_and(|iteration| iteration % every == 0)
-}
-
-fn local_serialized_entry(
-    formatted: impl Into<String>,
-    serialized: impl Into<String>,
-) -> burn_train::metric::SerializedEntry {
-    burn_train::metric::SerializedEntry::new(formatted.into(), serialized.into())
 }
 
 impl FileMetricBestCheckpointingStrategy {
@@ -308,6 +267,16 @@ where
     fs::create_dir_all(env.run_dir)?;
 
     let metric_every = env.training.log_frequency.max(1);
+    let source_selection_dataset = env
+        .source_selection_dataset
+        .as_ref()
+        .filter(|dataset| dataset.uses_live_source_selection())
+        .cloned();
+    let train_loss_metric_every = if source_selection_dataset.is_some() {
+        env.training.events.source_selection_every_steps.max(1)
+    } else {
+        metric_every
+    };
     #[cfg(feature = "ddp")]
     if env.parallel_runtime.mode == ParallelismKind::Ddp
         && env.parallel_runtime.is_process_group_launch()
@@ -328,6 +297,41 @@ where
             ));
         }
     };
+    let event_interrupter = burn_train::Interrupter::new();
+    let mut event_app = burn_dragon_train::train::events::TrainingAppBuilder::new(
+        burn_dragon_train::train::events::TrainingAppConfig {
+            run: burn_dragon_train::train::events::TrainingRunContext::new(
+                env.run_name,
+                env.run_name,
+                env.run_dir,
+                env.train_loader.num_items(),
+            ),
+            events: env.training.events.clone(),
+            gates: env.training.gates.clone(),
+            bus: Default::default(),
+        },
+    )
+    .with_control(
+        burn_dragon_train::train::events::BurnInterrupterControl::new(event_interrupter.clone()),
+    );
+    if let Some(dataset) = &source_selection_dataset {
+        let dataset = Arc::clone(dataset);
+        let source_selection_every_steps = env.training.events.source_selection_every_steps;
+        event_app = event_app.with_setup(move |app| {
+            app.insert_resource(crate::train::events::RuliadSourceSelectionResource::new(
+                Arc::clone(&dataset),
+                source_selection_every_steps,
+            ))
+            .add_plugins(crate::train::events::RuliadSourceSelectionTelemetryPlugin);
+        });
+    }
+    let event_thread = event_app.spawn_threaded()?;
+    let event_logger = burn_dragon_train::train::events::TrainingEventMetricLogger::with_thread(
+        event_thread,
+        env.run_name,
+        env.train_loader.num_items(),
+    );
+
     let builder = SupervisedTraining::new(
         env.run_dir,
         Arc::clone(&env.train_loader),
@@ -337,6 +341,8 @@ where
     .grads_accumulation(env.training.gradient_accumulation_steps.max(1))
     .with_training_strategy(training_strategy)
     .with_application_logger(None)
+    .with_interrupter(event_interrupter)
+    .with_metric_logger(event_logger)
     .with_file_checkpointer(BinFileRecorder::<FullPrecisionSettings>::new())
     .with_checkpointing_strategy(FileMetricBestCheckpointingStrategy::new(
         env.run_dir,
@@ -344,30 +350,20 @@ where
         burn_train::metric::store::Direction::Lowest,
         burn_train::metric::store::Split::Valid,
     ));
-    let builder = if let Some(dataset) = env
-        .source_selection_dataset
-        .as_ref()
-        .filter(|dataset| dataset.uses_live_source_selection())
-    {
-        builder.metric_train_numeric(RuliadSourceSelectionLossMetric::<ValidBackend<B>>::new(
-            "Loss",
-            Arc::clone(dataset),
-            env.train_loader.num_items(),
-            metric_every,
-        ))
-    } else {
-        builder.metric_train_numeric(
-            ScalarMetric::<ValidBackend<B>, LossValue<ValidBackend<B>>>::new_every(
-                "Loss",
-                metric_every,
-            ),
-        )
-    };
+    let builder = builder.metric_train_numeric(ScalarMetric::<
+        ValidBackend<B>,
+        LossValue<ValidBackend<B>>,
+    >::new_every("Loss", train_loss_metric_every));
     let builder = builder
         .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
         .metric_train_numeric(LearningRateMetric::new())
         .metric_train(DeviceMetric::new("device", env.backend_name))
         .metric_valid(DeviceMetric::new("device", env.backend_name));
+    let builder = if quiet_progress_renderer_enabled() {
+        builder.renderer(QuietMetricsRenderer)
+    } else {
+        builder
+    };
     #[cfg(feature = "rerun")]
     let builder = crate::train::rerun::attach_metric_loggers(builder, env.run_dir);
     let builder = builder.summary();
@@ -2137,6 +2133,8 @@ mod tests {
             sequence_kernel_override: None,
             objective: Default::default(),
             gdpo: None,
+            events: Default::default(),
+            gates: Default::default(),
         }
     }
 

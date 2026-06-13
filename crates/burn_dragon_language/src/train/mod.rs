@@ -4,6 +4,7 @@ mod prelude;
 
 pub mod backend;
 mod continual_backprop;
+pub mod events;
 pub mod objective;
 pub mod profile;
 #[cfg(feature = "rerun")]

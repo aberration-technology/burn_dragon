@@ -194,6 +194,10 @@ pub struct TrainingHyperparameters {
     pub objective: TrainingObjectiveConfig,
     #[serde(default)]
     pub gdpo: Option<burn_dragon_train::GdpoConfig>,
+    #[serde(default)]
+    pub events: burn_dragon_train::TrainingEventsConfig,
+    #[serde(default)]
+    pub gates: burn_dragon_train::TrainingGatesConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

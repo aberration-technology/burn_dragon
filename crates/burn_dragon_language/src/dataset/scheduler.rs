@@ -501,6 +501,13 @@ fn dataset_prefetch_workers() -> usize {
         })
 }
 
+fn live_source_selection_prefetch_depth() -> usize {
+    std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_PREFETCH_DEPTH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| dataset_prefetch_depth().min(4))
+}
+
 fn finalize_host_batch_on_device<B: Backend>(
     host: HostSequenceBatch,
     batch_size: usize,
@@ -768,10 +775,19 @@ where
             .as_ref()
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or_default();
-        let use_persistent_prefetch = dataset_prefetch_depth() > 0
-            && steps_total > 1
-            && self.split == DatasetSplit::Train
-            && !self.dataset.uses_live_source_selection();
+        let uses_live_source_selection = self.dataset.uses_live_source_selection();
+        let prefetch_depth = if uses_live_source_selection {
+            live_source_selection_prefetch_depth()
+        } else {
+            dataset_prefetch_depth()
+        };
+        let prefetch_workers = if uses_live_source_selection {
+            dataset_prefetch_workers().min(prefetch_depth.max(1))
+        } else {
+            dataset_prefetch_workers()
+        };
+        let use_persistent_prefetch =
+            prefetch_depth > 0 && steps_total > 1 && self.split == DatasetSplit::Train;
         if use_persistent_prefetch {
             let mut slot = self.prefetch.lock().expect("random prefetch lock");
             if slot.is_none() {
@@ -783,8 +799,8 @@ where
                     self.steps_per_epoch,
                     absolute_step_start,
                     self.total_steps,
-                    dataset_prefetch_depth(),
-                    dataset_prefetch_workers(),
+                    prefetch_depth,
+                    prefetch_workers,
                 ));
             } else if let Some(prefetch) = slot.as_mut() {
                 prefetch.seek_to(absolute_step_start);
@@ -1430,6 +1446,14 @@ mod random_loader_tests {
         tokenizer: SharedTokenizer,
     }
 
+    #[derive(Clone)]
+    struct LivePrefetchDataset {
+        block_size: usize,
+        batch_size: usize,
+        tokenizer: SharedTokenizer,
+        selected_steps: Arc<Mutex<Vec<usize>>>,
+    }
+
     impl TokenSequenceDataset for EpochAwareDataset {
         fn tokenizer(&self) -> SharedTokenizer {
             self.tokenizer.clone()
@@ -1470,6 +1494,70 @@ mod random_loader_tests {
 
         fn train_split_ratio(&self) -> f32 {
             1.0
+        }
+    }
+
+    impl TokenSequenceDataset for LivePrefetchDataset {
+        fn tokenizer(&self) -> SharedTokenizer {
+            self.tokenizer.clone()
+        }
+
+        fn token_count(&self) -> usize {
+            64
+        }
+
+        fn copy_token_range(&self, start: usize, dst: &mut [u32]) {
+            self.copy_token_range_with_epoch(DatasetSplit::Train, 0, start, dst);
+        }
+
+        fn copy_token_range_with_epoch(
+            &self,
+            _split: DatasetSplit,
+            _epoch_index: usize,
+            start: usize,
+            dst: &mut [u32],
+        ) {
+            for (idx, value) in dst.iter_mut().enumerate() {
+                *value = (start + idx) as u32;
+            }
+        }
+
+        fn uses_live_source_selection(&self) -> bool {
+            true
+        }
+
+        fn source_selected_document_indices(
+            &self,
+            _split: DatasetSplit,
+            _epoch_index: usize,
+            absolute_step: usize,
+            batch_size: usize,
+        ) -> Option<Vec<usize>> {
+            self.selected_steps
+                .lock()
+                .expect("selected steps lock")
+                .push(absolute_step);
+            Some(vec![0; batch_size])
+        }
+
+        fn train_len(&self) -> usize {
+            64
+        }
+
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn batch_size(&self) -> usize {
+            self.batch_size
+        }
+
+        fn train_split_ratio(&self) -> f32 {
+            1.0
+        }
+
+        fn preferred_logical_document_tokens(&self, _split: DatasetSplit) -> Option<usize> {
+            Some(self.block_size)
         }
     }
 
@@ -1532,5 +1620,41 @@ mod random_loader_tests {
 
         assert_eq!(first_epoch_batch, vec![0, 1, 2, 3]);
         assert_eq!(resumed_batch, vec![100, 101, 102, 103]);
+    }
+
+    #[test]
+    fn random_loader_prefetches_bounded_live_source_selection_steps() {
+        if live_source_selection_prefetch_depth() == 0 {
+            return;
+        }
+
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::clone(&selected_steps),
+        });
+
+        let loader = RandomDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            8,
+            Some(8),
+        );
+        let mut iter = loader.iter();
+        let steps_after_prime = selected_steps.lock().expect("selected steps lock").clone();
+        assert!(
+            steps_after_prime.contains(&0),
+            "live prefetch should prepare the current absolute step"
+        );
+        assert!(
+            steps_after_prime.iter().any(|step| *step > 0),
+            "live prefetch should prepare at least one bounded future absolute step"
+        );
+
+        let _ = iter.next().expect("prefetched live batch");
     }
 }

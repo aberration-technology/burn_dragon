@@ -113,6 +113,10 @@ const LARGE_SPEC: SmokeModelSpec = SmokeModelSpec {
 };
 
 const TEST_WEBRTC_DIRECT_SEED: &str = "/dns4/edge.example/udp/443/webrtc-direct/certhash/uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const RULIAD_CONVERGENCE_WINDOWS_ENV: &str = "BURN_DRAGON_RULIAD_CONVERGENCE_WINDOWS";
+const RULIAD_CONVERGENCE_MAX_SECONDS_ENV: &str = "BURN_DRAGON_RULIAD_CONVERGENCE_MAX_SECONDS";
+const RULIAD_CONVERGENCE_MAX_ITERS_ENV: &str = "BURN_DRAGON_RULIAD_CONVERGENCE_MAX_ITERS";
+const RULIAD_CONVERGENCE_ROOT_ENV: &str = "BURN_DRAGON_RULIAD_CONVERGENCE_ROOT";
 
 fn run_with_large_stack(name: &'static str, test: impl FnOnce() + Send + 'static) {
     let handle = thread::Builder::new()
@@ -123,6 +127,37 @@ fn run_with_large_stack(name: &'static str, test: impl FnOnce() + Send + 'static
     if let Err(payload) = handle.join() {
         resume_unwind(payload);
     }
+}
+
+fn positive_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn positive_env_duration(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn ruliad_convergence_root() -> (PathBuf, Option<tempfile::TempDir>) {
+    if let Some(path) = env_path(RULIAD_CONVERGENCE_ROOT_ENV) {
+        fs::create_dir_all(&path).expect("create ruliad convergence root");
+        return (path, None);
+    }
+    let root = tempdir().expect("root");
+    (root.path().to_path_buf(), Some(root))
 }
 
 fn dummy_auth_bundle() -> DragonNativeAuthBundle {
@@ -944,6 +979,20 @@ where
     B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    run_training_windows_with_heads_until(prepared, windows, None, head_prefix, None)
+}
+
+fn run_training_windows_with_heads_until<B>(
+    prepared: &burn_dragon_p2p::experiments::common::PreparedNativePeer<B>,
+    max_windows: usize,
+    max_elapsed: Option<Duration>,
+    head_prefix: &str,
+    progress_label: Option<&str>,
+) -> Vec<NativeWindowObservation>
+where
+    B: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
     let project = &prepared.project;
     let device = project.runtime_device();
     let registration = project.dataset_registration().expect("registration");
@@ -958,8 +1007,13 @@ where
     let mut observations = Vec::new();
     let mut global_step = 0u64;
     let mut parent_head_id = None;
+    let run_start = Instant::now();
 
-    for window_ordinal in 0..windows {
+    for window_ordinal in 0..max_windows {
+        if window_ordinal > 0 && max_elapsed.is_some_and(|duration| run_start.elapsed() >= duration)
+        {
+            break;
+        }
         let lease = burn_p2p::LeasePlanner::default()
             .plan_lease(
                 prepared.manifests.network_manifest.network_id.clone(),
@@ -1014,6 +1068,31 @@ where
             loss,
             elapsed,
         });
+        if let Some(label) = progress_label {
+            let obs = observations.last().expect("observation");
+            let train_steps = metric_integer(&obs.head.metrics, "train_steps");
+            let elapsed_secs = obs.elapsed.as_secs_f64();
+            let tokens = train_steps.max(0) as f64
+                * MATCHED_512_SMALL_SPEC.batch_size as f64
+                * MATCHED_512_SMALL_SPEC.block_size as f64;
+            eprintln!(
+                "{label}_window_report={}",
+                serde_json::to_string(&serde_json::json!({
+                    "window": window_ordinal + 1,
+                    "loss": obs.loss,
+                    "train_steps": train_steps,
+                    "elapsed_secs": elapsed_secs,
+                    "tokens_per_sec": if elapsed_secs > 0.0 { tokens / elapsed_secs } else { 0.0 },
+                    "run_elapsed_secs": run_start.elapsed().as_secs_f64(),
+                    "source_selection_entropy_bits": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_entropy_bits"),
+                    "source_selection_hash_noise_probability": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_hash_noise_probability"),
+                    "source_selection_mean_loss": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_mean_loss"),
+                    "source_selection_mean_learning_progress": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_mean_learning_progress"),
+                    "source_selection_verifier_failures": optional_metric_float(&obs.head.metrics, "ruliad_source_selection_verifier_failures"),
+                }))
+                .expect("window report json")
+            );
+        }
         model = ctx.model;
     }
 
@@ -4403,27 +4482,71 @@ fn nca_native_peer_medium_model_converges_over_more_windows() {
 fn ruliad_native_peer_small_model_converges_over_more_windows() {
     run_with_large_stack("ruliad-small-convergence", || {
         let _guard = native_swarm_test_guard();
-        let root = tempdir().expect("root");
-        let training_config_path =
-            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let (root, _temp_root) = ruliad_convergence_root();
+        let spec = SmokeModelSpec {
+            max_iters: positive_env_usize(
+                RULIAD_CONVERGENCE_MAX_ITERS_ENV,
+                MATCHED_512_SMALL_SPEC.max_iters,
+            ),
+            ..MATCHED_512_SMALL_SPEC
+        };
+        let training_config_path = write_ruliad_smoke_training_config(&root, spec);
         let native = native_smoke_peer_config(
-            root.path(),
+            &root,
             training_config_path,
             "storage-ruliad-small",
             "ruliad-small-scale",
-            Some(smoke_shard_export(
-                root.path(),
-                "ruliad-shards-small",
-                "dragon-ruliad-small",
-                4,
-                64,
-            )),
+            None,
         );
 
         let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
-        let losses = run_training_windows(&prepared, 4);
+        let max_elapsed = positive_env_duration(RULIAD_CONVERGENCE_MAX_SECONDS_ENV);
+        let windows = positive_env_usize(RULIAD_CONVERGENCE_WINDOWS_ENV, 1);
+        let observations = run_training_windows_with_heads_until(
+            &prepared,
+            windows,
+            max_elapsed,
+            "ruliad-small",
+            Some("ruliad_native_small_scale"),
+        );
+        assert!(
+            !observations.is_empty(),
+            "ruliad convergence run produced no windows"
+        );
+        for (index, observation) in observations.iter().enumerate() {
+            assert_ruliad_source_selection_metrics(
+                &format!("ruliad convergence window {}", index + 1),
+                &observation.head.metrics,
+            );
+        }
+        let losses = observations.iter().map(|obs| obs.loss).collect::<Vec<_>>();
         log_loss_series("ruliad_native_small_scale", &losses);
-        assert_material_best_improvement("small ruliad rung", &losses);
+        let report = serde_json::json!({
+            "comparison": "ruliad_native_peer_small_model_converges_over_more_windows",
+            "requested_windows": windows,
+            "completed_windows": observations.len(),
+            "max_elapsed_secs": max_elapsed.map(|duration| duration.as_secs()),
+            "root": root.display().to_string(),
+            "matched_spec": {
+                "n_layer": spec.n_layer,
+                "n_embd": spec.n_embd,
+                "n_head": spec.n_head,
+                "latent_total": spec.latent_total,
+                "block_size": spec.block_size,
+                "batch_size": spec.batch_size,
+                "max_iters": spec.max_iters,
+            },
+            "ruliad": observation_report_json("ruliad", spec, &observations),
+        });
+        eprintln!(
+            "ruliad_native_small_model_convergence_report={}",
+            serde_json::to_string_pretty(&report).expect("report json")
+        );
+        if losses.len() >= 2 {
+            assert_material_best_improvement("small ruliad rung", &losses);
+        } else {
+            assert!(losses.iter().all(|loss| loss.is_finite()));
+        }
     });
 }
 

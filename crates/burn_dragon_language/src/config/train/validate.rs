@@ -47,6 +47,32 @@ impl TrainingConfig {
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
+        if self.training.events.flush_every_steps == 0 {
+            return Err(anyhow!("training.events.flush_every_steps must be > 0"));
+        }
+        if self.training.events.source_selection_every_steps == 0 {
+            return Err(anyhow!(
+                "training.events.source_selection_every_steps must be > 0"
+            ));
+        }
+        if self.training.gates.plateau_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.plateau_patience_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.validation_regression_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.validation_regression_patience_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.source_entropy_patience == 0 {
+            return Err(anyhow!(
+                "training.gates.source_entropy_patience must be > 0"
+            ));
+        }
+        if self.training.gates.difficulty_patience == 0 {
+            return Err(anyhow!("training.gates.difficulty_patience must be > 0"));
+        }
         if self.parallel.world_size == 0 {
             return Err(anyhow!("parallel.world_size must be > 0"));
         }

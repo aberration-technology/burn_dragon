@@ -995,20 +995,42 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return None;
         }
         let probe_batch = 1usize;
-        let probe_time = probe_tokens.min(block_size).max(1);
-        let inputs = batch.inputs.slice([0..probe_batch, 0..probe_time]);
+        let generated_tokens = probe_tokens.max(1);
+        let prompt_time = block_size.min(probe_tokens.clamp(1, 32));
+        let device = batch.inputs.device();
+        let inputs = batch.inputs.slice([0..probe_batch, 0..prompt_time]);
         let summary_event_mask = batch
             .summary_event_mask
-            .map(|mask| mask.slice([0..probe_batch, 0..probe_time]));
+            .map(|mask| mask.slice([0..probe_batch, 0..prompt_time]));
         let mut state = self.model.init_state();
-        let hidden = if let Some(mask) = summary_event_mask {
+        let logits = if let Some(mask) = summary_event_mask {
             self.model
-                .forward_hidden_with_state_and_summary_event_mask(inputs, mask, &mut state)
+                .forward_with_state_and_summary_event_mask(inputs, mask, &mut state)
         } else {
-            self.model.forward_hidden_with_state(inputs, &mut state)
+            self.model.forward_with_state(inputs, &mut state)
         };
-        let logits = self.model.logits_from_hidden(hidden);
-        Some(output_degeneracy_from_logits(logits, eos_id)).filter(|stats| stats.token_count > 0)
+        let [_, time, vocab] = logits.shape().dims::<3>();
+        if time == 0 || vocab == 0 {
+            return None;
+        }
+        let mut last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+        let mut accumulator = OutputDegeneracyAccumulator::new(eos_id);
+        for _ in 0..generated_tokens {
+            let Some(step) = output_degeneracy_step_from_logits(last_logits.clone()) else {
+                continue;
+            };
+            accumulator.record(step);
+            let next = step.argmax as i64;
+            let next_tensor =
+                Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
+            let logits = self.model.forward_with_state(next_tensor, &mut state);
+            let [_, time, vocab] = logits.shape().dims::<3>();
+            if time == 0 || vocab == 0 {
+                break;
+            }
+            last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+        }
+        Some(accumulator.finish()).filter(|stats| stats.token_count > 0)
     }
 
     #[cfg(test)]
@@ -1925,74 +1947,131 @@ fn output_degeneracy_from_logits<B: BackendTrait>(
         .convert::<f32>()
         .into_vec::<f32>()
         .expect("validation degeneracy logits vec");
-    let mut token_count = 0usize;
-    let mut entropy_sum = 0.0f64;
-    let mut max_probability_sum = 0.0f64;
-    let mut eos_count = 0usize;
-    let mut repetition_count = 0usize;
-    let mut repetition_denominator = 0usize;
-    let mut unique = HashSet::new();
+    let mut accumulator = OutputDegeneracyAccumulator::new(eos_id);
 
     for b in 0..batch {
-        let mut previous = None;
         for t in 0..time {
             let start = (b * time + t) * vocab;
-            let row = &values[start..start + vocab];
-            let Some((argmax, max_logit)) = row
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(_, value)| value.is_finite())
-                .max_by(|(_, left), (_, right)| {
-                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-                })
-            else {
-                continue;
-            };
-            let mut exp_sum = 0.0f64;
-            let mut weighted_logit_sum = 0.0f64;
-            for value in row.iter().copied().filter(|value| value.is_finite()) {
-                let weight = (value as f64 - max_logit as f64).exp();
-                exp_sum += weight;
-                weighted_logit_sum += weight * value as f64;
+            if let Some(step) = output_degeneracy_step_from_row(&values[start..start + vocab]) {
+                accumulator.record(step);
             }
-            if exp_sum <= 0.0 || !exp_sum.is_finite() {
-                continue;
-            }
-            let logsumexp = max_logit as f64 + exp_sum.ln();
-            let entropy_nats = logsumexp - weighted_logit_sum / exp_sum;
-            entropy_sum += entropy_nats.max(0.0) / std::f64::consts::LN_2;
-            max_probability_sum += 1.0 / exp_sum;
-            if eos_id.is_some_and(|id| id >= 0 && argmax == id as usize) {
-                eos_count = eos_count.saturating_add(1);
-            }
-            if let Some(previous) = previous {
-                repetition_denominator = repetition_denominator.saturating_add(1);
-                if previous == argmax {
-                    repetition_count = repetition_count.saturating_add(1);
-                }
-            }
-            previous = Some(argmax);
-            unique.insert(argmax);
-            token_count = token_count.saturating_add(1);
         }
     }
 
-    if token_count == 0 {
-        return OutputDegeneracyStats::default();
+    accumulator.finish()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputDegeneracyStep {
+    argmax: usize,
+    entropy_bits: f64,
+    max_probability: f64,
+}
+
+#[derive(Debug)]
+struct OutputDegeneracyAccumulator {
+    eos_id: Option<i64>,
+    token_count: usize,
+    entropy_sum: f64,
+    max_probability_sum: f64,
+    eos_count: usize,
+    repetition_count: usize,
+    repetition_denominator: usize,
+    previous: Option<usize>,
+    unique: HashSet<usize>,
+}
+
+impl OutputDegeneracyAccumulator {
+    fn new(eos_id: Option<i64>) -> Self {
+        Self {
+            eos_id,
+            token_count: 0,
+            entropy_sum: 0.0,
+            max_probability_sum: 0.0,
+            eos_count: 0,
+            repetition_count: 0,
+            repetition_denominator: 0,
+            previous: None,
+            unique: HashSet::new(),
+        }
     }
-    OutputDegeneracyStats {
-        token_count,
-        entropy_bits: entropy_sum / token_count as f64,
-        mean_max_probability: max_probability_sum / token_count as f64,
-        argmax_unique_fraction: unique.len() as f64 / token_count as f64,
-        eos_fraction: eos_count as f64 / token_count as f64,
-        repetition_fraction: if repetition_denominator == 0 {
-            0.0
-        } else {
-            repetition_count as f64 / repetition_denominator as f64
-        },
+
+    fn record(&mut self, step: OutputDegeneracyStep) {
+        self.entropy_sum += step.entropy_bits;
+        self.max_probability_sum += step.max_probability;
+        if self
+            .eos_id
+            .is_some_and(|id| id >= 0 && step.argmax == id as usize)
+        {
+            self.eos_count = self.eos_count.saturating_add(1);
+        }
+        if let Some(previous) = self.previous {
+            self.repetition_denominator = self.repetition_denominator.saturating_add(1);
+            if previous == step.argmax {
+                self.repetition_count = self.repetition_count.saturating_add(1);
+            }
+        }
+        self.previous = Some(step.argmax);
+        self.unique.insert(step.argmax);
+        self.token_count = self.token_count.saturating_add(1);
     }
+
+    fn finish(self) -> OutputDegeneracyStats {
+        if self.token_count == 0 {
+            return OutputDegeneracyStats::default();
+        }
+        OutputDegeneracyStats {
+            token_count: self.token_count,
+            entropy_bits: self.entropy_sum / self.token_count as f64,
+            mean_max_probability: self.max_probability_sum / self.token_count as f64,
+            argmax_unique_fraction: self.unique.len() as f64 / self.token_count as f64,
+            eos_fraction: self.eos_count as f64 / self.token_count as f64,
+            repetition_fraction: if self.repetition_denominator == 0 {
+                0.0
+            } else {
+                self.repetition_count as f64 / self.repetition_denominator as f64
+            },
+        }
+    }
+}
+
+fn output_degeneracy_step_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 1>,
+) -> Option<OutputDegeneracyStep> {
+    let values = logits
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("validation free-running degeneracy logits vec");
+    output_degeneracy_step_from_row(&values)
+}
+
+fn output_degeneracy_step_from_row(row: &[f32]) -> Option<OutputDegeneracyStep> {
+    let (argmax, max_logit) = row
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    let mut exp_sum = 0.0f64;
+    let mut weighted_logit_sum = 0.0f64;
+    for value in row.iter().copied().filter(|value| value.is_finite()) {
+        let weight = (value as f64 - max_logit as f64).exp();
+        exp_sum += weight;
+        weighted_logit_sum += weight * value as f64;
+    }
+    if exp_sum <= 0.0 || !exp_sum.is_finite() {
+        return None;
+    }
+    let logsumexp = max_logit as f64 + exp_sum.ln();
+    let entropy_nats = logsumexp - weighted_logit_sum / exp_sum;
+    Some(OutputDegeneracyStep {
+        argmax,
+        entropy_bits: entropy_nats.max(0.0) / std::f64::consts::LN_2,
+        max_probability: 1.0 / exp_sum,
+    })
 }
 
 #[cfg(test)]
@@ -2065,6 +2144,57 @@ mod objective_step_tests {
             .convert::<f32>()
             .into_vec::<f32>()
             .expect("loss vec")[0]
+    }
+
+    #[test]
+    fn output_degeneracy_step_reports_overconfident_argmax() {
+        let step =
+            output_degeneracy_step_from_row(&[12.0, -8.0, -9.0, -10.0]).expect("finite step");
+        assert_eq!(step.argmax, 0);
+        assert!(
+            step.entropy_bits < 0.001,
+            "unexpected entropy: {}",
+            step.entropy_bits
+        );
+        assert!(
+            step.max_probability > 0.999,
+            "unexpected max probability: {}",
+            step.max_probability
+        );
+    }
+
+    #[test]
+    fn output_degeneracy_accumulator_tracks_repetition_and_eos() {
+        let mut accumulator = OutputDegeneracyAccumulator::new(Some(2));
+        for argmax in [2, 2, 3, 3] {
+            accumulator.record(OutputDegeneracyStep {
+                argmax,
+                entropy_bits: 0.25,
+                max_probability: 0.9,
+            });
+        }
+        let stats = accumulator.finish();
+        assert_eq!(stats.token_count, 4);
+        assert_eq!(stats.argmax_unique_fraction, 0.5);
+        assert_eq!(stats.eos_fraction, 0.5);
+        assert!((stats.repetition_fraction - (2.0 / 3.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn validation_degeneracy_probe_rolls_out_generated_tokens() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let (_loss, stats) = model.validation_loss_and_output_degeneracy(batch(&device), 3, None);
+        let stats = stats.expect("free-running degeneracy stats");
+        assert_eq!(stats.token_count, 3);
+        assert!(stats.entropy_bits.is_finite());
+        assert!(stats.mean_max_probability.is_finite());
+        assert!((0.0..=1.0).contains(&stats.argmax_unique_fraction));
+        assert!((0.0..=1.0).contains(&stats.repetition_fraction));
     }
 
     #[test]

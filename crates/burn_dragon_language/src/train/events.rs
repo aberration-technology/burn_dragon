@@ -13,6 +13,7 @@ use burn_ecs::prelude::{
 use crate::config::TrainingHyperparameters;
 use crate::dataset::Dataset;
 
+#[derive(Clone)]
 pub struct RuliadSourceSelectionResource {
     dataset: Arc<Dataset>,
     source_selection_every_steps: usize,
@@ -68,13 +69,10 @@ pub fn build_training_event_handles(
         source_selection_dataset.filter(|dataset| dataset.uses_live_source_selection())
     {
         let source_selection_every_steps = training.events.source_selection_every_steps;
-        event_app = event_app.with_setup(move |app| {
-            app.insert_resource(RuliadSourceSelectionResource::new(
-                Arc::clone(&dataset),
-                source_selection_every_steps,
-            ))
-            .add_plugins(RuliadSourceSelectionTelemetryPlugin);
-        });
+        event_app = event_app.with_plugin(RuliadSourceSelectionTelemetryPlugin::new(
+            dataset,
+            source_selection_every_steps,
+        ));
     }
 
     let event_thread = event_app.spawn_threaded()?;
@@ -86,14 +84,28 @@ pub fn build_training_event_handles(
     })
 }
 
-pub struct RuliadSourceSelectionTelemetryPlugin;
+pub struct RuliadSourceSelectionTelemetryPlugin {
+    source_selection: RuliadSourceSelectionResource,
+}
+
+impl RuliadSourceSelectionTelemetryPlugin {
+    pub fn new(dataset: Arc<Dataset>, source_selection_every_steps: usize) -> Self {
+        Self {
+            source_selection: RuliadSourceSelectionResource::new(
+                dataset,
+                source_selection_every_steps,
+            ),
+        }
+    }
+}
 
 impl Plugin for RuliadSourceSelectionTelemetryPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            record_ruliad_source_selection_from_loss.in_set(TrainingSet::Telemetry),
-        );
+        app.insert_resource(self.source_selection.clone())
+            .add_systems(
+                Update,
+                record_ruliad_source_selection_from_loss.in_set(TrainingSet::Telemetry),
+            );
     }
 }
 

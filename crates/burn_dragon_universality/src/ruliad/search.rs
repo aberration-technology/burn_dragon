@@ -12,6 +12,10 @@ pub struct RuliadSamplerConfig {
     pub target_loss: f32,
     #[serde(default = "default_hash_noise_penalty")]
     pub hash_noise_penalty: f32,
+    #[serde(default = "default_mastery_escape_weight")]
+    pub mastery_escape_weight: f32,
+    #[serde(default = "default_mastery_escape_threshold")]
+    pub mastery_escape_threshold: f32,
 }
 
 impl Default for RuliadSamplerConfig {
@@ -21,6 +25,8 @@ impl Default for RuliadSamplerConfig {
             exploration_floor: default_exploration_floor(),
             target_loss: default_target_loss(),
             hash_noise_penalty: default_hash_noise_penalty(),
+            mastery_escape_weight: default_mastery_escape_weight(),
+            mastery_escape_threshold: default_mastery_escape_threshold(),
         }
     }
 }
@@ -87,11 +93,33 @@ impl RuliadFrontierSampler {
             return Vec::new();
         }
         let temperature = self.config.temperature.max(1e-6);
+        let max_difficulty = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.difficulty_level)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mastered_fraction = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.loss_ema <= self.config.target_loss)
+            .count() as f32
+            / self.candidates.len() as f32;
+        let mastery_pressure = ((mastered_fraction - self.config.mastery_escape_threshold)
+            / (1.0 - self.config.mastery_escape_threshold).max(1e-6))
+        .clamp(0.0, 1.0);
         let logits = self
             .candidates
             .iter()
             .map(|candidate| {
-                candidate.prior.max(1e-9).ln() + candidate.utility(self.config) / temperature
+                let normalized_difficulty =
+                    candidate.difficulty_level as f32 / max_difficulty as f32;
+                let mastery_escape = mastery_pressure
+                    * self.config.mastery_escape_weight.max(0.0)
+                    * normalized_difficulty;
+                candidate.prior.max(1e-9).ln()
+                    + (candidate.utility(self.config) + mastery_escape) / temperature
             })
             .collect::<Vec<_>>();
         let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -167,6 +195,29 @@ impl RuliadFrontierSampler {
                 prob * difficulty_gate(candidate.loss_ema, self.config.target_loss)
             })
             .sum::<f32>();
+        let max_difficulty_level = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.difficulty_level)
+            .max()
+            .unwrap_or(0);
+        let mean_difficulty_level = probs
+            .iter()
+            .zip(&self.candidates)
+            .map(|(prob, candidate)| prob * candidate.difficulty_level as f32)
+            .sum::<f32>();
+        let normalized_difficulty_score = if max_difficulty_level == 0 {
+            0.0
+        } else {
+            mean_difficulty_level / max_difficulty_level as f32
+        };
+        let max_difficulty_probability = probs
+            .iter()
+            .zip(&self.candidates)
+            .filter_map(|(prob, candidate)| {
+                (candidate.difficulty_level == max_difficulty_level).then_some(*prob)
+            })
+            .sum::<f32>();
         let mastered_probability = probs
             .iter()
             .zip(&self.candidates)
@@ -184,6 +235,9 @@ impl RuliadFrontierSampler {
             frontier_loss,
             target_loss: self.config.target_loss,
             target_difficulty_score,
+            mean_difficulty_level,
+            normalized_difficulty_score,
+            max_difficulty_probability,
             mastered_probability,
         }
     }
@@ -217,6 +271,14 @@ fn default_target_loss() -> f32 {
 
 fn default_hash_noise_penalty() -> f32 {
     4.0
+}
+
+fn default_mastery_escape_weight() -> f32 {
+    4.0
+}
+
+fn default_mastery_escape_threshold() -> f32 {
+    0.70
 }
 
 fn default_prior() -> f32 {
@@ -277,6 +339,8 @@ mod tests {
                 exploration_floor: 0.0,
                 target_loss: 2.0,
                 hash_noise_penalty: 4.0,
+                mastery_escape_weight: 0.0,
+                mastery_escape_threshold: 0.70,
             },
             vec![
                 RuliadSamplerCandidate {
@@ -314,5 +378,51 @@ mod tests {
         assert_eq!(snapshot.target_loss, 2.0);
         assert!((snapshot.target_difficulty_score - 0.5).abs() < 0.02);
         assert!((snapshot.mastered_probability - 0.5).abs() < 0.05);
+        assert!((snapshot.mean_difficulty_level - 0.5).abs() < 0.05);
+        assert!((snapshot.normalized_difficulty_score - 0.5).abs() < 0.05);
+        assert!((snapshot.max_difficulty_probability - 0.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn sampler_escapes_mastered_easy_buckets_toward_higher_difficulty() {
+        let candidates = (0..=6)
+            .map(|difficulty_level| RuliadSamplerCandidate {
+                oracle_hash: format!("d{difficulty_level}"),
+                family: "category".to_string(),
+                task_kind: "proof".to_string(),
+                difficulty_level,
+                params_hash: String::new(),
+                prior: 1.0,
+                cost: 1.0,
+                loss_ema: if difficulty_level < 6 { 0.25 } else { 4.0 },
+                previous_loss_ema: if difficulty_level < 6 { 0.30 } else { 4.0 },
+                gradient_alignment: 0.0,
+                is_hash_noise: false,
+            })
+            .collect::<Vec<_>>();
+        let sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                temperature: 1.0,
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                hash_noise_penalty: 4.0,
+                mastery_escape_weight: 4.0,
+                mastery_escape_threshold: 0.70,
+            },
+            candidates,
+        );
+
+        let snapshot = sampler.snapshot();
+
+        assert!(
+            snapshot.normalized_difficulty_score > 0.70,
+            "expected mastery escape to bias toward high difficulty, got {}",
+            snapshot.normalized_difficulty_score
+        );
+        assert!(
+            snapshot.max_difficulty_probability > 0.30,
+            "expected max-difficulty bucket to receive substantial probability, got {}",
+            snapshot.max_difficulty_probability
+        );
     }
 }

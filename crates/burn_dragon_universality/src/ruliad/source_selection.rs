@@ -176,7 +176,7 @@ pub fn plan_epoch_source_buckets(
             probabilities
                 .get(index)
                 .copied()
-                .filter(|value| value.is_finite() && *value > 0.0)
+                .filter(|value| value.is_finite() && *value >= 0.0)
                 .unwrap_or(bucket.prior.max(1e-9))
         })
         .collect::<Vec<_>>();
@@ -192,9 +192,6 @@ pub fn plan_epoch_source_buckets(
         ],
     ));
     let mut selected = Vec::with_capacity(sample_count);
-    if sample_count >= buckets.len() {
-        selected.extend(buckets.iter().map(RuliadSourceBucket::label));
-    }
     while selected.len() < sample_count {
         let index = sample_weighted_index(&weights, &mut rng);
         selected.push(buckets[index].label());
@@ -319,7 +316,7 @@ fn sample_weighted_index(weights: &[f32], rng: &mut SplitMix64) -> usize {
     let mut cumulative = 0.0;
     for (index, weight) in weights.iter().enumerate() {
         cumulative += *weight;
-        if ticket <= cumulative {
+        if *weight > 0.0 && ticket <= cumulative {
             return index;
         }
     }
@@ -377,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn source_plan_is_deterministic_and_covers_active_buckets() {
+    fn source_plan_is_deterministic_and_samples_weighted_active_buckets() {
         let config = config_with_eca_steps(1, 3);
         let buckets = ruliad_source_buckets(&config);
-        let first = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 8, 42, 7, 2);
-        let second = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 8, 42, 7, 2);
+        let first = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 128, 42, 7, 2);
+        let second = plan_epoch_source_buckets(&buckets, &[0.9, 0.1], 128, 42, 7, 2);
         assert_eq!(first, second);
         assert!(
             first
@@ -394,6 +391,20 @@ mod tests {
                 .bucket_ids
                 .iter()
                 .any(|id| id.starts_with("eca:multi_step_state@d0#"))
+        );
+    }
+
+    #[test]
+    fn source_plan_does_not_force_zero_probability_buckets() {
+        let config = config_with_eca_steps(1, 3);
+        let buckets = ruliad_source_buckets(&config);
+        let plan = plan_epoch_source_buckets(&buckets, &[1.0, 0.0], 32, 42, 7, 2);
+        assert!(
+            plan.bucket_ids
+                .iter()
+                .all(|id| id.starts_with("eca:next_state@d0#")),
+            "zero-probability bucket was forced into plan: {:?}",
+            plan.bucket_ids
         );
     }
 

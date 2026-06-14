@@ -19,6 +19,7 @@ use crate::ruliad::tokenize::RuliadByteTokenizer;
 use crate::stats::{ComplexityHistogramBin, SampleStats, build_complexity_histogram};
 
 const DEFAULT_PROBE_SAMPLES: usize = 32;
+const SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct RuliadRuntimeSampleDocument {
@@ -175,24 +176,46 @@ impl OnlineRuliadCorpus {
                 })
             })
             .ok_or_else(|| anyhow!("unknown ruliad source bucket `{bucket_label}`"))?;
-        if self.config.serialization.document_mode == RuliadDocumentMode::MultiChunkProofTree {
-            return self.generate_multi_chunk_document_for_source_bucket(
-                split,
-                epoch_index,
-                sample_index,
-                bucket,
-            );
+        let mut last_error = None;
+        for retry in 0..SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT {
+            let candidate_sample_index = source_bucket_retry_sample_index(sample_index, retry);
+            let result = if self.config.serialization.document_mode
+                == RuliadDocumentMode::MultiChunkProofTree
+            {
+                self.generate_multi_chunk_document_for_source_bucket(
+                    split,
+                    epoch_index,
+                    candidate_sample_index,
+                    bucket,
+                )
+            } else {
+                let sample = generate_sample_for_source_bucket(
+                    &self.config,
+                    self.proof_tasks.as_slice(),
+                    split,
+                    epoch_index,
+                    candidate_sample_index,
+                    bucket,
+                )?;
+                let text = sample.text.clone();
+                self.document_from_sample_text(split, candidate_sample_index, sample, text)
+            };
+            match result {
+                Ok(mut document) => {
+                    document.sample_index = sample_index;
+                    return Ok(document);
+                }
+                Err(error) if is_document_payload_capacity_error(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let sample = generate_sample_for_source_bucket(
-            &self.config,
-            self.proof_tasks.as_slice(),
-            split,
-            epoch_index,
-            sample_index,
-            bucket,
-        )?;
-        let text = sample.text.clone();
-        self.document_from_sample_text(split, sample_index, sample, text)
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "failed to generate source bucket `{bucket_label}` within document payload capacity"
+            )
+        }))
     }
 
     pub fn generate_document_tokens(
@@ -388,6 +411,18 @@ impl OnlineRuliadCorpus {
     }
 }
 
+fn source_bucket_retry_sample_index(sample_index: usize, retry: usize) -> usize {
+    sample_index.saturating_add(retry.saturating_mul(1_000_003))
+}
+
+fn is_document_payload_capacity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("exceeds document payload capacity")
+    })
+}
+
 pub fn fixed_ruliad_document_token_count(config: &RuliadCorpusConfig) -> Result<usize> {
     if config.serialization.document_tokens <= 1 {
         return Err(anyhow!("ruliad document token count must be > 1"));
@@ -462,7 +497,7 @@ mod tests {
     use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
         RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
-        RuliadTokenizationConfig, default_ruliad_families,
+        RuliadSourceSelectionConfig, RuliadTokenizationConfig, default_ruliad_families,
     };
 
     fn config() -> RuliadCorpusConfig {
@@ -564,6 +599,40 @@ mod tests {
             assert!(doc.serialized_preview.len() <= payload_capacity);
             assert!(doc.serialized_preview.contains("[RTREE"));
         }
+    }
+
+    #[test]
+    fn source_bucket_generation_retries_overlong_far_out_draws() {
+        let mut config = config();
+        config.seed = 1337;
+        config.train_samples = 256;
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 4, max: 8 };
+        config.source_selection = RuliadSourceSelectionConfig {
+            enabled: true,
+            difficulty_levels: UsizeRangeConfig { min: 18, max: 18 },
+            ..RuliadSourceSelectionConfig::default()
+        };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::Automaton,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 3, max: 8 }),
+            steps: Some(UsizeRangeConfig { min: 6, max: 20 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+        let bucket = corpus
+            .source_buckets()
+            .iter()
+            .find(|bucket| bucket.id.difficulty_level == 18)
+            .expect("automaton bucket")
+            .label();
+        let doc = corpus
+            .generate_document_for_source_bucket(SampleSplit::Train, 0, 27, &bucket)
+            .expect("source-selected document retries overlong draw");
+        assert_eq!(doc.tokens.len(), 4104);
+        assert_eq!(doc.sample_index, 27);
+        assert_eq!(doc.family, "automaton");
+        assert_eq!(doc.task_kind, "evaluate_automaton");
     }
 
     #[test]

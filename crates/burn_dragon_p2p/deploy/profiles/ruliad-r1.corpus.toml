@@ -8,7 +8,7 @@ proof_tasks = "crates/burn_dragon_universality/data/ruliad_seed/proof_tasks.json
 lean_task_limit = 128
 
 [serialization]
-document_tokens = 513
+document_tokens = 1024
 preview_samples = 4
 document_mode = "multi_chunk_proof_tree"
 document_chunks = { min = 4, max = 8 }
@@ -20,7 +20,12 @@ eos_id = 50256
 
 [source_selection]
 enabled = true
-difficulty_levels = { min = 0, max = 6 }
+difficulty_levels = { min = 0, max = 24 }
+
+[source_selection.sampler]
+exploration_floor = 0.005
+mastery_escape_weight = 4.0
+mastery_escape_threshold = 0.70
 
 [[families]]
 kind = "eca"

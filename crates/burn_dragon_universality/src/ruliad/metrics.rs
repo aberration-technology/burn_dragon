@@ -31,6 +31,12 @@ pub struct RuliadMetricSnapshot {
     #[serde(default)]
     pub target_difficulty_score: f32,
     #[serde(default)]
+    pub mean_difficulty_level: f32,
+    #[serde(default)]
+    pub normalized_difficulty_score: f32,
+    #[serde(default)]
+    pub max_difficulty_probability: f32,
+    #[serde(default)]
     pub mastered_probability: f32,
 }
 

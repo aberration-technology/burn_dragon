@@ -1,3 +1,4 @@
+use crate::dataset::scheduler::TokenSequenceDataset;
 use crate::train::prelude::*;
 use crate::train::utils::log_theoretical_profile;
 #[cfg(feature = "ddp")]
@@ -1001,6 +1002,11 @@ fn emit_output_degeneracy<B>(
         argmax_unique_fraction: stats.argmax_unique_fraction,
         eos_fraction: stats.eos_fraction,
         repetition_fraction: stats.repetition_fraction,
+        distinct_1_fraction: stats.distinct_1_fraction,
+        distinct_2_fraction: stats.distinct_2_fraction,
+        period_2_fraction: stats.period_2_fraction,
+        period_3_fraction: stats.period_3_fraction,
+        generated_preview: decode_degeneracy_preview(env.source_selection_dataset.as_ref(), stats),
     });
     for (name, value) in [
         ("Output Entropy Bits", stats.entropy_bits),
@@ -1011,6 +1017,10 @@ fn emit_output_degeneracy<B>(
         ),
         ("Output EOS Fraction", stats.eos_fraction),
         ("Output Repetition Fraction", stats.repetition_fraction),
+        ("Output Distinct-1 Fraction", stats.distinct_1_fraction),
+        ("Output Distinct-2 Fraction", stats.distinct_2_fraction),
+        ("Output Period-2 Fraction", stats.period_2_fraction),
+        ("Output Period-3 Fraction", stats.period_3_fraction),
     ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: env.run_name.to_string(),
@@ -1023,6 +1033,32 @@ fn emit_output_degeneracy<B>(
             running_value: value,
         });
     }
+}
+
+fn decode_degeneracy_preview(
+    dataset: Option<&Arc<Dataset>>,
+    stats: &crate::train::steps::OutputDegeneracyStats,
+) -> Option<String> {
+    if stats.generated_tokens.is_empty() {
+        return None;
+    }
+    let preview_tokens = stats
+        .generated_tokens
+        .iter()
+        .copied()
+        .take(160)
+        .collect::<Vec<_>>();
+    let preview = dataset
+        .map(|dataset| dataset.decode(&preview_tokens))
+        .filter(|preview| !preview.trim().is_empty())
+        .unwrap_or_else(|| {
+            preview_tokens
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    Some(preview.chars().take(2_000).collect())
 }
 
 fn emit_continual_backprop_telemetry<B>(
@@ -1065,6 +1101,9 @@ fn emit_continual_backprop_telemetry<B>(
         utility_max: telemetry.utility_max as f64,
         age_mean: telemetry.age_mean as f64,
         age_max: telemetry.age_max as f64,
+        batch_stat_samples: telemetry.batch_stat_samples,
+        activation_abs_mean: telemetry.activation_abs_mean as f64,
+        zero_utility_fraction: telemetry.zero_utility_fraction as f64,
     });
 }
 

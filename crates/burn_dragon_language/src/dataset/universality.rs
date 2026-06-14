@@ -22,6 +22,7 @@ use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
 const DEFAULT_RUNTIME_CHUNK_CACHE_LIMIT: usize = 8;
 const DEFAULT_RUNTIME_DOCUMENT_CACHE_LIMIT: usize = 64;
 const DEFAULT_RUNTIME_GENERATION_WORKER_LIMIT: usize = 32;
+const DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP: usize = 4;
 const SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG: u8 = 2;
 
 #[derive(Clone)]
@@ -252,13 +253,59 @@ impl LiveSourceSelectionState {
         self.choose_bucket_for_step_inner(available, epoch_index, absolute_step, true)
     }
 
-    fn choose_bucket_for_validation_step(
+    fn choose_bucket_label_for_step(
         &self,
-        available: &HashMap<String, Vec<usize>>,
         epoch_index: usize,
         absolute_step: usize,
     ) -> Option<String> {
-        self.choose_bucket_for_step_inner(available, epoch_index, absolute_step, false)
+        self.choose_bucket_label_for_step_inner(epoch_index, absolute_step, true)
+    }
+
+    fn choose_bucket_label_for_validation_step(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> Option<String> {
+        self.choose_bucket_label_for_step_inner(epoch_index, absolute_step, false)
+    }
+
+    fn choose_bucket_label_for_step_inner(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        record_pending: bool,
+    ) -> Option<String> {
+        let probs = self.probabilities();
+        let mut weighted = Vec::new();
+        for (index, label) in self.bucket_labels.iter().enumerate() {
+            let weight = probs
+                .get(index)
+                .copied()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(1e-9);
+            weighted.push((label.clone(), weight));
+        }
+        if weighted.is_empty() {
+            return None;
+        }
+        let total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+            epoch_index,
+            absolute_step,
+            weighted.len(),
+        ));
+        let ticket = rng.r#gen::<f32>() * total.max(1e-12);
+        let mut cumulative = 0.0;
+        for (label, weight) in weighted {
+            cumulative += weight;
+            if ticket <= cumulative {
+                if record_pending {
+                    self.record_pending(absolute_step, &label);
+                }
+                return Some(label);
+            }
+        }
+        None
     }
 
     fn choose_bucket_for_step_inner(
@@ -887,6 +934,27 @@ impl TokenSequenceDataset for UniversalityDataset {
         }
     }
 
+    fn source_selected_token_windows(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        match (split, &self.storage) {
+            (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_token_windows(
+                    burn_dragon_universality::SampleSplit::Train,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
+                    block_size,
+                ),
+            _ => None,
+        }
+    }
+
     fn record_source_selection_loss(
         &self,
         absolute_step: usize,
@@ -994,6 +1062,9 @@ impl OnTheFlyStorage {
         absolute_step: usize,
         batch_size: usize,
     ) -> Option<Vec<usize>> {
+        if self.source_selection.is_some() {
+            return None;
+        }
         if split != burn_dragon_universality::SampleSplit::Train {
             return None;
         }
@@ -1023,6 +1094,38 @@ impl OnTheFlyStorage {
         )
     }
 
+    fn source_selected_token_windows(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        if split != burn_dragon_universality::SampleSplit::Train {
+            return None;
+        }
+        let source_selection = self.source_selection.as_ref()?;
+        let bucket_label =
+            source_selection.choose_bucket_label_for_step(epoch_index, absolute_step)?;
+        let document_count = live_source_selection_documents_per_step(batch_size);
+        let documents = self.generate_source_bucket_documents(
+            split,
+            epoch_index,
+            absolute_step,
+            &bucket_label,
+            document_count,
+        );
+        Some(source_selected_windows_from_documents(
+            &documents,
+            epoch_index,
+            absolute_step,
+            &bucket_label,
+            batch_size,
+            block_size,
+        ))
+    }
+
     fn source_weighted_validation_documents(
         &self,
         epoch_index: usize,
@@ -1030,41 +1133,28 @@ impl OnTheFlyStorage {
         batch_size: usize,
     ) -> Option<Vec<Arc<Vec<u32>>>> {
         let source_selection = self.source_selection.as_ref()?;
-        let epoch = self.source_weighted_validation_epoch_documents(epoch_index);
-        if epoch.documents_by_bucket.is_empty() {
-            return None;
-        }
-        let bucket_label = source_selection.choose_bucket_for_validation_step(
-            &epoch.documents_by_bucket,
+        let bucket_label =
+            source_selection.choose_bucket_label_for_validation_step(epoch_index, absolute_step)?;
+        Some(self.generate_source_bucket_documents(
+            burn_dragon_universality::SampleSplit::Validation,
             epoch_index,
             absolute_step,
-        )?;
-        let documents = epoch.documents_by_bucket.get(&bucket_label)?;
-        if documents.is_empty() {
-            return None;
-        }
-        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
-            epoch_index,
-            absolute_step,
-            source_label_seed(&bucket_label) as usize
-                ^ SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG as usize,
-        ));
-        Some(
-            (0..batch_size)
-                .filter_map(|_| {
-                    let sample_index = documents[rng.gen_range(0..documents.len())];
-                    epoch.documents.get(sample_index).map(Arc::clone)
-                })
-                .collect(),
-        )
-        .filter(|selected: &Vec<Arc<Vec<u32>>>| selected.len() == batch_size)
+            &bucket_label,
+            batch_size.max(1),
+        ))
     }
 
     fn prepare_epoch(&self, split: burn_dragon_universality::SampleSplit, epoch_index: usize) {
+        if self.source_selection.is_some() {
+            return;
+        }
         let _ = self.epoch_documents(split, epoch_index);
     }
 
     fn prefetch_epoch(&self, split: burn_dragon_universality::SampleSplit, epoch_index: usize) {
+        if self.source_selection.is_some() {
+            return;
+        }
         let key = RuntimeEpochKey {
             split_tag: split_tag(split),
             epoch_index,
@@ -1130,41 +1220,45 @@ impl OnTheFlyStorage {
         }
     }
 
-    fn source_weighted_validation_epoch_documents(
+    fn generate_source_bucket_documents(
         &self,
+        split: burn_dragon_universality::SampleSplit,
         epoch_index: usize,
-    ) -> Arc<GeneratedEpochDocuments> {
-        let key = RuntimeEpochKey {
-            split_tag: SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG,
-            epoch_index,
-        };
-        loop {
-            let mut cache = self
-                .cache
-                .inner
-                .lock()
-                .expect("universality runtime cache poisoned");
-            cache.tick = cache.tick.wrapping_add(1);
-            let tick = cache.tick;
-            if let Some(entry) = cache.entries.get_mut(&key) {
-                entry.last_used_tick = tick;
-                return Arc::clone(&entry.documents);
-            }
-            if cache.building.insert(key) {
-                drop(cache);
-                return self.build_and_store_epoch(
-                    key,
-                    burn_dragon_universality::SampleSplit::Validation,
-                    epoch_index,
-                    true,
-                );
-            }
-            let _unused = self
-                .cache
-                .ready
-                .wait(cache)
-                .expect("universality runtime cache poisoned");
+        absolute_step: usize,
+        bucket_label: &str,
+        document_count: usize,
+    ) -> Vec<Arc<Vec<u32>>> {
+        let sample_count = match split {
+            burn_dragon_universality::SampleSplit::Train => self.corpus.train_samples(),
+            burn_dragon_universality::SampleSplit::Validation => self.corpus.validation_samples(),
         }
+        .max(1);
+        (0..document_count.max(1))
+            .map(|document_rank| {
+                let sample_index = live_source_selection_sample_index(
+                    sample_count,
+                    split,
+                    epoch_index,
+                    absolute_step,
+                    bucket_label,
+                    document_rank,
+                );
+                Arc::new(
+                    self.corpus
+                        .generate_document_tokens_for_source_bucket(
+                            split,
+                            epoch_index,
+                            sample_index,
+                            bucket_label,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "failed to generate live source-selected universality sample split={split:?} epoch_index={epoch_index} absolute_step={absolute_step} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                            )
+                        }),
+                )
+            })
+            .collect()
     }
 
     fn build_and_store_epoch(
@@ -1382,6 +1476,16 @@ fn live_source_selection_pending_limit() -> usize {
         .unwrap_or(4096)
 }
 
+fn live_source_selection_documents_per_step(batch_size: usize) -> usize {
+    std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP)
+        .min(batch_size.max(1))
+        .max(1)
+}
+
 fn source_selection_step_seed(epoch_index: usize, absolute_step: usize, salt: usize) -> u64 {
     0x8B8B_4D1A_51E5_E1ECu64
         ^ (epoch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -1396,6 +1500,66 @@ fn source_label_seed(label: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
     }
     hash
+}
+
+fn live_source_selection_sample_index(
+    sample_count: usize,
+    split: burn_dragon_universality::SampleSplit,
+    epoch_index: usize,
+    absolute_step: usize,
+    bucket_label: &str,
+    document_rank: usize,
+) -> usize {
+    let sample_count = sample_count.max(1);
+    let split_salt = match split {
+        burn_dragon_universality::SampleSplit::Train => split_tag(split) as usize,
+        burn_dragon_universality::SampleSplit::Validation => {
+            SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG as usize
+        }
+    };
+    let seed = source_selection_step_seed(
+        epoch_index,
+        absolute_step,
+        source_label_seed(bucket_label) as usize
+            ^ document_rank.rotate_left(7)
+            ^ split_salt.rotate_left(17),
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    rng.gen_range(0..sample_count)
+}
+
+fn source_selected_windows_from_documents(
+    documents: &[Arc<Vec<u32>>],
+    epoch_index: usize,
+    absolute_step: usize,
+    bucket_label: &str,
+    batch_size: usize,
+    block_size: usize,
+) -> Vec<Vec<u32>> {
+    let document_count = documents.len().max(1);
+    (0..batch_size)
+        .map(|batch_index| {
+            let document = documents
+                .get(batch_index % document_count)
+                .expect("source-selected document set must be non-empty");
+            assert!(
+                document.len() > block_size,
+                "source-selected document must include block_size + 1 tokens"
+            );
+            let max_start = document.len().saturating_sub(block_size + 1);
+            let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+                epoch_index,
+                absolute_step,
+                source_label_seed(bucket_label) as usize ^ batch_index.rotate_left(11),
+            ));
+            let start = if max_start == 0 {
+                0
+            } else {
+                rng.gen_range(0..=max_start)
+            };
+            document[start..start + block_size + 1].to_vec()
+        })
+        .collect()
 }
 
 impl ChunkedTokens {
@@ -1926,18 +2090,34 @@ mod tests {
             UniversalityStorage::OnTheFly(storage) => storage,
             UniversalityStorage::Manifest(_) => panic!("expected on-the-fly storage"),
         };
-        let indices = storage
-            .source_selected_document_indices(burn_dragon_universality::SampleSplit::Train, 0, 0, 2)
-            .expect("source-selected indices");
-        assert_eq!(indices.len(), 2);
-        let epoch = storage.epoch_documents(burn_dragon_universality::SampleSplit::Train, 0);
+        dataset.prepare_epoch(DatasetSplit::Train, 0);
+        dataset.prefetch_epoch(DatasetSplit::Train, 1);
+        let windows = storage
+            .source_selected_token_windows(
+                burn_dragon_universality::SampleSplit::Train,
+                0,
+                0,
+                2,
+                32,
+            )
+            .expect("source-selected token windows");
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|window| window.len() == 33));
         assert!(
-            epoch
-                .documents_by_bucket
-                .values()
-                .any(|bucket_indices| indices.iter().all(|index| bucket_indices.contains(index))),
-            "batch document indices should come from one source bucket"
+            windows.iter().flatten().any(|token| *token != 0),
+            "source-selected windows should contain generated content"
         );
+        {
+            let cache = storage.cache.inner.lock().expect("runtime cache lock");
+            assert!(
+                cache.entries.is_empty(),
+                "live source-selected training must not materialize full epoch caches"
+            );
+            assert!(
+                cache.building.is_empty(),
+                "live source-selected training must not leave background epoch builds"
+            );
+        }
         assert!(
             storage
                 .source_selected_document_indices(
@@ -2001,6 +2181,13 @@ mod tests {
             UniversalityStorage::OnTheFly(storage) => storage,
             UniversalityStorage::Manifest(_) => panic!("expected on-the-fly storage"),
         };
+        {
+            let cache = storage.cache.inner.lock().expect("runtime cache lock");
+            assert!(
+                cache.entries.is_empty(),
+                "source-weighted validation must not materialize full epoch caches"
+            );
+        }
         assert!(
             storage
                 .source_selected_document_indices(

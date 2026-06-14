@@ -68,6 +68,19 @@ pub trait TokenSequenceDataset: Send + Sync {
         None
     }
 
+    /// Return concrete source-selected token windows for a batch, if the dataset can generate
+    /// them without mapping through global document indices.
+    fn source_selected_token_windows(
+        &self,
+        _split: DatasetSplit,
+        _epoch_index: usize,
+        _absolute_step: usize,
+        _batch_size: usize,
+        _block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        None
+    }
+
     /// Feed aggregate loss telemetry for a previously selected source bucket.
     fn record_source_selection_loss(
         &self,
@@ -179,7 +192,29 @@ where
     #[cfg(not(feature = "train"))]
     let mut sample = vec![0u32; block_size + 1];
 
-    if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
+    if let Some(source_windows) = dataset.source_selected_token_windows(
+        split,
+        epoch_index,
+        absolute_step,
+        batch_size,
+        block_size,
+    ) {
+        assert_eq!(
+            source_windows.len(),
+            batch_size,
+            "source-selected token windows must match batch size"
+        );
+        for (batch_idx, window) in source_windows.iter().take(batch_size).enumerate() {
+            assert!(
+                window.len() > block_size,
+                "source-selected token window must include block_size + 1 tokens"
+            );
+            for t in 0..block_size {
+                inputs[batch_idx * block_size + t] = window[t] as i64;
+                targets[batch_idx * block_size + t] = window[t + 1] as i64;
+            }
+        }
+    } else if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
         let num_documents = (span / document_span).max(1);
         let source_selected_documents =
@@ -353,9 +388,12 @@ impl RandomPrefetch {
     ) -> Self {
         let worker_count = workers.max(1);
         let current_epoch = absolute_step_start / steps_per_epoch.max(1);
-        dataset.prepare_epoch(split, current_epoch);
-        dataset.prefetch_epoch(split, current_epoch.saturating_add(1));
-        dataset.prefetch_epoch(split, current_epoch.saturating_add(2));
+        let uses_live_source_selection = dataset.uses_live_source_selection();
+        if !uses_live_source_selection {
+            dataset.prepare_epoch(split, current_epoch);
+            dataset.prefetch_epoch(split, current_epoch.saturating_add(1));
+            dataset.prefetch_epoch(split, current_epoch.saturating_add(2));
+        }
         let (sender, receiver) =
             sync_channel::<(usize, HostSequenceBatch)>(depth.max(worker_count));
         let next_task = Arc::new(AtomicUsize::new(absolute_step_start));
@@ -373,7 +411,9 @@ impl RandomPrefetch {
                         break;
                     }
                     let epoch_index = task_index / steps_per_epoch.max(1);
-                    dataset.prefetch_epoch(split, epoch_index.saturating_add(1));
+                    if !uses_live_source_selection {
+                        dataset.prefetch_epoch(split, epoch_index.saturating_add(1));
+                    }
                     let batch = sample_host_batch_with_shape(
                         dataset.as_ref(),
                         split,

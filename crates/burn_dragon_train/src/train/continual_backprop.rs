@@ -32,6 +32,9 @@ pub struct ContinualBackpropTelemetry {
     pub utility_max: f32,
     pub age_mean: f32,
     pub age_max: f32,
+    pub batch_stat_samples: usize,
+    pub activation_abs_mean: f32,
+    pub zero_utility_fraction: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -57,6 +60,9 @@ where
     fn take_batch_stats(module: &M) -> Option<Self::BatchStats>;
     fn batch_stats_mean(batch_stats: &Self::BatchStats) -> Vec<f32>;
     fn batch_stats_mean_abs(batch_stats: &Self::BatchStats) -> Vec<f32>;
+    fn batch_stats_sample_count(_batch_stats: &Self::BatchStats) -> usize {
+        1
+    }
     fn feature_count(module: &M) -> usize;
     fn device(module: &M) -> B::Device;
     fn target_lr_scale(module: &M) -> f32;
@@ -192,6 +198,8 @@ struct ContinualBackpropState<B: BackendTrait> {
     age: Tensor<B, 1>,
     avg_activation: Tensor<B, 1>,
     avg_abs_activation: Tensor<B, 1>,
+    batch_stat_samples: usize,
+    activation_abs_mean: f32,
 }
 
 #[derive(burn::record::Record, Clone)]
@@ -348,6 +356,8 @@ where
             age: Tensor::<B, 1>::zeros([feature_count], &device),
             avg_activation: Tensor::<B, 1>::zeros([feature_count], &device),
             avg_abs_activation: Tensor::<B, 1>::zeros([feature_count], &device),
+            batch_stat_samples: 0,
+            activation_abs_mean: 0.0,
         });
         state.step = state.step.saturating_add(1);
         state.age = state.age.add_scalar(1.0);
@@ -411,6 +421,10 @@ where
         if mean.len() != feature_count || mean_abs.len() != feature_count {
             return state;
         }
+        state.batch_stat_samples = state
+            .batch_stat_samples
+            .saturating_add(A::batch_stats_sample_count(&batch_stats));
+        state.activation_abs_mean = mean_f32(&mean_abs);
         let keep = self.config.utility_decay;
         let update = 1.0 - keep;
         let mean_tensor = Tensor::<B, 1>::from_data(TensorData::new(mean, [feature_count]), device);
@@ -476,6 +490,9 @@ where
             utility_max: 0.0,
             age_mean: mean_f32(&age),
             age_max: max_f32(&age),
+            batch_stat_samples: state.batch_stat_samples,
+            activation_abs_mean: state.activation_abs_mean,
+            zero_utility_fraction: 0.0,
         };
 
         let paused_reason = if state.step <= self.config.warmup_steps {
@@ -516,9 +533,8 @@ where
                     && *idx < metrics.outgoing_l1.len()
             })
             .map(|idx| {
-                let centered = (avg_abs[idx] - avg[idx].abs()).max(0.0);
-                let score =
-                    centered * metrics.outgoing_l1[idx] / metrics.incoming_l1[idx].max(epsilon);
+                let score = avg_abs[idx].max(0.0) * metrics.outgoing_l1[idx]
+                    / metrics.incoming_l1[idx].max(epsilon);
                 (idx, score)
             })
             .collect::<Vec<_>>();
@@ -526,6 +542,15 @@ where
         telemetry.utility_min = min_f32(&utility_values);
         telemetry.utility_mean = mean_f32(&utility_values);
         telemetry.utility_max = max_f32(&utility_values);
+        telemetry.zero_utility_fraction = if utility_values.is_empty() {
+            0.0
+        } else {
+            utility_values
+                .iter()
+                .filter(|value| **value <= epsilon)
+                .count() as f32
+                / utility_values.len() as f32
+        };
         let n_replace = (state.replacement_budget.floor() as usize)
             .min(self.config.max_replacements_per_interval);
         if n_replace == 0 {
@@ -1072,6 +1097,7 @@ mod tests {
     struct TestBatchStats {
         mean: Vec<f32>,
         mean_abs: Vec<f32>,
+        samples: usize,
     }
 
     #[derive(Module, Debug)]
@@ -1112,6 +1138,10 @@ mod tests {
 
         fn batch_stats_mean_abs(batch_stats: &Self::BatchStats) -> Vec<f32> {
             batch_stats.mean_abs.clone()
+        }
+
+        fn batch_stats_sample_count(batch_stats: &Self::BatchStats) -> usize {
+            batch_stats.samples
         }
 
         fn feature_count(_module: &TestModule<TestBackend>) -> usize {
@@ -1173,6 +1203,8 @@ mod tests {
                 TensorData::new(vec![1.0, 2.0], [2]),
                 &device,
             ),
+            batch_stat_samples: 0,
+            activation_abs_mean: 1.5,
         }
     }
 
@@ -1243,5 +1275,32 @@ mod tests {
         assert_eq!(telemetry.utility_min, 1.0);
         assert_eq!(telemetry.utility_mean, 1.5);
         assert_eq!(telemetry.utility_max, 2.0);
+        assert_eq!(telemetry.activation_abs_mean, 1.5);
+        assert_eq!(telemetry.zero_utility_fraction, 0.0);
+    }
+
+    #[test]
+    fn utility_uses_mean_absolute_activation_for_relu_stats() {
+        let config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 0,
+            maturity_steps: 1,
+            cooldown_steps: 0,
+            replacement_rate: 0.0,
+            ..ContinualBackpropConfig::default()
+        };
+        let mut optimizer = test_optimizer(config);
+        let mut state = test_state(2048, 0.0);
+        state.avg_activation = Tensor::<TestBackend, 1>::from_data(
+            TensorData::new(vec![1.0, 2.0], [2]),
+            &burn::tensor::Device::<TestBackend>::default(),
+        );
+        let module = test_module();
+
+        let (_, telemetry) = optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert_eq!(telemetry.utility_min, 1.0);
+        assert_eq!(telemetry.utility_max, 2.0);
+        assert_eq!(telemetry.zero_utility_fraction, 0.0);
     }
 }

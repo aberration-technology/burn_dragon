@@ -635,6 +635,11 @@ pub(crate) struct OutputDegeneracyStats {
     pub argmax_unique_fraction: f64,
     pub eos_fraction: f64,
     pub repetition_fraction: f64,
+    pub distinct_1_fraction: f64,
+    pub distinct_2_fraction: f64,
+    pub period_2_fraction: f64,
+    pub period_3_fraction: f64,
+    pub generated_tokens: Vec<i64>,
 }
 
 struct ObjectiveScoreBatch<B: BackendTrait> {
@@ -1021,6 +1026,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             };
             accumulator.record(step);
             let next = step.argmax as i64;
+            accumulator.record_generated_token(next);
             let next_tensor =
                 Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
             let logits = self.model.forward_with_state(next_tensor, &mut state);
@@ -1979,6 +1985,7 @@ struct OutputDegeneracyAccumulator {
     repetition_denominator: usize,
     previous: Option<usize>,
     unique: HashSet<usize>,
+    generated_tokens: Vec<i64>,
 }
 
 impl OutputDegeneracyAccumulator {
@@ -1993,6 +2000,7 @@ impl OutputDegeneracyAccumulator {
             repetition_denominator: 0,
             previous: None,
             unique: HashSet::new(),
+            generated_tokens: Vec::new(),
         }
     }
 
@@ -2016,10 +2024,18 @@ impl OutputDegeneracyAccumulator {
         self.token_count = self.token_count.saturating_add(1);
     }
 
+    fn record_generated_token(&mut self, token: i64) {
+        self.generated_tokens.push(token);
+    }
+
     fn finish(self) -> OutputDegeneracyStats {
         if self.token_count == 0 {
             return OutputDegeneracyStats::default();
         }
+        let distinct_1_fraction = distinct_n_fraction(&self.generated_tokens, 1);
+        let distinct_2_fraction = distinct_n_fraction(&self.generated_tokens, 2);
+        let period_2_fraction = period_fraction(&self.generated_tokens, 2);
+        let period_3_fraction = period_fraction(&self.generated_tokens, 3);
         OutputDegeneracyStats {
             token_count: self.token_count,
             entropy_bits: self.entropy_sum / self.token_count as f64,
@@ -2031,8 +2047,36 @@ impl OutputDegeneracyAccumulator {
             } else {
                 self.repetition_count as f64 / self.repetition_denominator as f64
             },
+            distinct_1_fraction,
+            distinct_2_fraction,
+            period_2_fraction,
+            period_3_fraction,
+            generated_tokens: self.generated_tokens,
         }
     }
+}
+
+fn distinct_n_fraction(tokens: &[i64], n: usize) -> f64 {
+    if n == 0 || tokens.len() < n {
+        return 0.0;
+    }
+    let total = tokens.len() + 1 - n;
+    let distinct = tokens
+        .windows(n)
+        .map(|window| window.to_vec())
+        .collect::<HashSet<_>>()
+        .len();
+    distinct as f64 / total as f64
+}
+
+fn period_fraction(tokens: &[i64], period: usize) -> f64 {
+    if period == 0 || tokens.len() <= period {
+        return 0.0;
+    }
+    let matches = (period..tokens.len())
+        .filter(|idx| tokens[*idx] == tokens[*idx - period])
+        .count();
+    matches as f64 / (tokens.len() - period) as f64
 }
 
 fn output_degeneracy_step_from_logits<B: BackendTrait>(
@@ -2172,12 +2216,16 @@ mod objective_step_tests {
                 entropy_bits: 0.25,
                 max_probability: 0.9,
             });
+            accumulator.record_generated_token(argmax as i64);
         }
         let stats = accumulator.finish();
         assert_eq!(stats.token_count, 4);
         assert_eq!(stats.argmax_unique_fraction, 0.5);
         assert_eq!(stats.eos_fraction, 0.5);
         assert!((stats.repetition_fraction - (2.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(stats.distinct_1_fraction, 0.5);
+        assert_eq!(stats.distinct_2_fraction, 1.0);
+        assert_eq!(stats.period_2_fraction, 0.0);
     }
 
     #[test]
@@ -2195,6 +2243,11 @@ mod objective_step_tests {
         assert!(stats.mean_max_probability.is_finite());
         assert!((0.0..=1.0).contains(&stats.argmax_unique_fraction));
         assert!((0.0..=1.0).contains(&stats.repetition_fraction));
+        assert_eq!(stats.generated_tokens.len(), 3);
+        assert!((0.0..=1.0).contains(&stats.distinct_1_fraction));
+        assert!((0.0..=1.0).contains(&stats.distinct_2_fraction));
+        assert!((0.0..=1.0).contains(&stats.period_2_fraction));
+        assert!((0.0..=1.0).contains(&stats.period_3_fraction));
     }
 
     #[test]

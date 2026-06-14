@@ -36,7 +36,6 @@ pub(crate) use burn::tensor::{Int, Tensor, TensorData};
 pub(crate) use burn_collective::{
     PeerId, ReduceOperation, all_reduce, broadcast, finish_collective, register,
 };
-#[cfg(feature = "ddp")]
 pub(crate) use burn_train::checkpoint::{Checkpointer, FileCheckpointer};
 pub(crate) use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossMetric};
 pub(crate) use burn_train::{

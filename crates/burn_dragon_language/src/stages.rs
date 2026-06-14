@@ -23,7 +23,11 @@ mod tests;
 mod types;
 
 pub use artifacts::resolve_training_stage_artifact;
-pub use prepare::{prepare_language_stage_config, prepare_universality_stage_config};
+pub use prepare::{
+    GeneratedUniversalityCorpusReport, PreparedUniversalityCorpusConfig,
+    generate_prepared_universality_stage_corpus, prepare_language_stage_config,
+    prepare_universality_stage_config,
+};
 pub use types::{
     ExperimentBackend, ExperimentBundleConfig, ExperimentBundleState, ExperimentStageArtifact,
     ExperimentStageConfig, ExperimentStageKind, ExperimentStageState, ExperimentStageStatus,

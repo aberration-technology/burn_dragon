@@ -212,6 +212,19 @@ fn dragon_sharded_input_descriptor(
             };
             descriptor.with_generated_input_source(&provider)
         }
+        burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { config } => {
+            let provider = DragonGeneratedInputDescriptor {
+                provider: "burn_dragon_universality_ruliad",
+                metadata: BTreeMap::from([
+                    ("config_path".into(), config.display().to_string()),
+                    (
+                        "experiment_kind".into(),
+                        experiment_kind.workload_slug().into(),
+                    ),
+                ]),
+            };
+            descriptor.with_generated_input_source(&provider)
+        }
         burn_dragon_language::DatasetSourceConfig::UniversalityManifest { manifest } => descriptor
             .with_custom_input_source(
                 "universality-manifest",
@@ -461,6 +474,10 @@ fn ensure_supported_training_mode(
             DragonExperimentKind::NcaPrepretraining,
         )
         | (
+            burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { .. },
+            DragonExperimentKind::NcaPrepretraining,
+        )
+        | (
             burn_dragon_language::DatasetSourceConfig::NemotronClimbMix { .. },
             DragonExperimentKind::ClimbMixPretraining,
         ) => {}
@@ -501,6 +518,32 @@ fn mean_loss_from_output_ref<B: Backend>(output: &LanguageModelOutput<B>) -> f64
 
 fn mean_loss_from_train_output_ref<B: AutodiffBackend>(output: &LanguageModelTrainItem<B>) -> f64 {
     mean_loss_from_output_ref(&output.clone().sync())
+}
+
+fn insert_ruliad_source_selection_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
+) {
+    metrics.insert(
+        "ruliad_source_selection_entropy_bits".into(),
+        MetricValue::Float(snapshot.sampler_entropy_bits as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_hash_noise_probability".into(),
+        MetricValue::Float(snapshot.hash_noise_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mean_loss".into(),
+        MetricValue::Float(snapshot.mean_loss as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mean_learning_progress".into(),
+        MetricValue::Float(snapshot.mean_learning_progress as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_verifier_failures".into(),
+        MetricValue::Integer(snapshot.verifier_failures as i64),
+    );
 }
 
 fn language_evaluate<B>(
@@ -1043,6 +1086,7 @@ where
         let max_eval_batches = native.training_overrides.max_eval_batches;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
+        let source_selection_dataset = Arc::clone(&datasets.train);
         let mut builder = from_loaders(learner, device.clone(), train_loader, validation_loader)
             .with_benchmark(move |model, _device| {
                 let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
@@ -1056,15 +1100,18 @@ where
             .with_evaluate(move |model, split| {
                 language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
             })
-            .with_step_metrics(|step_index, output, metrics| {
+            .with_step_metrics(move |step_index, output, metrics| {
+                let train_loss = mean_loss_from_train_output_ref(output);
                 metrics.insert(
                     "train_steps".into(),
                     MetricValue::Integer((step_index + 1) as i64),
                 );
-                metrics.insert(
-                    "train_loss".into(),
-                    MetricValue::Float(mean_loss_from_train_output_ref(output)),
-                );
+                metrics.insert("train_loss".into(), MetricValue::Float(train_loss));
+                if let Some(snapshot) = source_selection_dataset
+                    .record_source_selection_loss(step_index, train_loss as f32)
+                {
+                    insert_ruliad_source_selection_metrics(metrics, &snapshot);
+                }
                 Ok(())
             });
 

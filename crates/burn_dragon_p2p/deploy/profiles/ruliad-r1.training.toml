@@ -1,0 +1,46 @@
+[dataset]
+cache_dir = "./cache/ruliad-r1"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r1.corpus.toml"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 50257
+eos_id = 50256
+
+[model]
+n_layer = 8
+n_embd = 512
+n_head = 8
+latent_total = 1024
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = 512
+batch_size = 6
+max_iters = 24
+checkpoint_interval_iters = 8
+log_frequency = 1
+seed = 1337
+
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0001
+maturity_steps = 100
+sample_interval_steps = 8
+replace_interval_steps = 64
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "[R2"

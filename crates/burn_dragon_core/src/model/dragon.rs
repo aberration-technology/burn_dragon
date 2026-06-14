@@ -21,7 +21,7 @@ pub use interpretability::{
 };
 
 use burn::module::{Module, Param};
-use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig};
+use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData, activation};
 use burn_dragon_kernel::api::attention::{
@@ -92,6 +92,11 @@ use super::sequence::{SequenceKernelConfig, SequenceMemorySystem, SequenceTraini
 #[cfg(any(feature = "viz", feature = "probe"))]
 use super::state::LayerVizState;
 use super::state::{LayerState, ModelState};
+use super::widen::{
+    widen_1d_headed_last_dim_prefix_zero_tail, widen_2d_headed_last_dim_prefix_zero_tail,
+    widen_2d_headed_row_prefix, widen_2d_last_dim_prefix, widen_3d_last_dim_prefix,
+    widen_3d_last_dim_prefix_zero_tail,
+};
 use super::{ManifoldHyperConnections, mhc_merge_with_coefficients, mhc_split_with_coefficients};
 
 #[derive(Module, Debug)]
@@ -141,6 +146,15 @@ pub struct DragonModel<B: Backend> {
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
     #[module(skip)]
     nca_factorized_head_tables: Option<NcaFactorizedHeadTables>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DragonLatentWidenReport {
+    pub old_latent_total: usize,
+    pub new_latent_total: usize,
+    pub old_latent_per_head: usize,
+    pub new_latent_per_head: usize,
+    pub appended_latent_total: usize,
 }
 
 #[derive(Clone)]
@@ -292,6 +306,133 @@ struct LowrankProjectionRequest<'a, B: Backend> {
     use_fused: bool,
     latent_pattern: &'a crate::kernel::BlockPattern1d,
     sparse_mask: Option<Tensor<B, 4>>,
+}
+
+fn widen_headed_linear_output_prefix_zero_tail<B: Backend>(
+    current: &Linear<B>,
+    fresh: &Linear<B>,
+    heads: usize,
+    old_per_head: usize,
+    new_per_head: usize,
+) -> Result<Linear<B>, String> {
+    let mut widened = fresh.clone();
+    widened.weight = Param::from_tensor(widen_2d_headed_last_dim_prefix_zero_tail(
+        current.weight.val(),
+        fresh.weight.val(),
+        heads,
+        old_per_head,
+        new_per_head,
+    )?);
+    widened.bias = match (&current.bias, &fresh.bias) {
+        (Some(current_bias), Some(fresh_bias)) => Some(Param::from_tensor(
+            widen_1d_headed_last_dim_prefix_zero_tail(
+                current_bias.val(),
+                fresh_bias.val(),
+                heads,
+                old_per_head,
+                new_per_head,
+            )?,
+        )),
+        (None, None) => None,
+        _ => return Err("cannot widen linear output with incompatible bias presence".to_string()),
+    };
+    Ok(widened)
+}
+
+fn clone_linear_value<B: Backend>(current: &Linear<B>) -> Linear<B> {
+    let mut cloned = current.clone();
+    cloned.weight = Param::from_tensor(current.weight.val());
+    cloned.bias = current
+        .bias
+        .as_ref()
+        .map(|bias| Param::from_tensor(bias.val()));
+    cloned
+}
+
+fn scale_linear_output<B: Backend>(current: &Linear<B>, scale: f32) -> Linear<B> {
+    let mut scaled = current.clone();
+    scaled.weight = Param::from_tensor(current.weight.val().mul_scalar(scale));
+    scaled.bias = current
+        .bias
+        .as_ref()
+        .map(|bias| Param::from_tensor(bias.val().mul_scalar(scale)));
+    scaled
+}
+
+fn widen_upstream_gated_deltanet2_prefix<B: Backend>(
+    current: &GatedDeltaNet2Memory<B>,
+    fresh: &GatedDeltaNet2Memory<B>,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+) -> Result<GatedDeltaNet2Memory<B>, String> {
+    if current.config.heads != fresh.config.heads
+        || current.config.head_dim != fresh.config.head_dim
+        || current.config.chunk_size != fresh.config.chunk_size
+        || current.config.qk_l2_norm != fresh.config.qk_l2_norm
+        || current.config.allow_neg_eigval != fresh.config.allow_neg_eigval
+        || current.config.erase_gate != fresh.config.erase_gate
+        || current.config.write_gate != fresh.config.write_gate
+        || current.config.decay_gate != fresh.config.decay_gate
+        || current.config.executor != fresh.config.executor
+    {
+        return Err(format!(
+            "cannot widen upstream gated_deltanet2 with incompatible config (current={:?}, fresh={:?})",
+            current.config, fresh.config
+        ));
+    }
+    if current.config.latent_per_head != old_latent_per_head
+        || fresh.config.latent_per_head != new_latent_per_head
+        || old_latent_per_head > new_latent_per_head
+    {
+        return Err(format!(
+            "cannot widen upstream gated_deltanet2 with incompatible latent shape (current={} fresh={} old={} new={})",
+            current.config.latent_per_head,
+            fresh.config.latent_per_head,
+            old_latent_per_head,
+            new_latent_per_head
+        ));
+    }
+
+    let mut widened = fresh.clone();
+    widened.query = widen_headed_linear_output_prefix_zero_tail(
+        &current.query,
+        &fresh.query,
+        current.config.heads,
+        old_latent_per_head,
+        new_latent_per_head,
+    )?;
+    widened.key = widen_headed_linear_output_prefix_zero_tail(
+        &current.key,
+        &fresh.key,
+        current.config.heads,
+        old_latent_per_head,
+        new_latent_per_head,
+    )?;
+    widened.erase = widen_headed_linear_output_prefix_zero_tail(
+        &current.erase,
+        &fresh.erase,
+        current.config.heads,
+        old_latent_per_head,
+        new_latent_per_head,
+    )?;
+    widened.decay = widen_headed_linear_output_prefix_zero_tail(
+        &current.decay,
+        &fresh.decay,
+        current.config.heads,
+        old_latent_per_head,
+        new_latent_per_head,
+    )?;
+    widened.decay_log = Param::from_tensor(widen_2d_last_dim_prefix(
+        current.decay_log.val(),
+        fresh.decay_log.val(),
+        old_latent_per_head,
+        new_latent_per_head,
+    )?);
+    widened.value = clone_linear_value(&current.value);
+    widened.write = clone_linear_value(&current.write);
+    let scale = (new_latent_per_head as f32 / old_latent_per_head.max(1) as f32).sqrt();
+    widened.out = scale_linear_output(&current.out, scale);
+    Ok(widened)
 }
 
 impl<B: Backend> DragonModel<B> {
@@ -508,6 +649,186 @@ impl<B: Backend> DragonModel<B> {
             nca_special_lm_head,
             nca_factorized_head_tables,
         }
+    }
+
+    pub fn latent_total_capacity(&self) -> usize {
+        self.decoder.val().shape().dims::<2>()[0]
+    }
+
+    pub fn latent_per_head_capacity(&self) -> usize {
+        self.encoder.val().shape().dims::<3>()[2]
+    }
+
+    pub fn widen_latent_total(
+        &self,
+        target_config: DragonConfig,
+        device: &B::Device,
+    ) -> Result<(Self, DragonLatentWidenReport), String> {
+        let fresh = DragonModel::<B>::new(target_config, device);
+        self.widen_to_fresh_target(fresh)
+    }
+
+    pub fn widen_to_fresh_target(
+        &self,
+        fresh: Self,
+    ) -> Result<(Self, DragonLatentWidenReport), String> {
+        let old_latent_total = self.latent_total_capacity();
+        let old_latent_per_head = self.latent_per_head_capacity();
+        let new_latent_total = fresh.latent_total_capacity();
+        let new_latent_per_head = fresh.latent_per_head_capacity();
+
+        if new_latent_total <= old_latent_total {
+            return Err(format!(
+                "target latent_total must exceed current latent_total (current={old_latent_total}, target={new_latent_total})"
+            ));
+        }
+        if self.n_layer != fresh.n_layer {
+            return Err(format!(
+                "widening cannot change n_layer (current={} target={})",
+                self.n_layer, fresh.n_layer
+            ));
+        }
+        if self.n_embd != fresh.n_embd {
+            return Err(format!(
+                "widening cannot change n_embd (current={} target={})",
+                self.n_embd, fresh.n_embd
+            ));
+        }
+        if self.n_head != fresh.n_head {
+            return Err(format!(
+                "widening cannot change n_head (current={} target={})",
+                self.n_head, fresh.n_head
+            ));
+        }
+        if self.vocab_size != fresh.vocab_size {
+            return Err(format!(
+                "widening cannot change vocab_size (current={} target={})",
+                self.vocab_size, fresh.vocab_size
+            ));
+        }
+        if self.language_head != fresh.language_head {
+            return Err("widening cannot change language_head".to_string());
+        }
+        if self.sequence_kernel != fresh.sequence_kernel {
+            return Err(format!(
+                "widening cannot change sequence_kernel (current={:?} target={:?})",
+                self.sequence_kernel, fresh.sequence_kernel
+            ));
+        }
+        if self.rollout_fast_steps_per_slow_step != fresh.rollout_fast_steps_per_slow_step {
+            return Err(format!(
+                "widening cannot change rollout_fast_steps_per_slow_step (current={} target={})",
+                self.rollout_fast_steps_per_slow_step, fresh.rollout_fast_steps_per_slow_step
+            ));
+        }
+        if self.residual_connector != fresh.residual_connector {
+            return Err(format!(
+                "widening cannot change residual_connector (current={:?} target={:?})",
+                self.residual_connector, fresh.residual_connector
+            ));
+        }
+        if self.mamba_config != fresh.mamba_config {
+            return Err(format!(
+                "widening cannot change mamba_config (current={:?} target={:?})",
+                self.mamba_config, fresh.mamba_config
+            ));
+        }
+        if new_latent_total % self.n_head != 0 {
+            return Err(format!(
+                "target latent_total must be divisible by n_head (target={new_latent_total}, n_head={})",
+                self.n_head
+            ));
+        }
+        let mut widened = fresh.clone();
+        widened.embed = self.embed.clone();
+        widened.embed.weight = Param::from_tensor(self.embed.weight.val());
+        widened.dropout = self.dropout.clone();
+        widened.norm = self.norm.value_clone();
+        widened.x_relu_threshold = self.x_relu_threshold;
+        widened.y_relu_threshold = self.y_relu_threshold;
+        widened.attention = self.attention.widened_from_prefix(
+            &fresh.attention,
+            old_latent_per_head,
+            new_latent_per_head,
+        )?;
+        widened.residual_connector = self.residual_connector;
+        widened.mhc_shared = self.mhc_shared.clone();
+        widened.attention_residual_shared = self.attention_residual_shared.clone();
+        widened.block_attention_residual_shared = self.block_attention_residual_shared.clone();
+        widened.mamba = self
+            .mamba
+            .as_ref()
+            .map(MambaSequenceParameters::value_clone);
+        widened.lm_head = self
+            .lm_head
+            .as_ref()
+            .map(|head| Param::from_tensor(head.val()));
+        widened.nca_factorized_lm_head = self
+            .nca_factorized_lm_head
+            .as_ref()
+            .map(|head| Param::from_tensor(head.val()));
+        widened.nca_special_lm_head = self
+            .nca_special_lm_head
+            .as_ref()
+            .map(|head| Param::from_tensor(head.val()));
+
+        widened.encoder = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.encoder.val(),
+            fresh.encoder.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.encoder_v = Param::from_tensor(widen_3d_last_dim_prefix(
+            self.encoder_v.val(),
+            fresh.encoder_v.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decoder = Param::from_tensor(widen_2d_headed_row_prefix(
+            self.decoder.val(),
+            fresh.decoder.val(),
+            self.n_head,
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.gated_deltanet2 = match (&self.gated_deltanet2, &fresh.gated_deltanet2) {
+            (Some(current), Some(fresh)) => Some(current.widened_from_prefix(
+                fresh,
+                old_latent_per_head,
+                new_latent_per_head,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err("widening cannot change gated_deltanet2 parameter presence".to_string());
+            }
+        };
+        widened.gated_deltanet2_upstream = match (
+            &self.gated_deltanet2_upstream,
+            &fresh.gated_deltanet2_upstream,
+        ) {
+            (Some(current), Some(fresh)) => Some(widen_upstream_gated_deltanet2_prefix(
+                current,
+                fresh,
+                old_latent_per_head,
+                new_latent_per_head,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "widening cannot change upstream gated_deltanet2 parameter presence"
+                        .to_string(),
+                );
+            }
+        };
+
+        let report = DragonLatentWidenReport {
+            old_latent_total,
+            new_latent_total,
+            old_latent_per_head,
+            new_latent_per_head,
+            appended_latent_total: new_latent_total.saturating_sub(old_latent_total),
+        };
+        Ok((widened, report))
     }
 
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
@@ -734,7 +1055,7 @@ impl<B: Backend> DragonModel<B> {
         layer_idx: usize,
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
         let latent_per_head = self.layer_latent_per_head(layer_idx);
-        let latent_total = self.layer_latent_total(layer_idx);
+        let capacity_per_head = self.latent_per_head_capacity();
         let encoder = self
             .encoder
             .val()
@@ -745,7 +1066,18 @@ impl<B: Backend> DragonModel<B> {
             .val()
             .slice([0..self.n_head, 0..self.n_embd, 0..latent_per_head])
             .reshape([1, self.n_head, self.n_embd, latent_per_head]);
-        let decoder = self.decoder.val().slice([0..latent_total, 0..self.n_embd]);
+        let decoder_capacity = self.decoder.val();
+        let decoder = Tensor::cat(
+            (0..self.n_head)
+                .map(|head| {
+                    let start = head * capacity_per_head;
+                    decoder_capacity
+                        .clone()
+                        .slice([start..start + latent_per_head, 0..self.n_embd])
+                })
+                .collect(),
+            0,
+        );
         (encoder, encoder_v, decoder, latent_per_head)
     }
 
@@ -1635,6 +1967,146 @@ mod tests {
 
     type TestBackend = NdArray<f32>;
 
+    fn tensor_values<const D: usize>(tensor: Tensor<TestBackend, D>) -> Vec<f32> {
+        tensor
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("tensor values")
+    }
+
+    fn tiny_scaling_source_config(sequence_kernel: SequenceKernelConfig) -> DragonConfig {
+        DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            sequence_kernel,
+            ..Default::default()
+        }
+    }
+
+    fn assert_widened_forward_is_finite(model: &DragonModel<TestBackend>) {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+        let logits = model.forward(tokens);
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+    }
+
+    fn max_abs_diff(lhs: Vec<f32>, rhs: Vec<f32>) -> f32 {
+        assert_eq!(lhs.len(), rhs.len(), "tensor length mismatch");
+        lhs.into_iter()
+            .zip(rhs)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn assert_widened_forward_matches_source(
+        source: &DragonModel<TestBackend>,
+        widened: &DragonModel<TestBackend>,
+        tolerance: f32,
+    ) {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let embedding_weight_diff = max_abs_diff(
+            tensor_values(source.embed.weight.val()),
+            tensor_values(widened.embed.weight.val()),
+        );
+        assert!(
+            embedding_weight_diff <= tolerance,
+            "widened model changed embedding weights before training: max_abs_diff={embedding_weight_diff} tolerance={tolerance}"
+        );
+        let source_embedded = tensor_values(source.embed_tokens(tokens.clone()));
+        let widened_embedded = tensor_values(widened.embed_tokens(tokens.clone()));
+        let embedded_diff = max_abs_diff(source_embedded, widened_embedded);
+        assert!(
+            embedded_diff <= tolerance,
+            "widened model changed embeddings before training: max_abs_diff={embedded_diff} tolerance={tolerance}"
+        );
+        let source_hidden = tensor_values(source.forward_hidden(tokens.clone()));
+        let widened_hidden = tensor_values(widened.forward_hidden(tokens.clone()));
+        let hidden_diff = max_abs_diff(source_hidden, widened_hidden);
+        assert!(
+            hidden_diff <= tolerance,
+            "widened model changed hidden states before training: max_abs_diff={hidden_diff} tolerance={tolerance}"
+        );
+        let source_logits = tensor_values(source.forward(tokens.clone()));
+        let widened_logits = tensor_values(widened.forward(tokens));
+        let diff = max_abs_diff(source_logits, widened_logits);
+        assert!(
+            diff <= tolerance,
+            "widened model changed logits before training: max_abs_diff={diff} tolerance={tolerance}"
+        );
+    }
+
+    fn assert_widened_record_round_trip_matches_source(
+        source: &DragonModel<TestBackend>,
+        widened: &DragonModel<TestBackend>,
+        target_config: DragonConfig,
+        tolerance: f32,
+    ) {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let record = widened.clone().into_record();
+        let reloaded = DragonModel::<TestBackend>::new(target_config, &device).load_record(record);
+        assert_widened_forward_matches_source(source, &reloaded, tolerance);
+    }
+
+    fn assert_shared_lowrank_prefix_preserved(
+        source: &DragonModel<TestBackend>,
+        widened: &DragonModel<TestBackend>,
+    ) {
+        let old_latent_per_head = source.latent_per_head_capacity();
+        assert_eq!(
+            tensor_values(source.encoder.val()),
+            tensor_values(widened.encoder.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                0..old_latent_per_head
+            ]))
+        );
+        assert_eq!(
+            tensor_values(source.encoder_v.val()),
+            tensor_values(widened.encoder_v.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                0..old_latent_per_head
+            ]))
+        );
+        for head in 0..source.n_head {
+            let source_start = head * old_latent_per_head;
+            let widened_start = head * widened.latent_per_head_capacity();
+            assert_eq!(
+                tensor_values(source.decoder.val().slice([
+                    source_start..source_start + old_latent_per_head,
+                    0..source.n_embd
+                ])),
+                tensor_values(widened.decoder.val().slice([
+                    widened_start..widened_start + old_latent_per_head,
+                    0..source.n_embd
+                ]))
+            );
+        }
+        assert!(
+            tensor_values(widened.encoder.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                old_latent_per_head..widened.latent_per_head_capacity()
+            ]))
+            .iter()
+            .all(|value| *value == 0.0),
+            "widened query encoder tail should start as a no-op"
+        );
+    }
+
     #[test]
     fn tiny_reservoir_model_constructs_and_runs_forward() {
         let device = burn::tensor::Device::<TestBackend>::default();
@@ -1697,6 +2169,185 @@ mod tests {
             .into_vec::<f32>()
             .expect("logits");
         assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn widen_latent_total_supports_linear_attention() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let source_config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::LinearAttention,
+        ));
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen");
+        assert_eq!(report.old_latent_total, 32);
+        assert_eq!(report.new_latent_total, 64);
+        assert_eq!(widened.latent_total_capacity(), 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        assert_widened_forward_matches_source(&source, &widened, 1.0e-5);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-5);
+        assert_widened_forward_is_finite(&widened);
+    }
+
+    #[test]
+    fn widen_latent_total_supports_dense_score_short_context() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let source_config =
+            tiny_scaling_source_config(SequenceKernelConfig::dense_score_short_context());
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen");
+        assert_eq!(report.new_latent_total, 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        assert_widened_forward_matches_source(&source, &widened, 1.0e-5);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-5);
+        assert_widened_forward_is_finite(&widened);
+    }
+
+    #[test]
+    fn widen_latent_total_supports_mamba3_and_preserves_mamba_params() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let source_config = DragonConfig {
+            sequence_kernel: SequenceKernelConfig::reference(
+                SequenceMemorySystem::Mamba3StateSpaceDuality,
+            ),
+            mamba: super::super::sequence::mamba::MambaSequenceConfig {
+                headdim: 8,
+                chunk_size: 4,
+                ..Default::default()
+            },
+            ..tiny_scaling_source_config(SequenceKernelConfig::reference(
+                SequenceMemorySystem::Mamba3StateSpaceDuality,
+            ))
+        };
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let source_mamba = source.mamba.as_ref().expect("source mamba").mamba3();
+        let source_in_proj = tensor_values(source_mamba.in_proj_tensor());
+        let source_dt_bias = tensor_values(source_mamba.dt_bias_tensor());
+        let source_out_proj = tensor_values(source_mamba.out_proj_tensor());
+
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen");
+        assert_eq!(report.new_latent_total, 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        let widened_mamba = widened.mamba.as_ref().expect("widened mamba").mamba3();
+        assert_eq!(
+            source_in_proj,
+            tensor_values(widened_mamba.in_proj_tensor())
+        );
+        assert_eq!(
+            source_dt_bias,
+            tensor_values(widened_mamba.dt_bias_tensor())
+        );
+        assert_eq!(
+            source_out_proj,
+            tensor_values(widened_mamba.out_proj_tensor())
+        );
+        assert_widened_forward_matches_source(&source, &widened, 1.0e-5);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-5);
+        assert_widened_forward_is_finite(&widened);
+    }
+
+    #[test]
+    fn widen_latent_total_supports_gdn2_adapter_and_preserves_latent_prefix() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let source_config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::GatedDeltaNet2,
+        ));
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let source_gdn2 = source.gated_deltanet2.as_ref().expect("source gdn2");
+        let source_key = tensor_values(source_gdn2.key_proj_tensor());
+
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen");
+        assert_eq!(report.new_latent_total, 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        let widened_key_prefix = widened
+            .gated_deltanet2
+            .as_ref()
+            .expect("widened gdn2")
+            .key_proj_tensor()
+            .slice([0..source.n_head, 0..source.n_embd, 0..16]);
+        assert_eq!(source_key, tensor_values(widened_key_prefix));
+        assert_widened_forward_matches_source(&source, &widened, 5.0e-4);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 5.0e-4);
+        assert_widened_forward_is_finite(&widened);
+    }
+
+    #[test]
+    fn widen_latent_total_supports_upstream_gdn2_and_preserves_headed_prefix() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let source_config = DragonConfig {
+            sequence_kernel: SequenceKernelConfig::gated_delta_chunk_wy(),
+            gated_deltanet2: super::super::sequence::gdn2::GatedDeltaNet2Config {
+                implementation: GatedDeltaNet2Implementation::UpstreamFull,
+                chunk_size: 4,
+                ..Default::default()
+            },
+            ..tiny_scaling_source_config(SequenceKernelConfig::gated_delta_chunk_wy())
+        };
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let source_upstream = source
+            .gated_deltanet2_upstream
+            .as_ref()
+            .expect("source upstream gdn2");
+
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen");
+        assert_eq!(report.new_latent_total, 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        let widened_upstream = widened
+            .gated_deltanet2_upstream
+            .as_ref()
+            .expect("widened upstream gdn2");
+        for head in 0..source.n_head {
+            let source_start = head * 16;
+            let widened_start = head * 32;
+            assert_eq!(
+                tensor_values(
+                    source_upstream
+                        .query
+                        .weight
+                        .val()
+                        .slice([0..source.n_embd, source_start..source_start + 16])
+                ),
+                tensor_values(
+                    widened_upstream
+                        .query
+                        .weight
+                        .val()
+                        .slice([0..source.n_embd, widened_start..widened_start + 16])
+                )
+            );
+        }
+        assert_widened_forward_matches_source(&source, &widened, 1.0e-4);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-4);
+        assert_widened_forward_is_finite(&widened);
     }
 
     #[test]

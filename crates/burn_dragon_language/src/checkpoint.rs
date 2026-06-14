@@ -292,9 +292,6 @@ pub fn apply_init_checkpoint_to_language_core<B: BackendTrait>(
                 checkpoint_path.display()
             )
         })?;
-    let record = BinFileRecorder::<FullPrecisionSettings>::new()
-        .load::<<DragonModel<B> as Module<B>>::Record>(checkpoint_base.clone(), device)
-        .map_err(|err| anyhow!(format_checkpoint_load_error(&checkpoint_base, err)))?;
     let source_config =
         load_training_config_for_checkpoint(&[], Some(&checkpoint_path), backend_name)
             .with_context(|| {
@@ -303,6 +300,21 @@ pub fn apply_init_checkpoint_to_language_core<B: BackendTrait>(
                     checkpoint_path.display()
                 )
             })?;
+    let source_tokenizer = load_tokenizer_for_checkpoint(&[], Some(&checkpoint_path), backend_name)
+        .with_context(|| {
+            format!(
+                "failed to load source tokenizer for init checkpoint {}",
+                checkpoint_path.display()
+            )
+        })?;
+    let source_model_config = build_model_config_with_tokenizer(
+        &source_config.model,
+        source_config.training.block_size,
+        source_tokenizer.as_ref(),
+    )?;
+    let record = BinFileRecorder::<FullPrecisionSettings>::new()
+        .load::<<DragonModel<B> as Module<B>>::Record>(checkpoint_base.clone(), device)
+        .map_err(|err| anyhow!(format_checkpoint_load_error(&checkpoint_base, err)))?;
     let current_language_head = target_config
         .model
         .language_head
@@ -317,7 +329,24 @@ pub fn apply_init_checkpoint_to_language_core<B: BackendTrait>(
         source_config.dataset.tokenizer.kind != target_config.dataset.tokenizer.kind;
     let preserve_output_head =
         preserve_input_embedding || source_language_head != current_language_head;
-    let loaded = if preserve_input_embedding || preserve_output_head {
+    let loaded = if target_model.latent_total_capacity() > source_model_config.latent_total() {
+        if preserve_input_embedding || preserve_output_head {
+            return Err(anyhow!(
+                "Dragon neuron-dimension widening from init checkpoint cannot be combined with tokenizer or language-head transfer"
+            ));
+        }
+        let source_model = DragonModel::<B>::new(source_model_config, device).load_record(record);
+        let (widened, _) = source_model
+            .widen_to_fresh_target(target_model.clone())
+            .map_err(|message| anyhow!("failed to widen Dragon init checkpoint: {message}"))?;
+        widened
+    } else if target_model.latent_total_capacity() < source_model_config.latent_total() {
+        return Err(anyhow!(
+            "Dragon neuron-dimension checkpoint transfer is append-only: target latent_total {} is smaller than checkpoint latent_total {}",
+            target_model.latent_total_capacity(),
+            source_model_config.latent_total()
+        ));
+    } else if preserve_input_embedding || preserve_output_head {
         target_model.load_record_preserving_tokenizer_surfaces(
             record,
             preserve_input_embedding,

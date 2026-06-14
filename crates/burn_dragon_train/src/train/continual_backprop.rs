@@ -1,12 +1,12 @@
 use crate::train::prelude::*;
 use crate::{ContinualBackpropConfig, ContinualBackpropLrCoupling, OptimizerKind};
-use burn::module::{ModuleMapper, ParamId};
+use burn::module::{ModuleMapper, ModuleVisitor, ParamId};
 use burn::optim::AdaptiveMomentumState;
 use burn::optim::MultiGradientsParams;
 use burn::optim::SimpleOptimizer;
 use burn::optim::grad_clipping::GradientClipping;
 use burn::optim::record::AdaptorRecord;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use crate::train::pipeline::{ResolvedOptimizer, ResolvedOptimizerRecord, resolve_optimizer};
@@ -15,6 +15,26 @@ use crate::train::pipeline::{ResolvedOptimizer, ResolvedOptimizerRecord, resolve
 pub struct ContinualBackpropFeatureMetrics {
     pub incoming_l1: Vec<f32>,
     pub outgoing_l1: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContinualBackpropTelemetry {
+    pub optimizer_step: usize,
+    pub feature_count: usize,
+    pub eligible_count: usize,
+    pub replacement_count: usize,
+    pub replacement_budget: f32,
+    pub lr_multiplier: f32,
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+    pub utility_min: f32,
+    pub utility_mean: f32,
+    pub utility_max: f32,
+    pub age_mean: f32,
+    pub age_max: f32,
+    pub batch_stat_samples: usize,
+    pub activation_abs_mean: f32,
+    pub zero_utility_fraction: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +60,9 @@ where
     fn take_batch_stats(module: &M) -> Option<Self::BatchStats>;
     fn batch_stats_mean(batch_stats: &Self::BatchStats) -> Vec<f32>;
     fn batch_stats_mean_abs(batch_stats: &Self::BatchStats) -> Vec<f32>;
+    fn batch_stats_sample_count(_batch_stats: &Self::BatchStats) -> usize {
+        1
+    }
     fn feature_count(module: &M) -> usize;
     fn device(module: &M) -> B::Device;
     fn target_lr_scale(module: &M) -> f32;
@@ -175,6 +198,8 @@ struct ContinualBackpropState<B: BackendTrait> {
     age: Tensor<B, 1>,
     avg_activation: Tensor<B, 1>,
     avg_abs_activation: Tensor<B, 1>,
+    batch_stat_samples: usize,
+    activation_abs_mean: f32,
 }
 
 #[derive(burn::record::Record, Clone)]
@@ -197,6 +222,10 @@ where
     config: ContinualBackpropConfig,
     base_learning_rate: LearningRate,
     fresh_model: A::FreshModel,
+    pause_until_step: usize,
+    pause_reason: Option<String>,
+    cooldown_until_step: usize,
+    last_telemetry: Option<ContinualBackpropTelemetry>,
     _adapter: PhantomData<A>,
     module: PhantomData<M>,
 }
@@ -295,6 +324,10 @@ where
             config,
             base_learning_rate: optimizer_cfg.learning_rate,
             fresh_model,
+            pause_until_step: 0,
+            pause_reason: None,
+            cooldown_until_step: 0,
+            last_telemetry: None,
             _adapter: PhantomData,
             module: PhantomData,
         })
@@ -323,6 +356,8 @@ where
             age: Tensor::<B, 1>::zeros([feature_count], &device),
             avg_activation: Tensor::<B, 1>::zeros([feature_count], &device),
             avg_abs_activation: Tensor::<B, 1>::zeros([feature_count], &device),
+            batch_stat_samples: 0,
+            activation_abs_mean: 0.0,
         });
         state.step = state.step.saturating_add(1);
         state.age = state.age.add_scalar(1.0);
@@ -337,14 +372,16 @@ where
             .is_multiple_of(self.config.replace_interval_steps)
         {
             let target_lr_scale = A::target_lr_scale(&updated_module);
-            let selected =
+            let (selected, telemetry) =
                 self.select_features_to_replace(&updated_module, &mut state, lr, target_lr_scale);
+            self.last_telemetry = Some(telemetry);
             if !selected.is_empty() {
                 updated_module =
                     A::reinitialize_features(updated_module, &self.fresh_model, &selected);
                 let reset_targets = A::optimizer_reset_targets(&updated_module);
                 self.reset_optimizer_state_for_features(reset_targets, &selected);
                 state = self.reset_state_for_features(state, &selected, &device, feature_count);
+                self.cooldown_until_step = state.step.saturating_add(self.config.cooldown_steps);
                 info!(
                     "continual backprop replaced {} features at optimizer_step={}",
                     selected.len(),
@@ -384,6 +421,10 @@ where
         if mean.len() != feature_count || mean_abs.len() != feature_count {
             return state;
         }
+        state.batch_stat_samples = state
+            .batch_stat_samples
+            .saturating_add(A::batch_stats_sample_count(&batch_stats));
+        state.activation_abs_mean = mean_f32(&mean_abs);
         let keep = self.config.utility_decay;
         let update = 1.0 - keep;
         let mean_tensor = Tensor::<B, 1>::from_data(TensorData::new(mean, [feature_count]), device);
@@ -406,7 +447,7 @@ where
         state: &mut ContinualBackpropState<B>,
         lr: LearningRate,
         target_lr_scale: f32,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, ContinualBackpropTelemetry) {
         let metrics = A::feature_metrics(module);
         let age = state
             .age
@@ -429,32 +470,92 @@ where
             .convert::<f32>()
             .into_vec::<f32>()
             .expect("cbp avg abs activation vec");
+        let lr_multiplier = self.continual_backprop_lr_multiplier(lr, target_lr_scale);
         let eligible = age
             .iter()
             .enumerate()
             .filter_map(|(idx, age)| (*age >= self.config.maturity_steps as f32).then_some(idx))
             .collect::<Vec<_>>();
+        let mut telemetry = ContinualBackpropTelemetry {
+            optimizer_step: state.step,
+            feature_count: metrics.incoming_l1.len(),
+            eligible_count: eligible.len(),
+            replacement_count: 0,
+            replacement_budget: state.replacement_budget,
+            lr_multiplier,
+            paused: false,
+            pause_reason: None,
+            utility_min: 0.0,
+            utility_mean: 0.0,
+            utility_max: 0.0,
+            age_mean: mean_f32(&age),
+            age_max: max_f32(&age),
+            batch_stat_samples: state.batch_stat_samples,
+            activation_abs_mean: state.activation_abs_mean,
+            zero_utility_fraction: 0.0,
+        };
+
+        let paused_reason = if state.step <= self.config.warmup_steps {
+            Some("warmup".to_string())
+        } else if state.step < self.pause_until_step {
+            self.pause_reason
+                .clone()
+                .or_else(|| Some("paused".to_string()))
+        } else if state.step < self.cooldown_until_step {
+            Some("cooldown".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = paused_reason {
+            telemetry.paused = true;
+            telemetry.pause_reason = Some(reason);
+            return (Vec::new(), telemetry);
+        }
+        if state.step >= self.pause_until_step {
+            self.pause_reason = None;
+        }
         if eligible.is_empty() {
-            return Vec::new();
+            return (Vec::new(), telemetry);
         }
         state.replacement_budget += self.config.replacement_rate
-            * self.continual_backprop_lr_multiplier(lr, target_lr_scale)
+            * lr_multiplier
             * eligible.len() as f32
             * self.config.replace_interval_steps as f32;
-        let n_replace = state.replacement_budget.floor() as usize;
-        if n_replace == 0 {
-            return Vec::new();
-        }
+        telemetry.replacement_budget = state.replacement_budget;
         let epsilon = self.config.utility_epsilon;
         let mut ranked = eligible
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|idx| {
+                *idx < avg.len()
+                    && *idx < avg_abs.len()
+                    && *idx < metrics.incoming_l1.len()
+                    && *idx < metrics.outgoing_l1.len()
+            })
             .map(|idx| {
-                let centered = (avg_abs[idx] - avg[idx].abs()).max(0.0);
-                let score =
-                    centered * metrics.outgoing_l1[idx] / metrics.incoming_l1[idx].max(epsilon);
+                let score = avg_abs[idx].max(0.0) * metrics.outgoing_l1[idx]
+                    / metrics.incoming_l1[idx].max(epsilon);
                 (idx, score)
             })
             .collect::<Vec<_>>();
+        let utility_values = ranked.iter().map(|(_, score)| *score).collect::<Vec<_>>();
+        telemetry.utility_min = min_f32(&utility_values);
+        telemetry.utility_mean = mean_f32(&utility_values);
+        telemetry.utility_max = max_f32(&utility_values);
+        telemetry.zero_utility_fraction = if utility_values.is_empty() {
+            0.0
+        } else {
+            utility_values
+                .iter()
+                .filter(|value| **value <= epsilon)
+                .count() as f32
+                / utility_values.len() as f32
+        };
+        let n_replace = (state.replacement_budget.floor() as usize)
+            .min(self.config.max_replacements_per_interval);
+        if n_replace == 0 {
+            return (Vec::new(), telemetry);
+        }
         ranked.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let selected = ranked
             .into_iter()
@@ -464,7 +565,9 @@ where
         if !selected.is_empty() {
             state.replacement_budget -= selected.len() as f32;
         }
-        selected
+        telemetry.replacement_count = selected.len();
+        telemetry.replacement_budget = state.replacement_budget;
+        (selected, telemetry)
     }
 
     fn reset_state_for_features(
@@ -626,6 +729,50 @@ where
     }
 }
 
+impl<B, M, A> ContinualBackpropAdamWOptimizer<B, M, A>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B> + Clone + Send,
+    A: ContinualBackpropAdapter<B, M>,
+{
+    fn prepare_after_module_scale(&mut self, module: &M) {
+        let ids = collect_param_ids::<B, M>(module);
+        self.records.retain(|id, _| ids.contains(id));
+        let feature_count = A::feature_count(module);
+        let device = A::device(module);
+        if let Some(state) = self.state.take() {
+            self.state = Some(expand_continual_backprop_state(
+                state,
+                feature_count,
+                &device,
+            ));
+        }
+        if let Some(state) = &mut self.state {
+            state.replacement_budget = 0.0;
+        }
+    }
+
+    fn pause_for_steps(&mut self, steps: usize, reason: impl Into<String>) {
+        if steps == 0 {
+            return;
+        }
+        let current_step = self.state.as_ref().map(|state| state.step).unwrap_or(0);
+        self.pause_until_step = self
+            .pause_until_step
+            .max(current_step.saturating_add(steps));
+        self.pause_reason = Some(reason.into());
+    }
+
+    fn clear_pause(&mut self) {
+        self.pause_until_step = 0;
+        self.pause_reason = None;
+    }
+
+    fn latest_telemetry(&self) -> Option<ContinualBackpropTelemetry> {
+        self.last_telemetry.clone()
+    }
+}
+
 impl<B, M, A> Optimizer<M, B> for ContinualBackpropOptimizer<B, M, A>
 where
     B: AutodiffBackend,
@@ -705,6 +852,105 @@ where
         };
         Self { kind }
     }
+}
+
+impl<B, M, A> ContinualBackpropOptimizer<B, M, A>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B> + Clone + Send,
+    A: ContinualBackpropAdapter<B, M>,
+{
+    pub fn prepare_after_neuron_scale(&mut self, module: &M) {
+        match &mut self.kind {
+            ContinualBackpropOptimizerKind::Standard(_) => {}
+            ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) => {
+                optimizer.prepare_after_module_scale(module);
+            }
+        }
+    }
+
+    pub fn pause_continual_backprop_for_steps(&mut self, steps: usize, reason: impl Into<String>) {
+        if let ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) = &mut self.kind {
+            optimizer.pause_for_steps(steps, reason);
+        }
+    }
+
+    pub fn clear_continual_backprop_pause(&mut self) {
+        if let ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) = &mut self.kind {
+            optimizer.clear_pause();
+        }
+    }
+
+    pub fn continual_backprop_telemetry(&self) -> Option<ContinualBackpropTelemetry> {
+        match &self.kind {
+            ContinualBackpropOptimizerKind::Standard(_) => None,
+            ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) => {
+                optimizer.latest_telemetry()
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParamIdCollector {
+    ids: HashSet<ParamId>,
+}
+
+impl<B: BackendTrait> ModuleVisitor<B> for ParamIdCollector {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.ids.insert(param.id);
+    }
+}
+
+fn collect_param_ids<B, M>(module: &M) -> HashSet<ParamId>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let mut collector = ParamIdCollector::default();
+    module.visit(&mut collector);
+    collector.ids
+}
+
+fn mean_f32(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f32>() / values.len() as f32
+    }
+}
+
+fn min_f32(values: &[f32]) -> f32 {
+    values.iter().copied().reduce(f32::min).unwrap_or(0.0)
+}
+
+fn max_f32(values: &[f32]) -> f32 {
+    values.iter().copied().reduce(f32::max).unwrap_or(0.0)
+}
+
+fn expand_continual_backprop_state<B: AutodiffBackend>(
+    mut state: ContinualBackpropState<B>,
+    feature_count: usize,
+    device: &B::Device,
+) -> ContinualBackpropState<B> {
+    state.age = expand_state_vector(state.age, feature_count, device);
+    state.avg_activation = expand_state_vector(state.avg_activation, feature_count, device);
+    state.avg_abs_activation = expand_state_vector(state.avg_abs_activation, feature_count, device);
+    state
+}
+
+fn expand_state_vector<B: BackendTrait>(
+    tensor: Tensor<B, 1>,
+    feature_count: usize,
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    let mut values = tensor
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("continual backprop state vec");
+    values.resize(feature_count, 0.0);
+    Tensor::<B, 1>::from_data(TensorData::new(values, [feature_count]), device)
 }
 
 fn reset_adamw_state_3d<B: AutodiffBackend>(
@@ -837,4 +1083,224 @@ fn zero_selected_2d_feature_tensor<B: BackendTrait>(
         }
     }
     Tensor::<B, 2>::from_data(TensorData::new(values, [rows, cols]), &device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = Autodiff<NdArray<f32>>;
+
+    #[derive(Clone, Debug)]
+    struct TestBatchStats {
+        mean: Vec<f32>,
+        mean_abs: Vec<f32>,
+        samples: usize,
+    }
+
+    #[derive(Module, Debug)]
+    struct TestModule<B: BackendTrait> {
+        anchor: Param<Tensor<B, 1>>,
+        #[module(skip)]
+        stats: Option<TestBatchStats>,
+    }
+
+    #[derive(Clone)]
+    struct TestAdapter;
+
+    impl ContinualBackpropAdapter<TestBackend, TestModule<TestBackend>> for TestAdapter {
+        type FreshModel = TestModule<TestBackend>;
+        type BatchStats = TestBatchStats;
+
+        fn validate_config(
+            _config: &ContinualBackpropConfig,
+            _fresh_model: &Self::FreshModel,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn attach_runtime(
+            module: TestModule<TestBackend>,
+            _config: &ContinualBackpropConfig,
+        ) -> TestModule<TestBackend> {
+            module
+        }
+
+        fn take_batch_stats(module: &TestModule<TestBackend>) -> Option<Self::BatchStats> {
+            module.stats.clone()
+        }
+
+        fn batch_stats_mean(batch_stats: &Self::BatchStats) -> Vec<f32> {
+            batch_stats.mean.clone()
+        }
+
+        fn batch_stats_mean_abs(batch_stats: &Self::BatchStats) -> Vec<f32> {
+            batch_stats.mean_abs.clone()
+        }
+
+        fn batch_stats_sample_count(batch_stats: &Self::BatchStats) -> usize {
+            batch_stats.samples
+        }
+
+        fn feature_count(_module: &TestModule<TestBackend>) -> usize {
+            2
+        }
+
+        fn device(module: &TestModule<TestBackend>) -> burn::tensor::Device<TestBackend> {
+            module.anchor.val().device()
+        }
+
+        fn target_lr_scale(_module: &TestModule<TestBackend>) -> f32 {
+            1.0
+        }
+
+        fn feature_metrics(_module: &TestModule<TestBackend>) -> ContinualBackpropFeatureMetrics {
+            ContinualBackpropFeatureMetrics {
+                incoming_l1: vec![1.0, 1.0],
+                outgoing_l1: vec![1.0, 1.0],
+            }
+        }
+
+        fn reinitialize_features(
+            module: TestModule<TestBackend>,
+            _fresh_model: &Self::FreshModel,
+            _selected: &[usize],
+        ) -> TestModule<TestBackend> {
+            module
+        }
+
+        fn optimizer_reset_targets(
+            _module: &TestModule<TestBackend>,
+        ) -> ContinualBackpropParamResetTargets {
+            ContinualBackpropParamResetTargets::default()
+        }
+    }
+
+    fn test_module() -> TestModule<TestBackend> {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestModule {
+            anchor: Param::from_tensor(Tensor::<TestBackend, 1>::zeros([1], &device)),
+            stats: None,
+        }
+    }
+
+    fn test_state(step: usize, replacement_budget: f32) -> ContinualBackpropState<TestBackend> {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        ContinualBackpropState {
+            step,
+            replacement_budget,
+            age: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![2048.0, 2048.0], [2]),
+                &device,
+            ),
+            avg_activation: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![0.0, 0.0], [2]),
+                &device,
+            ),
+            avg_abs_activation: Tensor::<TestBackend, 1>::from_data(
+                TensorData::new(vec![1.0, 2.0], [2]),
+                &device,
+            ),
+            batch_stat_samples: 0,
+            activation_abs_mean: 1.5,
+        }
+    }
+
+    fn test_optimizer(
+        config: ContinualBackpropConfig,
+    ) -> ContinualBackpropAdamWOptimizer<TestBackend, TestModule<TestBackend>, TestAdapter> {
+        ContinualBackpropAdamWOptimizer {
+            optimizer: DragonAdamW {
+                beta_1: 0.9,
+                beta_2: 0.999,
+                epsilon: 1.0e-5,
+                weight_decay: 0.0,
+            },
+            records: HashMap::new(),
+            grad_clipping: None,
+            state: None,
+            config,
+            base_learning_rate: 1.0e-3,
+            fresh_model: test_module(),
+            pause_until_step: 0,
+            pause_reason: None,
+            cooldown_until_step: 0,
+            last_telemetry: None,
+            _adapter: PhantomData,
+            module: PhantomData,
+        }
+    }
+
+    #[test]
+    fn pause_preserves_replacement_budget() {
+        let mut optimizer = test_optimizer(ContinualBackpropConfig::default());
+        optimizer.state = Some(test_state(2048, 0.75));
+
+        optimizer.pause_for_steps(512, "structural_stabilization");
+
+        assert_eq!(
+            optimizer
+                .state
+                .as_ref()
+                .expect("continual backprop state")
+                .replacement_budget,
+            0.75
+        );
+    }
+
+    #[test]
+    fn utility_telemetry_updates_before_replacement_threshold() {
+        let mut config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 0,
+            maturity_steps: 1,
+            cooldown_steps: 0,
+            replacement_rate: 1.0e-5,
+            replace_interval_steps: 256,
+            ..ContinualBackpropConfig::default()
+        };
+        config.max_replacements_per_interval = 1;
+        let mut optimizer = test_optimizer(config);
+        let mut state = test_state(2048, 0.0);
+        let module = test_module();
+
+        let (selected, telemetry) =
+            optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert!(selected.is_empty());
+        assert_eq!(telemetry.replacement_count, 0);
+        assert!(telemetry.replacement_budget > 0.0);
+        assert_eq!(telemetry.utility_min, 1.0);
+        assert_eq!(telemetry.utility_mean, 1.5);
+        assert_eq!(telemetry.utility_max, 2.0);
+        assert_eq!(telemetry.activation_abs_mean, 1.5);
+        assert_eq!(telemetry.zero_utility_fraction, 0.0);
+    }
+
+    #[test]
+    fn utility_uses_mean_absolute_activation_for_relu_stats() {
+        let config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 0,
+            maturity_steps: 1,
+            cooldown_steps: 0,
+            replacement_rate: 0.0,
+            ..ContinualBackpropConfig::default()
+        };
+        let mut optimizer = test_optimizer(config);
+        let mut state = test_state(2048, 0.0);
+        state.avg_activation = Tensor::<TestBackend, 1>::from_data(
+            TensorData::new(vec![1.0, 2.0], [2]),
+            &burn::tensor::Device::<TestBackend>::default(),
+        );
+        let module = test_module();
+
+        let (_, telemetry) = optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert_eq!(telemetry.utility_min, 1.0);
+        assert_eq!(telemetry.utility_max, 2.0);
+        assert_eq!(telemetry.zero_utility_fraction, 0.0);
+    }
 }

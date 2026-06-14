@@ -278,6 +278,7 @@ impl<B: Backend> DragonModel<B> {
                     .gated_deltanet2
                     .as_ref()
                     .expect("gated_deltanet2 sequence family requires initialized GD2 params");
+                let output_scale = params.output_scale();
                 let [query_batch, query_heads, _query_time, latent] = query.shape().dims::<4>();
                 assert_eq!(
                     query_batch, batch,
@@ -335,7 +336,7 @@ impl<B: Backend> DragonModel<B> {
                         self.gated_deltanet2_config.chunk_size,
                     ) {
                         write_gated_deltanet2_state(layer_state, output.state);
-                        return output.context;
+                        return output.context.mul_scalar(output_scale);
                     }
                     static GDN2_CHUNK_WY_FALLBACK_WARN: Once = Once::new();
                     GDN2_CHUNK_WY_FALLBACK_WARN.call_once(|| {
@@ -356,7 +357,7 @@ impl<B: Backend> DragonModel<B> {
                     self.gated_deltanet2_config.state_epsilon,
                 );
                 write_gated_deltanet2_state(layer_state, next_state);
-                context
+                context.mul_scalar(output_scale)
             }
             (family, executor) => panic!(
                 "sequence kernel family {:?} with executor {:?} is not implemented in DragonModel yet",

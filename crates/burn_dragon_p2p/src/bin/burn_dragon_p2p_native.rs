@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::backend::AutodiffBackend;
-use burn_dragon_language::load_training_config;
+use burn_autodiff::Autodiff;
+use burn_dragon_language::{TrainingConfig, load_training_config, train};
 use burn_dragon_p2p::admin::{
     fetch_directory_entries, fetch_signed_directory_entries, mirror_peer_artifact,
     preserve_directory_entry_current_head, recover_directory_current_head_from_visible_roots,
@@ -54,6 +55,7 @@ use burn_dragon_p2p::native::{prepare_climbmix_native_rocm, prepare_nca_native_r
 use burn_dragon_p2p::native::{prepare_climbmix_native_wgpu, prepare_nca_native_wgpu};
 use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
+use burn_ndarray::NdArray;
 use burn_p2p::{
     AuthConfig, ClientPlatform, ClientReleaseManifest, ContentId, ControlPlaneSnapshot,
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentHandle, ExperimentId,
@@ -123,6 +125,8 @@ enum CommandKind {
     #[command(alias = "complete-login")]
     CompleteGithubLogin(CompleteGithubLoginArgs),
     EnrollStaticPrincipal(EnrollStaticPrincipalArgs),
+    TrainLocal(TrainLocalArgs),
+    MonitorRun(MonitorRunArgs),
     TrainWindowOnce(TrainWindowOnceArgs),
     RunPeer(RunPeerArgs),
     RunHeadMirror(RunHeadMirrorArgs),
@@ -147,13 +151,14 @@ enum OutputFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ExperimentKindArg {
     Nca,
+    Ruliad,
     Climbmix,
 }
 
 impl ExperimentKindArg {
     fn into_config(self) -> DragonExperimentKind {
         match self {
-            Self::Nca => DragonExperimentKind::NcaPrepretraining,
+            Self::Nca | Self::Ruliad => DragonExperimentKind::NcaPrepretraining,
             Self::Climbmix => DragonExperimentKind::ClimbMixPretraining,
         }
     }
@@ -290,6 +295,21 @@ impl CapabilityPolicyArgs {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TrainingProgressRendererArg {
+    Quiet,
+    Default,
+}
+
+impl TrainingProgressRendererArg {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Default => "default",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Parser)]
 struct NativeTrainingOverrideArgs {
     #[arg(long = "training-batch-size", value_name = "BATCH_SIZE")]
@@ -311,6 +331,65 @@ impl NativeTrainingOverrideArgs {
         if let Some(max_eval_batches) = self.max_eval_batches {
             config.training_overrides.max_eval_batches = Some(max_eval_batches);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Parser)]
+struct LocalTrainingOverrideArgs {
+    #[arg(long = "n-layer", value_name = "LAYERS")]
+    n_layer: Option<usize>,
+    #[arg(long = "n-embd", value_name = "DIM")]
+    n_embd: Option<usize>,
+    #[arg(long = "n-head", value_name = "HEADS")]
+    n_head: Option<usize>,
+    #[arg(long = "latent-total", value_name = "LATENTS")]
+    latent_total: Option<usize>,
+    #[arg(long = "training-block-size", value_name = "TOKENS")]
+    block_size: Option<usize>,
+    #[arg(long = "training-batch-size", value_name = "BATCH_SIZE")]
+    batch_size: Option<usize>,
+    #[arg(long = "training-max-iters", value_name = "ITERS")]
+    max_iters: Option<usize>,
+    #[arg(long = "checkpoint-interval-iters", value_name = "ITERS")]
+    checkpoint_interval_iters: Option<usize>,
+}
+
+impl LocalTrainingOverrideArgs {
+    fn apply_to(self, config: &mut TrainingConfig) -> Result<()> {
+        if let Some(n_layer) = self.n_layer {
+            config.model.n_layer = Some(n_layer);
+        }
+        if let Some(n_embd) = self.n_embd {
+            config.model.n_embd = Some(n_embd);
+        }
+        if let Some(n_head) = self.n_head {
+            config.model.n_head = Some(n_head);
+        }
+        if let Some(latent_total) = self.latent_total {
+            config.model.latent_total = Some(latent_total);
+            if let Some(n_embd) = self.n_embd.or(config.model.n_embd) {
+                if latent_total % n_embd != 0 {
+                    bail!(
+                        "--latent-total must be divisible by the resolved --n-embd/model.n_embd (got latent_total={latent_total} n_embd={n_embd})"
+                    );
+                }
+                config.model.mlp_internal_dim_multiplier = Some(latent_total / n_embd);
+            }
+        }
+        if let Some(block_size) = self.block_size {
+            config.training.block_size = block_size;
+            config.model.block_size = Some(block_size);
+        }
+        if let Some(batch_size) = self.batch_size {
+            config.training.batch_size = batch_size;
+        }
+        if let Some(max_iters) = self.max_iters {
+            config.training.max_iters = max_iters;
+        }
+        if let Some(checkpoint_interval_iters) = self.checkpoint_interval_iters {
+            config.training.checkpoint_interval_iters = checkpoint_interval_iters;
+        }
+        config.validate()
     }
 }
 
@@ -653,6 +732,36 @@ struct TrainWindowOnceArgs {
 }
 
 #[derive(Debug, Parser)]
+struct TrainLocalArgs {
+    #[arg(long = "training-config", alias = "config", required = true)]
+    training_config_paths: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendArg,
+    #[arg(long, value_enum, default_value = "quiet")]
+    progress: TrainingProgressRendererArg,
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+    #[arg(long)]
+    run_dir: Option<PathBuf>,
+    #[arg(long)]
+    run_name: Option<String>,
+    #[command(flatten)]
+    training_overrides: LocalTrainingOverrideArgs,
+}
+
+#[derive(Debug, Parser)]
+struct MonitorRunArgs {
+    #[arg(long)]
+    run_dir: PathBuf,
+    #[arg(long)]
+    run_name: Option<String>,
+    #[arg(long, default_value_t = false)]
+    follow: bool,
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
+}
+
+#[derive(Debug, Parser)]
 struct RunHeadMirrorArgs {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -879,6 +988,8 @@ fn main() -> Result<()> {
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
         CommandKind::EnrollStaticPrincipal(args) => enroll_static_principal(args),
+        CommandKind::TrainLocal(args) => train_local(args),
+        CommandKind::MonitorRun(args) => monitor_run(args),
         CommandKind::TrainWindowOnce(args) => train_window_once(args),
         CommandKind::RunPeer(args) => run_peer(args),
         CommandKind::RunHeadMirror(args) => run_head_mirror(args),
@@ -902,6 +1013,8 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::BeginGithubLogin(_) => "begin-github-login",
         CommandKind::CompleteGithubLogin(_) => "complete-github-login",
         CommandKind::EnrollStaticPrincipal(_) => "enroll-static-principal",
+        CommandKind::TrainLocal(_) => "train-local",
+        CommandKind::MonitorRun(_) => "monitor-run",
         CommandKind::TrainWindowOnce(_) => "train-window-once",
         CommandKind::RunPeer(_) => "run-peer",
         CommandKind::RunHeadMirror(_) => "run-head-mirror",
@@ -2150,6 +2263,102 @@ fn enroll_static_principal(args: EnrollStaticPrincipalArgs) -> Result<()> {
         args.output_format,
         &session.auth,
     )
+}
+
+fn train_local(args: TrainLocalArgs) -> Result<()> {
+    ensure_training_backend_runtime_accessible(args.backend)?;
+    apply_local_run_env(&args)?;
+    let mut config = load_training_config(&args.training_config_paths)?;
+    args.training_overrides.apply_to(&mut config)?;
+    eprintln!(
+        "starting burn_dragon local training: backend={} configs={} max_iters={} batch_size={} block_size={}",
+        args.backend.as_label(),
+        args.training_config_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        config.training.max_iters,
+        config.training.batch_size,
+        config.training.block_size,
+    );
+    match args.backend {
+        BackendArg::Cpu => train_local_backend::<Autodiff<NdArray<f32>>>(&config, "cpu"),
+        #[cfg(feature = "wgpu")]
+        BackendArg::Wgpu => train_local_backend::<Autodiff<burn_wgpu::Wgpu<f32>>>(&config, "wgpu"),
+        #[cfg(feature = "cuda")]
+        BackendArg::Cuda => train_local_backend::<Autodiff<burn_cuda::Cuda<f32>>>(&config, "cuda"),
+        #[cfg(feature = "rocm")]
+        BackendArg::Rocm => train_local_backend::<Autodiff<burn_rocm::Rocm<f32>>>(&config, "rocm"),
+        #[cfg(not(feature = "wgpu"))]
+        BackendArg::Wgpu => bail!("this binary was built without the `wgpu` feature"),
+        #[cfg(not(feature = "cuda"))]
+        BackendArg::Cuda => bail!("this binary was built without the `cuda` feature"),
+        #[cfg(not(feature = "rocm"))]
+        BackendArg::Rocm => bail!("this binary was built without the `rocm` feature"),
+    }
+}
+
+fn monitor_run(args: MonitorRunArgs) -> Result<()> {
+    let run_name = args.run_name.unwrap_or_else(|| {
+        args.run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("monitored-run")
+            .to_string()
+    });
+    burn_dragon_train::train::events::monitor_run(
+        burn_dragon_train::train::events::MonitorRunOptions {
+            run_dir: args.run_dir,
+            run_name,
+            follow: args.follow,
+            poll_interval: Duration::from_secs(args.poll_interval_secs.max(1)),
+            events: burn_dragon_train::TrainingEventsConfig::default(),
+            gates: burn_dragon_train::TrainingGatesConfig::default(),
+        },
+    )
+}
+
+fn apply_local_run_env(args: &TrainLocalArgs) -> Result<()> {
+    set_process_env(
+        "DragonModel_TRAINING_PROGRESS_RENDERER",
+        args.progress.as_env(),
+    );
+    if let Some(run_root) = &args.run_root {
+        set_process_env_path("BURN_DRAGON_RUN_ROOT", run_root);
+    }
+    match (&args.run_dir, &args.run_name) {
+        (Some(run_dir), Some(run_name)) => {
+            set_process_env_path("BURN_DRAGON_RUN_DIR", run_dir);
+            set_process_env("BURN_DRAGON_RUN_NAME", run_name);
+        }
+        (None, None) => {}
+        _ => bail!("--run-dir and --run-name must be provided together"),
+    }
+    Ok(())
+}
+
+fn set_process_env_path(key: &str, value: &Path) {
+    // SAFETY: CLI startup is single-threaded here; no other Rust threads are reading env vars yet.
+    unsafe {
+        env::set_var(key, value);
+    }
+}
+
+fn set_process_env(key: &str, value: &str) {
+    // SAFETY: CLI startup is single-threaded here; no other Rust threads are reading env vars yet.
+    unsafe {
+        env::set_var(key, value);
+    }
+}
+
+fn train_local_backend<B>(config: &TrainingConfig, backend_label: &str) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
+    train::train_backend::<B, _>(config, dataset, backend_label, |_| {})
 }
 
 fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {

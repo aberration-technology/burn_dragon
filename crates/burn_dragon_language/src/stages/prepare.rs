@@ -1,24 +1,96 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use burn_dragon_train::train::pipeline::resolve_resume_run_dir;
-use burn_dragon_universality::{NcaCorpusConfig, load_nca_config};
+use burn_dragon_universality::{
+    GeneratedCorpusReport, GeneratedRuliadCorpusReport, NcaCorpusConfig, RuliadCorpusConfig,
+    generate_nca_corpus, generate_ruliad_corpus, load_nca_config, load_ruliad_config,
+};
 
 use crate::config::{DatasetSourceConfig, TrainingConfig, load_training_config};
 use crate::tokenizer::TokenizerKind;
 
 use super::{ExperimentStageArtifact, ExperimentStageConfig, ExperimentStageKind};
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreparedUniversalityCorpusConfig {
+    Nca(NcaCorpusConfig),
+    Ruliad(RuliadCorpusConfig),
+}
+
+#[derive(Debug, Clone)]
+pub enum GeneratedUniversalityCorpusReport {
+    Nca(GeneratedCorpusReport),
+    Ruliad(GeneratedRuliadCorpusReport),
+}
+
+impl PreparedUniversalityCorpusConfig {
+    pub fn output_dir(&self) -> &Path {
+        match self {
+            Self::Nca(config) => &config.output_dir,
+            Self::Ruliad(config) => &config.output_dir,
+        }
+    }
+}
+
+impl GeneratedUniversalityCorpusReport {
+    pub fn manifest_path(&self) -> &Path {
+        match self {
+            Self::Nca(report) => &report.manifest_path,
+            Self::Ruliad(report) => &report.manifest_path,
+        }
+    }
+
+    pub fn sample_records_path(&self) -> &Path {
+        match self {
+            Self::Nca(report) => &report.sample_records_path,
+            Self::Ruliad(report) => &report.sample_records_path,
+        }
+    }
+
+    pub fn output_dir(&self) -> &Path {
+        match self {
+            Self::Nca(report) => report
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            Self::Ruliad(report) => &report.output_dir,
+        }
+    }
+}
+
 pub fn prepare_universality_stage_config(
     bundle_config_path: &Path,
     stage_dir: &Path,
     source_config_path: &Path,
-) -> Result<NcaCorpusConfig> {
+) -> Result<PreparedUniversalityCorpusConfig> {
     let source_path = resolve_relative_to(bundle_config_path, source_config_path);
-    let mut config = load_nca_config(&source_path)?;
-    config.output_dir = stage_dir.join("output");
-    Ok(config)
+    let output_dir = stage_dir.join("output");
+    match load_universality_corpus_config(&source_path)? {
+        PreparedUniversalityCorpusConfig::Nca(mut config) => {
+            config.output_dir = output_dir;
+            Ok(PreparedUniversalityCorpusConfig::Nca(config))
+        }
+        PreparedUniversalityCorpusConfig::Ruliad(mut config) => {
+            config.output_dir = output_dir;
+            Ok(PreparedUniversalityCorpusConfig::Ruliad(config))
+        }
+    }
+}
+
+pub fn generate_prepared_universality_stage_corpus(
+    config: &PreparedUniversalityCorpusConfig,
+) -> Result<GeneratedUniversalityCorpusReport> {
+    match config {
+        PreparedUniversalityCorpusConfig::Nca(config) => {
+            generate_nca_corpus(config).map(GeneratedUniversalityCorpusReport::Nca)
+        }
+        PreparedUniversalityCorpusConfig::Ruliad(config) => {
+            generate_ruliad_corpus(config).map(GeneratedUniversalityCorpusReport::Ruliad)
+        }
+    }
 }
 
 pub fn prepare_language_stage_config(
@@ -114,4 +186,60 @@ fn resolve_relative_to(bundle_config_path: &Path, relative_or_absolute: &Path) -
             .unwrap_or_else(|| Path::new("."))
             .join(relative_or_absolute)
     }
+}
+
+fn load_universality_corpus_config(path: &Path) -> Result<PreparedUniversalityCorpusConfig> {
+    if looks_like_ruliad_config(path)? {
+        return load_ruliad_config(path).map(PreparedUniversalityCorpusConfig::Ruliad);
+    }
+    match load_nca_config(path) {
+        Ok(config) => Ok(PreparedUniversalityCorpusConfig::Nca(config)),
+        Err(nca_error) => load_ruliad_config(path)
+            .map(PreparedUniversalityCorpusConfig::Ruliad)
+            .with_context(|| {
+                format!(
+                    "failed to parse {} as NCA or ruliad config; NCA parse error: {nca_error:#}",
+                    path.display()
+                )
+            }),
+    }
+}
+
+fn looks_like_ruliad_config(path: &Path) -> Result<bool> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read universality config {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
+    if value.get("proof_tasks").is_some() || value.get("lean_task_limit").is_some() {
+        return Ok(true);
+    }
+    if value
+        .get("serialization")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("document_tokens"))
+    {
+        return Ok(true);
+    }
+    let ruliad_family = value
+        .get("families")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter_map(|family| family.get("kind"))
+        .filter_map(toml::Value::as_str)
+        .any(|kind| {
+            matches!(
+                kind,
+                "eca"
+                    | "simulation"
+                    | "automaton"
+                    | "rewrite"
+                    | "algebra"
+                    | "category"
+                    | "lean_task"
+                    | "hash_noise"
+            )
+        });
+    Ok(ruliad_family)
 }

@@ -9,15 +9,21 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use burn::tensor::backend::Backend;
+use burn::tensor::{Int, Tensor, TensorData};
 use memmap2::Mmap;
+use rand::prelude::*;
 
 use super::DatasetSplit;
 use super::prepared_chunks::{ChunkRuntimeCache, load_cached_chunk_from_mutex, mmap_as_u32_slice};
 use super::scheduler::{SequenceBatch, TokenSequenceDataset};
+use crate::summary_events::summary_event_mask_tensor;
 use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
 
 const DEFAULT_RUNTIME_CHUNK_CACHE_LIMIT: usize = 8;
 const DEFAULT_RUNTIME_DOCUMENT_CACHE_LIMIT: usize = 64;
+const DEFAULT_RUNTIME_GENERATION_WORKER_LIMIT: usize = 32;
+const DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP: usize = 4;
+const SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG: u8 = 2;
 
 #[derive(Clone)]
 enum UniversalityStorage {
@@ -34,10 +40,12 @@ struct ManifestStorage {
 
 #[derive(Clone)]
 struct OnTheFlyStorage {
-    corpus: Arc<burn_dragon_universality::OnlineNcaCorpus>,
+    corpus: Arc<dyn OnlineUniversalityCorpus>,
     config_path: PathBuf,
+    source_kind_label: &'static str,
     cache_limit: usize,
     cache: Arc<EpochRuntimeCacheState>,
+    source_selection: Option<Arc<LiveSourceSelectionState>>,
     train_probe_summary: burn_dragon_universality::RuntimeCorpusSummary,
     validation_probe_summary: burn_dragon_universality::RuntimeCorpusSummary,
 }
@@ -71,8 +79,56 @@ struct EpochRuntimeCache {
 }
 
 struct CachedEpochDocuments {
-    documents: Arc<Vec<Arc<Vec<u32>>>>,
+    documents: Arc<GeneratedEpochDocuments>,
     last_used_tick: u64,
+}
+
+struct GeneratedEpochDocuments {
+    documents: Vec<Arc<Vec<u32>>>,
+    documents_by_bucket: HashMap<String, Vec<usize>>,
+}
+
+impl GeneratedEpochDocuments {
+    fn len(&self) -> usize {
+        self.documents.len()
+    }
+}
+
+struct LiveSourceSelectionState {
+    sampler: Mutex<burn_dragon_universality::RuliadFrontierSampler>,
+    bucket_labels: Vec<String>,
+    pending: Mutex<HashMap<usize, String>>,
+    pending_limit: usize,
+}
+
+trait OnlineUniversalityCorpus: Send + Sync {
+    fn train_samples(&self) -> usize;
+    fn validation_samples(&self) -> usize;
+    fn document_token_count(&self) -> usize;
+    fn generate_document_tokens_for_epoch(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> anyhow::Result<Vec<u32>>;
+
+    fn source_selection_seed(&self) -> u64 {
+        0
+    }
+
+    fn source_buckets(&self) -> Vec<burn_dragon_universality::RuliadSourceBucket> {
+        Vec::new()
+    }
+
+    fn generate_document_tokens_for_source_bucket(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        _bucket_label: &str,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.generate_document_tokens_for_epoch(split, epoch_index, sample_index)
+    }
 }
 
 #[derive(Default)]
@@ -91,6 +147,263 @@ pub struct UniversalityDataset {
     train_split_ratio: f32,
     tokenizer: SharedTokenizer,
     dataset_name: String,
+}
+
+impl OnlineUniversalityCorpus for burn_dragon_universality::OnlineNcaCorpus {
+    fn train_samples(&self) -> usize {
+        self.train_samples()
+    }
+
+    fn validation_samples(&self) -> usize {
+        self.validation_samples()
+    }
+
+    fn document_token_count(&self) -> usize {
+        self.document_token_count()
+    }
+
+    fn generate_document_tokens_for_epoch(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.generate_document_tokens_for_epoch(split, epoch_index, sample_index)
+    }
+}
+
+impl OnlineUniversalityCorpus for burn_dragon_universality::OnlineRuliadCorpus {
+    fn train_samples(&self) -> usize {
+        self.train_samples()
+    }
+
+    fn validation_samples(&self) -> usize {
+        self.validation_samples()
+    }
+
+    fn document_token_count(&self) -> usize {
+        self.document_token_count()
+    }
+
+    fn generate_document_tokens_for_epoch(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.generate_document_tokens_for_epoch(split, epoch_index, sample_index)
+    }
+
+    fn source_selection_seed(&self) -> u64 {
+        self.config().seed
+    }
+
+    fn source_buckets(&self) -> Vec<burn_dragon_universality::RuliadSourceBucket> {
+        burn_dragon_universality::OnlineRuliadCorpus::source_buckets(self).to_vec()
+    }
+
+    fn generate_document_tokens_for_source_bucket(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket_label: &str,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(self
+            .generate_document_for_source_bucket(split, epoch_index, sample_index, bucket_label)?
+            .tokens)
+    }
+}
+
+impl LiveSourceSelectionState {
+    fn new(
+        config: burn_dragon_universality::RuliadSamplerConfig,
+        candidates: Vec<burn_dragon_universality::RuliadSamplerCandidate>,
+    ) -> Option<Self> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let bucket_labels = candidates
+            .iter()
+            .map(|candidate| candidate.oracle_hash.clone())
+            .collect::<Vec<_>>();
+        Some(Self {
+            sampler: Mutex::new(burn_dragon_universality::RuliadFrontierSampler::new(
+                config, candidates,
+            )),
+            bucket_labels,
+            pending: Mutex::new(HashMap::new()),
+            pending_limit: live_source_selection_pending_limit(),
+        })
+    }
+
+    fn probabilities(&self) -> Vec<f32> {
+        self.sampler
+            .lock()
+            .expect("ruliad source sampler lock poisoned")
+            .probabilities()
+    }
+
+    fn choose_bucket_for_step(
+        &self,
+        available: &HashMap<String, Vec<usize>>,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> Option<String> {
+        self.choose_bucket_for_step_inner(available, epoch_index, absolute_step, true)
+    }
+
+    fn choose_bucket_label_for_step(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> Option<String> {
+        self.choose_bucket_label_for_step_inner(epoch_index, absolute_step, true)
+    }
+
+    fn choose_bucket_label_for_validation_step(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> Option<String> {
+        self.choose_bucket_label_for_step_inner(epoch_index, absolute_step, false)
+    }
+
+    fn choose_bucket_label_for_step_inner(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        record_pending: bool,
+    ) -> Option<String> {
+        let probs = self.probabilities();
+        let mut weighted = Vec::new();
+        for (index, label) in self.bucket_labels.iter().enumerate() {
+            let weight = probs
+                .get(index)
+                .copied()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(1e-9);
+            weighted.push((label.clone(), weight));
+        }
+        if weighted.is_empty() {
+            return None;
+        }
+        let total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+            epoch_index,
+            absolute_step,
+            weighted.len(),
+        ));
+        let ticket = rng.r#gen::<f32>() * total.max(1e-12);
+        let mut cumulative = 0.0;
+        for (label, weight) in weighted {
+            cumulative += weight;
+            if ticket <= cumulative {
+                if record_pending {
+                    self.record_pending(absolute_step, &label);
+                }
+                return Some(label);
+            }
+        }
+        None
+    }
+
+    fn choose_bucket_for_step_inner(
+        &self,
+        available: &HashMap<String, Vec<usize>>,
+        epoch_index: usize,
+        absolute_step: usize,
+        record_pending: bool,
+    ) -> Option<String> {
+        let probs = self.probabilities();
+        let mut filtered = Vec::new();
+        for (index, label) in self.bucket_labels.iter().enumerate() {
+            if available
+                .get(label)
+                .is_some_and(|documents| !documents.is_empty())
+            {
+                filtered.push((
+                    label.clone(),
+                    probs
+                        .get(index)
+                        .copied()
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .unwrap_or(1e-9),
+                ));
+            }
+        }
+        if filtered.is_empty() {
+            return None;
+        }
+        let total = filtered.iter().map(|(_, weight)| *weight).sum::<f32>();
+        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+            epoch_index,
+            absolute_step,
+            filtered.len(),
+        ));
+        let ticket = rng.r#gen::<f32>() * total.max(1e-12);
+        let mut cumulative = 0.0;
+        for (label, weight) in filtered {
+            cumulative += weight;
+            if ticket <= cumulative {
+                if record_pending {
+                    self.record_pending(absolute_step, &label);
+                }
+                return Some(label);
+            }
+        }
+        None
+    }
+
+    fn record_pending(&self, absolute_step: usize, bucket_label: &str) {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("ruliad source pending lock poisoned");
+        pending.insert(absolute_step, bucket_label.to_string());
+        if pending.len() > self.pending_limit {
+            let remove_count = pending.len().saturating_sub(self.pending_limit);
+            let mut keys = pending.keys().copied().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys.into_iter().take(remove_count) {
+                pending.remove(&key);
+            }
+        }
+    }
+
+    fn record_loss(
+        &self,
+        absolute_step: usize,
+        loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        let bucket_label = self
+            .pending
+            .lock()
+            .expect("ruliad source pending lock poisoned")
+            .remove(&absolute_step)?;
+        let mut sampler = self
+            .sampler
+            .lock()
+            .expect("ruliad source sampler lock poisoned");
+        sampler.record_telemetry(&burn_dragon_universality::RuliadSampleTelemetry {
+            oracle_hash: bucket_label,
+            family: String::new(),
+            task_kind: String::new(),
+            loss,
+            previous_loss: None,
+            gradient_alignment: None,
+            verification_cost: 1.0,
+            accepted: true,
+        });
+        Some(sampler.snapshot())
+    }
+
+    fn snapshot(&self) -> burn_dragon_universality::RuliadMetricSnapshot {
+        self.sampler
+            .lock()
+            .expect("ruliad source sampler lock poisoned")
+            .snapshot()
+    }
 }
 
 impl UniversalityDataset {
@@ -242,12 +555,99 @@ impl UniversalityDataset {
             storage: UniversalityStorage::OnTheFly(OnTheFlyStorage {
                 corpus: Arc::new(corpus),
                 config_path,
+                source_kind_label: "on-the-fly universality NCA",
                 cache_limit: runtime_document_cache_limit(
                     batch_size,
                     train_probe_summary.sample_count,
                     validation_probe_summary.sample_count,
                 ),
                 cache: Arc::new(EpochRuntimeCacheState::default()),
+                source_selection: None,
+                train_probe_summary,
+                validation_probe_summary,
+            }),
+            train_len,
+            token_count,
+            block_size,
+            batch_size,
+            train_split_ratio,
+            tokenizer,
+            dataset_name,
+        })
+    }
+
+    pub fn new_ruliad_on_the_fly(
+        config_path: impl AsRef<Path>,
+        block_size: usize,
+        batch_size: usize,
+        tokenizer_cfg: &TokenizerConfig,
+    ) -> io::Result<Self> {
+        let tokenizer = validate_pretokenized_tokenizer(tokenizer_cfg)?;
+        let config_path = config_path.as_ref().to_path_buf();
+        let corpus = burn_dragon_universality::OnlineRuliadCorpus::load(&config_path)
+            .map_err(io::Error::other)?;
+        validate_tokenizer_against_manifest(tokenizer.as_ref(), corpus.tokenizer_manifest())?;
+        let document_token_count = corpus.document_token_count();
+        let logical_document_tokens = document_token_count.saturating_sub(1);
+        if logical_document_tokens == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "on-the-fly ruliad corpus must yield at least one input token per document",
+            ));
+        }
+        if block_size > logical_document_tokens {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "training.block_size={} exceeds on-the-fly ruliad logical document length {}",
+                    block_size, logical_document_tokens
+                ),
+            ));
+        }
+
+        let train_probe_summary = corpus
+            .default_probe_summary(burn_dragon_universality::SampleSplit::Train)
+            .map_err(io::Error::other)?;
+        let validation_probe_summary = corpus
+            .default_probe_summary(burn_dragon_universality::SampleSplit::Validation)
+            .map_err(io::Error::other)?;
+        let train_len = corpus.train_token_count();
+        let token_count = corpus.total_token_count();
+        let train_split_ratio = if token_count == 0 {
+            1.0
+        } else {
+            train_len as f32 / token_count as f32
+        };
+        let dataset_name = config_file_display_name(
+            config_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("ruliad"),
+        )
+        .to_string();
+        let source_selection = corpus
+            .source_selection_enabled()
+            .then(|| {
+                LiveSourceSelectionState::new(
+                    corpus.config().source_selection.sampler,
+                    corpus.sampler_candidates(),
+                )
+            })
+            .flatten()
+            .map(Arc::new);
+
+        Ok(Self {
+            storage: UniversalityStorage::OnTheFly(OnTheFlyStorage {
+                corpus: Arc::new(corpus),
+                config_path,
+                source_kind_label: "on-the-fly universality ruliad",
+                cache_limit: runtime_document_cache_limit(
+                    batch_size,
+                    train_probe_summary.sample_count,
+                    validation_probe_summary.sample_count,
+                ),
+                cache: Arc::new(EpochRuntimeCacheState::default()),
+                source_selection,
                 train_probe_summary,
                 validation_probe_summary,
             }),
@@ -275,7 +675,7 @@ impl UniversalityDataset {
     pub fn source_kind_label(&self) -> &'static str {
         match &self.storage {
             UniversalityStorage::Manifest(_) => "universality manifest",
-            UniversalityStorage::OnTheFly(_) => "on-the-fly universality NCA",
+            UniversalityStorage::OnTheFly(storage) => storage.source_kind_label,
         }
     }
 
@@ -322,6 +722,78 @@ impl UniversalityDataset {
         super::scheduler::sample_batch(self, split, device)
     }
 
+    pub fn sample_source_weighted_validation_batch<B: Backend>(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        summary_event_token_ids: Option<&[u32]>,
+        device: &B::Device,
+    ) -> Option<SequenceBatch<B>> {
+        let storage = match &self.storage {
+            UniversalityStorage::Manifest(_) => return None,
+            UniversalityStorage::OnTheFly(storage) => storage,
+        };
+        let documents = storage.source_weighted_validation_documents(
+            epoch_index,
+            absolute_step,
+            batch_size.max(1),
+        )?;
+        let document_token_count = documents.first()?.len();
+        let logical_document_tokens = document_token_count.checked_sub(1)?;
+        if self.block_size > logical_document_tokens {
+            return None;
+        }
+
+        let max_start_in_document = logical_document_tokens
+            .saturating_sub(self.block_size)
+            .min(document_token_count.saturating_sub(self.block_size + 1));
+        let batch_size = batch_size.max(1);
+        let mut inputs = vec![0i64; batch_size * self.block_size];
+        let mut targets = vec![0i64; batch_size * self.block_size];
+        for (batch_idx, document) in documents.iter().enumerate() {
+            if document.len() <= self.block_size {
+                return None;
+            }
+            let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+                epoch_index,
+                absolute_step,
+                SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG as usize ^ batch_idx,
+            ));
+            let start = if max_start_in_document == 0 {
+                0
+            } else {
+                rng.gen_range(0..=max_start_in_document)
+            };
+            for token_index in 0..self.block_size {
+                let offset = batch_idx * self.block_size + token_index;
+                inputs[offset] = document[start + token_index] as i64;
+                targets[offset] = document[start + token_index + 1] as i64;
+            }
+        }
+
+        let summary_event_mask = summary_event_mask_tensor::<B>(
+            &inputs,
+            batch_size,
+            self.block_size,
+            summary_event_token_ids,
+            device,
+        );
+        let inputs_tensor = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(inputs, [batch_size, self.block_size]),
+            device,
+        );
+        let targets_tensor = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(targets, [batch_size, self.block_size]),
+            device,
+        );
+        Some(SequenceBatch::new(
+            inputs_tensor,
+            targets_tensor,
+            summary_event_mask,
+        ))
+    }
+
     pub fn train_probe_summary(&self) -> Option<&burn_dragon_universality::RuntimeCorpusSummary> {
         match &self.storage {
             UniversalityStorage::Manifest(_) => None,
@@ -342,6 +814,39 @@ impl UniversalityDataset {
         match &self.storage {
             UniversalityStorage::Manifest(_) => None,
             UniversalityStorage::OnTheFly(storage) => Some(storage.cache_limit),
+        }
+    }
+
+    pub fn uses_live_source_selection(&self) -> bool {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => false,
+            UniversalityStorage::OnTheFly(storage) => storage.source_selection.is_some(),
+        }
+    }
+
+    pub fn record_source_selection_loss(
+        &self,
+        absolute_step: usize,
+        loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => None,
+            UniversalityStorage::OnTheFly(storage) => storage
+                .source_selection
+                .as_ref()
+                .and_then(|source_selection| source_selection.record_loss(absolute_step, loss)),
+        }
+    }
+
+    pub fn source_selection_snapshot(
+        &self,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => None,
+            UniversalityStorage::OnTheFly(storage) => storage
+                .source_selection
+                .as_ref()
+                .map(|source_selection| source_selection.snapshot()),
         }
     }
 }
@@ -406,6 +911,62 @@ impl TokenSequenceDataset for UniversalityDataset {
         }
     }
 
+    fn uses_live_source_selection(&self) -> bool {
+        self.uses_live_source_selection()
+    }
+
+    fn source_selected_document_indices(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<Vec<usize>> {
+        match (split, &self.storage) {
+            (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_document_indices(
+                    burn_dragon_universality::SampleSplit::Train,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
+                ),
+            _ => None,
+        }
+    }
+
+    fn source_selected_token_windows(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        match (split, &self.storage) {
+            (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_token_windows(
+                    burn_dragon_universality::SampleSplit::Train,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
+                    block_size,
+                ),
+            _ => None,
+        }
+    }
+
+    fn record_source_selection_loss(
+        &self,
+        absolute_step: usize,
+        loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        self.record_source_selection_loss(absolute_step, loss)
+    }
+
+    fn source_selection_snapshot(&self) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        self.source_selection_snapshot()
+    }
+
     fn preferred_logical_document_tokens(&self, _split: DatasetSplit) -> Option<usize> {
         match &self.storage {
             UniversalityStorage::Manifest(storage) => storage.preferred_logical_document_tokens,
@@ -452,7 +1013,7 @@ impl OnTheFlyStorage {
             let sample_index = split_offset / document_token_count;
             if sample_index >= split_sample_count {
                 panic!(
-                    "on-the-fly NCA token request out of range: split={split:?} sample_index={sample_index} sample_count={split_sample_count} start={start} len={}",
+                    "on-the-fly universality token request out of range: split={split:?} sample_index={sample_index} sample_count={split_sample_count} start={start} len={}",
                     dst.len()
                 );
             }
@@ -483,22 +1044,117 @@ impl OnTheFlyStorage {
         sample_index: usize,
         epoch_index: usize,
     ) -> Arc<Vec<u32>> {
-        let documents = self.epoch_documents(split, epoch_index);
+        let epoch = self.epoch_documents(split, epoch_index);
         Arc::clone(
-            documents.get(sample_index).unwrap_or_else(|| {
+            epoch.documents.get(sample_index).unwrap_or_else(|| {
                 panic!(
-                    "on-the-fly NCA epoch cache out of range: split={split:?} epoch_index={epoch_index} sample_index={sample_index} sample_count={}",
-                    documents.len()
+                    "on-the-fly universality epoch cache out of range: split={split:?} epoch_index={epoch_index} sample_index={sample_index} sample_count={}",
+                    epoch.len()
                 )
             }),
         )
     }
 
+    fn source_selected_document_indices(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<Vec<usize>> {
+        if self.source_selection.is_some() {
+            return None;
+        }
+        if split != burn_dragon_universality::SampleSplit::Train {
+            return None;
+        }
+        let source_selection = self.source_selection.as_ref()?;
+        let epoch = self.epoch_documents(split, epoch_index);
+        if epoch.documents_by_bucket.is_empty() {
+            return None;
+        }
+        let bucket_label = source_selection.choose_bucket_for_step(
+            &epoch.documents_by_bucket,
+            epoch_index,
+            absolute_step,
+        )?;
+        let documents = epoch.documents_by_bucket.get(&bucket_label)?;
+        if documents.is_empty() {
+            return None;
+        }
+        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+            epoch_index,
+            absolute_step,
+            source_label_seed(&bucket_label) as usize,
+        ));
+        Some(
+            (0..batch_size)
+                .map(|_| documents[rng.gen_range(0..documents.len())])
+                .collect(),
+        )
+    }
+
+    fn source_selected_token_windows(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        if split != burn_dragon_universality::SampleSplit::Train {
+            return None;
+        }
+        let source_selection = self.source_selection.as_ref()?;
+        let bucket_label =
+            source_selection.choose_bucket_label_for_step(epoch_index, absolute_step)?;
+        let document_count = live_source_selection_documents_per_step(batch_size);
+        let documents = self.generate_source_bucket_documents(
+            split,
+            epoch_index,
+            absolute_step,
+            &bucket_label,
+            document_count,
+        );
+        Some(source_selected_windows_from_documents(
+            &documents,
+            epoch_index,
+            absolute_step,
+            &bucket_label,
+            batch_size,
+            block_size,
+        ))
+    }
+
+    fn source_weighted_validation_documents(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<Vec<Arc<Vec<u32>>>> {
+        let source_selection = self.source_selection.as_ref()?;
+        let bucket_label =
+            source_selection.choose_bucket_label_for_validation_step(epoch_index, absolute_step)?;
+        Some(self.generate_source_bucket_documents(
+            burn_dragon_universality::SampleSplit::Validation,
+            epoch_index,
+            absolute_step,
+            &bucket_label,
+            batch_size.max(1),
+        ))
+    }
+
     fn prepare_epoch(&self, split: burn_dragon_universality::SampleSplit, epoch_index: usize) {
+        if self.source_selection.is_some() {
+            return;
+        }
         let _ = self.epoch_documents(split, epoch_index);
     }
 
     fn prefetch_epoch(&self, split: burn_dragon_universality::SampleSplit, epoch_index: usize) {
+        if self.source_selection.is_some() {
+            return;
+        }
         let key = RuntimeEpochKey {
             split_tag: split_tag(split),
             epoch_index,
@@ -521,9 +1177,9 @@ impl OnTheFlyStorage {
         }
         let storage = self.clone();
         if let Err(error) = thread::Builder::new()
-            .name(format!("nca-epoch-prefetch-{epoch_index}"))
+            .name(format!("universality-epoch-prefetch-{epoch_index}"))
             .spawn(move || {
-                let _ = storage.build_and_store_epoch(key, split, epoch_index);
+                let _ = storage.build_and_store_epoch(key, split, epoch_index, false);
             })
         {
             self.clear_building_epoch(key);
@@ -535,7 +1191,7 @@ impl OnTheFlyStorage {
         &self,
         split: burn_dragon_universality::SampleSplit,
         epoch_index: usize,
-    ) -> Arc<Vec<Arc<Vec<u32>>>> {
+    ) -> Arc<GeneratedEpochDocuments> {
         let key = RuntimeEpochKey {
             split_tag: split_tag(split),
             epoch_index,
@@ -554,7 +1210,7 @@ impl OnTheFlyStorage {
             }
             if cache.building.insert(key) {
                 drop(cache);
-                return self.build_and_store_epoch(key, split, epoch_index);
+                return self.build_and_store_epoch(key, split, epoch_index, false);
             }
             let _unused = self
                 .cache
@@ -564,14 +1220,56 @@ impl OnTheFlyStorage {
         }
     }
 
+    fn generate_source_bucket_documents(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        bucket_label: &str,
+        document_count: usize,
+    ) -> Vec<Arc<Vec<u32>>> {
+        let sample_count = match split {
+            burn_dragon_universality::SampleSplit::Train => self.corpus.train_samples(),
+            burn_dragon_universality::SampleSplit::Validation => self.corpus.validation_samples(),
+        }
+        .max(1);
+        (0..document_count.max(1))
+            .map(|document_rank| {
+                let sample_index = live_source_selection_sample_index(
+                    sample_count,
+                    split,
+                    epoch_index,
+                    absolute_step,
+                    bucket_label,
+                    document_rank,
+                );
+                Arc::new(
+                    self.corpus
+                        .generate_document_tokens_for_source_bucket(
+                            split,
+                            epoch_index,
+                            sample_index,
+                            bucket_label,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "failed to generate live source-selected universality sample split={split:?} epoch_index={epoch_index} absolute_step={absolute_step} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                            )
+                        }),
+                )
+            })
+            .collect()
+    }
+
     fn build_and_store_epoch(
         &self,
         key: RuntimeEpochKey,
         split: burn_dragon_universality::SampleSplit,
         epoch_index: usize,
-    ) -> Arc<Vec<Arc<Vec<u32>>>> {
+        source_weighted: bool,
+    ) -> Arc<GeneratedEpochDocuments> {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            Arc::new(self.generate_epoch_documents(split, epoch_index))
+            Arc::new(self.generate_epoch_documents(split, epoch_index, source_weighted))
         }));
         match result {
             Ok(generated_documents) => {
@@ -588,7 +1286,7 @@ impl OnTheFlyStorage {
     fn store_generated_epoch(
         &self,
         key: RuntimeEpochKey,
-        generated_documents: Arc<Vec<Arc<Vec<u32>>>>,
+        generated_documents: Arc<GeneratedEpochDocuments>,
     ) {
         let mut cache = self
             .cache
@@ -640,44 +1338,93 @@ impl OnTheFlyStorage {
         &self,
         split: burn_dragon_universality::SampleSplit,
         epoch_index: usize,
-    ) -> Vec<Arc<Vec<u32>>> {
+        source_weighted: bool,
+    ) -> GeneratedEpochDocuments {
         let sample_count = match split {
             burn_dragon_universality::SampleSplit::Train => self.corpus.train_samples(),
             burn_dragon_universality::SampleSplit::Validation => self.corpus.validation_samples(),
         };
         if sample_count == 0 {
-            return Vec::new();
+            return GeneratedEpochDocuments {
+                documents: Vec::new(),
+                documents_by_bucket: HashMap::new(),
+            };
         }
 
-        let worker_count = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(4)
-            .min(sample_count)
-            .clamp(1, 8);
-        let (sender, receiver) =
-            sync_channel::<(usize, Arc<Vec<u32>>)>(worker_count.saturating_mul(2).max(1));
+        let source_plan =
+            if split == burn_dragon_universality::SampleSplit::Train || source_weighted {
+                self.source_selection.as_ref().and_then(|source_selection| {
+                    let buckets = self.corpus.source_buckets();
+                    (!buckets.is_empty()).then(|| {
+                        burn_dragon_universality::plan_epoch_source_buckets(
+                            &buckets,
+                            &source_selection.probabilities(),
+                            sample_count,
+                            self.corpus.source_selection_seed(),
+                            u64::from(if source_weighted {
+                                SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG
+                            } else {
+                                split_tag(split)
+                            }),
+                            epoch_index,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+        let source_bucket_plan = source_plan.as_ref().map(|plan| plan.bucket_ids.clone());
+
+        let worker_count = runtime_generation_worker_count(sample_count);
+        let (sender, receiver) = sync_channel::<(usize, Arc<Vec<u32>>, Option<String>)>(
+            worker_count.saturating_mul(2).max(1),
+        );
         let next_index = Arc::new(AtomicUsize::new(0));
+        let source_bucket_plan = Arc::new(source_bucket_plan);
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let sender = sender.clone();
             let next_index = Arc::clone(&next_index);
             let corpus = Arc::clone(&self.corpus);
+            let source_bucket_plan = Arc::clone(&source_bucket_plan);
             workers.push(thread::spawn(move || {
                 loop {
                     let sample_index = next_index.fetch_add(1, Ordering::Relaxed);
                     if sample_index >= sample_count {
                         break;
                     }
+                    let bucket_label = source_bucket_plan
+                        .as_ref()
+                        .as_ref()
+                        .and_then(|plan| plan.get(sample_index).cloned());
                     let tokens = Arc::new(
-                        corpus
-                            .generate_document_tokens_for_epoch(split, epoch_index, sample_index)
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "failed to generate on-the-fly NCA sample split={split:?} epoch_index={epoch_index} sample_index={sample_index}: {error:#}"
+                        match bucket_label.as_deref() {
+                            Some(bucket_label) => corpus
+                                .generate_document_tokens_for_source_bucket(
+                                    split,
+                                    epoch_index,
+                                    sample_index,
+                                    bucket_label,
                                 )
-                            }),
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "failed to generate source-selected universality sample split={split:?} epoch_index={epoch_index} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                                    )
+                                }),
+                            None => corpus
+                                .generate_document_tokens_for_epoch(
+                                    split,
+                                    epoch_index,
+                                    sample_index,
+                                )
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "failed to generate on-the-fly universality sample split={split:?} epoch_index={epoch_index} sample_index={sample_index}: {error:#}"
+                                    )
+                                }),
+                        },
                     );
-                    if sender.send((sample_index, tokens)).is_err() {
+                    if sender.send((sample_index, tokens, bucket_label)).is_err() {
                         return;
                     }
                 }
@@ -686,19 +1433,31 @@ impl OnTheFlyStorage {
         drop(sender);
 
         let mut documents = vec![None; sample_count];
+        let mut documents_by_bucket = HashMap::<String, Vec<usize>>::new();
         for _ in 0..sample_count {
-            let (sample_index, tokens) = receiver
+            let (sample_index, tokens, bucket_label) = receiver
                 .recv()
-                .expect("on-the-fly NCA epoch generation channel closed early");
+                .expect("on-the-fly universality epoch generation channel closed early");
             documents[sample_index] = Some(tokens);
+            if let Some(bucket_label) = bucket_label {
+                documents_by_bucket
+                    .entry(bucket_label)
+                    .or_default()
+                    .push(sample_index);
+            }
         }
         for worker in workers {
             let _ = worker.join();
         }
-        documents
-            .into_iter()
-            .map(|entry| entry.expect("on-the-fly NCA epoch generation missing sample"))
-            .collect()
+        GeneratedEpochDocuments {
+            documents: documents
+                .into_iter()
+                .map(|entry| {
+                    entry.expect("on-the-fly universality epoch generation missing sample")
+                })
+                .collect(),
+            documents_by_bucket,
+        }
     }
 }
 
@@ -707,6 +1466,100 @@ fn split_tag(split: burn_dragon_universality::SampleSplit) -> u8 {
         burn_dragon_universality::SampleSplit::Train => 0,
         burn_dragon_universality::SampleSplit::Validation => 1,
     }
+}
+
+fn live_source_selection_pending_limit() -> usize {
+    std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_PENDING_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+fn live_source_selection_documents_per_step(batch_size: usize) -> usize {
+    std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP)
+        .min(batch_size.max(1))
+        .max(1)
+}
+
+fn source_selection_step_seed(epoch_index: usize, absolute_step: usize, salt: usize) -> u64 {
+    0x8B8B_4D1A_51E5_E1ECu64
+        ^ (epoch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (absolute_step as u64).rotate_left(17)
+        ^ (salt as u64).rotate_left(31)
+}
+
+fn source_label_seed(label: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in label.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn live_source_selection_sample_index(
+    sample_count: usize,
+    split: burn_dragon_universality::SampleSplit,
+    epoch_index: usize,
+    absolute_step: usize,
+    bucket_label: &str,
+    document_rank: usize,
+) -> usize {
+    let sample_count = sample_count.max(1);
+    let split_salt = match split {
+        burn_dragon_universality::SampleSplit::Train => split_tag(split) as usize,
+        burn_dragon_universality::SampleSplit::Validation => {
+            SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG as usize
+        }
+    };
+    let seed = source_selection_step_seed(
+        epoch_index,
+        absolute_step,
+        source_label_seed(bucket_label) as usize
+            ^ document_rank.rotate_left(7)
+            ^ split_salt.rotate_left(17),
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    rng.gen_range(0..sample_count)
+}
+
+fn source_selected_windows_from_documents(
+    documents: &[Arc<Vec<u32>>],
+    epoch_index: usize,
+    absolute_step: usize,
+    bucket_label: &str,
+    batch_size: usize,
+    block_size: usize,
+) -> Vec<Vec<u32>> {
+    let document_count = documents.len().max(1);
+    (0..batch_size)
+        .map(|batch_index| {
+            let document = documents
+                .get(batch_index % document_count)
+                .expect("source-selected document set must be non-empty");
+            assert!(
+                document.len() > block_size,
+                "source-selected document must include block_size + 1 tokens"
+            );
+            let max_start = document.len().saturating_sub(block_size + 1);
+            let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
+                epoch_index,
+                absolute_step,
+                source_label_seed(bucket_label) as usize ^ batch_index.rotate_left(11),
+            ));
+            let start = if max_start == 0 {
+                0
+            } else {
+                rng.gen_range(0..=max_start)
+            };
+            document[start..start + block_size + 1].to_vec()
+        })
+        .collect()
 }
 
 impl ChunkedTokens {
@@ -817,6 +1670,18 @@ fn runtime_document_cache_limit(
         })
 }
 
+fn runtime_generation_worker_count(sample_count: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let configured = std::env::var("DragonModel_UNIVERSALITY_GENERATION_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| available.min(DEFAULT_RUNTIME_GENERATION_WORKER_LIMIT));
+    configured.min(sample_count).max(1)
+}
+
 fn fixed_manifest_logical_document_tokens(
     manifest: &burn_dragon_universality::UniversalityCorpusManifest,
 ) -> io::Result<Option<usize>> {
@@ -869,8 +1734,11 @@ mod tests {
     use crate::tokenizer::{PretokenizedTokenizerConfig, TokenizerConfig};
     use burn_dragon_universality::config::NcaCorpusConfig;
     use burn_dragon_universality::{
-        NcaSerializationConfig, NcaTokenizationConfig, generate_nca_corpus,
+        NcaSerializationConfig, NcaTokenizationConfig, RuliadCorpusConfig, RuliadDocumentMode,
+        RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig, RuliadTokenizationConfig,
+        generate_nca_corpus,
     };
+    use burn_ndarray::NdArray;
     use tempfile::tempdir;
 
     fn pretokenized_tokenizer() -> TokenizerConfig {
@@ -912,6 +1780,46 @@ mod tests {
             family.temperature =
                 Some(burn_dragon_universality::FloatRangeConfig { min: 0.0, max: 0.0 });
         }
+        config
+    }
+
+    fn fixed_ruliad_runtime_config() -> RuliadCorpusConfig {
+        RuliadCorpusConfig {
+            output_dir: "ignored".into(),
+            seed: 1337,
+            name: "ruliad-runtime".to_string(),
+            train_samples: 8,
+            validation_samples: 4,
+            chunk_token_capacity: 1024,
+            serialization: RuliadSerializationConfig {
+                document_tokens: 513,
+                preview_samples: 2,
+                ..RuliadSerializationConfig::default()
+            },
+            tokenization: RuliadTokenizationConfig::default(),
+            source_selection: burn_dragon_universality::RuliadSourceSelectionConfig::default(),
+            families: vec![
+                RuliadFamilyConfig {
+                    kind: RuliadFamilyKind::Eca,
+                    weight: 2,
+                    width: Some(burn_dragon_universality::UsizeRangeConfig { min: 12, max: 12 }),
+                    steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                },
+                RuliadFamilyConfig {
+                    kind: RuliadFamilyKind::Simulation,
+                    weight: 1,
+                    width: Some(burn_dragon_universality::UsizeRangeConfig { min: 12, max: 12 }),
+                    steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                },
+            ],
+            proof_tasks: None,
+            lean_task_limit: None,
+        }
+    }
+
+    fn live_ruliad_runtime_config() -> RuliadCorpusConfig {
+        let mut config = fixed_ruliad_runtime_config();
+        config.source_selection.enabled = true;
         config
     }
 
@@ -1092,5 +2000,210 @@ mod tests {
         let mut buffer = vec![0u32; 4097];
         dataset.copy_token_range(0, &mut buffer);
         assert!(buffer.iter().any(|value| *value != 0));
+    }
+
+    #[test]
+    fn on_the_fly_ruliad_dataset_is_deterministic() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad.toml");
+        let config = fixed_ruliad_runtime_config();
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        assert_eq!(
+            dataset.source_kind_label(),
+            "on-the-fly universality ruliad"
+        );
+        assert_eq!(
+            dataset.preferred_logical_document_tokens(DatasetSplit::Train),
+            Some(512)
+        );
+
+        let mut first = vec![0u32; 64];
+        let mut second = vec![0u32; 64];
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 2, 0, &mut first);
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 2, 0, &mut second);
+        assert_eq!(first, second);
+
+        let mut next_epoch = vec![0u32; 64];
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 3, 0, &mut next_epoch);
+        assert_ne!(first, next_epoch);
+    }
+
+    #[test]
+    fn on_the_fly_ruliad_dataset_exposes_multi_chunk_documents() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-multichunk.toml");
+        let mut config = fixed_ruliad_runtime_config();
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks =
+            burn_dragon_universality::UsizeRangeConfig { min: 3, max: 3 };
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            512,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        assert_eq!(
+            dataset.preferred_logical_document_tokens(DatasetSplit::Train),
+            Some(1538)
+        );
+
+        let mut prefix = vec![0u32; 128];
+        let mut later = vec![0u32; 128];
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 0, 0, &mut prefix);
+        dataset.copy_token_range_with_epoch(DatasetSplit::Train, 0, 700, &mut later);
+        assert_ne!(prefix, later);
+        assert!(later.iter().any(|token| *token != 0));
+    }
+
+    #[test]
+    fn live_ruliad_source_selection_records_batch_loss_feedback() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let config = live_ruliad_runtime_config();
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        assert!(dataset.uses_live_source_selection());
+        let before = dataset.source_selection_snapshot().expect("snapshot");
+        let wrapped = crate::dataset::Dataset::from_universality(dataset.clone());
+
+        let storage = match &dataset.storage {
+            UniversalityStorage::OnTheFly(storage) => storage,
+            UniversalityStorage::Manifest(_) => panic!("expected on-the-fly storage"),
+        };
+        dataset.prepare_epoch(DatasetSplit::Train, 0);
+        dataset.prefetch_epoch(DatasetSplit::Train, 1);
+        let windows = crate::dataset::TokenSequenceDataset::source_selected_token_windows(
+            &wrapped,
+            DatasetSplit::Train,
+            0,
+            0,
+            2,
+            32,
+        )
+        .expect("source-selected token windows");
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|window| window.len() == 33));
+        assert!(
+            windows.iter().flatten().any(|token| *token != 0),
+            "source-selected windows should contain generated content"
+        );
+        {
+            let cache = storage.cache.inner.lock().expect("runtime cache lock");
+            assert!(
+                cache.entries.is_empty(),
+                "live source-selected training must not materialize full epoch caches"
+            );
+            assert!(
+                cache.building.is_empty(),
+                "live source-selected training must not leave background epoch builds"
+            );
+        }
+        assert!(
+            storage
+                .source_selected_document_indices(
+                    burn_dragon_universality::SampleSplit::Validation,
+                    0,
+                    1,
+                    2,
+                )
+                .is_none()
+        );
+
+        let after =
+            crate::dataset::TokenSequenceDataset::record_source_selection_loss(&wrapped, 0, 0.5)
+                .expect("loss feedback");
+        assert_ne!(before.mean_loss, after.mean_loss);
+    }
+
+    #[test]
+    fn live_ruliad_source_weighted_validation_samples_without_feedback() {
+        type TestBackend = NdArray<f32>;
+
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let config = live_ruliad_runtime_config();
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        let before = dataset.source_selection_snapshot().expect("snapshot");
+        let device = burn::tensor::Device::<TestBackend>::default();
+
+        let first = dataset
+            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, 2, None, &device)
+            .expect("source-weighted validation batch");
+        let second = dataset
+            .sample_source_weighted_validation_batch::<TestBackend>(1, 41, 2, None, &device)
+            .expect("repeated source-weighted validation batch");
+        assert_eq!(first.inputs.shape().dims::<2>(), [2, 32]);
+        assert_eq!(
+            first
+                .inputs
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("first tokens"),
+            second
+                .inputs
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("second tokens")
+        );
+
+        let storage = match &dataset.storage {
+            UniversalityStorage::OnTheFly(storage) => storage,
+            UniversalityStorage::Manifest(_) => panic!("expected on-the-fly storage"),
+        };
+        {
+            let cache = storage.cache.inner.lock().expect("runtime cache lock");
+            assert!(
+                cache.entries.is_empty(),
+                "source-weighted validation must not materialize full epoch caches"
+            );
+        }
+        assert!(
+            storage
+                .source_selected_document_indices(
+                    burn_dragon_universality::SampleSplit::Validation,
+                    1,
+                    41,
+                    2,
+                )
+                .is_none()
+        );
+        assert!(
+            dataset.record_source_selection_loss(41, 0.25).is_none(),
+            "mirror validation must not create pending source-selection feedback"
+        );
+        let after = dataset.source_selection_snapshot().expect("snapshot");
+        assert_eq!(before.mean_loss, after.mean_loss);
     }
 }

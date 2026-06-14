@@ -4,12 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: "Validation suite to run. Example: `smoke` for the normal repo smoke rung, `nca-artifacts` for the explicit artifact persistence/publication check, `nca-runtime-cluster` for the ignored 3-peer native runtime cluster test, or `nca-edge-drill` / `climbmix-edge-drill` for the local browser+native control-plane drills."
+        description: "Validation suite to run. Example: `smoke` for the normal repo smoke rung, `ruliad-smoke` for the ruliad native training smoke, `ruliad-convergence` for the ignored ruliad/NCA comparison rung, or `nca-edge-drill` / `climbmix-edge-drill` for local browser+native drills."
         required: true
         default: smoke
         type: choice
         options:
           - smoke
+          - ruliad-smoke
+          - ruliad-convergence
           - nca-artifacts
           - nca-runtime-cluster
           - nca-edge-drill
@@ -61,6 +63,13 @@ jobs:
           case "${{ github.event.inputs.suite }}" in
             smoke)
               cargo run --manifest-path Cargo.toml -p xtask -- smoke
+              ;;
+            ruliad-smoke)
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native --test native_training ruliad_native_peer_executes_live_source_training_window -- --exact --nocapture
+              ;;
+            ruliad-convergence)
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native --test native_training ruliad_native_peer_small_model_converges_over_more_windows -- --ignored --exact --nocapture
+              cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --features native --test native_training nca_vs_ruliad_small_model_convergence_report -- --ignored --exact --nocapture
               ;;
             nca-artifacts)
               cargo run --manifest-path Cargo.toml -p xtask -- artifact-check

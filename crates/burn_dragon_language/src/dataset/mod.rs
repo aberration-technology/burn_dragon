@@ -5,6 +5,7 @@ pub mod scheduler;
 mod universality;
 
 use crate::tokenizer::SharedTokenizer;
+use burn::tensor::backend::Backend;
 
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
@@ -49,6 +50,44 @@ impl Dataset {
 
     pub fn steps_per_epoch(&self, split: DatasetSplit) -> usize {
         TokenSequenceDataset::steps_per_epoch(self, split)
+    }
+
+    pub fn uses_live_source_selection(&self) -> bool {
+        TokenSequenceDataset::uses_live_source_selection(self)
+    }
+
+    pub fn record_source_selection_loss(
+        &self,
+        absolute_step: usize,
+        loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        TokenSequenceDataset::record_source_selection_loss(self, absolute_step, loss)
+    }
+
+    pub fn source_selection_snapshot(
+        &self,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        TokenSequenceDataset::source_selection_snapshot(self)
+    }
+
+    pub fn sample_source_weighted_validation_batch<B: Backend>(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        summary_event_token_ids: Option<&[u32]>,
+        device: &B::Device,
+    ) -> Option<SequenceBatch<B>> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.sample_source_weighted_validation_batch(
+                epoch_index,
+                absolute_step,
+                batch_size,
+                summary_event_token_ids,
+                device,
+            ),
+        }
     }
 }
 
@@ -106,6 +145,84 @@ impl TokenSequenceDataset for Dataset {
         match self {
             Dataset::HuggingFace(dataset) => dataset.preferred_logical_document_tokens(split),
             Dataset::Universality(dataset) => dataset.preferred_logical_document_tokens(split),
+        }
+    }
+
+    fn uses_live_source_selection(&self) -> bool {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.uses_live_source_selection(),
+            Dataset::Universality(dataset) => dataset.uses_live_source_selection(),
+        }
+    }
+
+    fn source_selected_document_indices(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<Vec<usize>> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selected_document_indices(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+            ),
+            Dataset::Universality(dataset) => dataset.source_selected_document_indices(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+            ),
+        }
+    }
+
+    fn source_selected_token_windows(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selected_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+            Dataset::Universality(dataset) => dataset.source_selected_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+        }
+    }
+
+    fn record_source_selection_loss(
+        &self,
+        absolute_step: usize,
+        loss: f32,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match self {
+            Dataset::HuggingFace(dataset) => {
+                dataset.record_source_selection_loss(absolute_step, loss)
+            }
+            Dataset::Universality(dataset) => {
+                dataset.record_source_selection_loss(absolute_step, loss)
+            }
+        }
+    }
+
+    fn source_selection_snapshot(&self) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selection_snapshot(),
+            Dataset::Universality(dataset) => dataset.source_selection_snapshot(),
         }
     }
 

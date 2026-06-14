@@ -419,6 +419,7 @@ mod tests {
                 native: crate::profile::DragonNativeExperimentProfile {
                     training_toml: String::new(),
                     nca_corpus_toml: None,
+                    ruliad_corpus_toml: None,
                 },
                 browser: None,
             },
@@ -475,6 +476,7 @@ mod tests {
                 native: crate::profile::DragonNativeExperimentProfile {
                     training_toml: String::new(),
                     nca_corpus_toml: None,
+                    ruliad_corpus_toml: None,
                 },
                 browser: None,
             },
@@ -512,6 +514,7 @@ mod tests {
             native: crate::profile::DragonNativeExperimentProfile {
                 training_toml: String::new(),
                 nca_corpus_toml: None,
+                ruliad_corpus_toml: None,
             },
             browser: Some(crate::profile::DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
@@ -580,6 +583,7 @@ mod tests {
                 native: crate::profile::DragonNativeExperimentProfile {
                     training_toml: String::new(),
                     nca_corpus_toml: None,
+                    ruliad_corpus_toml: None,
                 },
                 browser: None,
             },

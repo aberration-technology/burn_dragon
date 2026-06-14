@@ -1,7 +1,8 @@
 use crate::checkpoint::{RUN_DIR_ENV, RUN_NAME_ENV};
 use crate::train::prelude::*;
 use crate::train::schedule::{
-    TrainEnvironment, resolve_lr_scheduler, resolve_train_schedule, train_with_scheduler,
+    TrainEnvironment, resolve_lr_scheduler, resolve_train_schedule,
+    train_with_dynamic_neuron_scaling_scheduler, train_with_scheduler,
 };
 use crate::train::startup_autotune::{
     resolve_gradient_accumulation_steps, resolve_startup_batch_size,
@@ -190,33 +191,71 @@ fn initialize_model_from_checkpoint<B: BackendTrait>(
     Ok(())
 }
 
-fn train_with_resolved_scheduler<B, O>(
+fn train_with_resolved_scheduler<B>(
     context: &TrainEnvironment<'_, B>,
     model: LanguageTrainModel<B>,
-    optimizer: O,
+    optimizer: crate::train::continual_backprop::LanguageOptimizer<B>,
     scheduler: ResolvedLrScheduler,
 ) -> Result<DragonModel<ValidBackend<B>>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
-    O: Optimizer<LanguageTrainModel<B>, B> + 'static,
 {
+    let use_dynamic_scaling = context.training.neuron_scaling.enabled;
+    if use_dynamic_scaling && context.parallel_runtime.mode != ParallelismKind::Single {
+        return Err(anyhow!(
+            "training.neuron_scaling.enabled currently requires parallel.mode=single; in-process Dragon neuron scaling mutates model and optimizer state between validation epochs"
+        ));
+    }
+    let use_event_scheduler = use_dynamic_scaling
+        || (context.parallel_runtime.mode == ParallelismKind::Single
+            && context.training.events.source_weighted_validation_batches > 0
+            && context
+                .source_selection_dataset
+                .as_ref()
+                .is_some_and(|dataset| dataset.uses_live_source_selection()));
     match scheduler {
-        ResolvedLrScheduler::Constant(lr) => train_with_scheduler(context, model, optimizer, lr),
+        ResolvedLrScheduler::Constant(lr) => {
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, lr)
+            } else {
+                train_with_scheduler(context, model, optimizer, lr)
+            }
+        }
         ResolvedLrScheduler::Cosine(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Linear(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Exponential(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Step(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
         ResolvedLrScheduler::Noam(scheduler) => {
-            train_with_scheduler(context, model, optimizer, scheduler)
+            if use_event_scheduler {
+                train_with_dynamic_neuron_scaling_scheduler(context, model, optimizer, scheduler)
+            } else {
+                train_with_scheduler(context, model, optimizer, scheduler)
+            }
         }
     }
 }
@@ -324,7 +363,7 @@ where
     Ok(())
 }
 
-fn resolve_effective_training_sequence_kernel(
+pub(crate) fn resolve_effective_training_sequence_kernel(
     configured_kernel: SequenceKernelConfig,
     training_override: Option<SequenceKernelConfig>,
     backend_name: &str,
@@ -683,7 +722,7 @@ where
                 valid_steps,
                 None,
             )
-            .with_summary_event_token_ids(summary_event_token_ids),
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 
     let mut base_model = DragonModel::<B>::new(model_config.clone(), &device);
@@ -741,7 +780,8 @@ where
     info!("run name: {run_name}");
     if let Some(report) = &startup_autotune {
         info!(
-            "startup autotune: backend={} target_device_memory_mb={} resolved_batch_size={} resolved_gradient_accumulation_steps={} resolved_effective_batch_size={} probes={}",
+            "startup autotune: source={} backend={} target_device_memory_mb={} resolved_batch_size={} resolved_gradient_accumulation_steps={} resolved_effective_batch_size={} probes={}",
+            report.config_source,
             report.backend_name,
             report.target_device_memory_mb,
             report.resolved_batch_size,
@@ -755,6 +795,8 @@ where
                         "bs{}:{}:{reserved:.1}/{in_use:.1}MiB",
                         probe.batch_size, probe.status
                     ),
+                    (Some(reserved), None) =>
+                        format!("bs{}:{}:{reserved:.1}MiB", probe.batch_size, probe.status),
                     _ => format!("bs{}:{}", probe.batch_size, probe.status),
                 })
                 .collect::<Vec<_>>()
@@ -792,6 +834,10 @@ where
         training.continual_backprop.lr_coupling,
         training.continual_backprop.lr_coupling_power,
     );
+    let neuron_scaling_slot = training
+        .neuron_scaling
+        .enabled
+        .then(crate::train::neuron_scaling::NeuronScaleRequestSlot::default);
     let context = TrainEnvironment {
         parallel_runtime: &parallel_runtime,
         parallel_config: &resolved_config.parallel,
@@ -803,9 +849,19 @@ where
         model_config: &model_config,
         device: &device,
         devices: &devices,
+        train_dataset: Some(Arc::clone(&datasets.train)),
+        valid_dataset: Some(Arc::clone(&datasets.valid)),
         train_loader,
         valid_loader,
+        source_selection_dataset: datasets
+            .train
+            .uses_live_source_selection()
+            .then(|| Arc::clone(&datasets.train)),
+        summary_event_token_ids,
+        neuron_scaling_slot: neuron_scaling_slot.clone(),
         epochs: total_epochs,
+        total_steps,
+        valid_steps,
     };
     let _model = train_with_resolved_scheduler(
         &context,

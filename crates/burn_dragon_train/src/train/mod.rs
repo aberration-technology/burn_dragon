@@ -5,6 +5,7 @@ mod prelude;
 pub mod artifacts;
 pub mod constants;
 pub mod continual_backprop;
+pub mod events;
 pub mod gdpo;
 pub mod metrics;
 pub mod runtime;

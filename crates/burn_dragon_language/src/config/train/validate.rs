@@ -47,6 +47,206 @@ impl TrainingConfig {
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
+        if self.training.auto_batch_size.enabled {
+            let auto_batch = &self.training.auto_batch_size;
+            if auto_batch.min_batch_size == 0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.min_batch_size must be > 0 when enabled"
+                ));
+            }
+            if matches!(auto_batch.max_batch_size, Some(0)) {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be > 0 when set"
+                ));
+            }
+            if matches!(auto_batch.max_probe_batch_size, Some(0)) {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_probe_batch_size must be > 0 when set"
+                ));
+            }
+            if let Some(max_batch_size) = auto_batch.max_batch_size
+                && max_batch_size < auto_batch.min_batch_size
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be >= min_batch_size"
+                ));
+            }
+            if let Some(max_probe_batch_size) = auto_batch.max_probe_batch_size
+                && max_probe_batch_size < auto_batch.min_batch_size
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_probe_batch_size must be >= min_batch_size"
+                ));
+            }
+            if auto_batch.probe_steps == 0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.probe_steps must be > 0 when enabled"
+                ));
+            }
+            if !auto_batch.scale_memory_exponent.is_finite()
+                || auto_batch.scale_memory_exponent < 0.0
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.scale_memory_exponent must be finite and >= 0"
+                ));
+            }
+            if !auto_batch.max_system_memory_fraction.is_finite()
+                || !(0.0..=0.9).contains(&auto_batch.max_system_memory_fraction)
+                || auto_batch.max_system_memory_fraction == 0.0
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_system_memory_fraction must be finite and in (0, 0.9]"
+                ));
+            }
+            if !auto_batch.probe_safety_margin.is_finite() || auto_batch.probe_safety_margin < 1.0 {
+                return Err(anyhow!(
+                    "training.auto_batch_size.probe_safety_margin must be finite and >= 1"
+                ));
+            }
+            if self.parallel.pipeline.enabled
+                && let Some(max_batch_size) = auto_batch.max_batch_size
+                && max_batch_size < self.parallel.pipeline.microbatches
+            {
+                return Err(anyhow!(
+                    "training.auto_batch_size.max_batch_size must be >= parallel.pipeline.microbatches when pipeline is enabled"
+                ));
+            }
+        }
+        if self.training.neuron_scaling.enabled {
+            if self.parallel.mode != ParallelismKind::Single {
+                return Err(anyhow!(
+                    "training.neuron_scaling.enabled currently requires parallel.mode=single"
+                ));
+            }
+            if self.training.neuron_scaling.max_latent_total == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be > 0"
+                ));
+            }
+            if self.training.neuron_scaling.max_scale_events == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_scale_events must be > 0"
+                ));
+            }
+            if self.training.neuron_scaling.capacity_patience_epochs == 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.capacity_patience_epochs must be > 0"
+                ));
+            }
+            if self
+                .training
+                .neuron_scaling
+                .stabilization
+                .new_slice_lr_scale
+                < 0.0
+                || !self
+                    .training
+                    .neuron_scaling
+                    .stabilization
+                    .new_slice_lr_scale
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.stabilization.new_slice_lr_scale must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .neuron_scaling
+                .stabilization
+                .base_lr_scale_after_ramp
+                < 0.0
+                || !self
+                    .training
+                    .neuron_scaling
+                    .stabilization
+                    .base_lr_scale_after_ramp
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.neuron_scaling.stabilization.base_lr_scale_after_ramp must be finite and >= 0"
+                ));
+            }
+        }
+        if self.training.events.flush_every_steps == 0 {
+            return Err(anyhow!("training.events.flush_every_steps must be > 0"));
+        }
+        if self.training.events.source_selection_every_steps == 0 {
+            return Err(anyhow!(
+                "training.events.source_selection_every_steps must be > 0"
+            ));
+        }
+        if self.training.events.continual_backprop_every_steps == 0 {
+            return Err(anyhow!(
+                "training.events.continual_backprop_every_steps must be > 0"
+            ));
+        }
+        if self.training.events.degeneracy_probe_every_epochs == 0 {
+            return Err(anyhow!(
+                "training.events.degeneracy_probe_every_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.plateau_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.plateau_patience_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.validation_regression_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.validation_regression_patience_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.source_entropy_patience == 0 {
+            return Err(anyhow!(
+                "training.gates.source_entropy_patience must be > 0"
+            ));
+        }
+        if self.training.gates.difficulty_patience == 0 {
+            return Err(anyhow!("training.gates.difficulty_patience must be > 0"));
+        }
+        if self.training.gates.degeneracy_patience == 0 {
+            return Err(anyhow!("training.gates.degeneracy_patience must be > 0"));
+        }
+        if self.training.gates.degeneracy_entropy_min_bits < 0.0
+            || !self.training.gates.degeneracy_entropy_min_bits.is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_entropy_min_bits must be finite and >= 0"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_max_probability_max)
+            || !self
+                .training
+                .gates
+                .degeneracy_max_probability_max
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_max_probability_max must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_argmax_unique_min_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_argmax_unique_min_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_argmax_unique_min_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_repetition_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_repetition_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_repetition_max_fraction must be finite and in [0, 1]"
+            ));
+        }
         if self.parallel.world_size == 0 {
             return Err(anyhow!("parallel.world_size must be > 0"));
         }
@@ -506,6 +706,16 @@ impl TrainingConfig {
                     "training.continual_backprop.lr_coupling_power must be finite and >= 0"
                 ));
             }
+            if self
+                .training
+                .continual_backprop
+                .max_replacements_per_interval
+                == 0
+            {
+                return Err(anyhow!(
+                    "training.continual_backprop.max_replacements_per_interval must be > 0"
+                ));
+            }
         }
         let mut seen_module_lr_targets = HashSet::new();
         for entry in &self.training.module_lr_scales {
@@ -864,6 +1074,30 @@ impl TrainingConfig {
                 resolved_model.latent_total(),
                 self.parallel.tensor.size
             ));
+        }
+        if self.training.neuron_scaling.enabled {
+            let max_latent_total = self.training.neuron_scaling.max_latent_total;
+            if max_latent_total < resolved_model.latent_total() {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be >= resolved model.latent_total (got max={} current={})",
+                    max_latent_total,
+                    resolved_model.latent_total()
+                ));
+            }
+            if max_latent_total % resolved_model.n_embd != 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be divisible by model.n_embd (got max={} n_embd={})",
+                    max_latent_total,
+                    resolved_model.n_embd
+                ));
+            }
+            if max_latent_total % resolved_model.n_head != 0 {
+                return Err(anyhow!(
+                    "training.neuron_scaling.max_latent_total must be divisible by model.n_head (got max={} n_head={})",
+                    max_latent_total,
+                    resolved_model.n_head
+                ));
+            }
         }
         if matches!(
             self.parallel.tensor.partition,
@@ -1264,6 +1498,249 @@ prompt = ""
     }
 
     #[test]
+    fn auto_batch_size_config_validates() {
+        parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 1
+max_batch_size = 32
+target_device_memory_mb = 90000
+probe_steps = 1
+recompute_on_neuron_scale = true
+"#,
+        )
+        .validate()
+        .expect("auto batch config should validate");
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_inverted_bounds() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 8
+max_batch_size = 4
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("inverted auto batch bounds should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_batch_size must be >= min_batch_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_probe_cap_below_min_batch() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 8
+max_probe_batch_size = 4
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("probe cap below min batch should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_probe_batch_size must be >= min_batch_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_batch_size_rejects_host_fraction_above_ninety_percent() {
+        let config = parse_config(
+            r#"
+[training.auto_batch_size]
+enabled = true
+max_system_memory_fraction = 0.95
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("host memory fraction above 90% should fail");
+        assert!(
+            err.to_string()
+                .contains("auto_batch_size.max_system_memory_fraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn neuron_scaling_config_validates_across_memory_kernels() {
+        let cases = [
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = { memory_system = "linear_attention", executor = "dense_score_short_context" }
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = "mamba3_state_space_duality"
+
+[model.mamba]
+headdim = 8
+chunk_size = 4
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = "gated_deltanet2"
+"#,
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+sequence_kernel = { memory_system = "gated_deltanet2", executor = "gated_delta_chunk_wy" }
+
+[model.gated_deltanet2]
+implementation = "upstream_full"
+chunk_size = 4
+"#,
+        ];
+
+        for case in cases {
+            parse_config(case)
+                .validate()
+                .unwrap_or_else(|err| panic!("neuron scaling config should validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_max_below_current_latent_total() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 16
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 2
+latent_total = 32
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("max below current should fail");
+        assert!(
+            err.to_string()
+                .contains("max_latent_total must be >= resolved model.latent_total"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_max_not_divisible_by_head_count() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 64
+
+[model]
+n_layer = 1
+n_embd = 16
+n_head = 3
+latent_total = 48
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("head-incompatible max should fail");
+        assert!(
+            err.to_string()
+                .contains("max_latent_total must be divisible by model.n_head"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn neuron_scaling_rejects_non_single_parallel_mode() {
+        let config = parse_config(
+            r#"
+[training.neuron_scaling]
+enabled = true
+max_latent_total = 80
+
+[model]
+n_layer = 1
+n_embd = 10
+n_head = 2
+latent_total = 40
+
+[parallel]
+mode = "tensor_parallel_neuron"
+world_size = 4
+
+[parallel.data]
+size = 1
+
+[parallel.tensor]
+size = 4
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("tensor-parallel neuron scaling should fail");
+        assert!(
+            err.to_string()
+                .contains("neuron_scaling.enabled currently requires parallel.mode=single"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn sdft_objective_config_validates() {
         let config = parse_config(
             r#"
@@ -1466,6 +1943,16 @@ fn validate_dataset_source(
             if !matches!(tokenizer_kind, TokenizerKind::Pretokenized(_)) {
                 return Err(anyhow!(
                     "{label}.tokenizer.type must be `pretokenized` for on-the-fly universality NCA datasets"
+                ));
+            }
+        }
+        DatasetSourceConfig::UniversalityRuliad { config } => {
+            if config.as_os_str().is_empty() {
+                return Err(anyhow!("{label}.config must not be empty"));
+            }
+            if !matches!(tokenizer_kind, TokenizerKind::Pretokenized(_)) {
+                return Err(anyhow!(
+                    "{label}.tokenizer.type must be `pretokenized` for on-the-fly universality ruliad datasets"
                 ));
             }
         }

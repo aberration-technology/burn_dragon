@@ -11,6 +11,7 @@ mod norm;
 mod residual_stream;
 mod sequence;
 mod state;
+mod widen;
 
 pub use attention_residual::{
     AttentionResidual, AttentionResidualConfig, BlockAttentionResidual,

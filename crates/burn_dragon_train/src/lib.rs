@@ -45,7 +45,7 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
-            VisionArtifactOutputMode,
+            TrainingEventsConfig, TrainingGatesConfig, VisionArtifactOutputMode,
         };
     }
 
@@ -90,5 +90,5 @@ pub use config::{
 #[cfg(feature = "train")]
 pub use config::{
     LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
-    VisionArtifactOutputMode,
+    TrainingEventsConfig, TrainingGatesConfig, VisionArtifactOutputMode,
 };

@@ -178,6 +178,32 @@ impl TokenSequenceDataset for Dataset {
         }
     }
 
+    fn source_selected_token_windows(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selected_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+            Dataset::Universality(dataset) => dataset.source_selected_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+        }
+    }
+
     fn record_source_selection_loss(
         &self,
         absolute_step: usize,

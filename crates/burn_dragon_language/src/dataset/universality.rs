@@ -2085,6 +2085,7 @@ mod tests {
         .expect("load ruliad dataset");
         assert!(dataset.uses_live_source_selection());
         let before = dataset.source_selection_snapshot().expect("snapshot");
+        let wrapped = crate::dataset::Dataset::from_universality(dataset.clone());
 
         let storage = match &dataset.storage {
             UniversalityStorage::OnTheFly(storage) => storage,
@@ -2092,15 +2093,15 @@ mod tests {
         };
         dataset.prepare_epoch(DatasetSplit::Train, 0);
         dataset.prefetch_epoch(DatasetSplit::Train, 1);
-        let windows = storage
-            .source_selected_token_windows(
-                burn_dragon_universality::SampleSplit::Train,
-                0,
-                0,
-                2,
-                32,
-            )
-            .expect("source-selected token windows");
+        let windows = crate::dataset::TokenSequenceDataset::source_selected_token_windows(
+            &wrapped,
+            DatasetSplit::Train,
+            0,
+            0,
+            2,
+            32,
+        )
+        .expect("source-selected token windows");
         assert_eq!(windows.len(), 2);
         assert!(windows.iter().all(|window| window.len() == 33));
         assert!(
@@ -2129,9 +2130,9 @@ mod tests {
                 .is_none()
         );
 
-        let after = dataset
-            .record_source_selection_loss(0, 0.5)
-            .expect("loss feedback");
+        let after =
+            crate::dataset::TokenSequenceDataset::record_source_selection_loss(&wrapped, 0, 0.5)
+                .expect("loss feedback");
         assert_ne!(before.mean_loss, after.mean_loss);
     }
 

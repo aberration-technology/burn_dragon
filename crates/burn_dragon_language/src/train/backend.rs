@@ -209,11 +209,12 @@ where
     }
     let use_event_scheduler = use_dynamic_scaling
         || (context.parallel_runtime.mode == ParallelismKind::Single
-            && context.training.events.source_weighted_validation_batches > 0
-            && context
-                .source_selection_dataset
-                .as_ref()
-                .is_some_and(|dataset| dataset.uses_live_source_selection()));
+            && (context.training.dynamics.enabled
+                || (context.training.events.source_weighted_validation_batches > 0
+                    && context
+                        .source_selection_dataset
+                        .as_ref()
+                        .is_some_and(|dataset| dataset.uses_live_source_selection()))));
     match scheduler {
         ResolvedLrScheduler::Constant(lr) => {
             if use_event_scheduler {
@@ -407,10 +408,6 @@ where
     Init: Fn(&B::Device),
 {
     let stage_profile = crate::train::profile::enabled();
-    if stage_profile {
-        crate::train::profile::reset();
-    }
-    let train_wall_start = stage_profile.then(Instant::now);
 
     let parallel_runtime = resolve_parallel_runtime(&config.parallel)?;
     info!("parallel runtime: {}", parallel_runtime.summary());
@@ -737,6 +734,10 @@ where
     validate_dragon_continual_backprop(training, &base_model, parallel_runtime.world_size)?;
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_objective(training.objective.clone())
+        .with_input_corruption(training.input_corruption.clone())
+        .with_logit_entropy_floor(training.logit_entropy_floor.clone())
+        .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
+        .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
         .with_pipeline_plan(pipeline_plan.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size)
         .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)
@@ -863,6 +864,10 @@ where
         total_steps,
         valid_steps,
     };
+    if stage_profile {
+        crate::train::profile::reset();
+    }
+    let train_wall_start = stage_profile.then(Instant::now);
     let _model = train_with_resolved_scheduler(
         &context,
         model.take().expect("model initialized"),
@@ -875,9 +880,28 @@ where
     if let Some(start) = train_wall_start {
         let elapsed_ns = start.elapsed().as_nanos();
         let snapshot = crate::train::profile::snapshot();
+        let train_tokens = (snapshot.train_steps as u128)
+            .saturating_mul(resolved_config.training.batch_size as u128)
+            .saturating_mul(resolved_config.training.block_size as u128);
+        let model_step_ns = snapshot
+            .forward_ns
+            .saturating_add(snapshot.loss_backward_ns);
+        let wall_tokens_per_second = tokens_per_second(train_tokens, elapsed_ns);
+        let model_tokens_per_second = tokens_per_second(train_tokens, model_step_ns);
+        let dataloader_wall_fraction = if elapsed_ns == 0 {
+            0.0
+        } else {
+            snapshot.dataloader_cpu_ns as f64 / elapsed_ns as f64
+        };
+        let dataloader_foreground_wait_fraction = if elapsed_ns == 0 {
+            0.0
+        } else {
+            snapshot.dataloader_foreground_wait_ns as f64 / elapsed_ns as f64
+        };
         info!(
-            "[stage-profile][training] total_ns={elapsed_ns} dataloader_cpu_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
+            snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
@@ -900,8 +924,9 @@ where
             snapshot.max_step_in_use_after_backward_bytes,
         );
         eprintln!(
-            "[stage-profile][training] total_ns={elapsed_ns} dataloader_cpu_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
+            snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
@@ -926,4 +951,11 @@ where
     }
 
     Ok(())
+}
+
+fn tokens_per_second(tokens: u128, elapsed_ns: u128) -> f64 {
+    if elapsed_ns == 0 {
+        return 0.0;
+    }
+    (tokens as f64) / (elapsed_ns as f64 / 1_000_000_000.0)
 }

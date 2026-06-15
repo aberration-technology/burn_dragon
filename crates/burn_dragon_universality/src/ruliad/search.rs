@@ -16,6 +16,12 @@ pub struct RuliadSamplerConfig {
     pub mastery_escape_weight: f32,
     #[serde(default = "default_mastery_escape_threshold")]
     pub mastery_escape_threshold: f32,
+    #[serde(default = "default_mastery_min_normalized_difficulty")]
+    pub mastery_min_normalized_difficulty: f32,
+    #[serde(default = "default_mastery_min_max_difficulty_probability")]
+    pub mastery_min_max_difficulty_probability: f32,
+    #[serde(default = "default_mastery_hash_noise_max_probability")]
+    pub mastery_hash_noise_max_probability: f32,
 }
 
 impl Default for RuliadSamplerConfig {
@@ -27,6 +33,10 @@ impl Default for RuliadSamplerConfig {
             hash_noise_penalty: default_hash_noise_penalty(),
             mastery_escape_weight: default_mastery_escape_weight(),
             mastery_escape_threshold: default_mastery_escape_threshold(),
+            mastery_min_normalized_difficulty: default_mastery_min_normalized_difficulty(),
+            mastery_min_max_difficulty_probability: default_mastery_min_max_difficulty_probability(
+            ),
+            mastery_hash_noise_max_probability: default_mastery_hash_noise_max_probability(),
         }
     }
 }
@@ -88,18 +98,33 @@ impl RuliadFrontierSampler {
         &self.candidates
     }
 
+    pub fn max_difficulty_level(&self) -> usize {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.difficulty_level)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn add_candidates(&mut self, candidates: impl IntoIterator<Item = RuliadSamplerCandidate>) {
+        for candidate in candidates {
+            if self
+                .candidates
+                .iter()
+                .any(|existing| existing.oracle_hash == candidate.oracle_hash)
+            {
+                continue;
+            }
+            self.candidates.push(candidate);
+        }
+    }
+
     pub fn probabilities(&self) -> Vec<f32> {
         if self.candidates.is_empty() {
             return Vec::new();
         }
         let temperature = self.config.temperature.max(1e-6);
-        let max_difficulty = self
-            .candidates
-            .iter()
-            .map(|candidate| candidate.difficulty_level)
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        let max_difficulty = self.max_difficulty_level().max(1);
         let mastered_fraction = self
             .candidates
             .iter()
@@ -136,7 +161,99 @@ impl RuliadFrontierSampler {
         for prob in &mut probs {
             *prob = *prob * (1.0 - floor) + uniform * floor;
         }
+        self.enforce_mastery_frontier(&mut probs);
         probs
+    }
+
+    fn enforce_mastery_frontier(&self, probs: &mut [f32]) {
+        let max_difficulty = self.max_difficulty_level();
+        if max_difficulty == 0 || probs.is_empty() {
+            return;
+        }
+        let mastered_probability = probs
+            .iter()
+            .zip(&self.candidates)
+            .filter_map(|(prob, candidate)| {
+                (candidate.loss_ema <= self.config.target_loss).then_some(*prob)
+            })
+            .sum::<f32>();
+        if mastered_probability < self.config.mastery_escape_threshold {
+            return;
+        }
+
+        let target_normalized = self
+            .config
+            .mastery_min_normalized_difficulty
+            .clamp(0.0, 1.0);
+        let target_max_probability = self
+            .config
+            .mastery_min_max_difficulty_probability
+            .clamp(0.0, 1.0);
+        let target_hash_noise = self
+            .config
+            .mastery_hash_noise_max_probability
+            .clamp(0.0, 1.0);
+        if target_normalized <= 0.0 && target_max_probability <= 0.0 {
+            return;
+        }
+
+        let high_distribution = self.high_difficulty_distribution(max_difficulty);
+        if high_distribution.is_empty() {
+            return;
+        }
+
+        let satisfies = |candidate_probs: &[f32]| {
+            let normalized_difficulty =
+                weighted_normalized_difficulty(candidate_probs, &self.candidates, max_difficulty);
+            let max_difficulty_probability = weighted_max_difficulty_probability(
+                candidate_probs,
+                &self.candidates,
+                max_difficulty,
+            );
+            let hash_noise_probability =
+                weighted_hash_noise_probability(candidate_probs, &self.candidates);
+            normalized_difficulty >= target_normalized
+                && max_difficulty_probability >= target_max_probability
+                && hash_noise_probability <= target_hash_noise
+        };
+        if satisfies(probs) {
+            return;
+        }
+
+        let original = probs.to_vec();
+        let mut best = original.clone();
+        let mut lo = 0.0f32;
+        let mut hi = 1.0f32;
+        for _ in 0..24 {
+            let alpha = (lo + hi) * 0.5;
+            let mixed = mix_probabilities(&original, &high_distribution, alpha);
+            if satisfies(&mixed) {
+                best = mixed;
+                hi = alpha;
+            } else {
+                lo = alpha;
+            }
+        }
+        if !satisfies(&best) {
+            best = high_distribution;
+        }
+        probs.copy_from_slice(&best);
+    }
+
+    fn high_difficulty_distribution(&self, max_difficulty: usize) -> Vec<f32> {
+        let mut weights = self
+            .candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.difficulty_level == max_difficulty && !candidate.is_hash_noise {
+                    candidate.prior.max(1e-9) / candidate.cost.max(1e-6)
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        normalize_distribution(&mut weights);
+        weights
     }
 
     pub fn record_telemetry(&mut self, telemetry: &RuliadSampleTelemetry) {
@@ -195,12 +312,7 @@ impl RuliadFrontierSampler {
                 prob * difficulty_gate(candidate.loss_ema, self.config.target_loss)
             })
             .sum::<f32>();
-        let max_difficulty_level = self
-            .candidates
-            .iter()
-            .map(|candidate| candidate.difficulty_level)
-            .max()
-            .unwrap_or(0);
+        let max_difficulty_level = self.max_difficulty_level();
         let mean_difficulty_level = probs
             .iter()
             .zip(&self.candidates)
@@ -235,10 +347,13 @@ impl RuliadFrontierSampler {
             frontier_loss,
             target_loss: self.config.target_loss,
             target_difficulty_score,
+            max_difficulty_level,
             mean_difficulty_level,
             normalized_difficulty_score,
             max_difficulty_probability,
             mastered_probability,
+            frontier_extension_count: 0,
+            frontier_saturated: false,
         }
     }
 }
@@ -255,6 +370,78 @@ fn mean(values: impl Iterator<Item = f32>) -> f32 {
         sum += value;
     }
     if count == 0 { 0.0 } else { sum / count as f32 }
+}
+
+fn mix_probabilities(left: &[f32], right: &[f32], alpha: f32) -> Vec<f32> {
+    let alpha = alpha.clamp(0.0, 1.0);
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * (1.0 - alpha) + right * alpha)
+        .collect()
+}
+
+fn normalize_distribution(values: &mut [f32]) {
+    let sum = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f32>();
+    if sum <= f32::EPSILON {
+        let uniform = if values.is_empty() {
+            0.0
+        } else {
+            1.0 / values.len() as f32
+        };
+        for value in values {
+            *value = uniform;
+        }
+        return;
+    }
+    for value in values {
+        *value = if value.is_finite() && *value > 0.0 {
+            *value / sum
+        } else {
+            0.0
+        };
+    }
+}
+
+fn weighted_normalized_difficulty(
+    probs: &[f32],
+    candidates: &[RuliadSamplerCandidate],
+    max_difficulty: usize,
+) -> f32 {
+    if max_difficulty == 0 {
+        return 0.0;
+    }
+    probs
+        .iter()
+        .zip(candidates)
+        .map(|(prob, candidate)| prob * candidate.difficulty_level as f32)
+        .sum::<f32>()
+        / max_difficulty as f32
+}
+
+fn weighted_max_difficulty_probability(
+    probs: &[f32],
+    candidates: &[RuliadSamplerCandidate],
+    max_difficulty: usize,
+) -> f32 {
+    probs
+        .iter()
+        .zip(candidates)
+        .filter_map(|(prob, candidate)| {
+            (candidate.difficulty_level == max_difficulty).then_some(*prob)
+        })
+        .sum()
+}
+
+fn weighted_hash_noise_probability(probs: &[f32], candidates: &[RuliadSamplerCandidate]) -> f32 {
+    probs
+        .iter()
+        .zip(candidates)
+        .filter_map(|(prob, candidate)| candidate.is_hash_noise.then_some(*prob))
+        .sum()
 }
 
 fn default_temperature() -> f32 {
@@ -279,6 +466,18 @@ fn default_mastery_escape_weight() -> f32 {
 
 fn default_mastery_escape_threshold() -> f32 {
     0.70
+}
+
+fn default_mastery_min_normalized_difficulty() -> f32 {
+    0.90
+}
+
+fn default_mastery_min_max_difficulty_probability() -> f32 {
+    0.35
+}
+
+fn default_mastery_hash_noise_max_probability() -> f32 {
+    0.01
 }
 
 fn default_prior() -> f32 {
@@ -341,6 +540,7 @@ mod tests {
                 hash_noise_penalty: 4.0,
                 mastery_escape_weight: 0.0,
                 mastery_escape_threshold: 0.70,
+                ..RuliadSamplerConfig::default()
             },
             vec![
                 RuliadSamplerCandidate {
@@ -394,8 +594,8 @@ mod tests {
                 params_hash: String::new(),
                 prior: 1.0,
                 cost: 1.0,
-                loss_ema: if difficulty_level < 6 { 0.25 } else { 4.0 },
-                previous_loss_ema: if difficulty_level < 6 { 0.30 } else { 4.0 },
+                loss_ema: 0.25,
+                previous_loss_ema: 0.30,
                 gradient_alignment: 0.0,
                 is_hash_noise: false,
             })
@@ -408,6 +608,9 @@ mod tests {
                 hash_noise_penalty: 4.0,
                 mastery_escape_weight: 4.0,
                 mastery_escape_threshold: 0.70,
+                mastery_min_normalized_difficulty: 0.90,
+                mastery_min_max_difficulty_probability: 0.35,
+                mastery_hash_noise_max_probability: 0.01,
             },
             candidates,
         );
@@ -415,12 +618,12 @@ mod tests {
         let snapshot = sampler.snapshot();
 
         assert!(
-            snapshot.normalized_difficulty_score > 0.70,
+            snapshot.normalized_difficulty_score >= 0.90,
             "expected mastery escape to bias toward high difficulty, got {}",
             snapshot.normalized_difficulty_score
         );
         assert!(
-            snapshot.max_difficulty_probability > 0.30,
+            snapshot.max_difficulty_probability >= 0.35,
             "expected max-difficulty bucket to receive substantial probability, got {}",
             snapshot.max_difficulty_probability
         );

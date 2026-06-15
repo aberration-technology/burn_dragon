@@ -29,6 +29,7 @@ pub enum TokenizerFamily {
     Gpt2ByteCompatible,
     PatchTokenIds,
     RustBpe,
+    RuliadSymbolic,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

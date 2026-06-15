@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 
 use burn_dragon_core::{
-    DragonConfig, ResidualConnectorKind, objective::validate_training_objective_config,
+    DragonConfig, LanguageHeadConfig, ResidualConnectorKind,
+    objective::validate_training_objective_config,
 };
 use burn_dragon_train::{
     LearningRateScheduleConfig, ParallelismKind, PipelineCommunicationKind, PipelineScheduleKind,
@@ -171,6 +172,318 @@ impl TrainingConfig {
         if self.training.events.flush_every_steps == 0 {
             return Err(anyhow!("training.events.flush_every_steps must be > 0"));
         }
+        if self.training.input_corruption.enabled {
+            if !(0.0..=1.0).contains(&self.training.input_corruption.probability)
+                || !self.training.input_corruption.probability.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.input_corruption.probability must be finite and in [0, 1]"
+                ));
+            }
+            if let Some(token_id) = self.training.input_corruption.replacement_token_id {
+                let vocab_size = self.dataset.tokenizer.vocab_size();
+                if vocab_size > 0 && token_id as usize >= vocab_size {
+                    return Err(anyhow!(
+                        "training.input_corruption.replacement_token_id must be < resolved vocab_size"
+                    ));
+                }
+            }
+        }
+        if self.training.logit_entropy_floor.enabled {
+            if self.training.logit_entropy_floor.weight < 0.0
+                || !self.training.logit_entropy_floor.weight.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.weight must be finite and >= 0"
+                ));
+            }
+            if self.training.logit_entropy_floor.marginal_weight < 0.0
+                || !self
+                    .training
+                    .logit_entropy_floor
+                    .marginal_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.marginal_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.logit_entropy_floor.target_coverage_weight < 0.0
+                || !self
+                    .training
+                    .logit_entropy_floor
+                    .target_coverage_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.target_coverage_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.logit_entropy_floor.target_entropy_bits < 0.0
+                || !self
+                    .training
+                    .logit_entropy_floor
+                    .target_entropy_bits
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.target_entropy_bits must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .logit_entropy_floor
+                .target_marginal_entropy_bits
+                < 0.0
+                || !self
+                    .training
+                    .logit_entropy_floor
+                    .target_marginal_entropy_bits
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.target_marginal_entropy_bits must be finite and >= 0"
+                ));
+            }
+            if self.training.logit_entropy_floor.target_coverage_epsilon <= 0.0
+                || self.training.logit_entropy_floor.target_coverage_epsilon >= 1.0
+                || !self
+                    .training
+                    .logit_entropy_floor
+                    .target_coverage_epsilon
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.target_coverage_epsilon must be finite and in (0, 1)"
+                ));
+            }
+            if self.training.logit_entropy_floor.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.logit_entropy_floor.every_steps must be > 0"
+                ));
+            }
+        }
+        if self.training.repeat_unlikelihood.enabled {
+            if self.training.repeat_unlikelihood.weight < 0.0
+                || !self.training.repeat_unlikelihood.weight.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.weight must be finite and >= 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_weight < 0.0
+                || !self.training.repeat_unlikelihood.cycle_weight.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_margin_weight < 0.0
+                || !self
+                    .training
+                    .repeat_unlikelihood
+                    .cycle_margin_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_margin_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_margin < 0.0
+                || !self.training.repeat_unlikelihood.cycle_margin.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_margin must be finite and >= 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_min_lag == 0 {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_min_lag must be > 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_max_lag
+                < self.training.repeat_unlikelihood.cycle_min_lag
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_max_lag must be >= cycle_min_lag"
+                ));
+            }
+            if self.training.repeat_unlikelihood.cycle_lags_per_step == 0
+                && (self.training.repeat_unlikelihood.cycle_weight > f32::EPSILON
+                    || self.training.repeat_unlikelihood.cycle_margin_weight > f32::EPSILON)
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.cycle_lags_per_step must be > 0 when cycle weights are enabled"
+                ));
+            }
+            if self.training.repeat_unlikelihood.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.every_steps must be > 0"
+                ));
+            }
+            if self.training.repeat_unlikelihood.epsilon <= 0.0
+                || self.training.repeat_unlikelihood.epsilon >= 1.0
+                || !self.training.repeat_unlikelihood.epsilon.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.epsilon must be finite and in (0, 1)"
+                ));
+            }
+            if self
+                .training
+                .repeat_unlikelihood
+                .history_lags
+                .iter()
+                .any(|lag| *lag == 0)
+            {
+                return Err(anyhow!(
+                    "training.repeat_unlikelihood.history_lags must contain only positive lags"
+                ));
+            }
+        }
+        if self.training.greedy_rollout_unlikelihood.enabled {
+            if self.training.greedy_rollout_unlikelihood.weight < 0.0
+                || !self.training.greedy_rollout_unlikelihood.weight.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.weight must be finite and >= 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.margin_weight < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .margin_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.margin_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.margin < 0.0
+                || !self.training.greedy_rollout_unlikelihood.margin.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.margin must be finite and >= 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.recovery_weight < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .recovery_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.recovery_weight must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .greedy_rollout_unlikelihood
+                .entropy_floor_weight
+                < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .entropy_floor_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.entropy_floor_weight must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .greedy_rollout_unlikelihood
+                .target_entropy_bits
+                < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .target_entropy_bits
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.target_entropy_bits must be finite and >= 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.cycle_weight < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .cycle_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.cycle_weight must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .greedy_rollout_unlikelihood
+                .cycle_margin_weight
+                < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .cycle_margin_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.cycle_margin_weight must be finite and >= 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.cycle_min_lag == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.cycle_min_lag must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.cycle_max_lag
+                < self.training.greedy_rollout_unlikelihood.cycle_min_lag
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.cycle_max_lag must be >= cycle_min_lag"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.every_steps must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.prompt_tokens == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.prompt_tokens must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.rollout_tokens == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.rollout_tokens must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.history_tokens == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.history_tokens must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.batch_prompts == 0 {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.batch_prompts must be > 0"
+                ));
+            }
+            if self.training.greedy_rollout_unlikelihood.epsilon <= 0.0
+                || self.training.greedy_rollout_unlikelihood.epsilon >= 1.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .epsilon
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.epsilon must be finite and in (0, 1)"
+                ));
+            }
+        }
         if self.training.events.source_selection_every_steps == 0 {
             return Err(anyhow!(
                 "training.events.source_selection_every_steps must be > 0"
@@ -236,6 +549,17 @@ impl TrainingConfig {
                 "training.gates.degeneracy_argmax_unique_min_fraction must be finite and in [0, 1]"
             ));
         }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_distinct_2_min_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_distinct_2_min_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_distinct_2_min_fraction must be finite and in [0, 1]"
+            ));
+        }
         if !(0.0..=1.0).contains(&self.training.gates.degeneracy_repetition_max_fraction)
             || !self
                 .training
@@ -245,6 +569,50 @@ impl TrainingConfig {
         {
             return Err(anyhow!(
                 "training.gates.degeneracy_repetition_max_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_period_2_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_period_2_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_period_2_max_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_period_3_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_period_3_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_period_3_max_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_period_2_to_16_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_period_2_to_16_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_period_2_to_16_max_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_period_2_to_64_max_fraction)
+            || !self
+                .training
+                .gates
+                .degeneracy_period_2_to_64_max_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_period_2_to_64_max_fraction must be finite and in [0, 1]"
             ));
         }
         if self.parallel.world_size == 0 {
@@ -954,6 +1322,22 @@ impl TrainingConfig {
             return Err(anyhow!("model.n_head must be > 0 when set"));
         }
         let mut resolved_model = DragonConfig::default();
+        if let Some(language_head) = &self.model.language_head {
+            resolved_model.language_head = language_head.clone();
+        }
+        if let Some(tie_input_output_embeddings) = self.model.tie_input_output_embeddings {
+            resolved_model.tie_input_output_embeddings = tie_input_output_embeddings;
+        }
+        if resolved_model.tie_input_output_embeddings
+            && !matches!(
+                resolved_model.language_head,
+                LanguageHeadConfig::StandardTokenClassification
+            )
+        {
+            return Err(anyhow!(
+                "model.tie_input_output_embeddings requires model.language_head.type = \"standard_token_classification\""
+            ));
+        }
         if let Some(n_layer) = self.model.n_layer {
             resolved_model.n_layer = n_layer;
         }
@@ -1569,6 +1953,376 @@ max_system_memory_fraction = 0.95
         assert!(
             err.to_string()
                 .contains("auto_batch_size.max_system_memory_fraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_unlikelihood_rejects_zero_history() {
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+weight = 0.5
+history_tokens = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero rollout history should fail");
+        assert!(
+            err.to_string()
+                .contains("greedy_rollout_unlikelihood.history_tokens must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_unlikelihood_rejects_negative_recovery_weight() {
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+weight = 0.5
+recovery_weight = -1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative rollout recovery weight should fail");
+        assert!(
+            err.to_string()
+                .contains("greedy_rollout_unlikelihood.recovery_weight must be finite and >= 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_unlikelihood_rejects_invalid_cycle_lag_range() {
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+cycle_weight = 0.5
+cycle_min_lag = 32
+cycle_max_lag = 16
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid rollout cycle lag range should fail");
+        assert!(
+            err.to_string()
+                .contains("greedy_rollout_unlikelihood.cycle_max_lag"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_unlikelihood_rejects_invalid_margin() {
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+weight = 0.5
+margin_weight = -1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative rollout margin weight should fail");
+        assert!(
+            err.to_string()
+                .contains("greedy_rollout_unlikelihood.margin_weight must be finite and >= 0"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+weight = 0.5
+margin = -0.25
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative rollout margin should fail");
+        assert!(
+            err.to_string()
+                .contains("greedy_rollout_unlikelihood.margin must be finite and >= 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn degeneracy_gates_reject_invalid_period_thresholds() {
+        let config = parse_config(
+            r#"
+[training.gates]
+degeneracy_distinct_2_min_fraction = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid distinct-2 threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("degeneracy_distinct_2_min_fraction"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+degeneracy_period_2_max_fraction = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid period threshold should fail");
+        assert!(
+            err.to_string().contains("degeneracy_period_2_max_fraction"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+degeneracy_period_2_to_16_max_fraction = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid long-cycle period threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("degeneracy_period_2_to_16_max_fraction"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+degeneracy_period_2_to_64_max_fraction = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid extended long-cycle period threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("degeneracy_period_2_to_64_max_fraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_rejects_zero_history_lag() {
+        let config = parse_config(
+            r#"
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.1
+history_lags = [1, 0, 8]
+"#,
+        );
+        let err = config.validate().expect_err("zero history lag should fail");
+        assert!(
+            err.to_string().contains("repeat_unlikelihood.history_lags"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_rejects_invalid_cycle_lag_range() {
+        let config = parse_config(
+            r#"
+[training.repeat_unlikelihood]
+enabled = true
+cycle_weight = 0.5
+cycle_min_lag = 32
+cycle_max_lag = 16
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid repeat cycle lag range should fail");
+        assert!(
+            err.to_string()
+                .contains("repeat_unlikelihood.cycle_max_lag"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_rejects_zero_cycle_lags_per_step_when_enabled() {
+        let config = parse_config(
+            r#"
+[training.repeat_unlikelihood]
+enabled = true
+cycle_weight = 0.5
+cycle_lags_per_step = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero repeat cycle lags per step should fail when cycle loss is enabled");
+        assert!(
+            err.to_string()
+                .contains("repeat_unlikelihood.cycle_lags_per_step"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_rejects_zero_every_steps() {
+        let config = parse_config(
+            r#"
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.5
+every_steps = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero repeat cadence should fail");
+        assert!(
+            err.to_string().contains("repeat_unlikelihood.every_steps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_rejects_negative_target() {
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.1
+target_entropy_bits = -1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative entropy floor target should fail");
+        assert!(
+            err.to_string()
+                .contains("logit_entropy_floor.target_entropy_bits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_rejects_invalid_marginal_fields() {
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+marginal_weight = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative marginal weight should fail");
+        assert!(
+            err.to_string()
+                .contains("logit_entropy_floor.marginal_weight"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+target_marginal_entropy_bits = -1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative marginal entropy target should fail");
+        assert!(
+            err.to_string()
+                .contains("logit_entropy_floor.target_marginal_entropy_bits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_rejects_zero_every_steps() {
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.1
+target_entropy_bits = 2.0
+every_steps = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero entropy cadence should fail");
+        assert!(
+            err.to_string().contains("logit_entropy_floor.every_steps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_rejects_invalid_target_coverage_fields() {
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+target_coverage_weight = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative target coverage weight should fail");
+        assert!(
+            err.to_string()
+                .contains("logit_entropy_floor.target_coverage_weight"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.logit_entropy_floor]
+enabled = true
+target_coverage_epsilon = 1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid target coverage epsilon should fail");
+        assert!(
+            err.to_string()
+                .contains("logit_entropy_floor.target_coverage_epsilon"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tied_input_output_embeddings_rejects_factorized_head() {
+        let config = parse_config(
+            r#"
+[model]
+tie_input_output_embeddings = true
+
+[model.language_head]
+type = "nca_factorized_patch"
+state_count = 2
+patch_size = 2
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("tied embeddings require flat token head");
+        assert!(
+            err.to_string()
+                .contains("model.tie_input_output_embeddings requires"),
             "unexpected error: {err}"
         );
     }

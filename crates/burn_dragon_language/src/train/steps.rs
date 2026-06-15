@@ -1,10 +1,11 @@
 use crate::config::train::NeuronScalingStabilizationConfig;
 use crate::train::prelude::*;
+use burn::tensor::activation;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type StreamingStateStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
@@ -462,30 +463,18 @@ fn scale_3d_latent_tail<B: BackendTrait, const D: usize>(
     }
     let dims: [usize; D] = tensor.shape().dims();
     let device = tensor.device();
-    let mut values = tensor
-        .to_data()
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .expect("3d shared lowrank gradient vec");
     let heads = dims[0];
     let embd = dims[1];
     let latent = dims[2];
     if latent != new_latent_per_head {
-        return Tensor::<B, D>::from_data(TensorData::new(values, dims), &device);
+        return tensor;
     }
-    for h in 0..heads {
-        for e in 0..embd {
-            for l in 0..latent {
-                let idx = (h * embd + e) * latent + l;
-                values[idx] *= if l < old_latent_per_head {
-                    base_scale
-                } else {
-                    tail_scale
-                };
-            }
-        }
-    }
-    Tensor::<B, D>::from_data(TensorData::new(values, dims), &device)
+    let scale =
+        latent_tail_scale_vector::<B>(latent, old_latent_per_head, base_scale, tail_scale, &device)
+            .reshape([1, 1, latent])
+            .repeat_dim(0, heads)
+            .repeat_dim(1, embd);
+    (tensor.reshape([heads, embd, latent]) * scale).reshape(dims)
 }
 
 fn scale_2d_headed_latent_rows<B: BackendTrait, const D: usize>(
@@ -500,28 +489,41 @@ fn scale_2d_headed_latent_rows<B: BackendTrait, const D: usize>(
     }
     let dims: [usize; D] = tensor.shape().dims();
     let device = tensor.device();
-    let mut values = tensor
-        .to_data()
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .expect("2d shared lowrank decoder gradient vec");
     let rows = dims[0];
     let cols = dims[1];
     if rows % new_latent_per_head != 0 {
-        return Tensor::<B, D>::from_data(TensorData::new(values, dims), &device);
+        return tensor;
     }
-    for row in 0..rows {
-        let local = row % new_latent_per_head;
-        let scale = if local < old_latent_per_head {
-            base_scale
-        } else {
-            tail_scale
-        };
-        for col in 0..cols {
-            values[row * cols + col] *= scale;
-        }
-    }
-    Tensor::<B, D>::from_data(TensorData::new(values, dims), &device)
+    let heads = rows / new_latent_per_head;
+    let scale = latent_tail_scale_vector::<B>(
+        new_latent_per_head,
+        old_latent_per_head,
+        base_scale,
+        tail_scale,
+        &device,
+    )
+    .reshape([1, new_latent_per_head, 1])
+    .repeat_dim(0, heads)
+    .repeat_dim(2, cols);
+    (tensor.reshape([heads, new_latent_per_head, cols]) * scale).reshape(dims)
+}
+
+fn latent_tail_scale_vector<B: BackendTrait>(
+    latent: usize,
+    old_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    let base_mask = Tensor::<B, 1, Int>::arange(0..latent as i64, device)
+        .float()
+        .lower_elem(old_latent_per_head.min(latent) as f32)
+        .float();
+    base_mask.clone().mul_scalar(base_scale)
+        + base_mask
+            .mul_scalar(-1.0)
+            .add_scalar(1.0)
+            .mul_scalar(tail_scale)
 }
 
 #[derive(Debug)]
@@ -618,6 +620,18 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     pub objective: TrainingObjectiveConfig,
     #[module(skip)]
+    input_corruption: CausalInputCorruptionConfig,
+    #[module(skip)]
+    logit_entropy_floor: LogitEntropyFloorConfig,
+    #[module(skip)]
+    repeat_unlikelihood: RepeatUnlikelihoodConfig,
+    #[module(skip)]
+    greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig,
+    #[module(skip)]
+    greedy_rollout_recovery_active: Arc<AtomicBool>,
+    #[module(skip)]
+    input_vocab_size: usize,
+    #[module(skip)]
     teacher_model: Option<DragonModel<B>>,
     #[module(skip)]
     streaming_runtime_key: usize,
@@ -639,6 +653,9 @@ pub(crate) struct OutputDegeneracyStats {
     pub distinct_2_fraction: f64,
     pub period_2_fraction: f64,
     pub period_3_fraction: f64,
+    pub max_period_2_to_16_fraction: f64,
+    pub max_period_2_to_64_fraction: f64,
+    pub dominant_period_2_to_64: usize,
     pub generated_tokens: Vec<i64>,
 }
 
@@ -664,11 +681,17 @@ struct RolloutScoreConfig {
 impl<B: BackendTrait> LanguageTrainModel<B> {
     pub fn new(model: DragonModel<B>) -> Self {
         Self {
+            input_vocab_size: model.vocab_size(),
             model,
             tbptt_chunk_size: None,
             pipeline_plan: None,
             tbptt_persist_across_steps: false,
             objective: TrainingObjectiveConfig::NextToken,
+            input_corruption: CausalInputCorruptionConfig::default(),
+            logit_entropy_floor: LogitEntropyFloorConfig::default(),
+            repeat_unlikelihood: RepeatUnlikelihoodConfig::default(),
+            greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig::default(),
+            greedy_rollout_recovery_active: Arc::new(AtomicBool::new(false)),
             teacher_model: None,
             streaming_runtime_key: next_streaming_runtime_key(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
@@ -701,6 +724,34 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         self.objective = objective;
         self
+    }
+
+    pub fn with_input_corruption(mut self, config: CausalInputCorruptionConfig) -> Self {
+        self.input_corruption = config;
+        self
+    }
+
+    pub fn with_logit_entropy_floor(mut self, config: LogitEntropyFloorConfig) -> Self {
+        self.logit_entropy_floor = config;
+        self
+    }
+
+    pub fn with_repeat_unlikelihood(mut self, config: RepeatUnlikelihoodConfig) -> Self {
+        self.repeat_unlikelihood = config;
+        self
+    }
+
+    pub fn with_greedy_rollout_unlikelihood(
+        mut self,
+        config: GreedyRolloutUnlikelihoodConfig,
+    ) -> Self {
+        self.greedy_rollout_unlikelihood = config;
+        self
+    }
+
+    pub fn set_recovery_auxiliary_active(&self, active: bool) {
+        self.greedy_rollout_recovery_active
+            .store(active, Ordering::Relaxed);
     }
 
     pub fn with_gradient_scale_schedule(
@@ -999,42 +1050,53 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if batch_size == 0 || block_size == 0 {
             return None;
         }
-        let probe_batch = 1usize;
+        let probe_batch = batch_size.min(4);
         let generated_tokens = probe_tokens.max(1);
         let prompt_time = block_size.min(probe_tokens.clamp(1, 32));
+        let prompt_available = block_size.saturating_sub(prompt_time);
         let device = batch.inputs.device();
-        let inputs = batch.inputs.slice([0..probe_batch, 0..prompt_time]);
-        let summary_event_mask = batch
-            .summary_event_mask
-            .map(|mask| mask.slice([0..probe_batch, 0..prompt_time]));
-        let mut state = self.model.init_state();
-        let logits = if let Some(mask) = summary_event_mask {
-            self.model
-                .forward_with_state_and_summary_event_mask(inputs, mask, &mut state)
-        } else {
-            self.model.forward_with_state(inputs, &mut state)
-        };
-        let [_, time, vocab] = logits.shape().dims::<3>();
-        if time == 0 || vocab == 0 {
-            return None;
-        }
-        let mut last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
         let mut accumulator = OutputDegeneracyAccumulator::new(eos_id);
-        for _ in 0..generated_tokens {
-            let Some(step) = output_degeneracy_step_from_logits(last_logits.clone()) else {
-                continue;
+        for prompt_index in 0..probe_batch {
+            let prompt_start =
+                validation_degeneracy_prompt_start(prompt_index, probe_batch, prompt_available);
+            let inputs = batch.inputs.clone().slice([
+                prompt_index..prompt_index + 1,
+                prompt_start..(prompt_start + prompt_time),
+            ]);
+            let summary_event_mask = batch.summary_event_mask.clone().map(|mask| {
+                mask.slice([
+                    prompt_index..prompt_index + 1,
+                    prompt_start..(prompt_start + prompt_time),
+                ])
+            });
+            let mut state = self.model.init_state();
+            let logits = if let Some(mask) = summary_event_mask {
+                self.model
+                    .forward_with_state_and_summary_event_mask(inputs, mask, &mut state)
+            } else {
+                self.model.forward_with_state(inputs, &mut state)
             };
-            accumulator.record(step);
-            let next = step.argmax as i64;
-            accumulator.record_generated_token(next);
-            let next_tensor =
-                Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
-            let logits = self.model.forward_with_state(next_tensor, &mut state);
             let [_, time, vocab] = logits.shape().dims::<3>();
             if time == 0 || vocab == 0 {
-                break;
+                continue;
             }
-            last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+            let mut last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+            for _ in 0..generated_tokens {
+                let Some(step) = output_degeneracy_step_from_logits(last_logits.clone()) else {
+                    continue;
+                };
+                accumulator.record(step);
+                let next = step.argmax as i64;
+                accumulator.record_generated_token(next);
+                let next_tensor =
+                    Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
+                let logits = self.model.forward_with_state(next_tensor, &mut state);
+                let [_, time, vocab] = logits.shape().dims::<3>();
+                if time == 0 || vocab == 0 {
+                    break;
+                }
+                last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+            }
         }
         Some(accumulator.finish()).filter(|stats| stats.token_count > 0)
     }
@@ -1053,6 +1115,791 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             &self.objective,
             self.model.uses_factorized_language_head(),
         );
+    }
+
+    fn causal_input_corruption_probability(&self) -> f32 {
+        if !self.input_corruption.enabled {
+            return 0.0;
+        }
+        let probability = self.input_corruption.probability.clamp(0.0, 1.0);
+        if probability <= f32::EPSILON {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < self.input_corruption.warmup_steps {
+            return 0.0;
+        }
+        if self.input_corruption.ramp_steps == 0 {
+            return probability;
+        }
+        let ramp_step = step_index
+            .saturating_sub(self.input_corruption.warmup_steps)
+            .saturating_add(1);
+        let ramp = (ramp_step as f32 / self.input_corruption.ramp_steps as f32).clamp(0.0, 1.0);
+        probability * ramp
+    }
+
+    fn scheduled_weight(
+        enabled: bool,
+        weight: f32,
+        warmup_steps: usize,
+        ramp_steps: usize,
+        step_index: usize,
+    ) -> f32 {
+        if !enabled || weight <= f32::EPSILON {
+            return 0.0;
+        }
+        if step_index < warmup_steps {
+            return 0.0;
+        }
+        if ramp_steps == 0 {
+            return weight;
+        }
+        let ramp_step = step_index.saturating_sub(warmup_steps).saturating_add(1);
+        let ramp = (ramp_step as f32 / ramp_steps as f32).clamp(0.0, 1.0);
+        weight * ramp
+    }
+
+    fn scheduled_weight_on_cadence(
+        enabled: bool,
+        weight: f32,
+        warmup_steps: usize,
+        ramp_steps: usize,
+        every_steps: usize,
+        step_index: usize,
+    ) -> f32 {
+        if every_steps > 1 && !step_index.is_multiple_of(every_steps) {
+            return 0.0;
+        }
+        Self::scheduled_weight(enabled, weight, warmup_steps, ramp_steps, step_index)
+    }
+
+    fn repeat_unlikelihood_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn repeat_cycle_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.cycle_weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn repeat_cycle_margin_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.cycle_margin_weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_marginal_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.marginal_weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_target_coverage_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.target_coverage_weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_unlikelihood_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_unlikelihood_margin_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.margin_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_cycle_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.cycle_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_cycle_margin_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.cycle_margin_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn next_token_loss_from_logits(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 1> {
+        let [batch_size, time, vocab] = logits.shape().dims();
+        let log_probs = log_probs_from_logits(logits.clone());
+        let mut loss = next_token_loss_from_log_probs(log_probs.clone(), targets.clone());
+        let weight = self.repeat_unlikelihood_weight();
+        let cycle_weight = self.repeat_cycle_weight();
+        let cycle_margin_weight = self.repeat_cycle_margin_weight();
+        let needs_lagged_aux = weight > f32::EPSILON
+            || cycle_weight > f32::EPSILON
+            || cycle_margin_weight > f32::EPSILON;
+        if needs_lagged_aux {
+            if weight > f32::EPSILON {
+                let mut total_loss: Option<Tensor<B, 1>> = None;
+                let mut total_hits: Option<Tensor<B, 1>> = None;
+                for lag in self.repeat_unlikelihood_lags(time) {
+                    let Some((lag_log_probs, lag_targets, history_tokens)) =
+                        lagged_prediction_tensors(
+                            log_probs.clone(),
+                            targets.clone(),
+                            clean_inputs.clone(),
+                            lag,
+                            batch_size,
+                            time,
+                            vocab,
+                        )
+                    else {
+                        continue;
+                    };
+                    let repeat_weight = history_tokens.clone().not_equal(lag_targets).int().float();
+                    let unlikelihood = unlikelihood_from_log_probs(
+                        lag_log_probs,
+                        history_tokens,
+                        self.repeat_unlikelihood.epsilon,
+                    );
+                    let lag_loss = (unlikelihood * repeat_weight.clone()).sum().reshape([1]);
+                    let lag_hits = repeat_weight.sum().reshape([1]);
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + lag_loss,
+                        None => lag_loss,
+                    });
+                    total_hits = Some(match total_hits {
+                        Some(accumulated) => accumulated + lag_hits,
+                        None => lag_hits,
+                    });
+                }
+                if let Some(total_loss) = total_loss {
+                    loss = loss
+                        + total_loss
+                            .div(
+                                total_hits
+                                    .expect("repeat unlikelihood hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(weight);
+                }
+            }
+            if cycle_weight > f32::EPSILON || cycle_margin_weight > f32::EPSILON {
+                let mut total_cycle: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_hits: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_margin: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_margin_hits: Option<Tensor<B, 1>> = None;
+                let mean_logits_by_position = (cycle_margin_weight > f32::EPSILON)
+                    .then(|| logits.clone().mean_dim(2).reshape([batch_size, time]));
+                for lag in self.repeat_cycle_lags(time) {
+                    let Some((lag_log_probs, lag_targets, history_tokens)) =
+                        lagged_prediction_tensors(
+                            log_probs.clone(),
+                            targets.clone(),
+                            clean_inputs.clone(),
+                            lag,
+                            batch_size,
+                            time,
+                            vocab,
+                        )
+                    else {
+                        continue;
+                    };
+                    let cycle_weight_tensor =
+                        history_tokens.clone().not_equal(lag_targets).int().float();
+                    if cycle_weight > f32::EPSILON {
+                        let unlikelihood = unlikelihood_from_log_probs(
+                            lag_log_probs,
+                            history_tokens.clone(),
+                            self.repeat_unlikelihood.epsilon,
+                        );
+                        let lag_loss = (unlikelihood * cycle_weight_tensor.clone())
+                            .sum()
+                            .reshape([1]);
+                        let lag_hits = cycle_weight_tensor.clone().sum().reshape([1]);
+                        total_cycle = Some(match total_cycle {
+                            Some(accumulated) => accumulated + lag_loss,
+                            None => lag_loss,
+                        });
+                        total_cycle_hits = Some(match total_cycle_hits {
+                            Some(accumulated) => accumulated + lag_hits,
+                            None => lag_hits,
+                        });
+                    }
+                    if cycle_margin_weight > f32::EPSILON {
+                        let start = lag.saturating_sub(1);
+                        let lag_logits =
+                            logits.clone().slice([0..batch_size, start..time, 0..vocab]);
+                        let history_logits =
+                            selected_token_logits(lag_logits.clone(), history_tokens);
+                        let mean_logits = mean_logits_by_position
+                            .as_ref()
+                            .expect("cycle margin mean logits")
+                            .clone()
+                            .slice([0..batch_size, start..time]);
+                        let margin_penalty = activation::softplus(
+                            history_logits - mean_logits + self.repeat_unlikelihood.cycle_margin,
+                            1.0,
+                        );
+                        let lag_margin = (margin_penalty * cycle_weight_tensor.clone())
+                            .sum()
+                            .reshape([1]);
+                        let lag_hits = cycle_weight_tensor.sum().reshape([1]);
+                        total_cycle_margin = Some(match total_cycle_margin {
+                            Some(accumulated) => accumulated + lag_margin,
+                            None => lag_margin,
+                        });
+                        total_cycle_margin_hits = Some(match total_cycle_margin_hits {
+                            Some(accumulated) => accumulated + lag_hits,
+                            None => lag_hits,
+                        });
+                    }
+                }
+                if let Some(total_cycle) = total_cycle {
+                    loss = loss
+                        + total_cycle
+                            .div(
+                                total_cycle_hits
+                                    .expect("repeat cycle hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(cycle_weight);
+                }
+                if let Some(total_cycle_margin) = total_cycle_margin {
+                    loss = loss
+                        + total_cycle_margin
+                            .div(
+                                total_cycle_margin_hits
+                                    .expect("repeat cycle margin hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(cycle_margin_weight);
+                }
+            }
+        }
+        if let Some(entropy_floor_loss) = self.logit_entropy_floor_loss(log_probs, targets.clone())
+        {
+            loss = loss + entropy_floor_loss;
+        }
+        loss
+    }
+
+    fn repeat_unlikelihood_lags(&self, time: usize) -> Vec<usize> {
+        if time == 0 {
+            return Vec::new();
+        }
+        let mut lags = Vec::with_capacity(self.repeat_unlikelihood.history_lags.len() + 1);
+        lags.push(1);
+        lags.extend(self.repeat_unlikelihood.history_lags.iter().copied());
+        lags.retain(|lag| (1..=time).contains(lag));
+        lags.sort_unstable();
+        lags.dedup();
+        lags
+    }
+
+    fn repeat_cycle_lags(&self, time: usize) -> Vec<usize> {
+        if time == 0
+            || self.repeat_unlikelihood.cycle_min_lag == 0
+            || self.repeat_unlikelihood.cycle_max_lag < self.repeat_unlikelihood.cycle_min_lag
+        {
+            return Vec::new();
+        }
+        let min_lag = self.repeat_unlikelihood.cycle_min_lag.min(time);
+        let max_lag = self.repeat_unlikelihood.cycle_max_lag.min(time);
+        if max_lag < min_lag {
+            return Vec::new();
+        }
+        let available = max_lag - min_lag + 1;
+        let budget = self
+            .repeat_unlikelihood
+            .cycle_lags_per_step
+            .max(1)
+            .min(available);
+        if budget == available {
+            return (min_lag..=max_lag).collect();
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let mut lags = Vec::with_capacity(budget);
+        let stride = (available / budget).max(1);
+        let offset = step_index % available;
+        for index in 0..budget {
+            let relative = (offset + index * stride) % available;
+            lags.push(min_lag + relative);
+        }
+        lags.sort_unstable();
+        lags.dedup();
+        lags
+    }
+
+    fn next_token_loss_from_hidden(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 1> {
+        if (self.repeat_unlikelihood_weight() <= f32::EPSILON
+            && self.repeat_cycle_weight() <= f32::EPSILON
+            && self.repeat_cycle_margin_weight() <= f32::EPSILON
+            && self.logit_entropy_floor_weight() <= f32::EPSILON
+            && self.logit_marginal_entropy_floor_weight() <= f32::EPSILON
+            && self.logit_target_coverage_weight() <= f32::EPSILON)
+            || self.model.uses_factorized_language_head()
+        {
+            return self.language_loss_from_hidden(hidden, targets);
+        }
+        let logits = self.model.logits_from_hidden(hidden);
+        self.next_token_loss_from_logits(logits, targets, clean_inputs)
+    }
+
+    fn logit_entropy_floor_loss(
+        &self,
+        log_probs: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+    ) -> Option<Tensor<B, 1>> {
+        let [batch, time, vocab] = log_probs.shape().dims();
+        if batch == 0 || time == 0 || vocab == 0 {
+            return None;
+        }
+        let token_count = batch * time;
+        let flat_log_probs = log_probs.reshape([token_count, vocab]);
+        let flat_probs = flat_log_probs.clone().exp();
+        let weight = self.logit_entropy_floor_weight();
+        let target_entropy_bits = self.logit_entropy_floor.target_entropy_bits;
+        let marginal_weight = self.logit_marginal_entropy_floor_weight();
+        let target_marginal_entropy_bits = self.logit_entropy_floor.target_marginal_entropy_bits;
+        let target_coverage_weight = self.logit_target_coverage_weight();
+        let mut total = if weight > f32::EPSILON && target_entropy_bits > f32::EPSILON {
+            entropy_floor_loss_from_flat_log_probs(
+                flat_log_probs.clone(),
+                flat_probs.clone(),
+                target_entropy_bits,
+            )
+            .map(|loss| loss.mul_scalar(weight))
+        } else {
+            None
+        };
+        let marginal_probs = (marginal_weight > f32::EPSILON
+            || target_coverage_weight > f32::EPSILON)
+            .then(|| flat_probs.mean_dim(0));
+        if marginal_weight > f32::EPSILON && target_marginal_entropy_bits > f32::EPSILON {
+            if let Some(loss) = marginal_entropy_floor_loss_from_marginal(
+                marginal_probs
+                    .as_ref()
+                    .expect("marginal probabilities")
+                    .clone(),
+                target_marginal_entropy_bits,
+            )
+            .map(|loss| loss.mul_scalar(marginal_weight))
+            {
+                total = Some(match total {
+                    Some(accumulated) => accumulated + loss,
+                    None => loss,
+                });
+            }
+        }
+        if target_coverage_weight > f32::EPSILON
+            && let Some(loss) = target_marginal_coverage_loss_from_marginal(
+                marginal_probs.expect("marginal probabilities"),
+                targets,
+                self.logit_entropy_floor.target_coverage_epsilon,
+            )
+            .map(|loss| loss.mul_scalar(target_coverage_weight))
+        {
+            total = Some(match total {
+                Some(accumulated) => accumulated + loss,
+                None => loss,
+            });
+        }
+        total
+    }
+
+    fn greedy_rollout_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.entropy_floor_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_entropy_floor_loss(&self, log_probs: Tensor<B, 3>) -> Option<Tensor<B, 1>> {
+        let weight = self.greedy_rollout_entropy_floor_weight();
+        let target_entropy_bits = self.greedy_rollout_unlikelihood.target_entropy_bits;
+        if weight <= f32::EPSILON || target_entropy_bits <= f32::EPSILON {
+            return None;
+        }
+        entropy_floor_loss_from_log_probs(log_probs, target_entropy_bits)
+            .map(|loss| loss.mul_scalar(weight))
+    }
+
+    fn greedy_rollout_unlikelihood_loss(
+        &self,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> Option<Tensor<B, 1>> {
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let config = &self.greedy_rollout_unlikelihood;
+        if config.recovery_only && !self.greedy_rollout_recovery_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let weight = self.greedy_rollout_unlikelihood_weight();
+        let margin_weight = self.greedy_rollout_unlikelihood_margin_weight();
+        let cycle_weight = self.greedy_rollout_cycle_weight();
+        let cycle_margin_weight = self.greedy_rollout_cycle_margin_weight();
+        let entropy_floor_weight = self.greedy_rollout_entropy_floor_weight();
+        let recovery_weight = Self::scheduled_weight(
+            config.enabled,
+            config.recovery_weight,
+            config.warmup_steps,
+            config.ramp_steps,
+            step_index,
+        );
+        if (weight <= f32::EPSILON
+            && margin_weight <= f32::EPSILON
+            && cycle_weight <= f32::EPSILON
+            && cycle_margin_weight <= f32::EPSILON
+            && recovery_weight <= f32::EPSILON
+            && entropy_floor_weight <= f32::EPSILON)
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+            || !step_index.is_multiple_of(config.every_steps)
+        {
+            return None;
+        }
+        let [batch_size, block_size] = clean_inputs.shape().dims();
+        let prompt_batch = batch_size.min(config.batch_prompts.max(1));
+        let prompt_tokens = block_size.min(config.prompt_tokens.max(1));
+        if prompt_batch == 0 || prompt_tokens == 0 {
+            return None;
+        }
+        let prompt_start =
+            rollout_prompt_start(step_index, config.every_steps, block_size, prompt_tokens);
+        let prompt = clean_inputs.clone().slice([
+            0..prompt_batch,
+            prompt_start..(prompt_start + prompt_tokens),
+        ]);
+        let mut state = self.model.init_state();
+        let logits = self.model.forward_with_state(prompt.clone(), &mut state);
+        let [_, time, vocab] = logits.shape().dims::<3>();
+        if time == 0 || vocab == 0 {
+            return None;
+        }
+        let mut last_logits = logits
+            .slice_dim(1, (time - 1)..time)
+            .reshape([prompt_batch, vocab]);
+        let history_tokens = config.history_tokens.max(1);
+        let mut history = Vec::with_capacity(history_tokens);
+        for offset in 0..prompt_tokens.min(history_tokens) {
+            let start = prompt_tokens - 1 - offset;
+            history.push(prompt.clone().slice([0..prompt_batch, start..(start + 1)]));
+        }
+        let mut total_loss: Option<Tensor<B, 1>> = None;
+        let mut total_hits: Option<Tensor<B, 1>> = None;
+        let mut total_margin: Option<Tensor<B, 1>> = None;
+        let mut total_margin_hits: Option<Tensor<B, 1>> = None;
+        let mut total_cycle: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_hits: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_margin: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_margin_hits: Option<Tensor<B, 1>> = None;
+        let mut total_recovery: Option<Tensor<B, 1>> = None;
+        let mut recovery_steps = 0usize;
+        let mut total_entropy_floor: Option<Tensor<B, 1>> = None;
+        let mut entropy_floor_steps = 0usize;
+        for rollout_index in 0..config.rollout_tokens {
+            let step_logits = last_logits.clone().reshape([prompt_batch, 1, vocab]);
+            let step_log_probs = log_probs_from_logits(step_logits.clone());
+            if let Some(entropy_loss) =
+                self.greedy_rollout_entropy_floor_loss(step_log_probs.clone())
+            {
+                total_entropy_floor = Some(match total_entropy_floor {
+                    Some(accumulated) => accumulated + entropy_loss,
+                    None => entropy_loss,
+                });
+                entropy_floor_steps = entropy_floor_steps.saturating_add(1);
+            }
+            let next = last_logits.clone().argmax(1).reshape([prompt_batch, 1]);
+            let mut repeat_mask = next.clone().equal(
+                history
+                    .first()
+                    .expect("greedy rollout history should not be empty")
+                    .clone(),
+            );
+            for previous in history.iter().skip(1) {
+                repeat_mask = repeat_mask.bool_or(next.clone().equal(previous.clone()));
+            }
+            let repeat_mask = repeat_mask.int();
+            let cycle_mask =
+                cycle_repeat_mask(&next, &history, config.cycle_min_lag, config.cycle_max_lag);
+            if weight > f32::EPSILON {
+                let next_log_probs = selected_token_log_probs(step_log_probs.clone(), next.clone());
+                let next_prob = next_log_probs
+                    .exp()
+                    .clamp_min(0.0)
+                    .clamp_max(1.0 - config.epsilon);
+                let unlikelihood = next_prob
+                    .mul_scalar(-1.0)
+                    .add_scalar(1.0)
+                    .clamp_min(config.epsilon)
+                    .log()
+                    .mul_scalar(-1.0);
+                let repeat_weight = repeat_mask.clone().float();
+                let step_loss = (unlikelihood * repeat_weight.clone()).sum().reshape([1]);
+                let step_hits = repeat_weight.sum().reshape([1]);
+                total_loss = Some(match total_loss {
+                    Some(accumulated) => accumulated + step_loss,
+                    None => step_loss,
+                });
+                total_hits = Some(match total_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if cycle_weight > f32::EPSILON
+                && let Some(cycle_mask) = cycle_mask.clone()
+            {
+                let next_log_probs = selected_token_log_probs(step_log_probs.clone(), next.clone());
+                let next_prob = next_log_probs
+                    .exp()
+                    .clamp_min(0.0)
+                    .clamp_max(1.0 - config.epsilon);
+                let unlikelihood = next_prob
+                    .mul_scalar(-1.0)
+                    .add_scalar(1.0)
+                    .clamp_min(config.epsilon)
+                    .log()
+                    .mul_scalar(-1.0);
+                let cycle_weight_tensor = cycle_mask.float();
+                let step_cycle = (unlikelihood * cycle_weight_tensor.clone())
+                    .sum()
+                    .reshape([1]);
+                let step_hits = cycle_weight_tensor.sum().reshape([1]);
+                total_cycle = Some(match total_cycle {
+                    Some(accumulated) => accumulated + step_cycle,
+                    None => step_cycle,
+                });
+                total_cycle_hits = Some(match total_cycle_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if margin_weight > f32::EPSILON {
+                let repeat_weight = repeat_mask.float();
+                let next_logits = selected_token_logits(step_logits.clone(), next.clone());
+                let mean_logits = step_logits.clone().mean_dim(2).reshape([prompt_batch, 1]);
+                let margin_penalty =
+                    activation::softplus(next_logits - mean_logits + config.margin, 1.0);
+                let step_margin = (margin_penalty * repeat_weight.clone()).sum().reshape([1]);
+                let step_hits = repeat_weight.sum().reshape([1]);
+                total_margin = Some(match total_margin {
+                    Some(accumulated) => accumulated + step_margin,
+                    None => step_margin,
+                });
+                total_margin_hits = Some(match total_margin_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if cycle_margin_weight > f32::EPSILON
+                && let Some(cycle_mask) = cycle_mask
+            {
+                let cycle_weight_tensor = cycle_mask.float();
+                let next_logits = selected_token_logits(step_logits.clone(), next.clone());
+                let mean_logits = step_logits.clone().mean_dim(2).reshape([prompt_batch, 1]);
+                let margin_penalty =
+                    activation::softplus(next_logits - mean_logits + config.margin, 1.0);
+                let step_margin = (margin_penalty * cycle_weight_tensor.clone())
+                    .sum()
+                    .reshape([1]);
+                let step_hits = cycle_weight_tensor.sum().reshape([1]);
+                total_cycle_margin = Some(match total_cycle_margin {
+                    Some(accumulated) => accumulated + step_margin,
+                    None => step_margin,
+                });
+                total_cycle_margin_hits = Some(match total_cycle_margin_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            let target_pos = prompt_start + prompt_tokens + rollout_index;
+            if recovery_weight > f32::EPSILON && target_pos < block_size {
+                let recovery_target = clean_inputs
+                    .clone()
+                    .slice([0..prompt_batch, target_pos..(target_pos + 1)]);
+                let recovery_loss = selected_token_log_probs(step_log_probs, recovery_target)
+                    .mul_scalar(-1.0)
+                    .mean()
+                    .reshape([1]);
+                total_recovery = Some(match total_recovery {
+                    Some(accumulated) => accumulated + recovery_loss,
+                    None => recovery_loss,
+                });
+                recovery_steps = recovery_steps.saturating_add(1);
+            }
+            let logits = self.model.forward_with_state(next.clone(), &mut state);
+            let [_, time, vocab] = logits.shape().dims::<3>();
+            if time == 0 || vocab == 0 {
+                break;
+            }
+            last_logits = logits
+                .slice_dim(1, (time - 1)..time)
+                .reshape([prompt_batch, vocab]);
+            history.insert(0, next);
+            if history.len() > history_tokens {
+                history.pop();
+            }
+        }
+        let mut loss = total_loss.map(|loss| {
+            loss.div(
+                total_hits
+                    .expect("greedy rollout hit accumulator should exist")
+                    .clamp_min(1.0),
+            )
+            .mul_scalar(weight)
+        });
+        if let Some(margin) = total_margin {
+            let margin = margin
+                .div(
+                    total_margin_hits
+                        .expect("greedy rollout margin hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(margin_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + margin,
+                None => margin,
+            });
+        }
+        if let Some(cycle) = total_cycle {
+            let cycle = cycle
+                .div(
+                    total_cycle_hits
+                        .expect("greedy rollout cycle hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(cycle_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + cycle,
+                None => cycle,
+            });
+        }
+        if let Some(cycle_margin) = total_cycle_margin {
+            let cycle_margin = cycle_margin
+                .div(
+                    total_cycle_margin_hits
+                        .expect("greedy rollout cycle margin hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(cycle_margin_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + cycle_margin,
+                None => cycle_margin,
+            });
+        }
+        if recovery_steps > 0
+            && let Some(recovery) = total_recovery
+        {
+            let recovery = recovery.mul_scalar(recovery_weight / recovery_steps as f32);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + recovery,
+                None => recovery,
+            });
+        }
+        if entropy_floor_steps > 0
+            && let Some(entropy_floor) = total_entropy_floor
+        {
+            let entropy_floor = entropy_floor.mul_scalar(1.0 / entropy_floor_steps as f32);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + entropy_floor,
+                None => entropy_floor,
+            });
+        }
+        loss
+    }
+
+    fn corrupt_causal_inputs(&self, inputs: Tensor<B, 2, Int>) -> Tensor<B, 2, Int> {
+        let probability = self.causal_input_corruption_probability();
+        if probability <= f32::EPSILON {
+            return inputs;
+        }
+        let shape = inputs.shape();
+        let device = inputs.device();
+        let mask = Tensor::<B, 2>::random(
+            shape.clone(),
+            TensorDistribution::Uniform(0.0, 1.0),
+            &device,
+        )
+        .lower_elem(probability);
+        let replacements = if let Some(token_id) = self.input_corruption.replacement_token_id {
+            Tensor::<B, 2, Int>::full(shape, i64::from(token_id), &device)
+        } else {
+            let vocab_size = self.input_vocab_size.max(1);
+            Tensor::<B, 2>::random(
+                shape,
+                TensorDistribution::Uniform(0.0, vocab_size as f64),
+                &device,
+            )
+            .clamp_min(0.0)
+            .clamp_max(vocab_size.saturating_sub(1) as f32)
+            .int()
+        };
+        inputs.mask_where(mask, replacements)
     }
 
     fn truncate_reprompt_tokens(
@@ -1477,20 +2324,23 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
 
     fn step(&self, batch: SequenceBatch<B>) -> TrainOutput<LanguageModelTrainItem<B>> {
         let prof_enabled = crate::train::profile::enabled();
-        let detail_prof_enabled = crate::train::profile::detail_enabled();
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let detail_prof_enabled = prof_enabled && crate::train::profile::detail_due(step_index);
         let memory_prof_enabled = prof_enabled && crate::train::profile::memory_enabled();
         let forward_start = prof_enabled.then(Instant::now);
-        let inputs = batch.inputs;
+        let clean_inputs = batch.inputs;
         let targets = batch.targets;
         if !self.objective.is_next_token() {
             self.update_teacher_runtime();
-            let loss = self.objective_loss(inputs, targets);
+            let loss = self.objective_loss(clean_inputs, targets);
             let grads = loss.backward();
             return TrainOutput {
                 grads: self.apply_gradient_scale_schedule(GradientsParams::from_grads(grads, self)),
                 item: LanguageModelTrainItem::new(loss),
             };
         }
+        let inputs = self.corrupt_causal_inputs(clean_inputs.clone());
+        let clean_inputs_for_aux = clean_inputs.clone();
         let summary_event_mask = batch.summary_event_mask;
         let reset_stream_state = batch.reset_stream_state;
         let step_device = memory_prof_enabled.then(|| inputs.device());
@@ -1552,7 +2402,11 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     }
                 }
                 let hidden = Tensor::cat(hidden_chunks, 1);
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                );
                 let logits = (!factorized_head).then(|| Tensor::cat(logits_chunks, 1));
                 (loss, Some(hidden), logits, total_forward_ns)
             } else {
@@ -1565,6 +2419,8 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 for start in (0..block_size).step_by(chunk_size) {
                     let end = (start + chunk_size).min(block_size);
                     let chunk_inputs = Self::slice_tokens(inputs.clone(), batch_size, start, end);
+                    let chunk_clean_inputs =
+                        Self::slice_tokens(clean_inputs.clone(), batch_size, start, end);
                     let chunk_targets = Self::slice_tokens(targets.clone(), batch_size, start, end);
                     let chunk_summary_event_mask = summary_event_mask
                         .clone()
@@ -1577,12 +2433,20 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                             mask,
                             &mut step_state,
                         );
-                        self.language_loss_from_hidden(hidden, chunk_targets.clone())
+                        self.next_token_loss_from_hidden(
+                            hidden,
+                            chunk_targets.clone(),
+                            chunk_clean_inputs.clone(),
+                        )
                     } else {
                         let hidden = self
                             .model
                             .forward_hidden_with_state(chunk_inputs, &mut step_state);
-                        self.language_loss_from_hidden(hidden, chunk_targets.clone())
+                        self.next_token_loss_from_hidden(
+                            hidden,
+                            chunk_targets.clone(),
+                            chunk_clean_inputs.clone(),
+                        )
                     };
                     total_forward_ns += chunk_forward_start.elapsed().as_nanos();
 
@@ -1646,7 +2510,11 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let forward_ns = forward_start
                     .map(|start| start.elapsed().as_nanos())
                     .unwrap_or_default();
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                );
                 let logits =
                     (!factorized_head).then(|| self.model.logits_from_hidden(hidden.clone()));
                 (loss, Some(hidden), logits, forward_ns)
@@ -1657,7 +2525,11 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let forward_ns = forward_start
                     .map(|start| start.elapsed().as_nanos())
                     .unwrap_or_default();
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                );
                 let logits =
                     (!factorized_head).then(|| self.model.logits_from_hidden(hidden.clone()));
                 (loss, Some(hidden), logits, forward_ns)
@@ -1676,8 +2548,16 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             let forward_ns = forward_start
                 .map(|start| start.elapsed().as_nanos())
                 .unwrap_or_default();
-            let loss = self.language_loss_from_hidden(hidden, targets.clone());
+            let loss =
+                self.next_token_loss_from_hidden(hidden, targets.clone(), clean_inputs.clone());
             (loss, None, None, forward_ns)
+        };
+        let loss = if let Some(rollout_loss) =
+            self.greedy_rollout_unlikelihood_loss(clean_inputs_for_aux)
+        {
+            loss + rollout_loss
+        } else {
+            loss
         };
         self.store_step_state(step_state);
         let step_memory_after_forward = step_device
@@ -1967,6 +2847,103 @@ fn output_degeneracy_from_logits<B: BackendTrait>(
     accumulator.finish()
 }
 
+fn validation_degeneracy_prompt_start(
+    prompt_index: usize,
+    prompt_count: usize,
+    available: usize,
+) -> usize {
+    if available == 0 || prompt_index == 0 || prompt_count <= 1 {
+        return 0;
+    }
+    let min_start = available.min(64);
+    let interior = available.saturating_sub(min_start);
+    let interior_index = prompt_index.saturating_sub(1);
+    let interior_count = prompt_count.saturating_sub(1).max(1);
+    min_start + (interior_index.saturating_mul(interior + 1) / interior_count).min(interior)
+}
+
+fn rollout_prompt_start(
+    step_index: usize,
+    every_steps: usize,
+    block_size: usize,
+    prompt_tokens: usize,
+) -> usize {
+    let available = block_size.saturating_sub(prompt_tokens);
+    if available == 0 {
+        return 0;
+    }
+    let min_start = available.min(prompt_tokens.max(1));
+    let span = available.saturating_sub(min_start);
+    if span == 0 {
+        return min_start;
+    }
+    let rollout_index = step_index / every_steps.max(1);
+    min_start + (rollout_index.saturating_mul(prompt_tokens.max(1)) % (span + 1))
+}
+
+fn lagged_prediction_tensors<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    clean_inputs: Tensor<B, 2, Int>,
+    lag: usize,
+    batch_size: usize,
+    time: usize,
+    vocab: usize,
+) -> Option<(Tensor<B, 3>, Tensor<B, 2, Int>, Tensor<B, 2, Int>)> {
+    if lag == 0 || time == 0 || lag > time {
+        return None;
+    }
+    let start = lag.saturating_sub(1);
+    let valid_time = time.saturating_sub(start);
+    if valid_time == 0 {
+        return None;
+    }
+    Some((
+        log_probs.slice([0..batch_size, start..time, 0..vocab]),
+        targets.slice([0..batch_size, start..time]),
+        clean_inputs.slice([0..batch_size, 0..valid_time]),
+    ))
+}
+
+fn unlikelihood_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    tokens: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Tensor<B, 2> {
+    selected_token_log_probs(log_probs, tokens)
+        .exp()
+        .clamp_min(0.0)
+        .clamp_max(1.0 - epsilon)
+        .mul_scalar(-1.0)
+        .add_scalar(1.0)
+        .clamp_min(epsilon)
+        .log()
+        .mul_scalar(-1.0)
+}
+
+fn cycle_repeat_mask<B: BackendTrait>(
+    next: &Tensor<B, 2, Int>,
+    history: &[Tensor<B, 2, Int>],
+    min_lag: usize,
+    max_lag: usize,
+) -> Option<Tensor<B, 2, burn::tensor::Bool>> {
+    if history.is_empty() || min_lag == 0 || max_lag < min_lag {
+        return None;
+    }
+    let mut mask: Option<Tensor<B, 2, burn::tensor::Bool>> = None;
+    for lag in min_lag..=max_lag {
+        let Some(previous) = history.get(lag.saturating_sub(1)) else {
+            continue;
+        };
+        let lag_mask = next.clone().equal(previous.clone());
+        mask = Some(match mask {
+            Some(accumulated) => accumulated.bool_or(lag_mask),
+            None => lag_mask,
+        });
+    }
+    mask
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OutputDegeneracyStep {
     argmax: usize,
@@ -2036,6 +3013,9 @@ impl OutputDegeneracyAccumulator {
         let distinct_2_fraction = distinct_n_fraction(&self.generated_tokens, 2);
         let period_2_fraction = period_fraction(&self.generated_tokens, 2);
         let period_3_fraction = period_fraction(&self.generated_tokens, 3);
+        let max_period_2_to_16_fraction = max_period_fraction(&self.generated_tokens, 2..=16);
+        let (dominant_period_2_to_64, max_period_2_to_64_fraction) =
+            dominant_period_fraction(&self.generated_tokens, 2..=64);
         OutputDegeneracyStats {
             token_count: self.token_count,
             entropy_bits: self.entropy_sum / self.token_count as f64,
@@ -2051,6 +3031,9 @@ impl OutputDegeneracyAccumulator {
             distinct_2_fraction,
             period_2_fraction,
             period_3_fraction,
+            max_period_2_to_16_fraction,
+            max_period_2_to_64_fraction,
+            dominant_period_2_to_64,
             generated_tokens: self.generated_tokens,
         }
     }
@@ -2077,6 +3060,166 @@ fn period_fraction(tokens: &[i64], period: usize) -> f64 {
         .filter(|idx| tokens[*idx] == tokens[*idx - period])
         .count();
     matches as f64 / (tokens.len() - period) as f64
+}
+
+fn max_period_fraction(tokens: &[i64], periods: impl IntoIterator<Item = usize>) -> f64 {
+    dominant_period_fraction(tokens, periods).1
+}
+
+fn dominant_period_fraction(
+    tokens: &[i64],
+    periods: impl IntoIterator<Item = usize>,
+) -> (usize, f64) {
+    periods
+        .into_iter()
+        .map(|period| (period, period_fraction(tokens, period)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or((0, 0.0))
+}
+
+fn selected_token_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+) -> Tensor<B, 2> {
+    let [batch, time, _vocab] = logits.shape().dims();
+    logits
+        .gather(2, targets.reshape([batch, time, 1]))
+        .reshape([batch, time])
+}
+
+fn next_token_loss_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+) -> Tensor<B, 1> {
+    selected_token_log_probs(log_probs, targets)
+        .mean()
+        .reshape([1])
+        .mul_scalar(-1.0)
+}
+
+fn entropy_floor_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    entropy_floor_loss_from_log_probs(log_probs_from_logits(logits), target_entropy_bits)
+}
+
+fn entropy_floor_loss_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    let [batch, time, vocab] = log_probs.shape().dims();
+    if batch == 0 || time == 0 || vocab == 0 || target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let flat_log_probs = log_probs.reshape([batch * time, vocab]);
+    let flat_probs = flat_log_probs.clone().exp();
+    entropy_floor_loss_from_flat_log_probs(flat_log_probs, flat_probs, target_entropy_bits)
+}
+
+fn entropy_floor_loss_from_flat_log_probs<B: BackendTrait>(
+    flat_log_probs: Tensor<B, 2>,
+    flat_probs: Tensor<B, 2>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    let [token_count, vocab] = flat_log_probs.shape().dims();
+    if token_count == 0 || vocab == 0 || target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let entropy = (flat_probs * flat_log_probs)
+        .sum_dim(1)
+        .mul_scalar(-1.0)
+        .mean()
+        .reshape([1]);
+    let target_nats = target_entropy_bits * std::f32::consts::LN_2;
+    Some(
+        entropy
+            .mul_scalar(-1.0)
+            .add_scalar(target_nats)
+            .clamp_min(0.0),
+    )
+}
+
+fn predicted_marginal_from_logits<B: BackendTrait>(logits: Tensor<B, 3>) -> Option<Tensor<B, 2>> {
+    predicted_marginal_from_log_probs(log_probs_from_logits(logits))
+}
+
+fn predicted_marginal_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+) -> Option<Tensor<B, 2>> {
+    let [batch, time, vocab] = log_probs.shape().dims();
+    if batch == 0 || time == 0 || vocab == 0 {
+        return None;
+    }
+    Some(log_probs.reshape([batch * time, vocab]).exp().mean_dim(0))
+}
+
+fn marginal_entropy_floor_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    marginal_entropy_floor_loss_from_marginal(
+        predicted_marginal_from_logits(logits)?,
+        target_entropy_bits,
+    )
+}
+
+fn marginal_entropy_floor_loss_from_marginal<B: BackendTrait>(
+    marginal: Tensor<B, 2>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    if target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let entropy = (marginal.clone() * marginal.clamp_min(1.0e-12).log())
+        .sum_dim(1)
+        .mul_scalar(-1.0)
+        .reshape([1]);
+    let target_nats = target_entropy_bits * std::f32::consts::LN_2;
+    Some(
+        entropy
+            .mul_scalar(-1.0)
+            .add_scalar(target_nats)
+            .clamp_min(0.0),
+    )
+}
+
+fn target_marginal_coverage_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Option<Tensor<B, 1>> {
+    target_marginal_coverage_loss_from_marginal(
+        predicted_marginal_from_logits(logits)?,
+        targets,
+        epsilon,
+    )
+}
+
+fn target_marginal_coverage_loss_from_marginal<B: BackendTrait>(
+    marginal: Tensor<B, 2>,
+    targets: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Option<Tensor<B, 1>> {
+    let [_marginal_batch, vocab] = marginal.shape().dims();
+    if vocab == 0 || epsilon <= 0.0 || epsilon >= 1.0 {
+        return None;
+    }
+    let [batch, time] = targets.shape().dims();
+    let token_count = batch * time;
+    if token_count == 0 {
+        return None;
+    }
+    let log_marginal = marginal.clamp_min(epsilon).log().repeat_dim(0, token_count);
+    Some(
+        log_marginal
+            .gather(1, targets.reshape([token_count, 1]))
+            .mean()
+            .reshape([1])
+            .mul_scalar(-1.0),
+    )
 }
 
 fn output_degeneracy_step_from_logits<B: BackendTrait>(
@@ -2126,6 +3269,14 @@ mod objective_step_tests {
 
     type TestBackend = Autodiff<NdArray<f32>>;
     type TestInnerBackend = NdArray<f32>;
+
+    fn tensor_scalar(tensor: Tensor<TestBackend, 1>) -> f32 {
+        tensor
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scalar tensor")[0]
+    }
 
     fn tiny_model_config() -> DragonConfig {
         DragonConfig {
@@ -2191,6 +3342,45 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn neuron_scale_3d_gradient_scaling_preserves_headed_tail_semantics() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tensor = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 1, 4]),
+            &device,
+        );
+        let scaled = scale_3d_latent_tail(tensor, 2, 4, 0.5, 2.0)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scaled 3d gradient");
+        assert_eq!(scaled, vec![0.5, 1.0, 6.0, 8.0, 2.5, 3.0, 14.0, 16.0]);
+    }
+
+    #[test]
+    fn neuron_scale_2d_gradient_scaling_preserves_headed_tail_semantics() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tensor = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                (1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                [8, 2],
+            ),
+            &device,
+        );
+        let scaled = scale_2d_headed_latent_rows(tensor, 2, 4, 0.5, 2.0)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scaled 2d gradient");
+        assert_eq!(
+            scaled,
+            vec![
+                0.5, 1.0, 1.5, 2.0, 10.0, 12.0, 14.0, 16.0, 4.5, 5.0, 5.5, 6.0, 26.0, 28.0, 30.0,
+                32.0,
+            ]
+        );
+    }
+
+    #[test]
     fn output_degeneracy_step_reports_overconfident_argmax() {
         let step =
             output_degeneracy_step_from_row(&[12.0, -8.0, -9.0, -10.0]).expect("finite step");
@@ -2229,6 +3419,36 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn output_degeneracy_accumulator_tracks_long_period_cycles() {
+        let mut accumulator = OutputDegeneracyAccumulator::new(None);
+        for index in 0..128 {
+            let argmax = index % 37;
+            accumulator.record(OutputDegeneracyStep {
+                argmax,
+                entropy_bits: 4.0,
+                max_probability: 0.25,
+            });
+            accumulator.record_generated_token(argmax as i64);
+        }
+        let stats = accumulator.finish();
+        assert!(
+            stats.max_period_2_to_16_fraction < 0.05,
+            "period-2..16 should not catch a period-37 loop: {}",
+            stats.max_period_2_to_16_fraction
+        );
+        assert_eq!(stats.dominant_period_2_to_64, 37);
+        assert!(
+            stats.max_period_2_to_64_fraction > 0.95,
+            "expected high extended long-cycle fraction, got {}",
+            stats.max_period_2_to_64_fraction
+        );
+        assert!(
+            stats.period_2_fraction < 0.01 && stats.period_3_fraction < 0.01,
+            "period-2/3 should not catch a period-37 loop"
+        );
+    }
+
+    #[test]
     fn validation_degeneracy_probe_rolls_out_generated_tokens() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
@@ -2238,16 +3458,669 @@ mod objective_step_tests {
         ));
         let (_loss, stats) = model.validation_loss_and_output_degeneracy(batch(&device), 3, None);
         let stats = stats.expect("free-running degeneracy stats");
-        assert_eq!(stats.token_count, 3);
+        assert_eq!(stats.token_count, 6);
         assert!(stats.entropy_bits.is_finite());
         assert!(stats.mean_max_probability.is_finite());
         assert!((0.0..=1.0).contains(&stats.argmax_unique_fraction));
         assert!((0.0..=1.0).contains(&stats.repetition_fraction));
-        assert_eq!(stats.generated_tokens.len(), 3);
+        assert_eq!(stats.generated_tokens.len(), 6);
         assert!((0.0..=1.0).contains(&stats.distinct_1_fraction));
         assert!((0.0..=1.0).contains(&stats.distinct_2_fraction));
         assert!((0.0..=1.0).contains(&stats.period_2_fraction));
         assert!((0.0..=1.0).contains(&stats.period_3_fraction));
+    }
+
+    #[test]
+    fn validation_degeneracy_prompts_cover_header_and_interior_windows() {
+        let starts = (0..4)
+            .map(|index| validation_degeneracy_prompt_start(index, 4, 224))
+            .collect::<Vec<_>>();
+        assert_eq!(starts[0], 0);
+        assert!(starts[1] >= 64, "{starts:?}");
+        assert!(starts[3] <= 224, "{starts:?}");
+        assert!(starts.windows(2).all(|window| window[0] <= window[1]));
+    }
+
+    #[test]
+    fn rollout_unlikelihood_prompt_rotates_away_from_header() {
+        let first = rollout_prompt_start(0, 1, 256, 32);
+        let later = rollout_prompt_start(1, 1, 256, 32);
+        assert_eq!(first, 32);
+        assert_ne!(first, later);
+        assert!(later > 0);
+    }
+
+    #[test]
+    fn selected_token_logits_gathers_raw_logits_not_log_probs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 9.0, -1.0, 4.0, 3.0, 7.0, 8.0], [1, 2, 4]),
+            &device,
+        );
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![2, 0], [1, 2]), &device);
+        let selected = selected_token_logits(logits, targets)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("selected logits");
+        assert_eq!(selected, vec![9.0, 4.0]);
+    }
+
+    #[test]
+    fn causal_input_corruption_replaces_inputs_with_fixed_token() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_input_corruption(CausalInputCorruptionConfig {
+            enabled: true,
+            probability: 1.0,
+            replacement_token_id: Some(3),
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let corrupted = model.corrupt_causal_inputs(inputs);
+        let values = corrupted
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(values, vec![3; 6]);
+    }
+
+    #[test]
+    fn causal_input_corruption_respects_warmup() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_input_corruption(CausalInputCorruptionConfig {
+            enabled: true,
+            probability: 1.0,
+            warmup_steps: 10,
+            replacement_token_id: Some(3),
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let corrupted = model.corrupt_causal_inputs(inputs);
+        let values = corrupted
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(values, vec![0, 1, 2, 4, 5, 6]);
+    }
+
+    #[test]
+    fn repeat_unlikelihood_penalizes_wrong_copy_predictions() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let repeat_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![5.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let penalized = repeat_penalized.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "repeat unlikelihood should increase loss for wrong-copy logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_penalizes_overconfident_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let entropy_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 2.0,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let penalized =
+            entropy_penalized.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "entropy floor should increase loss for overconfident logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_respects_every_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let throttled = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 2.0,
+            every_steps: 4,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = tensor_scalar(plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        ));
+        throttled
+            .gradient_scale_step
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let off_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        ));
+        throttled
+            .gradient_scale_step
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        let on_cadence =
+            tensor_scalar(throttled.next_token_loss_from_logits(logits, targets, clean_inputs));
+        assert!(
+            (off_cadence - ce).abs() < 1.0e-5,
+            "off-cadence entropy loss should match CE: ce={ce} off={off_cadence}"
+        );
+        assert!(
+            on_cadence > ce,
+            "on-cadence entropy loss should add penalty: ce={ce} on={on_cadence}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_does_not_penalize_logits_above_floor() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let entropy_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 1.0,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::zeros([1, 2, 4], &device);
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let penalized =
+            entropy_penalized.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            (penalized_value - ce_value).abs() < 1.0e-5,
+            "entropy floor should not penalize logits already above the floor: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn marginal_entropy_floor_penalizes_collapsed_batch_distribution() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let collapsed = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let diverse = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    8.0, 0.0, 0.0, 0.0, //
+                    0.0, 8.0, 0.0, 0.0, //
+                    0.0, 0.0, 8.0, 0.0, //
+                    0.0, 0.0, 0.0, 8.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let collapsed_loss =
+            tensor_scalar(marginal_entropy_floor_loss_from_logits(collapsed, 2.0).expect("loss"));
+        let diverse_loss =
+            tensor_scalar(marginal_entropy_floor_loss_from_logits(diverse, 2.0).expect("loss"));
+        assert!(
+            collapsed_loss > diverse_loss + 1.0,
+            "marginal entropy should penalize collapsed predicted support: collapsed={collapsed_loss} diverse={diverse_loss}"
+        );
+    }
+
+    #[test]
+    fn target_marginal_coverage_penalizes_missing_batch_targets() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let collapsed = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let covered = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    0.0, 6.0, 0.0, 0.0, //
+                    0.0, 0.0, 6.0, 0.0, //
+                    0.0, 0.0, 0.0, 6.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let collapsed_loss = tensor_scalar(
+            target_marginal_coverage_loss_from_logits(collapsed, targets.clone(), 1.0e-8)
+                .expect("collapsed loss"),
+        );
+        let covered_loss = tensor_scalar(
+            target_marginal_coverage_loss_from_logits(covered, targets, 1.0e-8)
+                .expect("covered loss"),
+        );
+        assert!(
+            collapsed_loss > covered_loss + 2.0,
+            "target marginal coverage should penalize missing target support: collapsed={collapsed_loss} covered={covered_loss}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_target_coverage_increases_training_loss() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let coverage_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            target_coverage_weight: 0.5,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let penalized =
+            coverage_penalized.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let ce_value = tensor_scalar(ce);
+        let penalized_value = tensor_scalar(penalized);
+        assert!(
+            penalized_value > ce_value,
+            "target coverage should increase loss for collapsed marginal support: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_penalizes_configured_history_lags() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let immediate_only = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            ..Default::default()
+        });
+        let lagged = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            history_lags: vec![2],
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, //
+                    5.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 3, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2], [1, 3]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3], [1, 3]),
+            &device,
+        );
+        let immediate = immediate_only.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let lagged = lagged.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let immediate_value = immediate
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("immediate")[0];
+        let lagged_value = lagged
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lagged")[0];
+        assert!(
+            lagged_value > immediate_value,
+            "configured history lag should add unlikelihood loss: immediate={immediate_value} lagged={lagged_value}"
+        );
+    }
+
+    #[test]
+    fn repeat_cycle_lags_respect_budget_and_rotate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            cycle_weight: 0.5,
+            cycle_min_lag: 2,
+            cycle_max_lag: 16,
+            cycle_lags_per_step: 4,
+            ..Default::default()
+        });
+        let first = model.repeat_cycle_lags(16);
+        assert_eq!(first.len(), 4);
+        assert!(first.iter().all(|lag| (2..=16).contains(lag)));
+        model
+            .gradient_scale_step
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let second = model.repeat_cycle_lags(16);
+        assert_eq!(second.len(), 4);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn repeat_unlikelihood_respects_every_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let throttled = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            every_steps: 4,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![5.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let ce = tensor_scalar(plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        ));
+        throttled
+            .gradient_scale_step
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let off_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        ));
+        throttled
+            .gradient_scale_step
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        let on_cadence =
+            tensor_scalar(throttled.next_token_loss_from_logits(logits, targets, clean_inputs));
+        assert!(
+            (off_cadence - ce).abs() < 1.0e-5,
+            "off-cadence repeat loss should match CE: ce={ce} off={off_cadence}"
+        );
+        assert!(
+            on_cadence > ce,
+            "on-cadence repeat loss should add penalty: ce={ce} on={on_cadence}"
+        );
+    }
+
+    #[test]
+    fn repeat_cycle_unlikelihood_penalizes_wrong_cycle_predictions() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let cycle_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            cycle_weight: 0.5,
+            cycle_margin_weight: 0.5,
+            cycle_margin: 0.05,
+            cycle_min_lag: 2,
+            cycle_max_lag: 2,
+            cycle_lags_per_step: 1,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, //
+                    5.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 3, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2], [1, 3]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3], [1, 3]),
+            &device,
+        );
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+        );
+        let penalized = cycle_penalized.next_token_loss_from_logits(logits, targets, clean_inputs);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "cycle unlikelihood should increase loss for wrong-cycle logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_recovery_only_skips_stable_hot_path() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_greedy_rollout_unlikelihood(GreedyRolloutUnlikelihoodConfig {
+            enabled: true,
+            recovery_only: true,
+            weight: 0.5,
+            prompt_tokens: 1,
+            rollout_tokens: 1,
+            history_tokens: 1,
+            batch_prompts: 1,
+            every_steps: 1,
+            ..Default::default()
+        });
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+
+        assert!(
+            model
+                .greedy_rollout_unlikelihood_loss(clean_inputs.clone())
+                .is_none(),
+            "recovery-only rollout must not run during stable training"
+        );
+        model.set_recovery_auxiliary_active(true);
+        assert!(
+            model
+                .greedy_rollout_unlikelihood_loss(clean_inputs)
+                .is_some(),
+            "recovery-only rollout should run when dynamics enters recovery"
+        );
     }
 
     #[test]

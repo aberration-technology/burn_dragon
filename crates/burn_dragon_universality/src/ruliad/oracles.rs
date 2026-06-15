@@ -369,7 +369,13 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             functors: Vec::new(),
             laws: vec!["path_composition_is_associative".to_string()],
             query: "compose the local-rule step morphism along a bounded trajectory".to_string(),
-            answer: format!("target={}", trace.last().cloned().unwrap_or_default()),
+            answer: format!(
+                "target={}",
+                trace
+                    .last()
+                    .map(|value| compact_symbolic_word(value, 48))
+                    .unwrap_or_default()
+            ),
             categorical_core: true,
         },
         RuliadSampleSpec::Simulation {
@@ -428,7 +434,7 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             functors: Vec::new(),
             laws: vec!["rewrite_paths_compose".to_string()],
             query: "compose rewrite morphisms until no reducing rule applies".to_string(),
-            answer: format!("normal_form={normal_form}"),
+            answer: format!("normal_form={}", compact_symbolic_word(normal_form, 48)),
             categorical_core: true,
         },
         RuliadSampleSpec::Algebra { law, holds, .. } => RuliadCategoricalPresentation {
@@ -504,7 +510,10 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
                     .unwrap_or_default(),
                 laws,
                 query: query.to_string(),
-                answer: format!("holds={holds};composed={composed};path={path:?}"),
+                answer: format!(
+                    "holds={holds};composed={composed};path={}",
+                    compact_usize_list(path)
+                ),
                 categorical_core: true,
             }
         }
@@ -890,20 +899,63 @@ impl RuliadProofTapeDocument {
         let domains = compact_labels(&self.domains);
         let modes = compact_labels(&self.reasoning_modes);
         let mut out = format!(
-            "[R2 h={hash} v={} f={} t={} p={}]\nS:{domains}|{modes}\nG:{}\n?:{}\n",
+            "[R2 {hash} v{} {}/{}/{}]\nS:{domains}|{modes}\nG:{}\n?:{}\n",
             self.verifier_version,
-            compact_label(&self.source_family),
-            compact_label(&self.task_kind),
-            compact_label(&self.presentation),
-            self.data.join("|"),
+            compact_ruliad_label(&self.source_family),
+            compact_ruliad_label(&self.task_kind),
+            compact_ruliad_label(&self.presentation),
+            self.data
+                .iter()
+                .map(|item| compact_text(item, 96))
+                .collect::<Vec<_>>()
+                .join("|"),
             self.query
         );
-        for (index, step) in self.proof_steps.iter().enumerate() {
-            out.push_str(&format!(">{index}:{}\n", compact_text(step, 96)));
+        for step in compact_proof_step_runs(&self.proof_steps, 32) {
+            out.push_str(&format!(">{}\n", compact_text(&step, 96)));
         }
         out.push_str(&format!("!:{}\n[/R2]\n", self.answer));
         out
     }
+}
+
+fn compact_proof_step_runs(steps: &[String], max_steps: usize) -> Vec<String> {
+    let mut compacted = Vec::with_capacity(steps.len().min(max_steps.max(1)));
+    let mut index = 0usize;
+    while index < steps.len() {
+        let step = &steps[index];
+        let mut run_len = 1usize;
+        while steps
+            .get(index + run_len)
+            .is_some_and(|candidate| candidate == step)
+        {
+            run_len = run_len.saturating_add(1);
+        }
+        if run_len >= 3 {
+            compacted.push(format!("{step} *{run_len}"));
+        } else {
+            for _ in 0..run_len {
+                compacted.push(step.clone());
+            }
+        }
+        index = index.saturating_add(run_len);
+    }
+    if compacted.len() <= max_steps {
+        return compacted;
+    }
+    let head = max_steps.saturating_div(2).max(1);
+    let tail = max_steps.saturating_sub(head).saturating_sub(1).max(1);
+    let omitted = compacted.len().saturating_sub(head + tail);
+    let mut bounded = Vec::with_capacity(max_steps);
+    bounded.extend(compacted.iter().take(head).cloned());
+    bounded.push(format!("omit={omitted}"));
+    bounded.extend(
+        compacted
+            .iter()
+            .skip(compacted.len().saturating_sub(tail))
+            .cloned(),
+    );
+    bounded
 }
 
 fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProofTapeDocument {
@@ -936,34 +988,34 @@ fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProo
 
 fn compact_query(spec: &RuliadSampleSpec) -> String {
     match spec {
-        RuliadSampleSpec::Eca { steps, .. } => format!("compose local rule for {steps} steps"),
+        RuliadSampleSpec::Eca { steps, .. } => format!("eca^{steps}"),
         RuliadSampleSpec::Simulation {
             source_rule,
             target_rule,
             steps,
             ..
-        } => format!("verify complement functor rule {source_rule}->{target_rule} for {steps}"),
-        RuliadSampleSpec::Automaton { input, .. } => format!("evaluate word action {}", input),
-        RuliadSampleSpec::Rewrite { initial, steps, .. } => {
-            format!("normalize {initial} in <= {steps} rewrites")
-        }
+        } => format!("Fcomp:{source_rule}->{target_rule};n={steps}"),
+        RuliadSampleSpec::Automaton { .. } => "act(w)".to_string(),
+        RuliadSampleSpec::Rewrite { steps, .. } => format!("nf(x0)<={steps}"),
         RuliadSampleSpec::Algebra { law, operands, .. } => {
-            format!("check {} on {}", law.label(), compact_usize_list(operands))
+            format!(
+                "{}({})",
+                compact_ruliad_label(law.label()),
+                compact_usize_list(operands)
+            )
         }
         RuliadSampleSpec::Category { task, .. } => match task {
-            RuliadTaskKind::ComposeCategoryPath => "compose finite-category path".to_string(),
-            RuliadTaskKind::VerifyCategoryLaw => "verify finite-category associativity".to_string(),
-            RuliadTaskKind::VerifyFunctorPreservation => {
-                "verify functor preserves composition".to_string()
-            }
-            RuliadTaskKind::VerifyNaturalitySquare => "verify finite naturality square".to_string(),
-            _ => "verify finite category trace".to_string(),
+            RuliadTaskKind::ComposeCategoryPath => "cp".to_string(),
+            RuliadTaskKind::VerifyCategoryLaw => "ca".to_string(),
+            RuliadTaskKind::VerifyFunctorPreservation => "cf".to_string(),
+            RuliadTaskKind::VerifyNaturalitySquare => "cn".to_string(),
+            _ => "ct".to_string(),
         },
         RuliadSampleSpec::ProofTree { modulus, .. } => {
-            format!("prove unnamed square-sum theorem over Z/{modulus}Z")
+            format!("ss:Z/{modulus}Z")
         }
-        RuliadSampleSpec::LeanTask { task_id, .. } => format!("validate proof payload {task_id}"),
-        RuliadSampleSpec::HashNoise { .. } => "verify entropy canary hash".to_string(),
+        RuliadSampleSpec::LeanTask { task_id, .. } => format!("ln:{task_id}"),
+        RuliadSampleSpec::HashNoise { .. } => "sha:canary".to_string(),
     }
 }
 
@@ -975,14 +1027,17 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             steps,
             ..
         } => {
-            let mut steps_out = vec![format!("x0={initial}")];
+            let mut steps_out = vec![format!("x0={}", compact_symbolic_word(initial, 48))];
             if trace.len() > 2 {
                 let mid = trace.len() / 2;
-                steps_out.push(format!("x{mid}={}", trace[mid]));
+                steps_out.push(format!("x{mid}={}", compact_symbolic_word(&trace[mid], 48)));
             }
             steps_out.push(format!(
                 "x{steps}={}",
-                trace.last().cloned().unwrap_or_default()
+                trace
+                    .last()
+                    .map(|value| compact_symbolic_word(value, 48))
+                    .unwrap_or_default()
             ));
             steps_out
         }
@@ -1013,7 +1068,7 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
                 start_state,
                 trace.last().copied().unwrap_or(*start_state)
             ),
-            format!("trace={}", compact_state_trace(trace)),
+            format!("tr={}", compact_state_trace(trace)),
         ],
         RuliadSampleSpec::Rewrite {
             initial,
@@ -1021,11 +1076,19 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             normal_form,
             ..
         } => vec![
-            format!("{}=>{} in {} steps", initial, normal_form, trace.len() - 1),
-            format!("trace={}", compact_string_trace(trace)),
+            format!(
+                "{}=>{};n={}",
+                compact_symbolic_word(initial, 48),
+                compact_symbolic_word(normal_form, 32),
+                trace.len() - 1
+            ),
+            format!("tr={}", compact_string_trace(trace)),
         ],
         RuliadSampleSpec::Algebra { law, lhs, rhs, .. } => {
-            vec![format!("{} lhs={lhs};rhs={rhs}", law.label())]
+            vec![format!(
+                "{} l={lhs};r={rhs}",
+                compact_ruliad_label(law.label())
+            )]
         }
         RuliadSampleSpec::Category { proof_steps, .. } => proof_steps.clone(),
         RuliadSampleSpec::ProofTree {
@@ -1033,10 +1096,7 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             proof_steps,
             ..
         } => {
-            let mut steps = vec![format!(
-                "dag=L0..L{};deps=chain,expand,subst",
-                lemmas.len().saturating_sub(1)
-            )];
+            let mut steps = vec![format!("D=L0..L{};d=ces", lemmas.len().saturating_sub(1))];
             if let Some(step) = proof_steps.get(1) {
                 steps.push(step.clone());
             }
@@ -1048,30 +1108,38 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             }
             steps
         }
-        RuliadSampleSpec::LeanTask { .. } => vec!["payload_hash_matches=true".to_string()],
-        RuliadSampleSpec::HashNoise { .. } => vec!["sha256_matches=true".to_string()],
+        RuliadSampleSpec::LeanTask { .. } => vec!["h=1".to_string()],
+        RuliadSampleSpec::HashNoise { .. } => vec!["h=1".to_string()],
     }
 }
 
 fn compact_answer(spec: &RuliadSampleSpec) -> String {
     match spec {
         RuliadSampleSpec::Eca { trace, .. } => {
-            format!("target={}", trace.last().cloned().unwrap_or_default())
+            format!(
+                "x={}",
+                trace
+                    .last()
+                    .map(|value| compact_symbolic_word(value, 32))
+                    .unwrap_or_default()
+            )
         }
-        RuliadSampleSpec::Simulation { .. } => "commutes=true".to_string(),
-        RuliadSampleSpec::Automaton { accepted, .. } => format!("accepted={accepted}"),
-        RuliadSampleSpec::Rewrite { normal_form, .. } => format!("normal_form={normal_form}"),
-        RuliadSampleSpec::Algebra { holds, .. } => format!("holds={holds}"),
+        RuliadSampleSpec::Simulation { .. } => "ok=1".to_string(),
+        RuliadSampleSpec::Automaton { accepted, .. } => format!("acc={}", bit(*accepted)),
+        RuliadSampleSpec::Rewrite { normal_form, .. } => {
+            format!("nf={}", compact_symbolic_word(normal_form, 32))
+        }
+        RuliadSampleSpec::Algebra { holds, .. } => format!("ok={}", bit(*holds)),
         RuliadSampleSpec::Category {
             lhs, rhs, holds, ..
-        } => format!("holds={holds};lhs={lhs};rhs={rhs}"),
+        } => format!("ok={};l={lhs};r={rhs}", bit(*holds)),
         RuliadSampleSpec::ProofTree {
             holds, lhs, rhs, ..
         } => {
-            format!("holds={holds};lhs={lhs};rhs={rhs}")
+            format!("ok={};l={lhs};r={rhs}", bit(*holds))
         }
-        RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("payload_hash={payload_hash}"),
-        RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("payload_hash={payload_hash}"),
+        RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("sha={payload_hash}"),
+        RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("sha={payload_hash}"),
     }
 }
 
@@ -1085,8 +1153,8 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             trace: _,
             ..
         } => vec![
-            format!("rule={rule};w={width};steps={steps}"),
-            format!("x0={initial}"),
+            format!("r={rule};w={width};n={steps}"),
+            format!("x0={}", compact_symbolic_word(initial, 64)),
         ],
         RuliadSampleSpec::Simulation {
             source_rule,
@@ -1096,8 +1164,11 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             source_initial,
             ..
         } => vec![
-            format!("rules={source_rule}->{target_rule};w={width};steps={steps}"),
-            format!("x0={source_initial};F=complement"),
+            format!("rs={source_rule}->{target_rule};w={width};n={steps}"),
+            format!(
+                "x0={};F=complement",
+                compact_symbolic_word(source_initial, 64)
+            ),
         ],
         RuliadSampleSpec::Automaton {
             state_count,
@@ -1107,15 +1178,22 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             input,
             ..
         } => vec![
-            format!("states={state_count};start={start_state};accept={accept_states:?}"),
-            format!("input={input};delta={transitions:?}"),
+            format!(
+                "q={state_count};s={start_state};a={}",
+                compact_usize_list(accept_states)
+            ),
+            format!(
+                "w={};d={}",
+                compact_symbolic_word(input, 64),
+                compact_transition_table(transitions)
+            ),
         ],
         RuliadSampleSpec::Rewrite {
             alphabet, rules, ..
         } => vec![
-            format!("alphabet={alphabet}"),
+            format!("A={alphabet}"),
             format!(
-                "rules={}",
+                "R={}",
                 rules
                     .iter()
                     .map(|rule| format!("{}>{}", rule.from, rule.to))
@@ -1129,10 +1207,7 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             operands,
             ..
         } => vec![
-            format!(
-                "carrier={carrier_size};operands={}",
-                compact_usize_list(operands)
-            ),
+            format!("C={carrier_size};xs={}", compact_usize_list(operands)),
             format!("op={}", compact_operation_descriptor(operation_table)),
         ],
         RuliadSampleSpec::Category {
@@ -1146,23 +1221,20 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             ..
         } => {
             let mut data = vec![
-                format!(
-                    "objects={object_count};ids={}",
-                    compact_usize_list(identities)
-                ),
-                format!("path={};composed={composed}", compact_usize_list(path)),
-                format!("arrows={}", compact_morphism_summary(morphisms)),
+                format!("O={object_count};I={}", compact_usize_list(identities)),
+                format!("P={};C={composed}", compact_usize_list(path)),
+                format!("A={}", compact_morphism_summary(morphisms)),
             ];
             if let Some(functor) = functor {
                 data.push(format!(
-                    "{}:obj={}",
+                    "{}:o={}",
                     functor.name,
                     compact_usize_list(&functor.object_map)
                 ));
             }
             if let Some(naturality) = naturality {
                 data.push(format!(
-                    "nat:f={};l={};r={}",
+                    "N:f={};l={};r={}",
                     naturality.source_morphism,
                     compact_usize_list(&naturality.left_path),
                     compact_usize_list(&naturality.right_path)
@@ -1191,9 +1263,17 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             proof,
             ..
         } => vec![
-            format!("task_id={task_id}"),
-            format!("stmt={}", compact_text(statement, 40)),
-            format!("proof={}", compact_text(proof, 40)),
+            format!("id={task_id}"),
+            format!(
+                "s=len{};h{}",
+                statement.len(),
+                compact_text(&sha256_hex(statement.as_bytes()), 16)
+            ),
+            format!(
+                "p=len{};h{}",
+                proof.len(),
+                compact_text(&sha256_hex(proof.as_bytes()), 16)
+            ),
         ],
         RuliadSampleSpec::HashNoise { bytes_hex, .. } => {
             vec![format!("bytes={}", compact_text(bytes_hex, 64))]
@@ -1201,9 +1281,14 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
     }
 }
 
+fn bit(value: bool) -> u8 {
+    u8::from(value)
+}
+
 fn compact_text(value: &str, max_len: usize) -> String {
+    let value = bound_repeated_chars(value, 6);
     if value.chars().count() <= max_len {
-        value.to_string()
+        value
     } else {
         format!(
             "{}..",
@@ -1215,21 +1300,115 @@ fn compact_text(value: &str, max_len: usize) -> String {
     }
 }
 
+fn compact_symbolic_word(value: &str, max_len: usize) -> String {
+    let alphabet = symbolic_alphabet(value);
+    let len = value.chars().count();
+    if len > 16 && alphabet.len() <= 4 {
+        if alphabet.iter().all(|ch| matches!(ch, '0' | '1')) {
+            return compact_binary_word(value, max_len);
+        }
+        return compact_low_alphabet_word(value, &alphabet, max_len);
+    }
+    let value = bound_repeated_chars(value, 6);
+    if value.chars().count() <= max_len {
+        return value;
+    }
+    if alphabet.iter().all(|ch| matches!(ch, '0' | '1')) {
+        return compact_binary_word(&value, max_len);
+    }
+    if alphabet.len() <= 4 {
+        return compact_low_alphabet_word(&value, &alphabet, max_len);
+    }
+    compact_text(&value, max_len)
+}
+
+fn symbolic_alphabet(value: &str) -> Vec<char> {
+    let mut alphabet = Vec::new();
+    for ch in value.chars() {
+        if !alphabet.contains(&ch) {
+            alphabet.push(ch);
+        }
+        if alphabet.len() > 4 {
+            break;
+        }
+    }
+    alphabet
+}
+
+fn compact_binary_word(value: &str, max_len: usize) -> String {
+    let hash = sha256_hex(value.as_bytes())
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let ones = value.bytes().filter(|byte| *byte == b'1').count();
+    compact_text(&format!("b{}:h{hash}:w{ones}", value.len()), max_len)
+}
+
+fn compact_low_alphabet_word(value: &str, alphabet: &[char], max_len: usize) -> String {
+    let hash = sha256_hex(value.as_bytes())
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let alphabet = alphabet.iter().collect::<String>();
+    let counts = alphabet
+        .chars()
+        .map(|symbol| {
+            value
+                .chars()
+                .filter(|candidate| *candidate == symbol)
+                .count()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    compact_text(
+        &format!("s{}:{alphabet}:h{hash}:c{counts}", value.chars().count()),
+        max_len,
+    )
+}
+
+fn bound_repeated_chars(value: &str, max_run: usize) -> String {
+    if max_run == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let mut run_len = 1usize;
+        while chars.peek().is_some_and(|next| *next == ch) {
+            chars.next();
+            run_len = run_len.saturating_add(1);
+        }
+        if run_len <= max_run {
+            for _ in 0..run_len {
+                out.push(ch);
+            }
+        } else {
+            for _ in 0..max_run {
+                out.push(ch);
+            }
+            out.push('^');
+            out.push_str(&run_len.to_string());
+        }
+    }
+    out
+}
+
 fn compact_labels(values: &[String]) -> String {
     values
         .iter()
-        .map(|value| compact_label(value))
+        .map(|value| compact_ruliad_label(value))
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn compact_label(value: &str) -> &str {
+pub fn compact_ruliad_label(value: &str) -> &str {
     match value {
         "discrete_dynamics" => "dd",
         "computation_theory" => "ct",
         "symbolic_rewriting" => "sr",
         "universal_algebra" => "ua",
-        "category_theory" => "cat",
+        "category_theory" => "cg",
         "formal_proof" => "fp",
         "information_theory" => "it",
         "local_rule_evaluation" => "lre",
@@ -1241,31 +1420,143 @@ fn compact_label(value: &str) -> &str {
         "equational_reasoning" => "eq",
         "counterexample_evaluation" => "cex",
         "compositional_reasoning" => "comp",
-        "associativity" => "assoc",
-        "formal_deduction" => "proof",
-        "entropy_canary" => "entropy",
-        "proof_tree" => "pt",
+        "associativity" => "as",
+        "commutativity" => "cm",
+        "formal_deduction" => "fd",
+        "entropy_canary" => "ec",
+        "eca" => "E",
+        "simulation" => "S",
+        "automaton" => "M",
+        "rewrite" => "R",
+        "algebra" => "A",
+        "category" => "C",
+        "proof_tree" => "P",
+        "lean_task" => "L",
+        "hash_noise" => "H",
+        "next_state" => "ns",
+        "multi_step_state" => "ms",
+        "verify_simulation" => "vsim",
+        "evaluate_automaton" => "aut",
+        "rewrite_normal_form" => "rw",
+        "check_algebra_law" => "alg",
+        "compose_category_path" => "cpath",
+        "verify_category_law" => "claw",
+        "verify_functor_preservation" => "fun",
+        "verify_naturality_square" => "nat",
         "prove_theorem" => "thm",
-        "verified_theorem_dependency_category" => "thm_cat",
+        "complete_proof" => "lp",
+        "hash_canary" => "hash",
+        "trajectory_category" => "tc",
+        "commuting_trajectory_functor" => "tf",
+        "free_monoid_action_category" => "ma",
+        "rewrite_path_category" => "rp",
+        "verified_theorem_dependency_category" => "td",
+        "proof_category" => "pc",
+        "one_object_category_law_probe" => "ol",
+        "finite_category_law" => "fl",
+        "finite_category_path" => "cp",
+        "finite_functor_preservation" => "ff",
+        "finite_naturality_square" => "fn",
         other => other,
     }
 }
 
 fn compact_usize_list(values: &[usize]) -> String {
-    values
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+    if values.len() > 16 {
+        return compact_long_usize_list(values);
+    }
+    let mut parts = Vec::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let value = values[index];
+        let mut run_len = 1usize;
+        while values
+            .get(index + run_len)
+            .is_some_and(|next| *next == value)
+        {
+            run_len = run_len.saturating_add(1);
+        }
+        if run_len >= 4 {
+            parts.push(format!("{value}*{run_len}"));
+        } else {
+            for _ in 0..run_len {
+                parts.push(value.to_string());
+            }
+        }
+        index = index.saturating_add(run_len);
+    }
+    parts.join(",")
+}
+
+fn compact_long_usize_list(values: &[usize]) -> String {
+    let hash = stable_json_hash(&values)
+        .unwrap_or_else(|_| "unknown".to_string())
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let first = values.first().copied().unwrap_or_default();
+    let last = values.last().copied().unwrap_or_default();
+    let max = values.iter().copied().max().unwrap_or_default();
+    let checksum = values.iter().fold(0usize, |acc, value| {
+        acc.wrapping_mul(131).wrapping_add(*value)
+    });
+    format!(
+        "u{}:h{}:f{}:z{}:m{}:c{:x}",
+        values.len(),
+        hash,
+        first,
+        last,
+        max,
+        checksum & 0xffff
+    )
+}
+
+fn compact_transition_table(transitions: &[Vec<usize>]) -> String {
+    let hash = stable_json_hash(&transitions)
+        .unwrap_or_else(|_| "unknown".to_string())
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let first = transitions.first();
+    let last = transitions.last();
+    let first_0 = first
+        .and_then(|row| row.first())
+        .copied()
+        .unwrap_or_default();
+    let first_1 = first
+        .and_then(|row| row.get(1))
+        .copied()
+        .unwrap_or_default();
+    let last_0 = last
+        .and_then(|row| row.first())
+        .copied()
+        .unwrap_or_default();
+    let last_1 = last.and_then(|row| row.get(1)).copied().unwrap_or_default();
+    format!(
+        "t{}:h{}:f{}-{}:z{}-{}",
+        transitions.len(),
+        hash,
+        first_0,
+        first_1,
+        last_0,
+        last_1
+    )
 }
 
 fn compact_state_trace(trace: &[usize]) -> String {
-    if trace.len() <= 8 {
+    if trace.len() <= 4 {
         return compact_usize_list(trace);
     }
+    let hash = stable_json_hash(&trace)
+        .unwrap_or_else(|_| "unknown".to_string())
+        .chars()
+        .take(16)
+        .collect::<String>();
     let mid = trace.len() / 2;
     format!(
-        "{},{},{}..{},{}",
+        "q{}:h{}:f{}:s{}:m{}:p{}:z{}",
+        trace.len(),
+        hash,
         trace[0],
         trace[1],
         trace[mid],
@@ -1276,15 +1567,22 @@ fn compact_state_trace(trace: &[usize]) -> String {
 
 fn compact_string_trace(trace: &[String]) -> String {
     if trace.len() <= 5 {
-        return trace.join(">");
+        return trace
+            .iter()
+            .map(|value| compact_symbolic_word(value, 48))
+            .collect::<Vec<_>>()
+            .join(">");
     }
     let mid = trace.len() / 2;
     format!(
         "{}>{}>{}..>{}",
-        trace[0],
-        trace[1],
-        trace[mid],
-        trace.last().cloned().unwrap_or_default()
+        compact_symbolic_word(&trace[0], 40),
+        compact_symbolic_word(&trace[1], 40),
+        compact_symbolic_word(&trace[mid], 40),
+        trace
+            .last()
+            .map(|value| compact_symbolic_word(value, 40))
+            .unwrap_or_default()
     )
 }
 
@@ -1299,10 +1597,10 @@ fn compact_table(table: &[Vec<usize>]) -> String {
 fn compact_operation_descriptor(table: &[Vec<usize>]) -> String {
     let carrier_size = table.len();
     if table == add_mod_table(carrier_size) {
-        return format!("add_mod_{carrier_size}");
+        return format!("add{carrier_size}");
     }
     if table == affine_mod_table(carrier_size, 1, 2, 1) {
-        return format!("affine_mod_{carrier_size}(x+2y+1)");
+        return format!("aff{carrier_size}(x+2y+1)");
     }
     if carrier_size <= 6 {
         return compact_table(table);
@@ -1328,10 +1626,7 @@ fn compact_morphism_summary(morphisms: &[RuliadCategoryMorphism]) -> String {
         .last()
         .map(|morphism| morphism.name.as_str())
         .unwrap_or("-");
-    format!(
-        "count={};thin_total_order;first={first};last={last}",
-        morphisms.len()
-    )
+    format!("n={};to;f={first};z={last}", morphisms.len())
 }
 
 fn family_of_spec(spec: &RuliadSampleSpec) -> RuliadFamilyKind {
@@ -1388,7 +1683,7 @@ pub(crate) fn scale_family_for_difficulty(
         return family.clone();
     }
     let mut scaled = family.clone();
-    let level = difficulty_level.min(32);
+    let level = difficulty_level.min(4096);
     if let Some(width) = scaled.width.as_mut() {
         let stride = (width.max.saturating_sub(width.min).max(1) / 2).max(1);
         let bump = stride.saturating_mul(level);
@@ -1413,7 +1708,7 @@ fn cap_scaled_family_for_payload(family: &mut RuliadFamilyConfig) {
         RuliadFamilyKind::Rewrite => (Some(128), Some(96)),
         RuliadFamilyKind::Algebra => (Some(64), None),
         RuliadFamilyKind::Category => (Some(48), Some(64)),
-        RuliadFamilyKind::ProofTree => (Some(512), Some(512)),
+        RuliadFamilyKind::ProofTree => (Some(4096), Some(4096)),
         RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => (None, None),
     };
     if let (Some(width), Some(max_width)) = (family.width.as_mut(), max_width) {
@@ -1467,39 +1762,47 @@ fn generate_simulation_spec(
     family: &RuliadFamilyConfig,
     rng: &mut SplitMix64,
 ) -> Result<RuliadSampleSpec> {
-    let width = range_or(family.width, 16, 32, rng);
-    let steps = range_or(family.steps, 4, 8, rng);
-    let source_rule = rng.next_u8();
-    let target_rule = eca::complement_rule(source_rule);
-    let source_initial = eca::random_state(width, rng);
-    let target_initial = eca::complement_state(&source_initial);
-    let source_trace = eca::trace(source_rule, &source_initial, steps);
-    let target_trace = eca::trace(target_rule, &target_initial, steps);
-    let mapped_source_trace = source_trace
-        .iter()
-        .map(|state| eca::complement_state(state))
-        .collect::<Vec<_>>();
-    Ok(RuliadSampleSpec::Simulation {
-        source_rule,
-        target_rule,
-        width,
-        steps,
-        source_initial: eca::format_state(&source_initial),
-        target_initial: eca::format_state(&target_initial),
-        source_trace: source_trace
+    let mut fallback = None;
+    for _ in 0..128 {
+        let width = range_or(family.width, 16, 32, rng);
+        let steps = range_or(family.steps, 4, 8, rng);
+        let source_rule = rng.next_u8();
+        let target_rule = eca::complement_rule(source_rule);
+        let source_initial = eca::random_state(width, rng);
+        let target_initial = eca::complement_state(&source_initial);
+        let source_trace = eca::trace(source_rule, &source_initial, steps);
+        let target_trace = eca::trace(target_rule, &target_initial, steps);
+        let mapped_source_trace = source_trace
             .iter()
-            .map(|state| eca::format_state(state))
-            .collect(),
-        target_trace: target_trace
-            .iter()
-            .map(|state| eca::format_state(state))
-            .collect(),
-        mapped_source_trace: mapped_source_trace
-            .iter()
-            .map(|state| eca::format_state(state))
-            .collect(),
-        task: RuliadTaskKind::VerifySimulation,
-    })
+            .map(|state| eca::complement_state(state))
+            .collect::<Vec<_>>();
+        let spec = RuliadSampleSpec::Simulation {
+            source_rule,
+            target_rule,
+            width,
+            steps,
+            source_initial: eca::format_state(&source_initial),
+            target_initial: eca::format_state(&target_initial),
+            source_trace: source_trace
+                .iter()
+                .map(|state| eca::format_state(state))
+                .collect(),
+            target_trace: target_trace
+                .iter()
+                .map(|state| eca::format_state(state))
+                .collect(),
+            mapped_source_trace: mapped_source_trace
+                .iter()
+                .map(|state| eca::format_state(state))
+                .collect(),
+            task: RuliadTaskKind::VerifySimulation,
+        };
+        if !is_degenerate_spec(&spec) {
+            return Ok(spec);
+        }
+        fallback = Some(spec);
+    }
+    fallback.ok_or_else(|| anyhow!("failed to generate simulation ruliad sample"))
 }
 
 fn generate_automaton_spec(
@@ -1719,22 +2022,20 @@ fn generate_proof_tree_spec(
     let norm_sum = mod_norm(sum, modulus);
     let rhs = (norm_u + norm_v) % modulus;
     let mut lemmas = vec![
-        format!("L0:def dot(x,y)=x0*y0+x1*y1 mod {modulus}"),
-        format!("L1:def n(x)=x0*x0+x1*x1 mod {modulus}"),
-        "L2:expand n(x+y)=n(x)+n(y)+2*dot(x,y)".to_string(),
-        "L3:orthogonal vectors cancel cross term".to_string(),
+        format!("L0:dot=x0*y0+x1*y1 mod {modulus}"),
+        format!("L1:n=x0*x0+x1*x1 mod {modulus}"),
+        "L2:n(x+y)=n(x)+n(y)+2dot".to_string(),
+        "L3:dot0=>cross0".to_string(),
     ];
     for lemma_index in 4..depth {
-        lemmas.push(format!(
-            "L{lemma_index}:substitute previous equality into goal term"
-        ));
+        lemmas.push(format!("L{lemma_index}:subst"));
     }
     let proof_steps = vec![
         format!("u=({},{});v=({},{});m={modulus}", u[0], u[1], v[0], v[1]),
         format!("dot={}*{}+{}*{}={dot}", u[0], v[0], u[1], v[1]),
         format!("sum=({},{});n(sum)={norm_sum}", sum[0], sum[1]),
         format!("n(u)+n(v)={norm_u}+{norm_v}={rhs}"),
-        "close by L2 and dot=0".to_string(),
+        "close:L2,dot0".to_string(),
     ];
     Ok(RuliadSampleSpec::ProofTree {
         modulus,
@@ -2283,6 +2584,41 @@ mod tests {
         }
     }
 
+    fn longest_repeated_char_run(text: &str) -> usize {
+        let mut longest = 0usize;
+        let mut previous = None;
+        let mut current = 0usize;
+        for ch in text.chars() {
+            if Some(ch) == previous {
+                current = current.saturating_add(1);
+            } else {
+                longest = longest.max(current);
+                previous = Some(ch);
+                current = 1;
+            }
+        }
+        longest.max(current)
+    }
+
+    fn longest_periodic_motif_run(text: &str, motif_len: usize) -> usize {
+        let bytes = text.as_bytes();
+        if motif_len == 0 || bytes.len() < motif_len * 2 {
+            return 0;
+        }
+        let mut longest = 0usize;
+        for start in 0..=bytes.len().saturating_sub(motif_len * 2) {
+            let motif = &bytes[start..start + motif_len];
+            let mut run = motif_len;
+            let mut offset = start + motif_len;
+            while offset + motif_len <= bytes.len() && &bytes[offset..offset + motif_len] == motif {
+                run = run.saturating_add(motif_len);
+                offset = offset.saturating_add(motif_len);
+            }
+            longest = longest.max(run);
+        }
+        longest
+    }
+
     #[test]
     fn generated_samples_verify() {
         for index in 0..16 {
@@ -2336,10 +2672,10 @@ mod tests {
                 weight: 1,
                 width: match family {
                     RuliadFamilyKind::Eca | RuliadFamilyKind::Simulation => {
-                        Some(UsizeRangeConfig { min: 8, max: 8 })
+                        Some(UsizeRangeConfig { min: 32, max: 32 })
                     }
                     RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 4, max: 4 }),
-                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 8, max: 8 }),
+                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 24, max: 24 }),
                     RuliadFamilyKind::Algebra => Some(UsizeRangeConfig { min: 3, max: 3 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 4, max: 4 }),
                     RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 5, max: 5 }),
@@ -2347,10 +2683,10 @@ mod tests {
                 },
                 steps: match family {
                     RuliadFamilyKind::Eca | RuliadFamilyKind::Simulation => {
-                        Some(UsizeRangeConfig { min: 4, max: 4 })
+                        Some(UsizeRangeConfig { min: 8, max: 8 })
                     }
-                    RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 6, max: 6 }),
-                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::Automaton => Some(UsizeRangeConfig { min: 24, max: 24 }),
+                    RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 12, max: 12 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 3, max: 3 }),
                     RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 4, max: 4 }),
                     RuliadFamilyKind::Algebra
@@ -2371,13 +2707,151 @@ mod tests {
             assert!(sample.text.starts_with("[R2 "));
             assert!(sample.text.contains("\n?:"));
             assert!(sample.text.contains("\n!:"));
+            for forbidden in [
+                "category",
+                "finite",
+                "normalize",
+                "accepted",
+                "theorem",
+                "proof",
+                "omitted",
+                "steps",
+                "chain",
+                "expand",
+                "add_mod",
+                "affine_mod",
+                "commutativity",
+                "trace",
+            ] {
+                assert!(
+                    !sample.text.contains(forbidden),
+                    "{} sample retained rote prose anchor `{forbidden}`:\n{}",
+                    family.label(),
+                    sample.text
+                );
+            }
             assert!(
                 sample.text.len() <= 512,
                 "{} sample exceeded trace-pretraining payload budget: {} bytes",
                 family.label(),
                 sample.text.len()
             );
+            assert!(
+                longest_repeated_char_run(&sample.text) <= 8,
+                "{} sample has a degenerate repeated-character run:\n{}",
+                family.label(),
+                sample.text
+            );
+            assert!(
+                longest_periodic_motif_run(&sample.text, 2) <= 24,
+                "{} sample has a degenerate period-2 run:\n{}",
+                family.label(),
+                sample.text
+            );
+            assert!(
+                longest_periodic_motif_run(&sample.text, 3) <= 24,
+                "{} sample has a degenerate period-3 run:\n{}",
+                family.label(),
+                sample.text
+            );
+            assert!(
+                sample.text.matches(',').count() <= sample.text.len() / 12,
+                "{} sample retained a comma-heavy numeric surface:\n{}",
+                family.label(),
+                sample.text
+            );
         }
+    }
+
+    #[test]
+    fn compact_usize_list_run_length_encodes_degenerate_runs() {
+        assert_eq!(compact_usize_list(&[1, 1, 1]), "1,1,1");
+        assert_eq!(compact_usize_list(&[1, 1, 1, 1]), "1*4");
+        assert_eq!(
+            compact_usize_list(&[2, 2, 2, 2, 3, 4, 4, 4, 4, 4]),
+            "2*4,3,4*5"
+        );
+        let long = compact_usize_list(&(0..48).collect::<Vec<_>>());
+        assert!(long.starts_with("u48:h"));
+        assert!(!long.contains(','));
+    }
+
+    #[test]
+    fn compact_text_bounds_repeated_character_runs() {
+        let text = compact_text("x=1111111111111111;y=BBBBBBBBBB", 128);
+        assert!(text.contains("1^16"));
+        assert!(text.contains("B^10"));
+        assert!(longest_repeated_char_run(&text) <= 8);
+    }
+
+    #[test]
+    fn compact_symbolic_word_packs_long_low_alphabet_payloads() {
+        let binary = compact_symbolic_word(&"0101".repeat(40), 48);
+        assert!(binary.starts_with("b160:"), "{binary}");
+        assert!(!binary.contains("01010101010101010101"), "{binary}");
+        assert!(!binary.contains("555555"), "{binary}");
+
+        let ternary = compact_symbolic_word(&"ABC".repeat(50), 48);
+        assert!(ternary.starts_with("s150:"), "{ternary}");
+        assert!(ternary.contains(":h"), "{ternary}");
+        assert!(!ternary.contains("ABCABC"), "{ternary}");
+        assert!(ternary.len() <= 64, "{ternary}");
+
+        let medium = compact_symbolic_word(&"BC".repeat(12), 64);
+        assert!(medium.starts_with("s24:"), "{medium}");
+        assert!(!medium.contains("BCBC"), "{medium}");
+    }
+
+    #[test]
+    fn categorical_presentation_compacts_symbolic_payload_answers() {
+        let binary = "0101".repeat(24);
+        let eca = RuliadSampleSpec::Eca {
+            rule: 30,
+            width: binary.len(),
+            steps: 2,
+            initial: binary.clone(),
+            trace: vec![binary.clone(), binary.clone(), binary.clone()],
+            task: RuliadTaskKind::MultiStepState,
+        };
+        let eca_answer = ruliad_categorical_presentation(&eca).answer;
+        assert!(eca_answer.starts_with("target=b96:"), "{eca_answer}");
+        assert!(!eca_answer.contains("010101010101"), "{eca_answer}");
+
+        let normal_form = "AB".repeat(32);
+        let rewrite = RuliadSampleSpec::Rewrite {
+            alphabet: "AB".to_string(),
+            rules: vec![RuliadRewriteRule {
+                from: "AA".to_string(),
+                to: "A".to_string(),
+            }],
+            initial: normal_form.clone(),
+            steps: 1,
+            trace: vec![normal_form.clone()],
+            normal_form,
+            task: RuliadTaskKind::RewriteNormalForm,
+        };
+        let rewrite_answer = ruliad_categorical_presentation(&rewrite).answer;
+        assert!(
+            rewrite_answer.starts_with("normal_form=s64:"),
+            "{rewrite_answer}"
+        );
+        assert!(!rewrite_answer.contains("ABABABAB"), "{rewrite_answer}");
+    }
+
+    #[test]
+    fn compact_proof_step_runs_collapse_repeated_identity_chains() {
+        let mut steps = vec!["a*b=c".to_string()];
+        steps.extend(std::iter::repeat("c*id=c".to_string()).take(32));
+        steps.push("close".to_string());
+        let compacted = compact_proof_step_runs(&steps, 32);
+        assert_eq!(
+            compacted,
+            vec![
+                "a*b=c".to_string(),
+                "c*id=c *32".to_string(),
+                "close".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2392,7 +2866,7 @@ mod tests {
         let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
         let prompt = ruliad_prompt_prefix(&sample.spec, &sample.oracle_hash);
         assert!(prompt.ends_with("!:"));
-        assert!(!prompt.contains("holds=true"));
+        assert!(!prompt.contains("ok=1"));
         assert!(!prompt.contains("[/R2]"));
     }
 
@@ -2445,7 +2919,7 @@ mod tests {
         assert!(report.ok);
         let text = sample_text(&spec, &report.oracle_hash);
         assert!(text.starts_with("[R2 "));
-        assert!(text.contains("\n!:holds=true"));
+        assert!(text.contains("\n!:ok=1"));
         assert!(!text.to_lowercase().contains("pythag"));
     }
 
@@ -2573,6 +3047,12 @@ mod tests {
         for index in 0..sample_count {
             let sample =
                 generate_sample(&config(), &[], SampleSplit::Train, 0, index).expect("sample");
+            assert!(
+                !is_degenerate_spec(&sample.spec),
+                "degenerate generated sample: family={} task={} index={index}",
+                sample.family.label(),
+                sample.task_kind.label()
+            );
             *family_counts.entry(sample.family).or_insert(0usize) += 1;
             *task_counts.entry(sample.task_kind).or_insert(0usize) += 1;
             oracle_hashes.insert(sample.oracle_hash);
@@ -2743,6 +3223,26 @@ mod tests {
         assert!(
             rewrite_lengths.len() > 4,
             "rewrite samples have too little terminal-length variety"
+        );
+    }
+
+    #[test]
+    fn far_out_difficulty_continues_scaling_after_legacy_clamp() {
+        let family = RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 5, max: 17 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 12 }),
+        };
+        let near = scale_family_for_difficulty(&family, 32);
+        let far = scale_family_for_difficulty(&family, 96);
+        assert!(
+            far.width.unwrap().max > near.width.unwrap().max,
+            "far-out proof-tree modulus range should exceed the legacy d32 clamp"
+        );
+        assert!(
+            far.steps.unwrap().max > near.steps.unwrap().max,
+            "far-out proof-tree depth range should exceed the legacy d32 clamp"
         );
     }
 }

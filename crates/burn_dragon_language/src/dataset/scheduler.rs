@@ -341,6 +341,9 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
     device: &B::Device,
 ) -> SequenceBatch<B> {
     let host = sample_host_batch_with_shape(dataset, split, batch_size, block_size, epoch_index, 0);
+    if crate::train::profile::enabled() {
+        crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);
+    }
     finalize_host_batch_on_device::<B>(
         host,
         batch_size,
@@ -435,7 +438,7 @@ impl RandomPrefetch {
             pending: BTreeMap::new(),
             next_index: absolute_step_start,
         };
-        prefetch.prime(worker_count.min(depth.max(1)).min(4));
+        prefetch.prime(worker_count.min(depth.max(1)));
         prefetch
     }
 
@@ -542,10 +545,13 @@ fn dataset_prefetch_workers() -> usize {
 }
 
 fn live_source_selection_prefetch_depth() -> usize {
-    std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_PREFETCH_DEPTH")
+    if let Some(configured) = std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_PREFETCH_DEPTH")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| dataset_prefetch_depth().min(4))
+    {
+        return configured;
+    }
+    dataset_prefetch_depth().max(16)
 }
 
 fn finalize_host_batch_on_device<B: Backend>(
@@ -1045,6 +1051,9 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let cpu_ns = cpu_start
             .map(|start| start.elapsed().as_nanos())
             .unwrap_or_default();
+        if prof_enabled {
+            crate::train::profile::record_dataloader_foreground_wait(cpu_ns);
+        }
 
         let tensor_copy_start = prof_enabled.then(Instant::now);
         let summary_event_mask = summary_event_mask_tensor::<B>(
@@ -1513,23 +1522,35 @@ impl<B: Backend> Iterator for RandomIterator<B> {
             return None;
         }
 
+        let prof_enabled = crate::train::profile::enabled();
         let host = if let Some(prefetch) = self.prefetch.as_ref() {
+            let wait_start = prof_enabled.then(Instant::now);
             let mut slot = prefetch.lock().expect("random prefetch lock");
-            slot.as_mut()?.recv()?
+            let host = slot.as_mut()?.recv()?;
+            if let Some(start) = wait_start {
+                crate::train::profile::record_dataloader_foreground_wait(
+                    start.elapsed().as_nanos(),
+                );
+            }
+            host
         } else {
             let absolute_step = self
                 .consumed_steps
                 .as_ref()
                 .map(|counter| counter.load(Ordering::Relaxed))
                 .unwrap_or(self.step);
-            sample_host_batch_with_shape(
+            let host = sample_host_batch_with_shape(
                 &*self.dataset,
                 self.split,
                 self.batch_size,
                 self.block_size,
                 self.epoch_index,
                 absolute_step,
-            )
+            );
+            if prof_enabled {
+                crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);
+            }
+            host
         };
 
         if let Some(counter) = &self.consumed_steps {

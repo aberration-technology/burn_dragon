@@ -258,6 +258,22 @@ utility_epsilon = 0.000001
 lr_coupling = "none"
 lr_coupling_power = 1.0
 
+[training.dynamics]
+enabled = true
+hard_collapse_rollback_attempts = 2
+minimum_continual_backprop_scale = 0.25
+soft_recovery_lr_scale = 0.5
+validation_recovery_lr_scale = 0.5
+hard_recovery_lr_scale = 0.25
+soft_recovery_continual_backprop_scale = 2.0
+validation_recovery_continual_backprop_scale = 1.25
+hard_recovery_continual_backprop_scale = 1.25
+stable_source_difficulty_pressure = 1.0
+recovery_source_difficulty_pressure = 0.75
+difficulty_advance_source_pressure = 1.5
+stable_hash_noise_max_probability = 0.01
+recovery_hash_noise_max_probability = 0.0
+
 [optimizer]
 learning_rate = 0.001
 weight_decay = 0.0

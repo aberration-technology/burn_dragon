@@ -4,6 +4,7 @@ mod prelude;
 
 pub mod backend;
 mod continual_backprop;
+mod dynamics;
 pub mod events;
 pub mod neuron_scaling;
 pub mod objective;
@@ -19,6 +20,8 @@ pub mod utils;
 pub use backend::*;
 #[allow(unused_imports)]
 pub use continual_backprop::*;
+#[allow(unused_imports)]
+pub use dynamics::*;
 #[allow(unused_imports)]
 pub use neuron_scaling::*;
 #[allow(unused_imports)]

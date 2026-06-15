@@ -70,6 +70,19 @@ impl Dataset {
         TokenSequenceDataset::source_selection_snapshot(self)
     }
 
+    pub fn apply_source_selection_dynamics_control(
+        &self,
+        difficulty_pressure: f32,
+        hash_noise_max_probability: f32,
+    ) {
+        if let Self::Universality(dataset) = self {
+            dataset.apply_source_selection_dynamics_control(
+                difficulty_pressure,
+                hash_noise_max_probability,
+            );
+        }
+    }
+
     pub fn sample_source_weighted_validation_batch<B: Backend>(
         &self,
         epoch_index: usize,

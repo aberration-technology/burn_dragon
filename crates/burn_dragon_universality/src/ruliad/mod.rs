@@ -31,10 +31,11 @@ pub mod cli;
 pub use category::{RuliadCategoryFunctor, RuliadCategoryMorphism, RuliadNaturalityCheck};
 pub use config::{
     LeanMode, RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RuliadCorpusConfig,
-    RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadMathDomain,
-    RuliadReasoningMode, RuliadSerializationConfig, RuliadSourceSelectionConfig,
-    RuliadSourceSemantics, RuliadTaskKind, RuliadTokenizationConfig, compact_ruliad_families,
-    default_ruliad_families, load_ruliad_config, ruliad_source_semantics,
+    RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadFrontierExtensionConfig,
+    RuliadMathDomain, RuliadReasoningMode, RuliadSerializationConfig,
+    RuliadSourceSelectionColdStartConfig, RuliadSourceSelectionConfig, RuliadSourceSemantics,
+    RuliadTaskKind, RuliadTokenizationConfig, compact_ruliad_families, default_ruliad_families,
+    load_ruliad_config, ruliad_source_semantics,
 };
 pub use eval::{
     RULIAD_DIAGNOSTIC_REPORT_VERSION, RULIAD_EVAL_REPORT_VERSION, RuliadCompletionRecord,
@@ -58,6 +59,7 @@ pub use runtime::{
 pub use search::{RuliadFrontierSampler, RuliadSamplerCandidate, RuliadSamplerConfig};
 pub use source_selection::{
     RuliadEpochSourcePlan, RuliadSourceBucket, RuliadSourceBucketId, plan_epoch_source_buckets,
-    ruliad_sampler_candidates, ruliad_source_buckets,
+    ruliad_sampler_candidates, ruliad_sampler_candidates_for_difficulty,
+    ruliad_source_bucket_by_label, ruliad_source_buckets, ruliad_source_buckets_for_difficulty,
 };
 pub use verification::{RuliadVerificationReport, verify_manifest, verify_sample};

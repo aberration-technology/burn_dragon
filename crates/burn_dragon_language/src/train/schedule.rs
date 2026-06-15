@@ -1,13 +1,14 @@
 use crate::dataset::scheduler::TokenSequenceDataset;
+use crate::train::dynamics::{ActiveDynamicsControl, DragonDynamicsControlSlot};
 use crate::train::prelude::*;
 use crate::train::utils::log_theoretical_profile;
 #[cfg(feature = "ddp")]
 use burn::tensor::TensorPrimitive;
 use burn_dragon_train::train::events::{
     CheckpointEvent, ContinualBackpropSample, ModelScaleApplied, ModelScaleRequest,
-    ModelScaleSkipped, OutputDegeneracySample, StepFinished, StepStarted, TrainingEpochSummary,
-    TrainingEventBus, TrainingGateAction, TrainingGateEvent, TrainingGateSeverity,
-    TrainingMetricSample, TrainingMetricSplit, ValidationFinished,
+    ModelScaleSkipped, OutputDegeneracySample, SourceSelectionSample, StepFinished, StepStarted,
+    TrainingEpochSummary, TrainingEventBus, TrainingGateAction, TrainingGateEvent,
+    TrainingGateSeverity, TrainingMetricSample, TrainingMetricSplit, ValidationFinished,
 };
 use std::collections::BTreeSet;
 #[cfg(feature = "ddp")]
@@ -92,13 +93,15 @@ impl burn_train::renderer::MetricsRenderer for QuietMetricsRenderer {
 fn quiet_progress_renderer_enabled() -> bool {
     std::env::var("DragonModel_TRAINING_PROGRESS_RENDERER")
         .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "quiet" | "none" | "off"
-            )
-        })
-        .unwrap_or(false)
+        .map(|value| quiet_progress_renderer_enabled_for(&value))
+        .unwrap_or(true)
+}
+
+fn quiet_progress_renderer_enabled_for(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "default" | "progress" | "on" | "true" | "1"
+    )
 }
 
 struct FileMetricBestCheckpointingStrategy {
@@ -367,6 +370,7 @@ where
         env.neuron_scaling_slot
             .as_ref()
             .map(|slot| (env.model_config.latent_total(), slot.clone())),
+        None,
     )?;
 
     let builder = SupervisedTraining::new(
@@ -513,10 +517,11 @@ pub(crate) fn train_with_dynamic_neuron_scaling_scheduler<B, S>(
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
-    S: LrScheduler + 'static,
+    S: LrScheduler + Clone + 'static,
 {
     fs::create_dir_all(env.run_dir)?;
-    let source_selection_dataset = env.source_selection_dataset.as_ref().cloned();
+    let source_selection_dataset = env.source_selection_dataset.clone();
+    let dynamics_control_slot = DragonDynamicsControlSlot::default();
     let event_handles = crate::train::events::build_training_event_handles(
         env.run_name,
         env.run_dir,
@@ -526,8 +531,10 @@ where
         env.neuron_scaling_slot
             .as_ref()
             .map(|slot| (env.model_config.latent_total(), slot.clone())),
+        Some(dynamics_control_slot.clone()),
     )?;
     let bus = event_handles.metric_logger.bus();
+    let emit_step_events = env.training.events.persist_step_events;
     let steps_per_epoch = env.train_loader.num_items().max(1);
     let start_epoch = env
         .resume_checkpoint_epoch
@@ -540,13 +547,29 @@ where
     let mut current_model_config = env.model_config.clone();
     let mut scale_generation = 0usize;
     let mut stability = ContinualLearningStabilityState::default();
+    let mut dynamics_control = ActiveDynamicsControl::default();
     let mut last_cbp_telemetry_step = 0usize;
     let mut best_valid_loss: Option<f64> = None;
     let mut best_valid_epoch: Option<usize> = None;
 
     if let Some(epoch) = env.resume_checkpoint_epoch {
-        model.model =
-            load_dragon_model_checkpoint(env.run_dir, epoch, env.model_config, env.device)?;
+        let (loaded_model, loaded_model_config) = load_dragon_training_state_checkpoint(
+            env.run_dir,
+            epoch,
+            env.model_config,
+            env.device,
+            &mut optimizer,
+            &mut scheduler,
+            &mut dynamics_control,
+        )?;
+        model.model = loaded_model;
+        if let Some(loaded_model_config) = loaded_model_config {
+            current_model_config = loaded_model_config;
+        }
+        optimizer.refresh_continual_backprop_fresh_model(DragonModel::<B>::new(
+            current_model_config.clone(),
+            env.device,
+        ));
     }
 
     let dynamic_neuron_scaling = env.neuron_scaling_slot.is_some();
@@ -580,6 +603,7 @@ where
         let mut accumulator = GradientsAccumulator::new();
         let mut accumulation_current = 0usize;
         let mut last_lr = 0.0;
+        let mut stop_requested = false;
 
         while let Some(item) = iterator.next() {
             iteration += 1;
@@ -587,21 +611,45 @@ where
                 .saturating_sub(1)
                 .saturating_mul(steps_per_epoch)
                 .saturating_add(iteration.saturating_sub(1));
-            let _ = bus.send_step_started(StepStarted {
-                run_id: env.run_name.to_string(),
-                absolute_step,
-                epoch,
-            });
+            if emit_step_events {
+                let _ = bus.send_step_started(StepStarted {
+                    run_id: env.run_name.to_string(),
+                    absolute_step,
+                    epoch,
+                });
+            }
 
+            model.set_recovery_auxiliary_active(dynamics_control.recovery_auxiliary_active());
             let item = burn_train::TrainStep::step(&model, item);
-            let train_output = item.item.sync();
-            let loss_value: LossValue<ValidBackend<B>> = train_output.adapt();
-            let mean_train_loss = mean_scalar_from_loss(loss_value.value());
+            let source_selection_due = source_selection_telemetry_due(env, absolute_step);
+            let log_train_metrics =
+                iteration % env.training.log_frequency.max(1) == 0 || iteration == steps_per_epoch;
+            let mean_train_loss = if source_selection_due || log_train_metrics {
+                let train_output = item.item.sync();
+                let loss_value: LossValue<ValidBackend<B>> = train_output.adapt();
+                Some(mean_scalar_from_loss(loss_value.value()))
+            } else {
+                None
+            };
+            if source_selection_due && let Some(mean_train_loss) = mean_train_loss {
+                emit_source_selection_telemetry(env, absolute_step, mean_train_loss, &bus);
+            }
             accumulator.accumulate(&model, item.grads);
             accumulation_current += 1;
 
             if active_grad_accumulation <= accumulation_current {
-                let lr = scheduler.step();
+                if apply_pending_dynamics_control(
+                    env,
+                    &dynamics_control_slot,
+                    &mut dynamics_control,
+                    &mut optimizer,
+                    &model,
+                ) == DynamicsControlOutcome::Stop
+                {
+                    stop_requested = true;
+                    break;
+                }
+                let lr = scheduler.step() * dynamics_control.lr_scale;
                 let grads = accumulator.grads();
                 model = optimizer.step(lr, model, grads);
                 accumulation_current = 0;
@@ -616,41 +664,45 @@ where
                 );
             }
 
-            let _ = bus.send_metric_sample(TrainingMetricSample {
-                run_id: env.run_name.to_string(),
-                split: TrainingMetricSplit::Train,
-                epoch,
-                step_in_epoch: iteration,
-                absolute_step,
-                name: "Loss".to_string(),
-                value: mean_train_loss,
-                running_value: mean_train_loss,
-            });
-            let _ = bus.send_metric_sample(TrainingMetricSample {
-                run_id: env.run_name.to_string(),
-                split: TrainingMetricSplit::Train,
-                epoch,
-                step_in_epoch: iteration,
-                absolute_step,
-                name: "Learning Rate".to_string(),
-                value: last_lr,
-                running_value: last_lr,
-            });
-            let _ = bus.send_step_finished(StepFinished {
-                run_id: env.run_name.to_string(),
-                absolute_step,
-                epoch,
-                loss: Some(mean_train_loss),
-            });
+            if log_train_metrics && let Some(mean_train_loss) = mean_train_loss {
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "Loss".to_string(),
+                    value: mean_train_loss,
+                    running_value: mean_train_loss,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "Learning Rate".to_string(),
+                    value: last_lr,
+                    running_value: last_lr,
+                });
+            }
+            if emit_step_events {
+                let _ = bus.send_step_finished(StepFinished {
+                    run_id: env.run_name.to_string(),
+                    absolute_step,
+                    epoch,
+                    loss: mean_train_loss,
+                });
+            }
 
-            if iteration % env.training.log_frequency.max(1) == 0 || iteration == steps_per_epoch {
+            if log_train_metrics {
                 let progress = iterator.progress();
                 info!(
                     "train epoch={} step={}/{} loss={:.4} lr={:.6} global_progress={}/{}",
                     epoch,
                     progress.items_processed,
                     progress.items_total,
-                    mean_train_loss,
+                    mean_train_loss.unwrap_or(f64::NAN),
                     last_lr,
                     epoch,
                     env.epochs
@@ -658,8 +710,24 @@ where
             }
         }
 
+        if stop_requested {
+            info!("stopping training after dynamics control request");
+            break;
+        }
+
         if accumulation_current > 0 {
-            let lr = scheduler.step();
+            if apply_pending_dynamics_control(
+                env,
+                &dynamics_control_slot,
+                &mut dynamics_control,
+                &mut optimizer,
+                &model,
+            ) == DynamicsControlOutcome::Stop
+            {
+                info!("stopping training after dynamics control request");
+                break;
+            }
+            let lr = scheduler.step() * dynamics_control.lr_scale;
             let grads = accumulator.grads();
             model = optimizer.step(lr, model, grads);
             let absolute_step = epoch.saturating_mul(steps_per_epoch).saturating_sub(1);
@@ -701,7 +769,15 @@ where
             best_valid_loss = Some(valid_loss);
             best_valid_epoch = Some(epoch);
         }
-        save_dragon_model_checkpoint(env.run_dir, epoch, &model.model)?;
+        save_dragon_training_state_checkpoint(
+            env.run_dir,
+            epoch,
+            &model,
+            &current_model_config,
+            &optimizer,
+            &scheduler,
+            &dynamics_control,
+        )?;
         prune_dragon_model_checkpoints(env.run_dir, epoch, best_valid_epoch)?;
         let absolute_step = epoch.saturating_mul(steps_per_epoch).saturating_sub(1);
         apply_continual_learning_stability_policy(
@@ -720,6 +796,20 @@ where
             promoted: checkpoint_promoted,
         });
         let _ = bus.flush();
+        if handle_post_validation_dynamics_control(
+            env,
+            &dynamics_control_slot,
+            &mut dynamics_control,
+            &mut optimizer,
+            &mut scheduler,
+            &mut model,
+            &mut current_model_config,
+            epoch,
+        )? == DynamicsControlOutcome::Stop
+        {
+            info!("stopping training after dynamics control request");
+            break;
+        }
 
         if let Some(request) = env
             .neuron_scaling_slot
@@ -784,19 +874,6 @@ where
                     );
                 }
             }
-            let pause_steps = env
-                .training
-                .neuron_scaling
-                .stabilization
-                .freeze_base_steps
-                .saturating_add(
-                    env.training
-                        .neuron_scaling
-                        .stabilization
-                        .unfreeze_ramp_steps,
-                )
-                .saturating_add(env.training.continual_backprop.cooldown_steps);
-            optimizer.pause_continual_backprop_for_steps(pause_steps, "neuron_scale_stabilization");
             let _ = bus.flush();
         }
     }
@@ -909,6 +986,7 @@ where
     let _ = bus.send_validation_finished(ValidationFinished {
         run_id: env.run_name.to_string(),
         epoch,
+        absolute_step: Some(epoch.saturating_mul(steps_per_epoch).saturating_sub(1)),
         loss: Some(mean),
     });
     Ok(DynamicValidationReport {
@@ -981,6 +1059,60 @@ fn dataset_eos_id(dataset: Option<&Arc<Dataset>>) -> Option<i64> {
         .map(i64::from)
 }
 
+fn source_selection_telemetry_due<B>(env: &TrainEnvironment<'_, B>, absolute_step: usize) -> bool
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let every = env.training.events.source_selection_every_steps.max(1);
+    if !absolute_step.is_multiple_of(every) {
+        return false;
+    }
+    env.source_selection_dataset
+        .as_ref()
+        .is_some_and(|dataset| dataset.uses_live_source_selection())
+}
+
+fn emit_source_selection_telemetry<B>(
+    env: &TrainEnvironment<'_, B>,
+    absolute_step: usize,
+    loss: f64,
+    bus: &TrainingEventBus,
+) where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let Some(dataset) = env.source_selection_dataset.as_ref() else {
+        return;
+    };
+    let snapshot = dataset
+        .record_source_selection_loss(absolute_step, loss as f32)
+        .or_else(|| dataset.source_selection_snapshot());
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let _ = bus.send_source_selection_sample(SourceSelectionSample {
+        run_id: env.run_name.to_string(),
+        absolute_step,
+        loss: Some(loss as f32),
+        entropy_bits: snapshot.sampler_entropy_bits as f64,
+        hash_noise_probability: snapshot.hash_noise_probability as f64,
+        mean_loss: snapshot.mean_loss as f64,
+        mean_learning_progress: snapshot.mean_learning_progress as f64,
+        frontier_loss: snapshot.frontier_loss as f64,
+        target_loss: snapshot.target_loss as f64,
+        target_difficulty_score: snapshot.target_difficulty_score as f64,
+        max_difficulty_level: snapshot.max_difficulty_level,
+        mean_difficulty_level: snapshot.mean_difficulty_level as f64,
+        normalized_difficulty_score: snapshot.normalized_difficulty_score as f64,
+        max_difficulty_probability: snapshot.max_difficulty_probability as f64,
+        mastered_probability: snapshot.mastered_probability as f64,
+        frontier_extension_count: snapshot.frontier_extension_count,
+        frontier_saturated: snapshot.frontier_saturated,
+        verifier_failures: snapshot.verifier_failures as u64,
+    });
+}
+
 fn emit_output_degeneracy<B>(
     env: &TrainEnvironment<'_, B>,
     epoch: usize,
@@ -1006,6 +1138,9 @@ fn emit_output_degeneracy<B>(
         distinct_2_fraction: stats.distinct_2_fraction,
         period_2_fraction: stats.period_2_fraction,
         period_3_fraction: stats.period_3_fraction,
+        max_period_2_to_16_fraction: stats.max_period_2_to_16_fraction,
+        max_period_2_to_64_fraction: stats.max_period_2_to_64_fraction,
+        dominant_period_2_to_64: stats.dominant_period_2_to_64,
         generated_preview: decode_degeneracy_preview(env.source_selection_dataset.as_ref(), stats),
     });
     for (name, value) in [
@@ -1021,6 +1156,14 @@ fn emit_output_degeneracy<B>(
         ("Output Distinct-2 Fraction", stats.distinct_2_fraction),
         ("Output Period-2 Fraction", stats.period_2_fraction),
         ("Output Period-3 Fraction", stats.period_3_fraction),
+        (
+            "Output Max Period-2..16 Fraction",
+            stats.max_period_2_to_16_fraction,
+        ),
+        (
+            "Output Max Period-2..64 Fraction",
+            stats.max_period_2_to_64_fraction,
+        ),
     ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: env.run_name.to_string(),
@@ -1094,6 +1237,9 @@ fn emit_continual_backprop_telemetry<B>(
         replacement_count: telemetry.replacement_count,
         replacement_budget: telemetry.replacement_budget as f64,
         lr_multiplier: telemetry.lr_multiplier as f64,
+        replacement_rate_scale: telemetry.replacement_rate_scale as f64,
+        effective_replacement_rate: telemetry.effective_replacement_rate as f64,
+        effective_max_replacements_per_interval: telemetry.effective_max_replacements_per_interval,
         paused: telemetry.paused,
         pause_reason: telemetry.pause_reason,
         utility_min: telemetry.utility_min as f64,
@@ -1105,6 +1251,133 @@ fn emit_continual_backprop_telemetry<B>(
         activation_abs_mean: telemetry.activation_abs_mean as f64,
         zero_utility_fraction: telemetry.zero_utility_fraction as f64,
     });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DynamicsControlOutcome {
+    Continue,
+    Stop,
+}
+
+fn apply_pending_dynamics_control<B>(
+    env: &TrainEnvironment<'_, B>,
+    slot: &DragonDynamicsControlSlot,
+    active: &mut ActiveDynamicsControl,
+    optimizer: &mut crate::train::continual_backprop::LanguageOptimizer<B>,
+    model: &LanguageTrainModel<B>,
+) -> DynamicsControlOutcome
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let Some(event) = slot.take() else {
+        optimizer.set_continual_backprop_runtime_control(
+            active.continual_backprop_scale,
+            active.max_replacements_per_interval,
+        );
+        model.set_recovery_auxiliary_active(active.recovery_auxiliary_active());
+        return DynamicsControlOutcome::Continue;
+    };
+    if event.run_id != env.run_name {
+        return DynamicsControlOutcome::Continue;
+    }
+    apply_dynamics_control_event(env, &event, active, optimizer, model)
+}
+
+fn apply_dynamics_control_event<B>(
+    env: &TrainEnvironment<'_, B>,
+    event: &burn_dragon_train::train::events::DynamicsControlEvent,
+    active: &mut ActiveDynamicsControl,
+    optimizer: &mut crate::train::continual_backprop::LanguageOptimizer<B>,
+    model: &LanguageTrainModel<B>,
+) -> DynamicsControlOutcome
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    active.apply_event(event);
+    optimizer.set_continual_backprop_runtime_control(
+        active.continual_backprop_scale,
+        active.max_replacements_per_interval,
+    );
+    model.set_recovery_auxiliary_active(active.recovery_auxiliary_active());
+    if let Some(dataset) = env.source_selection_dataset.as_ref() {
+        dataset.apply_source_selection_dynamics_control(
+            active.source_difficulty_pressure as f32,
+            active.hash_noise_max_probability as f32,
+        );
+    }
+    info!(
+        "dynamics control applied: mode={:?} lr_scale={:.3} cbp_scale={:.3} source_pressure={:.3} hash_noise_max={:.3} reason={}",
+        active.mode,
+        active.lr_scale,
+        active.continual_backprop_scale,
+        active.source_difficulty_pressure,
+        active.hash_noise_max_probability,
+        active.last_reason
+    );
+    if event.stop_if_repeated {
+        DynamicsControlOutcome::Stop
+    } else {
+        DynamicsControlOutcome::Continue
+    }
+}
+
+fn handle_post_validation_dynamics_control<B, S>(
+    env: &TrainEnvironment<'_, B>,
+    slot: &DragonDynamicsControlSlot,
+    active: &mut ActiveDynamicsControl,
+    optimizer: &mut crate::train::continual_backprop::LanguageOptimizer<B>,
+    scheduler: &mut S,
+    model: &mut LanguageTrainModel<B>,
+    current_model_config: &mut DragonConfig,
+    epoch: usize,
+) -> Result<DynamicsControlOutcome>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+    S: LrScheduler + Clone + 'static,
+{
+    let Some(event) = slot.take() else {
+        return Ok(DynamicsControlOutcome::Continue);
+    };
+    if event.run_id != env.run_name {
+        return Ok(DynamicsControlOutcome::Continue);
+    }
+    let rollback_epoch = event.rollback_to_epoch;
+    let outcome = apply_dynamics_control_event(env, &event, active, optimizer, model);
+    if let Some(rollback_epoch) = rollback_epoch {
+        let (rollback_model, rollback_config) = load_dragon_training_state_checkpoint(
+            env.run_dir,
+            rollback_epoch,
+            current_model_config,
+            env.device,
+            optimizer,
+            scheduler,
+            active,
+        )
+        .with_context(|| {
+            format!(
+                "failed to apply dynamics rollback from epoch {epoch} to checkpoint epoch {rollback_epoch}"
+            )
+        })?;
+        model.model = rollback_model;
+        if let Some(rollback_config) = rollback_config {
+            *current_model_config = rollback_config;
+        }
+        optimizer.refresh_continual_backprop_fresh_model(DragonModel::<B>::new(
+            current_model_config.clone(),
+            env.device,
+        ));
+        info!(
+            "dynamics rollback applied: epoch={} rollback_epoch={} latent_total={} reason={}",
+            epoch,
+            rollback_epoch,
+            current_model_config.latent_total(),
+            active.last_reason
+        );
+    }
+    Ok(outcome)
 }
 
 fn apply_continual_learning_stability_policy<B>(
@@ -1152,32 +1425,146 @@ fn apply_continual_learning_stability_policy<B>(
     let Some(degeneracy) = validation.output_degeneracy else {
         return;
     };
-    let degenerate = degeneracy.entropy_bits < env.training.gates.degeneracy_entropy_min_bits
-        || degeneracy.mean_max_probability > env.training.gates.degeneracy_max_probability_max
-        || degeneracy.argmax_unique_fraction
-            < env.training.gates.degeneracy_argmax_unique_min_fraction
-        || degeneracy.repetition_fraction > env.training.gates.degeneracy_repetition_max_fraction;
+    let degenerate = output_degeneracy_tripped(&env.training.gates, &degeneracy);
+    if uncertain_argmax_loop(&env.training.gates, &degeneracy) {
+        emit_policy_gate(
+            env,
+            bus,
+            "continual_learning_uncertain_argmax_loop",
+            epoch,
+            absolute_step,
+            format!(
+                "low-confidence argmax loop observed without distribution collapse: entropy {:.3}, max_prob {:.3}, unique {:.3}, distinct2 {:.3}, repetition {:.3}, period2 {:.3}, period3 {:.3}, max_period2_16 {:.3}, max_period2_64 {:.3} (period {})",
+                degeneracy.entropy_bits,
+                degeneracy.mean_max_probability,
+                degeneracy.argmax_unique_fraction,
+                degeneracy.distinct_2_fraction,
+                degeneracy.repetition_fraction,
+                degeneracy.period_2_fraction,
+                degeneracy.period_3_fraction,
+                degeneracy.max_period_2_to_16_fraction,
+                degeneracy.max_period_2_to_64_fraction,
+                degeneracy.dominant_period_2_to_64
+            ),
+        );
+    }
     if degenerate {
         state.consecutive_output_degeneracy = state.consecutive_output_degeneracy.saturating_add(1);
     } else {
         state.consecutive_output_degeneracy = 0;
     }
     if state.consecutive_output_degeneracy >= env.training.gates.degeneracy_patience {
-        emit_policy_gate(
+        let hard_collapse = hard_output_collapse(env, &degeneracy);
+        emit_policy_gate_with_action(
             env,
             bus,
             "continual_learning_output_degeneracy",
+            TrainingGateAction::Alert,
+            TrainingGateSeverity::Warning,
             epoch,
             absolute_step,
             format!(
-                "output degeneracy detected while leaving continual backprop active: entropy {:.3}, max_prob {:.3}, unique {:.3}, repetition {:.3}",
+                "{} output degeneracy detected while leaving continual backprop active and routing through dynamics recovery: entropy {:.3}, max_prob {:.3}, unique {:.3}, distinct2 {:.3}, repetition {:.3}, period2 {:.3}, period3 {:.3}, max_period2_16 {:.3}, max_period2_64 {:.3} (period {})",
+                if hard_collapse { "hard" } else { "soft" },
                 degeneracy.entropy_bits,
                 degeneracy.mean_max_probability,
                 degeneracy.argmax_unique_fraction,
-                degeneracy.repetition_fraction
+                degeneracy.distinct_2_fraction,
+                degeneracy.repetition_fraction,
+                degeneracy.period_2_fraction,
+                degeneracy.period_3_fraction,
+                degeneracy.max_period_2_to_16_fraction,
+                degeneracy.max_period_2_to_64_fraction,
+                degeneracy.dominant_period_2_to_64
             ),
         );
     }
+}
+
+fn output_degeneracy_tripped(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    output_diversity_degeneracy(gates, degeneracy)
+}
+
+fn output_distribution_collapse(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    degeneracy.entropy_bits < gates.degeneracy_entropy_min_bits
+        || degeneracy.mean_max_probability > gates.degeneracy_max_probability_max
+}
+
+fn output_diversity_degeneracy(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    degeneracy.argmax_unique_fraction < gates.degeneracy_argmax_unique_min_fraction
+        || degeneracy.distinct_2_fraction < gates.degeneracy_distinct_2_min_fraction
+        || degeneracy.repetition_fraction > gates.degeneracy_repetition_max_fraction
+        || degeneracy.period_2_fraction > gates.degeneracy_period_2_max_fraction
+        || degeneracy.period_3_fraction > gates.degeneracy_period_3_max_fraction
+        || degeneracy.max_period_2_to_16_fraction > gates.degeneracy_period_2_to_16_max_fraction
+        || degeneracy.max_period_2_to_64_fraction > gates.degeneracy_period_2_to_64_max_fraction
+}
+
+fn output_degeneracy_is_confident(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    degeneracy.mean_max_probability >= 0.25
+        || degeneracy.entropy_bits <= gates.degeneracy_entropy_min_bits * 2.0
+}
+
+fn uncertain_argmax_loop(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    output_diversity_degeneracy(gates, degeneracy)
+        && !output_distribution_collapse(gates, degeneracy)
+        && !output_degeneracy_is_confident(gates, degeneracy)
+}
+
+fn hard_argmax_loop_collapse(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    degeneracy.repetition_fraction > gates.degeneracy_repetition_max_fraction
+        || degeneracy.period_2_fraction > gates.degeneracy_period_2_max_fraction
+        || degeneracy.period_3_fraction > gates.degeneracy_period_3_max_fraction
+        || degeneracy.max_period_2_to_16_fraction > gates.degeneracy_period_2_to_16_max_fraction
+        || degeneracy.max_period_2_to_64_fraction > gates.degeneracy_period_2_to_64_max_fraction
+}
+
+fn low_diversity_collapse(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    degeneracy.argmax_unique_fraction < gates.degeneracy_argmax_unique_min_fraction
+        || degeneracy.distinct_2_fraction < gates.degeneracy_distinct_2_min_fraction
+}
+
+fn hard_output_collapse<B>(
+    env: &TrainEnvironment<'_, B>,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    hard_output_collapse_for_gates(&env.training.gates, degeneracy)
+}
+
+fn hard_output_collapse_for_gates(
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    degeneracy: &crate::train::steps::OutputDegeneracyStats,
+) -> bool {
+    (output_distribution_collapse(gates, degeneracy)
+        && (low_diversity_collapse(gates, degeneracy)
+            || hard_argmax_loop_collapse(gates, degeneracy)))
+        || (output_degeneracy_is_confident(gates, degeneracy)
+            && hard_argmax_loop_collapse(gates, degeneracy))
 }
 
 fn emit_policy_gate<B>(
@@ -1191,11 +1578,36 @@ fn emit_policy_gate<B>(
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    emit_policy_gate_with_action(
+        env,
+        bus,
+        gate,
+        TrainingGateAction::Alert,
+        TrainingGateSeverity::Warning,
+        epoch,
+        absolute_step,
+        message,
+    );
+}
+
+fn emit_policy_gate_with_action<B>(
+    env: &TrainEnvironment<'_, B>,
+    bus: &TrainingEventBus,
+    gate: &str,
+    action: TrainingGateAction,
+    severity: TrainingGateSeverity,
+    epoch: usize,
+    absolute_step: usize,
+    message: String,
+) where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
     let _ = bus.send_gate_event(TrainingGateEvent {
         run_id: env.run_name.to_string(),
         gate: gate.to_string(),
-        action: TrainingGateAction::Alert,
-        severity: TrainingGateSeverity::Warning,
+        action,
+        severity,
         epoch: Some(epoch),
         absolute_step: Some(absolute_step),
         message,
@@ -1233,6 +1645,73 @@ fn save_dragon_model_checkpoint<B: AutodiffBackend + Clone + 'static>(
     Ok(())
 }
 
+fn save_dragon_training_state_checkpoint<B, S>(
+    run_dir: &Path,
+    epoch: usize,
+    model: &LanguageTrainModel<B>,
+    model_config: &DragonConfig,
+    optimizer: &crate::train::continual_backprop::LanguageOptimizer<B>,
+    scheduler: &S,
+    dynamics_control: &ActiveDynamicsControl,
+) -> Result<()>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+    S: LrScheduler + Clone + 'static,
+{
+    save_dragon_model_checkpoint(run_dir, epoch, &model.model)?;
+    let checkpoint_dir = run_dir.join("checkpoint");
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    FileCheckpointer::new(recorder.clone(), &checkpoint_dir, "optimizer")
+        .save(epoch, optimizer.to_record())
+        .with_context(|| {
+            format!(
+                "failed to save dynamic Dragon optimizer checkpoint {epoch} in {}",
+                checkpoint_dir.display()
+            )
+        })?;
+    FileCheckpointer::new(recorder, &checkpoint_dir, "scheduler")
+        .save(epoch, scheduler.to_record::<B>())
+        .with_context(|| {
+            format!(
+                "failed to save dynamic Dragon scheduler checkpoint {epoch} in {}",
+                checkpoint_dir.display()
+            )
+        })?;
+    let dynamics_path = checkpoint_dir.join(format!("dynamics-{epoch}.json"));
+    fs::write(
+        &dynamics_path,
+        serde_json::to_vec_pretty(dynamics_control).context("serialize dynamics control")?,
+    )
+    .with_context(|| format!("failed to save {}", dynamics_path.display()))?;
+    let model_config_path = checkpoint_dir.join(format!("model-config-{epoch}.json"));
+    fs::write(
+        &model_config_path,
+        serde_json::to_vec_pretty(model_config).context("serialize Dragon model config")?,
+    )
+    .with_context(|| format!("failed to save {}", model_config_path.display()))?;
+    Ok(())
+}
+
+fn checkpoint_artifact_epoch(name: &str) -> Option<usize> {
+    for (prefix, suffix) in [
+        ("model-", ".bin"),
+        ("optimizer-", ".bin"),
+        ("scheduler-", ".bin"),
+        ("dynamics-", ".json"),
+        ("model-config-", ".json"),
+    ] {
+        if let Some(epoch) = name
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            return Some(epoch);
+        }
+    }
+    None
+}
+
 fn prune_dragon_model_checkpoints(
     run_dir: &Path,
     current_epoch: usize,
@@ -1257,9 +1736,7 @@ fn prune_dragon_model_checkpoints(
         let Some(epoch) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("model-"))
-            .and_then(|name| name.strip_suffix(".bin"))
-            .and_then(|epoch| epoch.parse::<usize>().ok())
+            .and_then(checkpoint_artifact_epoch)
         else {
             continue;
         };
@@ -1288,6 +1765,73 @@ fn load_dragon_model_checkpoint<B: AutodiffBackend + Clone + 'static>(
             )
         })?;
     Ok(DragonModel::<B>::new(model_config.clone(), device).load_record(record))
+}
+
+fn load_dragon_training_state_checkpoint<B, S>(
+    run_dir: &Path,
+    epoch: usize,
+    model_config: &DragonConfig,
+    device: &B::Device,
+    optimizer: &mut crate::train::continual_backprop::LanguageOptimizer<B>,
+    scheduler: &mut S,
+    dynamics_control: &mut ActiveDynamicsControl,
+) -> Result<(DragonModel<B>, Option<DragonConfig>)>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+    S: LrScheduler + Clone + 'static,
+{
+    let checkpoint_dir = run_dir.join("checkpoint");
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let model_config_path = checkpoint_dir.join(format!("model-config-{epoch}.json"));
+    let saved_model_config = if model_config_path.is_file() {
+        let bytes = fs::read(&model_config_path)
+            .with_context(|| format!("failed to read {}", model_config_path.display()))?;
+        Some(
+            serde_json::from_slice::<DragonConfig>(&bytes)
+                .with_context(|| format!("failed to parse {}", model_config_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let checkpoint_model_config = saved_model_config.as_ref().unwrap_or(model_config);
+    let model = load_dragon_model_checkpoint(run_dir, epoch, checkpoint_model_config, device)?;
+
+    let optimizer_path = checkpoint_dir.join(format!("optimizer-{epoch}.bin"));
+    if optimizer_path.is_file() {
+        let record = FileCheckpointer::new(recorder.clone(), &checkpoint_dir, "optimizer")
+            .restore(epoch, device)
+            .with_context(|| {
+                format!(
+                    "failed to restore dynamic Dragon optimizer checkpoint {epoch} from {}",
+                    checkpoint_dir.display()
+                )
+            })?;
+        *optimizer = optimizer.clone().load_record(record);
+    }
+
+    let scheduler_path = checkpoint_dir.join(format!("scheduler-{epoch}.bin"));
+    if scheduler_path.is_file() {
+        let record = FileCheckpointer::new(recorder, &checkpoint_dir, "scheduler")
+            .restore(epoch, device)
+            .with_context(|| {
+                format!(
+                    "failed to restore dynamic Dragon scheduler checkpoint {epoch} from {}",
+                    checkpoint_dir.display()
+                )
+            })?;
+        *scheduler = scheduler.clone().load_record::<B>(record);
+    }
+
+    let dynamics_path = checkpoint_dir.join(format!("dynamics-{epoch}.json"));
+    if dynamics_path.is_file() {
+        let bytes = fs::read(&dynamics_path)
+            .with_context(|| format!("failed to read {}", dynamics_path.display()))?;
+        *dynamics_control = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", dynamics_path.display()))?;
+    }
+
+    Ok((model, saved_model_config))
 }
 
 fn apply_dynamic_neuron_scale<B>(
@@ -1411,6 +1955,10 @@ where
             &env.training.neuron_scaling.stabilization,
         );
     optimizer.prepare_after_neuron_scale(model);
+    optimizer.refresh_continual_backprop_fresh_model(DragonModel::<B>::new(
+        target_config.clone(),
+        env.device,
+    ));
     *current_model_config = target_config;
     *scale_generation = scale_generation.saturating_add(1);
 
@@ -2161,7 +2709,7 @@ where
 #[cfg(feature = "ddp")]
 struct DistributedPipelineTrainStepResult {
     grads: GradientsParams,
-    mean_train_loss: f64,
+    mean_train_loss: Option<f64>,
 }
 
 #[cfg(feature = "ddp")]
@@ -2172,6 +2720,7 @@ fn distributed_pipeline_train_step<B>(
     layout: &PipelineParallelLayout,
     assignment: &PipelineRankAssignment,
     device: &B::Device,
+    reduce_metric_loss: bool,
 ) -> Result<DistributedPipelineTrainStepResult>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -2254,10 +2803,12 @@ where
                     .model
                     .language_loss_from_hidden(hidden, chunk_targets[microbatch_id].clone())
                     .mul_scalar(weight);
-                local_loss = Some(match local_loss {
-                    Some(accumulated) => accumulated + loss.clone().detach().inner(),
-                    None => loss.clone().detach().inner(),
-                });
+                if reduce_metric_loss {
+                    local_loss = Some(match local_loss {
+                        Some(accumulated) => accumulated + loss.clone().detach().inner(),
+                        None => loss.clone().detach().inner(),
+                    });
+                }
                 forward_cache.insert(
                     (event.virtual_stage_id, microbatch_id),
                     DistributedPipelineForwardCache {
@@ -2432,18 +2983,23 @@ where
         }
     }
 
-    let reduced_loss = reduce_sum_scalar::<B::InnerBackend>(
-        peer_id,
-        if assignment.is_last_stage() {
-            local_loss.unwrap_or_else(|| Tensor::<B::InnerBackend, 1>::zeros([1], device))
-        } else {
-            Tensor::<B::InnerBackend, 1>::zeros([1], device)
-        },
-    )?;
+    let mean_train_loss = if reduce_metric_loss {
+        let reduced_loss = reduce_sum_scalar::<B::InnerBackend>(
+            peer_id,
+            if assignment.is_last_stage() {
+                local_loss.unwrap_or_else(|| Tensor::<B::InnerBackend, 1>::zeros([1], device))
+            } else {
+                Tensor::<B::InnerBackend, 1>::zeros([1], device)
+            },
+        )?;
+        Some(reduced_loss / layout.data_parallel_size as f64)
+    } else {
+        None
+    };
 
     Ok(DistributedPipelineTrainStepResult {
         grads: local_accumulator.grads(),
-        mean_train_loss: reduced_loss / layout.data_parallel_size as f64,
+        mean_train_loss,
     })
 }
 
@@ -2539,6 +3095,12 @@ where
                 learner.lr_step();
             }
 
+            let absolute_step = epoch
+                .saturating_sub(1)
+                .saturating_mul(local_train_steps)
+                .saturating_add(iteration.saturating_sub(1));
+            let source_selection_due = source_selection_telemetry_due(env, absolute_step);
+            let log_train_metrics = iteration % metric_every == 0 || iteration == local_train_steps;
             let step = distributed_pipeline_train_step(
                 peer_id,
                 &learner.model(),
@@ -2546,7 +3108,18 @@ where
                 &layout,
                 &assignment,
                 env.device,
+                source_selection_due || log_train_metrics,
             )?;
+            if source_selection_due
+                && let (Some(dataset), Some(mean_train_loss)) = (
+                    env.source_selection_dataset
+                        .as_ref()
+                        .filter(|dataset| dataset.uses_live_source_selection()),
+                    step.mean_train_loss,
+                )
+            {
+                let _ = dataset.record_source_selection_loss(absolute_step, mean_train_loss as f32);
+            }
 
             accumulator.accumulate(&learner.model(), step.grads);
             accumulation_current += 1;
@@ -2569,7 +3142,8 @@ where
             }
 
             if env.parallel_runtime.is_primary()
-                && (iteration % metric_every == 0 || iteration == local_train_steps)
+                && log_train_metrics
+                && let Some(mean_train_loss) = step.mean_train_loss
             {
                 let progress = iterator.progress();
                 let global_iteration = epoch
@@ -2582,7 +3156,7 @@ where
                     progress.items_processed,
                     progress.items_total,
                     global_iteration,
-                    step.mean_train_loss,
+                    mean_train_loss,
                     learner.lr_current(),
                     epoch,
                     env.epochs
@@ -2698,27 +3272,30 @@ where
             }
 
             let item = learner.train_step(item);
-            let train_output = item.item.sync();
-            let loss_value: LossValue<ValidBackend<B>> = train_output.adapt();
-            info!(
-                "process-group DDP rank={} iteration={} entering scalar loss all-reduce",
-                env.parallel_runtime.global_rank, iteration
-            );
-            let mean_train_loss =
-                reduce_mean_scalar::<ValidBackend<B>>(peer_id, loss_value.value())?;
-            info!(
-                "process-group DDP rank={} iteration={} completed scalar loss all-reduce",
-                env.parallel_runtime.global_rank, iteration
-            );
-            if let Some(dataset) = env
-                .source_selection_dataset
-                .as_ref()
-                .filter(|dataset| dataset.uses_live_source_selection())
+            let absolute_step = epoch
+                .saturating_sub(1)
+                .saturating_mul(local_train_steps)
+                .saturating_add(iteration.saturating_sub(1));
+            let source_selection_due = source_selection_telemetry_due(env, absolute_step);
+            let log_train_metrics = iteration % metric_every == 0 || iteration == local_train_steps;
+            let mean_train_loss = if source_selection_due || log_train_metrics {
+                let train_output = item.item.sync();
+                let loss_value: LossValue<ValidBackend<B>> = train_output.adapt();
+                Some(reduce_mean_scalar::<ValidBackend<B>>(
+                    peer_id,
+                    loss_value.value(),
+                )?)
+            } else {
+                None
+            };
+            if source_selection_due
+                && let (Some(dataset), Some(mean_train_loss)) = (
+                    env.source_selection_dataset
+                        .as_ref()
+                        .filter(|dataset| dataset.uses_live_source_selection()),
+                    mean_train_loss,
+                )
             {
-                let absolute_step = epoch
-                    .saturating_sub(1)
-                    .saturating_mul(local_train_steps)
-                    .saturating_add(iteration.saturating_sub(1));
                 let _ = dataset.record_source_selection_loss(absolute_step, mean_train_loss as f32);
             }
 
@@ -2748,7 +3325,8 @@ where
             }
 
             if env.parallel_runtime.is_primary()
-                && (iteration % metric_every == 0 || iteration == local_train_steps)
+                && log_train_metrics
+                && let Some(mean_train_loss) = mean_train_loss
             {
                 let progress = iterator.progress();
                 let global_iteration = epoch
@@ -2850,6 +3428,185 @@ mod tests {
     type TestBackend = Autodiff<NdArray<f32>>;
     type TestValidBackend = ValidBackend<TestBackend>;
 
+    fn degeneracy_stats(
+        entropy_bits: f64,
+        mean_max_probability: f64,
+        distinct_2_fraction: f64,
+        repetition_fraction: f64,
+    ) -> crate::train::steps::OutputDegeneracyStats {
+        crate::train::steps::OutputDegeneracyStats {
+            token_count: 128,
+            entropy_bits,
+            mean_max_probability,
+            argmax_unique_fraction: 0.02,
+            eos_fraction: 0.0,
+            repetition_fraction,
+            distinct_1_fraction: 0.02,
+            distinct_2_fraction,
+            period_2_fraction: 0.0,
+            period_3_fraction: 0.0,
+            max_period_2_to_16_fraction: 0.0,
+            max_period_2_to_64_fraction: 0.0,
+            dominant_period_2_to_64: 0,
+            generated_tokens: Vec::new(),
+        }
+    }
+
+    fn ruliad_degeneracy_gates() -> burn_dragon_train::TrainingGatesConfig {
+        burn_dragon_train::TrainingGatesConfig {
+            degeneracy_entropy_min_bits: 2.0,
+            degeneracy_max_probability_max: 0.90,
+            degeneracy_argmax_unique_min_fraction: 0.08,
+            degeneracy_distinct_2_min_fraction: 0.20,
+            degeneracy_repetition_max_fraction: 0.75,
+            degeneracy_period_2_max_fraction: 0.90,
+            degeneracy_period_3_max_fraction: 0.90,
+            degeneracy_period_2_to_16_max_fraction: 0.90,
+            degeneracy_period_2_to_64_max_fraction: 0.90,
+            degeneracy_patience: 1,
+            ..burn_dragon_train::TrainingGatesConfig::default()
+        }
+    }
+
+    #[test]
+    fn output_degeneracy_policy_warns_on_low_confidence_argmax_loop() {
+        let gates = ruliad_degeneracy_gates();
+        let stats = degeneracy_stats(11.0, 0.03, 0.03, 0.94);
+
+        assert!(uncertain_argmax_loop(&gates, &stats));
+        assert!(output_degeneracy_tripped(&gates, &stats));
+        assert!(!hard_output_collapse_for_gates(&gates, &stats));
+    }
+
+    #[test]
+    fn quiet_progress_renderer_is_default_for_training_efficiency() {
+        assert!(quiet_progress_renderer_enabled_for("quiet"));
+        assert!(quiet_progress_renderer_enabled_for("off"));
+        assert!(quiet_progress_renderer_enabled_for(""));
+        assert!(!quiet_progress_renderer_enabled_for("progress"));
+        assert!(!quiet_progress_renderer_enabled_for("default"));
+    }
+
+    #[test]
+    fn output_degeneracy_policy_keeps_low_diversity_nonperiodic_output_soft() {
+        let gates = ruliad_degeneracy_gates();
+        let stats = degeneracy_stats(3.5, 0.52, 0.05, 0.04);
+
+        assert!(!uncertain_argmax_loop(&gates, &stats));
+        assert!(output_degeneracy_tripped(&gates, &stats));
+        assert!(!hard_output_collapse_for_gates(&gates, &stats));
+    }
+
+    #[test]
+    fn output_degeneracy_policy_accepts_structured_low_entropy_output() {
+        let gates = ruliad_degeneracy_gates();
+        let mut stats = degeneracy_stats(1.35, 0.78, 0.38, 0.01);
+        stats.argmax_unique_fraction = 0.13;
+        stats.distinct_1_fraction = 0.13;
+        stats.period_2_fraction = 0.02;
+        stats.period_3_fraction = 0.24;
+        stats.max_period_2_to_16_fraction = 0.36;
+        stats.max_period_2_to_64_fraction = 0.36;
+        stats.dominant_period_2_to_64 = 6;
+
+        assert!(!output_degeneracy_tripped(&gates, &stats));
+        assert!(!hard_output_collapse_for_gates(&gates, &stats));
+    }
+
+    #[test]
+    fn continual_learning_hard_output_degeneracy_alerts_without_direct_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams();
+        training.events.flush_every_steps = 1;
+        training.gates = ruliad_degeneracy_gates();
+        let model_config = tiny_model_config();
+        let devices = vec![device.clone()];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name: "hard-output-degeneracy-alert-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<TestBackend>(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            )])),
+            valid_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<
+                TestValidBackend,
+            >(
+                &valid_device,
+                &[0, 0, 1, 1, 2, 2, 3, 3],
+                &[0, 1, 1, 2, 2, 3, 3, 0],
+                [2, 4],
+            )])),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 1,
+            total_steps: 1,
+            valid_steps: 1,
+        };
+        let handles = crate::train::events::build_training_event_handles(
+            env.run_name,
+            &run_dir,
+            1,
+            &training,
+            None,
+            None,
+            None,
+        )
+        .expect("event handles");
+        let bus = handles.metric_logger.bus();
+        let mut state = ContinualLearningStabilityState::default();
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 1.0,
+                source_weighted_loss: None,
+                output_degeneracy: Some(degeneracy_stats(3.5, 0.52, 0.05, 0.04)),
+            },
+            1,
+            0,
+            &mut state,
+            &bus,
+        );
+        let _ = bus.flush();
+        drop(handles);
+
+        let gate = read_training_events(&run_dir)
+            .into_iter()
+            .find(|event| {
+                event.get("type").and_then(|value| value.as_str()) == Some("gate")
+                    && event.get("gate").and_then(|value| value.as_str())
+                        == Some("continual_learning_output_degeneracy")
+            })
+            .expect("output degeneracy gate event");
+
+        assert_eq!(
+            gate.get("action").and_then(|value| value.as_str()),
+            Some("alert")
+        );
+        assert_eq!(
+            gate.get("severity").and_then(|value| value.as_str()),
+            Some("warning")
+        );
+    }
+
     #[test]
     fn file_metric_best_strategy_tracks_best_value() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2947,6 +3704,23 @@ mod tests {
         epochs
     }
 
+    fn write_dynamic_checkpoint_bundle(checkpoint_dir: &Path, epoch: usize) {
+        for prefix in ["model", "optimizer", "scheduler"] {
+            fs::write(
+                checkpoint_dir.join(format!("{prefix}-{epoch}.bin")),
+                format!("{prefix}-{epoch}"),
+            )
+            .expect("write dynamic checkpoint record");
+        }
+        for prefix in ["dynamics", "model-config"] {
+            fs::write(
+                checkpoint_dir.join(format!("{prefix}-{epoch}.json")),
+                format!(r#"{{"epoch":{epoch}}}"#),
+            )
+            .expect("write dynamic checkpoint json");
+        }
+    }
+
     #[test]
     fn file_metric_best_strategy_preserves_old_best_outside_keep_last_window() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2980,13 +3754,40 @@ mod tests {
         let checkpoint_dir = dir.path().join("checkpoint");
         fs::create_dir_all(&checkpoint_dir).expect("checkpoint dir");
         for epoch in 1..=5 {
-            fs::write(checkpoint_dir.join(format!("model-{epoch}.bin")), "model")
-                .expect("checkpoint");
+            write_dynamic_checkpoint_bundle(&checkpoint_dir, epoch);
         }
 
         prune_dragon_model_checkpoints(dir.path(), 5, Some(2)).expect("prune checkpoints");
 
         assert_eq!(retained_model_epochs(dir.path()), vec![2, 4, 5]);
+        for kept_epoch in [2, 4, 5] {
+            for file in [
+                format!("model-{kept_epoch}.bin"),
+                format!("optimizer-{kept_epoch}.bin"),
+                format!("scheduler-{kept_epoch}.bin"),
+                format!("dynamics-{kept_epoch}.json"),
+                format!("model-config-{kept_epoch}.json"),
+            ] {
+                assert!(
+                    checkpoint_dir.join(file).is_file(),
+                    "expected checkpoint bundle artifact for kept epoch {kept_epoch}"
+                );
+            }
+        }
+        for pruned_epoch in [1, 3] {
+            for file in [
+                format!("model-{pruned_epoch}.bin"),
+                format!("optimizer-{pruned_epoch}.bin"),
+                format!("scheduler-{pruned_epoch}.bin"),
+                format!("dynamics-{pruned_epoch}.json"),
+                format!("model-config-{pruned_epoch}.json"),
+            ] {
+                assert!(
+                    !checkpoint_dir.join(file).exists(),
+                    "expected checkpoint bundle artifact to be pruned for epoch {pruned_epoch}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3182,6 +3983,10 @@ mod tests {
             init_checkpoint_epoch: None,
             init_transfer: Default::default(),
             continual_backprop: Default::default(),
+            input_corruption: Default::default(),
+            logit_entropy_floor: Default::default(),
+            repeat_unlikelihood: Default::default(),
+            greedy_rollout_unlikelihood: Default::default(),
             module_lr_scales: Vec::new(),
             context_strategy: ContextStrategyConfig::Infinite,
             sequence_kernel_override: None,
@@ -3189,6 +3994,7 @@ mod tests {
             gdpo: None,
             events: Default::default(),
             gates: Default::default(),
+            dynamics: Default::default(),
             neuron_scaling: Default::default(),
             auto_batch_size: Default::default(),
         }
@@ -3444,6 +4250,7 @@ mod tests {
             &training,
             None,
             None,
+            None,
         )
         .expect("event handles");
         let bus = handles.metric_logger.bus();
@@ -3550,6 +4357,356 @@ mod tests {
         assert_eq!(trained.latent_total_capacity(), 16);
         assert!(request_slot.take().is_none());
         assert!(run_dir.join("checkpoint").join("model-1.bin").is_file());
+    }
+
+    #[test]
+    fn dynamic_scheduler_throttles_train_metric_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams();
+        training.log_frequency = 2;
+        training.events.flush_every_steps = 1;
+        training.events.degeneracy_probe_every_epochs = usize::MAX;
+        let model_config = tiny_model_config();
+        let devices = vec![device.clone()];
+        let train_batches = vec![
+            make_batch::<TestBackend>(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            ),
+            make_batch::<TestBackend>(
+                &device,
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                &[2, 3, 4, 5, 6, 7, 0, 1],
+                [2, 4],
+            ),
+            make_batch::<TestBackend>(
+                &device,
+                &[2, 3, 4, 5, 6, 7, 0, 1],
+                &[3, 4, 5, 6, 7, 0, 1, 2],
+                [2, 4],
+            ),
+        ];
+        let valid_batches = vec![make_batch::<TestValidBackend>(
+            &valid_device,
+            &[0, 0, 1, 1, 2, 2, 3, 3],
+            &[0, 1, 1, 2, 2, 3, 3, 0],
+            [2, 4],
+        )];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name: "dynamic-metric-throttle-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
+            valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 1,
+            total_steps: 3,
+            valid_steps: 1,
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &device,
+        ))
+        .with_gradient_scale_schedule(&training, 3);
+        let optimizer = tiny_language_optimizer(&training, &model_config, &device);
+
+        let _trained = train_with_dynamic_neuron_scaling_scheduler(&env, model, optimizer, 1e-3)
+            .expect("dynamic scheduler train");
+
+        let events = read_training_events(&run_dir);
+        let train_loss_steps = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(|value| value.as_str()) == Some("metric")
+                    && event.get("split").and_then(|value| value.as_str()) == Some("train")
+                    && event.get("name").and_then(|value| value.as_str()) == Some("Loss")
+            })
+            .map(|event| {
+                event
+                    .get("step_in_epoch")
+                    .and_then(|value| value.as_u64())
+                    .expect("train loss step") as usize
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(train_loss_steps, vec![2, 3]);
+    }
+
+    #[test]
+    fn dynamic_scheduler_recovery_control_scales_continual_backprop_in_training_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weak_events = run_recovery_cbp_scale_smoke(
+            &dir.path().join("weak"),
+            "dynamic-recovery-cbp-weak",
+            0.5,
+            1.25,
+        );
+        let strong_events = run_recovery_cbp_scale_smoke(
+            &dir.path().join("strong"),
+            "dynamic-recovery-cbp-strong",
+            2.0,
+            0.75,
+        );
+
+        let weak_control_scale =
+            latest_dynamics_control_scale(&weak_events).expect("weak recovery control");
+        let strong_control_scale =
+            latest_dynamics_control_scale(&strong_events).expect("strong recovery control");
+        let strong_control_max_replacements =
+            latest_dynamics_control_max_replacements(&strong_events)
+                .expect("strong recovery max replacements");
+        let weak_effective_scale =
+            latest_continual_backprop_replacement_scale(&weak_events).expect("weak CBP telemetry");
+        let strong_effective_scale = latest_continual_backprop_replacement_scale(&strong_events)
+            .expect("strong CBP telemetry");
+        let strong_effective_max_replacements =
+            latest_continual_backprop_max_replacements(&strong_events)
+                .expect("strong CBP max replacements telemetry");
+
+        assert_eq!(weak_control_scale, 0.5);
+        assert_eq!(weak_effective_scale, 0.5);
+        assert_eq!(strong_control_scale, 2.0);
+        assert_eq!(strong_control_max_replacements, 3);
+        assert_eq!(strong_effective_scale, 2.0);
+        assert_eq!(strong_effective_max_replacements, 3);
+        assert!(
+            strong_effective_scale > weak_effective_scale,
+            "strong recovery should increase realized CBP plasticity relative to weak baseline"
+        );
+    }
+
+    fn run_recovery_cbp_scale_smoke(
+        run_dir: &Path,
+        run_name: &str,
+        recovery_cbp_scale: f64,
+        recovery_source_pressure: f64,
+    ) -> Vec<serde_json::Value> {
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams_with_epochs(2, None);
+        training.continual_backprop.enabled = true;
+        training.continual_backprop.warmup_steps = 0;
+        training.continual_backprop.maturity_steps = 0;
+        training.continual_backprop.cooldown_steps = 0;
+        training.continual_backprop.sample_interval_steps = 1;
+        training.continual_backprop.replace_interval_steps = 1;
+        training.continual_backprop.replacement_rate = 0.1;
+        training.continual_backprop.max_replacements_per_interval = 1;
+        training.continual_backprop.lr_coupling =
+            burn_dragon_train::ContinualBackpropLrCoupling::None;
+        training.events.continual_backprop_every_steps = 1;
+        training.events.degeneracy_probe_every_epochs = 1;
+        training.events.degeneracy_probe_tokens = 8;
+        training.gates.degeneracy_entropy_min_bits = 128.0;
+        training.gates.degeneracy_max_probability_max = 2.0;
+        training.dynamics.soft_recovery_continual_backprop_scale = recovery_cbp_scale;
+        training
+            .dynamics
+            .validation_recovery_continual_backprop_scale = recovery_cbp_scale;
+        training.dynamics.hard_recovery_continual_backprop_scale = recovery_cbp_scale;
+        training
+            .dynamics
+            .soft_recovery_max_replacements_per_interval = Some(3);
+        training
+            .dynamics
+            .validation_recovery_max_replacements_per_interval = Some(3);
+        training
+            .dynamics
+            .hard_recovery_max_replacements_per_interval = Some(3);
+        training.dynamics.recovery_source_difficulty_pressure = recovery_source_pressure;
+        let model_config = tiny_model_config();
+        let devices = vec![device.clone()];
+        let train_batches = vec![make_batch::<TestBackend>(
+            &device,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[1, 2, 3, 4, 5, 6, 7, 0],
+            [2, 4],
+        )];
+        let valid_batches = vec![make_batch::<TestValidBackend>(
+            &valid_device,
+            &[0, 0, 1, 1, 2, 2, 3, 3],
+            &[0, 1, 1, 2, 2, 3, 3, 0],
+            [2, 4],
+        )];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir,
+            run_name,
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
+            valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 2,
+            total_steps: 2,
+            valid_steps: 1,
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &device,
+        ))
+        .with_continual_backprop(&training.continual_backprop);
+        let optimizer = tiny_language_optimizer(&training, &model_config, &device);
+
+        let trained = train_with_dynamic_neuron_scaling_scheduler(&env, model, optimizer, 1e-3)
+            .expect("dynamic recovery train");
+
+        assert_eq!(trained.latent_total_capacity(), model_config.latent_total());
+        let events = read_training_events(run_dir);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(|value| value.as_str())
+                    == Some("dynamics_control")
+                    && event
+                        .get("mode")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(is_recovery_mode)
+                    && event
+                        .get("continual_backprop_scale")
+                        .and_then(|value| value.as_f64())
+                        .is_some_and(|scale| (scale - recovery_cbp_scale).abs() < 1.0e-9)
+                    && event
+                        .get("max_replacements_per_interval")
+                        .and_then(|value| value.as_u64())
+                        == Some(3)
+                    && event
+                        .get("source_difficulty_pressure")
+                        .and_then(|value| value.as_f64())
+                        .is_some_and(
+                            |pressure| (pressure - recovery_source_pressure).abs() < 1.0e-9
+                        )),
+            "training events should include a plasticity recovery control: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(|value| value.as_str())
+                    == Some("continual_backprop")
+                    && event
+                        .get("replacement_rate_scale")
+                        .and_then(|value| value.as_f64())
+                        .is_some_and(|scale| (scale - recovery_cbp_scale).abs() < 1.0e-6)
+                    && event
+                        .get("effective_max_replacements_per_interval")
+                        .and_then(|value| value.as_u64())
+                        == Some(3)),
+            "epoch after recovery should emit CBP telemetry using recovery scale: {events:#?}"
+        );
+        events
+    }
+
+    fn latest_dynamics_control_scale(events: &[serde_json::Value]) -> Option<f64> {
+        events.iter().rev().find_map(|event| {
+            (event.get("type").and_then(|value| value.as_str()) == Some("dynamics_control")
+                && event
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_recovery_mode))
+            .then(|| {
+                event
+                    .get("continual_backprop_scale")
+                    .and_then(|value| value.as_f64())
+            })
+            .flatten()
+        })
+    }
+
+    fn latest_continual_backprop_replacement_scale(events: &[serde_json::Value]) -> Option<f64> {
+        events.iter().rev().find_map(|event| {
+            (event.get("type").and_then(|value| value.as_str()) == Some("continual_backprop"))
+                .then(|| {
+                    event
+                        .get("replacement_rate_scale")
+                        .and_then(|value| value.as_f64())
+                })
+                .flatten()
+        })
+    }
+
+    fn latest_dynamics_control_max_replacements(events: &[serde_json::Value]) -> Option<usize> {
+        events.iter().rev().find_map(|event| {
+            (event.get("type").and_then(|value| value.as_str()) == Some("dynamics_control")
+                && event
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_recovery_mode))
+            .then(|| {
+                event
+                    .get("max_replacements_per_interval")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize)
+            })
+            .flatten()
+        })
+    }
+
+    fn is_recovery_mode(mode: &str) -> bool {
+        matches!(
+            mode,
+            "plasticity_recovery"
+                | "validation_recovery"
+                | "rollback_recovery"
+                | "hard_recovery"
+                | "hard_collapse"
+        )
+    }
+
+    fn latest_continual_backprop_max_replacements(events: &[serde_json::Value]) -> Option<usize> {
+        events.iter().rev().find_map(|event| {
+            (event.get("type").and_then(|value| value.as_str()) == Some("continual_backprop"))
+                .then(|| {
+                    event
+                        .get("effective_max_replacements_per_interval")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value as usize)
+                })
+                .flatten()
+        })
+    }
+
+    fn read_training_events(run_dir: &Path) -> Vec<serde_json::Value> {
+        let path = run_dir.join("events").join("training_events.jsonl");
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("training event json"))
+            .collect()
     }
 
     #[cfg(feature = "ddp")]

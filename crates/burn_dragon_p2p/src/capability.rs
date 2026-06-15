@@ -1,5 +1,7 @@
 #[cfg(all(not(feature = "native"), feature = "wasm-peer"))]
-use burn_dragon_core::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecutor};
+use burn_dragon_core::{
+    DragonConfig, SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor,
+};
 #[cfg(feature = "native")]
 use burn_dragon_language::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecutor};
 use burn_p2p::WorkloadTrainingBudget;
@@ -193,20 +195,49 @@ pub fn estimate_language_training_footprint(
     let block = block_size.max(1) as u64;
     let tokens = batch * block;
 
-    let embedding_params = 2 * vocab * embed;
-    let residual_params = 2 * embed * embed;
-    let projection_params = 4 * embed * embed + 6 * embed * latent_total;
+    let embedding_params = vocab * embed;
+    let output_head_params = vocab * embed;
+    let norm_params = 2 * embed + 2;
+    let shared_lowrank_params = 3 * embed * latent_total;
     let sequence_params = match model_config.sequence_kernel.memory_system {
-        SequenceMemorySystem::LinearAttention => 2 * heads * latent_per_head * embed,
+        SequenceMemorySystem::LinearAttention => 0,
         SequenceMemorySystem::Mamba3StateSpaceDuality => {
-            6 * embed * embed + 2 * embed * latent_total
+            let config = model_config.mamba.resolve(
+                model_config.n_embd,
+                model_config.sequence_kernel.memory_system,
+            );
+            let d_model = config.d_model as u64;
+            let d_inner = config.d_inner as u64;
+            let d_state = config.d_state as u64;
+            let nheads = config.nheads as u64;
+            let in_proj_dim = config.mamba3_in_proj_dim() as u64;
+            d_model * in_proj_dim
+                + d_inner * d_model
+                + nheads
+                + 2 * nheads * d_state
+                + 2 * d_state
+                + nheads
         }
         SequenceMemorySystem::GatedDeltaNet2 => {
-            heads * embed * embed + 3 * embed * latent_total + 4 * latent_total + heads * embed
+            let config = model_config.gated_deltanet2.resolve(
+                model_config.n_head,
+                model_config.n_embd,
+                model_config.latent_per_head(),
+            );
+            let max_latent_per_head = config.max_latent_per_head as u64;
+            let dense_dim = config.dense_dim as u64;
+            let gdn2_latent_total = heads * max_latent_per_head;
+            3 * dense_dim * gdn2_latent_total
+                + 3 * gdn2_latent_total
+                + heads * dense_dim * dense_dim
+                + heads * dense_dim
         }
     };
-    let parameter_count: u64 =
-        embedding_params + layers * (projection_params + residual_params + sequence_params);
+    let parameter_count: u64 = embedding_params
+        + output_head_params
+        + norm_params
+        + shared_lowrank_params
+        + sequence_params;
     let parameter_bytes = parameter_count.saturating_mul(4);
 
     let optimizer_state_bytes = match backend_class {
@@ -457,6 +488,10 @@ fn browser_trainer_memory_budget_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(not(feature = "native"), feature = "wasm-peer"))]
+    use burn_dragon_core::SequenceKernelConfig;
+    #[cfg(feature = "native")]
+    use burn_dragon_language::SequenceKernelConfig;
 
     #[test]
     fn estimated_training_footprint_scales_with_model_size() {
@@ -486,6 +521,45 @@ mod tests {
 
         assert!(larger_fp.estimated_training_bytes > tiny_fp.estimated_training_bytes);
         assert!(larger_fp.estimated_tokens_per_second < tiny_fp.estimated_tokens_per_second);
+    }
+
+    #[test]
+    fn estimated_training_footprint_counts_shared_layer_parameters_once() {
+        let shallow = DragonConfig {
+            n_layer: 2,
+            n_embd: 512,
+            n_head: 8,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 50_257,
+            sequence_kernel: SequenceKernelConfig::dense_score_short_context(),
+            ..DragonConfig::default()
+        };
+        let deep = DragonConfig {
+            n_layer: 8,
+            ..shallow.clone()
+        };
+
+        let shallow_fp = estimate_language_training_footprint(
+            &shallow,
+            6,
+            512,
+            DragonCapabilityClass::NativeCuda,
+        );
+        let deep_fp =
+            estimate_language_training_footprint(&deep, 6, 512, DragonCapabilityClass::NativeCuda);
+
+        let expected_parameter_count =
+            2 * 50_257_u64 * 512 + 3 * 512_u64 * 1024 + (2 * 512_u64 + 2);
+        assert_eq!(
+            deep_fp.estimated_parameter_bytes,
+            expected_parameter_count * 4
+        );
+        assert_eq!(
+            deep_fp.estimated_parameter_bytes,
+            shallow_fp.estimated_parameter_bytes
+        );
+        assert!(deep_fp.estimated_activation_bytes > shallow_fp.estimated_activation_bytes);
+        assert!(deep_fp.estimated_training_bytes > shallow_fp.estimated_training_bytes);
     }
 
     #[cfg(feature = "native")]

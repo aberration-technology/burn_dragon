@@ -17,7 +17,7 @@ use crate::ruliad::oracles::{
     RuliadSampleSpec, is_degenerate_spec, ruliad_categorical_presentation, ruliad_expected_answer,
     ruliad_prompt_prefix, sample_text, verify_spec,
 };
-use crate::ruliad::runtime::OnlineRuliadCorpus;
+use crate::ruliad::runtime::{OnlineRuliadCorpus, ruliad_serialized_node_count};
 use crate::ruliad::source_selection::{RuliadSourceBucket, ruliad_source_buckets};
 use crate::stats::SampleStats;
 
@@ -286,7 +286,7 @@ pub fn diagnose_config(
                 oracle_hash: Some(document.oracle_hash),
                 math_domains: document.math_domains,
                 reasoning_modes: document.reasoning_modes,
-                multi_chunk_document: document.serialized_preview.contains("[RTREE"),
+                multi_chunk_document: is_multi_chunk_document(&document.serialized_preview),
                 serialized_preview: Some(document.serialized_preview),
             });
         }
@@ -623,7 +623,7 @@ fn diagnose_samples(
             proof_trace_count += 1;
         }
         multi_chunk_document_count +=
-            usize::from(sample.multi_chunk_document || text.contains("[RTREE"));
+            usize::from(sample.multi_chunk_document || is_multi_chunk_document(&text));
         let view = ruliad_categorical_presentation(spec);
         categorical_core_count += usize::from(view.categorical_core);
     }
@@ -950,9 +950,14 @@ fn normalize_answer(value: &str) -> String {
     value
         .trim()
         .trim_end_matches("[/R2]")
+        .trim_end_matches("[/T]")
         .trim_end_matches("[/RTREE]")
         .trim()
         .to_string()
+}
+
+fn is_multi_chunk_document(text: &str) -> bool {
+    text.contains("[T ") || text.contains("[RTREE") || ruliad_serialized_node_count(text) > 1
 }
 
 fn parse_answer_pairs(value: &str) -> Option<BTreeMap<String, String>> {
@@ -964,15 +969,31 @@ fn parse_answer_pairs(value: &str) -> Option<BTreeMap<String, String>> {
         if key.is_empty() {
             return None;
         }
-        pairs.insert(key.to_string(), normalize_pair_value(value));
+        pairs.insert(
+            normalize_pair_key(key).to_string(),
+            normalize_pair_value(value),
+        );
     }
     (!pairs.is_empty()).then_some(pairs)
 }
 
+fn normalize_pair_key(value: &str) -> &str {
+    match value.trim() {
+        "accepted" => "acc",
+        "commutes" | "holds" => "ok",
+        "lhs" => "l",
+        "normal_form" => "nf",
+        "payload_hash" => "sha",
+        "rhs" => "r",
+        "target" => "x",
+        other => other,
+    }
+}
+
 fn normalize_pair_value(value: &str) -> String {
     match value.trim() {
-        "True" | "TRUE" => "true".to_string(),
-        "False" | "FALSE" => "false".to_string(),
+        "1" | "true" | "True" | "TRUE" => "1".to_string(),
+        "0" | "false" | "False" | "FALSE" => "0".to_string(),
         other => other.to_string(),
     }
 }
@@ -1069,6 +1090,11 @@ mod tests {
             "holds=true;lhs=1;rhs=1",
             "rhs=1;holds=TRUE;lhs=1"
         ));
+        assert!(ruliad_answers_semantic_match(
+            "ok=1;l=1;r=1",
+            "rhs=1;holds=TRUE;lhs=1"
+        ));
+        assert!(ruliad_answers_semantic_match("acc=0", "accepted=false"));
     }
 
     #[test]
@@ -1203,7 +1229,7 @@ mod tests {
             oracle_hash: Some(document.oracle_hash),
             math_domains: document.math_domains,
             reasoning_modes: document.reasoning_modes,
-            multi_chunk_document: document.serialized_preview.contains("[RTREE"),
+            multi_chunk_document: is_multi_chunk_document(&document.serialized_preview),
             serialized_preview: Some(document.serialized_preview),
         };
         let diagnostic = diagnose_samples(

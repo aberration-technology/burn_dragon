@@ -88,61 +88,73 @@ impl RuliadEpochSourcePlan {
 
 pub fn ruliad_source_buckets(config: &RuliadCorpusConfig) -> Vec<RuliadSourceBucket> {
     let mut buckets = Vec::new();
+    for difficulty_level in config.source_selection.difficulty_levels.min
+        ..=config.source_selection.difficulty_levels.max
+    {
+        buckets.extend(ruliad_source_buckets_for_difficulty(
+            config,
+            difficulty_level,
+        ));
+    }
+    buckets
+}
+
+pub fn ruliad_source_buckets_for_difficulty(
+    config: &RuliadCorpusConfig,
+    difficulty_level: usize,
+) -> Vec<RuliadSourceBucket> {
+    let mut buckets = Vec::new();
     for family in &config.families {
-        for difficulty_level in config.source_selection.difficulty_levels.min
-            ..=config.source_selection.difficulty_levels.max
-        {
-            let family_config = scale_family_for_difficulty(family, difficulty_level);
-            match family.kind {
-                RuliadFamilyKind::Eca => {
-                    add_eca_buckets(&mut buckets, &family_config, difficulty_level)
-                }
-                RuliadFamilyKind::Simulation => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::VerifySimulation,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::Automaton => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::EvaluateAutomaton,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::Rewrite => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::RewriteNormalForm,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::Algebra => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::CheckAlgebraLaw,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::Category => {
-                    add_category_buckets(&mut buckets, &family_config, difficulty_level)
-                }
-                RuliadFamilyKind::ProofTree => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::ProveTheorem,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::LeanTask => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::CompleteProof,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
-                RuliadFamilyKind::HashNoise => buckets.push(single_bucket(
-                    &family_config,
-                    RuliadTaskKind::HashCanary,
-                    family.weight as f32,
-                    difficulty_level,
-                )),
+        let family_config = scale_family_for_difficulty(family, difficulty_level);
+        match family.kind {
+            RuliadFamilyKind::Eca => {
+                add_eca_buckets(&mut buckets, &family_config, difficulty_level)
             }
+            RuliadFamilyKind::Simulation => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::VerifySimulation,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::Automaton => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::EvaluateAutomaton,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::Rewrite => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::RewriteNormalForm,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::Algebra => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::CheckAlgebraLaw,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::Category => {
+                add_category_buckets(&mut buckets, &family_config, difficulty_level)
+            }
+            RuliadFamilyKind::ProofTree => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::ProveTheorem,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::LeanTask => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::CompleteProof,
+                family.weight as f32,
+                difficulty_level,
+            )),
+            RuliadFamilyKind::HashNoise => buckets.push(single_bucket(
+                &family_config,
+                RuliadTaskKind::HashCanary,
+                family.weight as f32,
+                difficulty_level,
+            )),
         }
     }
     buckets
@@ -153,6 +165,26 @@ pub fn ruliad_sampler_candidates(config: &RuliadCorpusConfig) -> Vec<RuliadSampl
         .into_iter()
         .map(|bucket| bucket.to_sampler_candidate(config.source_selection.sampler))
         .collect()
+}
+
+pub fn ruliad_sampler_candidates_for_difficulty(
+    config: &RuliadCorpusConfig,
+    difficulty_level: usize,
+) -> Vec<RuliadSamplerCandidate> {
+    ruliad_source_buckets_for_difficulty(config, difficulty_level)
+        .into_iter()
+        .map(|bucket| bucket.to_sampler_candidate(config.source_selection.sampler))
+        .collect()
+}
+
+pub fn ruliad_source_bucket_by_label(
+    config: &RuliadCorpusConfig,
+    bucket_label: &str,
+) -> Option<RuliadSourceBucket> {
+    let difficulty_level = bucket_label_difficulty_level(bucket_label)?;
+    ruliad_source_buckets_for_difficulty(config, difficulty_level)
+        .into_iter()
+        .find(|bucket| bucket.label() == bucket_label)
 }
 
 pub fn plan_epoch_source_buckets(
@@ -292,6 +324,12 @@ fn family_config_hash(family: &RuliadFamilyConfig, task_kind: RuliadTaskKind) ->
         hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
     }
     hash
+}
+
+fn bucket_label_difficulty_level(bucket_label: &str) -> Option<usize> {
+    let (_, suffix) = bucket_label.split_once("@d")?;
+    let (level, _) = suffix.split_once('#')?;
+    level.parse().ok()
 }
 
 fn normalize_weights(weights: &mut [f32]) {
@@ -515,6 +553,25 @@ mod tests {
                     .to_sampler_candidate(RuliadSamplerConfig::default())
                     .cost
         );
+    }
+
+    #[test]
+    fn source_bucket_label_resolver_supports_dynamic_difficulty_levels() {
+        let config = config_with_eca_steps(2, 3);
+        let dynamic_label = ruliad_source_buckets_for_difficulty(&config, 7)
+            .into_iter()
+            .next()
+            .expect("dynamic bucket")
+            .label();
+        assert!(
+            ruliad_source_buckets(&config)
+                .iter()
+                .all(|bucket| bucket.label() != dynamic_label)
+        );
+        let resolved =
+            ruliad_source_bucket_by_label(&config, &dynamic_label).expect("resolved bucket");
+        assert_eq!(resolved.label(), dynamic_label);
+        assert_eq!(resolved.id.difficulty_level, 7);
     }
 
     #[test]

@@ -14,18 +14,28 @@ document_mode = "multi_chunk_proof_tree"
 document_chunks = { min = 4, max = 8 }
 
 [tokenization]
-type = "gpt2_byte_compatible"
-vocab_size = 50257
-eos_id = 50256
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
 
 [source_selection]
 enabled = true
 difficulty_levels = { min = 0, max = 24 }
 
+[source_selection.frontier_extension]
+enabled = true
+levels_per_extension = 8
+extend_when_normalized_difficulty_at_least = 0.88
+extend_when_max_difficulty_probability_at_least = 0.25
+max_materialized_levels = 4096
+
 [source_selection.sampler]
 exploration_floor = 0.005
 mastery_escape_weight = 4.0
 mastery_escape_threshold = 0.70
+mastery_min_normalized_difficulty = 0.90
+mastery_min_max_difficulty_probability = 0.35
+mastery_hash_noise_max_probability = 0.01
 
 [[families]]
 kind = "eca"

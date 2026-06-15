@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrainProfileSnapshot {
     pub dataloader_cpu_ns: u128,
+    pub dataloader_foreground_wait_ns: u128,
     pub dataloader_tensor_copy_ns: u128,
     pub dataloader_host_to_device_copy_bytes: u128,
     pub host_sync_points: u64,
@@ -28,6 +29,7 @@ pub struct TrainProfileSnapshot {
 #[derive(Clone, Copy, Debug, Default)]
 struct TrainProfileState {
     dataloader_cpu_ns: u128,
+    dataloader_foreground_wait_ns: u128,
     dataloader_tensor_copy_ns: u128,
     dataloader_host_to_device_copy_bytes: u128,
     host_sync_points: u64,
@@ -60,6 +62,36 @@ pub fn detail_enabled() -> bool {
     std::env::var_os("DragonModel_STAGE_PROFILE_DETAIL").is_some()
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+pub fn detail_interval_steps() -> usize {
+    env_usize("DragonModel_STAGE_PROFILE_DETAIL_EVERY").unwrap_or(64)
+}
+
+pub fn detail_max_steps() -> Option<usize> {
+    env_usize("DragonModel_STAGE_PROFILE_DETAIL_MAX_STEPS")
+}
+
+pub(crate) fn detail_due_for(
+    step_index: usize,
+    interval_steps: usize,
+    max_steps: Option<usize>,
+) -> bool {
+    if max_steps.is_some_and(|max_steps| step_index >= max_steps) {
+        return false;
+    }
+    step_index.is_multiple_of(interval_steps.max(1))
+}
+
+pub fn detail_due(step_index: usize) -> bool {
+    detail_enabled() && detail_due_for(step_index, detail_interval_steps(), detail_max_steps())
+}
+
 pub fn memory_enabled() -> bool {
     std::env::var_os("DragonModel_STAGE_PROFILE_MEMORY").is_some()
 }
@@ -84,6 +116,7 @@ pub fn snapshot() -> TrainProfileSnapshot {
     if let Ok(profile) = state().lock() {
         return TrainProfileSnapshot {
             dataloader_cpu_ns: profile.dataloader_cpu_ns,
+            dataloader_foreground_wait_ns: profile.dataloader_foreground_wait_ns,
             dataloader_tensor_copy_ns: profile.dataloader_tensor_copy_ns,
             dataloader_host_to_device_copy_bytes: profile.dataloader_host_to_device_copy_bytes,
             host_sync_points: profile.host_sync_points,
@@ -124,6 +157,14 @@ pub fn record_dataloader(
             .dataloader_host_to_device_copy_bytes
             .saturating_add(host_to_device_copy_bytes);
         profile.host_sync_points = profile.host_sync_points.saturating_add(host_sync_points);
+    });
+}
+
+pub fn record_dataloader_foreground_wait(wait_ns: u128) {
+    record(|profile| {
+        profile.dataloader_foreground_wait_ns = profile
+            .dataloader_foreground_wait_ns
+            .saturating_add(wait_ns);
     });
 }
 
@@ -196,4 +237,18 @@ pub fn record_detail_probe(
             .saturating_add(hidden_model_probe_ns);
         profile.detail_probe_steps = profile.detail_probe_steps.saturating_add(1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detail_due_for;
+
+    #[test]
+    fn detail_due_respects_interval_and_max_steps() {
+        assert!(detail_due_for(0, 64, None));
+        assert!(!detail_due_for(1, 64, None));
+        assert!(detail_due_for(64, 64, None));
+        assert!(!detail_due_for(64, 64, Some(64)));
+        assert!(detail_due_for(63, 1, Some(64)));
+    }
 }

@@ -25,6 +25,9 @@ pub struct ContinualBackpropTelemetry {
     pub replacement_count: usize,
     pub replacement_budget: f32,
     pub lr_multiplier: f32,
+    pub replacement_rate_scale: f32,
+    pub effective_replacement_rate: f32,
+    pub effective_max_replacements_per_interval: usize,
     pub paused: bool,
     pub pause_reason: Option<String>,
     pub utility_min: f32,
@@ -225,6 +228,8 @@ where
     pause_until_step: usize,
     pause_reason: Option<String>,
     cooldown_until_step: usize,
+    replacement_rate_scale: f32,
+    max_replacements_per_interval_override: Option<usize>,
     last_telemetry: Option<ContinualBackpropTelemetry>,
     _adapter: PhantomData<A>,
     module: PhantomData<M>,
@@ -327,6 +332,8 @@ where
             pause_until_step: 0,
             pause_reason: None,
             cooldown_until_step: 0,
+            replacement_rate_scale: 1.0,
+            max_replacements_per_interval_override: None,
             last_telemetry: None,
             _adapter: PhantomData,
             module: PhantomData,
@@ -471,6 +478,12 @@ where
             .into_vec::<f32>()
             .expect("cbp avg abs activation vec");
         let lr_multiplier = self.continual_backprop_lr_multiplier(lr, target_lr_scale);
+        let replacement_rate_scale = self.replacement_rate_scale.max(0.0);
+        let effective_replacement_rate = self.config.replacement_rate * replacement_rate_scale;
+        let effective_max_replacements_per_interval = self
+            .max_replacements_per_interval_override
+            .unwrap_or(self.config.max_replacements_per_interval)
+            .max(1);
         let eligible = age
             .iter()
             .enumerate()
@@ -483,6 +496,9 @@ where
             replacement_count: 0,
             replacement_budget: state.replacement_budget,
             lr_multiplier,
+            replacement_rate_scale,
+            effective_replacement_rate,
+            effective_max_replacements_per_interval,
             paused: false,
             pause_reason: None,
             utility_min: 0.0,
@@ -495,13 +511,15 @@ where
             zero_utility_fraction: 0.0,
         };
 
-        let paused_reason = if state.step <= self.config.warmup_steps {
+        let recovery_plasticity_active = self.recovery_plasticity_active();
+        let paused_reason = if !recovery_plasticity_active && state.step <= self.config.warmup_steps
+        {
             Some("warmup".to_string())
-        } else if state.step < self.pause_until_step {
+        } else if !recovery_plasticity_active && state.step < self.pause_until_step {
             self.pause_reason
                 .clone()
                 .or_else(|| Some("paused".to_string()))
-        } else if state.step < self.cooldown_until_step {
+        } else if !recovery_plasticity_active && state.step < self.cooldown_until_step {
             Some("cooldown".to_string())
         } else {
             None
@@ -517,7 +535,7 @@ where
         if eligible.is_empty() {
             return (Vec::new(), telemetry);
         }
-        state.replacement_budget += self.config.replacement_rate
+        state.replacement_budget += effective_replacement_rate
             * lr_multiplier
             * eligible.len() as f32
             * self.config.replace_interval_steps as f32;
@@ -552,7 +570,7 @@ where
                 / utility_values.len() as f32
         };
         let n_replace = (state.replacement_budget.floor() as usize)
-            .min(self.config.max_replacements_per_interval);
+            .min(effective_max_replacements_per_interval);
         if n_replace == 0 {
             return (Vec::new(), telemetry);
         }
@@ -568,6 +586,13 @@ where
         telemetry.replacement_count = selected.len();
         telemetry.replacement_budget = state.replacement_budget;
         (selected, telemetry)
+    }
+
+    fn recovery_plasticity_active(&self) -> bool {
+        self.replacement_rate_scale > 1.0 + f32::EPSILON
+            || self
+                .max_replacements_per_interval_override
+                .is_some_and(|max| max > self.config.max_replacements_per_interval)
     }
 
     fn reset_state_for_features(
@@ -768,6 +793,19 @@ where
         self.pause_reason = None;
     }
 
+    fn set_runtime_control(
+        &mut self,
+        replacement_rate_scale: f32,
+        max_replacements_per_interval: Option<usize>,
+    ) {
+        self.replacement_rate_scale = replacement_rate_scale.max(0.0);
+        self.max_replacements_per_interval_override = max_replacements_per_interval;
+    }
+
+    fn refresh_fresh_model(&mut self, fresh_model: A::FreshModel) {
+        self.fresh_model = fresh_model;
+    }
+
     fn latest_telemetry(&self) -> Option<ContinualBackpropTelemetry> {
         self.last_telemetry.clone()
     }
@@ -878,6 +916,22 @@ where
     pub fn clear_continual_backprop_pause(&mut self) {
         if let ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) = &mut self.kind {
             optimizer.clear_pause();
+        }
+    }
+
+    pub fn set_continual_backprop_runtime_control(
+        &mut self,
+        replacement_rate_scale: f32,
+        max_replacements_per_interval: Option<usize>,
+    ) {
+        if let ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) = &mut self.kind {
+            optimizer.set_runtime_control(replacement_rate_scale, max_replacements_per_interval);
+        }
+    }
+
+    pub fn refresh_continual_backprop_fresh_model(&mut self, fresh_model: A::FreshModel) {
+        if let ContinualBackpropOptimizerKind::ContinualBackprop(optimizer) = &mut self.kind {
+            optimizer.refresh_fresh_model(fresh_model);
         }
     }
 
@@ -1227,6 +1281,8 @@ mod tests {
             pause_until_step: 0,
             pause_reason: None,
             cooldown_until_step: 0,
+            replacement_rate_scale: 1.0,
+            max_replacements_per_interval_override: None,
             last_telemetry: None,
             _adapter: PhantomData,
             module: PhantomData,
@@ -1277,6 +1333,64 @@ mod tests {
         assert_eq!(telemetry.utility_max, 2.0);
         assert_eq!(telemetry.activation_abs_mean, 1.5);
         assert_eq!(telemetry.zero_utility_fraction, 0.0);
+    }
+
+    #[test]
+    fn runtime_control_scales_replacement_rate_without_pausing() {
+        let config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 0,
+            maturity_steps: 1,
+            cooldown_steps: 0,
+            replacement_rate: 2.0e-3,
+            replace_interval_steps: 256,
+            max_replacements_per_interval: 2,
+            ..ContinualBackpropConfig::default()
+        };
+        let mut optimizer = test_optimizer(config);
+        optimizer.set_runtime_control(3.0, Some(1));
+        let mut state = test_state(2048, 0.0);
+        let module = test_module();
+
+        let (selected, telemetry) =
+            optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert_eq!(telemetry.replacement_rate_scale, 3.0);
+        assert!((telemetry.effective_replacement_rate - 6.0e-3).abs() < 1.0e-8);
+        assert_eq!(telemetry.effective_max_replacements_per_interval, 1);
+        assert_eq!(telemetry.replacement_count, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(!telemetry.paused);
+    }
+
+    #[test]
+    fn recovery_runtime_control_bypasses_warmup_and_pause() {
+        let config = ContinualBackpropConfig {
+            enabled: true,
+            warmup_steps: 1_024,
+            maturity_steps: 1,
+            cooldown_steps: 512,
+            replacement_rate: 2.0e-3,
+            replace_interval_steps: 256,
+            max_replacements_per_interval: 1,
+            ..ContinualBackpropConfig::default()
+        };
+        let mut optimizer = test_optimizer(config);
+        optimizer.pause_for_steps(512, "validation_regression");
+        optimizer.cooldown_until_step = 1_024;
+        optimizer.set_runtime_control(2.0, Some(4));
+        let mut state = test_state(256, 0.0);
+        let module = test_module();
+
+        let (selected, telemetry) =
+            optimizer.select_features_to_replace(&module, &mut state, 1.0e-3, 1.0);
+
+        assert!(!telemetry.paused);
+        assert_eq!(telemetry.pause_reason, None);
+        assert_eq!(telemetry.replacement_rate_scale, 2.0);
+        assert_eq!(telemetry.effective_max_replacements_per_interval, 4);
+        assert_eq!(telemetry.replacement_count, 2);
+        assert_eq!(selected.len(), 2);
     }
 
     #[test]

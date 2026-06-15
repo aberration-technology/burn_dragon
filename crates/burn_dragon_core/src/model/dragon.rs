@@ -108,6 +108,8 @@ pub struct DragonModel<B: Backend> {
     vocab_size: usize,
     #[module(skip)]
     language_head: LanguageHeadRuntimeKind,
+    #[module(skip)]
+    tie_input_output_embeddings: bool,
     sequence_kernel: SequenceKernelConfig,
     rollout_fast_steps_per_slow_step: usize,
     kernel: FusedKernelConfig,
@@ -436,6 +438,10 @@ fn widen_upstream_gated_deltanet2_prefix<B: Backend>(
 }
 
 impl<B: Backend> DragonModel<B> {
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
     pub fn new(config: DragonConfig, device: &B::Device) -> Self {
         let initializer = DragonInitializer::new(&config.initialization);
         let embed = EmbeddingConfig::new(config.vocab_size, config.n_embd)
@@ -607,6 +613,7 @@ impl<B: Backend> DragonModel<B> {
             mlp_internal_dim_multiplier: config.mlp_internal_dim_multiplier,
             vocab_size: config.vocab_size,
             language_head,
+            tie_input_output_embeddings: config.tie_input_output_embeddings,
             sequence_kernel,
             rollout_fast_steps_per_slow_step: config.rollout_fast_steps_per_slow_step,
             kernel: config.fused_kernels,
@@ -708,6 +715,9 @@ impl<B: Backend> DragonModel<B> {
         }
         if self.language_head != fresh.language_head {
             return Err("widening cannot change language_head".to_string());
+        }
+        if self.tie_input_output_embeddings != fresh.tie_input_output_embeddings {
+            return Err("widening cannot change tie_input_output_embeddings".to_string());
         }
         if self.sequence_kernel != fresh.sequence_kernel {
             return Err(format!(
@@ -1826,15 +1836,19 @@ impl<B: Backend> DragonModel<B> {
         let prof_enabled = logits_projection_profile_enabled();
         let start = prof_enabled.then(Instant::now);
         let [batch, time, dim] = hidden.shape().dims();
-        let logits = hidden
-            .reshape([batch * time, dim])
-            .matmul(
-                self.lm_head
-                    .as_ref()
-                    .expect("flat language-model head weights missing")
-                    .val(),
-            )
-            .reshape([batch, time, self.vocab_size]);
+        let head = if self.tie_input_output_embeddings {
+            self.embed.weight.val().transpose()
+        } else {
+            self.lm_head
+                .as_ref()
+                .expect("flat language-model head weights missing")
+                .val()
+        };
+        let logits = hidden.reshape([batch * time, dim]).matmul(head).reshape([
+            batch,
+            time,
+            self.vocab_size,
+        ]);
         if let Some(start) = start {
             logits_projection_profile_record(start.elapsed().as_nanos());
         }
@@ -2005,6 +2019,59 @@ mod tests {
             .zip(rhs)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn tied_language_head_projects_with_input_embeddings() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.tie_input_output_embeddings = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let hidden = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..16).map(|value| value as f32 / 16.0).collect(),
+                [1, 1, 16],
+            ),
+            &device,
+        );
+        let logits = model.logits_from_hidden(hidden.clone());
+        let expected = hidden
+            .reshape([1, 16])
+            .matmul(model.embed.weight.val().transpose())
+            .reshape([1, 1, 32]);
+        let diff = max_abs_diff(tensor_values(logits), tensor_values(expected));
+        assert!(diff <= 1e-6, "tied logits drifted by {diff}");
+    }
+
+    #[test]
+    fn linear_attention_incremental_forward_matches_full_sequence() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::LinearAttention,
+        ));
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6], [1, 6]),
+            &device,
+        );
+
+        let full_logits = model.forward(tokens.clone());
+        let mut state = model.init_state();
+        let mut pieces = Vec::new();
+        for index in 0..6 {
+            let token = tokens.clone().slice([0..1, index..index + 1]);
+            pieces.push(model.forward_with_state(token, &mut state));
+        }
+        let incremental_logits = Tensor::cat(pieces, 1);
+        let diff = max_abs_diff(
+            tensor_values(full_logits),
+            tensor_values(incremental_logits),
+        );
+        assert!(
+            diff <= 1.0e-4,
+            "linear-attention incremental logits drifted from full sequence by {diff}"
+        );
+        assert_eq!(state.position, 6);
     }
 
     fn assert_widened_forward_matches_source(

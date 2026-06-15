@@ -10,7 +10,7 @@ use crate::manifest::{
     UniversalitySampleRecord, complexity_histogram, write_manifest, write_sample_records,
 };
 use crate::ruliad::config::RuliadCorpusConfig;
-use crate::ruliad::runtime::OnlineRuliadCorpus;
+use crate::ruliad::runtime::{OnlineRuliadCorpus, ruliad_serialized_node_count};
 use crate::stats::CorpusStats;
 
 #[derive(Debug, Clone)]
@@ -114,7 +114,7 @@ pub fn generate_ruliad_corpus(config: &RuliadCorpusConfig) -> Result<GeneratedRu
                 task_kind: Some(document.task_kind),
                 verifier_version: Some(document.verifier_version),
                 ruliad_document_mode: Some(config.serialization.document_mode.label().to_string()),
-                ruliad_node_count: Some(document.serialized_preview.matches("[R2 ").count()),
+                ruliad_node_count: Some(ruliad_serialized_node_count(&document.serialized_preview)),
                 math_domains: document.math_domains,
                 reasoning_modes: document.reasoning_modes,
             });

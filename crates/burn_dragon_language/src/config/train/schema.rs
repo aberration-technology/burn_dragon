@@ -317,6 +317,154 @@ impl Default for NeuronScalingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct CausalInputCorruptionConfig {
+    pub enabled: bool,
+    pub probability: f32,
+    pub warmup_steps: usize,
+    pub ramp_steps: usize,
+    pub replacement_token_id: Option<u32>,
+}
+
+impl Default for CausalInputCorruptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probability: 0.0,
+            warmup_steps: 0,
+            ramp_steps: 0,
+            replacement_token_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LogitEntropyFloorConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub target_entropy_bits: f32,
+    pub marginal_weight: f32,
+    pub target_marginal_entropy_bits: f32,
+    pub target_coverage_weight: f32,
+    pub target_coverage_epsilon: f32,
+    pub warmup_steps: usize,
+    pub ramp_steps: usize,
+    pub every_steps: usize,
+}
+
+impl Default for LogitEntropyFloorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.0,
+            target_entropy_bits: 0.0,
+            marginal_weight: 0.0,
+            target_marginal_entropy_bits: 0.0,
+            target_coverage_weight: 0.0,
+            target_coverage_epsilon: 1.0e-8,
+            warmup_steps: 0,
+            ramp_steps: 0,
+            every_steps: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RepeatUnlikelihoodConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub cycle_weight: f32,
+    pub cycle_margin_weight: f32,
+    pub cycle_margin: f32,
+    pub cycle_min_lag: usize,
+    pub cycle_max_lag: usize,
+    pub cycle_lags_per_step: usize,
+    pub warmup_steps: usize,
+    pub ramp_steps: usize,
+    pub every_steps: usize,
+    #[serde(default)]
+    pub history_lags: Vec<usize>,
+    pub epsilon: f32,
+}
+
+impl Default for RepeatUnlikelihoodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.0,
+            cycle_weight: 0.0,
+            cycle_margin_weight: 0.0,
+            cycle_margin: 0.0,
+            cycle_min_lag: 2,
+            cycle_max_lag: 64,
+            cycle_lags_per_step: 8,
+            warmup_steps: 0,
+            ramp_steps: 0,
+            every_steps: 1,
+            history_lags: Vec::new(),
+            epsilon: 1.0e-4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct GreedyRolloutUnlikelihoodConfig {
+    pub enabled: bool,
+    /// Run the expensive autoregressive rollout auxiliary only while dynamics is in a recovery
+    /// mode. This keeps stable training on the vectorized hot path while preserving stronger
+    /// anti-collapse pressure when the monitor detects output degeneracy.
+    pub recovery_only: bool,
+    pub weight: f32,
+    pub margin_weight: f32,
+    pub margin: f32,
+    pub recovery_weight: f32,
+    pub entropy_floor_weight: f32,
+    pub target_entropy_bits: f32,
+    pub cycle_weight: f32,
+    pub cycle_margin_weight: f32,
+    pub cycle_min_lag: usize,
+    pub cycle_max_lag: usize,
+    pub warmup_steps: usize,
+    pub ramp_steps: usize,
+    pub every_steps: usize,
+    pub prompt_tokens: usize,
+    pub rollout_tokens: usize,
+    pub history_tokens: usize,
+    pub batch_prompts: usize,
+    pub epsilon: f32,
+}
+
+impl Default for GreedyRolloutUnlikelihoodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            recovery_only: false,
+            weight: 0.0,
+            margin_weight: 0.0,
+            margin: 0.0,
+            recovery_weight: 0.0,
+            entropy_floor_weight: 0.0,
+            target_entropy_bits: 0.0,
+            cycle_weight: 0.0,
+            cycle_margin_weight: 0.0,
+            cycle_min_lag: 2,
+            cycle_max_lag: 64,
+            warmup_steps: 0,
+            ramp_steps: 0,
+            every_steps: 128,
+            prompt_tokens: 32,
+            rollout_tokens: 8,
+            history_tokens: 8,
+            batch_prompts: 1,
+            epsilon: 1.0e-4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
     pub block_size: usize,
     #[serde(default)]
@@ -357,6 +505,14 @@ pub struct TrainingHyperparameters {
     #[serde(default)]
     pub auto_batch_size: AutoBatchSizeConfig,
     #[serde(default)]
+    pub input_corruption: CausalInputCorruptionConfig,
+    #[serde(default)]
+    pub logit_entropy_floor: LogitEntropyFloorConfig,
+    #[serde(default)]
+    pub repeat_unlikelihood: RepeatUnlikelihoodConfig,
+    #[serde(default)]
+    pub greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig,
+    #[serde(default)]
     pub module_lr_scales: Vec<ModuleLrScaleEntry>,
     #[serde(default = "default_context_strategy")]
     pub context_strategy: ContextStrategyConfig,
@@ -370,6 +526,8 @@ pub struct TrainingHyperparameters {
     pub events: burn_dragon_train::TrainingEventsConfig,
     #[serde(default)]
     pub gates: burn_dragon_train::TrainingGatesConfig,
+    #[serde(default)]
+    pub dynamics: burn_dragon_train::train::events::DynamicsEquilibriumPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

@@ -71,6 +71,7 @@ pub struct ModelOverrides {
     pub n_head: Option<usize>,
     pub mlp_internal_dim_multiplier: Option<usize>,
     pub language_head: Option<LanguageHeadConfig>,
+    pub tie_input_output_embeddings: Option<bool>,
     #[serde(alias = "neuron_space_dim")]
     pub latent_total: Option<usize>,
     #[serde(alias = "init")]

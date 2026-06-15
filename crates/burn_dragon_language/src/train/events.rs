@@ -12,6 +12,7 @@ use burn_ecs::prelude::{
 
 use crate::config::TrainingHyperparameters;
 use crate::dataset::Dataset;
+use crate::train::dynamics::{DragonDynamicsControlPlugin, DragonDynamicsControlSlot};
 use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
 
 #[derive(Clone)]
@@ -57,6 +58,7 @@ pub fn build_training_event_handles(
     training: &TrainingHyperparameters,
     source_selection_dataset: Option<Arc<Dataset>>,
     neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
+    dynamics_control_slot: Option<DragonDynamicsControlSlot>,
 ) -> Result<TrainingEventHandles> {
     let interrupter = burn_train::Interrupter::new();
     let mut event_app = TrainingAppBuilder::new(TrainingAppConfig {
@@ -85,6 +87,17 @@ pub fn build_training_event_handles(
             current_latent_total,
             request_slot,
         ));
+    }
+
+    if training.dynamics.enabled {
+        event_app = event_app.with_plugin(
+            burn_dragon_train::train::events::DynamicsEquilibriumPlugin::new(
+                training.dynamics.clone(),
+            ),
+        );
+        if let Some(slot) = dynamics_control_slot {
+            event_app = event_app.with_plugin(DragonDynamicsControlPlugin::new(slot));
+        }
     }
 
     let event_thread = event_app.spawn_threaded()?;
@@ -151,10 +164,13 @@ fn record_ruliad_source_selection_from_loss(
             frontier_loss: snapshot.frontier_loss as f64,
             target_loss: snapshot.target_loss as f64,
             target_difficulty_score: snapshot.target_difficulty_score as f64,
+            max_difficulty_level: snapshot.max_difficulty_level,
             mean_difficulty_level: snapshot.mean_difficulty_level as f64,
             normalized_difficulty_score: snapshot.normalized_difficulty_score as f64,
             max_difficulty_probability: snapshot.max_difficulty_probability as f64,
             mastered_probability: snapshot.mastered_probability as f64,
+            frontier_extension_count: snapshot.frontier_extension_count,
+            frontier_saturated: snapshot.frontier_saturated,
             verifier_failures: snapshot.verifier_failures as u64,
         });
     }

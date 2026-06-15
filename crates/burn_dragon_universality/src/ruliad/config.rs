@@ -412,6 +412,18 @@ pub enum RuliadTokenizationConfig {
         #[serde(default = "default_gpt2_eos_id")]
         eos_id: Option<u32>,
     },
+    Symbolic {
+        #[serde(default = "default_ruliad_symbolic_vocab_size")]
+        vocab_size: usize,
+        #[serde(default = "default_ruliad_symbolic_eos_id")]
+        eos_id: Option<u32>,
+    },
+    StructuredSymbolic {
+        #[serde(default = "default_ruliad_structured_symbolic_vocab_size")]
+        vocab_size: usize,
+        #[serde(default = "default_ruliad_structured_symbolic_eos_id")]
+        eos_id: Option<u32>,
+    },
 }
 
 impl Default for RuliadTokenizationConfig {
@@ -424,6 +436,34 @@ impl Default for RuliadTokenizationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadFrontierExtensionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_frontier_levels_per_extension")]
+    pub levels_per_extension: usize,
+    #[serde(default = "default_frontier_extend_normalized_difficulty")]
+    pub extend_when_normalized_difficulty_at_least: f32,
+    #[serde(default = "default_frontier_extend_max_difficulty_probability")]
+    pub extend_when_max_difficulty_probability_at_least: f32,
+    #[serde(default = "default_frontier_max_materialized_levels")]
+    pub max_materialized_levels: usize,
+}
+
+impl Default for RuliadFrontierExtensionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            levels_per_extension: default_frontier_levels_per_extension(),
+            extend_when_normalized_difficulty_at_least:
+                default_frontier_extend_normalized_difficulty(),
+            extend_when_max_difficulty_probability_at_least:
+                default_frontier_extend_max_difficulty_probability(),
+            max_materialized_levels: default_frontier_max_materialized_levels(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSourceSelectionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -431,6 +471,10 @@ pub struct RuliadSourceSelectionConfig {
     pub sampler: RuliadSamplerConfig,
     #[serde(default = "default_difficulty_levels")]
     pub difficulty_levels: UsizeRangeConfig,
+    #[serde(default)]
+    pub frontier_extension: RuliadFrontierExtensionConfig,
+    #[serde(default)]
+    pub cold_start: RuliadSourceSelectionColdStartConfig,
 }
 
 impl Default for RuliadSourceSelectionConfig {
@@ -439,6 +483,31 @@ impl Default for RuliadSourceSelectionConfig {
             enabled: false,
             sampler: RuliadSamplerConfig::default(),
             difficulty_levels: default_difficulty_levels(),
+            frontier_extension: RuliadFrontierExtensionConfig::default(),
+            cold_start: RuliadSourceSelectionColdStartConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadSourceSelectionColdStartConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cold_start_max_difficulty_level")]
+    pub max_difficulty_level: usize,
+    #[serde(default = "default_cold_start_hold_steps")]
+    pub hold_steps: usize,
+    #[serde(default = "default_cold_start_ramp_steps")]
+    pub ramp_steps: usize,
+}
+
+impl Default for RuliadSourceSelectionColdStartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_difficulty_level: default_cold_start_max_difficulty_level(),
+            hold_steps: default_cold_start_hold_steps(),
+            ramp_steps: default_cold_start_ramp_steps(),
         }
     }
 }
@@ -494,6 +563,52 @@ impl RuliadCorpusConfig {
         self.source_selection
             .difficulty_levels
             .validate("source_selection.difficulty_levels")?;
+        if self.source_selection.cold_start.enabled {
+            if self.source_selection.cold_start.max_difficulty_level
+                < self.source_selection.difficulty_levels.min
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.max_difficulty_level must be >= source_selection.difficulty_levels.min"
+                ));
+            }
+            if self.source_selection.cold_start.ramp_steps == 0 {
+                return Err(anyhow!(
+                    "source_selection.cold_start.ramp_steps must be > 0 when cold_start is enabled"
+                ));
+            }
+        }
+        if self.source_selection.frontier_extension.enabled {
+            if self
+                .source_selection
+                .frontier_extension
+                .levels_per_extension
+                == 0
+            {
+                return Err(anyhow!(
+                    "source_selection.frontier_extension.levels_per_extension must be > 0"
+                ));
+            }
+            let normalized_threshold = self
+                .source_selection
+                .frontier_extension
+                .extend_when_normalized_difficulty_at_least;
+            if !normalized_threshold.is_finite() || !(0.0..=1.0).contains(&normalized_threshold) {
+                return Err(anyhow!(
+                    "source_selection.frontier_extension.extend_when_normalized_difficulty_at_least must be in [0, 1]"
+                ));
+            }
+            let max_probability_threshold = self
+                .source_selection
+                .frontier_extension
+                .extend_when_max_difficulty_probability_at_least;
+            if !max_probability_threshold.is_finite()
+                || !(0.0..=1.0).contains(&max_probability_threshold)
+            {
+                return Err(anyhow!(
+                    "source_selection.frontier_extension.extend_when_max_difficulty_probability_at_least must be in [0, 1]"
+                ));
+            }
+        }
         if self.families.is_empty() {
             return Err(anyhow!("families must not be empty"));
         }
@@ -524,6 +639,35 @@ impl RuliadCorpusConfig {
                 if matches!(eos_id, Some(id) if *id as usize >= *vocab_size) {
                     return Err(anyhow!(
                         "tokenization.eos_id must be < tokenization.vocab_size"
+                    ));
+                }
+            }
+            RuliadTokenizationConfig::Symbolic { vocab_size, eos_id } => {
+                if *vocab_size < 512 {
+                    return Err(anyhow!(
+                        "tokenization.vocab_size must be >= 512 for symbolic"
+                    ));
+                }
+                if matches!(eos_id, Some(id) if *id as usize >= *vocab_size) {
+                    return Err(anyhow!(
+                        "tokenization.eos_id must be < tokenization.vocab_size"
+                    ));
+                }
+            }
+            RuliadTokenizationConfig::StructuredSymbolic { vocab_size, eos_id } => {
+                if *vocab_size < 272 {
+                    return Err(anyhow!(
+                        "tokenization.vocab_size must be >= 272 for structured_symbolic"
+                    ));
+                }
+                if matches!(eos_id, Some(id) if *id as usize >= *vocab_size) {
+                    return Err(anyhow!(
+                        "tokenization.eos_id must be < tokenization.vocab_size"
+                    ));
+                }
+                if matches!(eos_id, Some(id) if *id < 271) {
+                    return Err(anyhow!(
+                        "tokenization.eos_id must not collide with structured_symbolic byte, structural, or class tokens"
                     ));
                 }
             }
@@ -665,6 +809,34 @@ fn default_difficulty_levels() -> UsizeRangeConfig {
     UsizeRangeConfig { min: 0, max: 0 }
 }
 
+fn default_cold_start_max_difficulty_level() -> usize {
+    2
+}
+
+fn default_cold_start_hold_steps() -> usize {
+    1024
+}
+
+fn default_cold_start_ramp_steps() -> usize {
+    8192
+}
+
+fn default_frontier_levels_per_extension() -> usize {
+    8
+}
+
+fn default_frontier_extend_normalized_difficulty() -> f32 {
+    0.88
+}
+
+fn default_frontier_extend_max_difficulty_probability() -> f32 {
+    0.25
+}
+
+fn default_frontier_max_materialized_levels() -> usize {
+    4096
+}
+
 fn default_chunk_token_capacity() -> usize {
     1_048_576
 }
@@ -675,6 +847,22 @@ fn default_gpt2_vocab_size() -> usize {
 
 fn default_gpt2_eos_id() -> Option<u32> {
     Some(50_256)
+}
+
+fn default_ruliad_symbolic_vocab_size() -> usize {
+    4097
+}
+
+fn default_ruliad_symbolic_eos_id() -> Option<u32> {
+    Some(4096)
+}
+
+fn default_ruliad_structured_symbolic_vocab_size() -> usize {
+    272
+}
+
+fn default_ruliad_structured_symbolic_eos_id() -> Option<u32> {
+    Some(271)
 }
 
 #[cfg(test)]

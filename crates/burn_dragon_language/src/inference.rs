@@ -35,6 +35,9 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(language_head) = &overrides.language_head {
         model_config.language_head = language_head.clone();
     }
+    if let Some(tie_input_output_embeddings) = overrides.tie_input_output_embeddings {
+        model_config.tie_input_output_embeddings = tie_input_output_embeddings;
+    }
     if let Some(latent_total) = overrides.latent_total {
         assert!(
             latent_total % model_config.n_embd == 0,
@@ -194,6 +197,13 @@ pub fn build_model_config_with_tokenizer(
         .language_head
         .validate_for_vocab_size(model_config.vocab_size)
         .unwrap_or_else(|message| panic!("invalid language_head config: {message}"));
+    if model_config.tie_input_output_embeddings
+        && !model_config.language_head.uses_flat_token_logits()
+    {
+        anyhow::bail!(
+            "model.tie_input_output_embeddings requires language_head.type=\"standard_token_classification\""
+        );
+    }
     Ok(model_config)
 }
 

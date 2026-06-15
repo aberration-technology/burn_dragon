@@ -140,12 +140,12 @@ fn generated_category_task_fields(
                 rhs,
                 proof_steps: vec![
                     format!(
-                        "assoc_left:{} then {}",
+                        "al:{}>{}",
                         morphism_name(&category.morphisms, fg),
                         morphism_name(&category.morphisms, lhs)
                     ),
                     format!(
-                        "assoc_right:{} then {}",
+                        "ar:{}>{}",
                         morphism_name(&category.morphisms, gh),
                         morphism_name(&category.morphisms, rhs)
                     ),
@@ -210,13 +210,13 @@ fn generated_category_task_fields(
                 rhs,
                 proof_steps: vec![
                     format!(
-                        "left=F({}) after eta_o{}={}",
+                        "L=F({})@e{}={}",
                         morphism_name(&category.morphisms, source_morphism),
                         source,
                         morphism_name(&category.morphisms, lhs)
                     ),
                     format!(
-                        "right=eta_o{} after {}={}",
+                        "R=e{}@{}={}",
                         target,
                         morphism_name(&category.morphisms, source_morphism),
                         morphism_name(&category.morphisms, rhs)

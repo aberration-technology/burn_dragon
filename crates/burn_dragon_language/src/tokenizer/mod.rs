@@ -110,4 +110,9 @@ impl TokenizerConfig {
     pub fn kind_name(&self) -> &'static str {
         "pretokenized"
     }
+
+    pub fn vocab_size(&self) -> usize {
+        let TokenizerKind::Pretokenized(config) = &self.kind;
+        config.vocab_size
+    }
 }

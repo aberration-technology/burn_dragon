@@ -632,6 +632,8 @@ pub struct DragonConfig {
     pub vocab_size: usize,
     #[serde(default)]
     pub language_head: LanguageHeadConfig,
+    #[serde(default)]
+    pub tie_input_output_embeddings: bool,
     /// Number of fast internal recurrent updates to run before each slow token emission.
     /// Valid values: 1, 2, 4, 8, 16.
     pub rollout_fast_steps_per_slow_step: usize,
@@ -665,6 +667,7 @@ impl Default for DragonConfig {
             n_expert: 1,
             vocab_size: 256,
             language_head: LanguageHeadConfig::default(),
+            tie_input_output_embeddings: false,
             rollout_fast_steps_per_slow_step: 1,
             fused_kernels: FusedKernelConfig::default(),
             normalization: DragonNormConfig::default(),

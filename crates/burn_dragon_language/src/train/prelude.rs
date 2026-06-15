@@ -51,10 +51,12 @@ pub(crate) use burn_cuda::Cuda;
 pub(crate) use serde::Serialize;
 
 pub(crate) use crate::config::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
+    CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
+    GreedyRolloutUnlikelihoodConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
+    LogitEntropyFloorConfig, RepeatUnlikelihoodConfig, RepromptTruncation, SdftObjectiveConfig,
+    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
+    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    ValidationDatasetConfig,
 };
 pub(crate) use crate::dataset::{
     Dataset, DatasetSplit, RandomDataLoader, SequenceBatch, StreamingDataLoader, build_dataset,

@@ -6,8 +6,8 @@ use burn_dragon_core::{
     objective::validate_training_objective_config,
 };
 use burn_dragon_train::{
-    LearningRateScheduleConfig, ParallelismKind, PipelineCommunicationKind, PipelineScheduleKind,
-    TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
+    LearningRateScheduleConfig, OptimizerKind, ParallelismKind, PipelineCommunicationKind,
+    PipelineScheduleKind, TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
 };
 
 use super::{DatasetSourceConfig, TrainingConfig};
@@ -1252,6 +1252,53 @@ impl TrainingConfig {
             return Err(anyhow!("training.epochs must be > 0"));
         }
         self.optimizer.validate()?;
+        if matches!(self.optimizer.name, OptimizerKind::Eggroll) {
+            if self.optimizer.eggroll.gradient_learning_rate.is_some() {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not support optimizer.eggroll.gradient_learning_rate; choose pure EGGROLL or optimizer.name=adamw"
+                ));
+            }
+            if self.optimizer.eggroll.gradient_weight_decay.is_some() {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not support optimizer.eggroll.gradient_weight_decay; choose pure EGGROLL or optimizer.name=adamw"
+                ));
+            }
+            if self.parallel.mode != ParallelismKind::Single {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll currently requires parallel.mode=single"
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support parallel.pipeline.enabled"
+                ));
+            }
+            if self.training.gradient_accumulation_steps != 1 {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll currently requires training.gradient_accumulation_steps = 1"
+                ));
+            }
+            if self.training.continual_backprop.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support training.continual_backprop.enabled"
+                ));
+            }
+            if self.training.neuron_scaling.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support training.neuron_scaling.enabled"
+                ));
+            }
+            if self.training.tbptt_persist_across_steps {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support training.tbptt_persist_across_steps"
+                ));
+            }
+            if !self.training.objective.is_next_token() {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll currently supports only the next-token training objective"
+                ));
+            }
+        }
         if !(0.0 < self.dataset.train_split_ratio && self.dataset.train_split_ratio <= 1.0) {
             return Err(anyhow!(
                 "dataset.train_split_ratio must be in (0, 1] (got {})",
@@ -1847,6 +1894,7 @@ impl TrainingConfig {
 mod tests {
     use super::*;
     use crate::config::TrainingObjectiveConfig;
+    use burn_dragon_train::OptimizerKind;
 
     fn parse_config(extra_training: &str) -> TrainingConfig {
         let toml = format!(
@@ -1879,6 +1927,73 @@ prompt = ""
         let config = parse_config("");
         assert!(config.training.objective.is_next_token());
         config.validate().expect("default objective validates");
+    }
+
+    #[test]
+    fn eggroll_optimizer_config_validates_for_single_next_token_training() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.optimizer.eggroll.population.population_size = 2;
+        config.optimizer.eggroll.population.population_chunk_size = 2;
+        config
+            .validate()
+            .expect("minimal single-device EGGROLL config should validate");
+    }
+
+    #[test]
+    fn eggroll_optimizer_rejects_gradient_accumulation() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.training.gradient_accumulation_steps = 2;
+        let err = config
+            .validate()
+            .expect_err("EGGROLL gradient accumulation should fail");
+        assert!(
+            err.to_string().contains("gradient_accumulation_steps = 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn eggroll_optimizer_rejects_gradient_correction() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.optimizer.eggroll.gradient_learning_rate = Some(1.0e-3);
+        let err = config
+            .validate()
+            .expect_err("EGGROLL gradient correction should fail");
+        assert!(
+            err.to_string().contains("gradient_learning_rate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn eggroll_optimizer_rejects_continual_backprop() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.training.continual_backprop.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("EGGROLL continual backprop should fail");
+        assert!(
+            err.to_string().contains("continual_backprop.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn eggroll_optimizer_rejects_neuron_scaling() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.training.neuron_scaling.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("EGGROLL neuron scaling should fail");
+        assert!(
+            err.to_string().contains("neuron_scaling.enabled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

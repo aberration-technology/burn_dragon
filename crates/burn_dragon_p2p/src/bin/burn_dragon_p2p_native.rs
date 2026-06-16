@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn_autodiff::Autodiff;
 use burn_dragon_language::{TrainingConfig, load_training_config, train};
 use burn_dragon_p2p::admin::{
@@ -2283,13 +2283,37 @@ fn train_local(args: TrainLocalArgs) -> Result<()> {
         config.training.block_size,
     );
     match args.backend {
-        BackendArg::Cpu => train_local_backend::<Autodiff<NdArray<f32>>>(&config, "cpu"),
+        BackendArg::Cpu => {
+            if train::optimizer_uses_forward_only_eggroll(&config) {
+                train_local_backend_forward_eggroll::<NdArray<f32>>(&config, "cpu")
+            } else {
+                train_local_backend::<Autodiff<NdArray<f32>>>(&config, "cpu")
+            }
+        }
         #[cfg(feature = "wgpu")]
-        BackendArg::Wgpu => train_local_backend::<Autodiff<burn_wgpu::Wgpu<f32>>>(&config, "wgpu"),
+        BackendArg::Wgpu => {
+            if train::optimizer_uses_forward_only_eggroll(&config) {
+                train_local_backend_forward_eggroll::<burn_wgpu::Wgpu<f32>>(&config, "wgpu")
+            } else {
+                train_local_backend::<Autodiff<burn_wgpu::Wgpu<f32>>>(&config, "wgpu")
+            }
+        }
         #[cfg(feature = "cuda")]
-        BackendArg::Cuda => train_local_backend::<Autodiff<burn_cuda::Cuda<f32>>>(&config, "cuda"),
+        BackendArg::Cuda => {
+            if train::optimizer_uses_forward_only_eggroll(&config) {
+                train_local_backend_forward_eggroll::<burn_cuda::Cuda<f32>>(&config, "cuda")
+            } else {
+                train_local_backend::<Autodiff<burn_cuda::Cuda<f32>>>(&config, "cuda")
+            }
+        }
         #[cfg(feature = "rocm")]
-        BackendArg::Rocm => train_local_backend::<Autodiff<burn_rocm::Rocm<f32>>>(&config, "rocm"),
+        BackendArg::Rocm => {
+            if train::optimizer_uses_forward_only_eggroll(&config) {
+                train_local_backend_forward_eggroll::<burn_rocm::Rocm<f32>>(&config, "rocm")
+            } else {
+                train_local_backend::<Autodiff<burn_rocm::Rocm<f32>>>(&config, "rocm")
+            }
+        }
         #[cfg(not(feature = "wgpu"))]
         BackendArg::Wgpu => bail!("this binary was built without the `wgpu` feature"),
         #[cfg(not(feature = "cuda"))]
@@ -2355,10 +2379,22 @@ fn set_process_env(key: &str, value: &str) {
 fn train_local_backend<B>(config: &TrainingConfig, backend_label: &str) -> Result<()>
 where
     B: AutodiffBackend + Clone + 'static,
-    B::Device: Clone,
+    B::Device: Clone + 'static,
 {
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
     train::train_backend::<B, _>(config, dataset, backend_label, |_| {})
+}
+
+fn train_local_backend_forward_eggroll<B>(
+    config: &TrainingConfig,
+    backend_label: &str,
+) -> Result<()>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone + 'static,
+{
+    let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
+    train::train_backend_forward_eggroll::<B, _>(config, dataset, backend_label, |_| {})
 }
 
 fn train_window_once(args: TrainWindowOnceArgs) -> Result<()> {

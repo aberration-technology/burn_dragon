@@ -61,7 +61,12 @@ where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
 {
-    Ok(ResolvedOptimizer::AdamW(
-        adamw_config_from_optimizer(optimizer_cfg).init::<B, M>(),
-    ))
+    match optimizer_cfg.name {
+        OptimizerKind::Adamw => Ok(ResolvedOptimizer::AdamW(
+            adamw_config_from_optimizer(optimizer_cfg).init::<B, M>(),
+        )),
+        OptimizerKind::Eggroll => Err(anyhow!(
+            "optimizer.name=eggroll uses the EGGROLL evolution-strategy training path, not the Burn gradient optimizer resolver"
+        )),
+    }
 }

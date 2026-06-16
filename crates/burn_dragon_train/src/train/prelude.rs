@@ -65,7 +65,8 @@ pub(crate) use burn::record::{BinFileRecorder, FullPrecisionSettings, Record};
 pub(crate) use crate::wgpu::init_runtime;
 pub(crate) use crate::{
     ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget, GdpoHardGate,
-    LearningRateScheduleConfig, OptimizerConfig, VisionArtifactOutputMode, VisionTeacherVariant,
+    LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, VisionArtifactOutputMode,
+    VisionTeacherVariant,
 };
 pub(crate) use serde::Serialize;
 

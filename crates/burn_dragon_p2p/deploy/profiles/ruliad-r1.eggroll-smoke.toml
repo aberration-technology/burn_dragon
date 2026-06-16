@@ -1,0 +1,63 @@
+[training]
+max_iters = 4
+checkpoint_interval_iters = 4
+log_frequency = 1
+batch_size = 8
+
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 4
+max_batch_size = 16
+max_probe_batch_size = 8
+probe_steps = 1
+target_device_memory_mb = 60000
+binary_search = true
+recompute_on_neuron_scale = false
+max_system_memory_fraction = 0.9
+probe_safety_margin = 1.15
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.dynamics]
+enabled = false
+
+[optimizer]
+name = "eggroll"
+learning_rate = 0.01
+weight_decay = 0.0
+
+[optimizer.eggroll]
+sigma = 0.0025
+sigma_decay = 1.0
+interval_steps = 1
+fitness_normalization = "rank"
+coefficient_clip = 128.0
+
+[optimizer.eggroll.population]
+population_size = 64
+population_chunk_size = 64
+rank = 1
+seed = 1337
+
+[optimizer.eggroll.update]
+kind = "sgd"
+learning_rate = 0.01
+weight_decay = 0.0
+max_delta_rms = 0.02
+
+[optimizer.eggroll_auto_population]
+enabled = true
+min_population_size = 64
+max_population_size = 512
+population_per_batch = 32
+population_chunk_size = 64
+prefer_power_of_two = true
+
+[optimizer.eggroll_auto_population.chunk_autotune]
+enabled = true
+candidates = [32, 64, 128]
+max_probe_population_size = 128

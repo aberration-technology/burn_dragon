@@ -36,6 +36,7 @@ train = [
   "dep:memmap2",
   "dep:tempfile",
   "dep:burn_dragon_universality",
+  "dep:burn_dragon_eggroll",
   "dep:burn_ecs",
 ]
 rerun = ["train", "dep:rerun", "dep:urlencoding"]
@@ -47,6 +48,7 @@ web = ["burn_dragon_core/web"]
 anyhow.workspace = true
 burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
 burn_ecs = { workspace = true, optional = true }
+burn_eggroll.workspace = true
 burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true, features = ["std"] }
@@ -54,6 +56,7 @@ burn-ndarray = { workspace = true, optional = true }
 burn-train = { workspace = true, optional = true }
 burn_dragon_checkpoint = { workspace = true, default-features = false, optional = true }
 burn_dragon_core = { workspace = true, default-features = false }
+burn_dragon_eggroll = { workspace = true, default-features = false, optional = true }
 burn_dragon_time.workspace = true
 burn_dragon_tokenizer.workspace = true
 burn_dragon_train = { workspace = true, default-features = false, optional = true }
@@ -90,6 +93,11 @@ required-features = ["train"]
 
 [[bench]]
 name = "universality_loader"
+harness = false
+required-features = ["train"]
+
+[[bench]]
+name = "optimizer_dynamics"
 harness = false
 required-features = ["train"]
 

@@ -322,6 +322,44 @@ where
     pub valid_steps: usize,
 }
 
+pub struct ForwardEggrollTrainEnvironment<'a, B>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    pub parallel_runtime: &'a ParallelRuntime,
+    pub run_dir: &'a Path,
+    pub run_name: &'a str,
+    pub backend_name: &'a str,
+    pub training: &'a TrainingHyperparameters,
+    pub resume_checkpoint_epoch: Option<usize>,
+    pub model_config: &'a DragonConfig,
+    pub device: &'a B::Device,
+    pub train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
+    pub valid_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>>,
+    pub source_selection_dataset: Option<Arc<Dataset>>,
+    pub summary_event_token_ids: Option<Vec<u32>>,
+    pub epochs: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct EggrollChunkAutotuneCandidateReport {
+    pub population_chunk_size: usize,
+    pub evaluated_population_size: usize,
+    pub elapsed_ms: f64,
+    pub forward_evaluations_per_second: f64,
+    pub mean_loss: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct EggrollChunkAutotuneReport {
+    pub selected_population_chunk_size: usize,
+    pub configured_population_chunk_size: usize,
+    pub population_size: usize,
+    pub max_probe_population_size: usize,
+    pub candidates: Vec<EggrollChunkAutotuneCandidateReport>,
+}
+
 pub(crate) fn train_with_scheduler<B, O, S>(
     env: &TrainEnvironment<'_, B>,
     model: LanguageTrainModel<B>,
@@ -438,6 +476,529 @@ where
     );
 
     Ok(model.model)
+}
+
+pub(crate) fn autotune_eggroll_population_chunk_size<B>(
+    optimizer_cfg: &OptimizerConfig,
+    model: &LanguageTrainModel<B>,
+    train_loader: &Arc<dyn DataLoader<B, SequenceBatch<B>>>,
+) -> Result<Option<EggrollChunkAutotuneReport>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    if !matches!(optimizer_cfg.name, OptimizerKind::Eggroll)
+        || !optimizer_cfg.eggroll_auto_population.enabled
+        || !optimizer_cfg.eggroll_auto_population.chunk_autotune.enabled
+    {
+        return Ok(None);
+    }
+
+    let Some(batch) = train_loader.iter().next() else {
+        return Ok(None);
+    };
+    let eggroll = optimizer_cfg.effective_eggroll_config();
+    let candidates = resolve_eggroll_chunk_autotune_candidates(optimizer_cfg);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut reports = Vec::with_capacity(candidates.len());
+    for population_chunk_size in candidates {
+        let report = measure_eggroll_chunk_candidate(
+            model,
+            batch.clone(),
+            &eggroll,
+            population_chunk_size,
+            optimizer_cfg
+                .eggroll_auto_population
+                .chunk_autotune
+                .max_probe_population_size,
+        );
+        reports.push(report);
+    }
+    let Some(selected) = reports
+        .iter()
+        .filter(|report| {
+            report.forward_evaluations_per_second.is_finite()
+                && report.forward_evaluations_per_second > 0.0
+                && report.mean_loss.is_finite()
+        })
+        .max_by(|left, right| {
+            left.forward_evaluations_per_second
+                .partial_cmp(&right.forward_evaluations_per_second)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(EggrollChunkAutotuneReport {
+        selected_population_chunk_size: selected.population_chunk_size,
+        configured_population_chunk_size: eggroll.population.population_chunk_size,
+        population_size: eggroll.population.population_size,
+        max_probe_population_size: optimizer_cfg
+            .eggroll_auto_population
+            .chunk_autotune
+            .max_probe_population_size,
+        candidates: reports,
+    }))
+}
+
+pub(crate) fn train_with_eggroll_forward_only<B>(
+    env: &ForwardEggrollTrainEnvironment<'_, B>,
+    optimizer_cfg: &OptimizerConfig,
+    mut model: LanguageTrainModel<B>,
+) -> Result<DragonModel<B>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    fs::create_dir_all(env.run_dir)?;
+    let eggroll = optimizer_cfg.effective_eggroll_config();
+
+    let source_selection_dataset = env.source_selection_dataset.as_ref().cloned();
+    let event_handles = crate::train::events::build_training_event_handles(
+        env.run_name,
+        env.run_dir,
+        env.train_loader.num_items(),
+        env.training,
+        source_selection_dataset,
+        None,
+        None,
+    )?;
+    let bus = event_handles.metric_logger.bus();
+    let emit_step_events = env.training.events.persist_step_events;
+    let steps_per_epoch = env.train_loader.num_items().max(1);
+    let start_epoch = env
+        .resume_checkpoint_epoch
+        .map(|epoch| epoch + 1)
+        .unwrap_or(1);
+    if let Some(epoch) = env.resume_checkpoint_epoch {
+        model.model =
+            load_dragon_model_checkpoint(env.run_dir, epoch, env.model_config, env.device)?;
+        info!(
+            "EGGROLL forward-only resumed model checkpoint epoch={} with fresh optimizer state",
+            epoch
+        );
+    }
+
+    let pair_count = eggroll.population.pair_count().max(1);
+    let chunk_pair_count = (eggroll.population.population_chunk_size.max(2) / 2)
+        .max(1)
+        .min(pair_count);
+    let mut optimizer_state = burn_dragon_eggroll::EggrollModuleOptimizerState::<B>::new();
+    let mut best_valid_loss: Option<f64> = None;
+    let mut best_valid_epoch: Option<usize> = None;
+
+    info!(
+        "training strategy: mode={:?} optimizer=eggroll backend_mode=forward_only population_size={} pair_count={} population_chunk_size={} chunk_pair_count={} rank={} sigma={} interval_steps={} start_epoch={}",
+        env.parallel_runtime.mode,
+        eggroll.population.population_size,
+        pair_count,
+        eggroll.population.population_chunk_size,
+        chunk_pair_count,
+        eggroll.population.rank,
+        eggroll.sigma,
+        eggroll.interval_steps,
+        start_epoch
+    );
+
+    for epoch in start_epoch..=env.epochs {
+        if event_handles.interrupter.should_stop() {
+            let reason = event_handles
+                .interrupter
+                .get_message()
+                .unwrap_or_else(|| "training interrupted".to_string());
+            info!("Training interrupted: {reason}");
+            break;
+        }
+
+        let mut iterator = env.train_loader.iter();
+        let mut iteration = 0usize;
+        while let Some(batch) = iterator.next() {
+            iteration += 1;
+            let absolute_step = epoch
+                .saturating_sub(1)
+                .saturating_mul(steps_per_epoch)
+                .saturating_add(iteration.saturating_sub(1));
+            if emit_step_events {
+                let _ = bus.send_step_started(StepStarted {
+                    run_id: env.run_name.to_string(),
+                    absolute_step,
+                    epoch,
+                });
+            }
+
+            let eggroll_step_active = absolute_step.is_multiple_of(eggroll.interval_steps.max(1));
+            let (mean_train_loss, metrics, eggroll_step_elapsed_ms) = if eggroll_step_active {
+                let eggroll_step_start = burn_dragon_time::Instant::now();
+                let mut losses = Vec::with_capacity(pair_count * 2);
+                let mut fitness = Vec::with_capacity(pair_count);
+                for chunk_start in (0..pair_count).step_by(chunk_pair_count) {
+                    let chunk_end = chunk_start.saturating_add(chunk_pair_count).min(pair_count);
+                    let pairs_in_chunk = chunk_end.saturating_sub(chunk_start);
+                    let mut chunk_loss_tensors = Vec::with_capacity(pairs_in_chunk * 2);
+                    for pair_index in chunk_start..chunk_end {
+                        let plus_model = burn_dragon_eggroll::perturb_module::<B, _>(
+                            model.clone(),
+                            &eggroll,
+                            absolute_step as u64,
+                            pair_index as u64,
+                            burn_eggroll::AntitheticSign::Plus,
+                        );
+                        let minus_model = burn_dragon_eggroll::perturb_module::<B, _>(
+                            model.clone(),
+                            &eggroll,
+                            absolute_step as u64,
+                            pair_index as u64,
+                            burn_eggroll::AntitheticSign::Minus,
+                        );
+                        chunk_loss_tensors
+                            .push(eggroll_batch_loss_tensor(&plus_model, batch.clone()));
+                        chunk_loss_tensors
+                            .push(eggroll_batch_loss_tensor(&minus_model, batch.clone()));
+                    }
+
+                    let chunk_losses = scalar_values_from_loss_tensors(chunk_loss_tensors);
+                    for (offset, pair_index) in (chunk_start..chunk_end).enumerate() {
+                        let plus_loss = chunk_losses[offset * 2];
+                        let minus_loss = chunk_losses[offset * 2 + 1];
+                        losses.push(plus_loss);
+                        losses.push(minus_loss);
+                        fitness.push(burn_dragon_eggroll::AntitheticFitness {
+                            pair_index: pair_index as u64,
+                            plus: -(plus_loss as f32),
+                            minus: -(minus_loss as f32),
+                        });
+                    }
+                }
+
+                let mean_train_loss = if losses.is_empty() {
+                    f64::NAN
+                } else {
+                    losses.iter().sum::<f64>() / losses.len() as f64
+                };
+                let (updated, metrics) = burn_dragon_eggroll::apply_antithetic_update(
+                    model,
+                    &eggroll,
+                    absolute_step as u64,
+                    &fitness,
+                    &mut optimizer_state,
+                )?;
+                model = updated;
+                (
+                    mean_train_loss,
+                    Some(metrics),
+                    Some(eggroll_step_start.elapsed().as_millis() as f64),
+                )
+            } else {
+                (f64::NAN, None, None)
+            };
+
+            if source_selection_telemetry_due_for(
+                env.training,
+                env.source_selection_dataset.as_ref(),
+                absolute_step,
+            ) && mean_train_loss.is_finite()
+            {
+                emit_source_selection_telemetry_sample(
+                    env.run_name,
+                    env.source_selection_dataset.as_ref(),
+                    absolute_step,
+                    mean_train_loss,
+                    &bus,
+                );
+            }
+            let log_train_metrics =
+                iteration % env.training.log_frequency.max(1) == 0 || iteration == steps_per_epoch;
+            if log_train_metrics {
+                let progress = iterator.progress();
+                if let Some(metrics) = &metrics {
+                    info!(
+                        "train epoch={} step={}/{} loss={:.4} eggroll_fitness_mean={:.4} eggroll_fitness_std={:.4}",
+                        epoch,
+                        progress.items_processed,
+                        progress.items_total,
+                        mean_train_loss,
+                        metrics.fitness_mean,
+                        metrics.fitness_std
+                    );
+                } else {
+                    info!(
+                        "train epoch={} step={}/{} loss={:.4} eggroll_interval_skip=true",
+                        epoch, progress.items_processed, progress.items_total, mean_train_loss
+                    );
+                }
+            }
+            if mean_train_loss.is_finite() {
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "Loss".to_string(),
+                    value: mean_train_loss,
+                    running_value: mean_train_loss,
+                });
+            }
+            if let Some(metrics) = &metrics {
+                let elapsed_ms = eggroll_step_elapsed_ms.unwrap_or(0.0);
+                let forward_evaluations = eggroll.population.population_size as f64;
+                let forward_evaluations_per_second = if elapsed_ms > 0.0 {
+                    forward_evaluations * 1000.0 / elapsed_ms
+                } else {
+                    0.0
+                };
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Fitness Std".to_string(),
+                    value: metrics.fitness_std as f64,
+                    running_value: metrics.fitness_std as f64,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Coefficient RMS".to_string(),
+                    value: metrics.coefficient_rms as f64,
+                    running_value: metrics.coefficient_rms as f64,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Coefficient Clip Fraction".to_string(),
+                    value: metrics.coefficient_clip_fraction as f64,
+                    running_value: metrics.coefficient_clip_fraction as f64,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Step Milliseconds".to_string(),
+                    value: elapsed_ms,
+                    running_value: elapsed_ms,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Forward Evaluations Per Second".to_string(),
+                    value: forward_evaluations_per_second,
+                    running_value: forward_evaluations_per_second,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Population Size".to_string(),
+                    value: eggroll.population.population_size as f64,
+                    running_value: eggroll.population.population_size as f64,
+                });
+                let _ = bus.send_metric_sample(TrainingMetricSample {
+                    run_id: env.run_name.to_string(),
+                    split: TrainingMetricSplit::Train,
+                    epoch,
+                    step_in_epoch: iteration,
+                    absolute_step,
+                    name: "EGGROLL Population Chunk Size".to_string(),
+                    value: eggroll.population.population_chunk_size as f64,
+                    running_value: eggroll.population.population_chunk_size as f64,
+                });
+            }
+            if emit_step_events {
+                let _ = bus.send_step_finished(StepFinished {
+                    run_id: env.run_name.to_string(),
+                    absolute_step,
+                    epoch,
+                    loss: mean_train_loss.is_finite().then_some(mean_train_loss),
+                });
+            }
+        }
+        drop(iterator);
+
+        let _ = bus.send_epoch_summary(TrainingEpochSummary {
+            run_id: env.run_name.to_string(),
+            split: TrainingMetricSplit::Train,
+            epoch,
+        });
+        let validation =
+            run_dynamic_validation_forward_only(env, &model, epoch, steps_per_epoch, &bus)?;
+        let valid_loss = validation.loss;
+        info!("valid epoch={} loss={valid_loss:.4}", epoch);
+        let checkpoint_promoted = best_valid_loss.is_none_or(|best| valid_loss < best);
+        if checkpoint_promoted {
+            best_valid_loss = Some(valid_loss);
+            best_valid_epoch = Some(epoch);
+        }
+        save_dragon_model_checkpoint(env.run_dir, epoch, &model.model)?;
+        prune_dragon_model_checkpoints(env.run_dir, epoch, best_valid_epoch)?;
+        let absolute_step = epoch.saturating_mul(steps_per_epoch).saturating_sub(1);
+        let _ = bus.send_checkpoint(CheckpointEvent {
+            run_id: env.run_name.to_string(),
+            checkpoint_id: format!("model-{epoch}"),
+            epoch: Some(epoch),
+            absolute_step: Some(absolute_step),
+            promoted: checkpoint_promoted,
+        });
+        let _ = bus.flush();
+    }
+
+    log_theoretical_profile(
+        env.model_config,
+        env.training.batch_size,
+        env.training.block_size,
+        env.backend_name,
+    );
+
+    Ok(model.model)
+}
+
+fn eggroll_batch_loss_tensor<B>(
+    model: &LanguageTrainModel<B>,
+    batch: SequenceBatch<B>,
+) -> Tensor<B, 1>
+where
+    B: BackendTrait,
+{
+    let output = ValidStep::step(model, batch);
+    let loss_value: LossValue<B> = output.adapt();
+    loss_value.value()
+}
+
+fn scalar_values_from_loss_tensors<B>(loss_tensors: Vec<Tensor<B, 1>>) -> Vec<f64>
+where
+    B: BackendTrait,
+{
+    if loss_tensors.is_empty() {
+        return Vec::new();
+    }
+    let values = Tensor::cat(loss_tensors, 0)
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("loss tensor to vec");
+    values.into_iter().map(|value| value as f64).collect()
+}
+
+fn resolve_eggroll_chunk_autotune_candidates(optimizer_cfg: &OptimizerConfig) -> Vec<usize> {
+    let population_size = optimizer_cfg.eggroll.population.population_size.max(2);
+    let configured = optimizer_cfg
+        .eggroll
+        .population
+        .population_chunk_size
+        .max(2)
+        .min(population_size);
+    let max_probe = optimizer_cfg
+        .eggroll_auto_population
+        .chunk_autotune
+        .max_probe_population_size
+        .max(2)
+        .min(population_size);
+    let configured = make_even_population_size(configured.min(max_probe));
+    let mut candidates = if optimizer_cfg
+        .eggroll_auto_population
+        .chunk_autotune
+        .candidates
+        .is_empty()
+    {
+        vec![16, 32, 64, 128, configured]
+    } else {
+        let mut candidates = optimizer_cfg
+            .eggroll_auto_population
+            .chunk_autotune
+            .candidates
+            .clone();
+        candidates.push(configured);
+        candidates
+    };
+    candidates = candidates
+        .into_iter()
+        .map(|candidate| make_even_population_size(candidate.max(2).min(max_probe)))
+        .filter(|candidate| *candidate >= 2 && *candidate <= max_probe)
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn make_even_population_size(value: usize) -> usize {
+    value.saturating_sub(value % 2).max(2)
+}
+
+fn measure_eggroll_chunk_candidate<B>(
+    model: &LanguageTrainModel<B>,
+    batch: SequenceBatch<B>,
+    eggroll: &burn_eggroll::EggrollConfig,
+    population_chunk_size: usize,
+    max_probe_population_size: usize,
+) -> EggrollChunkAutotuneCandidateReport
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let evaluated_population_size = make_even_population_size(
+        population_chunk_size
+            .min(max_probe_population_size)
+            .min(eggroll.population.population_size)
+            .max(2),
+    );
+    let pair_count = (evaluated_population_size / 2).max(1);
+    let mut loss_tensors = Vec::with_capacity(evaluated_population_size);
+    let started = burn_dragon_time::Instant::now();
+    for pair_index in 0..pair_count {
+        let plus_model = burn_dragon_eggroll::perturb_module::<B, _>(
+            model.clone(),
+            eggroll,
+            0,
+            pair_index as u64,
+            burn_eggroll::AntitheticSign::Plus,
+        );
+        let minus_model = burn_dragon_eggroll::perturb_module::<B, _>(
+            model.clone(),
+            eggroll,
+            0,
+            pair_index as u64,
+            burn_eggroll::AntitheticSign::Minus,
+        );
+        loss_tensors.push(eggroll_batch_loss_tensor(&plus_model, batch.clone()));
+        loss_tensors.push(eggroll_batch_loss_tensor(&minus_model, batch.clone()));
+    }
+    let losses = scalar_values_from_loss_tensors(loss_tensors);
+    let elapsed_ms = started.elapsed().as_millis() as f64;
+    let mean_loss = if losses.is_empty() {
+        f64::NAN
+    } else {
+        losses.iter().sum::<f64>() / losses.len() as f64
+    };
+    let forward_evaluations_per_second = if elapsed_ms > 0.0 {
+        losses.len() as f64 * 1000.0 / elapsed_ms
+    } else {
+        0.0
+    };
+    EggrollChunkAutotuneCandidateReport {
+        population_chunk_size,
+        evaluated_population_size: losses.len(),
+        elapsed_ms,
+        forward_evaluations_per_second,
+        mean_loss,
+    }
 }
 
 fn build_dynamic_train_loader<B>(
@@ -996,6 +1557,118 @@ where
     })
 }
 
+fn run_dynamic_validation_forward_only<B>(
+    env: &ForwardEggrollTrainEnvironment<'_, B>,
+    model: &LanguageTrainModel<B>,
+    epoch: usize,
+    steps_per_epoch: usize,
+    bus: &TrainingEventBus,
+) -> Result<DynamicValidationReport>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let mut iterator = env.valid_loader.iter();
+    let mut total = 0.0;
+    let mut count = 0usize;
+    let mut output_degeneracy = None;
+    let probe_enabled = epoch.is_multiple_of(env.training.events.degeneracy_probe_every_epochs);
+    while let Some(item) = iterator.next() {
+        let (loss_tensor, degeneracy) = if probe_enabled && output_degeneracy.is_none() {
+            model.validation_loss_and_output_degeneracy(
+                item,
+                env.training.events.degeneracy_probe_tokens,
+                dataset_eos_id(env.source_selection_dataset.as_ref()),
+            )
+        } else {
+            let output = ValidStep::step(model, item);
+            let loss_value: LossValue<B> = output.adapt();
+            (loss_value.value(), None)
+        };
+        let loss = mean_scalar_from_loss(loss_tensor);
+        count += 1;
+        total += loss;
+        if let Some(degeneracy) = degeneracy {
+            let absolute_step = epoch
+                .saturating_sub(1)
+                .saturating_mul(steps_per_epoch)
+                .saturating_add(count.saturating_sub(1));
+            emit_output_degeneracy_sample(
+                env.run_name,
+                env.source_selection_dataset.as_ref(),
+                epoch,
+                absolute_step,
+                &degeneracy,
+                bus,
+            );
+            output_degeneracy = Some(degeneracy);
+        }
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: count,
+            absolute_step: epoch
+                .saturating_sub(1)
+                .saturating_mul(steps_per_epoch)
+                .saturating_add(count.saturating_sub(1)),
+            name: "Loss".to_string(),
+            value: loss,
+            running_value: total / count as f64,
+        });
+    }
+    let mean = if count == 0 {
+        0.0
+    } else {
+        total / count as f64
+    };
+    let source_weighted_loss =
+        run_source_weighted_validation_forward_only(env, model, epoch, steps_per_epoch, bus)?;
+    if let Some(source_weighted_loss) = source_weighted_loss {
+        let delta = source_weighted_loss - mean;
+        let ratio = if mean.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            source_weighted_loss / mean
+        };
+        let absolute_step = epoch
+            .saturating_sub(1)
+            .saturating_mul(steps_per_epoch)
+            .saturating_add(count);
+        for (name, value) in [
+            ("Source Weighted Loss Delta", delta),
+            ("Source Weighted Loss Ratio", ratio),
+        ] {
+            let _ = bus.send_metric_sample(TrainingMetricSample {
+                run_id: env.run_name.to_string(),
+                split: TrainingMetricSplit::Valid,
+                epoch,
+                step_in_epoch: count.saturating_add(1),
+                absolute_step,
+                name: name.to_string(),
+                value,
+                running_value: value,
+            });
+        }
+    }
+    let _ = bus.send_epoch_summary(TrainingEpochSummary {
+        run_id: env.run_name.to_string(),
+        split: TrainingMetricSplit::Valid,
+        epoch,
+    });
+    let _ = bus.send_validation_finished(ValidationFinished {
+        run_id: env.run_name.to_string(),
+        epoch,
+        absolute_step: Some(epoch.saturating_mul(steps_per_epoch).saturating_sub(1)),
+        loss: Some(mean),
+    });
+    Ok(DynamicValidationReport {
+        loss: mean,
+        source_weighted_loss,
+        output_degeneracy,
+    })
+}
+
 fn run_source_weighted_validation<B>(
     env: &TrainEnvironment<'_, B>,
     valid_model: &LanguageTrainModel<ValidBackend<B>>,
@@ -1053,6 +1726,62 @@ where
     Ok((count > 0).then_some(total / count as f64))
 }
 
+fn run_source_weighted_validation_forward_only<B>(
+    env: &ForwardEggrollTrainEnvironment<'_, B>,
+    valid_model: &LanguageTrainModel<B>,
+    epoch: usize,
+    steps_per_epoch: usize,
+    bus: &TrainingEventBus,
+) -> Result<Option<f64>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let requested_batches = env.training.events.source_weighted_validation_batches;
+    if requested_batches == 0 {
+        return Ok(None);
+    }
+    let Some(dataset) = env.source_selection_dataset.as_ref() else {
+        return Ok(None);
+    };
+    if !dataset.uses_live_source_selection() {
+        return Ok(None);
+    }
+
+    let base_absolute_step = epoch.saturating_sub(1).saturating_mul(steps_per_epoch);
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for batch_index in 0..requested_batches {
+        let absolute_step = base_absolute_step.saturating_add(batch_index);
+        let Some(batch) = dataset.sample_source_weighted_validation_batch::<B>(
+            epoch,
+            absolute_step,
+            env.training.batch_size,
+            env.summary_event_token_ids.as_deref(),
+            env.device,
+        ) else {
+            break;
+        };
+        let output = ValidStep::step(valid_model, batch);
+        let loss_value: LossValue<B> = output.adapt();
+        let loss = mean_scalar_from_loss(loss_value.value());
+        count += 1;
+        total += loss;
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: count,
+            absolute_step,
+            name: "Source Weighted Loss".to_string(),
+            value: loss,
+            running_value: total / count as f64,
+        });
+    }
+
+    Ok((count > 0).then_some(total / count as f64))
+}
+
 fn dataset_eos_id(dataset: Option<&Arc<Dataset>>) -> Option<i64> {
     dataset
         .and_then(|dataset| dataset.tokenizer().eos_id())
@@ -1064,13 +1793,23 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    let every = env.training.events.source_selection_every_steps.max(1);
+    source_selection_telemetry_due_for(
+        env.training,
+        env.source_selection_dataset.as_ref(),
+        absolute_step,
+    )
+}
+
+fn source_selection_telemetry_due_for(
+    training: &TrainingHyperparameters,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    absolute_step: usize,
+) -> bool {
+    let every = training.events.source_selection_every_steps.max(1);
     if !absolute_step.is_multiple_of(every) {
         return false;
     }
-    env.source_selection_dataset
-        .as_ref()
-        .is_some_and(|dataset| dataset.uses_live_source_selection())
+    source_selection_dataset.is_some_and(|dataset| dataset.uses_live_source_selection())
 }
 
 fn emit_source_selection_telemetry<B>(
@@ -1082,7 +1821,23 @@ fn emit_source_selection_telemetry<B>(
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    let Some(dataset) = env.source_selection_dataset.as_ref() else {
+    emit_source_selection_telemetry_sample(
+        env.run_name,
+        env.source_selection_dataset.as_ref(),
+        absolute_step,
+        loss,
+        bus,
+    );
+}
+
+fn emit_source_selection_telemetry_sample(
+    run_name: &str,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    absolute_step: usize,
+    loss: f64,
+    bus: &TrainingEventBus,
+) {
+    let Some(dataset) = source_selection_dataset else {
         return;
     };
     let snapshot = dataset
@@ -1092,7 +1847,7 @@ fn emit_source_selection_telemetry<B>(
         return;
     };
     let _ = bus.send_source_selection_sample(SourceSelectionSample {
-        run_id: env.run_name.to_string(),
+        run_id: run_name.to_string(),
         absolute_step,
         loss: Some(loss as f32),
         entropy_bits: snapshot.sampler_entropy_bits as f64,
@@ -1123,8 +1878,26 @@ fn emit_output_degeneracy<B>(
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    emit_output_degeneracy_sample(
+        env.run_name,
+        env.source_selection_dataset.as_ref(),
+        epoch,
+        absolute_step,
+        stats,
+        bus,
+    );
+}
+
+fn emit_output_degeneracy_sample(
+    run_name: &str,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    epoch: usize,
+    absolute_step: usize,
+    stats: &crate::train::steps::OutputDegeneracyStats,
+    bus: &TrainingEventBus,
+) {
     let _ = bus.send_output_degeneracy_sample(OutputDegeneracySample {
-        run_id: env.run_name.to_string(),
+        run_id: run_name.to_string(),
         split: TrainingMetricSplit::Valid,
         epoch,
         absolute_step,
@@ -1141,7 +1914,7 @@ fn emit_output_degeneracy<B>(
         max_period_2_to_16_fraction: stats.max_period_2_to_16_fraction,
         max_period_2_to_64_fraction: stats.max_period_2_to_64_fraction,
         dominant_period_2_to_64: stats.dominant_period_2_to_64,
-        generated_preview: decode_degeneracy_preview(env.source_selection_dataset.as_ref(), stats),
+        generated_preview: decode_degeneracy_preview(source_selection_dataset, stats),
     });
     for (name, value) in [
         ("Output Entropy Bits", stats.entropy_bits),
@@ -1166,7 +1939,7 @@ fn emit_output_degeneracy<B>(
         ),
     ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: run_name.to_string(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -1627,11 +2400,14 @@ fn mean_scalar_from_loss<B: BackendTrait>(tensor: Tensor<B, 1>) -> f64 {
     }
 }
 
-fn save_dragon_model_checkpoint<B: AutodiffBackend + Clone + 'static>(
+fn save_dragon_model_checkpoint<B>(
     run_dir: &Path,
     epoch: usize,
     model: &DragonModel<B>,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: BackendTrait + Clone + 'static,
+{
     let checkpoint_dir = run_dir.join("checkpoint");
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     FileCheckpointer::new(recorder, &checkpoint_dir, "model")
@@ -1748,12 +2524,15 @@ fn prune_dragon_model_checkpoints(
     Ok(())
 }
 
-fn load_dragon_model_checkpoint<B: AutodiffBackend + Clone + 'static>(
+fn load_dragon_model_checkpoint<B>(
     run_dir: &Path,
     epoch: usize,
     model_config: &DragonConfig,
     device: &B::Device,
-) -> Result<DragonModel<B>> {
+) -> Result<DragonModel<B>>
+where
+    B: BackendTrait + Clone + 'static,
+{
     let checkpoint_dir = run_dir.join("checkpoint");
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let record = FileCheckpointer::new(recorder, &checkpoint_dir, "model")
@@ -3427,6 +4206,7 @@ mod tests {
 
     type TestBackend = Autodiff<NdArray<f32>>;
     type TestValidBackend = ValidBackend<TestBackend>;
+    type TestForwardBackend = NdArray<f32>;
 
     fn degeneracy_stats(
         entropy_bits: f64,
@@ -4030,6 +4810,8 @@ mod tests {
             schedule_mode: OptimizerScheduleMode::DragonReference,
             grad_clip_norm: None,
             grad_clip_value: None,
+            eggroll: burn_eggroll::EggrollConfig::default(),
+            eggroll_auto_population: Default::default(),
         };
         let fresh_model = DragonModel::<TestBackend>::new(model_config.clone(), device);
         crate::train::continual_backprop::resolve_dragon_language_optimizer::<TestBackend>(
@@ -4039,6 +4821,378 @@ mod tests {
             fresh_model,
         )
         .expect("optimizer")
+    }
+
+    #[test]
+    fn eggroll_chunk_autotune_candidates_are_even_bounded_and_include_configured() {
+        let optimizer_cfg = OptimizerConfig {
+            name: OptimizerKind::Eggroll,
+            learning_rate: 1e-2,
+            weight_decay: 0.0,
+            weight_decay_final: None,
+            lr_schedule: None,
+            schedule_mode: OptimizerScheduleMode::DragonReference,
+            grad_clip_norm: None,
+            grad_clip_value: None,
+            eggroll: burn_eggroll::EggrollConfig {
+                population: burn_eggroll::PopulationConfig {
+                    population_size: 512,
+                    population_chunk_size: 64,
+                    rank: 1,
+                    seed: 7,
+                },
+                ..burn_eggroll::EggrollConfig::default()
+            },
+            eggroll_auto_population: burn_dragon_train::EggrollAutoPopulationConfig {
+                enabled: true,
+                chunk_autotune: burn_dragon_train::EggrollChunkAutotuneConfig {
+                    enabled: true,
+                    candidates: vec![32, 128, 256],
+                    max_probe_population_size: 128,
+                },
+                ..Default::default()
+            },
+        };
+
+        let candidates = super::resolve_eggroll_chunk_autotune_candidates(&optimizer_cfg);
+
+        assert_eq!(candidates, vec![32, 64, 128]);
+    }
+
+    #[test]
+    fn eggroll_training_dynamics_are_bounded_against_adamw() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let report = crate::train::optimizer_dynamics::run_optimizer_dynamics_suite(
+            &crate::train::optimizer_dynamics::OptimizerDynamicsConfig::default(),
+            &[17, 29, 53],
+            dir.path(),
+        )
+        .expect("optimizer dynamics suite");
+
+        eprintln!("optimizer dynamics suite: {report:#?}");
+        for pair in &report.pairs {
+            assert!(pair.adamw.initial_loss.is_finite());
+            assert!(pair.adamw.final_loss.is_finite());
+            assert!(pair.eggroll.initial_loss.is_finite());
+            assert!(pair.eggroll.final_loss.is_finite());
+            assert!(
+                pair.adamw.loss_delta() > 0.0,
+                "AdamW should learn the deterministic comparison task: {pair:?}"
+            );
+            assert!(
+                pair.eggroll.final_loss <= pair.eggroll.initial_loss + 0.05,
+                "EGGROLL should not severely regress the deterministic comparison task: {pair:?}"
+            );
+            assert!(
+                pair.eggroll.evaluations_per_second() >= pair.adamw.evaluations_per_second() * 0.02,
+                "EGGROLL eval throughput is pathologically low: {pair:?}"
+            );
+            assert!(
+                pair.eggroll.milliseconds_per_train_step()
+                    <= pair.adamw.milliseconds_per_train_step() * 12.0 + 1.0,
+                "EGGROLL update throughput is too slow for population-size-8 smoke: {pair:?}"
+            );
+        }
+        assert!(
+            report.mean_eggroll_loss_delta() > 0.20,
+            "EGGROLL should learn a measurable average signal: {report:#?}"
+        );
+        assert!(
+            report.mean_eggroll_loss_delta() >= report.mean_adamw_loss_delta() * 0.10,
+            "EGGROLL should retain a nontrivial fraction of AdamW quality on the deterministic comparison task: {report:#?}"
+        );
+        assert!(
+            report.mean_eggroll_ms_per_step() <= report.mean_adamw_ms_per_step() * 12.0 + 1.0,
+            "EGGROLL mean update throughput is too slow for population-size-8 smoke: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn manual_adamw_loop_matches_learner_dynamics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = crate::train::optimizer_dynamics::OptimizerDynamicsConfig {
+            epochs: 4,
+            max_iters: 16,
+            log_frequency: 4,
+            seed: 29,
+            ..crate::train::optimizer_dynamics::OptimizerDynamicsConfig::default()
+        };
+        let learner = crate::train::optimizer_dynamics::run_optimizer_dynamics(
+            crate::train::optimizer_dynamics::OptimizerDynamicsKind::AdamW,
+            &config,
+            &dir.path().join("learner"),
+        )
+        .expect("learner adamw dynamics");
+        let manual = crate::train::optimizer_dynamics::run_manual_adamw_optimizer_dynamics(&config)
+            .expect("manual adamw dynamics");
+
+        eprintln!("adamw learner={learner:#?} manual={manual:#?}");
+        assert!(
+            manual.loss_delta() > 0.0,
+            "manual AdamW loop should learn the deterministic comparison task: {manual:?}"
+        );
+        assert!(
+            manual.loss_delta() >= learner.loss_delta() * 0.60,
+            "manual AdamW loop should be in the same quality regime as burn_train::Learner: learner={learner:?} manual={manual:?}"
+        );
+    }
+
+    #[test]
+    fn eggroll_update_preserves_train_step_gradients() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let model_config = tiny_model_config();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &device,
+        ));
+        let batch = make_batch::<TestBackend>(
+            &device,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            [2, 4],
+        );
+        let eggroll = burn_eggroll::EggrollConfig {
+            sigma: 0.0025,
+            update: burn_eggroll::EggrollUpdateConfig {
+                learning_rate: 1.0e-8,
+                ..burn_eggroll::EggrollUpdateConfig::default()
+            },
+            ..burn_eggroll::EggrollConfig::default()
+        };
+        let mut eggroll_state =
+            burn_dragon_eggroll::EggrollModuleOptimizerState::<TestBackend>::new();
+        let (updated, _metrics) = burn_dragon_eggroll::apply_antithetic_update(
+            model,
+            &eggroll,
+            0,
+            &[burn_dragon_eggroll::AntitheticFitness {
+                pair_index: 0,
+                plus: 0.0,
+                minus: 1.0,
+            }],
+            &mut eggroll_state,
+        )
+        .expect("eggroll update");
+        let item = burn_train::TrainStep::step(&updated, batch);
+        let raw_gradient_count = item.grads.len();
+        let mut accumulator = GradientsAccumulator::new();
+        accumulator.accumulate(&updated, item.grads);
+        let grads = accumulator.grads();
+        let accumulated_gradient_count = grads.len();
+
+        eprintln!(
+            "eggroll-updated gradient counts raw={raw_gradient_count} accumulated={accumulated_gradient_count}"
+        );
+        assert!(
+            raw_gradient_count > 0,
+            "EGGROLL-updated model should expose train-step gradients"
+        );
+        assert!(
+            accumulated_gradient_count > 0,
+            "EGGROLL-updated model should expose accumulated gradients"
+        );
+    }
+
+    #[test]
+    fn eggroll_forward_only_trains_on_plain_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("eggroll-forward-only");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestForwardBackend>::default();
+        TestForwardBackend::seed(&device, 41);
+        let training = tiny_training_hparams();
+        let model_config = tiny_model_config();
+        let optimizer_cfg = OptimizerConfig {
+            name: OptimizerKind::Eggroll,
+            learning_rate: 1.0e-6,
+            weight_decay: 0.0,
+            weight_decay_final: None,
+            lr_schedule: None,
+            schedule_mode: OptimizerScheduleMode::DragonReference,
+            grad_clip_norm: None,
+            grad_clip_value: None,
+            eggroll: burn_eggroll::EggrollConfig {
+                sigma: 2.5e-3,
+                population: burn_eggroll::PopulationConfig {
+                    population_size: 2,
+                    population_chunk_size: 2,
+                    rank: 1,
+                    seed: 41,
+                },
+                update: burn_eggroll::EggrollUpdateConfig {
+                    learning_rate: 1.0e-6,
+                    ..burn_eggroll::EggrollUpdateConfig::default()
+                },
+                ..burn_eggroll::EggrollConfig::default()
+            },
+            eggroll_auto_population: Default::default(),
+        };
+        let env = ForwardEggrollTrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            run_dir: &run_dir,
+            run_name: "eggroll-forward-only-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            train_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<
+                TestForwardBackend,
+            >(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                [2, 4],
+            )])),
+            valid_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<
+                TestForwardBackend,
+            >(
+                &device,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[2, 3, 4, 5, 6, 7, 8, 9],
+                [2, 4],
+            )])),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            epochs: 1,
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestForwardBackend>::new(
+            model_config.clone(),
+            &device,
+        ));
+        let trained = train_with_eggroll_forward_only(&env, &optimizer_cfg, model)
+            .expect("forward-only EGGROLL training should not require autodiff");
+        let probe = make_batch::<TestForwardBackend>(
+            &device,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[2, 3, 4, 5, 6, 7, 8, 9],
+            [2, 4],
+        );
+        let loss =
+            language_model_loss::<TestForwardBackend>(trained.forward(probe.inputs), probe.targets)
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("loss vec")[0];
+        assert!(
+            loss.is_finite(),
+            "forward-only EGGROLL loss should be finite"
+        );
+        assert!(
+            run_dir.join("checkpoint/model-1.bin").is_file(),
+            "forward-only EGGROLL should save plain-backend checkpoints"
+        );
+    }
+
+    #[test]
+    fn eggroll_interval_reduces_population_evaluations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = crate::train::optimizer_dynamics::OptimizerDynamicsConfig {
+            epochs: 4,
+            max_iters: 16,
+            log_frequency: 4,
+            seed: 29,
+            eggroll_learning_rate: 1.0e-2,
+            eggroll_interval_steps: 4,
+            ..crate::train::optimizer_dynamics::OptimizerDynamicsConfig::default()
+        };
+        let report = crate::train::optimizer_dynamics::run_optimizer_dynamics(
+            crate::train::optimizer_dynamics::OptimizerDynamicsKind::Eggroll,
+            &config,
+            dir.path(),
+        )
+        .expect("interval eggroll dynamics");
+        let total_steps = config.epochs * 4;
+        let eggroll_steps = total_steps.div_ceil(config.eggroll_interval_steps);
+        let expected_forward_evaluations = eggroll_steps * config.eggroll_population_size;
+
+        eprintln!("interval eggroll report={report:#?}");
+        assert_eq!(report.forward_evaluations, expected_forward_evaluations);
+        assert!(
+            report.final_loss.is_finite(),
+            "interval EGGROLL should produce finite validation loss: {report:?}"
+        );
+    }
+
+    #[test]
+    fn eggroll_baseline_is_reasonable_against_nearby_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = crate::train::optimizer_dynamics::OptimizerDynamicsConfig {
+            epochs: 6,
+            max_iters: 24,
+            log_frequency: 6,
+            seed: 29,
+            ..crate::train::optimizer_dynamics::OptimizerDynamicsConfig::default()
+        };
+        let mut center = base.clone();
+        center.eggroll_fitness_normalization = burn_eggroll::FitnessNormalization::Center;
+        let mut zscore = base.clone();
+        zscore.eggroll_fitness_normalization = burn_eggroll::FitnessNormalization::ZScore;
+        let mut adamw_update = base.clone();
+        adamw_update.eggroll_update_kind = burn_eggroll::EggrollUpdateKind::Adamw;
+        adamw_update.eggroll_learning_rate = 1.0e-3;
+        let mut small_population = base.clone();
+        small_population.eggroll_population_size = 4;
+
+        let report = crate::train::optimizer_dynamics::run_eggroll_dynamics_sweep(
+            &[
+                crate::train::optimizer_dynamics::EggrollDynamicsCandidate::new(
+                    "rank_sgd_pop8_rank2",
+                    base,
+                ),
+                crate::train::optimizer_dynamics::EggrollDynamicsCandidate::new(
+                    "center_sgd_pop8_rank2",
+                    center,
+                ),
+                crate::train::optimizer_dynamics::EggrollDynamicsCandidate::new(
+                    "zscore_sgd_pop8_rank2",
+                    zscore,
+                ),
+                crate::train::optimizer_dynamics::EggrollDynamicsCandidate::new(
+                    "center_adamw_pop8_rank2",
+                    adamw_update,
+                ),
+                crate::train::optimizer_dynamics::EggrollDynamicsCandidate::new(
+                    "center_sgd_pop4_rank2",
+                    small_population,
+                ),
+            ],
+            dir.path(),
+        )
+        .expect("eggroll dynamics sweep");
+
+        eprintln!("eggroll candidate sweep: {report:#?}");
+        let baseline = report
+            .get("rank_sgd_pop8_rank2")
+            .expect("baseline candidate");
+        let best_quality = report.best_by_loss_delta().expect("quality candidate");
+        let best_throughput = report
+            .best_by_loss_delta_per_second()
+            .expect("throughput candidate");
+        for candidate in &report.candidates {
+            assert!(candidate.report.initial_loss.is_finite());
+            assert!(candidate.report.final_loss.is_finite());
+        }
+        assert!(
+            baseline.report.final_loss <= baseline.report.initial_loss + 0.05,
+            "baseline EGGROLL should not regress in the candidate sweep: {report:#?}"
+        );
+        assert!(
+            baseline.report.loss_delta() > 0.15,
+            "baseline EGGROLL should learn a measurable signal in the candidate sweep: {report:#?}"
+        );
+        assert!(
+            baseline.report.loss_delta() >= best_quality.report.loss_delta() * 0.50,
+            "baseline EGGROLL should not be badly dominated on quality by nearby candidates: best={best_quality:?} report={report:#?}"
+        );
+        assert!(
+            baseline.report.loss_delta_per_second()
+                >= best_throughput.report.loss_delta_per_second() * 0.35,
+            "baseline EGGROLL should remain throughput-reasonable against nearby candidates: best={best_throughput:?} report={report:#?}"
+        );
     }
 
     fn single_device_scheduler_smoke(objective: TrainingObjectiveConfig, run_name: &str) -> f32 {

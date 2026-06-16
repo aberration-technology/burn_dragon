@@ -63,15 +63,58 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone + 'static,
 {
+    resolve_startup_batch_size_with_probe::<B, _>(
+        config,
+        dataset,
+        backend_name,
+        device,
+        probe_batch_size_autodiff::<B>,
+        true,
+    )
+}
+
+pub fn resolve_startup_batch_size_forward_only<B>(
+    config: &TrainingConfig,
+    dataset: &Arc<Dataset>,
+    backend_name: &str,
+    device: &B::Device,
+) -> Result<Option<StartupAutotuneReport>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone + 'static,
+{
+    resolve_startup_batch_size_with_probe::<B, _>(
+        config,
+        dataset,
+        backend_name,
+        device,
+        probe_batch_size_forward_only::<B>,
+        false,
+    )
+}
+
+fn resolve_startup_batch_size_with_probe<B, F>(
+    config: &TrainingConfig,
+    dataset: &Arc<Dataset>,
+    backend_name: &str,
+    device: &B::Device,
+    mut probe_batch_size: F,
+    use_target_effective_batch_size: bool,
+) -> Result<Option<StartupAutotuneReport>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone + 'static,
+    F: FnMut(ProbeBatchRequest<'_, B>) -> StartupAutotuneProbe,
+{
     let Some(autotune) = resolve_batch_autotune_settings(config, backend_name) else {
         return Ok(None);
     };
 
     let min_batch_size = autotune.min_batch_size;
     let max_batch_size = autotune.max_batch_size.max(min_batch_size);
-    let target_effective_batch_size = config
-        .training
-        .target_effective_batch_size
+    let target_effective_batch_size = use_target_effective_batch_size
+        .then_some(config.training.target_effective_batch_size)
+        .flatten()
         .filter(|value| *value > 0);
     let training_kernel_block_size =
         crate::train::utils::effective_training_kernel_block_size(&config.training);
@@ -154,7 +197,7 @@ where
             }
             continue;
         }
-        let probe = probe_batch_size::<B>(ProbeBatchRequest {
+        let probe = probe_batch_size(ProbeBatchRequest {
             dataset,
             model_config: &model_config,
             block_size: config.training.block_size,
@@ -214,7 +257,7 @@ where
                 low = candidate;
                 continue;
             }
-            let probe = probe_batch_size::<B>(ProbeBatchRequest {
+            let probe = probe_batch_size(ProbeBatchRequest {
                 dataset,
                 model_config: &model_config,
                 block_size: config.training.block_size,
@@ -706,7 +749,7 @@ fn predicted_probe(
     }
 }
 
-fn probe_batch_size<B>(request: ProbeBatchRequest<'_, B>) -> StartupAutotuneProbe
+fn probe_batch_size_autodiff<B>(request: ProbeBatchRequest<'_, B>) -> StartupAutotuneProbe
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone + 'static,
@@ -824,6 +867,145 @@ where
     }
 }
 
+fn probe_batch_size_forward_only<B>(request: ProbeBatchRequest<'_, B>) -> StartupAutotuneProbe
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone + 'static,
+{
+    let ProbeBatchRequest {
+        dataset,
+        model_config,
+        block_size,
+        tbptt_chunk_size,
+        batch_size,
+        probe_steps,
+        device_target_bytes,
+        host_cap_bytes,
+        summary_event_token_ids,
+        device,
+    } = request;
+    cleanup_device_memory::<B>(device, true);
+    let baseline_host_usage = system_memory_snapshot();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let model = LanguageTrainModel::new(DragonModel::<B>::new(model_config.clone(), device))
+            .with_tbptt_chunk_size(tbptt_chunk_size);
+        let mut peak_usage: Option<DeviceMemoryUsage> = None;
+        let mut peak_host_usage: Option<SystemMemorySnapshot> = baseline_host_usage;
+
+        for _ in 0..probe_steps {
+            let batch = sample_batch_with_shape::<B, _>(
+                &**dataset,
+                DatasetSplit::Train,
+                batch_size,
+                block_size,
+                summary_event_token_ids,
+                0,
+                device,
+            );
+            let output = ValidStep::step(&model, batch);
+            drop(output);
+            let _ = B::sync(device);
+            if let Some(usage) = device_memory_usage_safe::<B>(device) {
+                peak_usage = Some(match peak_usage {
+                    Some(current)
+                        if current.reserved_bytes.max(current.in_use_bytes)
+                            >= usage.reserved_bytes.max(usage.in_use_bytes) =>
+                    {
+                        current
+                    }
+                    _ => usage,
+                });
+            }
+            if let Some(snapshot) = system_memory_snapshot() {
+                peak_host_usage = Some(match peak_host_usage {
+                    Some(current) if current.used_bytes() >= snapshot.used_bytes() => current,
+                    _ => snapshot,
+                });
+            }
+        }
+
+        drop(model);
+        cleanup_device_memory::<B>(device, true);
+        (peak_usage, peak_host_usage)
+    }));
+
+    build_probe_result::<B>(
+        result,
+        batch_size,
+        device_target_bytes,
+        host_cap_bytes,
+        baseline_host_usage,
+        device,
+    )
+}
+
+fn build_probe_result<B>(
+    result: std::thread::Result<(Option<DeviceMemoryUsage>, Option<SystemMemorySnapshot>)>,
+    batch_size: usize,
+    device_target_bytes: Option<u64>,
+    host_cap_bytes: Option<u64>,
+    baseline_host_usage: Option<SystemMemorySnapshot>,
+    device: &B::Device,
+) -> StartupAutotuneProbe
+where
+    B: BackendTrait,
+{
+    match result {
+        Ok((peak_usage, peak_host_usage)) => {
+            let device_fits = match device_target_bytes {
+                Some(device_target_bytes) => peak_usage
+                    .map(|usage| {
+                        usage.reserved_bytes.max(usage.in_use_bytes) <= device_target_bytes
+                    })
+                    .unwrap_or(false),
+                None => true,
+            };
+            let host_fits = match host_cap_bytes {
+                Some(host_cap_bytes) => peak_host_usage
+                    .map(|snapshot| snapshot.used_bytes() <= host_cap_bytes)
+                    .unwrap_or(false),
+                None => true,
+            };
+            let fit_target = device_fits && host_fits;
+            StartupAutotuneProbe {
+                batch_size,
+                reserved_mb: peak_usage.map(DeviceMemoryUsage::reserved_mb),
+                in_use_mb: peak_usage.map(DeviceMemoryUsage::in_use_mb),
+                host_baseline_mb: baseline_host_usage.map(SystemMemorySnapshot::used_mb),
+                host_used_mb: peak_host_usage.map(SystemMemorySnapshot::used_mb),
+                host_available_mb: peak_host_usage.map(SystemMemorySnapshot::available_mb),
+                host_delta_mb: host_delta_mb(baseline_host_usage, peak_host_usage),
+                projected_host_used_mb: None,
+                fit_target,
+                status: if fit_target {
+                    "fit".to_string()
+                } else if !host_fits {
+                    "over_host_target".to_string()
+                } else {
+                    "over_target".to_string()
+                },
+            }
+        }
+        Err(_) => {
+            cleanup_device_memory::<B>(device, true);
+            let failed_host_usage = system_memory_snapshot();
+            StartupAutotuneProbe {
+                batch_size,
+                reserved_mb: None,
+                in_use_mb: None,
+                host_baseline_mb: baseline_host_usage.map(SystemMemorySnapshot::used_mb),
+                host_used_mb: failed_host_usage.map(SystemMemorySnapshot::used_mb),
+                host_available_mb: failed_host_usage.map(SystemMemorySnapshot::available_mb),
+                host_delta_mb: host_delta_mb(baseline_host_usage, failed_host_usage),
+                projected_host_used_mb: None,
+                fit_target: false,
+                status: "probe_failed".to_string(),
+            }
+        }
+    }
+}
+
 fn host_delta_mb(
     baseline: Option<SystemMemorySnapshot>,
     peak: Option<SystemMemorySnapshot>,
@@ -835,7 +1017,7 @@ fn host_delta_mb(
     ))
 }
 
-struct ProbeBatchRequest<'a, B: AutodiffBackend> {
+struct ProbeBatchRequest<'a, B: BackendTrait> {
     dataset: &'a Arc<Dataset>,
     model_config: &'a DragonConfig,
     block_size: usize,

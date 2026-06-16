@@ -42,6 +42,7 @@ integration_test = ["train"]
 anyhow.workspace = true
 burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
 burn_ecs.workspace = true
+burn_eggroll.workspace = true
 burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-communication = { workspace = true, optional = true }

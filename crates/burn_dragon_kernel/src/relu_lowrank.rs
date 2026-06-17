@@ -214,6 +214,7 @@ pub enum LowrankGradInputExecutor {
 struct LowrankProjectionShape {
     batch: usize,
     input_heads: usize,
+    weight_batch: usize,
     heads: usize,
     time: usize,
     embd: usize,
@@ -237,7 +238,8 @@ impl LowrankProjectionShape {
             || input_heads == 0
             || time == 0
             || embd == 0
-            || weight_batch != 1
+            || weight_batch == 0
+            || !(weight_batch == 1 || batch % weight_batch == 0)
             || heads == 0
             || latent == 0
             || embd != weight_embd
@@ -255,6 +257,7 @@ impl LowrankProjectionShape {
         Some(Self {
             batch,
             input_heads,
+            weight_batch,
             heads,
             time,
             embd,
@@ -276,6 +279,7 @@ impl LowrankProjectionShape {
                 self.latent as f32,
                 self.threshold,
                 if self.has_mask { 1.0 } else { 0.0 },
+                self.weight_batch as f32,
             ],
             device,
         )
@@ -325,12 +329,61 @@ fn head_aligned_projection_flat<B: BackendTrait>(
     )
 }
 
+fn grouped_single_stream_projection_flat<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+) -> Option<BurnTensor<B, 4>> {
+    let [batch, streams, time, embd] = input.shape().dims::<4>();
+    let [weight_batch, heads, weight_embd, latent] = weight.shape().dims::<4>();
+    if streams != 1 || weight_batch <= 1 || batch % weight_batch != 0 || embd != weight_embd {
+        return None;
+    }
+    let per_weight_batch = batch / weight_batch;
+    let input_grouped = input.reshape([weight_batch, per_weight_batch * time, embd]);
+    let weight_grouped = weight
+        .swap_dims(1, 2)
+        .reshape([weight_batch, embd, heads * latent]);
+    Some(
+        input_grouped
+            .matmul(weight_grouped)
+            .reshape([weight_batch, per_weight_batch, time, heads, latent])
+            .swap_dims(2, 3)
+            .reshape([batch, heads, time, latent]),
+    )
+}
+
+fn grouped_head_aligned_projection_flat<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+) -> Option<BurnTensor<B, 4>> {
+    let [batch, input_heads, time, embd] = input.shape().dims::<4>();
+    let [weight_batch, heads, weight_embd, latent] = weight.shape().dims::<4>();
+    if input_heads != heads || weight_batch <= 1 || batch % weight_batch != 0 || embd != weight_embd
+    {
+        return None;
+    }
+    let per_weight_batch = batch / weight_batch;
+    let input_grouped = input
+        .reshape([weight_batch, per_weight_batch, heads, time, embd])
+        .swap_dims(1, 2)
+        .reshape([weight_batch, heads, per_weight_batch * time, embd]);
+    Some(
+        input_grouped
+            .matmul(weight)
+            .reshape([weight_batch, heads, per_weight_batch, time, latent])
+            .swap_dims(1, 2)
+            .reshape([batch, heads, time, latent]),
+    )
+}
+
 fn lowrank_projection_reference<B: BackendTrait>(
     input: BurnTensor<B, 4>,
     weight: BurnTensor<B, 4>,
 ) -> BurnTensor<B, 4> {
     single_stream_projection_flat(input.clone(), weight.clone())
         .or_else(|| head_aligned_projection_flat(input.clone(), weight.clone()))
+        .or_else(|| grouped_single_stream_projection_flat(input.clone(), weight.clone()))
+        .or_else(|| grouped_head_aligned_projection_flat(input.clone(), weight.clone()))
         .unwrap_or_else(|| input.matmul(weight))
 }
 
@@ -695,6 +748,8 @@ where
 /// Supported layouts:
 /// - input `[batch, 1, time, embd]`, weight `[1, heads, embd, latent]`
 /// - input `[batch, heads, time, embd]`, weight `[1, heads, embd, latent]`
+/// - forward-only grouped input `[batch, 1|heads, time, embd]`, weight `[groups, heads, embd, latent]`
+///   when `batch % groups == 0`
 pub fn try_fused_relu_lowrank_projection_wgpu<B: BackendTrait>(
     input: &BurnTensor<B, 4>,
     weight: &BurnTensor<B, 4>,
@@ -1506,6 +1561,8 @@ where
 
 #[cube(launch)]
 fn relu_lowrank_cube_kernel(
+    weight_batch_arg: u32,
+    batch_per_weight_arg: u32,
     input: &Tensor<f32>,
     weight: &Tensor<f32>,
     output: &mut Tensor<f32>,
@@ -1520,6 +1577,8 @@ fn relu_lowrank_cube_kernel(
     let latent = u32::cast_from(params[5]) as usize;
     let threshold = params[6];
     let has_mask = params[7] > f32::cast_from(0u32);
+    let weight_batch = weight_batch_arg as usize;
+    let batch_per_weight = batch_per_weight_arg as usize;
 
     let l = (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize;
     let t = CUBE_POS_Y as usize;
@@ -1534,12 +1593,22 @@ fn relu_lowrank_cube_kernel(
     if input_heads == 1usize {
         input_head = 0usize;
     }
+    let mut weight_group = 0usize;
+    if weight_batch > 1usize {
+        weight_group = b / batch_per_weight;
+    }
 
     let mut sum = f32::cast_from(0u32);
     let mut e = 0usize;
     while e < embd {
-        let input_index = ((b * input_heads + input_head) * time + t) * embd + e;
-        let weight_index = (h * embd + e) * latent + l;
+        let input_index = b * input.stride(0)
+            + input_head * input.stride(1)
+            + t * input.stride(2)
+            + e * input.stride(3);
+        let weight_index = weight_group * weight.stride(0)
+            + h * weight.stride(1)
+            + e * weight.stride(2)
+            + l * weight.stride(3);
         sum += input[input_index] * weight[weight_index];
         e += 1usize;
     }
@@ -1552,7 +1621,8 @@ fn relu_lowrank_cube_kernel(
         sum *= sparse_mask[l];
     }
 
-    let output_index = ((b * heads + h) * time + t) * latent + l;
+    let output_index =
+        b * output.stride(0) + h * output.stride(1) + t * output.stride(2) + l * output.stride(3);
     output[output_index] = sum;
 }
 

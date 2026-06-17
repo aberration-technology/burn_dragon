@@ -89,6 +89,9 @@ pub(super) fn try_direct_path_autodiff_cube_runtime<B: BackendTrait, R: CubeRunt
 where
     B::FloatTensorPrimitive: 'static,
 {
+    if shape.weight_batch != 1 {
+        return None;
+    }
     if TypeId::of::<R>() == TypeId::of::<WgpuRuntime>() {
         let prim_input = input.clone().into_primitive().tensor();
         let input_ad: WgpuCubeAutodiffTensor = try_cast_primitive::<B, _>(prim_input)?;
@@ -195,6 +198,9 @@ where
     BT: BoolElement + 'static,
     R: CubeRuntime + 'static,
 {
+    if shape.weight_batch != 1 {
+        return None;
+    }
     if TypeId::of::<R>() == TypeId::of::<WgpuRuntime>() {
         let prim_input = input.clone().into_primitive().tensor();
         let input_ad: WgpuFusionAutodiffTensor<BT> = try_cast_primitive::<B, _>(prim_input)?;
@@ -476,6 +482,8 @@ fn relu_lowrank_cube_runtime<R: CubeRuntime>(
         &client,
         cube_count,
         cube_dim,
+        shape.weight_batch as u32,
+        (shape.batch / shape.weight_batch.max(1)) as u32,
         input.clone().into_tensor_arg(),
         weight.clone().into_tensor_arg(),
         output.clone().into_tensor_arg(),

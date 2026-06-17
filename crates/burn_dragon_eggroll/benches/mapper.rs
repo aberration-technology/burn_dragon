@@ -2,11 +2,14 @@ use burn::module::{Module, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_dragon_eggroll::{
-    AntitheticFitness, EggrollModuleOptimizerState, apply_antithetic_update, perturb_module,
+    AntitheticFitness, EggrollModuleOptimizerState, apply_antithetic_update,
+    apply_antithetic_update_with_allowed_param_ids, perturb_module,
+    perturb_module_with_allowed_param_ids,
 };
 use burn_eggroll::{AntitheticSign, EggrollConfig, PopulationConfig};
 use burn_ndarray::NdArray;
 use criterion::{Criterion, criterion_group, criterion_main};
+use std::collections::BTreeSet;
 use std::hint::black_box;
 
 type BenchBackend = NdArray<f32>;
@@ -42,6 +45,7 @@ fn config() -> EggrollConfig {
             population_chunk_size: 8,
             rank: 2,
             seed: 19,
+            matrix_noise: Default::default(),
         },
         ..EggrollConfig::default()
     }
@@ -50,6 +54,7 @@ fn config() -> EggrollConfig {
 fn bench_mapper(c: &mut Criterion) {
     let config = config();
     let module = bench_module();
+    let allowed = BTreeSet::from([module.projection.id.val(), module.headed.id.val()]);
     c.bench_function("dragon_eggroll/perturb_module", |b| {
         b.iter(|| {
             perturb_module::<BenchBackend, _>(
@@ -58,6 +63,18 @@ fn bench_mapper(c: &mut Criterion) {
                 7,
                 3,
                 AntitheticSign::Plus,
+            )
+        })
+    });
+    c.bench_function("dragon_eggroll/perturb_module_scoped", |b| {
+        b.iter(|| {
+            perturb_module_with_allowed_param_ids::<BenchBackend, _>(
+                black_box(module.clone()),
+                black_box(&config),
+                7,
+                3,
+                AntitheticSign::Plus,
+                Some(black_box(&allowed)),
             )
         })
     });
@@ -99,6 +116,28 @@ fn bench_mapper(c: &mut Criterion) {
                     7,
                     black_box(&fitness),
                     black_box(&mut state),
+                )
+                .expect("eggroll update")
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("dragon_eggroll/apply_antithetic_update_scoped", |b| {
+        b.iter_batched(
+            || {
+                (
+                    module.clone(),
+                    EggrollModuleOptimizerState::<BenchBackend>::new(),
+                )
+            },
+            |(module, mut state)| {
+                apply_antithetic_update_with_allowed_param_ids(
+                    black_box(module),
+                    black_box(&config),
+                    7,
+                    black_box(&fitness),
+                    black_box(&mut state),
+                    Some(black_box(&allowed)),
                 )
                 .expect("eggroll update")
             },

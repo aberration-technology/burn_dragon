@@ -1,16 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow};
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn_eggroll::{
-    AntitheticSign, BackendTensorOptimizerState, EggrollConfig, EggrollMetrics, MatrixNoiseSpec,
-    accumulate_gaussian_gradient_tensor, accumulate_low_rank_gradient_matrix_stack,
-    eggroll_metrics, normalize_fitness, perturb_gaussian_tensor, perturb_matrix_stack,
-    tensor_update,
+    AntitheticSign, BackendTensorOptimizerState, EggrollConfig, EggrollMetrics,
+    MatrixNoiseCoefficient, MatrixNoiseMode, MatrixNoiseSpec, accumulate_gaussian_gradient_tensor,
+    accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode, eggroll_metrics,
+    normalize_fitness, perturb_gaussian_tensor, perturb_matrix_stack_with_mode, tensor_update,
 };
 use serde::{Deserialize, Serialize};
 
@@ -101,13 +101,30 @@ where
     B: Backend,
     M: Module<B>,
 {
+    perturb_module_with_allowed_param_ids(module, config, generation, pair_index, sign, None)
+}
+
+pub fn perturb_module_with_allowed_param_ids<B, M>(
+    module: M,
+    config: &EggrollConfig,
+    generation: u64,
+    pair_index: u64,
+    sign: AntitheticSign,
+    allowed_param_ids: Option<&BTreeSet<u64>>,
+) -> M
+where
+    B: Backend,
+    M: Module<B>,
+{
     let mut mapper = EggrollPerturbMapper {
         seed: config.population.seed,
         generation,
         pair_index,
         rank: config.population.rank,
+        matrix_noise: config.population.matrix_noise,
         sigma: config.effective_sigma(generation),
         sign,
+        allowed_param_ids,
         perturbed_params: 0,
     };
     module.map(&mut mapper)
@@ -142,7 +159,7 @@ pub fn pair_gradient_coefficients(
             let plus = normalized[idx * 2];
             let minus = normalized[idx * 2 + 1];
             let mut coefficient =
-                burn_eggroll::antithetic_loss_gradient_weight(plus, minus, sigma, fitness.len());
+                burn_eggroll::antithetic_fitness_gradient_weight(plus, minus, sigma, fitness.len());
             if let Some(clip) = config.coefficient_clip {
                 coefficient = coefficient.clamp(-clip, clip);
             }
@@ -160,6 +177,21 @@ pub fn apply_antithetic_update<B, M>(
     generation: u64,
     fitness: &[AntitheticFitness],
     state: &mut EggrollModuleOptimizerState<B>,
+) -> Result<(M, EggrollMetrics)>
+where
+    B: Backend,
+    M: Module<B>,
+{
+    apply_antithetic_update_with_allowed_param_ids(module, config, generation, fitness, state, None)
+}
+
+pub fn apply_antithetic_update_with_allowed_param_ids<B, M>(
+    module: M,
+    config: &EggrollConfig,
+    generation: u64,
+    fitness: &[AntitheticFitness],
+    state: &mut EggrollModuleOptimizerState<B>,
+    allowed_param_ids: Option<&BTreeSet<u64>>,
 ) -> Result<(M, EggrollMetrics)>
 where
     B: Backend,
@@ -187,13 +219,88 @@ where
         seed: config.population.seed,
         generation,
         rank: config.population.rank,
+        matrix_noise: config.population.matrix_noise,
         coefficients: &coefficients,
         update: &config.update,
         state,
+        allowed_param_ids,
         updated_params: 0,
     };
     let module = module.map(&mut mapper);
     Ok((module, metrics))
+}
+
+pub fn apply_antithetic_update_to_tensor_with_coefficients<B, const D: usize>(
+    tensor: Tensor<B, D>,
+    param_id: u64,
+    config: &EggrollConfig,
+    generation: u64,
+    coefficients: &[PairGradientCoefficient],
+    state: &mut EggrollModuleOptimizerState<B>,
+) -> Tensor<B, D>
+where
+    B: Backend,
+{
+    let require_grad = tensor.is_require_grad();
+    if D == 0 || coefficients.is_empty() {
+        return tensor.detach().set_require_grad(require_grad);
+    }
+    let shape: [usize; D] = tensor.shape().dims();
+    let device = tensor.device();
+    let gradient = if D < 2 {
+        coefficients
+            .iter()
+            .fold(None, |accumulated, coefficient| {
+                let spec = MatrixNoiseSpec::new(
+                    config.population.seed,
+                    param_id,
+                    generation,
+                    coefficient.pair_index,
+                    config.population.rank,
+                );
+                Some(accumulate_gaussian_gradient_tensor(
+                    accumulated,
+                    coefficient.coefficient,
+                    shape,
+                    spec,
+                    &device,
+                ))
+            })
+            .expect("non-empty coefficients should produce a gradient")
+    } else {
+        let coefficients = matrix_noise_coefficients(coefficients);
+        accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode(
+            shape,
+            config.population.seed,
+            param_id,
+            generation,
+            config.population.rank,
+            &coefficients,
+            config.population.matrix_noise,
+            &device,
+        )
+    };
+    let elements = shape.iter().product::<usize>();
+    tensor_update(
+        tensor.reshape([elements]),
+        gradient.reshape([elements]),
+        state.params.entry(param_id).or_default(),
+        &config.update,
+    )
+    .reshape(shape)
+    .detach()
+    .set_require_grad(require_grad)
+}
+
+fn matrix_noise_coefficients(
+    coefficients: &[PairGradientCoefficient],
+) -> Vec<MatrixNoiseCoefficient> {
+    coefficients
+        .iter()
+        .map(|coefficient| {
+            MatrixNoiseCoefficient::new(coefficient.pair_index, coefficient.coefficient)
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -233,21 +340,27 @@ impl MatrixParamCatalogVisitor {
     }
 }
 
-struct EggrollPerturbMapper {
+struct EggrollPerturbMapper<'a> {
     seed: u64,
     generation: u64,
     pair_index: u64,
     rank: usize,
+    matrix_noise: MatrixNoiseMode,
     sigma: f32,
     sign: AntitheticSign,
+    allowed_param_ids: Option<&'a BTreeSet<u64>>,
     perturbed_params: usize,
 }
 
-impl<B: Backend> ModuleMapper<B> for EggrollPerturbMapper {
+impl<B: Backend> ModuleMapper<B> for EggrollPerturbMapper<'_> {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, tensor, mapper) = param.consume();
         let require_grad = tensor.is_require_grad();
-        if D == 0 {
+        if D == 0
+            || self
+                .allowed_param_ids
+                .is_some_and(|allowed| !allowed.contains(&id.val()))
+        {
             return Param::from_mapped_value(id, tensor, mapper);
         }
         let spec = MatrixNoiseSpec::new(
@@ -260,7 +373,7 @@ impl<B: Backend> ModuleMapper<B> for EggrollPerturbMapper {
         let tensor = if D < 2 {
             perturb_gaussian_tensor(tensor, self.sigma, self.sign, spec)
         } else {
-            perturb_matrix_stack(tensor, self.sigma, self.sign, spec)
+            perturb_matrix_stack_with_mode(tensor, self.sigma, self.sign, spec, self.matrix_noise)
         }
         .detach()
         .set_require_grad(require_grad);
@@ -273,9 +386,11 @@ struct EggrollUpdateMapper<'a, B: Backend> {
     seed: u64,
     generation: u64,
     rank: usize,
+    matrix_noise: MatrixNoiseMode,
     coefficients: &'a [PairGradientCoefficient],
     update: &'a burn_eggroll::EggrollUpdateConfig,
     state: &'a mut EggrollModuleOptimizerState<B>,
+    allowed_param_ids: Option<&'a BTreeSet<u64>>,
     updated_params: usize,
 }
 
@@ -283,41 +398,49 @@ impl<B: Backend> ModuleMapper<B> for EggrollUpdateMapper<'_, B> {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, tensor, mapper) = param.consume();
         let require_grad = tensor.is_require_grad();
-        if D == 0 || self.coefficients.is_empty() {
+        if D == 0
+            || self.coefficients.is_empty()
+            || self
+                .allowed_param_ids
+                .is_some_and(|allowed| !allowed.contains(&id.val()))
+        {
             return Param::from_mapped_value(id, tensor, mapper);
         }
         let shape: [usize; D] = tensor.shape().dims();
         let device = tensor.device();
-        let gradient = self
-            .coefficients
-            .iter()
-            .fold(None, |accumulated, coefficient| {
-                let spec = MatrixNoiseSpec::new(
-                    self.seed,
-                    id.val(),
-                    self.generation,
-                    coefficient.pair_index,
-                    self.rank,
-                );
-                Some(if D < 2 {
-                    accumulate_gaussian_gradient_tensor(
+        let gradient = if D < 2 {
+            self.coefficients
+                .iter()
+                .fold(None, |accumulated, coefficient| {
+                    let spec = MatrixNoiseSpec::new(
+                        self.seed,
+                        id.val(),
+                        self.generation,
+                        coefficient.pair_index,
+                        self.rank,
+                    );
+                    Some(accumulate_gaussian_gradient_tensor(
                         accumulated,
                         coefficient.coefficient,
                         shape,
                         spec,
                         &device,
-                    )
-                } else {
-                    accumulate_low_rank_gradient_matrix_stack(
-                        accumulated,
-                        coefficient.coefficient,
-                        shape,
-                        spec,
-                        &device,
-                    )
+                    ))
                 })
-            })
-            .expect("non-empty eggroll coefficients should produce a gradient");
+                .expect("non-empty eggroll coefficients should produce a gradient")
+        } else {
+            let coefficients = matrix_noise_coefficients(self.coefficients);
+            accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode(
+                shape,
+                self.seed,
+                id.val(),
+                self.generation,
+                self.rank,
+                &coefficients,
+                self.matrix_noise,
+                &device,
+            )
+        };
         let elements = shape.iter().product::<usize>();
         let param_state = self.state.params.entry(id.val()).or_default();
         let tensor = tensor_update(
@@ -371,6 +494,22 @@ mod tests {
             .expect("tensor values")
     }
 
+    fn max_abs_diff(lhs: Vec<f32>, rhs: Vec<f32>) -> f32 {
+        assert_eq!(lhs.len(), rhs.len(), "tensor length mismatch");
+        lhs.into_iter()
+            .zip(rhs)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
+        assert_eq!(lhs.len(), rhs.len(), "tensor length mismatch");
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(left, right)| left * right)
+            .sum()
+    }
+
     #[test]
     fn catalog_collects_matrix_stack_parameters_only() {
         let module = toy_module();
@@ -406,6 +545,71 @@ mod tests {
     }
 
     #[test]
+    fn perturbation_respects_matrix_noise_mode() {
+        let raw_config = EggrollConfig {
+            sigma: 0.01,
+            population: burn_eggroll::PopulationConfig {
+                rank: 2,
+                matrix_noise: MatrixNoiseMode::Raw,
+                ..burn_eggroll::PopulationConfig::default()
+            },
+            ..EggrollConfig::default()
+        };
+        let spectral_config = EggrollConfig {
+            population: burn_eggroll::PopulationConfig {
+                matrix_noise: MatrixNoiseMode::OrthogonalSpectral,
+                ..raw_config.population.clone()
+            },
+            ..raw_config.clone()
+        };
+        let base = toy_module();
+        let raw =
+            perturb_module::<TestBackend, _>(base.clone(), &raw_config, 3, 7, AntitheticSign::Plus);
+        let spectral =
+            perturb_module::<TestBackend, _>(base, &spectral_config, 3, 7, AntitheticSign::Plus);
+        assert_ne!(
+            tensor_values(raw.weight.val()),
+            tensor_values(spectral.weight.val())
+        );
+        assert_ne!(
+            tensor_values(raw.stack.val()),
+            tensor_values(spectral.stack.val())
+        );
+    }
+
+    #[test]
+    fn scoped_perturbation_only_changes_allowed_parameters() {
+        let config = EggrollConfig {
+            sigma: 0.01,
+            ..EggrollConfig::default()
+        };
+        let base = toy_module();
+        let mut allowed = BTreeSet::new();
+        allowed.insert(base.weight.id.val());
+        let updated = perturb_module_with_allowed_param_ids::<TestBackend, _>(
+            base.clone(),
+            &config,
+            3,
+            7,
+            AntitheticSign::Plus,
+            Some(&allowed),
+        );
+
+        assert_ne!(
+            tensor_values(base.weight.val()),
+            tensor_values(updated.weight.val())
+        );
+        assert_eq!(
+            tensor_values(base.bias.val()),
+            tensor_values(updated.bias.val())
+        );
+        assert_eq!(
+            tensor_values(base.stack.val()),
+            tensor_values(updated.stack.val())
+        );
+    }
+
+    #[test]
     fn update_changes_float_params() {
         let config = EggrollConfig {
             sigma: 0.01,
@@ -417,8 +621,8 @@ mod tests {
         let mut state = EggrollModuleOptimizerState::new();
         let fitness = [AntitheticFitness {
             pair_index: 0,
-            plus: 0.0,
-            minus: 1.0,
+            plus: 1.0,
+            minus: 0.0,
         }];
         let (updated, _metrics) =
             apply_antithetic_update(base, &config, 0, &fitness, &mut state).expect("update");
@@ -427,6 +631,118 @@ mod tests {
         assert_ne!(updated_weight, base_weight);
         assert_ne!(updated_bias, base_bias);
         assert_eq!(state.len(), 3);
+    }
+
+    #[test]
+    fn fitness_update_moves_toward_higher_fitness_perturbation() {
+        let config = EggrollConfig {
+            sigma: 0.01,
+            population: burn_eggroll::PopulationConfig {
+                rank: 2,
+                ..burn_eggroll::PopulationConfig::default()
+            },
+            ..EggrollConfig::default()
+        };
+        let base = toy_module();
+        let plus =
+            perturb_module::<TestBackend, _>(base.clone(), &config, 0, 0, AntitheticSign::Plus);
+        let base_weight = tensor_values(base.weight.val());
+        let plus_delta = tensor_values(plus.weight.val())
+            .into_iter()
+            .zip(base_weight.iter())
+            .map(|(plus, base)| plus - base)
+            .collect::<Vec<_>>();
+        let fitness = [AntitheticFitness {
+            pair_index: 0,
+            plus: 1.0,
+            minus: 0.0,
+        }];
+        let mut state = EggrollModuleOptimizerState::new();
+        let (updated, _metrics) =
+            apply_antithetic_update(base, &config, 0, &fitness, &mut state).expect("update");
+        let update_delta = tensor_values(updated.weight.val())
+            .into_iter()
+            .zip(base_weight.iter())
+            .map(|(updated, base)| updated - base)
+            .collect::<Vec<_>>();
+
+        assert!(
+            dot(&update_delta, &plus_delta) > 0.0,
+            "higher plus fitness should move parameters toward the plus perturbation"
+        );
+    }
+
+    #[test]
+    fn scoped_update_only_changes_allowed_parameters() {
+        let config = EggrollConfig {
+            sigma: 0.01,
+            ..EggrollConfig::default()
+        };
+        let base = toy_module();
+        let base_weight = tensor_values(base.weight.val());
+        let base_bias = tensor_values(base.bias.val());
+        let base_stack = tensor_values(base.stack.val());
+        let mut allowed = BTreeSet::new();
+        allowed.insert(base.stack.id.val());
+        let mut state = EggrollModuleOptimizerState::new();
+        let fitness = [AntitheticFitness {
+            pair_index: 0,
+            plus: 0.0,
+            minus: 1.0,
+        }];
+        let (updated, _metrics) = apply_antithetic_update_with_allowed_param_ids(
+            base,
+            &config,
+            0,
+            &fitness,
+            &mut state,
+            Some(&allowed),
+        )
+        .expect("update");
+        assert_eq!(tensor_values(updated.weight.val()), base_weight);
+        assert_eq!(tensor_values(updated.bias.val()), base_bias);
+        assert_ne!(tensor_values(updated.stack.val()), base_stack);
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn tensor_update_helper_matches_scoped_module_update() {
+        let config = EggrollConfig {
+            sigma: 0.01,
+            ..EggrollConfig::default()
+        };
+        let base = toy_module();
+        let fitness = [AntitheticFitness {
+            pair_index: 0,
+            plus: 0.0,
+            minus: 1.0,
+        }];
+        let mut allowed = BTreeSet::new();
+        allowed.insert(base.stack.id.val());
+        let mut module_state = EggrollModuleOptimizerState::new();
+        let (updated, _metrics) = apply_antithetic_update_with_allowed_param_ids(
+            base.clone(),
+            &config,
+            0,
+            &fitness,
+            &mut module_state,
+            Some(&allowed),
+        )
+        .expect("module update");
+
+        let coefficients = pair_gradient_coefficients(&config, 0, &fitness).expect("coefficients");
+        let mut tensor_state = EggrollModuleOptimizerState::new();
+        let tensor = apply_antithetic_update_to_tensor_with_coefficients(
+            base.stack.val(),
+            base.stack.id.val(),
+            &config,
+            0,
+            &coefficients,
+            &mut tensor_state,
+        );
+
+        let diff = max_abs_diff(tensor_values(updated.stack.val()), tensor_values(tensor));
+        assert!(diff <= 1.0e-6, "tensor update drifted by {diff}");
     }
 
     #[test]

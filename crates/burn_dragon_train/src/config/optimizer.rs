@@ -16,6 +16,42 @@ pub enum OptimizerScheduleMode {
     DragonReference,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EggrollPopulationExecutionBackend {
+    #[default]
+    Auto,
+    Reference,
+    Cuda,
+    Factorized,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EggrollPerturbationScope {
+    #[default]
+    DragonCoreProjection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EggrollPopulationExecutionConfig {
+    pub backend: EggrollPopulationExecutionBackend,
+    pub perturbation_scope: EggrollPerturbationScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_tile_size: Option<usize>,
+}
+
+impl Default for EggrollPopulationExecutionConfig {
+    fn default() -> Self {
+        Self {
+            backend: EggrollPopulationExecutionBackend::Auto,
+            perturbation_scope: EggrollPerturbationScope::DragonCoreProjection,
+            population_tile_size: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EggrollAutoPopulationConfig {
@@ -108,6 +144,18 @@ impl EggrollAutoPopulationConfig {
     }
 }
 
+impl EggrollPopulationExecutionConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(population_tile_size) = self.population_tile_size {
+            validate_even_population(
+                "optimizer.eggroll_population_execution.population_tile_size",
+                population_tile_size,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl EggrollChunkAutotuneConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
@@ -151,6 +199,8 @@ pub struct OptimizerConfig {
     pub grad_clip_value: Option<f32>,
     #[serde(default)]
     pub eggroll: burn_eggroll::EggrollConfig,
+    #[serde(default)]
+    pub eggroll_population_execution: EggrollPopulationExecutionConfig,
     #[serde(default)]
     pub eggroll_auto_population: EggrollAutoPopulationConfig,
 }
@@ -236,6 +286,7 @@ impl OptimizerConfig {
                 "optimizer.grad_clip_norm and optimizer.grad_clip_value are mutually exclusive"
             ));
         }
+        self.eggroll_population_execution.validate()?;
         self.eggroll_auto_population.validate()?;
         if self.eggroll_auto_population.enabled && !matches!(self.name, OptimizerKind::Eggroll) {
             return Err(anyhow!(
@@ -356,6 +407,7 @@ mod tests {
             grad_clip_norm: None,
             grad_clip_value: None,
             eggroll: burn_eggroll::EggrollConfig::default(),
+            eggroll_population_execution: EggrollPopulationExecutionConfig::default(),
             eggroll_auto_population: EggrollAutoPopulationConfig::default(),
         }
     }
@@ -405,6 +457,54 @@ mod tests {
     }
 
     #[test]
+    fn eggroll_population_execution_rejects_odd_tile_size() {
+        let config = OptimizerConfig {
+            name: OptimizerKind::Eggroll,
+            eggroll_population_execution: EggrollPopulationExecutionConfig {
+                perturbation_scope: EggrollPerturbationScope::DragonCoreProjection,
+                population_tile_size: Some(3),
+                ..EggrollPopulationExecutionConfig::default()
+            },
+            ..base_optimizer()
+        };
+        let err = config.validate().expect_err("expected validation failure");
+        assert!(
+            err.to_string().contains("population_tile_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn eggroll_population_execution_allows_cuda_tensorized_backend() {
+        let config = OptimizerConfig {
+            name: OptimizerKind::Eggroll,
+            eggroll_population_execution: EggrollPopulationExecutionConfig {
+                backend: EggrollPopulationExecutionBackend::Cuda,
+                perturbation_scope: EggrollPerturbationScope::DragonCoreProjection,
+                ..EggrollPopulationExecutionConfig::default()
+            },
+            ..base_optimizer()
+        };
+        config.validate().expect("cuda tensorized config validates");
+    }
+
+    #[test]
+    fn eggroll_population_execution_allows_factorized_backend() {
+        let config = OptimizerConfig {
+            name: OptimizerKind::Eggroll,
+            eggroll_population_execution: EggrollPopulationExecutionConfig {
+                backend: EggrollPopulationExecutionBackend::Factorized,
+                perturbation_scope: EggrollPerturbationScope::DragonCoreProjection,
+                ..EggrollPopulationExecutionConfig::default()
+            },
+            ..base_optimizer()
+        };
+        config
+            .validate()
+            .expect("factorized tensorized config validates");
+    }
+
+    #[test]
     fn eggroll_auto_population_resolves_from_batch_size() {
         let mut config = OptimizerConfig {
             name: OptimizerKind::Eggroll,
@@ -414,6 +514,7 @@ mod tests {
                     population_chunk_size: 16,
                     rank: 2,
                     seed: 7,
+                    matrix_noise: burn_eggroll::MatrixNoiseMode::default(),
                 },
                 ..burn_eggroll::EggrollConfig::default()
             },

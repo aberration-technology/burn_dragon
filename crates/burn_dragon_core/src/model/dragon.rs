@@ -69,10 +69,15 @@ use super::residual_stream::LowRankResidualOutput;
 #[cfg(any(feature = "viz", feature = "probe"))]
 use super::residual_stream::lowrank_residual_step_branch_thresholds_relu_native;
 use super::residual_stream::lowrank_residual_step_next_branch_thresholds;
-#[cfg(not(any(feature = "viz", feature = "probe")))]
-use super::residual_stream::lowrank_residual_step_next_branch_thresholds_relu_native;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds;
+#[cfg(any(feature = "viz", feature = "probe"))]
+use super::residual_stream::{decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat};
+#[cfg(not(any(feature = "viz", feature = "probe")))]
+use super::residual_stream::{
+    decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat,
+    lowrank_residual_step_next_branch_thresholds_relu_native,
+};
 use super::sequence::gdn2::{
     GatedDeltaNet2Implementation, GatedDeltaNet2Parameters, ResolvedGatedDeltaNet2Config,
     gated_deltanet2_reference, l2_normalize_last,
@@ -148,6 +153,47 @@ pub struct DragonModel<B: Backend> {
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
     #[module(skip)]
     nca_factorized_head_tables: Option<NcaFactorizedHeadTables>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedLowrankWeights<B: Backend> {
+    pub encoder: Tensor<B, 3>,
+    pub encoder_v: Tensor<B, 3>,
+    pub decoder: Tensor<B, 2>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedLowrankPopulationWeights<B: Backend> {
+    pub encoder: Tensor<B, 4>,
+    pub encoder_v: Tensor<B, 4>,
+    pub decoder: Tensor<B, 3>,
+}
+
+impl<B: Backend> SharedLowrankPopulationWeights<B> {
+    pub fn population_size(&self) -> usize {
+        self.encoder.shape().dims::<4>()[0]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedLowrankPopulationFactors<B: Backend> {
+    pub encoder_a: Tensor<B, 4>,
+    pub encoder_b: Tensor<B, 4>,
+    pub encoder_v_a: Tensor<B, 4>,
+    pub encoder_v_b: Tensor<B, 4>,
+    pub decoder_a: Tensor<B, 3>,
+    pub decoder_b: Tensor<B, 3>,
+    pub signs: Tensor<B, 1>,
+    pub encoder_scale: f64,
+    pub encoder_v_scale: f64,
+    pub decoder_scale: f64,
+    pub sigma: f32,
+}
+
+impl<B: Backend> SharedLowrankPopulationFactors<B> {
+    pub fn population_size(&self) -> usize {
+        self.signs.shape().dims::<1>()[0]
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -438,6 +484,14 @@ fn widen_upstream_gated_deltanet2_prefix<B: Backend>(
 }
 
 impl<B: Backend> DragonModel<B> {
+    fn replace_param_value<const D: usize>(
+        param: Param<Tensor<B, D>>,
+        value: Tensor<B, D>,
+    ) -> Param<Tensor<B, D>> {
+        let (id, _old, mapper) = param.consume();
+        Param::from_mapped_value(id, value, mapper)
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }
@@ -666,6 +720,42 @@ impl<B: Backend> DragonModel<B> {
         self.encoder.val().shape().dims::<3>()[2]
     }
 
+    pub fn shared_lowrank_weights(&self) -> SharedLowrankWeights<B> {
+        SharedLowrankWeights {
+            encoder: self.encoder.val(),
+            encoder_v: self.encoder_v.val(),
+            decoder: self.decoder.val(),
+        }
+    }
+
+    pub fn with_shared_lowrank_weights(mut self, weights: SharedLowrankWeights<B>) -> Self {
+        assert_eq!(
+            weights.encoder.shape().dims::<3>(),
+            self.encoder.val().shape().dims::<3>(),
+            "shared lowrank encoder shape mismatch"
+        );
+        assert_eq!(
+            weights.encoder_v.shape().dims::<3>(),
+            self.encoder_v.val().shape().dims::<3>(),
+            "shared lowrank encoder_v shape mismatch"
+        );
+        assert_eq!(
+            weights.decoder.shape().dims::<2>(),
+            self.decoder.val().shape().dims::<2>(),
+            "shared lowrank decoder shape mismatch"
+        );
+        self.encoder = Self::replace_param_value(self.encoder, weights.encoder);
+        self.encoder_v = Self::replace_param_value(self.encoder_v, weights.encoder_v);
+        self.decoder = Self::replace_param_value(self.decoder, weights.decoder);
+        self
+    }
+
+    pub fn supports_shared_lowrank_population_forward(&self) -> bool {
+        !self.y_neuron_recurrence.enabled
+            && self.rollout_fast_steps_per_slow_step == 1
+            && self.language_head.uses_flat_token_logits()
+    }
+
     pub fn widen_latent_total(
         &self,
         target_config: DragonConfig,
@@ -858,6 +948,91 @@ impl<B: Backend> DragonModel<B> {
     pub fn forward_with_hidden(&self, tokens: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let mut state = self.init_state();
         self.forward_with_hidden_and_state(tokens, &mut state)
+    }
+
+    pub fn forward_with_shared_lowrank_population(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        lowrank: SharedLowrankPopulationWeights<B>,
+    ) -> Tensor<B, 3>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        assert!(
+            !self.y_neuron_recurrence.enabled,
+            "shared lowrank population forward does not support y-neuron recurrence"
+        );
+        assert_eq!(
+            self.rollout_fast_steps_per_slow_step, 1,
+            "shared lowrank population forward requires rollout_fast_steps_per_slow_step = 1"
+        );
+        assert!(
+            self.language_head.uses_flat_token_logits(),
+            "shared lowrank population forward requires flat token logits"
+        );
+        let population = lowrank.population_size();
+        assert!(population > 0, "population size must be > 0");
+        self.assert_shared_lowrank_population_shapes(&lowrank);
+
+        let embedded = self.embed.forward(tokens);
+        let embedded_population = Tensor::cat(
+            (0..population)
+                .map(|_| embedded.clone())
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let mut state = self.init_state();
+        let hidden = self.forward_hidden_with_shared_lowrank_population_from_embedded_single_pass(
+            embedded_population,
+            &mut state,
+            &lowrank,
+            population,
+        );
+        self.project_hidden_to_logits(hidden)
+    }
+
+    pub fn forward_with_shared_lowrank_population_factors(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        factors: SharedLowrankPopulationFactors<B>,
+    ) -> Tensor<B, 3>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        assert!(
+            !self.y_neuron_recurrence.enabled,
+            "shared lowrank population factor forward does not support y-neuron recurrence"
+        );
+        assert_eq!(
+            self.rollout_fast_steps_per_slow_step, 1,
+            "shared lowrank population factor forward requires rollout_fast_steps_per_slow_step = 1"
+        );
+        assert!(
+            self.language_head.uses_flat_token_logits(),
+            "shared lowrank population factor forward requires flat token logits"
+        );
+        let population = factors.population_size();
+        assert!(population > 0, "population size must be > 0");
+        self.assert_shared_lowrank_population_factor_shapes(&factors);
+
+        let embedded = self.embed.forward(tokens);
+        let embedded_population = Tensor::cat(
+            (0..population)
+                .map(|_| embedded.clone())
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let mut state = self.init_state();
+        let hidden = self
+            .forward_hidden_with_shared_lowrank_population_factors_from_embedded_single_pass(
+                embedded_population,
+                &mut state,
+                &factors,
+                population,
+            );
+        self.project_hidden_to_logits(hidden)
     }
 
     pub fn embed_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
@@ -1089,6 +1264,519 @@ impl<B: Backend> DragonModel<B> {
             0,
         );
         (encoder, encoder_v, decoder, latent_per_head)
+    }
+
+    fn assert_shared_lowrank_population_shapes(&self, lowrank: &SharedLowrankPopulationWeights<B>) {
+        let [population, heads, embd, latent_capacity] = lowrank.encoder.shape().dims::<4>();
+        assert!(population > 0, "population size must be > 0");
+        assert_eq!(heads, self.n_head, "population encoder heads mismatch");
+        assert_eq!(
+            embd, self.n_embd,
+            "population encoder embedding dim mismatch"
+        );
+        assert_eq!(
+            latent_capacity,
+            self.latent_per_head_capacity(),
+            "population encoder latent capacity mismatch"
+        );
+        assert_eq!(
+            lowrank.encoder_v.shape().dims::<4>(),
+            [population, self.n_head, self.n_embd, latent_capacity],
+            "population encoder_v shape mismatch"
+        );
+        assert_eq!(
+            lowrank.decoder.shape().dims::<3>(),
+            [population, self.latent_total_capacity(), self.n_embd],
+            "population decoder shape mismatch"
+        );
+    }
+
+    fn assert_shared_lowrank_population_factor_shapes(
+        &self,
+        factors: &SharedLowrankPopulationFactors<B>,
+    ) {
+        let population = factors.population_size();
+        let [encoder_population, heads, embd, encoder_rank] = factors.encoder_a.shape().dims::<4>();
+        let [
+            encoder_b_population,
+            encoder_b_heads,
+            latent_capacity,
+            encoder_b_rank,
+        ] = factors.encoder_b.shape().dims::<4>();
+        assert!(population > 0, "population size must be > 0");
+        assert_eq!(
+            encoder_population, population,
+            "population encoder factor count mismatch"
+        );
+        assert_eq!(
+            heads, self.n_head,
+            "population encoder factor heads mismatch"
+        );
+        assert_eq!(
+            embd, self.n_embd,
+            "population encoder factor embedding dim mismatch"
+        );
+        assert_eq!(
+            encoder_b_population, population,
+            "population encoder factor-b count mismatch"
+        );
+        assert_eq!(
+            encoder_b_heads, self.n_head,
+            "population encoder factor-b heads mismatch"
+        );
+        assert_eq!(
+            latent_capacity,
+            self.latent_per_head_capacity(),
+            "population encoder factor latent capacity mismatch"
+        );
+        assert_eq!(
+            encoder_b_rank, encoder_rank,
+            "population encoder factor rank mismatch"
+        );
+        assert_eq!(
+            factors.encoder_v_a.shape().dims::<4>(),
+            [population, self.n_head, self.n_embd, encoder_rank],
+            "population encoder_v factor-a shape mismatch"
+        );
+        assert_eq!(
+            factors.encoder_v_b.shape().dims::<4>(),
+            [
+                population,
+                self.n_head,
+                self.latent_per_head_capacity(),
+                encoder_rank,
+            ],
+            "population encoder_v factor-b shape mismatch"
+        );
+
+        let [decoder_population, decoder_rows, decoder_rank] =
+            factors.decoder_a.shape().dims::<3>();
+        let [decoder_b_population, decoder_cols, decoder_b_rank] =
+            factors.decoder_b.shape().dims::<3>();
+        assert_eq!(
+            decoder_population, population,
+            "population decoder factor-a count mismatch"
+        );
+        assert_eq!(
+            decoder_rows,
+            self.latent_total_capacity(),
+            "population decoder factor-a rows mismatch"
+        );
+        assert_eq!(
+            decoder_b_population, population,
+            "population decoder factor-b count mismatch"
+        );
+        assert_eq!(
+            decoder_cols, self.n_embd,
+            "population decoder factor-b cols mismatch"
+        );
+        assert_eq!(
+            decoder_b_rank, decoder_rank,
+            "population decoder factor rank mismatch"
+        );
+    }
+
+    fn population_layer_lowrank_weights(
+        &self,
+        layer_idx: usize,
+        lowrank: &SharedLowrankPopulationWeights<B>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 3>, usize) {
+        let latent_per_head = self.layer_latent_per_head(layer_idx);
+        let capacity_per_head = self.latent_per_head_capacity();
+        let population = lowrank.population_size();
+        let encoder = lowrank.encoder.clone().slice([
+            0..population,
+            0..self.n_head,
+            0..self.n_embd,
+            0..latent_per_head,
+        ]);
+        let encoder_v = lowrank.encoder_v.clone().slice([
+            0..population,
+            0..self.n_head,
+            0..self.n_embd,
+            0..latent_per_head,
+        ]);
+        let decoder = Tensor::cat(
+            (0..self.n_head)
+                .map(|head| {
+                    let start = head * capacity_per_head;
+                    lowrank.decoder.clone().slice([
+                        0..population,
+                        start..start + latent_per_head,
+                        0..self.n_embd,
+                    ])
+                })
+                .collect(),
+            1,
+        );
+        (encoder, encoder_v, decoder, latent_per_head)
+    }
+
+    fn population_layer_lowrank_factors(
+        &self,
+        layer_idx: usize,
+        factors: &SharedLowrankPopulationFactors<B>,
+    ) -> (
+        Tensor<B, 4>,
+        Tensor<B, 4>,
+        Tensor<B, 4>,
+        Tensor<B, 4>,
+        Tensor<B, 3>,
+        Tensor<B, 3>,
+        Tensor<B, 1>,
+        usize,
+    ) {
+        let latent_per_head = self.layer_latent_per_head(layer_idx);
+        let capacity_per_head = self.latent_per_head_capacity();
+        let population = factors.population_size();
+        let encoder_rank = factors.encoder_a.shape().dims::<4>()[3];
+        let decoder_rank = factors.decoder_a.shape().dims::<3>()[2];
+        let encoder_a = factors.encoder_a.clone();
+        let encoder_b = factors.encoder_b.clone().slice([
+            0..population,
+            0..self.n_head,
+            0..latent_per_head,
+            0..encoder_rank,
+        ]);
+        let encoder_v_a = factors.encoder_v_a.clone();
+        let encoder_v_b = factors.encoder_v_b.clone().slice([
+            0..population,
+            0..self.n_head,
+            0..latent_per_head,
+            0..encoder_rank,
+        ]);
+        let decoder_a = Tensor::cat(
+            (0..self.n_head)
+                .map(|head| {
+                    let start = head * capacity_per_head;
+                    factors.decoder_a.clone().slice([
+                        0..population,
+                        start..start + latent_per_head,
+                        0..decoder_rank,
+                    ])
+                })
+                .collect(),
+            1,
+        );
+        (
+            encoder_a,
+            encoder_b,
+            encoder_v_a,
+            encoder_v_b,
+            decoder_a,
+            factors.decoder_b.clone(),
+            factors.signs.clone(),
+            latent_per_head,
+        )
+    }
+
+    fn project_shared_lowrank_population_positive(
+        &self,
+        dense: Tensor<B, 4>,
+        projector: Tensor<B, 4>,
+        population: usize,
+        relu_threshold: f32,
+        use_fused: bool,
+        latent_pattern: &crate::kernel::BlockPattern1d,
+        sparse_mask: Option<Tensor<B, 4>>,
+    ) -> Tensor<B, 4>
+    where
+        B::FloatTensorPrimitive: 'static,
+    {
+        let [flat_batch, streams, time, embd] = dense.shape().dims::<4>();
+        assert_eq!(
+            flat_batch % population,
+            0,
+            "population flat batch must divide evenly"
+        );
+        let per_population_batch = flat_batch / population;
+        if population == 1 {
+            return self.project_lowrank_positive(LowrankProjectionRequest {
+                dense,
+                projector,
+                relu_threshold,
+                use_fused,
+                latent_pattern,
+                sparse_mask,
+            });
+        }
+
+        let [projector_population, heads, projector_embd, latent] = projector.shape().dims::<4>();
+        assert_eq!(
+            projector_population, population,
+            "population projector count mismatch"
+        );
+        assert_eq!(projector_embd, embd, "population projector dim mismatch");
+        if use_fused {
+            return crate::kernel::relu_lowrank::fused_forward_with_executor(
+                dense,
+                projector,
+                None,
+                relu_threshold,
+                latent_pattern,
+                sparse_mask,
+                self.kernel.lowrank_grad_input_executor,
+            );
+        }
+
+        let mut projected = if streams == 1 {
+            let dense_grouped = dense.reshape([population, per_population_batch * time, embd]);
+            let projector_grouped =
+                projector
+                    .swap_dims(1, 2)
+                    .reshape([population, embd, heads * latent]);
+            dense_grouped
+                .matmul(projector_grouped)
+                .reshape([population, per_population_batch, time, heads, latent])
+                .swap_dims(2, 3)
+                .reshape([flat_batch, heads, time, latent])
+        } else if streams == heads {
+            let dense_grouped = dense
+                .reshape([population, per_population_batch, heads, time, embd])
+                .swap_dims(1, 2)
+                .reshape([population, heads, per_population_batch * time, embd]);
+            dense_grouped
+                .matmul(projector)
+                .reshape([population, heads, per_population_batch, time, latent])
+                .swap_dims(1, 2)
+                .reshape([flat_batch, heads, time, latent])
+        } else {
+            return Tensor::cat(
+                (0..population)
+                    .map(|population_idx| {
+                        let start = population_idx * per_population_batch;
+                        let end = start + per_population_batch;
+                        let dense_slice = dense.clone().slice_dim(0, start..end);
+                        let projector_slice = projector
+                            .clone()
+                            .slice_dim(0, population_idx..population_idx + 1);
+                        self.project_lowrank_positive(LowrankProjectionRequest {
+                            dense: dense_slice,
+                            projector: projector_slice,
+                            relu_threshold,
+                            use_fused,
+                            latent_pattern,
+                            sparse_mask: sparse_mask.clone(),
+                        })
+                    })
+                    .collect(),
+                0,
+            );
+        };
+
+        if relu_threshold != 0.0 {
+            projected = projected.sub_scalar(relu_threshold);
+        }
+        let mut activated = activation::relu(projected);
+        if latent_pattern.is_sparse() {
+            let mask = sparse_mask
+                .unwrap_or_else(|| latent_pattern.mask::<B>(latent, &activated.device()));
+            activated = activated * mask;
+        }
+        activated
+    }
+
+    fn project_shared_lowrank_population_factorized_positive(
+        &self,
+        dense: Tensor<B, 4>,
+        base_projector: Tensor<B, 4>,
+        factor_a: Tensor<B, 4>,
+        factor_b: Tensor<B, 4>,
+        signs: Tensor<B, 1>,
+        sigma_scale: f64,
+        population: usize,
+        relu_threshold: f32,
+        latent_pattern: &crate::kernel::BlockPattern1d,
+        sparse_mask: Option<Tensor<B, 4>>,
+    ) -> Tensor<B, 4> {
+        let [flat_batch, streams, time, embd] = dense.shape().dims::<4>();
+        assert_eq!(
+            flat_batch % population,
+            0,
+            "population flat batch must divide evenly"
+        );
+        let per_population_batch = flat_batch / population;
+        let [factor_population, heads, factor_embd, rank] = factor_a.shape().dims::<4>();
+        let [factor_b_population, factor_b_heads, latent, factor_b_rank] =
+            factor_b.shape().dims::<4>();
+        assert_eq!(
+            factor_population, population,
+            "population factor count mismatch"
+        );
+        assert_eq!(
+            factor_b_population, population,
+            "population factor-b count mismatch"
+        );
+        assert_eq!(factor_b_heads, heads, "population factor head mismatch");
+        assert_eq!(factor_embd, embd, "population factor embedding mismatch");
+        assert_eq!(factor_b_rank, rank, "population factor rank mismatch");
+
+        let mut projected = if streams == 1 || streams == heads {
+            let base_projected = dense.clone().matmul(base_projector);
+            let steps = per_population_batch * time;
+            let correction = if streams == 1 {
+                let dense_grouped = dense.reshape([population, steps, embd]);
+                dense_grouped
+                    .reshape([population, 1, steps, embd])
+                    .repeat_dim(1, heads)
+                    .matmul(factor_a)
+                    .matmul(factor_b.swap_dims(2, 3))
+            } else {
+                let dense_grouped = dense
+                    .reshape([population, per_population_batch, heads, time, embd])
+                    .swap_dims(1, 2)
+                    .reshape([population, heads, steps, embd]);
+                dense_grouped
+                    .matmul(factor_a)
+                    .matmul(factor_b.swap_dims(2, 3))
+            };
+            let correction = correction
+                * signs
+                    .clone()
+                    .reshape([population, 1, 1, 1])
+                    .mul_scalar(sigma_scale);
+            let correction = correction
+                .reshape([population, heads, per_population_batch, time, latent])
+                .swap_dims(1, 2)
+                .reshape([flat_batch, heads, time, latent]);
+            base_projected + correction
+        } else {
+            Tensor::cat(
+                (0..population)
+                    .map(|population_idx| {
+                        let start = population_idx * per_population_batch;
+                        let end = start + per_population_batch;
+                        let dense_slice = dense.clone().slice_dim(0, start..end);
+                        let delta = factor_a
+                            .clone()
+                            .slice_dim(0, population_idx..population_idx + 1)
+                            .matmul(
+                                factor_b
+                                    .clone()
+                                    .slice_dim(0, population_idx..population_idx + 1)
+                                    .swap_dims(2, 3),
+                            )
+                            * signs
+                                .clone()
+                                .slice_dim(0, population_idx..population_idx + 1)
+                                .reshape([1, 1, 1, 1])
+                                .mul_scalar(sigma_scale);
+                        dense_slice.matmul(base_projector.clone() + delta)
+                    })
+                    .collect(),
+                0,
+            )
+        };
+
+        if relu_threshold != 0.0 {
+            projected = projected.sub_scalar(relu_threshold);
+        }
+        let mut activated = activation::relu(projected);
+        if latent_pattern.is_sparse() {
+            let mask = sparse_mask
+                .unwrap_or_else(|| latent_pattern.mask::<B>(latent, &activated.device()));
+            activated = activated * mask;
+        }
+        activated
+    }
+
+    fn decode_shared_lowrank_population_tail(
+        &self,
+        y_neuron: Tensor<B, 4>,
+        decoder: Tensor<B, 3>,
+        population: usize,
+    ) -> Tensor<B, 4> {
+        let [flat_batch, heads, time, latent] = y_neuron.shape().dims::<4>();
+        assert_eq!(
+            flat_batch % population,
+            0,
+            "population y-neuron batch must divide evenly"
+        );
+        let per_population_batch = flat_batch / population;
+        if population == 1 {
+            let decoder_rows = decoder.shape().dims::<3>()[1];
+            return decode_y_neuron_tail(y_neuron, decoder.reshape([decoder_rows, self.n_embd]));
+        }
+
+        let [decoder_population, decoder_rows, decoder_dim] = decoder.shape().dims::<3>();
+        assert_eq!(
+            decoder_population, population,
+            "population decoder count mismatch"
+        );
+        assert_eq!(
+            decoder_rows,
+            heads * latent,
+            "population decoder latent rows mismatch"
+        );
+        assert_eq!(decoder_dim, self.n_embd, "population decoder dim mismatch");
+
+        if decode_y_neuron_tail_uses_legacy_flat() {
+            let mixed = y_neuron
+                .reshape([population, per_population_batch, heads, time, latent])
+                .swap_dims(2, 3)
+                .reshape([population, per_population_batch * time, heads * latent]);
+            return mixed
+                .matmul(decoder)
+                .reshape([population, per_population_batch, time, self.n_embd])
+                .reshape([flat_batch, 1, time, self.n_embd]);
+        }
+
+        let y_by_head = y_neuron
+            .reshape([population, per_population_batch, heads, time, latent])
+            .swap_dims(1, 2)
+            .reshape([population, heads, per_population_batch * time, latent]);
+        let decoder_by_head = decoder.reshape([population, heads, latent, self.n_embd]);
+        y_by_head
+            .matmul(decoder_by_head)
+            .sum_dim(1)
+            .reshape([population, per_population_batch, time, self.n_embd])
+            .reshape([flat_batch, 1, time, self.n_embd])
+    }
+
+    fn decode_shared_lowrank_population_factors_tail(
+        &self,
+        y_neuron: Tensor<B, 4>,
+        base_decoder: Tensor<B, 2>,
+        factor_a: Tensor<B, 3>,
+        factor_b: Tensor<B, 3>,
+        signs: Tensor<B, 1>,
+        sigma_scale: f64,
+        population: usize,
+    ) -> Tensor<B, 4> {
+        let [flat_batch, heads, time, latent] = y_neuron.shape().dims::<4>();
+        assert_eq!(
+            flat_batch % population,
+            0,
+            "population y-neuron batch must divide evenly"
+        );
+        let per_population_batch = flat_batch / population;
+        let [factor_population, factor_rows, rank] = factor_a.shape().dims::<3>();
+        let [factor_b_population, decoder_dim, factor_b_rank] = factor_b.shape().dims::<3>();
+        assert_eq!(
+            factor_population, population,
+            "population decoder factor count mismatch"
+        );
+        assert_eq!(
+            factor_b_population, population,
+            "population decoder factor-b count mismatch"
+        );
+        assert_eq!(
+            factor_rows,
+            heads * latent,
+            "population decoder factor row mismatch"
+        );
+        assert_eq!(factor_b_rank, rank, "population decoder rank mismatch");
+
+        let base = decode_y_neuron_tail(y_neuron.clone(), base_decoder);
+        let steps = per_population_batch * time;
+        let y_flat = y_neuron
+            .reshape([population, per_population_batch, heads, time, latent])
+            .swap_dims(2, 3)
+            .reshape([population, steps, heads * latent]);
+        let correction = y_flat.matmul(factor_a).matmul(factor_b.swap_dims(1, 2))
+            * signs.reshape([population, 1, 1]).mul_scalar(sigma_scale);
+        let correction = correction.reshape([flat_batch, 1, time, decoder_dim]);
+        base + correction
     }
 
     fn project_lowrank_positive(&self, request: LowrankProjectionRequest<'_, B>) -> Tensor<B, 4>
@@ -1396,6 +2084,338 @@ impl<B: Backend> DragonModel<B> {
         }
 
         Tensor::cat(hidden_slow, 1)
+    }
+
+    fn forward_hidden_with_shared_lowrank_population_from_embedded_single_pass(
+        &self,
+        embedded: Tensor<B, 3>,
+        state: &mut ModelState<B>,
+        lowrank: &SharedLowrankPopulationWeights<B>,
+        population: usize,
+    ) -> Tensor<B, 3>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        assert_eq!(
+            state.layers.len(),
+            self.n_layer,
+            "model state layers mismatch"
+        );
+        assert!(
+            !self.y_neuron_recurrence.enabled,
+            "population lowrank forward does not support y-neuron recurrence"
+        );
+        let [batch, time, embd] = embedded.shape().dims::<3>();
+        assert_eq!(batch % population, 0, "population batch must divide evenly");
+        let start_pos = state.position;
+        let mut current = self.norm.forward(embedded.reshape([batch, 1, time, embd]));
+        let fused = self.kernel.enabled;
+        let static_mhc_coefficients = self.mhc_shared.as_ref().and_then(|mhc| {
+            (!mhc.coefficient_policy().uses_dynamic_stream_controller()).then(|| mhc.coefficients())
+        });
+        let mut residual_history = self.initialize_language_residual_history(&current);
+
+        for (layer_idx, layer_state) in state.layers.iter_mut().enumerate() {
+            let connector = self.residual_connector_for_layer(layer_idx);
+            let current_before = residual_history.capture_previous(&current);
+            let mhc_coefficients = match connector {
+                ResidualConnectorRef::Mhc(_) => static_mhc_coefficients.as_ref(),
+                ResidualConnectorRef::Vanilla
+                | ResidualConnectorRef::AttentionResidual(_)
+                | ResidualConnectorRef::BlockAttentionResidual(_) => None,
+            };
+            let bindings = self.split_language_residuals_for_layer(
+                current,
+                &connector,
+                residual_history.as_slice(),
+                mhc_coefficients,
+            );
+            let LanguageMhcSplitBindings {
+                branch_input,
+                merge: merge_bindings,
+            } = bindings;
+            layer_state.clocked_slow_hidden = None;
+            layer_state.summary_memory_hidden = None;
+
+            let [branch_batch, branch_views, branch_time, branch_dim] =
+                branch_input.shape().dims::<4>();
+            let flat_batch = branch_batch * branch_views;
+            assert_eq!(
+                flat_batch % population,
+                0,
+                "population branch batch must divide evenly"
+            );
+            let branch_flat = branch_input.reshape([flat_batch, 1, branch_time, branch_dim]);
+            let (encoder, encoder_v, decoder, latent) =
+                self.population_layer_lowrank_weights(layer_idx, lowrank);
+            let heads = self.n_head;
+            let latent_pattern = &self.kernel.block_sparse.latent;
+            let sparse_mask = if fused && latent_pattern.is_sparse() {
+                Some(latent_pattern.mask::<B>(latent, &branch_flat.device()))
+            } else {
+                None
+            };
+            let fused_recurrent_plan = if matches!(
+                (
+                    self.sequence_kernel.memory_system,
+                    self.sequence_kernel.executor,
+                ),
+                (
+                    SequenceMemorySystem::LinearAttention,
+                    SequenceTrainingExecutor::Reference,
+                )
+            ) && self.kernel.enabled
+                && self.kernel.wgpu_recurrent_kernel
+                && supports_recurrent_backend::<B>()
+            {
+                Some(CompiledRecurrentAttentionPlan::new(
+                    flat_batch,
+                    heads,
+                    1,
+                    branch_time,
+                    latent,
+                    branch_dim,
+                    &branch_flat.device(),
+                ))
+            } else {
+                None
+            };
+
+            let x_neuron = self.project_shared_lowrank_population_positive(
+                branch_flat.clone(),
+                encoder,
+                population,
+                self.x_relu_threshold,
+                fused && self.kernel.projection_executor.use_x(),
+                latent_pattern,
+                sparse_mask.clone(),
+            );
+            let attn = self.recurrent_attention_with_plan(
+                x_neuron.clone(),
+                branch_flat.clone(),
+                layer_state,
+                start_pos,
+                RecurrentPositionMode::Sequential,
+                fused_recurrent_plan.as_ref(),
+            );
+            let attn = self.norm.forward(attn);
+            let y_gate = self.project_shared_lowrank_population_positive(
+                attn,
+                encoder_v,
+                population,
+                self.y_relu_threshold,
+                fused && self.kernel.projection_executor.use_y(),
+                latent_pattern,
+                sparse_mask,
+            );
+            let y_neuron = self.dropout.forward(x_neuron * y_gate);
+            let mlp_out = self.decode_shared_lowrank_population_tail(y_neuron, decoder, population);
+            let mlp_out = self.norm.forward(mlp_out);
+            let branch_out = self.norm.forward(branch_flat + mlp_out).reshape([
+                branch_batch,
+                branch_views,
+                branch_time,
+                branch_dim,
+            ]);
+            let next = self.merge_language_residuals_for_layer(
+                branch_out,
+                merge_bindings,
+                &connector,
+                mhc_coefficients,
+            );
+            current = if self.residual_connector_needs_post_merge_norm(&connector) {
+                self.norm.forward(next)
+            } else {
+                next
+            };
+            self.update_language_residual_history(&mut residual_history, current_before, &current);
+        }
+
+        let hidden = self.collapse_language_streams(current);
+        let [_batch, time, _dim] = hidden.shape().dims::<3>();
+        state.position = state.position.saturating_add(time);
+        hidden
+    }
+
+    fn forward_hidden_with_shared_lowrank_population_factors_from_embedded_single_pass(
+        &self,
+        embedded: Tensor<B, 3>,
+        state: &mut ModelState<B>,
+        factors: &SharedLowrankPopulationFactors<B>,
+        population: usize,
+    ) -> Tensor<B, 3>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        assert_eq!(
+            state.layers.len(),
+            self.n_layer,
+            "model state layers mismatch"
+        );
+        assert!(
+            !self.y_neuron_recurrence.enabled,
+            "population lowrank factor forward does not support y-neuron recurrence"
+        );
+        let [batch, time, embd] = embedded.shape().dims::<3>();
+        assert_eq!(batch % population, 0, "population batch must divide evenly");
+        let start_pos = state.position;
+        let mut current = self.norm.forward(embedded.reshape([batch, 1, time, embd]));
+        let fused = self.kernel.enabled;
+        let static_mhc_coefficients = self.mhc_shared.as_ref().and_then(|mhc| {
+            (!mhc.coefficient_policy().uses_dynamic_stream_controller()).then(|| mhc.coefficients())
+        });
+        let mut residual_history = self.initialize_language_residual_history(&current);
+
+        for (layer_idx, layer_state) in state.layers.iter_mut().enumerate() {
+            let connector = self.residual_connector_for_layer(layer_idx);
+            let current_before = residual_history.capture_previous(&current);
+            let mhc_coefficients = match connector {
+                ResidualConnectorRef::Mhc(_) => static_mhc_coefficients.as_ref(),
+                ResidualConnectorRef::Vanilla
+                | ResidualConnectorRef::AttentionResidual(_)
+                | ResidualConnectorRef::BlockAttentionResidual(_) => None,
+            };
+            let bindings = self.split_language_residuals_for_layer(
+                current,
+                &connector,
+                residual_history.as_slice(),
+                mhc_coefficients,
+            );
+            let LanguageMhcSplitBindings {
+                branch_input,
+                merge: merge_bindings,
+            } = bindings;
+            layer_state.clocked_slow_hidden = None;
+            layer_state.summary_memory_hidden = None;
+
+            let [branch_batch, branch_views, branch_time, branch_dim] =
+                branch_input.shape().dims::<4>();
+            let flat_batch = branch_batch * branch_views;
+            assert_eq!(
+                flat_batch % population,
+                0,
+                "population branch batch must divide evenly"
+            );
+            let branch_flat = branch_input.reshape([flat_batch, 1, branch_time, branch_dim]);
+            let (base_encoder, base_encoder_v, base_decoder, latent) =
+                self.layer_lowrank_weights(layer_idx);
+            let (
+                encoder_a,
+                encoder_b,
+                encoder_v_a,
+                encoder_v_b,
+                decoder_a,
+                decoder_b,
+                signs,
+                factor_latent,
+            ) = self.population_layer_lowrank_factors(layer_idx, factors);
+            assert_eq!(
+                latent, factor_latent,
+                "population factor latent slice mismatch"
+            );
+            let heads = self.n_head;
+            let latent_pattern = &self.kernel.block_sparse.latent;
+            let sparse_mask = if fused && latent_pattern.is_sparse() {
+                Some(latent_pattern.mask::<B>(latent, &branch_flat.device()))
+            } else {
+                None
+            };
+            let fused_recurrent_plan = if matches!(
+                (
+                    self.sequence_kernel.memory_system,
+                    self.sequence_kernel.executor,
+                ),
+                (
+                    SequenceMemorySystem::LinearAttention,
+                    SequenceTrainingExecutor::Reference,
+                )
+            ) && self.kernel.enabled
+                && self.kernel.wgpu_recurrent_kernel
+                && supports_recurrent_backend::<B>()
+            {
+                Some(CompiledRecurrentAttentionPlan::new(
+                    flat_batch,
+                    heads,
+                    1,
+                    branch_time,
+                    latent,
+                    branch_dim,
+                    &branch_flat.device(),
+                ))
+            } else {
+                None
+            };
+
+            let x_neuron = self.project_shared_lowrank_population_factorized_positive(
+                branch_flat.clone(),
+                base_encoder,
+                encoder_a,
+                encoder_b,
+                signs.clone(),
+                factors.sigma as f64 * factors.encoder_scale,
+                population,
+                self.x_relu_threshold,
+                latent_pattern,
+                sparse_mask.clone(),
+            );
+            let attn = self.recurrent_attention_with_plan(
+                x_neuron.clone(),
+                branch_flat.clone(),
+                layer_state,
+                start_pos,
+                RecurrentPositionMode::Sequential,
+                fused_recurrent_plan.as_ref(),
+            );
+            let attn = self.norm.forward(attn);
+            let y_gate = self.project_shared_lowrank_population_factorized_positive(
+                attn,
+                base_encoder_v,
+                encoder_v_a,
+                encoder_v_b,
+                signs.clone(),
+                factors.sigma as f64 * factors.encoder_v_scale,
+                population,
+                self.y_relu_threshold,
+                latent_pattern,
+                sparse_mask,
+            );
+            let y_neuron = self.dropout.forward(x_neuron * y_gate);
+            let mlp_out = self.decode_shared_lowrank_population_factors_tail(
+                y_neuron,
+                base_decoder,
+                decoder_a,
+                decoder_b,
+                signs,
+                factors.sigma as f64 * factors.decoder_scale,
+                population,
+            );
+            let mlp_out = self.norm.forward(mlp_out);
+            let branch_out = self.norm.forward(branch_flat + mlp_out).reshape([
+                branch_batch,
+                branch_views,
+                branch_time,
+                branch_dim,
+            ]);
+            let next = self.merge_language_residuals_for_layer(
+                branch_out,
+                merge_bindings,
+                &connector,
+                mhc_coefficients,
+            );
+            current = if self.residual_connector_needs_post_merge_norm(&connector) {
+                self.norm.forward(next)
+            } else {
+                next
+            };
+            self.update_language_residual_history(&mut residual_history, current_before, &current);
+        }
+
+        let hidden = self.collapse_language_streams(current);
+        let [_batch, time, _dim] = hidden.shape().dims::<3>();
+        state.position = state.position.saturating_add(time);
+        hidden
     }
 
     fn forward_hidden_with_state_from_embedded_single_pass_y_neuron_recurrence(
@@ -2041,6 +3061,252 @@ mod tests {
             .reshape([1, 1, 32]);
         let diff = max_abs_diff(tensor_values(logits), tensor_values(expected));
         assert!(diff <= 1e-6, "tied logits drifted by {diff}");
+    }
+
+    #[test]
+    fn shared_lowrank_population_forward_matches_base_for_single_member() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let base = model.shared_lowrank_weights();
+        let population = SharedLowrankPopulationWeights {
+            encoder: base.encoder.reshape([
+                1,
+                model.n_head,
+                model.n_embd,
+                model.latent_per_head_capacity(),
+            ]),
+            encoder_v: base.encoder_v.reshape([
+                1,
+                model.n_head,
+                model.n_embd,
+                model.latent_per_head_capacity(),
+            ]),
+            decoder: base
+                .decoder
+                .reshape([1, model.latent_total_capacity(), model.n_embd]),
+        };
+
+        let expected = model.forward(tokens.clone());
+        let actual = model.forward_with_shared_lowrank_population(tokens, population);
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(actual));
+        assert!(diff <= 1e-5, "population forward drifted by {diff}");
+    }
+
+    #[test]
+    fn shared_lowrank_population_forward_keeps_members_independent() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let base = model.shared_lowrank_weights();
+        let population = SharedLowrankPopulationWeights {
+            encoder: Tensor::cat(
+                vec![
+                    base.encoder.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    base.encoder.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            encoder_v: Tensor::cat(
+                vec![
+                    base.encoder_v.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    base.encoder_v.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            decoder: Tensor::cat(
+                vec![
+                    base.decoder
+                        .clone()
+                        .reshape([1, model.latent_total_capacity(), model.n_embd]),
+                    base.decoder
+                        .reshape([1, model.latent_total_capacity(), model.n_embd]),
+                ],
+                0,
+            ),
+        };
+
+        let expected = model.forward(tokens.clone());
+        let stacked = model.forward_with_shared_lowrank_population(tokens, population);
+        let first = stacked.clone().slice_dim(0, 0..2);
+        let second = stacked.slice_dim(0, 2..4);
+        let first_diff = max_abs_diff(tensor_values(expected.clone()), tensor_values(first));
+        let second_diff = max_abs_diff(tensor_values(expected), tensor_values(second));
+        assert!(
+            first_diff <= 1e-5,
+            "first population drifted by {first_diff}"
+        );
+        assert!(
+            second_diff <= 1e-5,
+            "second population drifted by {second_diff}"
+        );
+    }
+
+    #[test]
+    fn shared_lowrank_population_forward_does_not_couple_different_members() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let base = model.shared_lowrank_weights();
+        let shifted_encoder = base.encoder.clone().add_scalar(1.0e-3);
+        let shifted_encoder_v = base.encoder_v.clone().sub_scalar(1.0e-3);
+        let shifted_decoder = base.decoder.clone().add_scalar(1.0e-3);
+        let population = SharedLowrankPopulationWeights {
+            encoder: Tensor::cat(
+                vec![
+                    base.encoder.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    shifted_encoder.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            encoder_v: Tensor::cat(
+                vec![
+                    base.encoder_v.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    shifted_encoder_v.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            decoder: Tensor::cat(
+                vec![
+                    base.decoder
+                        .clone()
+                        .reshape([1, model.latent_total_capacity(), model.n_embd]),
+                    shifted_decoder.reshape([1, model.latent_total_capacity(), model.n_embd]),
+                ],
+                0,
+            ),
+        };
+
+        let expected = model.forward(tokens.clone());
+        let stacked = model.forward_with_shared_lowrank_population(tokens, population);
+        let first = stacked.slice_dim(0, 0..2);
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(first));
+        assert!(diff <= 1e-5, "base population was coupled by {diff}");
+    }
+
+    #[test]
+    fn shared_lowrank_population_forward_single_head_keeps_members_independent() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.n_embd = 8;
+        config.n_head = 1;
+        config.mlp_internal_dim_multiplier = 1;
+        config.vocab_size = 16;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [2, 4]),
+            &device,
+        );
+        let base = model.shared_lowrank_weights();
+        let shifted_encoder = base.encoder.clone().add_scalar(1.0e-3);
+        let shifted_encoder_v = base.encoder_v.clone().sub_scalar(1.0e-3);
+        let shifted_decoder = base.decoder.clone().add_scalar(1.0e-3);
+        let population = SharedLowrankPopulationWeights {
+            encoder: Tensor::cat(
+                vec![
+                    base.encoder.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    shifted_encoder.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            encoder_v: Tensor::cat(
+                vec![
+                    base.encoder_v.clone().reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                    shifted_encoder_v.reshape([
+                        1,
+                        model.n_head,
+                        model.n_embd,
+                        model.latent_per_head_capacity(),
+                    ]),
+                ],
+                0,
+            ),
+            decoder: Tensor::cat(
+                vec![
+                    base.decoder
+                        .clone()
+                        .reshape([1, model.latent_total_capacity(), model.n_embd]),
+                    shifted_decoder.reshape([1, model.latent_total_capacity(), model.n_embd]),
+                ],
+                0,
+            ),
+        };
+
+        let expected = model.forward(tokens.clone());
+        let stacked = model.forward_with_shared_lowrank_population(tokens, population);
+        let first = stacked.slice_dim(0, 0..2);
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(first));
+        assert!(
+            diff <= 1e-5,
+            "single-head base population was coupled by {diff}"
+        );
     }
 
     #[test]

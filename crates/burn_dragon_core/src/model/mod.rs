@@ -26,6 +26,7 @@ pub use config::{
 pub use dragon::{
     DragonModel, LanguageModuleLrScaleTarget, SharedLowrankActivationBatchStats,
     SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
+    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
 };
 #[cfg(any(feature = "probe", test))]
 pub use dragon::{

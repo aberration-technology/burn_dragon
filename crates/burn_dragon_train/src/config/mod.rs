@@ -25,7 +25,9 @@ pub use core::{
 };
 pub use events::{TrainingEventsConfig, TrainingGatesConfig};
 pub use optimizer::{
-    EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, LearningRateScheduleConfig,
-    OptimizerConfig, OptimizerKind, OptimizerScheduleMode, ResolvedEggrollAutoPopulation,
+    EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
+    EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
+    LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    ResolvedEggrollAutoPopulation,
 };
 pub use run_layout::RunLayoutConfig;

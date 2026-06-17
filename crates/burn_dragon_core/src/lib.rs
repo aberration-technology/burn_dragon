@@ -119,6 +119,7 @@ pub use model::{
     MicroTransformerBlock, ModelState, ResidualConnectorKind, SequenceKernelConfig,
     SequenceMemorySystem, SequenceTrainingExecutor, SharedLowrankActivationBatchStats,
     SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
+    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
     SummaryMemoryConfig, YNeuronRecurrenceConfig, gated_deltanet2_reference,
     logits_projection_profile_reset, logits_projection_profile_snapshot,
     lowrank_residual_memory_profile_reset, lowrank_residual_memory_profile_snapshot,

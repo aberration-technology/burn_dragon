@@ -704,6 +704,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub(crate) fn map_model(mut self, f: impl FnOnce(DragonModel<B>) -> DragonModel<B>) -> Self {
+        self.model = f(self.model);
+        self
+    }
+
     pub fn with_pipeline_plan(mut self, pipeline_plan: Option<PipelinePlan>) -> Self {
         self.pipeline_plan = pipeline_plan;
         self

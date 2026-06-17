@@ -44,9 +44,11 @@ pub mod api {
         };
         #[cfg(feature = "train")]
         pub use crate::config::{
-            EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, LearningRateScheduleConfig,
-            OptimizerConfig, OptimizerKind, OptimizerScheduleMode, ResolvedEggrollAutoPopulation,
-            TrainingEventsConfig, TrainingGatesConfig, VisionArtifactOutputMode,
+            EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
+            EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
+            LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+            ResolvedEggrollAutoPopulation, TrainingEventsConfig, TrainingGatesConfig,
+            VisionArtifactOutputMode,
         };
     }
 
@@ -90,7 +92,9 @@ pub use config::{
 };
 #[cfg(feature = "train")]
 pub use config::{
-    EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, LearningRateScheduleConfig,
-    OptimizerConfig, OptimizerKind, OptimizerScheduleMode, ResolvedEggrollAutoPopulation,
-    TrainingEventsConfig, TrainingGatesConfig, VisionArtifactOutputMode,
+    EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
+    EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
+    LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    ResolvedEggrollAutoPopulation, TrainingEventsConfig, TrainingGatesConfig,
+    VisionArtifactOutputMode,
 };

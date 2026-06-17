@@ -82,6 +82,7 @@ pub(crate) use crate::train::objective::{
 pub(crate) use crate::train::steps::LanguageTrainModel;
 pub(crate) use burn_dragon_core::{
     DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState, ModelState,
+    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
 };
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;
 pub(crate) use burn_dragon_train::train::metrics::{
@@ -102,8 +103,9 @@ pub(crate) use burn_dragon_train::train::runtime::{
     resolve_pipeline_parallel_layout, resolve_training_devices,
 };
 pub(crate) use burn_dragon_train::{
-    GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec,
-    LearningRateScheduleConfig, ModelSpec, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
-    OptimizerSpec, ParallelConfig, ParallelSpec, ParallelismKind, ReservoirInitializationSpec,
-    SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
+    EggrollPerturbationScope, EggrollPopulationExecutionBackend, GatedDeltaNet2Spec, GdpoConfig,
+    GdpoHardGate, KernelSpec, LayerStateSpec, LearningRateScheduleConfig, ModelSpec,
+    OptimizerConfig, OptimizerKind, OptimizerScheduleMode, OptimizerSpec, ParallelConfig,
+    ParallelSpec, ParallelismKind, ReservoirInitializationSpec, SequenceKernelConfig,
+    StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
 };

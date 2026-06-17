@@ -102,6 +102,11 @@ harness = false
 required-features = ["train"]
 
 [[bench]]
+name = "eggroll_population"
+harness = false
+required-features = ["train"]
+
+[[bench]]
 name = "gdn2_sequence"
 harness = false
 

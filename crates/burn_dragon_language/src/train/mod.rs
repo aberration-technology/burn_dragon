@@ -9,6 +9,7 @@ pub mod events;
 pub mod neuron_scaling;
 pub mod objective;
 pub mod optimizer_dynamics;
+pub mod phased;
 pub mod profile;
 #[cfg(feature = "rerun")]
 pub mod rerun;
@@ -29,6 +30,8 @@ pub use neuron_scaling::*;
 pub use objective::*;
 #[allow(unused_imports)]
 pub use optimizer_dynamics::*;
+#[allow(unused_imports)]
+pub use phased::*;
 #[allow(unused_imports)]
 pub use profile::*;
 #[cfg(feature = "rerun")]

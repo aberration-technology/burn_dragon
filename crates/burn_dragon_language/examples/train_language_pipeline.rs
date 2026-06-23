@@ -8,16 +8,20 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(feature = "train")]
 use burn_autodiff::Autodiff;
 #[cfg(feature = "train")]
+use burn_dragon_language::dataset::Dataset;
+#[cfg(feature = "train")]
 use burn_dragon_language::train::{
     AdamwEggrollPipelineReport, OptimizerPipelinePhaseConfig, ScopedRunEnv,
     latest_model_checkpoint_epoch, load_adamw_eggroll_pipeline_config, load_phase_training_config,
-    plan_adamw_eggroll_runs, prepare_eggroll_continuation_config, validate_adamw_warmup_config,
-    write_pipeline_report,
+    pipeline_source_selection_state_path, plan_adamw_eggroll_runs,
+    prepare_eggroll_continuation_config, validate_adamw_warmup_config, write_pipeline_report,
 };
 #[cfg(feature = "train")]
 use burn_dragon_language::{TrainingConfig, train};
 #[cfg(feature = "train")]
 use burn_ndarray::NdArray;
+#[cfg(feature = "train")]
+use std::sync::Arc;
 
 #[cfg(feature = "train")]
 #[derive(Debug, Default)]
@@ -140,10 +144,11 @@ fn run_adamw_cpu_phase(
     config: &TrainingConfig,
     run_dir: &std::path::Path,
     run_name: &str,
-) -> Result<()> {
+) -> Result<Arc<Dataset>> {
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
     let _run_env = ScopedRunEnv::set(run_dir, run_name)?;
-    train::train_backend::<Autodiff<NdArray<f32>>, _>(config, dataset, "cpu", |_| {})
+    train::train_backend::<Autodiff<NdArray<f32>>, _>(config, Arc::clone(&dataset), "cpu", |_| {})?;
+    Ok(dataset)
 }
 
 #[cfg(feature = "train")]
@@ -162,10 +167,16 @@ fn run_adamw_cuda_phase(
     config: &TrainingConfig,
     run_dir: &std::path::Path,
     run_name: &str,
-) -> Result<()> {
+) -> Result<Arc<Dataset>> {
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
     let _run_env = ScopedRunEnv::set(run_dir, run_name)?;
-    train::train_backend::<Autodiff<burn_cuda::Cuda<f32>>, _>(config, dataset, "cuda", |_| {})
+    train::train_backend::<Autodiff<burn_cuda::Cuda<f32>>, _>(
+        config,
+        Arc::clone(&dataset),
+        "cuda",
+        |_| {},
+    )?;
+    Ok(dataset)
 }
 
 #[cfg(all(feature = "train", feature = "cuda"))]
@@ -184,7 +195,7 @@ fn run_adamw_cuda_phase(
     _config: &TrainingConfig,
     _run_dir: &std::path::Path,
     _run_name: &str,
-) -> Result<()> {
+) -> Result<Arc<Dataset>> {
     Err(anyhow!(
         "the train_language_pipeline example was built without the cuda feature"
     ))
@@ -216,11 +227,11 @@ fn run_pipeline(args: &RunArgs) -> Result<()> {
 
     let adamw_config = load_phase_training_config(&pipeline.adamw)?;
     validate_adamw_warmup_config(&adamw_config)?;
-    match args.backend.as_str() {
+    let adamw_dataset = match args.backend.as_str() {
         "cpu" => run_adamw_cpu_phase(&adamw_config, &plan.adamw_run_dir, &plan.adamw_run_name)?,
         "cuda" => run_adamw_cuda_phase(&adamw_config, &plan.adamw_run_dir, &plan.adamw_run_name)?,
         other => return Err(anyhow!("unsupported backend {other}")),
-    }
+    };
 
     let checkpoint_dir = plan.adamw_checkpoint_dir();
     let checkpoint_epoch = latest_model_checkpoint_epoch(&checkpoint_dir)?;
@@ -230,15 +241,34 @@ fn run_pipeline(args: &RunArgs) -> Result<()> {
         checkpoint_epoch
     );
 
+    let source_selection_state_path = pipeline_source_selection_state_path(&plan);
+    let source_selection_state = adamw_dataset
+        .write_source_selection_state(
+            &source_selection_state_path,
+            adamw_config.training.max_iters,
+        )
+        .with_context(|| {
+            format!(
+                "write ruliad source-selection state {}",
+                source_selection_state_path.display()
+            )
+        })?;
+    let source_selection_state_path = source_selection_state.map(|_| source_selection_state_path);
+    if let Some(path) = &source_selection_state_path {
+        eprintln!("source-selection handoff state={}", path.display());
+    }
+
     let eggroll_config = prepare_eggroll_continuation_config(
         load_phase_training_config(&pipeline.eggroll)?,
         &checkpoint_dir,
         Some(checkpoint_epoch),
+        source_selection_state_path.as_deref(),
     )?;
     let report = AdamwEggrollPipelineReport {
         plan: plan.clone(),
         adamw_checkpoint_dir: checkpoint_dir,
         adamw_checkpoint_epoch: checkpoint_epoch,
+        source_selection_state_path: source_selection_state_path.clone(),
     };
     let report_path = plan
         .run_root

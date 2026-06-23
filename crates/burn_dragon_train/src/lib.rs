@@ -47,6 +47,7 @@ pub mod api {
             EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
             EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
             LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+            PredictiveCodingOptimizerConfig, PredictiveCodingOptimizerTransform,
             ResolvedEggrollAutoPopulation, TrainingEventsConfig, TrainingGatesConfig,
             VisionArtifactOutputMode,
         };
@@ -95,6 +96,7 @@ pub use config::{
     EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
     EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
     LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    PredictiveCodingOptimizerConfig, PredictiveCodingOptimizerTransform,
     ResolvedEggrollAutoPopulation, TrainingEventsConfig, TrainingGatesConfig,
     VisionArtifactOutputMode,
 };

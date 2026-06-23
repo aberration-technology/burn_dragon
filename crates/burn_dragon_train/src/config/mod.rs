@@ -28,6 +28,7 @@ pub use optimizer::{
     EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
     EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
     LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    PredictiveCodingOptimizerConfig, PredictiveCodingOptimizerTransform,
     ResolvedEggrollAutoPopulation,
 };
 pub use run_layout::RunLayoutConfig;

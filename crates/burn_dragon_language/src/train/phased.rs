@@ -77,6 +77,7 @@ pub struct AdamwEggrollPipelineReport {
     pub plan: AdamwEggrollPipelineRunPlan,
     pub adamw_checkpoint_dir: PathBuf,
     pub adamw_checkpoint_epoch: usize,
+    pub source_selection_state_path: Option<PathBuf>,
 }
 
 pub fn load_adamw_eggroll_pipeline_config(path: &Path) -> Result<AdamwEggrollPipelineConfig> {
@@ -146,9 +147,9 @@ pub fn apply_phase_overrides(
 }
 
 pub fn validate_adamw_warmup_config(config: &TrainingConfig) -> Result<()> {
-    if matches!(config.optimizer.name, OptimizerKind::Eggroll) {
+    if !matches!(config.optimizer.name, OptimizerKind::Adamw) {
         return Err(anyhow!(
-            "adamw warmup phase must use an autodiff optimizer, not optimizer.name = \"eggroll\""
+            "adamw warmup phase requires optimizer.name = \"adamw\""
         ));
     }
     Ok(())
@@ -158,6 +159,7 @@ pub fn prepare_eggroll_continuation_config(
     mut config: TrainingConfig,
     checkpoint_dir: &Path,
     checkpoint_epoch: Option<usize>,
+    source_selection_state_path: Option<&Path>,
 ) -> Result<TrainingConfig> {
     if !matches!(config.optimizer.name, OptimizerKind::Eggroll) {
         return Err(anyhow!(
@@ -169,6 +171,8 @@ pub fn prepare_eggroll_continuation_config(
     config.training.resume_checkpoint_epoch = None;
     config.training.init_checkpoint_path = Some(checkpoint_dir.to_path_buf());
     config.training.init_checkpoint_epoch = checkpoint_epoch;
+    config.training.source_selection_state_path =
+        source_selection_state_path.map(Path::to_path_buf);
     config.validate()?;
     Ok(config)
 }
@@ -269,6 +273,11 @@ pub fn write_pipeline_report(path: &Path, report: &AdamwEggrollPipelineReport) -
     fs::write(path, payload).with_context(|| format!("write pipeline report {}", path.display()))
 }
 
+pub fn pipeline_source_selection_state_path(plan: &AdamwEggrollPipelineRunPlan) -> PathBuf {
+    plan.run_root
+        .join(format!("{}-source-selection-state.json", plan.run_prefix))
+}
+
 pub struct ScopedRunEnv {
     previous_run_dir: Option<OsString>,
     previous_run_name: Option<OsString>,
@@ -315,6 +324,36 @@ impl Drop for ScopedRunEnv {
 mod tests {
     use super::*;
 
+    fn parse_eggroll_ruliad_config() -> TrainingConfig {
+        toml::from_str(
+            r#"
+[dataset]
+cache_dir = "target/test-cache"
+type = "universality_ruliad"
+config = "ruliad.toml"
+
+[training]
+block_size = 8
+batch_size = 2
+max_iters = 1
+log_frequency = 1
+
+[optimizer]
+name = "eggroll"
+learning_rate = 0.001
+weight_decay = 0.0
+
+[optimizer.eggroll.population]
+population_size = 2
+population_chunk_size = 2
+
+[generation]
+prompt = ""
+"#,
+        )
+        .expect("eggroll ruliad training config should parse")
+    }
+
     #[test]
     fn latest_checkpoint_ignores_non_model_files() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -359,6 +398,31 @@ checkpoint_interval_iters = 16
         );
         assert_eq!(config.adamw.max_iters, Some(8));
         assert_eq!(config.eggroll.checkpoint_interval_iters, Some(16));
+        Ok(())
+    }
+
+    #[test]
+    fn eggroll_continuation_config_carries_source_selection_state_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let checkpoint_dir = dir.path().join("checkpoint");
+        let source_state_path = dir.path().join("source-selection-state.json");
+        let prepared = prepare_eggroll_continuation_config(
+            parse_eggroll_ruliad_config(),
+            &checkpoint_dir,
+            Some(12),
+            Some(&source_state_path),
+        )?;
+
+        assert_eq!(
+            prepared.training.launch_mode,
+            TrainingLaunchMode::InitFromCheckpoint
+        );
+        assert_eq!(prepared.training.init_checkpoint_path, Some(checkpoint_dir));
+        assert_eq!(prepared.training.init_checkpoint_epoch, Some(12));
+        assert_eq!(
+            prepared.training.source_selection_state_path,
+            Some(source_state_path)
+        );
         Ok(())
     }
 

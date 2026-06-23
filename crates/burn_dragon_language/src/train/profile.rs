@@ -27,6 +27,84 @@ pub struct TrainProfileSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PredictiveCodingProfileSnapshot {
+    pub chunks_seen: usize,
+    pub chunks_corrected: usize,
+    pub inference_steps: usize,
+    pub skipped_empty_state: usize,
+    pub energy_before_sum: f64,
+    pub energy_after_sum: f64,
+    pub energy_delta_sum: f64,
+    pub energy_samples: usize,
+    pub grad_norm_sum: f64,
+    pub grad_norm_max: f64,
+    pub grad_norm_samples: usize,
+    pub delta_rms_sum: f64,
+    pub delta_rms_samples: usize,
+    pub elapsed_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LatentReasoningProfileSnapshot {
+    pub loss_calls: usize,
+    pub next_latent_components: usize,
+    pub dragon_state_components: usize,
+    pub jepa_components: usize,
+    pub sigreg_components: usize,
+    pub configured_steps_sum: usize,
+    pub configured_steps_samples: usize,
+}
+
+impl LatentReasoningProfileSnapshot {
+    pub(crate) fn has_activity(self) -> bool {
+        self.loss_calls > 0
+            || self.next_latent_components > 0
+            || self.dragon_state_components > 0
+            || self.jepa_components > 0
+            || self.sigreg_components > 0
+    }
+
+    pub(crate) fn configured_steps_mean(self) -> Option<f64> {
+        (self.configured_steps_samples > 0)
+            .then(|| self.configured_steps_sum as f64 / self.configured_steps_samples as f64)
+    }
+}
+
+impl PredictiveCodingProfileSnapshot {
+    pub(crate) fn has_activity(self) -> bool {
+        self.chunks_seen > 0 || self.inference_steps > 0 || self.elapsed_ns > 0
+    }
+
+    pub(crate) fn energy_before_mean(self) -> Option<f64> {
+        (self.energy_samples > 0).then(|| self.energy_before_sum / self.energy_samples as f64)
+    }
+
+    pub(crate) fn energy_after_mean(self) -> Option<f64> {
+        (self.energy_samples > 0).then(|| self.energy_after_sum / self.energy_samples as f64)
+    }
+
+    pub(crate) fn energy_delta_mean(self) -> Option<f64> {
+        (self.energy_samples > 0).then(|| self.energy_delta_sum / self.energy_samples as f64)
+    }
+
+    pub(crate) fn grad_norm_mean(self) -> Option<f64> {
+        (self.grad_norm_samples > 0).then(|| self.grad_norm_sum / self.grad_norm_samples as f64)
+    }
+
+    pub(crate) fn grad_norm_max(self) -> Option<f64> {
+        (self.grad_norm_samples > 0).then_some(self.grad_norm_max)
+    }
+
+    pub(crate) fn delta_rms_mean(self) -> Option<f64> {
+        (self.delta_rms_samples > 0).then(|| self.delta_rms_sum / self.delta_rms_samples as f64)
+    }
+
+    pub(crate) fn elapsed_ms(self) -> f64 {
+        self.elapsed_ns as f64 / 1_000_000.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct TrainProfileState {
     dataloader_cpu_ns: u128,
     dataloader_foreground_wait_ns: u128,
@@ -50,6 +128,8 @@ struct TrainProfileState {
     max_step_in_use_after_forward_bytes: u64,
     max_step_reserved_after_backward_bytes: u64,
     max_step_in_use_after_backward_bytes: u64,
+    predictive_coding: PredictiveCodingProfileSnapshot,
+    latent_reasoning: LatentReasoningProfileSnapshot,
 }
 
 static TRAIN_PROFILE: OnceLock<Mutex<TrainProfileState>> = OnceLock::new();
@@ -112,6 +192,30 @@ pub fn reset() {
     }
 }
 
+pub(crate) fn reset_predictive_coding() {
+    if let Ok(mut profile) = state().lock() {
+        profile.predictive_coding = PredictiveCodingProfileSnapshot::default();
+    }
+}
+
+pub(crate) fn take_predictive_coding() -> PredictiveCodingProfileSnapshot {
+    if let Ok(mut profile) = state().lock() {
+        let snapshot = profile.predictive_coding;
+        profile.predictive_coding = PredictiveCodingProfileSnapshot::default();
+        return snapshot;
+    }
+    PredictiveCodingProfileSnapshot::default()
+}
+
+pub(crate) fn take_latent_reasoning() -> LatentReasoningProfileSnapshot {
+    if let Ok(mut profile) = state().lock() {
+        let snapshot = profile.latent_reasoning;
+        profile.latent_reasoning = LatentReasoningProfileSnapshot::default();
+        return snapshot;
+    }
+    LatentReasoningProfileSnapshot::default()
+}
+
 pub fn snapshot() -> TrainProfileSnapshot {
     if let Ok(profile) = state().lock() {
         return TrainProfileSnapshot {
@@ -140,6 +244,77 @@ pub fn snapshot() -> TrainProfileSnapshot {
         };
     }
     TrainProfileSnapshot::default()
+}
+
+pub(crate) fn record_predictive_coding(
+    chunks_seen: usize,
+    chunks_corrected: usize,
+    inference_steps: usize,
+    skipped_empty_state: usize,
+    energy_before: Option<f64>,
+    energy_after: Option<f64>,
+    grad_norm_mean: Option<f64>,
+    grad_norm_max: Option<f64>,
+    delta_rms_mean: Option<f64>,
+    elapsed_ns: u128,
+) {
+    record(|profile| {
+        let pc = &mut profile.predictive_coding;
+        pc.chunks_seen = pc.chunks_seen.saturating_add(chunks_seen);
+        pc.chunks_corrected = pc.chunks_corrected.saturating_add(chunks_corrected);
+        pc.inference_steps = pc.inference_steps.saturating_add(inference_steps);
+        pc.skipped_empty_state = pc.skipped_empty_state.saturating_add(skipped_empty_state);
+        pc.elapsed_ns = pc.elapsed_ns.saturating_add(elapsed_ns);
+        if let (Some(before), Some(after)) = (energy_before, energy_after)
+            && before.is_finite()
+            && after.is_finite()
+        {
+            pc.energy_before_sum += before;
+            pc.energy_after_sum += after;
+            pc.energy_delta_sum += after - before;
+            pc.energy_samples = pc.energy_samples.saturating_add(1);
+        }
+        if let Some(grad_norm_mean) = grad_norm_mean
+            && grad_norm_mean.is_finite()
+        {
+            pc.grad_norm_sum += grad_norm_mean;
+            pc.grad_norm_samples = pc.grad_norm_samples.saturating_add(1);
+        }
+        if let Some(grad_norm_max) = grad_norm_max
+            && grad_norm_max.is_finite()
+        {
+            pc.grad_norm_max = pc.grad_norm_max.max(grad_norm_max);
+        }
+        if let Some(delta_rms_mean) = delta_rms_mean
+            && delta_rms_mean.is_finite()
+        {
+            pc.delta_rms_sum += delta_rms_mean;
+            pc.delta_rms_samples = pc.delta_rms_samples.saturating_add(1);
+        }
+    });
+}
+
+pub(crate) fn record_latent_reasoning(
+    next_latent_components: usize,
+    dragon_state_components: usize,
+    jepa_components: usize,
+    sigreg_components: usize,
+    configured_steps: usize,
+) {
+    record(|profile| {
+        let latent = &mut profile.latent_reasoning;
+        latent.loss_calls = latent.loss_calls.saturating_add(1);
+        latent.next_latent_components = latent
+            .next_latent_components
+            .saturating_add(next_latent_components);
+        latent.dragon_state_components = latent
+            .dragon_state_components
+            .saturating_add(dragon_state_components);
+        latent.jepa_components = latent.jepa_components.saturating_add(jepa_components);
+        latent.sigreg_components = latent.sigreg_components.saturating_add(sigreg_components);
+        latent.configured_steps_sum = latent.configured_steps_sum.saturating_add(configured_steps);
+        latent.configured_steps_samples = latent.configured_steps_samples.saturating_add(1);
+    });
 }
 
 pub fn record_dataloader(

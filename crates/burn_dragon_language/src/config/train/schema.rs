@@ -421,6 +421,7 @@ pub struct GreedyRolloutUnlikelihoodConfig {
     pub margin_weight: f32,
     pub margin: f32,
     pub recovery_weight: f32,
+    pub sequence_recovery_weight: f32,
     pub entropy_floor_weight: f32,
     pub target_entropy_bits: f32,
     pub cycle_weight: f32,
@@ -446,6 +447,7 @@ impl Default for GreedyRolloutUnlikelihoodConfig {
             margin_weight: 0.0,
             margin: 0.0,
             recovery_weight: 0.0,
+            sequence_recovery_weight: 0.0,
             entropy_floor_weight: 0.0,
             target_entropy_bits: 0.0,
             cycle_weight: 0.0,
@@ -460,6 +462,337 @@ impl Default for GreedyRolloutUnlikelihoodConfig {
             history_tokens: 8,
             batch_prompts: 1,
             epsilon: 1.0e-4,
+        }
+    }
+}
+
+fn default_dynamics_anchor_teacher_update_rate() -> f32 {
+    0.01
+}
+
+fn default_dynamics_anchor_every_steps() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicsAnchorMask {
+    #[default]
+    AllTokens,
+    ContextTokens,
+    TargetTokens,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DynamicsAnchorConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    #[serde(default = "default_dynamics_anchor_teacher_update_rate")]
+    pub teacher_update_rate: f32,
+    pub kl: SelfDistillationKlKind,
+    pub mask: DynamicsAnchorMask,
+    pub warmup_steps: usize,
+    pub ramp_steps: usize,
+    #[serde(default = "default_dynamics_anchor_every_steps")]
+    pub every_steps: usize,
+}
+
+impl Default for DynamicsAnchorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.0,
+            teacher_update_rate: default_dynamics_anchor_teacher_update_rate(),
+            kl: SelfDistillationKlKind::JensenShannon,
+            mask: DynamicsAnchorMask::default(),
+            warmup_steps: 0,
+            ramp_steps: 0,
+            every_steps: default_dynamics_anchor_every_steps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingMode {
+    #[default]
+    RecurrentState,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingStateScope {
+    #[default]
+    Core,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingBackwardMode {
+    #[default]
+    Chunked,
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingParameterUpdate {
+    #[default]
+    Optimizer,
+    #[serde(alias = "frozen")]
+    StateOnlyControl,
+}
+
+fn default_predictive_coding_step_size() -> f32 {
+    0.03
+}
+
+fn default_predictive_coding_max_grad_norm() -> Option<f32> {
+    Some(1.0)
+}
+
+fn default_predictive_coding_eps() -> f32 {
+    1.0e-8
+}
+
+fn default_predictive_coding_apply_every_chunks() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PredictiveCodingConfig {
+    pub enabled: bool,
+    pub mode: PredictiveCodingMode,
+    pub state_scope: PredictiveCodingStateScope,
+    pub backward_mode: PredictiveCodingBackwardMode,
+    pub parameter_update: PredictiveCodingParameterUpdate,
+    pub steps: usize,
+    #[serde(default = "default_predictive_coding_step_size")]
+    pub step_size: f32,
+    pub latent_decay: f32,
+    #[serde(default = "default_predictive_coding_max_grad_norm")]
+    pub max_grad_norm: Option<f32>,
+    #[serde(default = "default_predictive_coding_eps")]
+    pub eps: f32,
+    #[serde(default = "default_predictive_coding_apply_every_chunks")]
+    pub apply_every_chunks: usize,
+    pub warmup_steps: usize,
+    pub sync_diagnostics: bool,
+}
+
+impl Default for PredictiveCodingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: PredictiveCodingMode::default(),
+            state_scope: PredictiveCodingStateScope::default(),
+            backward_mode: PredictiveCodingBackwardMode::default(),
+            parameter_update: PredictiveCodingParameterUpdate::default(),
+            steps: 1,
+            step_size: default_predictive_coding_step_size(),
+            latent_decay: 0.0,
+            max_grad_norm: default_predictive_coding_max_grad_norm(),
+            eps: default_predictive_coding_eps(),
+            apply_every_chunks: default_predictive_coding_apply_every_chunks(),
+            warmup_steps: 0,
+            sync_diagnostics: false,
+        }
+    }
+}
+
+fn default_latent_reasoning_future_offsets() -> Vec<usize> {
+    vec![1, 2, 4, 8]
+}
+
+fn default_latent_reasoning_teacher_update_rate() -> f32 {
+    0.01
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LatentReasoningTargetEncoder {
+    EmaTeacher,
+    #[default]
+    DetachedStudent,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LatentReasoningNegativeSource {
+    #[default]
+    InBatchAndCorruptAnswer,
+    TemporalShift,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LatentReasoningSigRegConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub every_steps: Option<usize>,
+    #[serde(default)]
+    pub start_after_steps: Option<usize>,
+    pub mode: LatentReasoningSigRegMode,
+    pub target: LatentReasoningSigRegTarget,
+    pub target_variance: f32,
+    pub min_variance: f32,
+    pub mean_tolerance: f32,
+    pub max_rho_slots: usize,
+}
+
+impl Default for LatentReasoningSigRegConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            every_steps: None,
+            start_after_steps: None,
+            mode: LatentReasoningSigRegMode::default(),
+            target: LatentReasoningSigRegTarget::default(),
+            target_variance: 1.0,
+            min_variance: 0.2,
+            mean_tolerance: 0.05,
+            max_rho_slots: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LatentReasoningSigRegMode {
+    #[default]
+    WeakCovariance,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LatentReasoningSigRegTarget {
+    #[default]
+    Hidden,
+    RhoMemorySlots,
+    HiddenAndRhoMemorySlots,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LatentReasoningConstraintBalancerConfig {
+    pub enabled: bool,
+    pub normalized_aux_scale: f32,
+    pub start_after_steps: usize,
+    pub warmup_steps: usize,
+    pub stop_target_mean_steps: f32,
+    pub stop_tolerance_steps: f32,
+}
+
+impl Default for LatentReasoningConstraintBalancerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            normalized_aux_scale: 1.0,
+            start_after_steps: 0,
+            warmup_steps: 0,
+            stop_target_mean_steps: 2.0,
+            stop_tolerance_steps: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NextLatentPredictionConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub every_steps: Option<usize>,
+    #[serde(default)]
+    pub start_after_steps: Option<usize>,
+    pub horizon: usize,
+    pub regression_weight: f32,
+    pub token_kl_weight: f32,
+    pub smooth_l1_beta: f32,
+    pub detach_action_embedding: bool,
+}
+
+impl Default for NextLatentPredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: None,
+            start_after_steps: None,
+            horizon: 1,
+            regression_weight: 1.0,
+            token_kl_weight: 0.0,
+            smooth_l1_beta: 1.0,
+            detach_action_embedding: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DragonStateConsistencyConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub every_steps: Option<usize>,
+    #[serde(default)]
+    pub start_after_steps: Option<usize>,
+    pub rho_weight: f32,
+    pub rho_energy_weight: f32,
+    pub smooth_l1_beta: f32,
+    pub max_rho_slots: usize,
+}
+
+impl Default for DragonStateConsistencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: None,
+            start_after_steps: None,
+            rho_weight: 1.0,
+            rho_energy_weight: 0.25,
+            smooth_l1_beta: 1.0,
+            max_rho_slots: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LatentReasoningTrainingConfig {
+    pub enabled: bool,
+    pub every_steps: usize,
+    #[serde(default)]
+    pub jepa_every_steps: Option<usize>,
+    #[serde(default)]
+    pub jepa_start_after_steps: Option<usize>,
+    #[serde(default = "default_latent_reasoning_future_offsets")]
+    pub jepa_future_offsets: Vec<usize>,
+    pub target_encoder: LatentReasoningTargetEncoder,
+    #[serde(default = "default_latent_reasoning_teacher_update_rate")]
+    pub teacher_update_rate: f32,
+    pub negative_source: LatentReasoningNegativeSource,
+    pub next_latent: NextLatentPredictionConfig,
+    pub dragon_state: DragonStateConsistencyConfig,
+    pub sigreg: LatentReasoningSigRegConfig,
+    pub constraint_balancer: LatentReasoningConstraintBalancerConfig,
+}
+
+impl Default for LatentReasoningTrainingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: 1,
+            jepa_every_steps: None,
+            jepa_start_after_steps: None,
+            jepa_future_offsets: default_latent_reasoning_future_offsets(),
+            target_encoder: LatentReasoningTargetEncoder::default(),
+            teacher_update_rate: default_latent_reasoning_teacher_update_rate(),
+            negative_source: LatentReasoningNegativeSource::default(),
+            next_latent: NextLatentPredictionConfig::default(),
+            dragon_state: DragonStateConsistencyConfig::default(),
+            sigreg: LatentReasoningSigRegConfig::default(),
+            constraint_balancer: LatentReasoningConstraintBalancerConfig::default(),
         }
     }
 }
@@ -497,6 +830,8 @@ pub struct TrainingHyperparameters {
     #[serde(default)]
     pub init_checkpoint_epoch: Option<usize>,
     #[serde(default)]
+    pub source_selection_state_path: Option<PathBuf>,
+    #[serde(default)]
     pub init_transfer: InitTransferConfig,
     #[serde(default)]
     pub continual_backprop: ContinualBackpropConfig,
@@ -513,6 +848,14 @@ pub struct TrainingHyperparameters {
     #[serde(default)]
     pub greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig,
     #[serde(default)]
+    pub dynamics_anchor: DynamicsAnchorConfig,
+    #[serde(default)]
+    pub predictive_coding: PredictiveCodingConfig,
+    #[serde(default)]
+    pub latent_reasoning: LatentReasoningTrainingConfig,
+    #[serde(default)]
+    pub ruliad_supervision: RuliadSupervisionConfig,
+    #[serde(default)]
     pub module_lr_scales: Vec<ModuleLrScaleEntry>,
     #[serde(default = "default_context_strategy")]
     pub context_strategy: ContextStrategyConfig,
@@ -528,6 +871,63 @@ pub struct TrainingHyperparameters {
     pub gates: burn_dragon_train::TrainingGatesConfig,
     #[serde(default)]
     pub dynamics: burn_dragon_train::train::events::DynamicsEquilibriumPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadSupervisionMode {
+    #[default]
+    FullDocument,
+    AnswerWindow,
+    AnswerCompletion,
+    Mixed,
+}
+
+impl RuliadSupervisionMode {
+    pub fn uses_answer_target_mask(self) -> bool {
+        matches!(self, Self::AnswerCompletion | Self::Mixed)
+    }
+
+    pub fn prefer_answer_window(
+        self,
+        validation: bool,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> bool {
+        match self {
+            Self::FullDocument => false,
+            Self::AnswerWindow => true,
+            Self::AnswerCompletion => true,
+            Self::Mixed => validation || (epoch_index.wrapping_add(absolute_step) & 1) == 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RuliadSupervisionConfig {
+    pub mode: RuliadSupervisionMode,
+    pub mask_high_entropy_spans: bool,
+}
+
+impl RuliadSupervisionConfig {
+    pub fn uses_answer_target_mask(self) -> bool {
+        self.mode.uses_answer_target_mask()
+    }
+
+    pub fn uses_target_loss_mask(self) -> bool {
+        self.uses_answer_target_mask() || self.mask_high_entropy_spans
+    }
+
+    pub fn prefer_answer_window(
+        self,
+        validation: bool,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> bool {
+        self.mode
+            .prefer_answer_window(validation, epoch_index, absolute_step)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

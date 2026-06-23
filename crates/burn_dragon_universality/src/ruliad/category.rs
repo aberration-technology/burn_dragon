@@ -157,7 +157,10 @@ fn generated_category_task_fields(
         RuliadTaskKind::VerifyFunctorPreservation => {
             let functor = generated_shift_functor(category, rng);
             let first = path[0];
-            let second = path.get(1).copied().unwrap_or(first);
+            let second = path.get(1).copied().unwrap_or_else(|| {
+                let target = category.morphisms[first].target;
+                category.identities[target]
+            });
             let composed = compose_pair(&category.composition, first, second)
                 .ok_or_else(|| anyhow!("generated invalid functor path"))?;
             let lhs = functor.morphism_map[composed];

@@ -10,10 +10,16 @@ pub struct DragonDynamicsControlSlot {
 
 impl DragonDynamicsControlSlot {
     pub fn store(&self, event: DynamicsControlEvent) {
-        *self
+        let mut pending = self
             .inner
             .lock()
-            .expect("dragon dynamics control slot lock poisoned") = Some(event);
+            .expect("dragon dynamics control slot lock poisoned");
+        if pending
+            .as_ref()
+            .is_none_or(|current| event.mode.control_priority() >= current.mode.control_priority())
+        {
+            *pending = Some(event);
+        }
     }
 
     pub fn take(&self) -> Option<DynamicsControlEvent> {
@@ -51,6 +57,48 @@ fn capture_dynamics_controls(
 ) {
     for event in controls.read() {
         slot.store(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control_event(mode: DynamicsMode) -> DynamicsControlEvent {
+        DynamicsControlEvent {
+            run_id: "run".to_string(),
+            epoch: Some(1),
+            absolute_step: Some(1),
+            mode,
+            lr_scale: 1.0,
+            continual_backprop_scale: 1.0,
+            max_replacements_per_interval: None,
+            source_difficulty_pressure: 1.0,
+            hash_noise_max_probability: 0.01,
+            rollback_to_epoch: None,
+            stop_if_repeated: false,
+            reason: format!("{mode:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamics_slot_keeps_recovery_when_stable_arrives_later() {
+        let slot = DragonDynamicsControlSlot::default();
+        slot.store(control_event(DynamicsMode::HardRecovery));
+        slot.store(control_event(DynamicsMode::Stable));
+
+        let event = slot.take().expect("pending control");
+        assert_eq!(event.mode, DynamicsMode::HardRecovery);
+    }
+
+    #[test]
+    fn dynamics_slot_allows_stronger_recovery_to_replace_pending_control() {
+        let slot = DragonDynamicsControlSlot::default();
+        slot.store(control_event(DynamicsMode::PlasticityRecovery));
+        slot.store(control_event(DynamicsMode::RollbackRecovery));
+
+        let event = slot.take().expect("pending control");
+        assert_eq!(event.mode, DynamicsMode::RollbackRecovery);
     }
 }
 

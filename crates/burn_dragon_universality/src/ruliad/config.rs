@@ -834,7 +834,7 @@ fn default_frontier_extend_max_difficulty_probability() -> f32 {
 }
 
 fn default_frontier_max_materialized_levels() -> usize {
-    4096
+    0
 }
 
 fn default_chunk_token_capacity() -> usize {

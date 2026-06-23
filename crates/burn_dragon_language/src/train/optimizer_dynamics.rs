@@ -337,12 +337,17 @@ fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparam
         resume_checkpoint_epoch: None,
         init_checkpoint_path: None,
         init_checkpoint_epoch: None,
+        source_selection_state_path: None,
         init_transfer: Default::default(),
         continual_backprop: Default::default(),
         input_corruption: Default::default(),
         logit_entropy_floor: Default::default(),
         repeat_unlikelihood: Default::default(),
         greedy_rollout_unlikelihood: Default::default(),
+        dynamics_anchor: Default::default(),
+        predictive_coding: Default::default(),
+        latent_reasoning: Default::default(),
+        ruliad_supervision: Default::default(),
         module_lr_scales: Vec::new(),
         context_strategy: ContextStrategyConfig::Infinite,
         sequence_kernel_override: None,
@@ -542,6 +547,7 @@ fn base_optimizer_config(
         eggroll,
         eggroll_population_execution: Default::default(),
         eggroll_auto_population: Default::default(),
+        predictive_coding: Default::default(),
     }
 }
 

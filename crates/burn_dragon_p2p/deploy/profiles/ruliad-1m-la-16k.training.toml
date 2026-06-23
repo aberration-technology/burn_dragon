@@ -1,0 +1,113 @@
+extends = "ruliad-1m.training.toml"
+
+[model]
+n_layer = 4
+n_embd = 256
+n_head = 4
+latent_total = 16384
+sequence_kernel = "linear_attention"
+rotary_embedding = "alibi"
+dropout = 0.0
+
+[training]
+block_size = 256
+tbptt_chunk_size = 128
+tbptt_persist_across_steps = true
+min_logical_block_size = 512
+batch_size = 1
+max_iters = 1000000
+checkpoint_interval_iters = 1024
+log_frequency = 16
+
+[training.ruliad_supervision]
+mode = "answer_window"
+
+[training.input_corruption]
+enabled = true
+probability = 0.03
+warmup_steps = 512
+ramp_steps = 2048
+
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.006
+target_entropy_bits = 0.75
+marginal_weight = 0.003
+target_marginal_entropy_bits = 2.5
+target_coverage_weight = 0.001
+target_coverage_epsilon = 0.0001
+warmup_steps = 512
+ramp_steps = 2048
+every_steps = 1
+
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.003
+cycle_weight = 0.006
+cycle_margin_weight = 0.0015
+cycle_margin = 0.5
+cycle_min_lag = 2
+cycle_max_lag = 64
+cycle_lags_per_step = 8
+warmup_steps = 512
+ramp_steps = 2048
+every_steps = 1
+history_lags = [2, 3, 4, 8, 16, 32, 64]
+epsilon = 0.0001
+
+[training.greedy_rollout_unlikelihood]
+enabled = true
+recovery_only = true
+weight = 0.05
+margin_weight = 0.01
+margin = 0.5
+recovery_weight = 0.10
+entropy_floor_weight = 0.01
+target_entropy_bits = 0.75
+cycle_weight = 0.05
+cycle_margin_weight = 0.01
+cycle_min_lag = 2
+cycle_max_lag = 64
+warmup_steps = 512
+ramp_steps = 2048
+every_steps = 128
+prompt_tokens = 32
+rollout_tokens = 16
+history_tokens = 16
+batch_prompts = 2
+epsilon = 0.0001
+
+[training.dynamics_anchor]
+enabled = true
+weight = 0.05
+teacher_update_rate = 0.005
+kl = "jensen_shannon"
+mask = "all_tokens"
+warmup_steps = 0
+ramp_steps = 256
+every_steps = 1
+
+[training.gates]
+validation_regression_patience_epochs = 1
+degeneracy_entropy_min_bits = 0.55
+degeneracy_max_probability_max = 0.88
+degeneracy_distinct_2_min_fraction = 0.55
+degeneracy_eos_max_fraction = 0.20
+degeneracy_repetition_max_fraction = 0.20
+degeneracy_period_2_max_fraction = 0.25
+degeneracy_period_3_max_fraction = 0.25
+degeneracy_period_2_to_16_max_fraction = 0.25
+degeneracy_period_2_to_64_max_fraction = 0.25
+degeneracy_patience = 1
+
+[training.dynamics]
+validation_recovery_lr_scale = 0.25
+hard_recovery_lr_scale = 0.20
+validation_recovery_continual_backprop_scale = 1.25
+hard_recovery_continual_backprop_scale = 1.50
+recovery_source_difficulty_pressure = 0.60
+recovery_hash_noise_max_probability = 0.0
+
+[optimizer]
+learning_rate = 0.0003
+weight_decay = 0.01

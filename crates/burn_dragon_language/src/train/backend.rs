@@ -210,6 +210,7 @@ where
         ));
     }
     let use_event_scheduler = use_dynamic_scaling
+        || context.training.predictive_coding.enabled
         || (context.parallel_runtime.mode == ParallelismKind::Single
             && (context.training.dynamics.enabled
                 || (context.training.events.source_weighted_validation_batches > 0
@@ -502,10 +503,11 @@ where
         || config.parallel.pipeline.enabled
         || config.parallel.mode != ParallelismKind::Single
         || config.training.tbptt_persist_across_steps
+        || config.training.predictive_coding.enabled
         || !config.training.objective.is_next_token()
     {
         return Err(anyhow!(
-            "forward-only EGGROLL supports single-device next-token training without pipeline, continual backprop, neuron scaling, or persistent TBPTT"
+            "forward-only EGGROLL supports single-device next-token training without pipeline, continual backprop, neuron scaling, predictive coding, or persistent TBPTT"
         ));
     }
 
@@ -722,6 +724,9 @@ where
         .with_logit_entropy_floor(training.logit_entropy_floor.clone())
         .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
         .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
+        .with_dynamics_anchor(training.dynamics_anchor.clone())
+        .with_predictive_coding(training.predictive_coding.clone())
+        .with_latent_reasoning(training.latent_reasoning.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size);
     let model = Some(prepared_model);
     let eggroll_chunk_autotune = if let Some(model_ref) = model.as_ref() {
@@ -1245,6 +1250,9 @@ where
         .with_logit_entropy_floor(training.logit_entropy_floor.clone())
         .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
         .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
+        .with_dynamics_anchor(training.dynamics_anchor.clone())
+        .with_predictive_coding(training.predictive_coding.clone())
+        .with_latent_reasoning(training.latent_reasoning.clone())
         .with_pipeline_plan(pipeline_plan.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size)
         .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)

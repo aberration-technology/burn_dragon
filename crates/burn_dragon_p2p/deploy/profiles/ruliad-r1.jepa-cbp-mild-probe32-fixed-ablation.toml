@@ -1,0 +1,23 @@
+extends = ["ruliad-r1.jepa-probe32-fixed-ablation.toml"]
+
+[training.events]
+continual_backprop_every_steps = 64
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 32
+ruliad_correctness_probe_tokens = 64
+
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0002
+maturity_steps = 64
+sample_interval_steps = 16
+replace_interval_steps = 64
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
+warmup_steps = 256
+cooldown_steps = 64
+max_replacements_per_interval = 1
+regression_pause_steps = 0

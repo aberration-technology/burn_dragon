@@ -6,7 +6,8 @@ use burn_dragon_train::train::events::{
     TrainingRunContext,
 };
 use burn_ecs::prelude::{
-    App, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Res, SourceSelectionSample,
+    App, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Res,
+    SourceSelectionBucketMetric, SourceSelectionGroupMetric, SourceSelectionSample,
     TrainingMetricSample, TrainingMetricSplit, TrainingSet, Update,
 };
 
@@ -140,38 +141,102 @@ fn record_ruliad_source_selection_from_loss(
     mut source_selection_events: MessageWriter<SourceSelectionSample>,
 ) {
     for sample in metrics.read() {
-        if sample.split != TrainingMetricSplit::Train || sample.name != "Loss" {
+        if sample.split != TrainingMetricSplit::Train
+            || (sample.name != "Loss" && sample.name != "Stream Warm Loss")
+        {
             continue;
         }
         if sample.absolute_step % source_selection.source_selection_every_steps != 0 {
             continue;
         }
-        let snapshot = source_selection
+        let recorded_snapshot = source_selection
             .dataset
-            .record_source_selection_loss(sample.absolute_step, sample.value as f32)
-            .or_else(|| source_selection.dataset.source_selection_snapshot());
+            .record_source_selection_loss(sample.absolute_step, sample.value as f32);
+        let loss = recorded_snapshot.as_ref().map(|_| sample.value as f32);
+        let snapshot =
+            recorded_snapshot.or_else(|| source_selection.dataset.source_selection_snapshot());
         let Some(snapshot) = snapshot else {
             continue;
         };
-        source_selection_events.write(SourceSelectionSample {
-            run_id: sample.run_id.clone(),
-            absolute_step: sample.absolute_step,
-            loss: Some(sample.value as f32),
-            entropy_bits: snapshot.sampler_entropy_bits as f64,
-            hash_noise_probability: snapshot.hash_noise_probability as f64,
-            mean_loss: snapshot.mean_loss as f64,
-            mean_learning_progress: snapshot.mean_learning_progress as f64,
-            frontier_loss: snapshot.frontier_loss as f64,
-            target_loss: snapshot.target_loss as f64,
-            target_difficulty_score: snapshot.target_difficulty_score as f64,
-            max_difficulty_level: snapshot.max_difficulty_level,
-            mean_difficulty_level: snapshot.mean_difficulty_level as f64,
-            normalized_difficulty_score: snapshot.normalized_difficulty_score as f64,
-            max_difficulty_probability: snapshot.max_difficulty_probability as f64,
-            mastered_probability: snapshot.mastered_probability as f64,
-            frontier_extension_count: snapshot.frontier_extension_count,
-            frontier_saturated: snapshot.frontier_saturated,
-            verifier_failures: snapshot.verifier_failures as u64,
-        });
+        source_selection_events.write(source_selection_sample_from_snapshot(
+            sample.run_id.clone(),
+            sample.absolute_step,
+            loss,
+            &snapshot,
+        ));
+    }
+}
+
+pub(crate) fn source_selection_sample_from_snapshot(
+    run_id: String,
+    absolute_step: usize,
+    loss: Option<f32>,
+    snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
+) -> SourceSelectionSample {
+    SourceSelectionSample {
+        run_id,
+        absolute_step,
+        loss,
+        entropy_bits: snapshot.sampler_entropy_bits as f64,
+        hash_noise_probability: snapshot.hash_noise_probability as f64,
+        mean_loss: snapshot.mean_loss as f64,
+        mean_learning_progress: snapshot.mean_learning_progress as f64,
+        frontier_loss: snapshot.frontier_loss as f64,
+        target_loss: snapshot.target_loss as f64,
+        target_difficulty_score: snapshot.target_difficulty_score as f64,
+        max_difficulty_level: snapshot.max_difficulty_level,
+        materialized_frontier_edge: snapshot.max_difficulty_level,
+        mean_difficulty_level: snapshot.mean_difficulty_level as f64,
+        normalized_difficulty_score: snapshot.normalized_difficulty_score as f64,
+        max_difficulty_probability: snapshot.max_difficulty_probability as f64,
+        mastered_probability: snapshot.mastered_probability as f64,
+        frontier_extension_count: snapshot.frontier_extension_count,
+        frontier_saturated: snapshot.frontier_saturated,
+        unbounded_frontier: snapshot.frontier_unbounded,
+        top_buckets: snapshot
+            .top_buckets
+            .iter()
+            .map(|bucket| SourceSelectionBucketMetric {
+                label: bucket.label.clone(),
+                family: bucket.family.clone(),
+                task_kind: bucket.task_kind.clone(),
+                difficulty_level: bucket.difficulty_level,
+                probability: bucket.probability as f64,
+                loss_ema: bucket.loss_ema as f64,
+                previous_loss_ema: bucket.previous_loss_ema as f64,
+                learning_progress: bucket.learning_progress as f64,
+                mastered: bucket.mastered,
+            })
+            .collect(),
+        difficulty_buckets: snapshot
+            .difficulty_buckets
+            .iter()
+            .map(source_selection_group_metric)
+            .collect(),
+        family_buckets: snapshot
+            .family_buckets
+            .iter()
+            .map(source_selection_group_metric)
+            .collect(),
+        task_buckets: snapshot
+            .task_buckets
+            .iter()
+            .map(source_selection_group_metric)
+            .collect(),
+        verifier_failures: snapshot.verifier_failures as u64,
+    }
+}
+
+fn source_selection_group_metric(
+    group: &burn_dragon_universality::RuliadGroupMetric,
+) -> SourceSelectionGroupMetric {
+    SourceSelectionGroupMetric {
+        label: group.label.clone(),
+        candidate_count: group.candidate_count,
+        probability: group.probability as f64,
+        mean_loss: group.mean_loss as f64,
+        learning_progress: group.learning_progress as f64,
+        mastered_probability: group.mastered_probability as f64,
+        mean_difficulty_level: group.mean_difficulty_level as f64,
     }
 }

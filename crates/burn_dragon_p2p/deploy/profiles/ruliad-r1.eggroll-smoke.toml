@@ -1,3 +1,7 @@
+# Experimental/quarantined profile: EGGROLL remains available for optimizer
+# research, but ruliad baseline training should use the AdamW profiles until
+# the forward-only optimizer is competitive on controlled diagnostics.
+
 [training]
 max_iters = 4
 checkpoint_interval_iters = 4

@@ -39,6 +39,24 @@ The bootstrap publishes initial Dragon experiment directory entries for:
 Those entries include Dragon profile metadata, so peers can resolve experiment and training configuration from the network instead of requiring a matching static local config.
 The initial ClimbMix revision now defaults to the managed dataset CDN path under `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile, and browser peers fetch only the shards they train on from that managed shard pool unless you override the base URL explicitly.
 
+## Ruliad Training Profiles
+
+The ruliad profile family keeps recommended defaults and comparison baselines
+separate so ablations stay reproducible:
+
+- `profiles/ruliad-r1.jepa.training.toml`: promoted JEPA default profile.
+- `profiles/ruliad-r1.training.toml`: base CE/AdamW comparison profile.
+- `profiles/ruliad-r1.jepa-state.training.toml`: JEPA plus rho-state
+  consistency candidate for collapse-resistance experiments.
+- `profiles/ruliad-1m.jepa.training.toml` and
+  `profiles/ruliad-1m-la-16k.jepa.training.toml`: larger JEPA default
+  profiles.
+
+The plain non-JEPA profiles intentionally remain available as AdamW/CE
+comparison points. Treat the ruliad competence scalar as a coarse dashboard
+composite; use verifier/schema/degen metrics and source-bucket telemetry when
+promoting a profile.
+
 ## Minimal Topology
 
 The cheapest supported production topology is now:
@@ -488,6 +506,15 @@ The initial directory entries are seeded from:
 
 - `crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
+
+The checked-in `ruliad-1m` profile pair is the local ruliad trainability
+baseline: `profiles/ruliad-1m.training.toml` and `profiles/ruliad-1m.corpus.toml`.
+It remains intentionally small, AdamW-only, live-source-selected, and
+answer-completion supervised so dataset/model issues show up in an isolated CE
+comparison. The default ruliad research/training path is the JEPA-only profile
+family, starting with `profiles/ruliad-1m.jepa.training.toml`. The
+`ruliad-r1.eggroll-smoke.toml` override is quarantined for optimizer research
+and should not be treated as the default ruliad path.
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 

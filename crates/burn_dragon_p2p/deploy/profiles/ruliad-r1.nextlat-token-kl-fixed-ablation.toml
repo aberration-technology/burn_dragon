@@ -1,0 +1,9 @@
+extends = ["ruliad-r1.nextlat-fixed-ablation.toml"]
+
+[training.latent_reasoning.next_latent]
+enabled = true
+horizon = 2
+regression_weight = 1.0
+token_kl_weight = 0.01
+smooth_l1_beta = 1.0
+detach_action_embedding = true

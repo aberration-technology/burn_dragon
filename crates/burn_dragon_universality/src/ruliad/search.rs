@@ -1,6 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::ruliad::metrics::{RuliadMetricSnapshot, RuliadSampleTelemetry};
+use crate::ruliad::metrics::{
+    RuliadBucketMetric, RuliadGroupMetric, RuliadMetricSnapshot, RuliadSampleTelemetry,
+};
+
+const SNAPSHOT_TOP_BUCKET_COUNT: usize = 12;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSamplerConfig {
@@ -85,6 +91,13 @@ pub struct RuliadFrontierSampler {
     verifier_failures: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadFrontierSamplerState {
+    pub candidates: Vec<RuliadSamplerCandidate>,
+    #[serde(default)]
+    pub verifier_failures: usize,
+}
+
 impl RuliadFrontierSampler {
     pub fn new(config: RuliadSamplerConfig, candidates: Vec<RuliadSamplerCandidate>) -> Self {
         Self {
@@ -96,6 +109,21 @@ impl RuliadFrontierSampler {
 
     pub fn candidates(&self) -> &[RuliadSamplerCandidate] {
         &self.candidates
+    }
+
+    pub fn export_state(&self) -> RuliadFrontierSamplerState {
+        RuliadFrontierSamplerState {
+            candidates: self.candidates.clone(),
+            verifier_failures: self.verifier_failures,
+        }
+    }
+
+    pub fn from_state(config: RuliadSamplerConfig, state: RuliadFrontierSamplerState) -> Self {
+        Self {
+            config,
+            candidates: state.candidates,
+            verifier_failures: state.verifier_failures,
+        }
     }
 
     pub fn max_difficulty_level(&self) -> usize {
@@ -284,6 +312,17 @@ impl RuliadFrontierSampler {
 
     pub fn snapshot(&self) -> RuliadMetricSnapshot {
         let probs = self.probabilities();
+        self.snapshot_with_probabilities(&probs)
+    }
+
+    pub fn snapshot_with_probabilities(&self, probabilities: &[f32]) -> RuliadMetricSnapshot {
+        let fallback_probs;
+        let probs = if probabilities.len() == self.candidates.len() {
+            probabilities
+        } else {
+            fallback_probs = self.probabilities();
+            &fallback_probs
+        };
         let sampler_entropy_bits = probs
             .iter()
             .filter(|prob| **prob > 0.0)
@@ -337,6 +376,35 @@ impl RuliadFrontierSampler {
                 (candidate.loss_ema <= self.config.target_loss).then_some(*prob)
             })
             .sum::<f32>();
+        let top_buckets = top_bucket_metrics(
+            probs,
+            &self.candidates,
+            self.config.target_loss,
+            SNAPSHOT_TOP_BUCKET_COUNT,
+        );
+        let mut difficulty_buckets = group_metrics_by(
+            probs,
+            &self.candidates,
+            self.config.target_loss,
+            |candidate| format!("d{}", candidate.difficulty_level),
+        );
+        difficulty_buckets.sort_by(|left, right| {
+            difficulty_label_key(&left.label)
+                .cmp(&difficulty_label_key(&right.label))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        let family_buckets = group_metrics_by(
+            probs,
+            &self.candidates,
+            self.config.target_loss,
+            |candidate| candidate.family.clone(),
+        );
+        let task_buckets = group_metrics_by(
+            probs,
+            &self.candidates,
+            self.config.target_loss,
+            |candidate| format!("{}:{}", candidate.family, candidate.task_kind),
+        );
         RuliadMetricSnapshot {
             sample_count: self.candidates.len(),
             verifier_failures: self.verifier_failures,
@@ -354,12 +422,112 @@ impl RuliadFrontierSampler {
             mastered_probability,
             frontier_extension_count: 0,
             frontier_saturated: false,
+            frontier_unbounded: false,
+            top_buckets,
+            difficulty_buckets,
+            family_buckets,
+            task_buckets,
         }
     }
 }
 
 fn difficulty_gate(loss_ema: f32, target_loss: f32) -> f32 {
     1.0 / (1.0 + (loss_ema - target_loss).abs())
+}
+
+fn top_bucket_metrics(
+    probs: &[f32],
+    candidates: &[RuliadSamplerCandidate],
+    target_loss: f32,
+    limit: usize,
+) -> Vec<RuliadBucketMetric> {
+    let mut buckets = probs
+        .iter()
+        .zip(candidates)
+        .map(|(probability, candidate)| RuliadBucketMetric {
+            label: candidate.oracle_hash.clone(),
+            family: candidate.family.clone(),
+            task_kind: candidate.task_kind.clone(),
+            difficulty_level: candidate.difficulty_level,
+            probability: *probability,
+            loss_ema: candidate.loss_ema,
+            previous_loss_ema: candidate.previous_loss_ema,
+            learning_progress: (candidate.previous_loss_ema - candidate.loss_ema).max(0.0),
+            mastered: candidate.loss_ema <= target_loss,
+        })
+        .collect::<Vec<_>>();
+    buckets.sort_by(|left, right| {
+        right
+            .probability
+            .partial_cmp(&left.probability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    buckets.truncate(limit);
+    buckets
+}
+
+fn group_metrics_by(
+    probs: &[f32],
+    candidates: &[RuliadSamplerCandidate],
+    target_loss: f32,
+    label: impl Fn(&RuliadSamplerCandidate) -> String,
+) -> Vec<RuliadGroupMetric> {
+    #[derive(Default)]
+    struct Accumulator {
+        candidate_count: usize,
+        probability: f32,
+        weighted_loss: f32,
+        learning_progress: f32,
+        mastered_probability: f32,
+        weighted_difficulty: f32,
+    }
+
+    let mut groups = BTreeMap::<String, Accumulator>::new();
+    for (probability, candidate) in probs.iter().zip(candidates) {
+        let group = groups.entry(label(candidate)).or_default();
+        group.candidate_count += 1;
+        group.probability += *probability;
+        group.weighted_loss += *probability * candidate.loss_ema;
+        group.learning_progress +=
+            *probability * (candidate.previous_loss_ema - candidate.loss_ema).max(0.0);
+        if candidate.loss_ema <= target_loss {
+            group.mastered_probability += *probability;
+        }
+        group.weighted_difficulty += *probability * candidate.difficulty_level as f32;
+    }
+
+    let mut metrics = groups
+        .into_iter()
+        .map(|(label, group)| {
+            let probability = group.probability.max(0.0);
+            let denominator = probability.max(1e-12);
+            RuliadGroupMetric {
+                label,
+                candidate_count: group.candidate_count,
+                probability,
+                mean_loss: group.weighted_loss / denominator,
+                learning_progress: group.learning_progress / denominator,
+                mastered_probability: group.mastered_probability,
+                mean_difficulty_level: group.weighted_difficulty / denominator,
+            }
+        })
+        .collect::<Vec<_>>();
+    metrics.sort_by(|left, right| {
+        right
+            .probability
+            .partial_cmp(&left.probability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    metrics
+}
+
+fn difficulty_label_key(label: &str) -> usize {
+    label
+        .strip_prefix('d')
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
 }
 
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
@@ -581,6 +749,22 @@ mod tests {
         assert!((snapshot.mean_difficulty_level - 0.5).abs() < 0.05);
         assert!((snapshot.normalized_difficulty_score - 0.5).abs() < 0.05);
         assert!((snapshot.max_difficulty_probability - 0.5).abs() < 0.05);
+        assert_eq!(snapshot.top_buckets.len(), 2);
+        assert_eq!(snapshot.top_buckets[0].label, "easy");
+        assert!(snapshot.top_buckets[0].probability > 0.45);
+        assert!(snapshot.top_buckets[0].mastered);
+        assert_eq!(
+            snapshot
+                .difficulty_buckets
+                .iter()
+                .map(|bucket| bucket.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d0", "d1"]
+        );
+        assert_eq!(snapshot.family_buckets.len(), 1);
+        assert_eq!(snapshot.family_buckets[0].label, "category");
+        assert!((snapshot.family_buckets[0].probability - 1.0).abs() < 0.01);
+        assert_eq!(snapshot.task_buckets.len(), 2);
     }
 
     #[test]

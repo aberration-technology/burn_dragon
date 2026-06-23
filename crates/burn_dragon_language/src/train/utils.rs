@@ -208,6 +208,8 @@ pub(crate) fn build_model_spec(model_config: &DragonConfig) -> ModelSpec {
         latent_per_head: model_config.latent_per_head(),
         shared_layer_weights: true,
         sequence_kernel: model_config.sequence_kernel,
+        latent_reasoning_enabled: model_config.latent_reasoning.enabled,
+        latent_reasoning_max_steps: model_config.latent_reasoning.max_steps,
         dragon_initialization_kind: model_config.initialization.kind,
         dragon_residual_scaling_kind: model_config.initialization.residual_scaling.kind,
         dragon_neuron_gain_kind: model_config.initialization.neuron_gains.kind,

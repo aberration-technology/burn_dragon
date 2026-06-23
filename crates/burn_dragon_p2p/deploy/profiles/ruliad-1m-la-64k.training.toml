@@ -1,0 +1,7 @@
+extends = "ruliad-1m-la-16k.training.toml"
+
+[model]
+latent_total = 65536
+
+[training]
+batch_size = 1

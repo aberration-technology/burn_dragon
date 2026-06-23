@@ -1,0 +1,9 @@
+extends = ["ruliad-r1.jepa-nextlat-delayed1024-sparse16-probe32-fixed-ablation.toml"]
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.003
+start_after_steps = 1024
+warmup_steps = 512
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5

@@ -44,8 +44,42 @@ pub struct RuliadMetricSnapshot {
     pub frontier_extension_count: usize,
     #[serde(default)]
     pub frontier_saturated: bool,
+    #[serde(default)]
+    pub frontier_unbounded: bool,
+    #[serde(default)]
+    pub top_buckets: Vec<RuliadBucketMetric>,
+    #[serde(default)]
+    pub difficulty_buckets: Vec<RuliadGroupMetric>,
+    #[serde(default)]
+    pub family_buckets: Vec<RuliadGroupMetric>,
+    #[serde(default)]
+    pub task_buckets: Vec<RuliadGroupMetric>,
 }
 
 fn default_cost() -> f32 {
     1.0
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadBucketMetric {
+    pub label: String,
+    pub family: String,
+    pub task_kind: String,
+    pub difficulty_level: usize,
+    pub probability: f32,
+    pub loss_ema: f32,
+    pub previous_loss_ema: f32,
+    pub learning_progress: f32,
+    pub mastered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadGroupMetric {
+    pub label: String,
+    pub candidate_count: usize,
+    pub probability: f32,
+    pub mean_loss: f32,
+    pub learning_progress: f32,
+    pub mastered_probability: f32,
+    pub mean_difficulty_level: f32,
 }

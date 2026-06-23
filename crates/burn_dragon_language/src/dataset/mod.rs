@@ -13,7 +13,9 @@ pub use scheduler::{
     RandomDataLoader, SequenceBatch, StreamingDataLoader, TokenSequenceDataset,
     sample_batch_with_shape,
 };
-pub use universality::UniversalityDataset;
+pub use universality::{
+    RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, UniversalityDataset,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetSplit {
@@ -70,6 +72,19 @@ impl Dataset {
         TokenSequenceDataset::source_selection_snapshot(self)
     }
 
+    pub fn write_source_selection_state(
+        &self,
+        path: &std::path::Path,
+        absolute_step_offset: usize,
+    ) -> std::io::Result<Option<RuliadSourceSelectionStateSnapshot>> {
+        match self {
+            Dataset::HuggingFace(_) => Ok(None),
+            Dataset::Universality(dataset) => {
+                dataset.write_source_selection_state(path, absolute_step_offset)
+            }
+        }
+    }
+
     pub fn apply_source_selection_dynamics_control(
         &self,
         difficulty_pressure: f32,
@@ -100,6 +115,33 @@ impl Dataset {
                 summary_event_token_ids,
                 device,
             ),
+        }
+    }
+
+    pub fn sample_ruliad_validation_probe_items(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        max_items: usize,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => {
+                dataset.sample_ruliad_validation_probe_items(epoch_index, absolute_step, max_items)
+            }
+        }
+    }
+
+    pub fn decode_ruliad_payload_tokens(
+        &self,
+        tokens: &[i64],
+        stop_at_eos: bool,
+    ) -> Option<String> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => {
+                dataset.decode_ruliad_payload_tokens(tokens, stop_at_eos)
+            }
         }
     }
 }
@@ -217,6 +259,35 @@ impl TokenSequenceDataset for Dataset {
         }
     }
 
+    fn source_selected_stream_token_windows(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        chunk_index_in_document: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selected_stream_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                chunk_index_in_document,
+                batch_size,
+                block_size,
+            ),
+            Dataset::Universality(dataset) => dataset.source_selected_stream_token_windows(
+                split,
+                epoch_index,
+                absolute_step,
+                chunk_index_in_document,
+                batch_size,
+                block_size,
+            ),
+        }
+    }
+
     fn record_source_selection_loss(
         &self,
         absolute_step: usize,
@@ -236,6 +307,24 @@ impl TokenSequenceDataset for Dataset {
         match self {
             Dataset::HuggingFace(dataset) => dataset.source_selection_snapshot(),
             Dataset::Universality(dataset) => dataset.source_selection_snapshot(),
+        }
+    }
+
+    fn uses_target_loss_mask(&self) -> bool {
+        match self {
+            Dataset::HuggingFace(dataset) => TokenSequenceDataset::uses_target_loss_mask(dataset),
+            Dataset::Universality(dataset) => TokenSequenceDataset::uses_target_loss_mask(dataset),
+        }
+    }
+
+    fn target_loss_mask_for_window(&self, window: &[u32], mask: &mut [i64]) -> bool {
+        match self {
+            Dataset::HuggingFace(dataset) => {
+                TokenSequenceDataset::target_loss_mask_for_window(dataset, window, mask)
+            }
+            Dataset::Universality(dataset) => {
+                TokenSequenceDataset::target_loss_mask_for_window(dataset, window, mask)
+            }
         }
     }
 

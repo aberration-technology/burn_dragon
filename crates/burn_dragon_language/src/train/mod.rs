@@ -7,6 +7,7 @@ mod continual_backprop;
 mod dynamics;
 pub mod events;
 pub mod neuron_scaling;
+pub(crate) mod next_latent;
 pub mod objective;
 pub mod optimizer_dynamics;
 pub mod phased;

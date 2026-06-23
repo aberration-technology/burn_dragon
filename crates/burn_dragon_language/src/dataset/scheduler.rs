@@ -81,6 +81,22 @@ pub trait TokenSequenceDataset: Send + Sync {
         None
     }
 
+    /// Return concrete source-selected token windows for a streaming TBPTT chunk, if the dataset
+    /// can generate them without first materializing a full epoch. `chunk_index_in_document`
+    /// identifies the chunk offset inside the logical document currently being streamed, while
+    /// `absolute_step` is the feedback key that will later receive the chunk loss.
+    fn source_selected_stream_token_windows(
+        &self,
+        _split: DatasetSplit,
+        _epoch_index: usize,
+        _absolute_step: usize,
+        _chunk_index_in_document: usize,
+        _batch_size: usize,
+        _block_size: usize,
+    ) -> Option<Vec<Vec<u32>>> {
+        None
+    }
+
     /// Feed aggregate loss telemetry for a previously selected source bucket.
     fn record_source_selection_loss(
         &self,
@@ -92,6 +108,17 @@ pub trait TokenSequenceDataset: Send + Sync {
 
     fn source_selection_snapshot(&self) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         None
+    }
+
+    /// Whether sampled batches should include a per-target loss mask.
+    fn uses_target_loss_mask(&self) -> bool {
+        false
+    }
+
+    /// Fill a per-target loss mask for a sampled token window. `window` has length
+    /// `block_size + 1`, while `mask` has length `block_size` and aligns with shifted targets.
+    fn target_loss_mask_for_window(&self, _window: &[u32], _mask: &mut [i64]) -> bool {
+        false
     }
 
     /// Number of tokens reserved for the training split from the start of the corpus.
@@ -168,6 +195,93 @@ pub fn sample_batch<B: Backend, T: TokenSequenceDataset + ?Sized>(
     )
 }
 
+#[cfg(feature = "train")]
+#[allow(clippy::too_many_arguments)]
+fn fill_sampled_logical_document_row<T: TokenSequenceDataset + ?Sized>(
+    dataset: &T,
+    split: DatasetSplit,
+    epoch_index: usize,
+    offset: usize,
+    document_span: usize,
+    num_documents: usize,
+    max_start_in_document: usize,
+    source_selected_documents: Option<&Vec<usize>>,
+    batch_idx: usize,
+    block_size: usize,
+    input_row: &mut [i64],
+    target_row: &mut [i64],
+    mask_row: Option<&mut [i64]>,
+) {
+    let mut rng = thread_rng();
+    let doc_index = source_selected_documents
+        .and_then(|indices| indices.get(batch_idx))
+        .copied()
+        .unwrap_or_else(|| {
+            if num_documents <= 1 {
+                0
+            } else {
+                rng.gen_range(0..num_documents)
+            }
+        });
+    let start_in_document = if max_start_in_document == 0 {
+        0
+    } else {
+        rng.gen_range(0..=max_start_in_document)
+    };
+    let start = offset + doc_index.saturating_mul(document_span) + start_in_document;
+    let mut sample = vec![0u32; block_size + 1];
+    dataset.copy_token_range_with_epoch(split, epoch_index, start, &mut sample);
+    fill_rows_from_window(
+        dataset, &sample, block_size, input_row, target_row, mask_row,
+    );
+}
+
+#[cfg(feature = "train")]
+#[allow(clippy::too_many_arguments)]
+fn fill_sampled_flat_row<T: TokenSequenceDataset + ?Sized>(
+    dataset: &T,
+    split: DatasetSplit,
+    epoch_index: usize,
+    offset: usize,
+    span: usize,
+    block_size: usize,
+    input_row: &mut [i64],
+    target_row: &mut [i64],
+    mask_row: Option<&mut [i64]>,
+) {
+    let mut rng = thread_rng();
+    let max_start = span.saturating_sub(block_size + 1);
+    let start_offset = if max_start == 0 {
+        0
+    } else {
+        rng.gen_range(0..=max_start)
+    };
+    let start = offset + start_offset;
+    let mut sample = vec![0u32; block_size + 1];
+    dataset.copy_token_range_with_epoch(split, epoch_index, start, &mut sample);
+    fill_rows_from_window(
+        dataset, &sample, block_size, input_row, target_row, mask_row,
+    );
+}
+
+#[cfg(feature = "train")]
+fn fill_rows_from_window<T: TokenSequenceDataset + ?Sized>(
+    dataset: &T,
+    window: &[u32],
+    block_size: usize,
+    input_row: &mut [i64],
+    target_row: &mut [i64],
+    mask_row: Option<&mut [i64]>,
+) {
+    for t in 0..block_size {
+        input_row[t] = window[t] as i64;
+        target_row[t] = window[t + 1] as i64;
+    }
+    if let Some(mask_row) = mask_row {
+        dataset.target_loss_mask_for_window(window, mask_row);
+    }
+}
+
 /// Sample a random batch with an explicit batch/block shape from any dataset implementing
 /// [`TokenSequenceDataset`].
 fn sample_host_batch_with_shape<T>(
@@ -189,6 +303,9 @@ where
     let mut rng = thread_rng();
     let mut inputs = vec![0i64; batch_size * block_size];
     let mut targets = vec![0i64; batch_size * block_size];
+    let mut loss_mask = dataset
+        .uses_target_loss_mask()
+        .then(|| vec![0i64; batch_size * block_size]);
     #[cfg(not(feature = "train"))]
     let mut sample = vec![0u32; block_size + 1];
 
@@ -213,6 +330,12 @@ where
                 inputs[batch_idx * block_size + t] = window[t] as i64;
                 targets[batch_idx * block_size + t] = window[t + 1] as i64;
             }
+            if let Some(mask) = loss_mask.as_mut() {
+                dataset.target_loss_mask_for_window(
+                    window,
+                    &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
+                );
+            }
         }
     } else if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
@@ -224,37 +347,52 @@ where
             .min(document_span.saturating_sub(block_size + 1));
         #[cfg(feature = "train")]
         {
-            inputs
-                .par_chunks_mut(block_size)
-                .zip(targets.par_chunks_mut(block_size))
-                .enumerate()
-                .for_each(|(batch_idx, (input_row, target_row))| {
-                    let mut rng = thread_rng();
-                    let doc_index = source_selected_documents
-                        .as_ref()
-                        .and_then(|indices| indices.get(batch_idx))
-                        .copied()
-                        .unwrap_or_else(|| {
-                            if num_documents <= 1 {
-                                0
-                            } else {
-                                rng.gen_range(0..num_documents)
-                            }
-                        });
-                    let start_in_document = if max_start_in_document == 0 {
-                        0
-                    } else {
-                        rng.gen_range(0..=max_start_in_document)
-                    };
-                    let start =
-                        offset + doc_index.saturating_mul(document_span) + start_in_document;
-                    let mut sample = vec![0u32; block_size + 1];
-                    dataset.copy_token_range_with_epoch(split, epoch_index, start, &mut sample);
-                    for t in 0..block_size {
-                        input_row[t] = sample[t] as i64;
-                        target_row[t] = sample[t + 1] as i64;
-                    }
-                });
+            if let Some(mask) = loss_mask.as_mut() {
+                inputs
+                    .par_chunks_mut(block_size)
+                    .zip(targets.par_chunks_mut(block_size))
+                    .zip(mask.par_chunks_mut(block_size))
+                    .enumerate()
+                    .for_each(|(batch_idx, ((input_row, target_row), mask_row))| {
+                        fill_sampled_logical_document_row(
+                            dataset,
+                            split,
+                            epoch_index,
+                            offset,
+                            document_span,
+                            num_documents,
+                            max_start_in_document,
+                            source_selected_documents.as_ref(),
+                            batch_idx,
+                            block_size,
+                            input_row,
+                            target_row,
+                            Some(mask_row),
+                        );
+                    });
+            } else {
+                inputs
+                    .par_chunks_mut(block_size)
+                    .zip(targets.par_chunks_mut(block_size))
+                    .enumerate()
+                    .for_each(|(batch_idx, (input_row, target_row))| {
+                        fill_sampled_logical_document_row(
+                            dataset,
+                            split,
+                            epoch_index,
+                            offset,
+                            document_span,
+                            num_documents,
+                            max_start_in_document,
+                            source_selected_documents.as_ref(),
+                            batch_idx,
+                            block_size,
+                            input_row,
+                            target_row,
+                            None,
+                        );
+                    });
+            }
         }
         #[cfg(not(feature = "train"))]
         for batch_idx in 0..batch_size {
@@ -280,29 +418,52 @@ where
                 inputs[batch_idx * block_size + t] = sample[t] as i64;
                 targets[batch_idx * block_size + t] = sample[t + 1] as i64;
             }
+            if let Some(mask) = loss_mask.as_mut() {
+                dataset.target_loss_mask_for_window(
+                    &sample,
+                    &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
+                );
+            }
         }
     } else {
         #[cfg(feature = "train")]
         {
-            inputs
-                .par_chunks_mut(block_size)
-                .zip(targets.par_chunks_mut(block_size))
-                .for_each(|(input_row, target_row)| {
-                    let mut rng = thread_rng();
-                    let max_start = span.saturating_sub(block_size + 1);
-                    let start_offset = if max_start == 0 {
-                        0
-                    } else {
-                        rng.gen_range(0..=max_start)
-                    };
-                    let start = offset + start_offset;
-                    let mut sample = vec![0u32; block_size + 1];
-                    dataset.copy_token_range_with_epoch(split, epoch_index, start, &mut sample);
-                    for t in 0..block_size {
-                        input_row[t] = sample[t] as i64;
-                        target_row[t] = sample[t + 1] as i64;
-                    }
-                });
+            if let Some(mask) = loss_mask.as_mut() {
+                inputs
+                    .par_chunks_mut(block_size)
+                    .zip(targets.par_chunks_mut(block_size))
+                    .zip(mask.par_chunks_mut(block_size))
+                    .for_each(|((input_row, target_row), mask_row)| {
+                        fill_sampled_flat_row(
+                            dataset,
+                            split,
+                            epoch_index,
+                            offset,
+                            span,
+                            block_size,
+                            input_row,
+                            target_row,
+                            Some(mask_row),
+                        );
+                    });
+            } else {
+                inputs
+                    .par_chunks_mut(block_size)
+                    .zip(targets.par_chunks_mut(block_size))
+                    .for_each(|(input_row, target_row)| {
+                        fill_sampled_flat_row(
+                            dataset,
+                            split,
+                            epoch_index,
+                            offset,
+                            span,
+                            block_size,
+                            input_row,
+                            target_row,
+                            None,
+                        );
+                    });
+            }
         }
         #[cfg(not(feature = "train"))]
         for batch_idx in 0..batch_size {
@@ -318,12 +479,19 @@ where
                 inputs[batch_idx * block_size + t] = sample[t] as i64;
                 targets[batch_idx * block_size + t] = sample[t + 1] as i64;
             }
+            if let Some(mask) = loss_mask.as_mut() {
+                dataset.target_loss_mask_for_window(
+                    &sample,
+                    &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
+                );
+            }
         }
     }
 
     HostSequenceBatch {
         inputs,
         targets,
+        loss_mask,
         dataloader_cpu_ns: cpu_start
             .map(|start| start.elapsed().as_nanos())
             .unwrap_or_default(),
@@ -358,6 +526,7 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
 pub struct SequenceBatch<B: Backend> {
     pub inputs: Tensor<B, 2, Int>,
     pub targets: Tensor<B, 2, Int>,
+    pub loss_mask: Option<Tensor<B, 2, Int>>,
     pub summary_event_mask: Option<Tensor<B, 2, Int>>,
     pub reset_stream_state: bool,
 }
@@ -365,6 +534,7 @@ pub struct SequenceBatch<B: Backend> {
 struct HostSequenceBatch {
     inputs: Vec<i64>,
     targets: Vec<i64>,
+    loss_mask: Option<Vec<i64>>,
     dataloader_cpu_ns: u128,
     reset_stream_state: bool,
 }
@@ -507,9 +677,15 @@ impl<B: Backend> SequenceBatch<B> {
         Self {
             inputs,
             targets,
+            loss_mask: None,
             summary_event_mask,
             reset_stream_state: false,
         }
+    }
+
+    pub fn with_loss_mask(mut self, loss_mask: Option<Tensor<B, 2, Int>>) -> Self {
+        self.loss_mask = loss_mask;
+        self
     }
 
     pub fn with_reset_stream_state(mut self, reset_stream_state: bool) -> Self {
@@ -564,6 +740,7 @@ fn finalize_host_batch_on_device<B: Backend>(
     let HostSequenceBatch {
         inputs,
         targets,
+        loss_mask,
         dataloader_cpu_ns,
         reset_stream_state,
     } = host;
@@ -580,17 +757,24 @@ fn finalize_host_batch_on_device<B: Backend>(
         Tensor::<B, 2, Int>::from_data(TensorData::new(inputs, [batch_size, block_size]), device);
     let targets_tensor =
         Tensor::<B, 2, Int>::from_data(TensorData::new(targets, [batch_size, block_size]), device);
+    let loss_mask_tensor = loss_mask.map(|mask| {
+        Tensor::<B, 2, Int>::from_data(TensorData::new(mask, [batch_size, block_size]), device)
+    });
     let tensor_copy_ns = tensor_copy_start
         .map(|start| start.elapsed().as_nanos())
         .unwrap_or_default();
 
     if prof_enabled {
         let values = batch_size.saturating_mul(block_size);
-        let copy_bytes = (values.saturating_mul(2).saturating_mul(size_of::<i64>())) as u128;
+        let tensor_count = 2 + usize::from(loss_mask_tensor.is_some());
+        let copy_bytes = (values
+            .saturating_mul(tensor_count)
+            .saturating_mul(size_of::<i64>())) as u128;
         crate::train::profile::record_dataloader(dataloader_cpu_ns, tensor_copy_ns, copy_bytes, 0);
     }
 
     SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
+        .with_loss_mask(loss_mask_tensor)
         .with_reset_stream_state(reset_stream_state)
 }
 
@@ -954,6 +1138,7 @@ struct StreamingIterator<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
+    steps_per_epoch: usize,
     logical_document_tokens: usize,
     chunks_per_document: usize,
     next_document_group: usize,
@@ -971,18 +1156,21 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         if self.step >= self.steps_total {
             return None;
         }
-        self.step += 1;
-
-        if let Some(counter) = &self.consumed_steps {
-            if let Some(limit) = self.total_steps {
-                let previous = counter.fetch_add(1, Ordering::Relaxed);
-                if previous >= limit {
-                    return None;
-                }
-            } else {
-                counter.fetch_add(1, Ordering::Relaxed);
+        let step_in_loader = self.step;
+        let absolute_step = if let Some(counter) = &self.consumed_steps {
+            let previous = counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(limit) = self.total_steps
+                && previous >= limit
+            {
+                return None;
             }
-        }
+            previous
+        } else {
+            self.epoch_index
+                .saturating_mul(self.steps_per_epoch.max(1))
+                .saturating_add(step_in_loader)
+        };
+        self.step += 1;
 
         let prof_enabled = crate::train::profile::enabled();
         let cpu_start = prof_enabled.then(Instant::now);
@@ -991,60 +1179,142 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let block_size = self.block_size;
         let mut inputs = vec![0i64; batch_size * block_size];
         let mut targets = vec![0i64; batch_size * block_size];
+        let mut loss_mask = self
+            .dataset
+            .uses_target_loss_mask()
+            .then(|| vec![0i64; batch_size * block_size]);
         #[cfg(not(feature = "train"))]
         let mut sample = vec![0u32; block_size + 1];
         let document_span = self.logical_document_tokens + 1;
-        let reset_stream_state = self.chunk_index_in_document == 0;
+        let reset_stream_state =
+            self.chunk_index_in_document == 0 || self.dataset.uses_target_loss_mask();
 
-        #[cfg(feature = "train")]
-        {
-            let next_document_group = self.next_document_group;
-            let document_start = self.document_start;
-            let document_stride = self.document_stride;
-            let num_documents = self.num_documents.max(1);
-            let chunk_index_in_document = self.chunk_index_in_document;
-            inputs
-                .par_chunks_mut(block_size)
-                .zip(targets.par_chunks_mut(block_size))
-                .enumerate()
-                .for_each(|(batch_idx, (input_row, target_row))| {
-                    let doc_rank = (next_document_group + batch_idx) % num_documents;
-                    let doc_idx = (document_start
-                        .wrapping_add(doc_rank.wrapping_mul(document_stride)))
-                        % num_documents;
-                    let doc_start = offset + doc_idx.saturating_mul(document_span);
-                    let start = doc_start + chunk_index_in_document.saturating_mul(block_size);
-                    let mut sample = vec![0u32; block_size + 1];
-                    self.dataset.copy_token_range_with_epoch(
-                        self.split,
-                        self.epoch_index,
-                        start,
-                        &mut sample,
-                    );
-                    for t in 0..block_size {
-                        input_row[t] = sample[t] as i64;
-                        target_row[t] = sample[t + 1] as i64;
-                    }
-                });
-        }
-        #[cfg(not(feature = "train"))]
-        for batch_idx in 0..batch_size {
-            let doc_rank = (self.next_document_group + batch_idx) % self.num_documents.max(1);
-            let doc_idx = (self
-                .document_start
-                .wrapping_add(doc_rank.wrapping_mul(self.document_stride)))
-                % self.num_documents.max(1);
-            let doc_start = offset + doc_idx.saturating_mul(document_span);
-            let start = doc_start + self.chunk_index_in_document.saturating_mul(block_size);
-            self.dataset.copy_token_range_with_epoch(
-                self.split,
-                self.epoch_index,
-                start,
-                &mut sample,
+        if let Some(source_windows) = self.dataset.source_selected_stream_token_windows(
+            self.split,
+            self.epoch_index,
+            absolute_step,
+            self.chunk_index_in_document,
+            batch_size,
+            block_size,
+        ) {
+            assert_eq!(
+                source_windows.len(),
+                batch_size,
+                "source-selected stream windows must match batch size"
             );
-            for t in 0..block_size {
-                inputs[batch_idx * block_size + t] = sample[t] as i64;
-                targets[batch_idx * block_size + t] = sample[t + 1] as i64;
+            for (batch_idx, window) in source_windows.iter().enumerate() {
+                assert!(
+                    window.len() > block_size,
+                    "source-selected stream window must include block_size + 1 tokens"
+                );
+                let input_row = &mut inputs[batch_idx * block_size..(batch_idx + 1) * block_size];
+                let target_row = &mut targets[batch_idx * block_size..(batch_idx + 1) * block_size];
+                let mask_row = loss_mask
+                    .as_mut()
+                    .map(|mask| &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size]);
+                fill_rows_from_window(
+                    self.dataset.as_ref(),
+                    window,
+                    block_size,
+                    input_row,
+                    target_row,
+                    mask_row,
+                );
+            }
+        } else {
+            #[cfg(feature = "train")]
+            {
+                let next_document_group = self.next_document_group;
+                let document_start = self.document_start;
+                let document_stride = self.document_stride;
+                let num_documents = self.num_documents.max(1);
+                let chunk_index_in_document = self.chunk_index_in_document;
+                if let Some(mask) = loss_mask.as_mut() {
+                    inputs
+                        .par_chunks_mut(block_size)
+                        .zip(targets.par_chunks_mut(block_size))
+                        .zip(mask.par_chunks_mut(block_size))
+                        .enumerate()
+                        .for_each(|(batch_idx, ((input_row, target_row), mask_row))| {
+                            let doc_rank = (next_document_group + batch_idx) % num_documents;
+                            let doc_idx = (document_start
+                                .wrapping_add(doc_rank.wrapping_mul(document_stride)))
+                                % num_documents;
+                            let doc_start = offset + doc_idx.saturating_mul(document_span);
+                            let start =
+                                doc_start + chunk_index_in_document.saturating_mul(block_size);
+                            let mut sample = vec![0u32; block_size + 1];
+                            self.dataset.copy_token_range_with_epoch(
+                                self.split,
+                                self.epoch_index,
+                                start,
+                                &mut sample,
+                            );
+                            fill_rows_from_window(
+                                self.dataset.as_ref(),
+                                &sample,
+                                block_size,
+                                input_row,
+                                target_row,
+                                Some(mask_row),
+                            );
+                        });
+                } else {
+                    inputs
+                        .par_chunks_mut(block_size)
+                        .zip(targets.par_chunks_mut(block_size))
+                        .enumerate()
+                        .for_each(|(batch_idx, (input_row, target_row))| {
+                            let doc_rank = (next_document_group + batch_idx) % num_documents;
+                            let doc_idx = (document_start
+                                .wrapping_add(doc_rank.wrapping_mul(document_stride)))
+                                % num_documents;
+                            let doc_start = offset + doc_idx.saturating_mul(document_span);
+                            let start =
+                                doc_start + chunk_index_in_document.saturating_mul(block_size);
+                            let mut sample = vec![0u32; block_size + 1];
+                            self.dataset.copy_token_range_with_epoch(
+                                self.split,
+                                self.epoch_index,
+                                start,
+                                &mut sample,
+                            );
+                            fill_rows_from_window(
+                                self.dataset.as_ref(),
+                                &sample,
+                                block_size,
+                                input_row,
+                                target_row,
+                                None,
+                            );
+                        });
+                }
+            }
+            #[cfg(not(feature = "train"))]
+            for batch_idx in 0..batch_size {
+                let doc_rank = (self.next_document_group + batch_idx) % self.num_documents.max(1);
+                let doc_idx = (self
+                    .document_start
+                    .wrapping_add(doc_rank.wrapping_mul(self.document_stride)))
+                    % self.num_documents.max(1);
+                let doc_start = offset + doc_idx.saturating_mul(document_span);
+                let start = doc_start + self.chunk_index_in_document.saturating_mul(block_size);
+                self.dataset.copy_token_range_with_epoch(
+                    self.split,
+                    self.epoch_index,
+                    start,
+                    &mut sample,
+                );
+                for t in 0..block_size {
+                    inputs[batch_idx * block_size + t] = sample[t] as i64;
+                    targets[batch_idx * block_size + t] = sample[t + 1] as i64;
+                }
+                if let Some(mask) = loss_mask.as_mut() {
+                    self.dataset.target_loss_mask_for_window(
+                        &sample,
+                        &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
+                    );
+                }
             }
         }
 
@@ -1071,13 +1341,22 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
             TensorData::new(targets, [batch_size, block_size]),
             &self.device,
         );
+        let loss_mask_tensor = loss_mask.map(|mask| {
+            Tensor::<B, 2, Int>::from_data(
+                TensorData::new(mask, [batch_size, block_size]),
+                &self.device,
+            )
+        });
         let tensor_copy_ns = tensor_copy_start
             .map(|start| start.elapsed().as_nanos())
             .unwrap_or_default();
 
         if prof_enabled {
             let values = batch_size.saturating_mul(block_size);
-            let copy_bytes = (values.saturating_mul(2).saturating_mul(size_of::<i64>())) as u128;
+            let tensor_count = 2 + usize::from(loss_mask_tensor.is_some());
+            let copy_bytes = (values
+                .saturating_mul(tensor_count)
+                .saturating_mul(size_of::<i64>())) as u128;
             crate::train::profile::record_dataloader(cpu_ns, tensor_copy_ns, copy_bytes, 0);
         }
 
@@ -1090,6 +1369,7 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
 
         Some(
             SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
+                .with_loss_mask(loss_mask_tensor)
                 .with_reset_stream_state(reset_stream_state),
         )
     }
@@ -1132,8 +1412,15 @@ where
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or_default();
         let epoch_index = consumed / self.steps_per_epoch.max(1);
+        let step_in_epoch = consumed % self.steps_per_epoch.max(1);
         let (document_start, document_stride) =
             resolve_stream_document_permutation(self.seed, epoch_index, num_documents);
+        let chunk_index_in_document = step_in_epoch % chunks_per_document;
+        let next_document_group = step_in_epoch
+            .checked_div(chunks_per_document)
+            .unwrap_or_default()
+            .saturating_mul(self.batch_size)
+            % num_documents;
 
         Box::new(StreamingIterator {
             dataset: Arc::clone(&self.dataset),
@@ -1146,10 +1433,11 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.clone(),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            steps_per_epoch: self.steps_per_epoch,
             logical_document_tokens,
             chunks_per_document,
-            next_document_group: 0,
-            chunk_index_in_document: 0,
+            next_document_group,
+            chunk_index_in_document,
             num_documents,
             document_start,
             document_stride,
@@ -1215,6 +1503,7 @@ mod streaming_tests {
         batch_size: usize,
         tokenizer: SharedTokenizer,
         preferred_logical_document_tokens: Option<usize>,
+        mask_even_targets: bool,
     }
 
     impl TokenSequenceDataset for TinyDataset {
@@ -1249,6 +1538,21 @@ mod streaming_tests {
         fn preferred_logical_document_tokens(&self, _split: DatasetSplit) -> Option<usize> {
             self.preferred_logical_document_tokens
         }
+
+        fn uses_target_loss_mask(&self) -> bool {
+            self.mask_even_targets
+        }
+
+        fn target_loss_mask_for_window(&self, window: &[u32], mask: &mut [i64]) -> bool {
+            mask.fill(0);
+            if !self.mask_even_targets || window.len() < mask.len().saturating_add(1) {
+                return false;
+            }
+            for t in 0..mask.len() {
+                mask[t] = i64::from(window[t + 1] % 2 == 0);
+            }
+            true
+        }
     }
 
     fn tiny_pretokenized_tokenizer() -> SharedTokenizer {
@@ -1277,6 +1581,7 @@ mod streaming_tests {
             batch_size: 2,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: None,
+            mask_even_targets: false,
         });
         let loader = StreamingDataLoader::<TestBackend>::new(
             Arc::clone(&dataset),
@@ -1309,6 +1614,7 @@ mod streaming_tests {
             batch_size: 8,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: Some(8),
+            mask_even_targets: false,
         });
 
         for _ in 0..32 {
@@ -1356,6 +1662,7 @@ mod streaming_tests {
             batch_size: 2,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: None,
+            mask_even_targets: false,
         });
         let batch = RandomDataLoader::<TestBackend>::new(
             Arc::clone(&dataset),
@@ -1381,6 +1688,7 @@ mod streaming_tests {
             batch_size: 2,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: None,
+            mask_even_targets: false,
         });
         let batch = StreamingDataLoader::<TestBackend>::new(
             Arc::clone(&dataset),
@@ -1409,6 +1717,7 @@ mod streaming_tests {
             batch_size: 4,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: Some(8),
+            mask_even_targets: false,
         };
 
         for absolute_step in 0..16 {
@@ -1470,6 +1779,7 @@ mod streaming_tests {
             batch_size: 2,
             tokenizer: tiny_pretokenized_tokenizer(),
             preferred_logical_document_tokens: None,
+            mask_even_targets: false,
         });
         let batch_inputs = |seed| {
             let loader = StreamingDataLoader::<TestBackend>::new(
@@ -1496,6 +1806,51 @@ mod streaming_tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, different);
+    }
+
+    #[test]
+    fn streaming_loader_propagates_target_loss_mask() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let dataset = Arc::new(TinyDataset {
+            tokens: Arc::new((0u32..65).collect()),
+            train_len: 65,
+            block_size: 4,
+            batch_size: 2,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: None,
+            mask_even_targets: true,
+        });
+        let batch = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            2,
+            Some(2),
+            Some(8),
+            1337,
+        )
+        .iter()
+        .next()
+        .expect("streaming batch");
+
+        let targets = batch
+            .targets
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("targets");
+        let mask = batch
+            .loss_mask
+            .expect("streaming loss mask")
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("loss mask");
+        let expected = targets
+            .iter()
+            .map(|target| i64::from(target % 2 == 0))
+            .collect::<Vec<_>>();
+        assert_eq!(mask, expected);
     }
 }
 

@@ -1959,6 +1959,7 @@ dependencies = [
  "burn_dragon_universality",
  "burn_ecs",
  "burn_eggroll",
+ "burn_pc",
  "criterion 0.7.0",
  "csv",
  "fancy-regex",
@@ -2485,6 +2486,15 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "burn_pc"
+version = "0.21.8"
+dependencies = [
+ "anyhow",
+ "burn",
+ "serde",
 ]
 
 [[package]]

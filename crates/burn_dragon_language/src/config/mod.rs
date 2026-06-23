@@ -11,9 +11,15 @@ pub use core::{
 #[cfg(feature = "train")]
 pub use train::{
     AutoBatchSizeConfig, CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
+    DragonStateConsistencyConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
     GreedyRolloutUnlikelihoodConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    LogitEntropyFloorConfig, RepeatUnlikelihoodConfig, RepromptTruncation, SdftObjectiveConfig,
-    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
-    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    ValidationDatasetConfig, load_training_config,
+    LatentReasoningConstraintBalancerConfig, LatentReasoningNegativeSource,
+    LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
+    LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LogitEntropyFloorConfig,
+    NextLatentPredictionConfig, PredictiveCodingBackwardMode, PredictiveCodingConfig,
+    PredictiveCodingMode, PredictiveCodingParameterUpdate, PredictiveCodingStateScope,
+    RepeatUnlikelihoodConfig, RepromptTruncation, RuliadSupervisionConfig, RuliadSupervisionMode,
+    SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
 };

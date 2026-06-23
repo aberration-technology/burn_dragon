@@ -601,6 +601,12 @@ pub fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverride
     if let Some(value) = &incoming.summary_memory {
         base.summary_memory = Some(value.clone());
     }
+    if let Some(value) = &incoming.latent_reasoning {
+        base.latent_reasoning = Some(value.clone());
+    }
+    if let Some(value) = &incoming.next_latent_transition {
+        base.next_latent_transition = Some(value.clone());
+    }
     if let Some(value) = &incoming.mhc {
         base.mhc = Some(value.clone());
     }

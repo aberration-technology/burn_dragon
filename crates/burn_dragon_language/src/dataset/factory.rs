@@ -68,6 +68,12 @@ pub fn build_dataset(
                 training.batch_size,
                 &cfg.tokenizer,
             )
+            .and_then(|dataset| {
+                dataset.with_source_selection_state_path(
+                    training.source_selection_state_path.as_deref(),
+                )
+            })
+            .map(|dataset| dataset.with_ruliad_supervision(training.ruliad_supervision))
             .with_context(|| {
                 format!(
                     "failed to prepare on-the-fly universality ruliad dataset {}",

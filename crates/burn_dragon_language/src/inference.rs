@@ -122,6 +122,12 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(summary_memory) = &overrides.summary_memory {
         model_config.summary_memory = summary_memory.clone();
     }
+    if let Some(latent_reasoning) = &overrides.latent_reasoning {
+        model_config.latent_reasoning = latent_reasoning.clone();
+    }
+    if let Some(next_latent_transition) = &overrides.next_latent_transition {
+        model_config.next_latent_transition = next_latent_transition.clone();
+    }
     if let Some(mhc) = &overrides.mhc {
         model_config.mhc = mhc.clone();
     }

@@ -1,0 +1,8 @@
+extends = ["ruliad-r1.jepa-nextlat-delayed1024-probe32-fixed-ablation.toml"]
+
+[training.latent_reasoning]
+every_steps = 16
+jepa_future_offsets = [1]
+target_encoder = "detached_student"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"

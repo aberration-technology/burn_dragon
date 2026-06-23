@@ -1,0 +1,7 @@
+extends = ["ruliad-r1.jepa-nextlat-probe32-fixed-ablation.toml"]
+
+[training.latent_reasoning]
+jepa_every_steps = 8
+
+[training.latent_reasoning.next_latent]
+every_steps = 16

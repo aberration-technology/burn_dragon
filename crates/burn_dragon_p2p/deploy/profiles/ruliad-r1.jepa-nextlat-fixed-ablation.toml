@@ -1,0 +1,21 @@
+extends = ["ruliad-r1.nextlat-fixed-ablation.toml"]
+
+[model.latent_reasoning]
+enabled = true
+max_steps = 1
+min_steps = 1
+adaptive_halting = false
+halt_threshold = 0.55
+refiner_hidden_multiplier = 1
+normalize_steps = false
+energy_head = false
+stop_bias_init = -2.0
+energy_margin = 1.0
+
+[training.latent_reasoning]
+enabled = true
+every_steps = 8
+jepa_future_offsets = [1]
+target_encoder = "detached_student"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"

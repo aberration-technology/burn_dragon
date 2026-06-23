@@ -309,6 +309,7 @@ impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindow
                 TensorData::new(targets, [batch_size, block_size]),
                 device,
             ),
+            loss_mask: None,
             summary_event_mask,
             reset_stream_state,
         }

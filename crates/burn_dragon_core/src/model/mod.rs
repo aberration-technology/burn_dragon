@@ -20,13 +20,14 @@ pub use attention_residual::{
 pub use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
 pub use config::{
     ClockedSlowMemoryConfig, DragonConfig, FusedAttentionExecutor, FusedKernelConfig,
-    FusedProjectionExecutor, LanguageHeadConfig, LatentFanoutScheduleConfig, SummaryMemoryConfig,
-    YNeuronRecurrenceConfig,
+    FusedProjectionExecutor, LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig,
+    NextLatentTransitionConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 pub use dragon::{
-    DragonModel, LanguageModuleLrScaleTarget, SharedLowrankActivationBatchStats,
-    SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
-    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
+    DragonModel, LanguageModuleLrScaleTarget, LatentReasoningOutput,
+    SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
+    SharedLowrankFeatureMetrics, SharedLowrankParamIds, SharedLowrankPopulationFactors,
+    SharedLowrankPopulationWeights, SharedLowrankWeights,
 };
 #[cfg(any(feature = "probe", test))]
 pub use dragon::{

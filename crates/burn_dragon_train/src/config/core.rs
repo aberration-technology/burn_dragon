@@ -318,6 +318,10 @@ pub struct ModelSpec {
     pub shared_layer_weights: bool,
     pub sequence_kernel: SequenceKernelConfig,
     #[serde(default)]
+    pub latent_reasoning_enabled: bool,
+    #[serde(default)]
+    pub latent_reasoning_max_steps: usize,
+    #[serde(default)]
     pub dragon_initialization_kind: DragonInitializationKind,
     #[serde(default)]
     pub dragon_residual_scaling_kind: DragonResidualScalingKind,

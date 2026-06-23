@@ -51,9 +51,13 @@ pub(crate) use burn_cuda::Cuda;
 pub(crate) use serde::Serialize;
 
 pub(crate) use crate::config::{
-    CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
-    GreedyRolloutUnlikelihoodConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    LogitEntropyFloorConfig, RepeatUnlikelihoodConfig, RepromptTruncation, SdftObjectiveConfig,
+    CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig, DragonStateConsistencyConfig,
+    DynamicsAnchorConfig, DynamicsAnchorMask, GreedyRolloutUnlikelihoodConfig,
+    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LatentReasoningConstraintBalancerConfig,
+    LatentReasoningSigRegConfig, LatentReasoningSigRegTarget, LatentReasoningTrainingConfig,
+    LogitEntropyFloorConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
+    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation, SdftObjectiveConfig,
     SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
     TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
     ValidationDatasetConfig,
@@ -81,8 +85,9 @@ pub(crate) use crate::train::objective::{
 };
 pub(crate) use crate::train::steps::LanguageTrainModel;
 pub(crate) use burn_dragon_core::{
-    DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState, ModelState,
-    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
+    DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState,
+    LatentReasoningOutput, ModelState, NextLatentTransitionConfig, SharedLowrankPopulationFactors,
+    SharedLowrankPopulationWeights, SharedLowrankWeights,
 };
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;
 pub(crate) use burn_dragon_train::train::metrics::{
@@ -106,6 +111,7 @@ pub(crate) use burn_dragon_train::{
     EggrollPerturbationScope, EggrollPopulationExecutionBackend, GatedDeltaNet2Spec, GdpoConfig,
     GdpoHardGate, KernelSpec, LayerStateSpec, LearningRateScheduleConfig, ModelSpec,
     OptimizerConfig, OptimizerKind, OptimizerScheduleMode, OptimizerSpec, ParallelConfig,
-    ParallelSpec, ParallelismKind, ReservoirInitializationSpec, SequenceKernelConfig,
+    ParallelSpec, ParallelismKind, PredictiveCodingOptimizerConfig,
+    PredictiveCodingOptimizerTransform, ReservoirInitializationSpec, SequenceKernelConfig,
     StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
 };

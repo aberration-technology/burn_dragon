@@ -2903,6 +2903,30 @@ mod tests {
     }
 
     #[test]
+    fn functor_preservation_handles_one_arrow_paths() {
+        let family = RuliadFamilyConfig {
+            kind: RuliadFamilyKind::Category,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 3, max: 6 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        };
+        for sample_index in 0..64 {
+            let mut rng = sample_rng(42, SampleSplit::Train, sample_index, 0, 0);
+            let sample = generate_category_spec_for_task(
+                &family,
+                RuliadTaskKind::VerifyFunctorPreservation,
+                &mut rng,
+            )
+            .expect("functor-preservation category spec");
+            let report = verify_spec(&sample).expect("verify");
+            assert!(
+                report.ok,
+                "one-arrow functor-preservation sample {sample_index} should verify"
+            );
+        }
+    }
+
+    #[test]
     fn proof_tree_theorem_verifies_without_named_memorization_target() {
         let mut rng = sample_rng(61, SampleSplit::Train, 0, 0, 0);
         let spec = generate_proof_tree_spec(

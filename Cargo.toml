@@ -29,6 +29,7 @@ anyhow = "1.0"
 burn = { version = "0.21.0", default-features = false }
 burn_ecs = { version = "=0.21.8", path = "../burn_ecs", default-features = false }
 burn_eggroll = { version = "=0.21.8", path = "../burn_eggroll", default-features = false }
+burn_pc = { version = "=0.21.8", path = "../burn_pc", default-features = false }
 burn-autodiff = { version = "0.21.0", default-features = false }
 burn-collective = "0.21.0"
 burn-communication = "0.21.0"

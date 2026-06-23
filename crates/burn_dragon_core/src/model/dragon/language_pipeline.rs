@@ -23,6 +23,7 @@ impl<B: Backend> DragonModel<B> {
             position_mode,
             summary_event_mask,
         );
+        let hidden = self.reason_hidden(hidden).final_hidden;
         let logits = self.project_hidden_to_logits(hidden.clone());
         (hidden, logits)
     }

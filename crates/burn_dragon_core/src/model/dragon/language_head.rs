@@ -75,6 +75,29 @@ impl<B: Backend> DragonModel<B> {
         residual_modules.extend(Self::collect_optional_param_ids_from_module(
             self.block_attention_residual_shared.as_ref(),
         ));
+        let mut latent_reasoning =
+            Self::collect_optional_param_ids_from_module(self.latent_refiner_in.as_ref());
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_refiner_out.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_energy_head.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_stop_head.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_jepa_predictor.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_in.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_mid.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_out.as_ref(),
+        ));
 
         let ids = match target {
             LanguageModuleLrScaleTarget::Embedding => embedding,
@@ -86,6 +109,7 @@ impl<B: Backend> DragonModel<B> {
             LanguageModuleLrScaleTarget::Mamba => mamba,
             LanguageModuleLrScaleTarget::GatedDeltaNet2 => gated_deltanet2,
             LanguageModuleLrScaleTarget::ResidualModules => residual_modules,
+            LanguageModuleLrScaleTarget::LatentReasoning => latent_reasoning,
             LanguageModuleLrScaleTarget::OtherBackbone => {
                 let mut remaining = Self::collect_param_ids_from_module(self);
                 for excluded in embedding
@@ -98,6 +122,7 @@ impl<B: Backend> DragonModel<B> {
                     .chain(mamba)
                     .chain(gated_deltanet2)
                     .chain(residual_modules)
+                    .chain(latent_reasoning)
                 {
                     remaining.remove(&excluded);
                 }

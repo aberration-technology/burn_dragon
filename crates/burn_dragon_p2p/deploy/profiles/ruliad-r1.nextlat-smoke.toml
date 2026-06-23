@@ -1,0 +1,29 @@
+extends = ["ruliad-r1.nextlat-fixed-ablation.toml"]
+
+[training]
+max_iters = 8
+checkpoint_interval_iters = 8
+log_frequency = 1
+batch_size = 8
+
+[training.latent_reasoning]
+every_steps = 1
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.01
+warmup_steps = 0
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5
+
+[training.auto_batch_size]
+enabled = false
+min_batch_size = 4
+max_batch_size = 16
+max_probe_batch_size = 8
+probe_steps = 1
+target_device_memory_mb = 60000
+binary_search = true
+recompute_on_neuron_scale = false
+max_system_memory_fraction = 0.9
+probe_safety_margin = 1.15

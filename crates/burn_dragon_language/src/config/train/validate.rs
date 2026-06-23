@@ -10,7 +10,10 @@ use burn_dragon_train::{
     PipelineScheduleKind, TensorParallelPartitionKind, train::pipeline::TrainingLaunchMode,
 };
 
-use super::{DatasetSourceConfig, TrainingConfig};
+use super::{
+    DatasetSourceConfig, PredictiveCodingBackwardMode, PredictiveCodingMode,
+    PredictiveCodingParameterUpdate, TrainingConfig,
+};
 use crate::tokenizer::TokenizerKind;
 
 impl TrainingConfig {
@@ -381,6 +384,21 @@ impl TrainingConfig {
             if self
                 .training
                 .greedy_rollout_unlikelihood
+                .sequence_recovery_weight
+                < 0.0
+                || !self
+                    .training
+                    .greedy_rollout_unlikelihood
+                    .sequence_recovery_weight
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.greedy_rollout_unlikelihood.sequence_recovery_weight must be finite and >= 0"
+                ));
+            }
+            if self
+                .training
+                .greedy_rollout_unlikelihood
                 .entropy_floor_weight
                 < 0.0
                 || !self
@@ -484,6 +502,228 @@ impl TrainingConfig {
                 ));
             }
         }
+        if self.training.dynamics_anchor.enabled {
+            if self.training.dynamics_anchor.weight < 0.0
+                || !self.training.dynamics_anchor.weight.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.dynamics_anchor.weight must be finite and >= 0"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.training.dynamics_anchor.teacher_update_rate)
+                || !self
+                    .training
+                    .dynamics_anchor
+                    .teacher_update_rate
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "training.dynamics_anchor.teacher_update_rate must be finite and in [0, 1]"
+                ));
+            }
+            if self.training.dynamics_anchor.every_steps == 0 {
+                return Err(anyhow!("training.dynamics_anchor.every_steps must be > 0"));
+            }
+        }
+        if self.training.predictive_coding.enabled {
+            let pc = &self.training.predictive_coding;
+            if !matches!(pc.mode, PredictiveCodingMode::RecurrentState) {
+                return Err(anyhow!(
+                    "training.predictive_coding.mode currently supports only recurrent_state"
+                ));
+            }
+            if pc.steps == 0 {
+                return Err(anyhow!("training.predictive_coding.steps must be > 0"));
+            }
+            if pc.step_size <= 0.0 || !pc.step_size.is_finite() {
+                return Err(anyhow!(
+                    "training.predictive_coding.step_size must be finite and > 0"
+                ));
+            }
+            if pc.latent_decay < 0.0 || !pc.latent_decay.is_finite() {
+                return Err(anyhow!(
+                    "training.predictive_coding.latent_decay must be finite and >= 0"
+                ));
+            }
+            if let Some(max_grad_norm) = pc.max_grad_norm
+                && (max_grad_norm <= 0.0 || !max_grad_norm.is_finite())
+            {
+                return Err(anyhow!(
+                    "training.predictive_coding.max_grad_norm must be finite and > 0"
+                ));
+            }
+            if pc.eps <= 0.0 || !pc.eps.is_finite() {
+                return Err(anyhow!(
+                    "training.predictive_coding.eps must be finite and > 0"
+                ));
+            }
+            if pc.apply_every_chunks == 0 {
+                return Err(anyhow!(
+                    "training.predictive_coding.apply_every_chunks must be > 0"
+                ));
+            }
+            if self.training.tbptt_chunk_size.is_none() {
+                return Err(anyhow!(
+                    "training.predictive_coding.enabled requires training.tbptt_chunk_size"
+                ));
+            }
+            if !self.training.objective.is_next_token() {
+                return Err(anyhow!(
+                    "training.predictive_coding.enabled currently requires next-token training.objective"
+                ));
+            }
+            if self.parallel.mode != ParallelismKind::Single {
+                return Err(anyhow!(
+                    "training.predictive_coding.enabled currently requires parallel.mode=single"
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "training.predictive_coding.enabled does not support parallel.pipeline.enabled"
+                ));
+            }
+        }
+        if self.training.latent_reasoning.enabled {
+            let latent = &self.training.latent_reasoning;
+            if latent.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.latent_reasoning.every_steps must be > 0 when enabled"
+                ));
+            }
+            if latent.jepa_every_steps == Some(0) {
+                return Err(anyhow!(
+                    "training.latent_reasoning.jepa_every_steps must be > 0 when set"
+                ));
+            }
+            if latent.jepa_future_offsets.is_empty()
+                && !latent.next_latent.enabled
+                && !latent.dragon_state.enabled
+                && !latent.sigreg.enabled
+            {
+                return Err(anyhow!(
+                    "training.latent_reasoning.jepa_future_offsets must not be empty unless next_latent, dragon_state, or sigreg is enabled"
+                ));
+            }
+            if latent.jepa_future_offsets.iter().any(|offset| *offset == 0) {
+                return Err(anyhow!(
+                    "training.latent_reasoning.jepa_future_offsets must contain only positive offsets"
+                ));
+            }
+            if !latent.teacher_update_rate.is_finite()
+                || !(0.0..=1.0).contains(&latent.teacher_update_rate)
+            {
+                return Err(anyhow!(
+                    "training.latent_reasoning.teacher_update_rate must be finite and in [0, 1]"
+                ));
+            }
+            if latent.constraint_balancer.normalized_aux_scale < 0.0
+                || !latent.constraint_balancer.normalized_aux_scale.is_finite()
+            {
+                return Err(anyhow!(
+                    "training.latent_reasoning.constraint_balancer.normalized_aux_scale must be finite and >= 0"
+                ));
+            }
+            if latent.next_latent.enabled {
+                if latent.next_latent.every_steps == Some(0) {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.next_latent.every_steps must be > 0 when set"
+                    ));
+                }
+                if latent.next_latent.horizon == 0 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.next_latent.horizon must be > 0 when enabled"
+                    ));
+                }
+                if !latent.next_latent.regression_weight.is_finite()
+                    || latent.next_latent.regression_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.next_latent.regression_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.next_latent.token_kl_weight.is_finite()
+                    || latent.next_latent.token_kl_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.next_latent.token_kl_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.next_latent.smooth_l1_beta.is_finite()
+                    || latent.next_latent.smooth_l1_beta <= 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.next_latent.smooth_l1_beta must be finite and > 0"
+                    ));
+                }
+            }
+            if latent.dragon_state.enabled {
+                if latent.dragon_state.every_steps == Some(0) {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.every_steps must be > 0 when set"
+                    ));
+                }
+                if !latent.dragon_state.rho_weight.is_finite()
+                    || latent.dragon_state.rho_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.rho_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.dragon_state.rho_energy_weight.is_finite()
+                    || latent.dragon_state.rho_energy_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.rho_energy_weight must be finite and >= 0"
+                    ));
+                }
+                if latent.dragon_state.rho_weight <= f32::EPSILON
+                    && latent.dragon_state.rho_energy_weight <= f32::EPSILON
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state requires rho_weight or rho_energy_weight > 0"
+                    ));
+                }
+                if !latent.dragon_state.smooth_l1_beta.is_finite()
+                    || latent.dragon_state.smooth_l1_beta <= 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.smooth_l1_beta must be finite and > 0"
+                    ));
+                }
+                if latent.dragon_state.max_rho_slots < 2 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.max_rho_slots must be >= 2"
+                    ));
+                }
+                if self.parallel.pipeline.enabled {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.dragon_state.enabled does not support parallel.pipeline.enabled yet"
+                    ));
+                }
+            }
+            if latent.sigreg.enabled {
+                if latent.sigreg.every_steps == Some(0) {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.sigreg.every_steps must be > 0 when set"
+                    ));
+                }
+                if latent.sigreg.min_variance < 0.0 || !latent.sigreg.min_variance.is_finite() {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.sigreg.min_variance must be finite and >= 0"
+                    ));
+                }
+                if latent.sigreg.mean_tolerance < 0.0 || !latent.sigreg.mean_tolerance.is_finite() {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.sigreg.mean_tolerance must be finite and >= 0"
+                    ));
+                }
+                if latent.sigreg.max_rho_slots < 2 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.sigreg.max_rho_slots must be >= 2"
+                    ));
+                }
+            }
+        }
         if self.training.events.source_selection_every_steps == 0 {
             return Err(anyhow!(
                 "training.events.source_selection_every_steps must be > 0"
@@ -569,6 +809,13 @@ impl TrainingConfig {
         {
             return Err(anyhow!(
                 "training.gates.degeneracy_repetition_max_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.degeneracy_eos_max_fraction)
+            || !self.training.gates.degeneracy_eos_max_fraction.is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.degeneracy_eos_max_fraction must be finite and in [0, 1]"
             ));
         }
         if !(0.0..=1.0).contains(&self.training.gates.degeneracy_period_2_max_fraction)
@@ -1252,6 +1499,44 @@ impl TrainingConfig {
             return Err(anyhow!("training.epochs must be > 0"));
         }
         self.optimizer.validate()?;
+        if matches!(self.optimizer.name, OptimizerKind::PredictiveCoding) {
+            if !self.training.predictive_coding.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding requires training.predictive_coding.enabled"
+                ));
+            }
+            if matches!(
+                self.training.predictive_coding.parameter_update,
+                PredictiveCodingParameterUpdate::StateOnlyControl
+            ) {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding requires training.predictive_coding.parameter_update=optimizer"
+                ));
+            }
+            if matches!(
+                self.training.predictive_coding.backward_mode,
+                PredictiveCodingBackwardMode::Block
+            ) {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding currently requires training.predictive_coding.backward_mode=chunked"
+                ));
+            }
+            if self.training.continual_backprop.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding does not yet support training.continual_backprop.enabled"
+                ));
+            }
+            if self.training.neuron_scaling.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding does not yet support training.neuron_scaling.enabled"
+                ));
+            }
+            if self.training.tbptt_persist_across_steps {
+                return Err(anyhow!(
+                    "optimizer.name=predictive_coding does not yet support training.tbptt_persist_across_steps"
+                ));
+            }
+        }
         if matches!(self.optimizer.name, OptimizerKind::Eggroll) {
             if self.optimizer.eggroll.gradient_learning_rate.is_some() {
                 return Err(anyhow!(
@@ -1288,6 +1573,11 @@ impl TrainingConfig {
                     "optimizer.name=eggroll does not yet support training.neuron_scaling.enabled"
                 ));
             }
+            if self.training.predictive_coding.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not support training.predictive_coding.enabled; use optimizer.name=predictive_coding for the PC optimizer path"
+                ));
+            }
             if self.training.tbptt_persist_across_steps {
                 return Err(anyhow!(
                     "optimizer.name=eggroll does not yet support training.tbptt_persist_across_steps"
@@ -1298,6 +1588,33 @@ impl TrainingConfig {
                     "optimizer.name=eggroll currently supports only the next-token training objective"
                 ));
             }
+            if self.training.ruliad_supervision.uses_target_loss_mask() {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support masked training.ruliad_supervision={:?}; use optimizer.name=adamw or disable ruliad target masks",
+                    self.training.ruliad_supervision.mode
+                ));
+            }
+        }
+        if self.training.ruliad_supervision.uses_target_loss_mask()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "training.ruliad_supervision.mode={:?} requires dataset.type=\"universality_ruliad\"",
+                self.training.ruliad_supervision.mode
+            ));
+        }
+        if self.training.source_selection_state_path.is_some()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "training.source_selection_state_path requires dataset.type=\"universality_ruliad\""
+            ));
         }
         if !(0.0 < self.dataset.train_split_ratio && self.dataset.train_split_ratio <= 1.0) {
             return Err(anyhow!(
@@ -1506,6 +1823,24 @@ impl TrainingConfig {
                 self.parallel.tensor.size
             ));
         }
+        if self.training.dynamics_anchor.enabled
+            && !self.training.auto_batch_size.enabled
+            && self.training.batch_size > 1
+            && resolved_model.latent_total() >= 65_536
+        {
+            return Err(anyhow!(
+                "training.dynamics_anchor with fixed training.batch_size > 1 is not allowed for resolved model.latent_total >= 65536; use training.batch_size=1 or enable training.auto_batch_size"
+            ));
+        }
+        if self.training.predictive_coding.enabled
+            && !self.training.auto_batch_size.enabled
+            && self.training.batch_size > 1
+            && resolved_model.latent_total() >= 16_384
+        {
+            return Err(anyhow!(
+                "training.predictive_coding with fixed training.batch_size > 1 is not allowed for resolved model.latent_total >= 16384; use training.batch_size=1 or enable training.auto_batch_size"
+            ));
+        }
         if self.training.neuron_scaling.enabled {
             let max_latent_total = self.training.neuron_scaling.max_latent_total;
             if max_latent_total < resolved_model.latent_total() {
@@ -1545,6 +1880,45 @@ impl TrainingConfig {
             && let Err(message) = resolved_model.validate_latent_fanout_schedule(schedule)
         {
             return Err(anyhow!(message));
+        }
+        if let Some(latent_reasoning) = &self.model.latent_reasoning {
+            latent_reasoning.validate().map_err(anyhow::Error::msg)?;
+            resolved_model.latent_reasoning = latent_reasoning.clone();
+        }
+        if let Some(next_latent_transition) = &self.model.next_latent_transition {
+            next_latent_transition
+                .validate()
+                .map_err(anyhow::Error::msg)?;
+            resolved_model.next_latent_transition = next_latent_transition.clone();
+        }
+        let latent_jepa_can_run = self.training.latent_reasoning.enabled
+            && self
+                .training
+                .latent_reasoning
+                .jepa_future_offsets
+                .iter()
+                .any(|offset| *offset < self.training.block_size);
+        if latent_jepa_can_run && !resolved_model.latent_reasoning.enabled {
+            return Err(anyhow!(
+                "training.latent_reasoning JEPA offsets within training.block_size require model.latent_reasoning.enabled"
+            ));
+        }
+        if self.training.latent_reasoning.enabled
+            && self.training.latent_reasoning.next_latent.enabled
+            && !resolved_model.next_latent_transition.enabled
+        {
+            return Err(anyhow!(
+                "training.latent_reasoning.next_latent.enabled requires model.next_latent_transition.enabled"
+            ));
+        }
+        if self.training.latent_reasoning.enabled
+            && self.training.latent_reasoning.next_latent.enabled
+            && self.training.latent_reasoning.next_latent.token_kl_weight > f32::EPSILON
+            && !resolved_model.language_head.uses_flat_token_logits()
+        {
+            return Err(anyhow!(
+                "training.latent_reasoning.next_latent.token_kl_weight requires a flat token language head"
+            ));
         }
         if let Some(dropout) = self.model.dropout
             && dropout < 0.0
@@ -1894,7 +2268,12 @@ impl TrainingConfig {
 mod tests {
     use super::*;
     use crate::config::TrainingObjectiveConfig;
+    use crate::config::load_training_config;
+    use crate::config::train::RuliadSupervisionMode;
+    use crate::inference::build_model_config;
+    use burn_dragon_core::{RotaryEmbedding, SequenceMemorySystem};
     use burn_dragon_train::OptimizerKind;
+    use std::path::{Path, PathBuf};
 
     fn parse_config(extra_training: &str) -> TrainingConfig {
         let toml = format!(
@@ -1930,6 +2309,445 @@ prompt = ""
     }
 
     #[test]
+    fn latent_reasoning_jepa_training_requires_model_modules() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![1];
+
+        let err = config
+            .validate()
+            .expect_err("latent JEPA training should require model latent reasoning");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning JEPA offsets"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn latent_sigreg_only_training_validates_without_model_modules() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = true;
+        config.training.latent_reasoning.sigreg.target =
+            crate::config::LatentReasoningSigRegTarget::RhoMemorySlots;
+
+        config
+            .validate()
+            .expect("SIGReg-only latent regularization should not require model latent modules");
+    }
+
+    #[test]
+    fn next_latent_training_requires_transition_head() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.next_latent.enabled = true;
+
+        let err = config
+            .validate()
+            .expect_err("NextLat training should require a transition head");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning.next_latent.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn next_latent_training_does_not_require_inference_latent_reasoning() {
+        let mut config = parse_config("");
+        config.model.next_latent_transition = Some(Default::default());
+        config
+            .model
+            .next_latent_transition
+            .as_mut()
+            .expect("next latent transition config")
+            .enabled = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.next_latent.enabled = true;
+
+        config
+            .validate()
+            .expect("NextLat transition training should not require model.latent_reasoning");
+    }
+
+    #[test]
+    fn dragon_state_training_does_not_require_inference_latent_reasoning_or_transition_head() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.dragon_state.enabled = true;
+
+        config
+            .validate()
+            .expect("Dragon state consistency should only require recurrent Dragon state");
+    }
+
+    #[test]
+    fn latent_reasoning_training_validates_with_model_modules() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![1, 2];
+
+        config
+            .validate()
+            .expect("latent reasoning training should validate with model modules enabled");
+    }
+
+    #[test]
+    fn latent_reasoning_training_rejects_zero_every_steps() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.every_steps = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero latent every_steps should fail validation");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning.every_steps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_training_rejects_zero_per_objective_every_steps() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.model.next_latent_transition = Some(Default::default());
+        config
+            .model
+            .next_latent_transition
+            .as_mut()
+            .expect("next latent config")
+            .enabled = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![1];
+        config.training.latent_reasoning.next_latent.enabled = true;
+        config.training.latent_reasoning.next_latent.every_steps = Some(0);
+
+        let err = config
+            .validate()
+            .expect_err("zero NextLat every_steps should fail validation");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning.next_latent.every_steps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_validates_for_single_tbptt_next_token_training() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+
+        config
+            .validate()
+            .expect("predictive coding should validate for local TBPTT next-token training");
+    }
+
+    #[test]
+    fn predictive_coding_optimizer_validates_for_local_chunked_pc_training() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::PredictiveCoding;
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+
+        config
+            .validate()
+            .expect("predictive coding optimizer should validate for local chunked PC training");
+    }
+
+    #[test]
+    fn predictive_coding_optimizer_requires_enabled_pc_inference() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::PredictiveCoding;
+        config.training.tbptt_chunk_size = Some(4);
+
+        let err = config
+            .validate()
+            .expect_err("predictive coding optimizer without PC should be rejected");
+        assert!(
+            err.to_string()
+                .contains("requires training.predictive_coding.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_optimizer_rejects_state_only_control() {
+        let mut config = parse_config("");
+        config.optimizer.name = OptimizerKind::PredictiveCoding;
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.predictive_coding.parameter_update =
+            PredictiveCodingParameterUpdate::StateOnlyControl;
+
+        let err = config
+            .validate()
+            .expect_err("predictive coding optimizer with state-only control should be rejected");
+        assert!(
+            err.to_string().contains("parameter_update=optimizer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_requires_tbptt() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = None;
+        config.training.predictive_coding.enabled = true;
+
+        let err = config
+            .validate()
+            .expect_err("predictive coding without TBPTT should be rejected");
+        assert!(
+            err.to_string()
+                .contains("predictive_coding.enabled requires training.tbptt_chunk_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_rejects_pipeline_training() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.parallel.pipeline.enabled = true;
+        config.parallel.pipeline.stage_count = 1;
+        config.parallel.pipeline.microbatches = 1;
+
+        let err = config
+            .validate()
+            .expect_err("predictive coding should not run in pipeline mode");
+        assert!(
+            err.to_string()
+                .contains("predictive_coding.enabled does not support parallel.pipeline.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_high_latent_rejects_unsafe_fixed_large_batch() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.batch_size = 2;
+        config.training.auto_batch_size.enabled = false;
+        config.model.latent_total = Some(16_384);
+
+        let err = config
+            .validate()
+            .expect_err("high-latent PC should require batch one or auto batch sizing");
+        assert!(
+            err.to_string()
+                .contains("predictive_coding with fixed training.batch_size > 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_baseline_profile_validates_and_stays_small() {
+        let config = load_profile("ruliad-1m.training.toml");
+        config.validate().expect("ruliad-1m profile validates");
+        assert!(matches!(
+            &config.dataset.source,
+            DatasetSourceConfig::UniversalityRuliad { .. }
+        ));
+        assert!(matches!(config.optimizer.name, OptimizerKind::Adamw));
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        let estimated = estimate_profile_parameter_budget(&config);
+        assert!(
+            (750_000..=2_000_000).contains(&estimated),
+            "ruliad-1m profile should stay in the fast diagnostic range, estimated params={estimated}"
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_jepa_default_profiles_validate() {
+        for profile in [
+            "ruliad-1m.jepa.training.toml",
+            "ruliad-1m-la-16k.jepa.training.toml",
+            "ruliad-1m-la-32k.jepa.training.toml",
+            "ruliad-1m-la-64k.jepa.training.toml",
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            assert!(
+                config
+                    .model
+                    .latent_reasoning
+                    .as_ref()
+                    .is_some_and(|latent| latent.enabled),
+                "{profile} should enable the JEPA latent reasoning model module"
+            );
+            assert!(
+                config.training.latent_reasoning.enabled,
+                "{profile} should enable JEPA latent training"
+            );
+            assert_eq!(
+                config.training.latent_reasoning.jepa_future_offsets,
+                vec![1],
+                "{profile} should use JEPA-only future hidden prediction"
+            );
+            assert!(
+                !config.training.latent_reasoning.next_latent.enabled,
+                "{profile} should not enable NextLat by default"
+            );
+        }
+    }
+
+    #[test]
+    fn ruliad_1m_high_neuron_sweep_profiles_resolve_expected_long_context_shape() {
+        for (profile, latent_total, batch_size) in [
+            ("ruliad-1m-la-16k.training.toml", 16_384, 1),
+            ("ruliad-1m-la-32k.training.toml", 32_768, 1),
+            ("ruliad-1m-la-64k.training.toml", 65_536, 1),
+        ] {
+            let config = load_profile(profile);
+            config.validate().unwrap_or_else(|err| {
+                panic!("{profile} should validate as a safe high-neuron sweep profile: {err}")
+            });
+            assert!(matches!(
+                &config.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            ));
+            assert!(matches!(config.optimizer.name, OptimizerKind::Adamw));
+            assert_eq!(config.optimizer.learning_rate, 3.0e-4, "{profile}");
+            assert_eq!(config.model.n_layer, Some(4), "{profile}");
+            assert_eq!(config.model.n_embd, Some(256), "{profile}");
+            assert_eq!(config.model.n_head, Some(4), "{profile}");
+            assert_eq!(config.model.latent_total, Some(latent_total), "{profile}");
+            assert_eq!(config.training.block_size, 256, "{profile}");
+            assert_eq!(config.training.tbptt_chunk_size, Some(128), "{profile}");
+            assert!(config.training.tbptt_persist_across_steps, "{profile}");
+            assert_eq!(
+                config.training.min_logical_block_size,
+                Some(512),
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.mode,
+                RuliadSupervisionMode::AnswerWindow,
+                "{profile}"
+            );
+            assert!(
+                config.training.input_corruption.enabled,
+                "{profile} should use input corruption as cheap continual-learning regularization"
+            );
+            assert!(
+                config.training.logit_entropy_floor.enabled,
+                "{profile} should keep a minimum token-distribution entropy floor"
+            );
+            assert!(
+                config.training.repeat_unlikelihood.enabled,
+                "{profile} should penalize short-period repetition"
+            );
+            assert!(
+                config.training.greedy_rollout_unlikelihood.enabled
+                    && config.training.greedy_rollout_unlikelihood.recovery_only,
+                "{profile} should keep expensive rollout anti-collapse pressure recovery-only"
+            );
+            assert!(
+                config.training.dynamics_anchor.enabled
+                    && config.training.dynamics_anchor.weight > 0.0,
+                "{profile} should constrain next-token distribution drift with an EMA dynamics anchor"
+            );
+            assert!(
+                !config.training.auto_batch_size.enabled,
+                "{profile} should rely on the guarded sweep wrapper, not startup auto-batch probing"
+            );
+            assert_eq!(config.training.batch_size, batch_size, "{profile}");
+            assert_eq!(
+                config.training.gates.degeneracy_eos_max_fraction, 0.20,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.degeneracy_period_3_max_fraction, 0.25,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.degeneracy_period_2_to_64_max_fraction, 0.25,
+                "{profile}"
+            );
+
+            let model = build_model_config(&config.model, config.training.block_size);
+            assert_eq!(model.latent_total(), latent_total, "{profile}");
+            assert_eq!(
+                model.sequence_kernel.memory_system,
+                SequenceMemorySystem::LinearAttention,
+                "{profile}"
+            );
+            assert_eq!(
+                model.fused_kernels.rotary_embedding,
+                RotaryEmbedding::Alibi,
+                "{profile}"
+            );
+        }
+    }
+
+    fn load_profile(file_name: &str) -> TrainingConfig {
+        let profile_path = profile_path(file_name);
+        load_training_config(&[profile_path.clone()])
+            .unwrap_or_else(|err| panic!("load {}: {err}", profile_path.display()))
+    }
+
+    #[test]
+    fn ruliad_64k_dynamics_anchor_rejects_unsafe_fixed_large_batch() {
+        let mut config = load_profile("ruliad-1m-la-64k.training.toml");
+        config.training.batch_size = 32;
+        config.training.auto_batch_size.enabled = false;
+        config.training.dynamics_anchor.enabled = true;
+
+        let err = config
+            .validate()
+            .expect_err("64k anchored profile should reject fixed batch sizes above one");
+        assert!(
+            err.to_string()
+                .contains("dynamics_anchor with fixed training.batch_size > 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn profile_path(file_name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../burn_dragon_p2p/deploy/profiles")
+            .join(file_name)
+    }
+
+    #[test]
     fn eggroll_optimizer_config_validates_for_single_next_token_training() {
         let mut config = parse_config("");
         config.optimizer.name = OptimizerKind::Eggroll;
@@ -1938,6 +2756,19 @@ prompt = ""
         config
             .validate()
             .expect("minimal single-device EGGROLL config should validate");
+    }
+
+    fn estimate_profile_parameter_budget(config: &TrainingConfig) -> usize {
+        let layers = config.model.n_layer.unwrap_or(8);
+        let width = config.model.n_embd.unwrap_or(512);
+        let latent = config.model.latent_total.unwrap_or(width * 2);
+        let vocab = config.dataset.tokenizer.vocab_size();
+        let embeddings = vocab.saturating_mul(width).saturating_mul(2);
+        let per_layer = width
+            .saturating_mul(width)
+            .saturating_mul(4)
+            .saturating_add(width.saturating_mul(latent).saturating_mul(4));
+        embeddings.saturating_add(layers.saturating_mul(per_layer))
     }
 
     #[test]
@@ -1992,6 +2823,75 @@ prompt = ""
             .expect_err("EGGROLL neuron scaling should fail");
         assert!(
             err.to_string().contains("neuron_scaling.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_completion_requires_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        let err = config
+            .validate()
+            .expect_err("answer-completion supervision should reject non-ruliad datasets");
+        assert!(
+            err.to_string().contains("universality_ruliad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_completion_validates_for_ruliad_adamw() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config
+            .validate()
+            .expect("ruliad answer-completion AdamW config should validate");
+    }
+
+    #[test]
+    fn source_selection_state_path_requires_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.training.source_selection_state_path = Some("target/source-state.json".into());
+        let err = config
+            .validate()
+            .expect_err("source-selection handoff should reject non-ruliad datasets");
+        assert!(
+            err.to_string().contains("universality_ruliad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn source_selection_state_path_validates_for_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.source_selection_state_path = Some("target/source-state.json".into());
+        config
+            .validate()
+            .expect("ruliad source-selection state should validate");
+    }
+
+    #[test]
+    fn ruliad_answer_completion_rejects_pure_eggroll_dense_ce_path() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.optimizer.name = OptimizerKind::Eggroll;
+        config.optimizer.eggroll.population.population_size = 2;
+        config.optimizer.eggroll.population.population_chunk_size = 2;
+        let err = config
+            .validate()
+            .expect_err("answer-completion supervision should reject current pure EGGROLL path");
+        assert!(
+            err.to_string().contains("ruliad_supervision"),
             "unexpected error: {err}"
         );
     }
@@ -2108,6 +3008,27 @@ recovery_weight = -1.0
         assert!(
             err.to_string()
                 .contains("greedy_rollout_unlikelihood.recovery_weight must be finite and >= 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_unlikelihood_rejects_negative_sequence_recovery_weight() {
+        let config = parse_config(
+            r#"
+[training.greedy_rollout_unlikelihood]
+enabled = true
+weight = 0.5
+sequence_recovery_weight = -1.0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("negative rollout sequence recovery weight should fail");
+        assert!(
+            err.to_string().contains(
+                "greedy_rollout_unlikelihood.sequence_recovery_weight must be finite and >= 0"
+            ),
             "unexpected error: {err}"
         );
     }

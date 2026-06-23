@@ -1,0 +1,12 @@
+extends = ["ruliad-r1.latent-jepa-fixed-ablation.toml"]
+
+[training.latent_reasoning]
+target_encoder = "ema_teacher"
+teacher_update_rate = 0.01
+
+[training.latent_reasoning.dragon_state]
+enabled = true
+rho_weight = 0.5
+rho_energy_weight = 0.125
+smooth_l1_beta = 1.0
+max_rho_slots = 64

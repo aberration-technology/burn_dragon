@@ -8,10 +8,11 @@ use crate::manifest::{SampleSplit, UniversalityTokenizerManifest};
 use crate::ruliad::config::{
     RuliadCorpusConfig, RuliadDocumentMode, load_ruliad_config, ruliad_source_semantics,
 };
+use crate::ruliad::eval::RuliadEvalItem;
 use crate::ruliad::oracles::{
     GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
     compact_ruliad_label, default_proof_tasks, generate_sample, generate_sample_for_source_bucket,
-    load_proof_tasks,
+    load_proof_tasks, ruliad_expected_answer, ruliad_prompt_prefix,
 };
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::search::RuliadSamplerCandidate;
@@ -133,6 +134,14 @@ impl OnlineRuliadCorpus {
         self.source_buckets.as_slice()
     }
 
+    pub fn encode_payload_tokens(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.encode_payload(text)
+    }
+
+    pub fn decode_payload_tokens(&self, tokens: &[u32], stop_at_eos: bool) -> String {
+        self.tokenizer.decode_payload(tokens, stop_at_eos)
+    }
+
     pub fn sampler_candidates(&self) -> Vec<RuliadSamplerCandidate> {
         self.sampler_candidates.as_ref().clone()
     }
@@ -241,6 +250,32 @@ impl OnlineRuliadCorpus {
         Ok(self
             .generate_document_for_epoch(split, epoch_index, sample_index)?
             .tokens)
+    }
+
+    pub fn generate_eval_item_for_epoch(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> Result<RuliadEvalItem> {
+        let document = self.generate_document_for_epoch(split, epoch_index, sample_index)?;
+        Ok(eval_item_from_document(document))
+    }
+
+    pub fn generate_eval_item_for_source_bucket(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket_label: &str,
+    ) -> Result<RuliadEvalItem> {
+        let document = self.generate_document_for_source_bucket(
+            split,
+            epoch_index,
+            sample_index,
+            bucket_label,
+        )?;
+        Ok(eval_item_from_document(document))
     }
 
     pub fn generate_raw_sample(
@@ -676,6 +711,23 @@ fn min(values: impl Iterator<Item = f32>) -> f32 {
 
 fn max(values: impl Iterator<Item = f32>) -> f32 {
     values.reduce(f32::max).unwrap_or_default()
+}
+
+fn eval_item_from_document(document: RuliadRuntimeSampleDocument) -> RuliadEvalItem {
+    let prompt = ruliad_prompt_prefix(&document.spec, &document.oracle_hash);
+    let expected_answer = ruliad_expected_answer(&document.spec);
+    RuliadEvalItem {
+        oracle_hash: document.oracle_hash,
+        sample_index: document.sample_index,
+        split: document.split,
+        family: document.family,
+        task_kind: document.task_kind,
+        math_domains: document.math_domains,
+        reasoning_modes: document.reasoning_modes,
+        prompt,
+        expected_answer,
+        spec: Some(document.spec),
+    }
 }
 
 #[allow(dead_code)]

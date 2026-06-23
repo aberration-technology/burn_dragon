@@ -38,6 +38,7 @@ train = [
   "dep:burn_dragon_universality",
   "dep:burn_dragon_eggroll",
   "dep:burn_ecs",
+  "dep:burn_pc",
 ]
 rerun = ["train", "dep:rerun", "dep:urlencoding"]
 cuda = ["burn-cuda", "burn_dragon_core/cuda", "burn_dragon_train/cuda"]
@@ -49,6 +50,7 @@ anyhow.workspace = true
 burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
 burn_ecs = { workspace = true, optional = true }
 burn_eggroll.workspace = true
+burn_pc = { workspace = true, optional = true }
 burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true, features = ["std"] }

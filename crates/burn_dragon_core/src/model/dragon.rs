@@ -21,7 +21,7 @@ pub use interpretability::{
 };
 
 use burn::module::{Module, Param};
-use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear};
+use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData, activation};
 use burn_dragon_kernel::api::attention::{
@@ -49,7 +49,8 @@ use super::attention_residual::{
 };
 use super::config::{
     ClockedSlowMemoryConfig, DragonConfig, FusedKernelConfig, LanguageHeadConfig,
-    SummaryMemoryConfig, YNeuronRecurrenceConfig,
+    LatentReasoningConfig, NextLatentTransitionConfig, SummaryMemoryConfig,
+    YNeuronRecurrenceConfig,
 };
 #[cfg(any(feature = "probe", test))]
 use super::dragon_support::{
@@ -123,6 +124,7 @@ pub struct DragonModel<B: Backend> {
     y_neuron_recurrence: YNeuronRecurrenceConfig,
     clocked_slow_memory: ClockedSlowMemoryConfig,
     summary_memory: SummaryMemoryConfig,
+    latent_reasoning: LatentReasoningConfig,
     #[module(skip)]
     layer_latent_totals: Vec<usize>,
     #[module(skip)]
@@ -151,8 +153,28 @@ pub struct DragonModel<B: Backend> {
     lm_head: Option<Param<Tensor<B, 2>>>,
     nca_factorized_lm_head: Option<Param<Tensor<B, 2>>>,
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
+    latent_refiner_in: Option<Linear<B>>,
+    latent_refiner_out: Option<Linear<B>>,
+    latent_energy_head: Option<Linear<B>>,
+    latent_stop_head: Option<Linear<B>>,
+    latent_jepa_predictor: Option<Linear<B>>,
+    next_latent_transition: NextLatentTransitionConfig,
+    next_latent_transition_in: Option<Linear<B>>,
+    next_latent_transition_mid: Option<Linear<B>>,
+    next_latent_transition_out: Option<Linear<B>>,
     #[module(skip)]
     nca_factorized_head_tables: Option<NcaFactorizedHeadTables>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LatentReasoningOutput<B: Backend> {
+    pub raw_hidden: Tensor<B, 3>,
+    pub final_hidden: Tensor<B, 3>,
+    pub step_hiddens: Vec<Tensor<B, 3>>,
+    pub energies: Vec<Tensor<B, 3>>,
+    pub stop_logits: Vec<Tensor<B, 3>>,
+    pub stop_probs: Vec<Tensor<B, 3>>,
+    pub steps_used: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +269,7 @@ pub enum LanguageModuleLrScaleTarget {
     Mamba,
     GatedDeltaNet2,
     ResidualModules,
+    LatentReasoning,
     OtherBackbone,
 }
 
@@ -656,6 +679,61 @@ impl<B: Backend> DragonModel<B> {
                 ))
             })
         });
+        let latent_reasoning = config.latent_reasoning.clone();
+        let latent_refiner_hidden =
+            config.n_embd * latent_reasoning.refiner_hidden_multiplier.max(1);
+        let latent_refiner_in = latent_reasoning
+            .enabled
+            .then(|| LinearConfig::new(config.n_embd, latent_refiner_hidden).init(device));
+        let latent_refiner_out = latent_reasoning.enabled.then(|| {
+            let mut out = LinearConfig::new(latent_refiner_hidden, config.n_embd).init(device);
+            let [rows, cols] = out.weight.val().shape().dims();
+            out.weight = Param::from_tensor(Tensor::<B, 2>::zeros([rows, cols], device));
+            if let Some(bias) = out.bias.as_mut() {
+                let [dim] = bias.val().shape().dims();
+                *bias = Param::from_tensor(Tensor::<B, 1>::zeros([dim], device));
+            }
+            out
+        });
+        let latent_energy_head = (latent_reasoning.enabled && latent_reasoning.energy_head)
+            .then(|| LinearConfig::new(config.n_embd, 1).init(device));
+        let latent_stop_head = (latent_reasoning.enabled && latent_reasoning.adaptive_halting)
+            .then(|| {
+                let mut head = LinearConfig::new(config.n_embd, 1).init(device);
+                if let Some(bias) = head.bias.as_mut() {
+                    *bias = Param::from_tensor(
+                        Tensor::<B, 1>::ones([1], device)
+                            .mul_scalar(latent_reasoning.stop_bias_init),
+                    );
+                }
+                head
+            });
+        let latent_jepa_predictor = latent_reasoning
+            .enabled
+            .then(|| LinearConfig::new(config.n_embd, config.n_embd).init(device));
+        let next_latent_transition = config.next_latent_transition.clone();
+        let next_latent_transition_hidden =
+            config.n_embd * next_latent_transition.hidden_multiplier.max(1);
+        let next_latent_transition_in = next_latent_transition.enabled.then(|| {
+            LinearConfig::new(config.n_embd * 2, next_latent_transition_hidden).init(device)
+        });
+        let next_latent_transition_mid = next_latent_transition.enabled.then(|| {
+            LinearConfig::new(next_latent_transition_hidden, next_latent_transition_hidden)
+                .init(device)
+        });
+        let next_latent_transition_out = next_latent_transition.enabled.then(|| {
+            let mut out =
+                LinearConfig::new(next_latent_transition_hidden, config.n_embd).init(device);
+            if next_latent_transition.zero_init_output {
+                let [rows, cols] = out.weight.val().shape().dims();
+                out.weight = Param::from_tensor(Tensor::<B, 2>::zeros([rows, cols], device));
+                if let Some(bias) = out.bias.as_mut() {
+                    let [dim] = bias.val().shape().dims();
+                    *bias = Param::from_tensor(Tensor::<B, 1>::zeros([dim], device));
+                }
+            }
+            out
+        });
         let layer_latent_totals = (0..config.n_layer)
             .map(|layer_idx| config.latent_total_for_layer(layer_idx))
             .collect();
@@ -684,6 +762,7 @@ impl<B: Backend> DragonModel<B> {
             y_neuron_recurrence: config.y_neuron_recurrence,
             clocked_slow_memory: config.clocked_slow_memory,
             summary_memory: config.summary_memory,
+            latent_reasoning,
             layer_latent_totals,
             shared_lowrank_continual_backprop: None,
             embed,
@@ -708,6 +787,15 @@ impl<B: Backend> DragonModel<B> {
             lm_head,
             nca_factorized_lm_head,
             nca_special_lm_head,
+            latent_refiner_in,
+            latent_refiner_out,
+            latent_energy_head,
+            latent_stop_head,
+            latent_jepa_predictor,
+            next_latent_transition,
+            next_latent_transition_in,
+            next_latent_transition_mid,
+            next_latent_transition_out,
             nca_factorized_head_tables,
         }
     }
@@ -833,6 +921,18 @@ impl<B: Backend> DragonModel<B> {
                 self.mamba_config, fresh.mamba_config
             ));
         }
+        if self.latent_reasoning != fresh.latent_reasoning {
+            return Err(format!(
+                "widening cannot change latent_reasoning (current={:?} target={:?})",
+                self.latent_reasoning, fresh.latent_reasoning
+            ));
+        }
+        if self.next_latent_transition != fresh.next_latent_transition {
+            return Err(format!(
+                "widening cannot change next_latent_transition (current={:?} target={:?})",
+                self.next_latent_transition, fresh.next_latent_transition
+            ));
+        }
         if new_latent_total % self.n_head != 0 {
             return Err(format!(
                 "target latent_total must be divisible by n_head (target={new_latent_total}, n_head={})",
@@ -871,6 +971,23 @@ impl<B: Backend> DragonModel<B> {
             .nca_special_lm_head
             .as_ref()
             .map(|head| Param::from_tensor(head.val()));
+        widened.latent_refiner_in = self.latent_refiner_in.as_ref().map(clone_linear_value);
+        widened.latent_refiner_out = self.latent_refiner_out.as_ref().map(clone_linear_value);
+        widened.latent_energy_head = self.latent_energy_head.as_ref().map(clone_linear_value);
+        widened.latent_stop_head = self.latent_stop_head.as_ref().map(clone_linear_value);
+        widened.latent_jepa_predictor = self.latent_jepa_predictor.as_ref().map(clone_linear_value);
+        widened.next_latent_transition_in = self
+            .next_latent_transition_in
+            .as_ref()
+            .map(clone_linear_value);
+        widened.next_latent_transition_mid = self
+            .next_latent_transition_mid
+            .as_ref()
+            .map(clone_linear_value);
+        widened.next_latent_transition_out = self
+            .next_latent_transition_out
+            .as_ref()
+            .map(clone_linear_value);
 
         widened.encoder = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
             self.encoder.val(),
@@ -1863,7 +1980,7 @@ impl<B: Backend> DragonModel<B> {
         }
     }
 
-    fn forward_hidden_with_state_from_embedded(
+    fn forward_hidden_raw_with_state_from_embedded(
         &self,
         embedded: Tensor<B, 3>,
         state: &mut ModelState<B>,
@@ -1895,6 +2012,17 @@ impl<B: Backend> DragonModel<B> {
                     summary_event_mask,
                 ),
         }
+    }
+
+    fn forward_hidden_with_state_from_embedded(
+        &self,
+        embedded: Tensor<B, 3>,
+        state: &mut ModelState<B>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Tensor<B, 3> {
+        let hidden =
+            self.forward_hidden_raw_with_state_from_embedded(embedded, state, summary_event_mask);
+        self.reason_hidden_final(hidden)
     }
 
     fn forward_with_state_from_embedded_rollout_host_loop(
@@ -2031,7 +2159,8 @@ impl<B: Backend> DragonModel<B> {
                 token_summary_event_mask,
             );
             let last = fast_steps - 1;
-            let hidden_last = hidden_rollout.slice_dim(1, last..fast_steps);
+            let hidden_last =
+                self.reason_hidden_final(hidden_rollout.slice_dim(1, last..fast_steps));
             let logits_last = self.project_hidden_to_logits(hidden_last.clone());
             hidden_slow.push(hidden_last);
             logits_slow.push(logits_last);
@@ -2848,6 +2977,214 @@ impl<B: Backend> DragonModel<B> {
         hidden
     }
 
+    pub fn latent_reasoning_config(&self) -> &LatentReasoningConfig {
+        &self.latent_reasoning
+    }
+
+    pub fn latent_reasoning_enabled(&self) -> bool {
+        self.latent_reasoning.enabled
+            && self.latent_reasoning.max_steps > 0
+            && self.latent_refiner_in.is_some()
+            && self.latent_refiner_out.is_some()
+            && (!self.latent_reasoning.adaptive_halting || self.latent_stop_head.is_some())
+    }
+
+    fn latent_refine_step(
+        &self,
+        current: Tensor<B, 3>,
+        refiner_in: &Linear<B>,
+        refiner_out: &Linear<B>,
+    ) -> Tensor<B, 3> {
+        let update = refiner_out.forward(activation::gelu(refiner_in.forward(current.clone())));
+        if self.latent_reasoning.normalize_steps {
+            self.norm.forward(current + update)
+        } else {
+            current + update
+        }
+    }
+
+    pub fn reason_hidden_final(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        if !self.latent_reasoning_enabled() {
+            return hidden;
+        }
+
+        let refiner_in = self
+            .latent_refiner_in
+            .as_ref()
+            .expect("latent refiner input missing");
+        let refiner_out = self
+            .latent_refiner_out
+            .as_ref()
+            .expect("latent refiner output missing");
+        if !self.latent_reasoning.adaptive_halting {
+            let mut current = hidden;
+            for _ in 0..self.latent_reasoning.max_steps {
+                current = self.latent_refine_step(current, refiner_in, refiner_out);
+            }
+            return current;
+        }
+        let energy_head = self.latent_energy_head.as_ref();
+        let stop_head = self
+            .latent_stop_head
+            .as_ref()
+            .expect("latent stop head missing");
+
+        let [batch, time, dim] = hidden.shape().dims();
+        let device = hidden.device();
+        let mut current = hidden.clone();
+        let mut final_hidden = Tensor::<B, 3>::zeros([batch, time, dim], &device);
+        let mut remaining = Tensor::<B, 3>::ones([batch, time, 1], &device);
+        for step in 0..self.latent_reasoning.max_steps {
+            current = self.latent_refine_step(current, refiner_in, refiner_out);
+            let _energy = energy_head.map(|head| head.forward(current.clone()));
+            let logits = stop_head.forward(current.clone());
+            let probs = if step + 1 < self.latent_reasoning.min_steps {
+                Tensor::<B, 3>::zeros(logits.shape().dims::<3>(), &logits.device())
+            } else {
+                activation::sigmoid(logits.clone())
+            };
+            let halt = probs
+                .clone()
+                .greater_equal_elem(self.latent_reasoning.halt_threshold)
+                .float()
+                * remaining.clone();
+            final_hidden = final_hidden + current.clone() * halt.clone().repeat_dim(2, dim);
+            remaining = remaining * halt.mul_scalar(-1.0).add_scalar(1.0);
+        }
+        final_hidden + current * remaining.repeat_dim(2, dim)
+    }
+
+    pub fn reason_hidden(&self, hidden: Tensor<B, 3>) -> LatentReasoningOutput<B> {
+        if !self.latent_reasoning_enabled() {
+            return LatentReasoningOutput {
+                raw_hidden: hidden.clone(),
+                final_hidden: hidden,
+                step_hiddens: Vec::new(),
+                energies: Vec::new(),
+                stop_logits: Vec::new(),
+                stop_probs: Vec::new(),
+                steps_used: 0,
+            };
+        }
+
+        let refiner_in = self
+            .latent_refiner_in
+            .as_ref()
+            .expect("latent refiner input missing");
+        let refiner_out = self
+            .latent_refiner_out
+            .as_ref()
+            .expect("latent refiner output missing");
+        let energy_head = self.latent_energy_head.as_ref();
+        let stop_head = self.latent_stop_head.as_ref();
+
+        let [batch, time, dim] = hidden.shape().dims();
+        let device = hidden.device();
+        let mut current = hidden.clone();
+        let mut final_hidden = Tensor::<B, 3>::zeros([batch, time, dim], &device);
+        let mut remaining = Tensor::<B, 3>::ones([batch, time, 1], &device);
+        let mut step_hiddens = Vec::with_capacity(self.latent_reasoning.max_steps);
+        let mut energies = Vec::with_capacity(self.latent_reasoning.max_steps);
+        let mut stop_logits = Vec::with_capacity(self.latent_reasoning.max_steps);
+        let mut stop_probs = Vec::with_capacity(self.latent_reasoning.max_steps);
+        for step in 0..self.latent_reasoning.max_steps {
+            current = self.latent_refine_step(current, refiner_in, refiner_out);
+            if let Some(head) = energy_head {
+                energies.push(head.forward(current.clone()));
+            }
+            if let Some(head) = stop_head {
+                let logits = head.forward(current.clone());
+                let probs = if step + 1 < self.latent_reasoning.min_steps {
+                    Tensor::<B, 3>::zeros(logits.shape().dims::<3>(), &logits.device())
+                } else {
+                    activation::sigmoid(logits.clone())
+                };
+                let halt = probs
+                    .clone()
+                    .greater_equal_elem(self.latent_reasoning.halt_threshold)
+                    .float()
+                    * remaining.clone();
+                final_hidden = final_hidden + current.clone() * halt.clone().repeat_dim(2, dim);
+                remaining = remaining * halt.mul_scalar(-1.0).add_scalar(1.0);
+                stop_logits.push(logits);
+                stop_probs.push(probs);
+            }
+            step_hiddens.push(current.clone());
+        }
+        if self.latent_reasoning.adaptive_halting {
+            final_hidden = final_hidden + current.clone() * remaining.repeat_dim(2, dim);
+        } else {
+            final_hidden = current.clone();
+        }
+
+        LatentReasoningOutput {
+            raw_hidden: hidden,
+            final_hidden,
+            step_hiddens,
+            energies,
+            stop_logits,
+            stop_probs,
+            steps_used: self.latent_reasoning.max_steps,
+        }
+    }
+
+    pub fn latent_jepa_prediction_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.latent_jepa_predictor
+            .as_ref()
+            .map(|predictor| predictor.forward(hidden.clone()))
+            .unwrap_or(hidden)
+    }
+
+    pub fn next_latent_transition_enabled(&self) -> bool {
+        self.next_latent_transition.enabled
+            && self.next_latent_transition_in.is_some()
+            && self.next_latent_transition_mid.is_some()
+            && self.next_latent_transition_out.is_some()
+    }
+
+    fn normalize_next_latent_transition_input(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        if !self.next_latent_transition.normalize_input {
+            return input;
+        }
+        let [_batch, _time, dim] = input.shape().dims();
+        if dim == 0 {
+            return input;
+        }
+        let mean = input.clone().mean_dim(2);
+        let centered = input - mean.repeat_dim(2, dim);
+        let variance = centered.clone().powf_scalar(2.0).mean_dim(2);
+        centered / variance.add_scalar(1.0e-5).sqrt().repeat_dim(2, dim)
+    }
+
+    pub fn next_latent_prediction_from_hidden_action(
+        &self,
+        hidden: Tensor<B, 3>,
+        action_embedding: Tensor<B, 3>,
+    ) -> Option<Tensor<B, 3>> {
+        if !self.next_latent_transition_enabled() {
+            return None;
+        }
+        let transition_in = self.next_latent_transition_in.as_ref()?;
+        let transition_mid = self.next_latent_transition_mid.as_ref()?;
+        let transition_out = self.next_latent_transition_out.as_ref()?;
+        let [batch, time, dim] = hidden.shape().dims();
+        if action_embedding.shape().dims() != [batch, time, dim] {
+            return None;
+        }
+        let input = Tensor::cat(vec![hidden.clone(), action_embedding], 2);
+        let input = self.normalize_next_latent_transition_input(input);
+        let update = transition_out.forward(activation::gelu(
+            transition_mid.forward(activation::gelu(transition_in.forward(input))),
+        ));
+        Some(hidden + update)
+    }
+
+    pub fn latent_energy_from_hidden(&self, hidden: Tensor<B, 3>) -> Option<Tensor<B, 3>> {
+        self.latent_energy_head
+            .as_ref()
+            .map(|head| head.forward(hidden))
+    }
+
     fn project_hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         assert!(
             self.language_head.uses_flat_token_logits(),
@@ -2897,6 +3234,11 @@ impl<B: Backend> DragonModel<B> {
         self.forward_hidden_with_state(tokens, &mut state)
     }
 
+    pub fn forward_hidden_raw(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        let mut state = ModelState::new(self.n_layer);
+        self.forward_hidden_raw_with_state(tokens, &mut state)
+    }
+
     pub fn forward_with_state_and_summary_event_mask(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -2914,6 +3256,15 @@ impl<B: Backend> DragonModel<B> {
         state: &mut ModelState<B>,
     ) -> Tensor<B, 3> {
         self.forward_hidden_with_state_impl(tokens, state, None)
+    }
+
+    pub fn forward_hidden_raw_with_state(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: &mut ModelState<B>,
+    ) -> Tensor<B, 3> {
+        let embedded = self.embed.forward(tokens);
+        self.forward_hidden_raw_with_state_from_embedded(embedded, state, None)
     }
 
     pub fn forward_hidden_with_state_and_summary_event_mask(
@@ -3061,6 +3412,97 @@ mod tests {
             .reshape([1, 1, 32]);
         let diff = max_abs_diff(tensor_values(logits), tensor_values(expected));
         assert!(diff <= 1e-6, "tied logits drifted by {diff}");
+    }
+
+    #[test]
+    fn latent_reasoning_forward_returns_finite_reasoned_hidden() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 1;
+        config.latent_reasoning.adaptive_halting = true;
+        config.latent_reasoning.energy_head = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        let raw = model.forward_hidden_raw(tokens.clone());
+        let reasoned = model.forward_hidden(tokens.clone());
+        let logits = model.forward(tokens.clone());
+        let output = model.reason_hidden(raw.clone());
+
+        assert_eq!(raw.shape().dims(), [1, 4, 16]);
+        assert_eq!(reasoned.shape().dims(), [1, 4, 16]);
+        assert_eq!(logits.shape().dims(), [1, 4, 32]);
+        assert_eq!(output.steps_used, 2);
+        assert_eq!(output.energies.len(), 2);
+        assert_eq!(output.stop_probs.len(), 2);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+        assert!(
+            tensor_values(reasoned)
+                .iter()
+                .all(|value| value.is_finite()),
+            "reasoned hidden contains non-finite values"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_default_refiner_starts_as_identity_residual() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.latent_reasoning.enabled = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        let raw = model.forward_hidden_raw(tokens);
+        let output = model.reason_hidden(raw.clone());
+        let diff = max_abs_diff(tensor_values(raw), tensor_values(output.final_hidden));
+
+        assert!(
+            diff <= 1e-6,
+            "zero-initialized latent residual should preserve hidden at init; diff={diff}"
+        );
+        assert_eq!(output.steps_used, 1);
+        assert_eq!(output.energies.len(), 0);
+        assert_eq!(output.stop_probs.len(), 0);
+    }
+
+    #[test]
+    fn next_latent_transition_starts_as_identity_delta() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.next_latent_transition.enabled = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        let raw = model.forward_hidden_raw(tokens.clone());
+        let hidden = model.forward_hidden(tokens.clone());
+        let context = hidden.clone().slice([0..1, 0..3, 0..16]);
+        let action_tokens = tokens.slice([0..1, 1..4]);
+        let action_embedding = model.embed_tokens(action_tokens);
+        let prediction = model
+            .next_latent_prediction_from_hidden_action(context.clone(), action_embedding)
+            .expect("next latent transition enabled");
+        let diff = max_abs_diff(tensor_values(context), tensor_values(prediction));
+        let forward_diff = max_abs_diff(tensor_values(raw), tensor_values(hidden));
+
+        assert!(
+            diff <= 1.0e-6,
+            "zero-initialized transition drifted by {diff}"
+        );
+        assert!(
+            forward_diff <= 1.0e-6,
+            "NextLat transition should not alter forward_hidden; diff={forward_diff}"
+        );
     }
 
     #[test]

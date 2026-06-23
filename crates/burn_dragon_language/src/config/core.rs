@@ -6,9 +6,9 @@ use crate::tokenizer::TokenizerConfig;
 use burn_dragon_core::{
     AttentionResidualConfig, BlockAttentionResidualConfig, ClockedSlowMemoryConfig,
     DragonInitializationConfig, DragonNormConfig, GatedDeltaNet2Config, LanguageHeadConfig,
-    LatentFanoutScheduleConfig, MambaSequenceConfig, ManifoldHyperConnectionsConfig,
-    ResidualConnectorKind, RotaryEmbedding, SequenceKernelConfig, SummaryMemoryConfig,
-    YNeuronRecurrenceConfig,
+    LatentFanoutScheduleConfig, LatentReasoningConfig, MambaSequenceConfig,
+    ManifoldHyperConnectionsConfig, NextLatentTransitionConfig, ResidualConnectorKind,
+    RotaryEmbedding, SequenceKernelConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -95,6 +95,8 @@ pub struct ModelOverrides {
     pub y_neuron_recurrence: Option<YNeuronRecurrenceConfig>,
     pub clocked_slow_memory: Option<ClockedSlowMemoryConfig>,
     pub summary_memory: Option<SummaryMemoryConfig>,
+    pub latent_reasoning: Option<LatentReasoningConfig>,
+    pub next_latent_transition: Option<NextLatentTransitionConfig>,
     pub mhc: Option<ManifoldHyperConnectionsConfig>,
 }
 

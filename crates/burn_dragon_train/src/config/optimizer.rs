@@ -7,6 +7,7 @@ pub enum OptimizerKind {
     #[default]
     Adamw,
     Eggroll,
+    PredictiveCoding,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -31,6 +32,59 @@ pub enum EggrollPopulationExecutionBackend {
 pub enum EggrollPerturbationScope {
     #[default]
     DragonCoreProjection,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingOptimizerTransform {
+    #[default]
+    Sgd,
+    Momentum,
+    Adamw,
+    DiagonalNatural,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PredictiveCodingOptimizerConfig {
+    pub transform: PredictiveCodingOptimizerTransform,
+    pub momentum: f32,
+    pub fisher_decay: f32,
+    pub damping: f32,
+    pub nesterov: bool,
+}
+
+impl Default for PredictiveCodingOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            transform: PredictiveCodingOptimizerTransform::default(),
+            momentum: 0.9,
+            fisher_decay: 0.95,
+            damping: 1.0e-3,
+            nesterov: false,
+        }
+    }
+}
+
+impl PredictiveCodingOptimizerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..1.0).contains(&self.momentum) || !self.momentum.is_finite() {
+            return Err(anyhow!(
+                "optimizer.predictive_coding.momentum must be finite and in [0, 1)"
+            ));
+        }
+        if !(0.0..1.0).contains(&self.fisher_decay) || !self.fisher_decay.is_finite() {
+            return Err(anyhow!(
+                "optimizer.predictive_coding.fisher_decay must be finite and in [0, 1)"
+            ));
+        }
+        if self.damping <= 0.0 || !self.damping.is_finite() {
+            return Err(anyhow!(
+                "optimizer.predictive_coding.damping must be finite and > 0"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -203,6 +257,8 @@ pub struct OptimizerConfig {
     pub eggroll_population_execution: EggrollPopulationExecutionConfig,
     #[serde(default)]
     pub eggroll_auto_population: EggrollAutoPopulationConfig,
+    #[serde(default)]
+    pub predictive_coding: PredictiveCodingOptimizerConfig,
 }
 
 impl OptimizerConfig {
@@ -288,6 +344,7 @@ impl OptimizerConfig {
         }
         self.eggroll_population_execution.validate()?;
         self.eggroll_auto_population.validate()?;
+        self.predictive_coding.validate()?;
         if self.eggroll_auto_population.enabled && !matches!(self.name, OptimizerKind::Eggroll) {
             return Err(anyhow!(
                 "optimizer.eggroll_auto_population.enabled requires optimizer.name=eggroll"
@@ -300,6 +357,13 @@ impl OptimizerConfig {
                     "optimizer grad clipping is not supported by optimizer.name=eggroll"
                 ));
             }
+        }
+        if matches!(self.name, OptimizerKind::PredictiveCoding)
+            && self.eggroll_auto_population.enabled
+        {
+            return Err(anyhow!(
+                "optimizer.eggroll_auto_population.enabled is only valid with optimizer.name=eggroll"
+            ));
         }
         Ok(())
     }
@@ -409,6 +473,7 @@ mod tests {
             eggroll: burn_eggroll::EggrollConfig::default(),
             eggroll_population_execution: EggrollPopulationExecutionConfig::default(),
             eggroll_auto_population: EggrollAutoPopulationConfig::default(),
+            predictive_coding: PredictiveCodingOptimizerConfig::default(),
         }
     }
 
@@ -605,6 +670,40 @@ mod tests {
         let err = config.validate().expect_err("expected validation failure");
         assert!(
             err.to_string().contains("chunk_autotune.candidates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_optimizer_config_validates_transform_defaults() {
+        let config = OptimizerConfig {
+            name: OptimizerKind::PredictiveCoding,
+            predictive_coding: PredictiveCodingOptimizerConfig {
+                transform: PredictiveCodingOptimizerTransform::DiagonalNatural,
+                ..PredictiveCodingOptimizerConfig::default()
+            },
+            ..base_optimizer()
+        };
+
+        config
+            .validate()
+            .expect("predictive coding optimizer config should validate");
+    }
+
+    #[test]
+    fn predictive_coding_optimizer_rejects_invalid_preconditioner_decay() {
+        let config = OptimizerConfig {
+            name: OptimizerKind::PredictiveCoding,
+            predictive_coding: PredictiveCodingOptimizerConfig {
+                fisher_decay: 1.0,
+                ..PredictiveCodingOptimizerConfig::default()
+            },
+            ..base_optimizer()
+        };
+
+        let err = config.validate().expect_err("expected validation failure");
+        assert!(
+            err.to_string().contains("fisher_decay"),
             "unexpected error: {err}"
         );
     }

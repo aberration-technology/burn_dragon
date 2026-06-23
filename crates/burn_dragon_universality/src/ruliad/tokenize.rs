@@ -133,6 +133,42 @@ impl RuliadByteTokenizer {
         }
     }
 
+    pub fn encode_payload(&self, text: &str) -> Vec<u32> {
+        match self.mode {
+            RuliadTokenizerMode::ByteCompatible { .. } => text.bytes().map(u32::from).collect(),
+            RuliadTokenizerMode::Symbolic { .. } => symbolic_payload_tokens(text, &self.mode),
+            RuliadTokenizerMode::StructuredSymbolic { .. } => {
+                structured_symbolic_payload_tokens(text, &self.mode)
+            }
+        }
+    }
+
+    pub fn decode_payload(&self, tokens: &[u32], stop_at_eos: bool) -> String {
+        let mut text = String::new();
+        for token in tokens {
+            if Some(*token) == self.eos_id() {
+                if stop_at_eos {
+                    break;
+                }
+                continue;
+            }
+            match self.mode {
+                RuliadTokenizerMode::ByteCompatible { .. } => {
+                    if let Some(ch) = char::from_u32(*token) {
+                        text.push(ch);
+                    }
+                }
+                RuliadTokenizerMode::Symbolic { .. } => {
+                    decode_symbolic_token(&mut text, *token, false);
+                }
+                RuliadTokenizerMode::StructuredSymbolic { .. } => {
+                    decode_symbolic_token(&mut text, *token, true);
+                }
+            }
+        }
+        text
+    }
+
     pub fn eos_id(&self) -> Option<u32> {
         match self.mode {
             RuliadTokenizerMode::ByteCompatible { eos_id, .. }
@@ -164,34 +200,94 @@ impl RuliadByteTokenizer {
         {
             tokens.push(eos_id);
         }
-        let fill_seed = stable_text_hash(text);
         while tokens.len() < document_tokens {
-            tokens.push(self.fill_token(fill_seed, tokens.len()));
+            tokens.push(self.fill_token());
         }
         tokens.truncate(document_tokens);
         tokens
     }
 
-    fn fill_token(&self, seed: u64, index: usize) -> u32 {
+    fn fill_token(&self) -> u32 {
         match self.mode {
             RuliadTokenizerMode::ByteCompatible { eos_id, .. } => {
                 eos_id.unwrap_or(u32::from(b'\n'))
             }
-            RuliadTokenizerMode::Symbolic { .. } => {
-                let mixed = seed
-                    ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ 0xA5A5_23B7_91C3_4D11;
-                symbolic_bucket_token(SymbolicClass::Filler, mixed, &self.mode)
-            }
-            RuliadTokenizerMode::StructuredSymbolic { .. } => {
-                let mixed = seed
-                    ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ 0x37B5_F4A7_1C2D_90EF;
-                let byte = b'a'.saturating_add((mixed % 26) as u8);
-                u32::from(byte)
+            RuliadTokenizerMode::Symbolic { eos_id, .. }
+            | RuliadTokenizerMode::StructuredSymbolic { eos_id, .. } => {
+                eos_id.unwrap_or_else(|| {
+                    symbolic_structural_token(SymbolicStructuralToken::DocumentEnd, &self.mode)
+                })
             }
         }
     }
+}
+
+fn decode_symbolic_token(text: &mut String, token: u32, structured: bool) {
+    match token {
+        0..=255 if structured => {
+            if let Some(ch) = char::from_u32(token) {
+                text.push(ch);
+            }
+        }
+        0..=255 => {}
+        token
+            if token
+                == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::TraceStart.index() =>
+        {
+            push_marker(text, "[T");
+        }
+        token
+            if token
+                == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::TraceNode.index() =>
+        {
+            push_marker(text, "N<");
+        }
+        token
+            if token == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::TraceEnd.index() =>
+        {
+            push_marker(text, "[/T]");
+        }
+        token
+            if token
+                == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::DocumentStart.index() =>
+        {
+            push_marker(text, "[R2");
+        }
+        token
+            if token == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::Metadata.index() =>
+        {
+            push_marker(text, "S:");
+        }
+        token if token == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::Data.index() => {
+            push_marker(text, "G:");
+        }
+        token if token == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::Query.index() => {
+            push_marker(text, "?:");
+        }
+        token
+            if token
+                == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::ProofStep.index() =>
+        {
+            push_marker(text, ">");
+        }
+        token if token == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::Answer.index() => {
+            push_marker(text, "!:");
+        }
+        token
+            if token
+                == RAW_BYTE_TOKEN_COUNT as u32 + SymbolicStructuralToken::DocumentEnd.index() =>
+        {
+            push_marker(text, "[/R2]");
+        }
+        _ => {}
+    }
+}
+
+fn push_marker(text: &mut String, marker: &str) {
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(marker);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +296,7 @@ enum SymbolicClass {
     Number,
     Hex,
     Mixed,
+    #[allow(dead_code)]
     Filler,
 }
 
@@ -575,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_tokenizer_groups_lexemes_and_avoids_eos_padding_runs() {
+    fn symbolic_tokenizer_groups_lexemes_and_uses_deterministic_eos_padding() {
         let tokenizer = RuliadByteTokenizer::from_config(&RuliadTokenizationConfig::Symbolic {
             vocab_size: 1025,
             eos_id: Some(1024),
@@ -592,8 +689,11 @@ mod tests {
             tokens.iter().position(|token| *token == 1024).expect("eos"),
             tokenizer.payload_token_count("G:O=48;I=u48:habc123:z9\n?:cp\n")
         );
-        let eos_count = tokens.iter().filter(|token| **token == 1024).count();
-        assert_eq!(eos_count, 1);
+        let eos_pos = tokens.iter().position(|token| *token == 1024).expect("eos");
+        assert!(
+            tokens[eos_pos..].iter().all(|token| *token == 1024),
+            "symbolic padding should be deterministic eos tokens after payload end: {tokens:?}"
+        );
     }
 
     #[test]
@@ -800,5 +900,29 @@ mod tests {
             1,
             "only the line-start proof step should become a proof-step marker: {payload:?}"
         );
+    }
+
+    #[test]
+    fn structured_symbolic_decode_recovers_verifier_completion_shape() {
+        let tokenizer =
+            RuliadByteTokenizer::from_config(&RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            })
+            .expect("tok");
+        let tokens = vec![
+            264,
+            u32::from(b'o'),
+            u32::from(b'k'),
+            u32::from(b'='),
+            u32::from(b'1'),
+            265,
+            271,
+            u32::from(b'x'),
+        ];
+        let decoded = tokenizer.decode_payload(&tokens, true);
+        assert!(decoded.contains("!:ok=1"), "{decoded}");
+        assert!(decoded.contains("[/R2]"), "{decoded}");
+        assert!(!decoded.contains('x'), "{decoded}");
     }
 }

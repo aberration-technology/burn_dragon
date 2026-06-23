@@ -78,14 +78,15 @@ impl TokenizerConfig {
     }
 
     pub fn load(&self, _path: &Path) -> Result<SharedTokenizer> {
-        let TokenizerKind::Pretokenized(config) = &self.kind;
-        Ok(Arc::new(PretokenizedTokenizer::new(
-            config.vocab_size,
-            config.bos_id,
-            config.eos_id,
-            config.pad_id,
-            config.unk_id,
-        )) as SharedTokenizer)
+        match &self.kind {
+            TokenizerKind::Pretokenized(config) => Ok(Arc::new(PretokenizedTokenizer::new(
+                config.vocab_size,
+                config.bos_id,
+                config.eos_id,
+                config.pad_id,
+                config.unk_id,
+            )) as SharedTokenizer),
+        }
     }
 
     pub fn fit<'a, I>(&self, _texts: I) -> Result<SharedTokenizer>
@@ -108,11 +109,14 @@ impl TokenizerConfig {
     }
 
     pub fn kind_name(&self) -> &'static str {
-        "pretokenized"
+        match self.kind {
+            TokenizerKind::Pretokenized(_) => "pretokenized",
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
-        let TokenizerKind::Pretokenized(config) = &self.kind;
-        config.vocab_size
+        match &self.kind {
+            TokenizerKind::Pretokenized(config) => config.vocab_size,
+        }
     }
 }

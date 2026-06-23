@@ -1,0 +1,8 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-probe32-fixed-ablation.toml"]
+
+[training.latent_reasoning.next_latent]
+horizon = 2
+every_steps = 16
+start_after_steps = 1024
+regression_weight = 0.1
+token_kl_weight = 0.0

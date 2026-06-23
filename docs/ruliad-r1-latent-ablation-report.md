@@ -34,6 +34,14 @@ the two additional seed runs are in
 The decoupled NextLat schedule pass, where JEPA and NextLat have separate
 cadence/start controls, is in
 `target/ruliad-r1-nextlat-decoupled-4096-latest/summary.csv`.
+The second decoupled 4096-step screen is in
+`target/ruliad-r1-nextlat-decoupled2-4096-latest/summary.csv`. The 128-item
+correctness probe follow-up is in
+`target/ruliad-r1-nextlat-probe128-4096-latest/summary.csv`, and the 8192-step
+continuation screen is in
+`target/ruliad-r1-nextlat-probe128-8192-latest/summary.csv`. The 16384-step
+promotion gate is in
+`target/ruliad-r1-nextlat-probe128-16384-latest/summary.csv`.
 
 The tables report the ruliad competence scalar as `Composite`. That metric is
 only a coarse lexicographic dashboard encoding of verifier, semantic, partial,
@@ -205,6 +213,65 @@ cadence while only NextLat is sparse and/or delayed.
 | Decoupled delayed1024 sparse16 | 207s | 1.2940 | 0.5986 | 0.00 | 0.00 | 0.000 | 0.406 | 0.000 | 593750 |
 | Decoupled weak delayed1024 sparse16 | 204s | 1.2537 | 0.6104 | 0.00 | 0.00 | 0.000 | 0.438 | 0.000 | 562500 |
 
+## 4096-Step Decoupled Screen 2
+
+This screen keeps JEPA cadence fixed and sweeps only NextLat horizon, start,
+cadence, and regression weight.
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| h1 delayed1024 sparse16 | 213s | 1.3162 | 0.6009 | 0.000 | 0.000 | 0.031 | 0.656 | 0.000 | 343750 |
+| h4 delayed1024 sparse16 | 214s | 1.2542 | 0.6055 | 0.000 | 0.000 | 0.000 | 0.656 | 0.000 | 343750 |
+| h2 delayed2048 sparse16 | 214s | 1.3148 | 0.5935 | 0.000 | 0.000 | 0.031 | 0.406 | 0.000 | 593750 |
+| h2 delayed2048 sparse32 | 214s | 1.2958 | 0.5983 | 0.000 | 0.000 | 0.219 | 0.406 | 0.000 | 593750 |
+| h2 weak0.1 delayed1024 sparse16 | 213s | 1.3083 | 0.6047 | 0.000 | 0.000 | 0.031 | 0.250 | 0.000 | 750000 |
+| h2 weak0.03 delayed1024 sparse16 | 204s | 1.2876 | 0.6121 | 0.000 | 0.000 | 0.031 | 0.625 | 0.000 | 375000 |
+
+## 4096-Step Probe128 Follow-Up
+
+This pass repeats the best candidates with 128 correctness-probe items.
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JEPA | 217s | 1.3043 | 0.6367 | 0.000 | 0.000 | 0.164 | 0.555 | 0.000 | 445313 |
+| h2 delayed1024 sparse16 | 216s | 1.2682 | 0.6132 | 0.000 | 0.000 | 0.086 | 0.164 | 0.023 | 812500 |
+| h2 delayed2048 sparse16 | 208s | 1.3104 | 0.6047 | 0.000 | 0.000 | 0.039 | 0.406 | 0.000 | 593750 |
+| h2 delayed2048 sparse32 | 215s | 1.2595 | 0.6137 | 0.008 | 0.008 | 0.094 | 0.438 | 0.000 | 562500 |
+| h2 weak0.1 delayed1024 sparse16 | 207s | 1.3043 | 0.6122 | 0.000 | 0.000 | 0.031 | 0.477 | 0.000 | 523438 |
+
+## 8192-Step Probe128 Continuation
+
+This longer screen tests whether the 4096-step candidates keep improving with
+more training.
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JEPA | 409s | 1.0147 | 0.5699 | 0.031 | 0.031 | 0.117 | 0.586 | 0.000 | 414063 |
+| h2 delayed1024 sparse16 | 410s | 1.0269 | 0.5678 | 0.016 | 0.016 | 0.078 | 0.516 | 0.000 | 484375 |
+| h2 delayed2048 sparse32 | 408s | 1.0842 | 0.5691 | 0.000 | 0.000 | 0.031 | 0.383 | 0.039 | 578125 |
+
+## 16384-Step Probe128 Promotion Gate
+
+This gate keeps the same 128-item correctness probe and validates every 4096
+steps. The key question is whether the candidate preserves verifier/schema
+behavior after the CE objective continues to improve.
+
+Endpoint summary:
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JEPA | 1021s | 0.9115 | 0.5444 | 0.000 | 0.000 | 0.016 | 0.781 | 0.000 | 218750 |
+| h2 delayed1024 sparse16 | 1017s | 0.2383 | 0.5308 | 0.016 | 0.016 | 0.148 | 0.383 | 0.000 | 617188 |
+| h2 delayed2048 sparse32 | 1019s | 0.8366 | 0.5264 | 0.016 | 0.016 | 0.234 | 0.500 | 0.000 | 500000 |
+
+Checkpoint trajectory:
+
+| Variant | Valid@4k | Valid@8k | Valid@12k | Valid@16k | Verifier@16k | Partial@16k | Schema Wrong@16k |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| JEPA | 0.6019 | 0.5553 | 0.5550 | 0.5444 | 0.000 | 0.016 | 0.781 |
+| h2 delayed1024 sparse16 | 0.5942 | 0.5494 | 0.5354 | 0.5308 | 0.016 | 0.148 | 0.383 |
+| h2 delayed2048 sparse32 | 0.5939 | 0.5532 | 0.5453 | 0.5264 | 0.016 | 0.234 | 0.500 |
+
 ## Readout
 
 - JEPA is still the best practical objective family in this ablation, but the
@@ -257,6 +324,29 @@ cadence while only NextLat is sparse and/or delayed.
   this family, but it still has zero verifier/semantic/partial progress. The
   sparse-only decoupled arm preserves JEPA-like schema-wrong rate, but introduces
   malformed completions, so it is not a promotion candidate either.
+- The second decoupled screen shows that NextLat horizon 2 remains the best
+  default. Horizon 1 and horizon 4 both hurt schema health. Delaying NextLat to
+  step 2048 improves validation CE, and sparse32 recovers partial progress in
+  the 32-item probe.
+- The 128-item probe is more favorable to decoupled NextLat than the earlier
+  probe32 screens. `h2 delayed1024 sparse16` improves validation, schema-wrong
+  rate, and completion health versus JEPA at 4096 steps, with only a small
+  malformed rate. `h2 delayed2048 sparse32` is the only 4096-step arm in this
+  batch with nonzero verifier/semantic accuracy.
+- At 8192 steps, the result is still mixed rather than promotable. `h2
+  delayed1024 sparse16` has the best validation loss and better completion
+  health than JEPA, but JEPA keeps stronger verifier/semantic and partial
+  progress. `h2 delayed2048 sparse32` has the best schema-wrong rate and
+  completion health, but loses verifier and introduces malformed completions.
+- At 16384 steps, the picture changes: both decoupled NextLat candidates beat
+  JEPA on validation CE and preserve more verifiable output structure at the
+  endpoint. JEPA's CE continues improving, but its correctness probe degrades to
+  very high schema-wrong rate and near-zero partial progress. This is exactly
+  the failure mode the auxiliary objective is supposed to address.
+- `h2 delayed1024 sparse16` is the best stability candidate in the 16384-step
+  gate. It does not have the lowest endpoint CE, but it preserves the best
+  schema health and completion health. `h2 delayed2048 sparse32` has the best
+  CE and partial progress, but its schema-wrong rate is materially worse.
 - Mild CBP did not improve validation or verifier behavior, although it did
   raise partial progress. It should remain a plasticity experiment rather than a
   default training component.
@@ -284,12 +374,15 @@ the default. It appears to improve validation CE, but current evidence says it
 can trade away verifier/schema behavior. The likely next useful variant is
 delayed or sparse JEPA+NextLat, not always-on token-KL decoding.
 
-The current best practical recipe remains JEPA-only. The current best research
-candidate is JEPA+NextLat hidden regression with sparse or delayed scheduling,
-because it sometimes improves validation CE without runtime cost explosion.
-However, the three-seed aggregate shows that the current schedules are still
-trading away verifiable output structure, so they should not be promoted until
-schema/correctness metrics improve alongside CE.
+The current best practical default remains JEPA-only for production-sized runs
+until the NextLat result survives multiple seeds and a larger profile. However,
+the 16384-step fixed-small gate is now strong evidence that JEPA-only is not
+the right endpoint for long continual ruliad training: it improves CE while
+losing verifiable structure. The current best research candidate is decoupled
+JEPA+NextLat hidden regression with horizon 2, sparse cadence, and delayed
+start. The leading candidate is `h2 delayed1024 sparse16`; `h2 delayed2048
+sparse32` is worth keeping as a lower-CE, higher-partial but weaker-schema
+candidate.
 
 Use the decoupled NextLat schedules for future NextLat work. They are cleaner
 than the older coupled profiles because JEPA can remain active while only
@@ -301,20 +394,22 @@ scale.
 
 ## Next Ablation Steps
 
-- Run the next promotion gate on longer 16k-32k step windows for JEPA-only,
-  JEPA+state, and the best sparse/delayed JEPA+NextLat candidates. Require
-  verifier/schema parity with JEPA before considering NextLat promotion.
-- Separate cadence and weight controls for JEPA, NextLat, and rho-state losses.
-  The current single `training.latent_reasoning.every_steps` setting makes
-  low-cost JEPA and expensive state consistency move together, which is too
-  blunt for production training.
+- Run the next promotion gate across multiple seeds for JEPA-only, `h2
+  delayed1024 sparse16`, and `h2 delayed2048 sparse32`. Require the NextLat
+  endpoint advantage to survive seed changes before promoting it beyond the
+  fixed-small profile.
+- Add a larger-profile gate after the multi-seed fixed-small pass. The minimum
+  useful set is 1M/16k latent JEPA versus delayed1024 sparse16 NextLat with the
+  same 128-item correctness probe.
+- Keep per-objective cadence/start controls as the standard for NextLat
+  experiments. Do not use the older coupled schedules for promotion decisions.
 - Add explicit rho-dynamics telemetry: student/teacher rho drift, rho energy
   drift, slot redundancy, hidden-state variance, and chunk-boundary prediction
   error. This is the missing signal for whether rho is stabilized through time.
 - Rework NextLat as a delayed state-prediction curriculum: enable it only after
-  CE and schema health are stable, start with horizon 1, then sweep horizons
-  2/4/8 against verifier/schema/degen metrics. The 64/128-step evidence says
-  always-on NextLat is not safe enough.
+  CE and schema health are stable, keep horizon 2 as the default, and test
+  sparse16/sparse32 schedules against verifier/schema/degen metrics. The
+  horizon sweep says h1/h4 are worse than h2 in this setup.
 - Avoid treating composite ruliad score as a promotion target until the probe is
   larger and verifier accuracy is nonzero. For now, composite is dashboard
   context, not a capability objective.
@@ -326,7 +421,7 @@ Concrete next matrix:
 | Telemetry-only | AdamW, JEPA, JEPA+state | Establish rho drift/redundancy and output-degen baselines without changing objectives. | No objective promotion from this gate; it validates the diagnostic signals. |
 | Sparse state | JEPA, JEPA+state every 16/32/64 aux steps | Check whether state consistency helps when decoupled from JEPA cadence. | Keep only arms that improve validation or degen metrics without worse schema health and with less than 15% overhead. |
 | Delayed state | JEPA+state activated after CE/schema-health thresholds | Test whether state consistency is harmful before the token model has a stable manifold. | Promote over JEPA-only only if it improves 4096-step validation and does not regress completion health. |
-| Delayed NextLat | JEPA+NextLat h1, h2, h4 after stability threshold | Test next-latent prediction as continuation supervision rather than always-on regularization. | Continue only if schema-wrong stays below JEPA-only and rho/chunk-boundary prediction improves. |
+| Delayed NextLat | JEPA+NextLat h2 sparse16/sparse32 after stability threshold | Test next-latent prediction as continuation supervision rather than always-on regularization. | Promote only if the 16k endpoint advantage survives multiple seeds and a larger profile. |
 | Larger-profile check | AdamW, JEPA, JEPA+best-state on 1M/16k profile | Verify that the candidate scales beyond the toy fixed profile. | Default promotion requires no throughput collapse and no verifier/schema regression. |
 
 Immediate follow-up:
@@ -334,16 +429,13 @@ Immediate follow-up:
 - Add fixed profiles with at least 32 or 128 ruliad correctness probe items. The
   4-item probe is too coarse to distinguish real verifier progress from sample
   noise.
-- Add sparse and delayed JEPA+NextLat hidden regression profiles. Candidate
-  settings: every 16/32 aux steps, or activation after validation CE and schema
-  health are stable.
+- Add threshold-triggered delayed JEPA+NextLat profiles. The current fixed-start
+  schedules are useful, but the better version should start NextLat only after
+  schema health is stable rather than at a fixed optimizer step.
 - Keep token-KL decode supervision behind an experimental flag until it stops
   worsening schema health at 1024+ steps.
-- Re-run 4096-step JEPA, sparse16 JEPA+NextLat, delayed1024 JEPA+NextLat, and
-  weak+delayed1024+sparse16 JEPA+NextLat across at least three seeds.
-- Add per-objective cadence controls if we want JEPA frequent but NextLat sparse.
-  The current `every_steps` cadence gates all latent objectives together, so
-  sparse NextLat also makes JEPA sparse.
+- Re-run 16384-step JEPA, h2 delayed1024 sparse16, and h2 delayed2048 sparse32
+  across at least three seeds with 128-item probes.
 
 Required metrics before the next promotion gate:
 

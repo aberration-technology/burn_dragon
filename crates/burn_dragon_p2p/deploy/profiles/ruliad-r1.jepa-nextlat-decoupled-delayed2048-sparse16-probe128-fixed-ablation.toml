@@ -1,0 +1,6 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed2048-sparse16-probe32-fixed-ablation.toml"]
+
+[training.events]
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 64

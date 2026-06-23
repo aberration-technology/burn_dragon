@@ -1,0 +1,16 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-tbptt256-probe128-fixed-ablation.toml"]
+
+[training.predictive_coding]
+enabled = true
+mode = "recurrent_state"
+state_scope = "core"
+backward_mode = "chunked"
+parameter_update = "optimizer"
+steps = 1
+step_size = 0.01
+latent_decay = 0.0
+max_grad_norm = 1.0
+eps = 0.00000001
+apply_every_chunks = 2
+warmup_steps = 0
+sync_diagnostics = false

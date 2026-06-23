@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BACKEND="${BURN_DRAGON_PC_PAPER_BACKEND:-cuda}"
 FEATURES="${BURN_DRAGON_PC_PAPER_FEATURES:-train,cuda}"
-PROFILE="${BURN_DRAGON_PC_PAPER_PROFILE:-crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
+PROFILE="${BURN_DRAGON_PC_PAPER_PROFILE:-}"
 OUT_DIR="${BURN_DRAGON_PC_PAPER_OUT_DIR:-$ROOT_DIR/target/pc-paper/$(date -u +%Y%m%dT%H%M%SZ)}"
 MATRIX="${BURN_DRAGON_PC_PAPER_MATRIX:-smoke}"
 BATCH_SIZE="${BURN_DRAGON_PC_PAPER_BATCH_SIZE:-}"
@@ -31,7 +31,8 @@ Usage:
   scripts/pc_paper_experiments.sh [options]
 
 Options:
-  --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability | pc-optimizer | hparam
+  --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
+                               pc-optimizer | hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
@@ -132,6 +133,7 @@ RUSTUP_RUSTC="$(rustup which rustc)"
 matrix_defaults() {
   case "$MATRIX" in
     smoke)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621}"
       : "${ITERS_CSV:=4}"
       : "${ARMS_CSV:=adamw}"
@@ -141,18 +143,21 @@ matrix_defaults() {
       fi
       ;;
     main-fixed-token)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623,20260624,20260625}"
       : "${ITERS_CSV:=2048,8192}"
       : "${ARMS_CSV:=adamw,adamwpc,adamwpc_every_chunk}"
       : "${BATCH_SIZE:=64}"
       ;;
     controls)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=512,2048}"
       : "${ARMS_CSV:=pconly}"
       : "${BATCH_SIZE:=64}"
       ;;
     wall-clock)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=100000000}"
       : "${ARMS_CSV:=adamw,adamwpc}"
@@ -165,6 +170,7 @@ matrix_defaults() {
       fi
       ;;
     stability)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622}"
       : "${ITERS_CSV:=100000000}"
       : "${ARMS_CSV:=adamw,adamwpc}"
@@ -177,16 +183,28 @@ matrix_defaults() {
       fi
       ;;
     pc-optimizer)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=512,2048}"
       : "${ARMS_CSV:=pcopt_sgd,pcopt_momentum,pcopt_adamw,pcopt_diagonal_natural}"
       : "${BATCH_SIZE:=64}"
       ;;
     hparam)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=512}"
       : "${ARMS_CSV:=adamwpc,adamwpc_step003,adamwpc_step03,adamwpc_steps2,adamwpc_allstate,adamwpc_block}"
       : "${BATCH_SIZE:=64}"
+      ;;
+    nextlat-tbptt)
+      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-tbptt256-probe128-fixed-ablation.toml}"
+      : "${SEEDS_CSV:=20260621}"
+      : "${ITERS_CSV:=2048,4096}"
+      : "${ARMS_CSV:=adamw,adamwpc,adamwpc_warm1024,adamwpc_step003,adamwpc_warm1024_step003}"
+      : "${BATCH_SIZE:=8}"
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
       ;;
     *)
       echo "unknown matrix: $MATRIX" >&2
@@ -332,6 +350,7 @@ write_pc_block() {
   local steps="$6"
   local step_size="$7"
   local apply_every_chunks="$8"
+  local warmup_steps="${9:-0}"
   {
     echo "[training.predictive_coding]"
     echo "enabled = $enabled"
@@ -345,7 +364,7 @@ write_pc_block() {
     echo "max_grad_norm = 1.0"
     echo "eps = 1.0e-8"
     echo "apply_every_chunks = $apply_every_chunks"
-    echo "warmup_steps = 0"
+    echo "warmup_steps = $warmup_steps"
     echo "sync_diagnostics = false"
   } >> "$path"
 }
@@ -419,6 +438,16 @@ weight_decay = 0.01
 EOF
       write_pc_block "$path" true core chunked optimizer 1 0.01 1
       ;;
+    adamwpc_warm1024)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 0.01 2 1024
+      ;;
     pconly)
       cat >> "$path" <<EOF
 [optimizer]
@@ -438,6 +467,16 @@ weight_decay = 0.01
 
 EOF
       write_pc_block "$path" true core chunked optimizer 1 0.003 2
+      ;;
+    adamwpc_warm1024_step003)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 0.003 2 1024
       ;;
     adamwpc_step03)
       cat >> "$path" <<EOF

@@ -133,6 +133,43 @@ Paired AdamW+PC minus AdamW deltas at 2048 steps:
 | Wall time | +67.90 +/- 0.31 s | PC is consistently slower |
 | Tokens/s | -32,641 +/- 239 | PC throughput is 77.4% of AdamW |
 
+### Fixed-Small TBPTT-256 Ruliad/NextLat Matrix
+
+The fixed-small latent objective screens need explicit multi-chunk TBPTT for PC
+to be meaningful. A `block_size = 64`, `tbptt_chunk_size = 64` profile has no
+chunk boundary for recurrent-state correction, so the PC follow-up uses
+`block_size = 256` and `tbptt_chunk_size = 64`.
+
+Artifacts:
+
+- `target/ruliad-r1-tbptt256-pc-probe128-2048-latest/summary.csv`
+- `target/ruliad-r1-tbptt256-nextlat-pc-followup-2048-latest/summary.csv`
+- `target/ruliad-r1-tbptt256-nextlat-pc-warm1024-4096-latest/summary.csv`
+
+At 2048 steps, plain JEPA TBPTT improves structurally when PC is enabled:
+schema-wrong drops from 0.961 to 0.484 and health rises from 39k PPM to 516k
+PPM with about 18% wall-time overhead. Every-chunk PC is much slower and is not
+better enough to justify the cost.
+
+On the stronger JEPA+NextLat h2 delayed1024 sparse16 baseline, the result is
+mixed. Default PC can improve short-run CE and partial progress in one
+2048-step follow-up, and a `warmup_steps = 1024` variant produced a short
+verifier/semantic hit. The 4096-step warmup-PC gate did not preserve that hit:
+validation CE was worse than the non-PC TBPTT baseline, partial progress tied,
+and schema/health improved only slightly.
+
+Current interpretation: PC is useful as a TBPTT recurrent-state stability
+screen, especially for plain JEPA, but it is not yet additive enough with the
+leading NextLat candidate to promote by default.
+
+The reusable runner now exposes this as a preset:
+
+```bash
+scripts/pc_paper_experiments.sh \
+  --matrix nextlat-tbptt \
+  --out-dir target/pc-paper/nextlat-tbptt-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
 ## Publish-Grade Experiment Matrix
 
 Use `scripts/pc_paper_experiments.sh` for new runs and `scripts/pc_paper_analyze.py` for
@@ -276,6 +313,10 @@ Supported by current evidence:
 2. Core-state, chunked-backward PC is the best current implementation mode.
 3. State-only PC correction is not a viable substitute for parameter optimization.
 4. AdamW+PC gives an early 512-step validation improvement but no replicated 2048-step advantage.
+5. Fixed-small PC ablations require `block_size > tbptt_chunk_size`; otherwise
+   there is no recurrent chunk boundary for PC to correct.
+6. PC can improve plain JEPA TBPTT structure, but delayed NextLat remains the
+   stronger current ruliad stability candidate.
 
 Not yet supported:
 
@@ -283,6 +324,7 @@ Not yet supported:
 2. PC prevents output degeneracy or collapse.
 3. PC is worth its throughput cost by default.
 4. The first-class PC optimizer path is competitive with AdamW.
+5. PC is additive with JEPA+NextLat beyond short-run or single-seed evidence.
 
 ## Acceptance Gate For An arXiv Submission
 

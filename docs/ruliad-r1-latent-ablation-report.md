@@ -42,6 +42,10 @@ continuation screen is in
 `target/ruliad-r1-nextlat-probe128-8192-latest/summary.csv`. The 16384-step
 promotion gate is in
 `target/ruliad-r1-nextlat-probe128-16384-latest/summary.csv`.
+The TBPTT-256 predictive-coding screens are in
+`target/ruliad-r1-tbptt256-pc-probe128-2048-latest/summary.csv`,
+`target/ruliad-r1-tbptt256-nextlat-pc-followup-2048-latest/summary.csv`, and
+`target/ruliad-r1-tbptt256-nextlat-pc-warm1024-4096-latest/summary.csv`.
 
 The tables report the ruliad competence scalar as `Composite`. That metric is
 only a coarse lexicographic dashboard encoding of verifier, semantic, partial,
@@ -272,6 +276,40 @@ Checkpoint trajectory:
 | h2 delayed1024 sparse16 | 0.5942 | 0.5494 | 0.5354 | 0.5308 | 0.016 | 0.148 | 0.383 |
 | h2 delayed2048 sparse32 | 0.5939 | 0.5532 | 0.5453 | 0.5264 | 0.016 | 0.234 | 0.500 |
 
+## TBPTT-256 Predictive-Coding Screens
+
+Predictive coding only tests recurrent-state correction when the model has more
+than one TBPTT chunk. A fixed-small profile with `block_size = 64` and
+`tbptt_chunk_size = 64` has no chunk boundary for PC to correct, so the PC
+matrix uses `block_size = 256` and `tbptt_chunk_size = 64`.
+
+### 2048-Step TBPTT-256 Matrix
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM | PC Frac | PC ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JEPA TBPTT | 431s | 1.2205 | 0.8097 | 0.000 | 0.000 | 0.000 | 0.961 | 0.000 | 39063 | - | - |
+| JEPA+PC | 510s | 1.1542 | 0.8074 | 0.000 | 0.000 | 0.008 | 0.484 | 0.000 | 515625 | 0.50 | 366.5 |
+| JEPA+PC every chunk | 697s | 1.2045 | 0.8022 | 0.000 | 0.000 | 0.008 | 0.508 | 0.000 | 492188 | 0.75 | 1101.2 |
+| h2 delayed1024 sparse16 TBPTT | 413s | 1.1511 | 0.8045 | 0.000 | 0.000 | 0.055 | 0.383 | 0.000 | 617188 | - | - |
+| h2 delayed1024 sparse16 + PC | 505s | 1.1477 | 0.8047 | 0.000 | 0.000 | 0.000 | 0.773 | 0.000 | 226563 | 0.50 | 361.6 |
+
+### 2048-Step NextLat+PC Interaction Follow-Up
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM | PC Frac | PC Count |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| h2 delayed1024 sparse16 TBPTT | 434s | 1.1539 | 0.8083 | 0.000 | 0.000 | 0.070 | 0.750 | 0.000 | 250000 | - | - |
+| h2 delayed1024 sparse16 + PC | 531s | 1.1412 | 0.8003 | 0.000 | 0.000 | 0.180 | 0.508 | 0.000 | 492188 | 0.50 | 256 |
+| h2 delayed1024 sparse16 + PC warm1024 | 463s | 1.1534 | 0.8084 | 0.141 | 0.141 | 0.141 | 0.445 | 0.000 | 554688 | 0.50 | 128 |
+| h2 delayed1024 sparse16 + PC step0.003 | 512s | 1.1459 | 0.8017 | 0.000 | 0.000 | 0.000 | 0.469 | 0.000 | 531250 | 0.50 | 256 |
+| h2 delayed1024 sparse16 + PC warm1024 step0.003 | 465s | 1.1494 | 0.8094 | 0.000 | 0.000 | 0.031 | 0.633 | 0.000 | 367188 | 0.50 | 128 |
+
+### 4096-Step Warmup-PC Gate
+
+| Variant | Time | Train | Valid | Verifier | Semantic | Partial | Schema Wrong | Malformed | Health PPM | PC Frac | PC Count |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| h2 delayed1024 sparse16 TBPTT | 865s | 1.1916 | 0.7496 | 0.000 | 0.000 | 0.047 | 0.578 | 0.000 | 421875 | - | - |
+| h2 delayed1024 sparse16 + PC warm1024 | 1012s | 1.0944 | 0.7578 | 0.000 | 0.000 | 0.047 | 0.547 | 0.000 | 453125 | 0.50 | 384 |
+
 ## Readout
 
 - JEPA is still the best practical objective family in this ablation, but the
@@ -350,6 +388,15 @@ Checkpoint trajectory:
 - Mild CBP did not improve validation or verifier behavior, although it did
   raise partial progress. It should remain a plasticity experiment rather than a
   default training component.
+- PC must be evaluated on multi-chunk TBPTT runs. The corrected TBPTT-256
+  screen shows PC is a real state-stability signal, not a valid single-chunk
+  fixed-small toggle.
+- PC materially improves plain JEPA TBPTT completion structure in the 2048-step
+  screen, but it does not beat the NextLat TBPTT baseline. Every-chunk PC is too
+  expensive for the observed quality and should not be promoted.
+- PC on top of NextLat is mixed. A warm1024 variant produced a short 2048-step
+  verifier/semantic hit, but the 4096-step gate did not preserve that signal.
+  Delayed warmup PC is worth keeping as an ablation; it is not a default.
 
 ## Recommendation
 
@@ -388,6 +435,10 @@ Use the decoupled NextLat schedules for future NextLat work. They are cleaner
 than the older coupled profiles because JEPA can remain active while only
 NextLat is sparse/delayed.
 
+Keep PC as a TBPTT stability ablation rather than a default objective. If PC is
+tested with NextLat, use delayed warmup with every-other-chunk correction and
+require the verifier/schema advantage to survive a longer, multi-seed gate.
+
 The current rho-state objective is mechanically correct and covered by unit
 tests, but this ablation does not show it is a better training objective at this
 scale.
@@ -422,6 +473,7 @@ Concrete next matrix:
 | Sparse state | JEPA, JEPA+state every 16/32/64 aux steps | Check whether state consistency helps when decoupled from JEPA cadence. | Keep only arms that improve validation or degen metrics without worse schema health and with less than 15% overhead. |
 | Delayed state | JEPA+state activated after CE/schema-health thresholds | Test whether state consistency is harmful before the token model has a stable manifold. | Promote over JEPA-only only if it improves 4096-step validation and does not regress completion health. |
 | Delayed NextLat | JEPA+NextLat h2 sparse16/sparse32 after stability threshold | Test next-latent prediction as continuation supervision rather than always-on regularization. | Promote only if the 16k endpoint advantage survives multiple seeds and a larger profile. |
+| TBPTT PC | JEPA TBPTT, h2 delayed1024 sparse16 TBPTT, h2 delayed1024 sparse16 warmup-PC | Test PC as recurrent-state stabilization rather than single-chunk regularization. | Keep only if verifier/schema gains survive at least 16k steps and the overhead stays under 20%. |
 | Larger-profile check | AdamW, JEPA, JEPA+best-state on 1M/16k profile | Verify that the candidate scales beyond the toy fixed profile. | Default promotion requires no throughput collapse and no verifier/schema regression. |
 
 Immediate follow-up:

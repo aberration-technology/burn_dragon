@@ -1,0 +1,6 @@
+extends = ["ruliad-r1.jepa-nextlat-energy-probe128-fixed-ablation.toml"]
+
+[training.latent_reasoning.energy_model]
+contrastive_weight = 0.0
+monotonic_weight = 0.25
+contractive_weight = 0.05

@@ -583,8 +583,13 @@ impl TrainingConfig {
                 ));
             }
         }
+        let latent = &self.training.latent_reasoning;
+        if latent.eval_step_sweep.iter().any(|steps| *steps == 0) {
+            return Err(anyhow!(
+                "training.latent_reasoning.eval_step_sweep must contain only positive step counts"
+            ));
+        }
         if self.training.latent_reasoning.enabled {
-            let latent = &self.training.latent_reasoning;
             if latent.every_steps == 0 {
                 return Err(anyhow!(
                     "training.latent_reasoning.every_steps must be > 0 when enabled"
@@ -598,10 +603,12 @@ impl TrainingConfig {
             if latent.jepa_future_offsets.is_empty()
                 && !latent.next_latent.enabled
                 && !latent.dragon_state.enabled
+                && !latent.energy_model.enabled
+                && !latent.step_contract.enabled
                 && !latent.sigreg.enabled
             {
                 return Err(anyhow!(
-                    "training.latent_reasoning.jepa_future_offsets must not be empty unless next_latent, dragon_state, or sigreg is enabled"
+                    "training.latent_reasoning.jepa_future_offsets must not be empty unless next_latent, dragon_state, energy_model, step_contract, or sigreg is enabled"
                 ));
             }
             if latent.jepa_future_offsets.iter().any(|offset| *offset == 0) {
@@ -656,6 +663,69 @@ impl TrainingConfig {
                     ));
                 }
             }
+            if latent.step_contract.enabled {
+                if latent.step_contract.every_steps == Some(0) {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.every_steps must be > 0 when set"
+                    ));
+                }
+                if latent.step_contract.max_rollout_steps_for_loss == 0 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.max_rollout_steps_for_loss must be > 0 when enabled"
+                    ));
+                }
+                if !latent.step_contract.ce_weight.is_finite()
+                    || latent.step_contract.ce_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.ce_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.step_contract.token_kl_weight.is_finite()
+                    || latent.step_contract.token_kl_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.token_kl_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.step_contract.monotonic_ce_weight.is_finite()
+                    || latent.step_contract.monotonic_ce_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.monotonic_ce_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.step_contract.contractive_weight.is_finite()
+                    || latent.step_contract.contractive_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.contractive_weight must be finite and >= 0"
+                    ));
+                }
+                if latent.step_contract.ce_weight <= f32::EPSILON
+                    && latent.step_contract.token_kl_weight <= f32::EPSILON
+                    && latent.step_contract.monotonic_ce_weight <= f32::EPSILON
+                    && latent.step_contract.contractive_weight <= f32::EPSILON
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract requires at least one positive loss weight"
+                    ));
+                }
+                if !latent.step_contract.ce_tolerance.is_finite()
+                    || latent.step_contract.ce_tolerance < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.ce_tolerance must be finite and >= 0"
+                    ));
+                }
+                if !latent.step_contract.trust_radius.is_finite()
+                    || latent.step_contract.trust_radius < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.step_contract.trust_radius must be finite and >= 0"
+                    ));
+                }
+            }
             if latent.dragon_state.enabled {
                 if latent.dragon_state.every_steps == Some(0) {
                     return Err(anyhow!(
@@ -698,6 +768,66 @@ impl TrainingConfig {
                 if self.parallel.pipeline.enabled {
                     return Err(anyhow!(
                         "training.latent_reasoning.dragon_state.enabled does not support parallel.pipeline.enabled yet"
+                    ));
+                }
+            }
+            if latent.energy_model.enabled {
+                if latent.energy_model.every_steps == Some(0) {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.every_steps must be > 0 when set"
+                    ));
+                }
+                if !latent.energy_model.contrastive_weight.is_finite()
+                    || latent.energy_model.contrastive_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.contrastive_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.energy_model.monotonic_weight.is_finite()
+                    || latent.energy_model.monotonic_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.monotonic_weight must be finite and >= 0"
+                    ));
+                }
+                if !latent.energy_model.contractive_weight.is_finite()
+                    || latent.energy_model.contractive_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.contractive_weight must be finite and >= 0"
+                    ));
+                }
+                if latent.energy_model.contrastive_weight <= f32::EPSILON
+                    && latent.energy_model.monotonic_weight <= f32::EPSILON
+                    && latent.energy_model.contractive_weight <= f32::EPSILON
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model requires at least one positive loss weight"
+                    ));
+                }
+                if !latent.energy_model.margin.is_finite() || latent.energy_model.margin < 0.0 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.margin must be finite and >= 0"
+                    ));
+                }
+                if !latent.energy_model.monotonic_tolerance.is_finite()
+                    || latent.energy_model.monotonic_tolerance < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.monotonic_tolerance must be finite and >= 0"
+                    ));
+                }
+                if !latent.energy_model.trust_radius.is_finite()
+                    || latent.energy_model.trust_radius < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.trust_radius must be finite and >= 0"
+                    ));
+                }
+                if latent.energy_model.max_rollout_steps_for_loss == 0 {
+                    return Err(anyhow!(
+                        "training.latent_reasoning.energy_model.max_rollout_steps_for_loss must be > 0 when enabled"
                     ));
                 }
             }
@@ -760,11 +890,83 @@ impl TrainingConfig {
         if self.training.gates.degeneracy_patience == 0 {
             return Err(anyhow!("training.gates.degeneracy_patience must be > 0"));
         }
+        if self.training.gates.capability_zero_verifier_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.capability_zero_verifier_patience_epochs must be > 0"
+            ));
+        }
+        if self.training.gates.capability_regression_patience_epochs == 0 {
+            return Err(anyhow!(
+                "training.gates.capability_regression_patience_epochs must be > 0"
+            ));
+        }
         if self.training.gates.degeneracy_entropy_min_bits < 0.0
             || !self.training.gates.degeneracy_entropy_min_bits.is_finite()
         {
             return Err(anyhow!(
                 "training.gates.degeneracy_entropy_min_bits must be finite and >= 0"
+            ));
+        }
+        if self.training.gates.capability_output_entropy_min_bits < 0.0
+            || !self
+                .training
+                .gates
+                .capability_output_entropy_min_bits
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_output_entropy_min_bits must be finite and >= 0"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_schema_wrong_max_rate)
+            || !self
+                .training
+                .gates
+                .capability_schema_wrong_max_rate
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_schema_wrong_max_rate must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_malformed_max_rate)
+            || !self
+                .training
+                .gates
+                .capability_malformed_max_rate
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_malformed_max_rate must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_missing_max_rate)
+            || !self.training.gates.capability_missing_max_rate.is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_missing_max_rate must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_completion_health_min_rate)
+            || !self
+                .training
+                .gates
+                .capability_completion_health_min_rate
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_completion_health_min_rate must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_distinct_2_min_fraction)
+            || !self
+                .training
+                .gates
+                .capability_distinct_2_min_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_distinct_2_min_fraction must be finite and in [0, 1]"
             ));
         }
         if !(0.0..=1.0).contains(&self.training.gates.degeneracy_max_probability_max)
@@ -1595,6 +1797,57 @@ impl TrainingConfig {
                 ));
             }
         }
+        if self.training.ruliad_supervision.answer_ranking.enabled {
+            let ranking = self.training.ruliad_supervision.answer_ranking;
+            if !ranking.weight.is_finite() || ranking.weight < 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_ranking.weight must be finite and non-negative"
+                ));
+            }
+            if !ranking.margin.is_finite() || ranking.margin < 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_ranking.margin must be finite and non-negative"
+                ));
+            }
+            if ranking.corrupt_offset <= 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_ranking.corrupt_offset must be positive"
+                ));
+            }
+            if !self.training.ruliad_supervision.uses_answer_target_mask() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_ranking.enabled requires training.ruliad_supervision.mode to use answer target masks"
+                ));
+            }
+        }
+        if self.training.ruliad_supervision.answer_denoising.enabled {
+            let denoising = self.training.ruliad_supervision.answer_denoising;
+            if !denoising.weight.is_finite() || denoising.weight < 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.weight must be finite and non-negative"
+                ));
+            }
+            if !denoising.probability.is_finite() || !(0.0..=1.0).contains(&denoising.probability) {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.probability must be finite and in [0, 1]"
+                ));
+            }
+            if denoising.corrupt_offset <= 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.corrupt_offset must be positive"
+                ));
+            }
+            if !self.training.ruliad_supervision.uses_answer_target_mask() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.enabled requires training.ruliad_supervision.mode to use answer target masks"
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.enabled does not yet support parallel.pipeline.enabled"
+                ));
+            }
+        }
         if self.training.ruliad_supervision.uses_target_loss_mask()
             && !matches!(
                 self.dataset.source,
@@ -1891,6 +2144,55 @@ impl TrainingConfig {
                 .map_err(anyhow::Error::msg)?;
             resolved_model.next_latent_transition = next_latent_transition.clone();
         }
+        if let Some(hierarchical_dragon) = &self.model.hierarchical_dragon {
+            resolved_model.hierarchical_dragon = hierarchical_dragon.clone();
+            if hierarchical_dragon.enabled {
+                if matches!(hierarchical_dragon.last_layers, Some(0)) {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon.last_layers must be > 0 when set"
+                    ));
+                }
+                if hierarchical_dragon.fast_cycles == 0 {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon.fast_cycles must be > 0 when enabled"
+                    ));
+                }
+                if hierarchical_dragon.slow_cycles == 0 {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon.slow_cycles must be > 0 when enabled"
+                    ));
+                }
+                if !hierarchical_dragon.slow_to_fast_scale.is_finite()
+                    || hierarchical_dragon.slow_to_fast_scale < 0.0
+                {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon.slow_to_fast_scale must be finite and >= 0 when enabled"
+                    ));
+                }
+                if !hierarchical_dragon.fast_to_slow_scale.is_finite()
+                    || hierarchical_dragon.fast_to_slow_scale < 0.0
+                {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon.fast_to_slow_scale must be finite and >= 0 when enabled"
+                    ));
+                }
+                if resolved_model.y_neuron_recurrence.enabled {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon is not yet supported together with model.y_neuron_recurrence"
+                    ));
+                }
+                if resolved_model.clocked_slow_memory.enabled {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon is not supported together with model.clocked_slow_memory"
+                    ));
+                }
+                if self.parallel.pipeline.enabled {
+                    return Err(anyhow!(
+                        "model.hierarchical_dragon is not yet supported together with parallel.pipeline.enabled"
+                    ));
+                }
+            }
+        }
         let latent_jepa_can_run = self.training.latent_reasoning.enabled
             && self
                 .training
@@ -1903,6 +2205,13 @@ impl TrainingConfig {
                 "training.latent_reasoning JEPA offsets within training.block_size require model.latent_reasoning.enabled"
             ));
         }
+        if !self.training.latent_reasoning.eval_step_sweep.is_empty()
+            && !resolved_model.latent_reasoning.enabled
+        {
+            return Err(anyhow!(
+                "training.latent_reasoning.eval_step_sweep requires model.latent_reasoning.enabled"
+            ));
+        }
         if self.training.latent_reasoning.enabled
             && self.training.latent_reasoning.next_latent.enabled
             && !resolved_model.next_latent_transition.enabled
@@ -1912,12 +2221,43 @@ impl TrainingConfig {
             ));
         }
         if self.training.latent_reasoning.enabled
+            && self.training.latent_reasoning.energy_model.enabled
+        {
+            if !resolved_model.latent_reasoning.enabled {
+                return Err(anyhow!(
+                    "training.latent_reasoning.energy_model.enabled requires model.latent_reasoning.enabled"
+                ));
+            }
+            if !resolved_model.latent_reasoning.energy_head {
+                return Err(anyhow!(
+                    "training.latent_reasoning.energy_model.enabled requires model.latent_reasoning.energy_head=true"
+                ));
+            }
+        }
+        if self.training.latent_reasoning.enabled
+            && self.training.latent_reasoning.step_contract.enabled
+            && !resolved_model.latent_reasoning.enabled
+        {
+            return Err(anyhow!(
+                "training.latent_reasoning.step_contract.enabled requires model.latent_reasoning.enabled"
+            ));
+        }
+        if self.training.latent_reasoning.enabled
             && self.training.latent_reasoning.next_latent.enabled
             && self.training.latent_reasoning.next_latent.token_kl_weight > f32::EPSILON
             && !resolved_model.language_head.uses_flat_token_logits()
         {
             return Err(anyhow!(
                 "training.latent_reasoning.next_latent.token_kl_weight requires a flat token language head"
+            ));
+        }
+        if self.training.latent_reasoning.enabled
+            && self.training.latent_reasoning.step_contract.enabled
+            && self.training.latent_reasoning.step_contract.token_kl_weight > f32::EPSILON
+            && !resolved_model.language_head.uses_flat_token_logits()
+        {
+            return Err(anyhow!(
+                "training.latent_reasoning.step_contract.token_kl_weight requires a flat token language head"
             ));
         }
         if let Some(dropout) = self.model.dropout
@@ -2271,7 +2611,7 @@ mod tests {
     use crate::config::load_training_config;
     use crate::config::train::RuliadSupervisionMode;
     use crate::inference::build_model_config;
-    use burn_dragon_core::{RotaryEmbedding, SequenceMemorySystem};
+    use burn_dragon_core::{HierarchicalDragonSharing, RotaryEmbedding, SequenceMemorySystem};
     use burn_dragon_train::OptimizerKind;
     use std::path::{Path, PathBuf};
 
@@ -2339,6 +2679,70 @@ prompt = ""
     }
 
     #[test]
+    fn hierarchical_dragon_training_config_validates() {
+        let config = parse_config(
+            r#"
+[model.hierarchical_dragon]
+enabled = true
+last_layers = 1
+fast_cycles = 2
+slow_cycles = 1
+rho_sharing = "split"
+weight_sharing = "shared"
+slow_to_fast_scale = 0.1
+fast_to_slow_scale = 0.1
+"#,
+        );
+
+        config
+            .validate()
+            .expect("hierarchical Dragon profile should validate");
+    }
+
+    #[test]
+    fn hierarchical_dragon_rejects_zero_cycles() {
+        let config = parse_config(
+            r#"
+[model.hierarchical_dragon]
+enabled = true
+fast_cycles = 0
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("zero fast cycles should be rejected");
+        assert!(
+            err.to_string()
+                .contains("model.hierarchical_dragon.fast_cycles"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hierarchical_dragon_rejects_pipeline_parallelism() {
+        let config = parse_config(
+            r#"
+[parallel.pipeline]
+enabled = true
+stage_count = 2
+microbatches = 2
+
+[model.hierarchical_dragon]
+enabled = true
+"#,
+        );
+
+        let err = config
+            .validate()
+            .expect_err("pipeline hierarchy should be rejected");
+        assert!(
+            err.to_string().contains("parallel.pipeline.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn next_latent_training_requires_transition_head() {
         let mut config = parse_config("");
         config.training.latent_reasoning.enabled = true;
@@ -2390,6 +2794,24 @@ prompt = ""
     }
 
     #[test]
+    fn step_contract_training_requires_inference_latent_reasoning() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.step_contract.enabled = true;
+
+        let err = config
+            .validate()
+            .expect_err("step contract training should require latent reasoning architecture");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning.step_contract.enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn latent_reasoning_training_validates_with_model_modules() {
         let mut config = parse_config("");
         config.model.latent_reasoning = Some(Default::default());
@@ -2405,6 +2827,130 @@ prompt = ""
         config
             .validate()
             .expect("latent reasoning training should validate with model modules enabled");
+    }
+
+    #[test]
+    fn latent_energy_model_training_requires_model_energy_head() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.energy_model.enabled = true;
+
+        let err = config
+            .validate()
+            .expect_err("latent EBM training should require model energy head");
+        assert!(
+            err.to_string()
+                .contains("model.latent_reasoning.energy_head"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_model_training_validates_with_model_energy_head() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        let latent = config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config");
+        latent.enabled = true;
+        latent.energy_head = true;
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.jepa_future_offsets = vec![usize::MAX];
+        config.training.latent_reasoning.sigreg.enabled = false;
+        config.training.latent_reasoning.energy_model.enabled = true;
+
+        config
+            .validate()
+            .expect("latent EBM training should validate with model energy head");
+    }
+
+    #[test]
+    fn latent_reasoning_eval_step_sweep_requires_model_modules() {
+        let mut config = parse_config("");
+        config.training.latent_reasoning.eval_step_sweep = vec![1, 2, 4];
+
+        let err = config
+            .validate()
+            .expect_err("eval step sweep should require model latent reasoning");
+        assert!(
+            err.to_string()
+                .contains("training.latent_reasoning.eval_step_sweep"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_eval_step_sweep_validates_with_model_modules() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.training.latent_reasoning.eval_step_sweep = vec![1, 2, 4];
+
+        config
+            .validate()
+            .expect("eval step sweep should validate with model latent reasoning");
+    }
+
+    #[test]
+    fn latent_reasoning_eval_step_sweep_rejects_zero() {
+        let mut config = parse_config("");
+        config.model.latent_reasoning = Some(Default::default());
+        config
+            .model
+            .latent_reasoning
+            .as_mut()
+            .expect("latent config")
+            .enabled = true;
+        config.training.latent_reasoning.eval_step_sweep = vec![1, 0, 4];
+
+        let err = config
+            .validate()
+            .expect_err("zero eval step should fail validation");
+        assert!(
+            err.to_string()
+                .contains("eval_step_sweep must contain only positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_start_policy_toml_values_parse() {
+        let config = parse_config(
+            r#"
+[training.latent_reasoning]
+enabled = true
+jepa_start_policy = "fixed_step_and_capability_gate"
+
+[training.latent_reasoning.next_latent]
+enabled = true
+start_policy = "capability_gate"
+"#,
+        );
+
+        assert_eq!(
+            config.training.latent_reasoning.jepa_start_policy,
+            Some(crate::config::LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate)
+        );
+        assert_eq!(
+            config.training.latent_reasoning.next_latent.start_policy,
+            Some(crate::config::LatentReasoningAuxiliaryStartPolicy::CapabilityGate)
+        );
     }
 
     #[test]
@@ -2630,6 +3176,169 @@ prompt = ""
     }
 
     #[test]
+    fn ruliad_10m_screening_profiles_validate_capability_gates() {
+        for profile in [
+            "ruliad-r1.jepa-10m-screening.toml",
+            "ruliad-r1.jepa-nextlat-10m-screening.toml",
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            assert!(config.training.latent_reasoning.enabled, "{profile}");
+            assert_eq!(
+                config.training.events.ruliad_correctness_probe_items, 128,
+                "{profile}"
+            );
+            assert!(
+                config.training.events.source_selection_capability_feedback,
+                "{profile} should feed capability probes back into live source selection by default"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .gates
+                    .capability_zero_verifier_patience_epochs,
+                8,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_grace_epochs, 3,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_regression_patience_epochs, 2,
+                "{profile}"
+            );
+            assert!(
+                config.training.gates.capability_required_after_first_pass,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_schema_wrong_max_rate, 0.50,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_malformed_max_rate, 0.02,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_missing_max_rate, 0.02,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_completion_health_min_rate, 0.40,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_output_entropy_min_bits, 1.25,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_distinct_2_min_fraction, 0.30,
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn ruliad_latent_energy_ablation_profile_validates() {
+        for profile in [
+            "ruliad-r1.jepa-nextlat-energy-probe128-fixed-ablation.toml",
+            "ruliad-r1.jepa-nextlat-energy-contrastive-probe128-fixed-ablation.toml",
+            "ruliad-r1.jepa-nextlat-energy-stability-probe128-fixed-ablation.toml",
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            let latent = config
+                .model
+                .latent_reasoning
+                .as_ref()
+                .unwrap_or_else(|| panic!("{profile} should configure latent reasoning"));
+            assert!(latent.enabled, "{profile}");
+            assert!(latent.energy_head, "{profile}");
+            assert!(config.training.latent_reasoning.enabled, "{profile}");
+            assert!(
+                config.training.latent_reasoning.energy_model.enabled,
+                "{profile} should enable latent EBM training"
+            );
+            assert_eq!(
+                config.training.latent_reasoning.eval_step_sweep,
+                vec![1, 2, 4, 8],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn ruliad_step_contract_ablation_profile_validates() {
+        let profile = "ruliad-r1.jepa-nextlat-step-contract-probe128-fixed-ablation.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let latent = config
+            .model
+            .latent_reasoning
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile} should configure latent reasoning"));
+        assert!(latent.enabled, "{profile}");
+        assert!(!latent.energy_head, "{profile}");
+        assert!(config.training.latent_reasoning.enabled, "{profile}");
+        assert!(
+            config.training.latent_reasoning.step_contract.enabled,
+            "{profile} should enable latent step contract training"
+        );
+        assert_eq!(
+            config.training.latent_reasoning.eval_step_sweep,
+            vec![1, 2, 4, 8],
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn ruliad_hierarchical_dragon_ablation_profiles_validate() {
+        for (profile, rho_sharing, weight_sharing) in [
+            (
+                "ruliad-r1.hdragon-shared-rho-shared-weights-probe128-fixed-ablation.toml",
+                HierarchicalDragonSharing::Shared,
+                HierarchicalDragonSharing::Shared,
+            ),
+            (
+                "ruliad-r1.hdragon-split-rho-shared-weights-probe128-fixed-ablation.toml",
+                HierarchicalDragonSharing::Split,
+                HierarchicalDragonSharing::Shared,
+            ),
+            (
+                "ruliad-r1.hdragon-split-rho-split-weights-probe128-fixed-ablation.toml",
+                HierarchicalDragonSharing::Split,
+                HierarchicalDragonSharing::Split,
+            ),
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            let hierarchy = config
+                .model
+                .hierarchical_dragon
+                .as_ref()
+                .unwrap_or_else(|| panic!("{profile} should configure hierarchical Dragon"));
+            assert!(hierarchy.enabled, "{profile}");
+            assert_eq!(hierarchy.rho_sharing, rho_sharing, "{profile}");
+            assert_eq!(hierarchy.weight_sharing, weight_sharing, "{profile}");
+            assert_eq!(hierarchy.last_layers, Some(1), "{profile}");
+            assert!(config.training.latent_reasoning.enabled, "{profile}");
+            assert!(
+                config.training.latent_reasoning.next_latent.enabled,
+                "{profile} should inherit NextLat training"
+            );
+        }
+    }
+
+    #[test]
     fn ruliad_1m_high_neuron_sweep_profiles_resolve_expected_long_context_shape() {
         for (profile, latent_total, batch_size) in [
             ("ruliad-1m-la-16k.training.toml", 16_384, 1),
@@ -2850,6 +3559,110 @@ prompt = ""
         config
             .validate()
             .expect("ruliad answer-completion AdamW config should validate");
+    }
+
+    #[test]
+    fn ruliad_answer_ranking_requires_answer_target_mask_mode() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::FullDocument;
+        config.training.ruliad_supervision.answer_ranking.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("answer ranking should require an answer target mask mode");
+        assert!(
+            err.to_string().contains("answer target masks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_ranking_validates_for_ruliad_answer_completion() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_ranking.enabled = true;
+        config
+            .validate()
+            .expect("ruliad answer ranking should validate with answer-completion masks");
+    }
+
+    #[test]
+    fn ruliad_answer_ranking_rejects_invalid_parameters() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_ranking.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .answer_ranking
+            .corrupt_offset = 0;
+        let err = config
+            .validate()
+            .expect_err("zero corrupt offset should fail");
+        assert!(
+            err.to_string().contains("corrupt_offset"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_requires_answer_target_mask_mode() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::FullDocument;
+        config.training.ruliad_supervision.answer_denoising.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("answer denoising should require an answer target mask mode");
+        assert!(
+            err.to_string().contains("answer target masks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_validates_for_ruliad_answer_completion() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_denoising.enabled = true;
+        config
+            .validate()
+            .expect("ruliad answer denoising should validate with answer-completion masks");
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_rejects_invalid_parameters() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_denoising.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .answer_denoising
+            .probability = 1.5;
+        let err = config
+            .validate()
+            .expect_err("invalid denoising probability should fail");
+        assert!(
+            err.to_string().contains("answer_denoising.probability"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3149,6 +3962,111 @@ degeneracy_period_2_to_64_max_fraction = 1.1
         assert!(
             err.to_string()
                 .contains("degeneracy_period_2_to_64_max_fraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn capability_gates_reject_invalid_thresholds() {
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_zero_verifier_patience_epochs = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero capability patience should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_zero_verifier_patience_epochs"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_regression_patience_epochs = 0
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("zero capability regression patience should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_regression_patience_epochs"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_schema_wrong_max_rate = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability schema threshold should fail");
+        assert!(
+            err.to_string().contains("capability_schema_wrong_max_rate"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_malformed_max_rate = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability malformed threshold should fail");
+        assert!(
+            err.to_string().contains("capability_malformed_max_rate"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_missing_max_rate = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability missing threshold should fail");
+        assert!(
+            err.to_string().contains("capability_missing_max_rate"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_completion_health_min_rate = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability completion-health threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_completion_health_min_rate"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_distinct_2_min_fraction = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability distinct-2 threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_distinct_2_min_fraction"),
             "unexpected error: {err}"
         );
     }

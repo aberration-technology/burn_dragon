@@ -22,7 +22,7 @@ use crate::ruliad::source_selection::{RuliadSourceBucket, ruliad_source_buckets}
 use crate::stats::SampleStats;
 
 pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 1;
-pub const RULIAD_EVAL_REPORT_VERSION: u32 = 1;
+pub const RULIAD_EVAL_REPORT_VERSION: u32 = 2;
 pub const RULIAD_REASONING_SCORE_VERSION: u32 = 1;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
@@ -155,6 +155,8 @@ pub struct RuliadEvalItem {
     pub prompt: String,
     pub expected_answer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_level: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<RuliadSampleSpec>,
 }
 
@@ -219,6 +221,8 @@ pub struct RuliadEvalReport {
     pub canary_semantic_match_count: usize,
     pub family_scores: Vec<RuliadEvalGroupScore>,
     pub task_scores: Vec<RuliadEvalGroupScore>,
+    #[serde(default)]
+    pub difficulty_scores: Vec<RuliadEvalGroupScore>,
     pub math_domain_scores: Vec<RuliadEvalGroupScore>,
     pub reasoning_mode_scores: Vec<RuliadEvalGroupScore>,
     pub failures: Vec<RuliadEvalFailure>,
@@ -321,6 +325,15 @@ pub struct RuliadExtractedCompletion {
     pub answer: Option<String>,
     pub certificate_lines: Vec<String>,
     pub generated_token_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RuliadAnswerKeyAlignment {
+    pub expected_key_count: usize,
+    pub actual_key_count: usize,
+    pub matching_key_count: usize,
+    pub exact_key_match: bool,
+    pub overlap_ppm: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +490,7 @@ pub fn build_eval_items_from_manifest(
             reasoning_modes: record.reasoning_modes,
             prompt: ruliad_prompt_prefix(&spec, oracle_hash),
             expected_answer: ruliad_expected_answer(&spec),
+            difficulty_level: None,
             spec: Some(spec),
         });
         if config
@@ -560,6 +574,7 @@ pub fn evaluate_completions(
 
     let mut family_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut task_scores = BTreeMap::<String, EvalAccumulator>::new();
+    let mut difficulty_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut math_domain_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut reasoning_mode_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut exact_match_count = 0usize;
@@ -603,6 +618,13 @@ pub fn evaluate_completions(
         }
         add_group_score(&mut family_scores, &item.family, &outcome);
         add_group_score(&mut task_scores, &item.task_kind, &outcome);
+        if let Some(difficulty_level) = item.difficulty_level {
+            add_group_score(
+                &mut difficulty_scores,
+                &format!("d{difficulty_level}"),
+                &outcome,
+            );
+        }
         for domain in &item.math_domains {
             add_group_score(&mut math_domain_scores, domain, &outcome);
         }
@@ -652,6 +674,7 @@ pub fn evaluate_completions(
         canary_semantic_match_count,
         family_scores: finalize_group_scores(family_scores),
         task_scores: finalize_group_scores(task_scores),
+        difficulty_scores: finalize_group_scores(difficulty_scores),
         math_domain_scores: finalize_group_scores(math_domain_scores),
         reasoning_mode_scores: finalize_group_scores(reasoning_mode_scores),
         failures,
@@ -828,7 +851,10 @@ fn score_answer_fields(
         };
     }
 
-    match (parse_answer_pairs(expected), parse_answer_pairs(actual)) {
+    match (
+        parse_answer_pairs(expected),
+        parse_answer_pairs_or_contract_values(expected, actual),
+    ) {
         (Some(expected_pairs), Some(actual_pairs)) => {
             let expected_field_count = expected_pairs.len().max(1);
             let correct_field_count = expected_pairs
@@ -1002,9 +1028,39 @@ pub fn ruliad_answers_semantic_match(expected: &str, actual: &str) -> bool {
     if ruliad_answers_exact_match(expected, actual) {
         return true;
     }
-    match (parse_answer_pairs(expected), parse_answer_pairs(actual)) {
+    match (
+        parse_answer_pairs(expected),
+        parse_answer_pairs_or_contract_values(expected, actual),
+    ) {
         (Some(left), Some(right)) => left == right,
         _ => false,
+    }
+}
+
+pub fn ruliad_answer_key_alignment(
+    expected: &str,
+    actual: Option<&str>,
+) -> RuliadAnswerKeyAlignment {
+    let expected_keys = parse_answer_pairs(expected)
+        .map(|pairs| pairs.into_keys().collect::<BTreeSet<_>>())
+        .unwrap_or_else(|| BTreeSet::from(["value".to_string()]));
+    let actual_keys = actual
+        .and_then(|actual| parse_answer_pairs_or_contract_values(expected, actual))
+        .map(|pairs| pairs.into_keys().collect::<BTreeSet<_>>())
+        .unwrap_or_else(|| {
+            actual
+                .filter(|value| !normalize_answer(value).is_empty())
+                .map(|_| BTreeSet::from(["value".to_string()]))
+                .unwrap_or_default()
+        });
+    let matching_key_count = expected_keys.intersection(&actual_keys).count();
+    let denominator = expected_keys.len().max(actual_keys.len()).max(1);
+    RuliadAnswerKeyAlignment {
+        expected_key_count: expected_keys.len(),
+        actual_key_count: actual_keys.len(),
+        matching_key_count,
+        exact_key_match: expected_keys == actual_keys,
+        overlap_ppm: matching_key_count.saturating_mul(SCORE_PPM_DENOMINATOR) / denominator,
     }
 }
 
@@ -1489,18 +1545,52 @@ fn is_multi_chunk_document(text: &str) -> bool {
 }
 
 fn parse_answer_pairs(value: &str) -> Option<BTreeMap<String, String>> {
+    let pairs = parse_answer_pair_sequence(value)?;
+    Some(pairs.into_iter().collect())
+}
+
+fn parse_answer_pairs_or_contract_values(
+    expected: &str,
+    actual: &str,
+) -> Option<BTreeMap<String, String>> {
+    if let Some(pairs) = parse_answer_pairs(actual) {
+        return Some(pairs);
+    }
+    let expected_fields = parse_answer_pair_sequence(expected)?;
+    let normalized = normalize_answer(actual);
+    if normalized.is_empty() || normalized.contains('=') {
+        return None;
+    }
+    let values = normalized.split(';').map(str::trim).collect::<Vec<_>>();
+    if values.len() != expected_fields.len()
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.chars().any(char::is_whitespace))
+    {
+        return None;
+    }
+    Some(
+        expected_fields
+            .into_iter()
+            .zip(values)
+            .map(|((key, _expected_value), actual_value)| (key, normalize_pair_value(actual_value)))
+            .collect(),
+    )
+}
+
+fn parse_answer_pair_sequence(value: &str) -> Option<Vec<(String, String)>> {
     let normalized = normalize_answer(value);
-    let mut pairs = BTreeMap::new();
+    let mut pairs = Vec::new();
     for part in normalized.split(';') {
         let (key, value) = part.split_once('=')?;
         let key = key.trim();
         if key.is_empty() {
             return None;
         }
-        pairs.insert(
+        pairs.push((
             normalize_pair_key(key).to_string(),
             normalize_pair_value(value),
-        );
+        ));
     }
     (!pairs.is_empty()).then_some(pairs)
 }
@@ -1630,18 +1720,45 @@ mod tests {
             "ok=1;l=1;r=1",
             "rhs=1;holds=TRUE;lhs=1"
         ));
+        assert!(ruliad_answers_semantic_match("ok=1;l=1;r=1", "1;1;1"));
+        assert!(ruliad_answers_semantic_match("ok=0", "0"));
         assert!(ruliad_answers_semantic_match("acc=0", "accepted=false"));
+    }
+
+    #[test]
+    fn answer_key_alignment_detects_wrong_family_schema() {
+        let exact = ruliad_answer_key_alignment("ok=1;l=3;r=3", Some("holds=false;rhs=7;lhs=2"));
+        assert!(exact.exact_key_match);
+        assert_eq!(exact.matching_key_count, 3);
+        assert_eq!(exact.overlap_ppm, SCORE_PPM_DENOMINATOR);
+
+        let wrong_family =
+            ruliad_answer_key_alignment("x=b128:h923eef785cae9cd9:w63", Some("ok=1;l=0;r=1"));
+        assert!(!wrong_family.exact_key_match);
+        assert_eq!(wrong_family.matching_key_count, 0);
+        assert_eq!(wrong_family.overlap_ppm, 0);
+
+        let partial = ruliad_answer_key_alignment("ok=1;l=3;r=3", Some("ok=0"));
+        assert!(!partial.exact_key_match);
+        assert_eq!(partial.matching_key_count, 1);
+        assert_eq!(partial.overlap_ppm, SCORE_PPM_DENOMINATOR / 3);
+
+        let contract_values = ruliad_answer_key_alignment("ok=1;l=3;r=3", Some("1;3;3"));
+        assert!(contract_values.exact_key_match);
+        assert_eq!(contract_values.matching_key_count, 3);
     }
 
     #[test]
     fn ordinal_reasoning_score_tracks_partial_structured_answers() {
         let exact = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("holds=true;rhs=3;lhs=3"));
+        let contract_exact = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("1;3;3"));
         let partial = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("ok=1;l=2;r=7"));
         let wrong_schema = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("ok=0;l=2;r=7"));
         let malformed = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("not an answer"));
         let missing = score_ruliad_answer(None, "ok=1;l=3;r=3", None);
 
         assert_eq!(exact.status, RuliadAnswerStatus::SemanticMatch);
+        assert_eq!(contract_exact.status, RuliadAnswerStatus::SemanticMatch);
         assert_eq!(partial.status, RuliadAnswerStatus::Partial);
         assert_eq!(partial.correct_field_count, 1);
         assert_eq!(partial.partial_progress_ppm, SCORE_PPM_DENOMINATOR / 3);

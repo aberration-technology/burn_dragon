@@ -122,6 +122,9 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(summary_memory) = &overrides.summary_memory {
         model_config.summary_memory = summary_memory.clone();
     }
+    if let Some(hierarchical_dragon) = &overrides.hierarchical_dragon {
+        model_config.hierarchical_dragon = hierarchical_dragon.clone();
+    }
     if let Some(latent_reasoning) = &overrides.latent_reasoning {
         model_config.latent_reasoning = latent_reasoning.clone();
     }

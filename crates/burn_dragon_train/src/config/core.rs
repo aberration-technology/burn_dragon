@@ -4,7 +4,8 @@ use burn::module::{Content, ModuleDisplay, ModuleDisplayDefault};
 pub use burn_dragon_core::{
     DragonFiringTargetKind, DragonInitializationKind, DragonNeuronGainKind,
     DragonReservoirInitializationConfig, DragonResidualScalingKind, DragonTopologyPriorKind,
-    GatedDeltaNet2GateMode, GatedDeltaNet2StatePrecision, SequenceKernelConfig,
+    GatedDeltaNet2GateMode, GatedDeltaNet2StatePrecision, HierarchicalDragonSharing,
+    SequenceKernelConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -317,6 +318,16 @@ pub struct ModelSpec {
     pub latent_per_head: usize,
     pub shared_layer_weights: bool,
     pub sequence_kernel: SequenceKernelConfig,
+    #[serde(default)]
+    pub hierarchical_dragon_enabled: bool,
+    #[serde(default)]
+    pub hierarchical_dragon_rho_sharing: HierarchicalDragonSharing,
+    #[serde(default)]
+    pub hierarchical_dragon_weight_sharing: HierarchicalDragonSharing,
+    #[serde(default)]
+    pub hierarchical_dragon_fast_cycles: usize,
+    #[serde(default)]
+    pub hierarchical_dragon_slow_cycles: usize,
     #[serde(default)]
     pub latent_reasoning_enabled: bool,
     #[serde(default)]

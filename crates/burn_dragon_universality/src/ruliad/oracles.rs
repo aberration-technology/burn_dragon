@@ -869,6 +869,14 @@ pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
     compact_answer(spec)
 }
 
+pub fn ruliad_answer_contract(spec: &RuliadSampleSpec) -> String {
+    compact_answer_keys(&compact_answer(spec))
+}
+
+pub fn ruliad_answer_values(spec: &RuliadSampleSpec) -> String {
+    compact_answer_values(&compact_answer(spec))
+}
+
 pub fn ruliad_prompt_prefix(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
     let text = sample_text(spec, oracle_hash);
     if let Some(answer_offset) = text.find("\n!:") {
@@ -888,6 +896,7 @@ struct RuliadProofTapeDocument {
     verifier_version: u32,
     oracle_hash: String,
     query: String,
+    answer_contract: String,
     proof_steps: Vec<String>,
     answer: String,
     data: Vec<String>,
@@ -899,7 +908,7 @@ impl RuliadProofTapeDocument {
         let domains = compact_labels(&self.domains);
         let modes = compact_labels(&self.reasoning_modes);
         let mut out = format!(
-            "[R2 {hash} v{} {}/{}/{}]\nS:{domains}|{modes}\nG:{}\n?:{}\n",
+            "[R2 {hash} v{} {}/{}/{}]\nS:{domains}|{modes}\nG:{}\n?:{}\nA:{}\n",
             self.verifier_version,
             compact_ruliad_label(&self.source_family),
             compact_ruliad_label(&self.task_kind),
@@ -909,7 +918,8 @@ impl RuliadProofTapeDocument {
                 .map(|item| compact_text(item, 96))
                 .collect::<Vec<_>>()
                 .join("|"),
-            self.query
+            self.query,
+            self.answer_contract
         );
         for step in compact_proof_step_runs(&self.proof_steps, 32) {
             out.push_str(&format!(">{}\n", compact_text(&step, 96)));
@@ -963,6 +973,7 @@ fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProo
     let family = family_of_spec(spec);
     let task_kind = task_kind_of_spec(spec);
     let semantics = ruliad_source_semantics(family, task_kind);
+    let answer = compact_answer(spec);
     RuliadProofTapeDocument {
         source_family: view.source_family,
         task_kind: view.task_kind,
@@ -980,8 +991,9 @@ fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProo
         verifier_version: RULIAD_VERIFIER_VERSION,
         oracle_hash: oracle_hash.to_string(),
         query: compact_query(spec),
+        answer_contract: compact_answer_keys(&answer),
         proof_steps: compact_proof_steps(spec),
-        answer: compact_answer(spec),
+        answer: compact_answer_values(&answer),
         data: compact_data(spec),
     }
 }
@@ -1140,6 +1152,38 @@ fn compact_answer(spec: &RuliadSampleSpec) -> String {
         }
         RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("sha={payload_hash}"),
         RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("sha={payload_hash}"),
+    }
+}
+
+fn compact_answer_keys(answer: &str) -> String {
+    let keys = answer
+        .split(';')
+        .filter_map(|part| {
+            let (key, _value) = part.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then_some(compact_ruliad_label(key))
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        "value".to_string()
+    } else {
+        keys.join(",")
+    }
+}
+
+fn compact_answer_values(answer: &str) -> String {
+    let values = answer
+        .split(';')
+        .filter_map(|part| {
+            let (_key, value) = part.split_once('=')?;
+            let value = value.trim();
+            (!value.is_empty()).then_some(value.to_string())
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        answer.trim().to_string()
+    } else {
+        values.join(";")
     }
 }
 
@@ -2866,8 +2910,24 @@ mod tests {
         let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
         let prompt = ruliad_prompt_prefix(&sample.spec, &sample.oracle_hash);
         assert!(prompt.ends_with("!:"));
+        assert!(
+            prompt.contains("\nA:ok,l,r\n"),
+            "prompt should expose answer schema without values: {prompt}"
+        );
         assert!(!prompt.contains("ok=1"));
         assert!(!prompt.contains("[/R2]"));
+    }
+
+    #[test]
+    fn answer_contract_lists_keys_without_values() {
+        assert_eq!(compact_answer_keys("ok=1;l=19;r=19"), "ok,l,r");
+        assert_eq!(compact_answer_keys("sha=abcdef0123456789"), "sha");
+        assert_eq!(compact_answer_keys("bare"), "value");
+        assert_eq!(compact_answer_values("ok=1;l=19;r=19"), "1;19;19");
+        assert_eq!(
+            compact_answer_values("nf=s38:CAB:hc0ee52f513ebc9aa:c14,.."),
+            "s38:CAB:hc0ee52f513ebc9aa:c14,.."
+        );
     }
 
     #[test]
@@ -2943,7 +3003,8 @@ mod tests {
         assert!(report.ok);
         let text = sample_text(&spec, &report.oracle_hash);
         assert!(text.starts_with("[R2 "));
-        assert!(text.contains("\n!:ok=1"));
+        assert!(text.contains("\nA:ok,l,r\n"));
+        assert!(text.contains("\n!:1;"));
         assert!(!text.to_lowercase().contains("pythag"));
     }
 

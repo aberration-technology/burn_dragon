@@ -1,0 +1,11 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-probe128-fixed-ablation.toml"]
+
+[model.hierarchical_dragon]
+enabled = true
+last_layers = 1
+fast_cycles = 2
+slow_cycles = 1
+rho_sharing = "split"
+weight_sharing = "split"
+slow_to_fast_scale = 0.1
+fast_to_slow_scale = 0.1

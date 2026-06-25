@@ -601,6 +601,9 @@ pub fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverride
     if let Some(value) = &incoming.summary_memory {
         base.summary_memory = Some(value.clone());
     }
+    if let Some(value) = &incoming.hierarchical_dragon {
+        base.hierarchical_dragon = Some(value.clone());
+    }
     if let Some(value) = &incoming.latent_reasoning {
         base.latent_reasoning = Some(value.clone());
     }

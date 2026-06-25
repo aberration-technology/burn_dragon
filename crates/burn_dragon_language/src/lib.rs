@@ -106,10 +106,10 @@ pub use config::{
     DatasetConfig, DatasetSourceConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
     HuggingFaceDatasetConfig, HuggingFaceRecordFormat, PredictiveCodingBackwardMode,
     PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, RepromptTruncation, RuliadSupervisionConfig, RuliadSupervisionMode,
-    SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
-    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    load_training_config,
+    PredictiveCodingStateScope, RepromptTruncation, RuliadAnswerDenoisingConfig,
+    RuliadAnswerRankingConfig, RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig,
+    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings, generate_text, generate_tokens,

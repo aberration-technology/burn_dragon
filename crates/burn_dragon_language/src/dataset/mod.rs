@@ -72,6 +72,16 @@ impl Dataset {
         TokenSequenceDataset::source_selection_snapshot(self)
     }
 
+    pub fn record_ruliad_capability_feedback(
+        &self,
+        report: &burn_dragon_universality::RuliadEvalReport,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.record_ruliad_capability_feedback(report),
+        }
+    }
+
     pub fn write_source_selection_state(
         &self,
         path: &std::path::Path,

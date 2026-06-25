@@ -5,15 +5,16 @@ use crate::train::utils::log_theoretical_profile;
 #[cfg(feature = "ddp")]
 use burn::tensor::TensorPrimitive;
 use burn_dragon_train::train::events::{
-    CheckpointEvent, ContinualBackpropSample, DynamicsControlEvent, DynamicsMode,
-    ModelScaleApplied, ModelScaleRequest, ModelScaleSkipped, OutputDegeneracySample,
-    PredictiveCodingSample, StepFinished, StepStarted, TrainingEpochSummary, TrainingEventBus,
-    TrainingGateAction, TrainingGateEvent, TrainingGateSeverity, TrainingMetricSample,
-    TrainingMetricSplit, ValidationFinished,
+    CapabilityProbeExample, CapabilityProbeGroupMetric, CapabilityProbeSample, CheckpointEvent,
+    ContinualBackpropSample, DynamicsControlEvent, DynamicsMode, ModelScaleApplied,
+    ModelScaleRequest, ModelScaleSkipped, OutputDegeneracySample, PredictiveCodingSample,
+    StepFinished, StepStarted, TrainingEpochSummary, TrainingEventBus, TrainingGateAction,
+    TrainingGateEvent, TrainingGateSeverity, TrainingMetricSample, TrainingMetricSplit,
+    ValidationFinished,
 };
-use std::collections::BTreeSet;
 #[cfg(feature = "ddp")]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 #[cfg(feature = "ddp")]
 use std::marker::PhantomData;
@@ -33,6 +34,9 @@ struct ContinualLearningStabilityState {
     consecutive_validation_regressions: usize,
     consecutive_output_degeneracy: usize,
     consecutive_ruliad_correctness_regressions: usize,
+    first_capability_pass_epoch: Option<usize>,
+    last_capability_pass_epoch: Option<usize>,
+    consecutive_capability_gate_failures: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -99,6 +103,98 @@ fn ruliad_competence_score(report: &burn_dragon_universality::RuliadEvalReport) 
         + f64::from(key.completion_health_ppm)
 }
 
+fn ruliad_capability_rates(
+    report: &burn_dragon_universality::RuliadEvalReport,
+) -> (f64, f64, f64, f64) {
+    let item_count = report.item_count.max(1) as f64;
+    let schema_wrong_rate = report.schema_valid_wrong_count as f64 / item_count;
+    let malformed_rate = report.malformed_completion_count as f64 / item_count;
+    let missing_rate = report.missing_completion_count as f64 / item_count;
+    let unhealthy_count = report
+        .schema_valid_wrong_count
+        .saturating_add(report.malformed_completion_count)
+        .saturating_add(report.missing_completion_count)
+        .min(report.item_count);
+    let completion_health_rate = if report.item_count == 0 {
+        0.0
+    } else {
+        report.item_count.saturating_sub(unhealthy_count) as f64 / report.item_count as f64
+    };
+    (
+        schema_wrong_rate,
+        malformed_rate,
+        missing_rate,
+        completion_health_rate,
+    )
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RuliadCapabilityGateStatus {
+    passed: bool,
+    reasons: Vec<String>,
+}
+
+fn ruliad_capability_gate_status(
+    report: &burn_dragon_universality::RuliadEvalReport,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    gates: &burn_dragon_train::TrainingGatesConfig,
+) -> RuliadCapabilityGateStatus {
+    if !gates.enabled {
+        return RuliadCapabilityGateStatus {
+            passed: true,
+            reasons: Vec::new(),
+        };
+    }
+    let mut reasons = Vec::new();
+    if report.item_count == 0 || report.scored_count == 0 {
+        reasons.push("no_scored_ruliad_items".to_string());
+    }
+    let (schema_wrong_rate, malformed_rate, missing_rate, completion_health_rate) =
+        ruliad_capability_rates(report);
+    if schema_wrong_rate > gates.capability_schema_wrong_max_rate {
+        reasons.push(format!(
+            "schema_wrong_rate={schema_wrong_rate:.3}>{:.3}",
+            gates.capability_schema_wrong_max_rate
+        ));
+    }
+    if malformed_rate > gates.capability_malformed_max_rate {
+        reasons.push(format!(
+            "malformed_rate={malformed_rate:.3}>{:.3}",
+            gates.capability_malformed_max_rate
+        ));
+    }
+    if missing_rate > gates.capability_missing_max_rate {
+        reasons.push(format!(
+            "missing_rate={missing_rate:.3}>{:.3}",
+            gates.capability_missing_max_rate
+        ));
+    }
+    if completion_health_rate < gates.capability_completion_health_min_rate {
+        reasons.push(format!(
+            "completion_health={completion_health_rate:.3}<{}",
+            gates.capability_completion_health_min_rate
+        ));
+    }
+    if let Some(stats) = output_degeneracy {
+        if stats.entropy_bits < gates.capability_output_entropy_min_bits {
+            reasons.push(format!(
+                "output_entropy_bits={:.3}<{}",
+                stats.entropy_bits, gates.capability_output_entropy_min_bits
+            ));
+        }
+        if stats.distinct_2_fraction < gates.capability_distinct_2_min_fraction {
+            reasons.push(format!(
+                "output_distinct2={:.3}<{}",
+                stats.distinct_2_fraction, gates.capability_distinct_2_min_fraction
+            ));
+        }
+    }
+    RuliadCapabilityGateStatus {
+        passed: reasons.is_empty(),
+        reasons,
+    }
+}
+
 fn validation_ruliad_correctness_improved(
     validation: &DynamicValidationReport,
     state: &ContinualLearningStabilityState,
@@ -136,6 +232,125 @@ fn ruliad_metric_materially_regressed(
     current + tolerance < best && current < best * 0.90
 }
 
+fn update_capability_run_control_state<B>(
+    env: &TrainEnvironment<'_, B>,
+    report: &burn_dragon_universality::RuliadEvalReport,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    epoch: usize,
+    absolute_step: usize,
+    state: &mut ContinualLearningStabilityState,
+    bus: &TrainingEventBus,
+    recovery_requested: &mut bool,
+) where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let gates = &env.training.gates;
+    if !gates.enabled {
+        return;
+    }
+    let status = ruliad_capability_gate_status(report, output_degeneracy, gates);
+    if status.passed {
+        if state.first_capability_pass_epoch.is_none() {
+            state.first_capability_pass_epoch = Some(epoch);
+            emit_policy_gate_with_action(
+                env,
+                bus,
+                "continual_learning_capability_gate_first_pass",
+                TrainingGateAction::Alert,
+                TrainingGateSeverity::Info,
+                epoch,
+                absolute_step,
+                "ruliad capability gate passed for the first time; capability-gated auxiliaries and regression tracking may open".to_string(),
+            );
+        }
+        state.last_capability_pass_epoch = Some(epoch);
+        state.consecutive_capability_gate_failures = 0;
+        return;
+    }
+
+    let reasons = status.reasons.join(", ");
+    let before_grace =
+        state.first_capability_pass_epoch.is_none() && epoch <= gates.capability_grace_epochs;
+    if before_grace {
+        emit_policy_gate_with_action(
+            env,
+            bus,
+            "continual_learning_capability_gate_grace",
+            TrainingGateAction::Alert,
+            TrainingGateSeverity::Info,
+            epoch,
+            absolute_step,
+            format!(
+                "ruliad capability gate has not passed during grace window epoch {epoch}/{}: {reasons}",
+                gates.capability_grace_epochs
+            ),
+        );
+        return;
+    }
+
+    let require_failure_recovery =
+        !gates.capability_required_after_first_pass || state.first_capability_pass_epoch.is_some();
+    if !require_failure_recovery {
+        emit_policy_gate_with_action(
+            env,
+            bus,
+            "continual_learning_capability_gate_not_ready",
+            TrainingGateAction::Alert,
+            TrainingGateSeverity::Warning,
+            epoch,
+            absolute_step,
+            format!("ruliad capability gate still has not passed: {reasons}"),
+        );
+        return;
+    }
+
+    state.consecutive_capability_gate_failures =
+        state.consecutive_capability_gate_failures.saturating_add(1);
+    let failures = state.consecutive_capability_gate_failures;
+    emit_policy_gate_with_action(
+        env,
+        bus,
+        "continual_learning_capability_gate_regression",
+        TrainingGateAction::Alert,
+        TrainingGateSeverity::Warning,
+        epoch,
+        absolute_step,
+        format!(
+            "ruliad capability gate failed after capability was required ({failures}/{}): {reasons}",
+            gates.capability_regression_patience_epochs
+        ),
+    );
+    if failures < gates.capability_regression_patience_epochs || *recovery_requested {
+        return;
+    }
+
+    let rollback_epoch = state.best_checkpoint_epoch;
+    let mode = if rollback_epoch.is_some() {
+        DynamicsMode::RollbackRecovery
+    } else {
+        DynamicsMode::ValidationRecovery
+    };
+    let message = format!(
+        "ruliad capability regression persisted for {failures} validation epochs; requesting {:?}{}",
+        mode,
+        rollback_epoch
+            .map(|epoch| format!(" to checkpoint epoch {epoch}"))
+            .unwrap_or_default()
+    );
+    emit_dynamics_control(
+        env,
+        bus,
+        &env.training.dynamics,
+        mode,
+        epoch,
+        absolute_step,
+        rollback_epoch,
+        message,
+    );
+    *recovery_requested = true;
+}
+
 fn should_promote_checkpoint(
     validation: &DynamicValidationReport,
     best_loss: Option<f64>,
@@ -150,6 +365,12 @@ fn should_promote_checkpoint(
     else {
         return loss_improved;
     };
+    if let Some(report) = validation.ruliad_eval_report.as_ref()
+        && !ruliad_capability_gate_status(report, validation.output_degeneracy.as_ref(), gates)
+            .passed
+    {
+        return false;
+    }
     let Some(best_competence) = best_competence else {
         return true;
     };
@@ -2208,10 +2429,15 @@ where
     let mut total = 0.0;
     let mut count = 0usize;
     let mut output_degeneracy = None;
+    let mut latent_eval_sweep_emitted = false;
     let probe_enabled = epoch.is_multiple_of(env.training.events.degeneracy_probe_every_epochs);
     let probe_absolute_step = epoch.saturating_mul(steps_per_epoch).saturating_sub(1);
     while let Some(item) = iterator.next() {
-        let (loss_tensor, degeneracy) = if probe_enabled && output_degeneracy.is_none() {
+        let eval_sweep_enabled =
+            !latent_eval_sweep_emitted && !latent_eval_step_sweep(env.training).is_empty();
+        let degeneracy_probe_enabled = probe_enabled && output_degeneracy.is_none();
+        let item_for_eval_sweep = item.clone();
+        let (loss_tensor, degeneracy) = if degeneracy_probe_enabled {
             valid_model.validation_loss_and_output_degeneracy(
                 item,
                 env.training.events.degeneracy_probe_tokens,
@@ -2232,6 +2458,21 @@ where
         if let Some(degeneracy) = degeneracy {
             emit_output_degeneracy(env, epoch, probe_absolute_step, &degeneracy, bus);
             output_degeneracy = Some(degeneracy);
+        }
+        if eval_sweep_enabled {
+            emit_latent_eval_step_validation_sweep(
+                env.run_name,
+                env.training,
+                env.source_selection_dataset.as_ref(),
+                epoch,
+                probe_absolute_step,
+                &valid_model,
+                item_for_eval_sweep,
+                dataset_eos_id(env.source_selection_dataset.as_ref()),
+                degeneracy_probe_enabled,
+                bus,
+            );
+            latent_eval_sweep_emitted = true;
         }
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: env.run_name.to_string(),
@@ -2287,8 +2528,32 @@ where
         epoch,
         steps_per_epoch,
         env.device,
+        output_degeneracy.as_ref(),
         bus,
     )?;
+    if let Some(report) = ruliad_eval_report.as_ref() {
+        let capability_gate = emit_ruliad_capability_gate_metrics(
+            env.run_name,
+            epoch,
+            epoch.saturating_mul(steps_per_epoch).saturating_sub(1),
+            report,
+            output_degeneracy.as_ref(),
+            &env.training.gates,
+            bus,
+        );
+        if capability_gate.passed {
+            model.set_latent_reasoning_capability_gate_open(true);
+        }
+        if env.training.events.source_selection_capability_feedback {
+            emit_source_selection_capability_feedback_sample(
+                env.run_name,
+                env.source_selection_dataset.as_ref(),
+                epoch.saturating_mul(steps_per_epoch).saturating_sub(1),
+                report,
+                bus,
+            );
+        }
+    }
     let stream_warm_loss = if env.training.tbptt_persist_across_steps {
         run_stream_warm_validation(env, model, epoch, steps_per_epoch, batch_size, bus)?
     } else {
@@ -2410,10 +2675,15 @@ where
     let mut total = 0.0;
     let mut count = 0usize;
     let mut output_degeneracy = None;
+    let mut latent_eval_sweep_emitted = false;
     let probe_enabled = epoch.is_multiple_of(env.training.events.degeneracy_probe_every_epochs);
     let probe_absolute_step = epoch.saturating_mul(steps_per_epoch).saturating_sub(1);
     while let Some(item) = iterator.next() {
-        let (loss_tensor, degeneracy) = if probe_enabled && output_degeneracy.is_none() {
+        let eval_sweep_enabled =
+            !latent_eval_sweep_emitted && !latent_eval_step_sweep(env.training).is_empty();
+        let degeneracy_probe_enabled = probe_enabled && output_degeneracy.is_none();
+        let item_for_eval_sweep = item.clone();
+        let (loss_tensor, degeneracy) = if degeneracy_probe_enabled {
             model.validation_loss_and_output_degeneracy(
                 item,
                 env.training.events.degeneracy_probe_tokens,
@@ -2441,6 +2711,21 @@ where
                 bus,
             );
             output_degeneracy = Some(degeneracy);
+        }
+        if eval_sweep_enabled {
+            emit_latent_eval_step_validation_sweep(
+                env.run_name,
+                env.training,
+                env.source_selection_dataset.as_ref(),
+                epoch,
+                probe_absolute_step,
+                model,
+                item_for_eval_sweep,
+                dataset_eos_id(env.source_selection_dataset.as_ref()),
+                degeneracy_probe_enabled,
+                bus,
+            );
+            latent_eval_sweep_emitted = true;
         }
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: env.run_name.to_string(),
@@ -2478,8 +2763,32 @@ where
         epoch,
         steps_per_epoch,
         env.device,
+        output_degeneracy.as_ref(),
         bus,
     )?;
+    if let Some(report) = ruliad_eval_report.as_ref() {
+        let capability_gate = emit_ruliad_capability_gate_metrics(
+            env.run_name,
+            epoch,
+            epoch.saturating_mul(steps_per_epoch).saturating_sub(1),
+            report,
+            output_degeneracy.as_ref(),
+            &env.training.gates,
+            bus,
+        );
+        if capability_gate.passed {
+            model.set_latent_reasoning_capability_gate_open(true);
+        }
+        if env.training.events.source_selection_capability_feedback {
+            emit_source_selection_capability_feedback_sample(
+                env.run_name,
+                env.source_selection_dataset.as_ref(),
+                epoch.saturating_mul(steps_per_epoch).saturating_sub(1),
+                report,
+                bus,
+            );
+        }
+    }
     if let Some(source_weighted_loss) = source_weighted_loss {
         let delta = source_weighted_loss - mean;
         let ratio = if mean.abs() <= f64::EPSILON {
@@ -2525,6 +2834,268 @@ where
         output_degeneracy,
         ruliad_eval_report,
     })
+}
+
+fn latent_eval_step_sweep(training: &TrainingHyperparameters) -> Vec<usize> {
+    let mut steps = training
+        .latent_reasoning
+        .eval_step_sweep
+        .iter()
+        .copied()
+        .filter(|steps| *steps > 0)
+        .collect::<BTreeSet<_>>();
+    steps.retain(|steps| *steps > 0);
+    steps.into_iter().collect()
+}
+
+fn model_with_fixed_latent_eval_steps<B>(
+    model: &LanguageTrainModel<B>,
+    steps: usize,
+) -> LanguageTrainModel<B>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    model
+        .clone()
+        .map_model(|model| model.with_fixed_latent_reasoning_steps(steps))
+}
+
+fn emit_latent_eval_step_validation_sweep<B>(
+    run_name: &str,
+    training: &TrainingHyperparameters,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    epoch: usize,
+    absolute_step: usize,
+    model: &LanguageTrainModel<B>,
+    batch: SequenceBatch<B>,
+    eos_id: Option<i64>,
+    include_degeneracy: bool,
+    bus: &TrainingEventBus,
+) where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    if !model.model.latent_reasoning_enabled() {
+        return;
+    }
+    for steps in latent_eval_step_sweep(training) {
+        let eval_model = model_with_fixed_latent_eval_steps(model, steps);
+        let probe_tokens = if include_degeneracy {
+            training.events.degeneracy_probe_tokens
+        } else {
+            0
+        };
+        let (loss, degeneracy) =
+            eval_model.validation_loss_and_output_degeneracy(batch.clone(), probe_tokens, eos_id);
+        let loss = mean_scalar_from_loss(loss);
+        let prefix = format!("Latent Eval Steps {steps}");
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: 0,
+            absolute_step,
+            name: format!("{prefix} Teacher Forced CE"),
+            value: loss,
+            running_value: loss,
+        });
+        if let Some(degeneracy) = degeneracy {
+            emit_output_degeneracy_sample_with_prefix(
+                run_name,
+                source_selection_dataset,
+                epoch,
+                absolute_step,
+                &degeneracy,
+                bus,
+                Some(&prefix),
+            );
+        }
+        if let Some(diagnostics) = eval_model.latent_reasoning_step_diagnostics(batch.clone()) {
+            emit_latent_reasoning_step_diagnostics(
+                run_name,
+                epoch,
+                absolute_step,
+                steps,
+                &diagnostics,
+                bus,
+            );
+        }
+    }
+}
+
+fn emit_latent_reasoning_step_diagnostics(
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    steps: usize,
+    diagnostics: &crate::train::steps::LatentReasoningStepDiagnostics,
+    bus: &TrainingEventBus,
+) {
+    let prefix = format!("Latent Eval Steps {steps}");
+    for (name, value) in [
+        ("Raw Hidden CE", diagnostics.raw_loss),
+        ("Final Hidden CE", diagnostics.final_loss),
+        ("Raw Hidden Entropy Bits", diagnostics.raw_entropy_bits),
+        ("Final Hidden Entropy Bits", diagnostics.final_entropy_bits),
+        ("Final Delta RMS", diagnostics.final_delta_rms),
+        ("Final Raw Cosine", diagnostics.final_raw_cosine),
+        (
+            "Best Energy Step",
+            diagnostics.best_energy_step.unwrap_or(0) as f64,
+        ),
+    ] {
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: 0,
+            absolute_step,
+            name: format!("{prefix} {name}"),
+            value,
+            running_value: value,
+        });
+    }
+    for (index, value) in diagnostics.step_loss.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "CE",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_ce_delta.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "CE Delta",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics
+        .step_ce_monotonic_violation_rate
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "CE Monotonic Violation Rate",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_entropy_bits.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Entropy Bits",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_delta_rms.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Delta RMS",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_raw_cosine.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Raw Cosine",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_energy_mean.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Energy Mean",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics.step_energy_delta.iter().copied().enumerate() {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Energy Delta",
+            value,
+            bus,
+        );
+    }
+    for (index, value) in diagnostics
+        .step_energy_monotonic_violation_rate
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        emit_latent_step_metric(
+            run_name,
+            epoch,
+            absolute_step,
+            &prefix,
+            index,
+            "Energy Monotonic Violation Rate",
+            value,
+            bus,
+        );
+    }
+}
+
+fn emit_latent_step_metric(
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    prefix: &str,
+    index: usize,
+    suffix: &str,
+    value: f64,
+    bus: &TrainingEventBus,
+) {
+    let _ = bus.send_metric_sample(TrainingMetricSample {
+        run_id: run_name.to_string(),
+        split: TrainingMetricSplit::Valid,
+        epoch,
+        step_in_epoch: 0,
+        absolute_step,
+        name: format!("{prefix} Step {} {suffix}", index.saturating_add(1)),
+        value,
+        running_value: value,
+    });
 }
 
 fn run_source_weighted_validation<B>(
@@ -2592,6 +3163,7 @@ fn run_ruliad_correctness_validation<B>(
     epoch: usize,
     steps_per_epoch: usize,
     device: &B::Device,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
     bus: &TrainingEventBus,
 ) -> Result<Option<burn_dragon_universality::RuliadEvalReport>>
 where
@@ -2621,6 +3193,67 @@ where
         return Ok(None);
     }
 
+    let base_report = run_ruliad_correctness_validation_for_items(
+        run_name,
+        dataset,
+        model,
+        epoch,
+        base_absolute_step,
+        device,
+        training,
+        &probe_items,
+        "ruliad_validation_probe",
+        "ruliad_correctness",
+        None,
+        output_degeneracy,
+        bus,
+    )?;
+    if model.model.latent_reasoning_enabled() {
+        for steps in latent_eval_step_sweep(training) {
+            let eval_model = model_with_fixed_latent_eval_steps(model, steps);
+            let metric_prefix = format!("Ruliad Eval Steps {steps}");
+            let probe_name = format!("ruliad_correctness_eval_steps_{steps}");
+            let _ = run_ruliad_correctness_validation_for_items(
+                run_name,
+                dataset,
+                &eval_model,
+                epoch,
+                base_absolute_step,
+                device,
+                training,
+                &probe_items,
+                "ruliad_validation_probe",
+                &probe_name,
+                Some(&metric_prefix),
+                None,
+                bus,
+            )?;
+        }
+    }
+    Ok(Some(base_report))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ruliad_correctness_validation_for_items<B>(
+    run_name: &str,
+    dataset: &Dataset,
+    model: &LanguageTrainModel<B>,
+    epoch: usize,
+    absolute_step: usize,
+    device: &B::Device,
+    training: &TrainingHyperparameters,
+    probe_items: &[crate::dataset::RuliadValidationProbeItem],
+    dataset_name: &str,
+    probe_name: &str,
+    metric_prefix: Option<&str>,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    bus: &TrainingEventBus,
+) -> Result<burn_dragon_universality::RuliadEvalReport>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let max_new_tokens = training.events.ruliad_correctness_probe_tokens;
     let mut items = Vec::with_capacity(probe_items.len());
     let mut completions = Vec::with_capacity(probe_items.len());
     let generation_settings = crate::generation::GenerationSettings {
@@ -2633,7 +3266,7 @@ where
         ),
     };
 
-    for probe in probe_items {
+    for probe in probe_items.iter().cloned() {
         let prompt_len = probe.prompt_tokens.len();
         let full_tokens = crate::generation::generate_tokens(
             &model.model,
@@ -2656,13 +3289,139 @@ where
         items.push(probe.item);
     }
 
-    let report = burn_dragon_universality::evaluate_completions(
-        "ruliad_validation_probe",
+    let report = burn_dragon_universality::evaluate_completions(dataset_name, &items, &completions);
+    let schema_alignment = ruliad_answer_schema_alignment_summary(&items, &completions);
+    let examples = ruliad_probe_examples(
         &items,
         &completions,
+        training.events.capability_probe_example_count,
     );
-    emit_ruliad_correctness_metrics(run_name, epoch, base_absolute_step, &report, bus);
-    Ok(Some(report))
+    emit_ruliad_correctness_metrics_with_labels(
+        run_name,
+        epoch,
+        absolute_step,
+        &report,
+        bus,
+        probe_name,
+        metric_prefix,
+        output_degeneracy,
+        &examples,
+        schema_alignment,
+    );
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RuliadAnswerSchemaAlignmentSummary {
+    key_match_rate: f64,
+    mean_key_overlap: f64,
+}
+
+fn ruliad_answer_schema_alignment_summary(
+    items: &[burn_dragon_universality::RuliadEvalItem],
+    completions: &[burn_dragon_universality::RuliadCompletionRecord],
+) -> RuliadAnswerSchemaAlignmentSummary {
+    if items.is_empty() {
+        return RuliadAnswerSchemaAlignmentSummary::default();
+    }
+    let completion_by_hash = completions
+        .iter()
+        .map(|completion| {
+            (
+                completion.oracle_hash.as_str(),
+                completion.completion.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut exact_matches = 0usize;
+    let mut overlap_ppm_sum = 0usize;
+    for item in items {
+        let answer = completion_by_hash
+            .get(item.oracle_hash.as_str())
+            .copied()
+            .and_then(burn_dragon_universality::ruliad::extract_ruliad_answer);
+        let alignment = burn_dragon_universality::ruliad::ruliad_answer_key_alignment(
+            &item.expected_answer,
+            answer.as_deref(),
+        );
+        exact_matches += usize::from(alignment.exact_key_match);
+        overlap_ppm_sum = overlap_ppm_sum.saturating_add(alignment.overlap_ppm);
+    }
+    let item_count = items.len().max(1) as f64;
+    RuliadAnswerSchemaAlignmentSummary {
+        key_match_rate: exact_matches as f64 / item_count,
+        mean_key_overlap: overlap_ppm_sum as f64 / (item_count * 1_000_000.0),
+    }
+}
+
+fn ruliad_probe_examples(
+    items: &[burn_dragon_universality::RuliadEvalItem],
+    completions: &[burn_dragon_universality::RuliadCompletionRecord],
+    limit: usize,
+) -> Vec<CapabilityProbeExample> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let completion_by_hash = completions
+        .iter()
+        .map(|completion| {
+            (
+                completion.oracle_hash.as_str(),
+                completion.completion.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut examples = Vec::with_capacity(limit.min(items.len()));
+    for item in items {
+        let completion = completion_by_hash.get(item.oracle_hash.as_str()).copied();
+        let score =
+            burn_dragon_universality::ruliad::score_ruliad_item_completion(item, completion);
+        if score.verifier_match() {
+            continue;
+        }
+        let extracted = completion.map(burn_dragon_universality::ruliad::extract_ruliad_completion);
+        let actual = extracted
+            .as_ref()
+            .and_then(|completion| completion.answer.clone());
+        examples.push(CapabilityProbeExample {
+            label: format!("{}:{}", item.family, item.task_kind),
+            prompt: compact_probe_example_text(&item.prompt, 512),
+            expected: compact_probe_example_text(&item.expected_answer, 256),
+            actual: actual.map(|answer| compact_probe_example_text(&answer, 256)),
+            completion: compact_probe_example_text(completion.unwrap_or_default(), 512),
+            status: format!("{:?}", score.status),
+            reason: if completion.is_none() {
+                "missing_completion".to_string()
+            } else if extracted
+                .as_ref()
+                .is_none_or(|completion| completion.answer.is_none())
+            {
+                "malformed_completion".to_string()
+            } else {
+                "answer_mismatch".to_string()
+            },
+            generated_tokens: extracted
+                .as_ref()
+                .map(|completion| completion.generated_token_count)
+                .unwrap_or_default(),
+        });
+        if examples.len() >= limit {
+            break;
+        }
+    }
+    examples
+}
+
+fn compact_probe_example_text(text: &str, max_chars: usize) -> String {
+    let mut compact = text.replace('\r', "\\r").replace('\n', "\\n");
+    let char_count = compact.chars().count();
+    if char_count <= max_chars {
+        return compact;
+    }
+    let keep = max_chars.saturating_sub(3);
+    compact = compact.chars().take(keep).collect();
+    compact.push_str("...");
+    compact
 }
 
 fn emit_ruliad_correctness_metrics(
@@ -2671,6 +3430,32 @@ fn emit_ruliad_correctness_metrics(
     absolute_step: usize,
     report: &burn_dragon_universality::RuliadEvalReport,
     bus: &TrainingEventBus,
+) {
+    emit_ruliad_correctness_metrics_with_labels(
+        run_name,
+        epoch,
+        absolute_step,
+        report,
+        bus,
+        "ruliad_correctness",
+        None,
+        None,
+        &[],
+        RuliadAnswerSchemaAlignmentSummary::default(),
+    );
+}
+
+fn emit_ruliad_correctness_metrics_with_labels(
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    report: &burn_dragon_universality::RuliadEvalReport,
+    bus: &TrainingEventBus,
+    probe_name: &str,
+    metric_prefix: Option<&str>,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    examples: &[CapabilityProbeExample],
+    schema_alignment: RuliadAnswerSchemaAlignmentSummary,
 ) {
     let item_count = report.item_count.max(1) as f64;
     let competence = ruliad_competence_key(report).unwrap_or_default();
@@ -2735,8 +3520,67 @@ fn emit_ruliad_correctness_metrics(
             "Ruliad Mean Completion Tokens",
             f64::from(report.mean_completion_tokens),
         ),
+        (
+            "Ruliad Answer Key Match Rate",
+            schema_alignment.key_match_rate,
+        ),
+        (
+            "Ruliad Answer Key Overlap",
+            schema_alignment.mean_key_overlap,
+        ),
     ];
     for (name, value) in metrics {
+        let metric_name = metric_prefix
+            .map(|prefix| format!("{prefix} {name}"))
+            .unwrap_or_else(|| name.to_string());
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: 0,
+            absolute_step,
+            name: metric_name,
+            value,
+            running_value: value,
+        });
+    }
+    let _ = bus.send_capability_probe_sample(ruliad_capability_probe_sample(
+        run_name,
+        epoch,
+        absolute_step,
+        report,
+        competence,
+        probe_name,
+        output_degeneracy,
+        examples,
+    ));
+}
+
+fn emit_ruliad_capability_gate_metrics(
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    report: &burn_dragon_universality::RuliadEvalReport,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    gates: &burn_dragon_train::TrainingGatesConfig,
+    bus: &TrainingEventBus,
+) -> RuliadCapabilityGateStatus {
+    let status = ruliad_capability_gate_status(report, output_degeneracy, gates);
+    let (_, _, _, completion_health_rate) = ruliad_capability_rates(report);
+    for (name, value) in [
+        (
+            "Ruliad Capability Gate Passed",
+            if status.passed { 1.0 } else { 0.0 },
+        ),
+        (
+            "Ruliad Capability Gate Failure Count",
+            status.reasons.len() as f64,
+        ),
+        (
+            "Ruliad Capability Completion Health Rate",
+            completion_health_rate,
+        ),
+    ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: run_name.to_string(),
             split: TrainingMetricSplit::Valid,
@@ -2748,6 +3592,104 @@ fn emit_ruliad_correctness_metrics(
             running_value: value,
         });
     }
+    if gates.enabled && !status.passed {
+        let _ = bus.send_gate_event(TrainingGateEvent {
+            run_id: run_name.to_string(),
+            gate: "ruliad_capability_gate_failed".to_string(),
+            action: TrainingGateAction::Alert,
+            severity: TrainingGateSeverity::Warning,
+            epoch: Some(epoch),
+            absolute_step: Some(absolute_step),
+            message: format!(
+                "ruliad capability gate failed: {}",
+                status.reasons.join(", ")
+            ),
+        });
+    }
+    status
+}
+
+fn ruliad_capability_probe_sample(
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    report: &burn_dragon_universality::RuliadEvalReport,
+    competence: RuliadCompetenceKey,
+    probe_name: &str,
+    output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
+    examples: &[CapabilityProbeExample],
+) -> CapabilityProbeSample {
+    let item_count = report.item_count.max(1) as f64;
+    let mut group_buckets = Vec::new();
+    extend_ruliad_capability_groups(&mut group_buckets, "difficulty", &report.difficulty_scores);
+    extend_ruliad_capability_groups(&mut group_buckets, "family", &report.family_scores);
+    extend_ruliad_capability_groups(&mut group_buckets, "task", &report.task_scores);
+    extend_ruliad_capability_groups(&mut group_buckets, "domain", &report.math_domain_scores);
+    extend_ruliad_capability_groups(&mut group_buckets, "mode", &report.reasoning_mode_scores);
+
+    CapabilityProbeSample {
+        run_id: run_name.to_string(),
+        split: TrainingMetricSplit::Valid,
+        epoch,
+        absolute_step,
+        probe_name: probe_name.to_string(),
+        item_count: report.item_count,
+        scored_count: report.scored_count,
+        exact_rate: f64::from(report.exact_accuracy),
+        semantic_rate: f64::from(report.semantic_accuracy),
+        verifier_rate: f64::from(report.verifier_accuracy),
+        partial_credit_rate: f64::from(report.partial_credit_rate),
+        schema_valid_wrong_rate: report.schema_valid_wrong_count as f64 / item_count,
+        malformed_rate: report.malformed_completion_count as f64 / item_count,
+        missing_rate: report.missing_completion_count as f64 / item_count,
+        certificate_rate: f64::from(competence.certificate_ppm) / 1_000_000.0,
+        completion_health_rate: f64::from(competence.completion_health_ppm) / 1_000_000.0,
+        mean_partial_progress: f64::from(report.mean_partial_progress),
+        mean_completion_tokens: f64::from(report.mean_completion_tokens),
+        achieved_difficulty_level: ruliad_achieved_verifier_difficulty(report),
+        output_entropy_bits: output_degeneracy.map(|stats| stats.entropy_bits),
+        output_distinct_2_fraction: output_degeneracy.map(|stats| stats.distinct_2_fraction),
+        group_buckets,
+        examples: examples.to_vec(),
+    }
+}
+
+fn extend_ruliad_capability_groups(
+    output: &mut Vec<CapabilityProbeGroupMetric>,
+    prefix: &str,
+    groups: &[burn_dragon_universality::RuliadEvalGroupScore],
+) {
+    output.extend(groups.iter().map(|group| CapabilityProbeGroupMetric {
+        label: format!("{prefix}:{}", group.label),
+        item_count: group.count,
+        exact_rate: f64::from(group.exact_accuracy),
+        semantic_rate: f64::from(group.semantic_accuracy),
+        verifier_rate: f64::from(group.verifier_accuracy),
+        partial_credit_rate: f64::from(group.partial_credit_rate),
+        schema_valid_wrong_rate: ratio_usize(group.schema_valid_wrong_count, group.count),
+        malformed_rate: ratio_usize(group.malformed_completion_count, group.count),
+        missing_rate: ratio_usize(group.missing_completion_count, group.count),
+        mean_partial_progress: f64::from(group.mean_partial_progress),
+    }));
+}
+
+fn ratio_usize(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn ruliad_achieved_verifier_difficulty(
+    report: &burn_dragon_universality::RuliadEvalReport,
+) -> Option<usize> {
+    report
+        .difficulty_scores
+        .iter()
+        .filter(|group| group.verifier_accuracy > 0.0)
+        .filter_map(|group| group.label.strip_prefix('d')?.parse::<usize>().ok())
+        .max()
 }
 
 fn run_source_weighted_validation_forward_only<B>(
@@ -2888,6 +3830,29 @@ fn emit_source_selection_telemetry_sample(
     );
 }
 
+fn emit_source_selection_capability_feedback_sample(
+    run_name: &str,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    absolute_step: usize,
+    report: &burn_dragon_universality::RuliadEvalReport,
+    bus: &TrainingEventBus,
+) {
+    let Some(dataset) = source_selection_dataset else {
+        return;
+    };
+    let Some(snapshot) = dataset.record_ruliad_capability_feedback(report) else {
+        return;
+    };
+    let _ = bus.send_source_selection_sample(
+        crate::train::events::source_selection_sample_from_snapshot(
+            run_name.to_string(),
+            absolute_step,
+            None,
+            &snapshot,
+        ),
+    );
+}
+
 fn emit_output_degeneracy<B>(
     env: &TrainEnvironment<'_, B>,
     epoch: usize,
@@ -2916,26 +3881,48 @@ fn emit_output_degeneracy_sample(
     stats: &crate::train::steps::OutputDegeneracyStats,
     bus: &TrainingEventBus,
 ) {
-    let _ = bus.send_output_degeneracy_sample(OutputDegeneracySample {
-        run_id: run_name.to_string(),
-        split: TrainingMetricSplit::Valid,
+    emit_output_degeneracy_sample_with_prefix(
+        run_name,
+        source_selection_dataset,
         epoch,
         absolute_step,
-        token_count: stats.token_count,
-        entropy_bits: stats.entropy_bits,
-        mean_max_probability: stats.mean_max_probability,
-        argmax_unique_fraction: stats.argmax_unique_fraction,
-        eos_fraction: stats.eos_fraction,
-        repetition_fraction: stats.repetition_fraction,
-        distinct_1_fraction: stats.distinct_1_fraction,
-        distinct_2_fraction: stats.distinct_2_fraction,
-        period_2_fraction: stats.period_2_fraction,
-        period_3_fraction: stats.period_3_fraction,
-        max_period_2_to_16_fraction: stats.max_period_2_to_16_fraction,
-        max_period_2_to_64_fraction: stats.max_period_2_to_64_fraction,
-        dominant_period_2_to_64: stats.dominant_period_2_to_64,
-        generated_preview: decode_degeneracy_preview(source_selection_dataset, stats),
-    });
+        stats,
+        bus,
+        None,
+    );
+}
+
+fn emit_output_degeneracy_sample_with_prefix(
+    run_name: &str,
+    source_selection_dataset: Option<&Arc<Dataset>>,
+    epoch: usize,
+    absolute_step: usize,
+    stats: &crate::train::steps::OutputDegeneracyStats,
+    bus: &TrainingEventBus,
+    metric_prefix: Option<&str>,
+) {
+    if metric_prefix.is_none() {
+        let _ = bus.send_output_degeneracy_sample(OutputDegeneracySample {
+            run_id: run_name.to_string(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            absolute_step,
+            token_count: stats.token_count,
+            entropy_bits: stats.entropy_bits,
+            mean_max_probability: stats.mean_max_probability,
+            argmax_unique_fraction: stats.argmax_unique_fraction,
+            eos_fraction: stats.eos_fraction,
+            repetition_fraction: stats.repetition_fraction,
+            distinct_1_fraction: stats.distinct_1_fraction,
+            distinct_2_fraction: stats.distinct_2_fraction,
+            period_2_fraction: stats.period_2_fraction,
+            period_3_fraction: stats.period_3_fraction,
+            max_period_2_to_16_fraction: stats.max_period_2_to_16_fraction,
+            max_period_2_to_64_fraction: stats.max_period_2_to_64_fraction,
+            dominant_period_2_to_64: stats.dominant_period_2_to_64,
+            generated_preview: decode_degeneracy_preview(source_selection_dataset, stats),
+        });
+    }
     for (name, value) in [
         ("Output Entropy Bits", stats.entropy_bits),
         ("Output Mean Max Probability", stats.mean_max_probability),
@@ -2958,13 +3945,16 @@ fn emit_output_degeneracy_sample(
             stats.max_period_2_to_64_fraction,
         ),
     ] {
+        let metric_name = metric_prefix
+            .map(|prefix| format!("{prefix} {name}"))
+            .unwrap_or_else(|| name.to_string());
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: run_name.to_string(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
             absolute_step,
-            name: name.to_string(),
+            name: metric_name,
             value,
             running_value: value,
         });
@@ -3177,6 +4167,14 @@ fn emit_latent_reasoning_telemetry<B>(
         (
             "Latent Reasoning JEPA Components",
             Some(snapshot.jepa_components as f64),
+        ),
+        (
+            "Latent Reasoning Energy Model Components",
+            Some(snapshot.energy_model_components as f64),
+        ),
+        (
+            "Latent Reasoning Step Contract Components",
+            Some(snapshot.step_contract_components as f64),
         ),
         (
             "Latent Reasoning SIGReg Components",
@@ -3431,6 +4429,19 @@ fn apply_continual_learning_stability_policy<B>(
             );
             recovery_requested = true;
         }
+    }
+
+    if let Some(report) = validation.ruliad_eval_report.as_ref() {
+        update_capability_run_control_state(
+            env,
+            report,
+            validation.output_degeneracy.as_ref(),
+            epoch,
+            absolute_step,
+            state,
+            bus,
+            &mut recovery_requested,
+        );
     }
 
     if let Some(report) = validation.ruliad_eval_report.as_ref()
@@ -5857,6 +6868,7 @@ mod tests {
             canary_semantic_match_count: 0,
             family_scores: Vec::new(),
             task_scores: Vec::new(),
+            difficulty_scores: Vec::new(),
             math_domain_scores: Vec::new(),
             reasoning_mode_scores: Vec::new(),
             failures: Vec::new(),
@@ -5904,6 +6916,23 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_promotion_rejects_loss_only_when_capability_gate_fails() {
+        let mut gates = ruliad_degeneracy_gates();
+        gates.capability_schema_wrong_max_rate = 0.25;
+        let mut report = ruliad_eval_report(0.25, 0.25, 0.25, 0.25);
+        report.schema_valid_wrong_count = 40;
+        let validation = DynamicValidationReport {
+            loss: 0.01,
+            source_weighted_loss: None,
+            stream_warm_loss: None,
+            output_degeneracy: None,
+            ruliad_eval_report: Some(report),
+        };
+
+        assert!(!should_promote_checkpoint(&validation, None, None, &gates));
+    }
+
+    #[test]
     fn ruliad_correctness_progress_suppresses_loss_only_regression() {
         let state = ContinualLearningStabilityState {
             best_ruliad_verifier_accuracy: Some(0.1875),
@@ -5947,6 +6976,197 @@ mod tests {
         assert!(ruliad_metric_materially_regressed(
             0.21875, 0.1875, 128, 0.125
         ));
+    }
+
+    #[test]
+    fn ruliad_capability_gate_status_flags_malformed_missing_and_output_collapse() {
+        let mut gates = ruliad_degeneracy_gates();
+        gates.capability_malformed_max_rate = 0.02;
+        gates.capability_missing_max_rate = 0.02;
+        gates.capability_completion_health_min_rate = 0.80;
+        gates.capability_output_entropy_min_bits = 1.25;
+        gates.capability_distinct_2_min_fraction = 0.30;
+        let mut report = ruliad_eval_report(0.25, 0.25, 0.25, 0.25);
+        report.malformed_completion_count = 5;
+        report.missing_completion_count = 3;
+        let stats = degeneracy_stats(0.5, 0.9, 0.1, 0.0);
+
+        let status = ruliad_capability_gate_status(&report, Some(&stats), &gates);
+
+        assert!(!status.passed);
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("malformed_rate="))
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("missing_rate="))
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("output_entropy_bits="))
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("output_distinct2="))
+        );
+    }
+
+    #[test]
+    fn ruliad_capability_gate_status_respects_disabled_gates() {
+        let mut gates = ruliad_degeneracy_gates();
+        gates.enabled = false;
+        gates.capability_schema_wrong_max_rate = 0.0;
+        let mut report = ruliad_eval_report(0.0, 0.0, 0.0, 0.0);
+        report.schema_valid_wrong_count = report.item_count;
+
+        let status = ruliad_capability_gate_status(&report, None, &gates);
+
+        assert!(status.passed);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[test]
+    fn capability_run_control_warns_during_grace_then_recovers_after_first_pass_regression() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams();
+        training.events.flush_every_steps = 1;
+        training.gates = burn_dragon_train::TrainingGatesConfig {
+            capability_grace_epochs: 3,
+            capability_regression_patience_epochs: 2,
+            capability_required_after_first_pass: true,
+            capability_schema_wrong_max_rate: 0.25,
+            ..ruliad_degeneracy_gates()
+        };
+        let model_config = tiny_model_config();
+        let devices = vec![device.clone()];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name: "capability-run-control-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<TestBackend>(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            )])),
+            valid_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<
+                TestValidBackend,
+            >(
+                &valid_device,
+                &[0, 0, 1, 1, 2, 2, 3, 3],
+                &[0, 1, 1, 2, 2, 3, 3, 0],
+                [2, 4],
+            )])),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 1,
+            total_steps: 1,
+            valid_steps: 1,
+        };
+        let handles = crate::train::events::build_training_event_handles(
+            env.run_name,
+            &run_dir,
+            1,
+            &training,
+            None,
+            None,
+            None,
+        )
+        .expect("event handles");
+        let bus = handles.metric_logger.bus();
+        let mut state = ContinualLearningStabilityState::default();
+        let mut bad_report = ruliad_eval_report(0.25, 0.25, 0.25, 0.25);
+        bad_report.schema_valid_wrong_count = 80;
+        let good_report = ruliad_eval_report(0.25, 0.25, 0.25, 0.25);
+
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 1.0,
+                ruliad_eval_report: Some(bad_report.clone()),
+                ..Default::default()
+            },
+            1,
+            0,
+            &mut state,
+            &bus,
+        );
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 0.9,
+                ruliad_eval_report: Some(good_report),
+                ..Default::default()
+            },
+            4,
+            1,
+            &mut state,
+            &bus,
+        );
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 0.9,
+                ruliad_eval_report: Some(bad_report.clone()),
+                ..Default::default()
+            },
+            5,
+            2,
+            &mut state,
+            &bus,
+        );
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 0.9,
+                ruliad_eval_report: Some(bad_report),
+                ..Default::default()
+            },
+            6,
+            3,
+            &mut state,
+            &bus,
+        );
+        let _ = bus.flush();
+        drop(handles);
+
+        let events = read_training_events(&run_dir);
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("gate")
+                && event.get("gate").and_then(|value| value.as_str())
+                    == Some("continual_learning_capability_gate_grace")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("dynamics_control")
+                && event.get("mode").and_then(|value| value.as_str()) == Some("validation_recovery")
+        }));
+        assert_eq!(state.first_capability_pass_epoch, Some(4));
+        assert_eq!(state.consecutive_capability_gate_failures, 2);
     }
 
     #[test]
@@ -6411,6 +7631,22 @@ mod tests {
             canary_semantic_match_count: 0,
             family_scores: Vec::new(),
             task_scores: Vec::new(),
+            difficulty_scores: vec![burn_dragon_universality::RuliadEvalGroupScore {
+                label: "d7".to_string(),
+                count: 4,
+                exact_match_count: 1,
+                semantic_match_count: 2,
+                verifier_match_count: 2,
+                partial_credit_count: 3,
+                schema_valid_wrong_count: 1,
+                malformed_completion_count: 1,
+                missing_completion_count: 0,
+                exact_accuracy: 0.25,
+                semantic_accuracy: 0.5,
+                verifier_accuracy: 0.5,
+                partial_credit_rate: 0.75,
+                mean_partial_progress: 0.625,
+            }],
             math_domain_scores: Vec::new(),
             reasoning_mode_scores: Vec::new(),
             failures: Vec::new(),
@@ -6440,6 +7676,210 @@ mod tests {
             500_000.0
         );
         assert_eq!(metric_value("Ruliad Malformed Completion Rate"), 0.25);
+        let capability = events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(|value| value.as_str()) == Some("capability_probe")
+            })
+            .expect("capability probe event");
+        assert_eq!(
+            capability
+                .get("probe_name")
+                .and_then(|value| value.as_str()),
+            Some("ruliad_correctness")
+        );
+        assert_eq!(
+            capability
+                .get("achieved_difficulty_level")
+                .and_then(|value| value.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            capability
+                .get("verifier_rate")
+                .and_then(|value| value.as_f64()),
+            Some(0.5)
+        );
+        let capability_jsonl =
+            std::fs::read_to_string(run_dir.join("events/capability_probe.jsonl"))
+                .expect("capability probe jsonl");
+        assert!(capability_jsonl.contains("\"probe_name\":\"ruliad_correctness\""));
+    }
+
+    #[test]
+    fn ruliad_probe_examples_capture_mismatched_completion() {
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "hash-a".to_string(),
+            sample_index: 7,
+            split: burn_dragon_universality::SampleSplit::Validation,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category_theory".to_string()],
+            reasoning_modes: vec!["equational_reasoning".to_string()],
+            prompt: "[R2 hash-a v1 P/thm/proof]\nA:ok,l,r\n!:".to_string(),
+            expected_answer: "ok=1;l=2;r=2".to_string(),
+            difficulty_level: Some(3),
+            spec: None,
+        };
+        let completion = burn_dragon_universality::RuliadCompletionRecord {
+            oracle_hash: "hash-a".to_string(),
+            completion: "!:ok=0;l=2;r=9\n[/R2]\n".to_string(),
+        };
+
+        let examples = ruliad_probe_examples(&[item], &[completion], 4);
+
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].label, "proof_tree:prove_theorem");
+        assert_eq!(examples[0].expected, "ok=1;l=2;r=2");
+        assert_eq!(examples[0].actual.as_deref(), Some("ok=0;l=2;r=9"));
+        assert_eq!(examples[0].status, "Partial");
+        assert_eq!(examples[0].reason, "answer_mismatch");
+        assert!(examples[0].prompt.contains("\\nA:ok,l,r\\n!:"));
+        assert_eq!(examples[0].generated_tokens, 2);
+    }
+
+    #[test]
+    fn ruliad_capability_gate_metrics_emit_failure_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let mut training = tiny_training_hparams();
+        training.events.flush_every_steps = 1;
+        training.gates.capability_schema_wrong_max_rate = 0.25;
+        training.gates.capability_malformed_max_rate = 0.02;
+        training.gates.capability_completion_health_min_rate = 0.80;
+        training.gates.capability_output_entropy_min_bits = 1.25;
+        training.gates.capability_distinct_2_min_fraction = 0.30;
+        let handles = crate::train::events::build_training_event_handles(
+            "ruliad-capability-gate-metric-smoke",
+            &run_dir,
+            1,
+            &training,
+            None,
+            None,
+            None,
+        )
+        .expect("event handles");
+        let bus = handles.metric_logger.bus();
+        let mut report = ruliad_eval_report(0.25, 0.25, 0.25, 0.25);
+        report.schema_valid_wrong_count = 40;
+        report.malformed_completion_count = 5;
+        let stats = degeneracy_stats(0.5, 0.9, 0.1, 0.0);
+        emit_ruliad_capability_gate_metrics(
+            "ruliad-capability-gate-metric-smoke",
+            4,
+            19,
+            &report,
+            Some(&stats),
+            &training.gates,
+            &bus,
+        );
+        let _ = bus.flush();
+        drop(handles);
+
+        let events = read_training_events(&run_dir);
+        let metric_value = |name: &str| {
+            events
+                .iter()
+                .find(|event| {
+                    event.get("type").and_then(|value| value.as_str()) == Some("metric")
+                        && event.get("split").and_then(|value| value.as_str()) == Some("valid")
+                        && event.get("name").and_then(|value| value.as_str()) == Some(name)
+                })
+                .and_then(|event| event.get("value"))
+                .and_then(|value| value.as_f64())
+                .unwrap_or_else(|| panic!("missing metric {name}"))
+        };
+        assert_eq!(metric_value("Ruliad Capability Gate Passed"), 0.0);
+        assert!(metric_value("Ruliad Capability Gate Failure Count") >= 4.0);
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("gate")
+                && event.get("gate").and_then(|value| value.as_str())
+                    == Some("ruliad_capability_gate_failed")
+        }));
+    }
+
+    #[test]
+    fn latent_eval_step_sweep_sorts_and_deduplicates_steps() {
+        let mut training = tiny_training_hparams();
+        training.latent_reasoning.eval_step_sweep = vec![8, 1, 4, 1, 2];
+
+        assert_eq!(latent_eval_step_sweep(&training), vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn ruliad_correctness_eval_step_metrics_use_distinct_probe_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let mut training = tiny_training_hparams();
+        training.events.flush_every_steps = 1;
+        let handles = crate::train::events::build_training_event_handles(
+            "ruliad-eval-step-metric-smoke",
+            &run_dir,
+            1,
+            &training,
+            None,
+            None,
+            None,
+        )
+        .expect("event handles");
+        let bus = handles.metric_logger.bus();
+        let report = burn_dragon_universality::RuliadEvalReport {
+            version: burn_dragon_universality::ruliad::RULIAD_EVAL_REPORT_VERSION,
+            reasoning_score_version:
+                burn_dragon_universality::ruliad::RULIAD_REASONING_SCORE_VERSION,
+            dataset_name: "test".to_string(),
+            item_count: 2,
+            scored_count: 2,
+            exact_match_count: 0,
+            semantic_match_count: 1,
+            verifier_match_count: 1,
+            partial_credit_count: 1,
+            schema_valid_wrong_count: 0,
+            malformed_completion_count: 0,
+            missing_completion_count: 0,
+            unexpected_completion_count: 0,
+            exact_accuracy: 0.0,
+            semantic_accuracy: 0.5,
+            verifier_accuracy: 0.5,
+            partial_credit_rate: 0.5,
+            mean_partial_progress: 0.5,
+            mean_certificate_prefix_coverage: 0.5,
+            mean_completion_tokens: 8.0,
+            canary_count: 0,
+            canary_semantic_match_count: 0,
+            family_scores: Vec::new(),
+            task_scores: Vec::new(),
+            difficulty_scores: Vec::new(),
+            math_domain_scores: Vec::new(),
+            reasoning_mode_scores: Vec::new(),
+            failures: Vec::new(),
+        };
+        emit_ruliad_correctness_metrics_with_labels(
+            "ruliad-eval-step-metric-smoke",
+            2,
+            32,
+            &report,
+            &bus,
+            "ruliad_correctness_eval_steps_8",
+            Some("Ruliad Eval Steps 8"),
+            None,
+            &[],
+            RuliadAnswerSchemaAlignmentSummary::default(),
+        );
+        let _ = bus.flush();
+        drop(handles);
+
+        let events = read_training_events(&run_dir);
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("metric")
+                && event.get("name").and_then(|value| value.as_str())
+                    == Some("Ruliad Eval Steps 8 Ruliad Verifier Accuracy")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("capability_probe")
+                && event.get("probe_name").and_then(|value| value.as_str())
+                    == Some("ruliad_correctness_eval_steps_8")
+        }));
     }
 
     #[test]

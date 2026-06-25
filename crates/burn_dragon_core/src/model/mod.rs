@@ -20,7 +20,8 @@ pub use attention_residual::{
 pub use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
 pub use config::{
     ClockedSlowMemoryConfig, DragonConfig, FusedAttentionExecutor, FusedKernelConfig,
-    FusedProjectionExecutor, LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig,
+    FusedProjectionExecutor, HierarchicalDragonConfig, HierarchicalDragonSharing,
+    LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig,
     NextLatentTransitionConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 pub use dragon::{

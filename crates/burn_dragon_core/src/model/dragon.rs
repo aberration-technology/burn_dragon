@@ -48,9 +48,9 @@ use super::attention_residual::{
     AttentionResidual, BlockAttentionResidual, ResidualConnectorKind, ResidualHistory,
 };
 use super::config::{
-    ClockedSlowMemoryConfig, DragonConfig, FusedKernelConfig, LanguageHeadConfig,
-    LatentReasoningConfig, NextLatentTransitionConfig, SummaryMemoryConfig,
-    YNeuronRecurrenceConfig,
+    ClockedSlowMemoryConfig, DragonConfig, FusedKernelConfig, HierarchicalDragonConfig,
+    HierarchicalDragonSharing, LanguageHeadConfig, LatentReasoningConfig,
+    NextLatentTransitionConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 #[cfg(any(feature = "probe", test))]
 use super::dragon_support::{
@@ -124,6 +124,7 @@ pub struct DragonModel<B: Backend> {
     y_neuron_recurrence: YNeuronRecurrenceConfig,
     clocked_slow_memory: ClockedSlowMemoryConfig,
     summary_memory: SummaryMemoryConfig,
+    hierarchical_dragon: HierarchicalDragonConfig,
     latent_reasoning: LatentReasoningConfig,
     #[module(skip)]
     layer_latent_totals: Vec<usize>,
@@ -143,6 +144,9 @@ pub struct DragonModel<B: Backend> {
     encoder: Param<Tensor<B, 3>>,
     encoder_v: Param<Tensor<B, 3>>,
     decoder: Param<Tensor<B, 2>>,
+    slow_encoder: Option<Param<Tensor<B, 3>>>,
+    slow_encoder_v: Option<Param<Tensor<B, 3>>>,
+    slow_decoder: Option<Param<Tensor<B, 2>>>,
     #[module(skip)]
     mamba_config: ResolvedMambaSequenceConfig,
     mamba: Option<MambaSequenceParameters<B>>,
@@ -155,9 +159,11 @@ pub struct DragonModel<B: Backend> {
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
     latent_refiner_in: Option<Linear<B>>,
     latent_refiner_out: Option<Linear<B>>,
+    latent_refiner_gate: Option<Param<Tensor<B, 1>>>,
     latent_energy_head: Option<Linear<B>>,
     latent_stop_head: Option<Linear<B>>,
     latent_jepa_predictor: Option<Linear<B>>,
+    latent_step_decoder_embedding: Option<Param<Tensor<B, 2>>>,
     next_latent_transition: NextLatentTransitionConfig,
     next_latent_transition_in: Option<Linear<B>>,
     next_latent_transition_mid: Option<Linear<B>>,
@@ -216,6 +222,18 @@ impl<B: Backend> SharedLowrankPopulationFactors<B> {
     pub fn population_size(&self) -> usize {
         self.signs.shape().dims::<1>()[0]
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HierarchicalDragonBranch {
+    Fast,
+    Slow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HierarchicalSequenceSlot {
+    Fast,
+    Slow,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -568,6 +586,41 @@ impl<B: Backend> DragonModel<B> {
             residual_depth,
             device,
         ));
+        let hierarchical_dragon = config.hierarchical_dragon.clone();
+        let (slow_encoder, slow_encoder_v, slow_decoder) = if hierarchical_dragon.enabled
+            && matches!(
+                hierarchical_dragon.weight_sharing,
+                HierarchicalDragonSharing::Split
+            ) {
+            (
+                Some(Param::from_tensor(
+                    initializer.headwise_projection_tensor::<B>(
+                        DragonProjectionRole::Encoder,
+                        config.n_head,
+                        config.n_embd,
+                        latent_per_head,
+                        residual_depth,
+                        device,
+                    ),
+                )),
+                Some(Param::from_tensor(
+                    initializer.headwise_projection_tensor::<B>(
+                        DragonProjectionRole::EncoderValue,
+                        config.n_head,
+                        config.n_embd,
+                        latent_per_head,
+                        residual_depth,
+                        device,
+                    ),
+                )),
+                Some(Param::from_tensor(Tensor::<B, 2>::zeros(
+                    [latent_total, config.n_embd],
+                    device,
+                ))),
+            )
+        } else {
+            (None, None, None)
+        };
         let residual_connector = config.resolved_residual_connector_kind();
         let mhc_first_layer = config
             .mhc
@@ -695,6 +748,12 @@ impl<B: Backend> DragonModel<B> {
             }
             out
         });
+        let latent_refiner_gate =
+            (latent_reasoning.enabled && latent_reasoning.residual_refinement_gate).then(|| {
+                let init = latent_reasoning.residual_refinement_gate_init;
+                let logit = (init / (1.0 - init)).ln();
+                Param::from_tensor(Tensor::<B, 1>::ones([config.n_embd], device).mul_scalar(logit))
+            });
         let latent_energy_head = (latent_reasoning.enabled && latent_reasoning.energy_head)
             .then(|| LinearConfig::new(config.n_embd, 1).init(device));
         let latent_stop_head = (latent_reasoning.enabled && latent_reasoning.adaptive_halting)
@@ -711,6 +770,13 @@ impl<B: Backend> DragonModel<B> {
         let latent_jepa_predictor = latent_reasoning
             .enabled
             .then(|| LinearConfig::new(config.n_embd, config.n_embd).init(device));
+        let latent_step_decoder_embedding =
+            (latent_reasoning.enabled && latent_reasoning.step_conditioned_decoder).then(|| {
+                Param::from_tensor(Tensor::<B, 2>::zeros(
+                    [latent_reasoning.max_steps.saturating_add(1), config.n_embd],
+                    device,
+                ))
+            });
         let next_latent_transition = config.next_latent_transition.clone();
         let next_latent_transition_hidden =
             config.n_embd * next_latent_transition.hidden_multiplier.max(1);
@@ -762,6 +828,7 @@ impl<B: Backend> DragonModel<B> {
             y_neuron_recurrence: config.y_neuron_recurrence,
             clocked_slow_memory: config.clocked_slow_memory,
             summary_memory: config.summary_memory,
+            hierarchical_dragon,
             latent_reasoning,
             layer_latent_totals,
             shared_lowrank_continual_backprop: None,
@@ -779,6 +846,9 @@ impl<B: Backend> DragonModel<B> {
             encoder,
             encoder_v,
             decoder,
+            slow_encoder,
+            slow_encoder_v,
+            slow_decoder,
             mamba_config,
             mamba,
             gated_deltanet2_config,
@@ -789,9 +859,11 @@ impl<B: Backend> DragonModel<B> {
             nca_special_lm_head,
             latent_refiner_in,
             latent_refiner_out,
+            latent_refiner_gate,
             latent_energy_head,
             latent_stop_head,
             latent_jepa_predictor,
+            latent_step_decoder_embedding,
             next_latent_transition,
             next_latent_transition_in,
             next_latent_transition_mid,
@@ -840,6 +912,7 @@ impl<B: Backend> DragonModel<B> {
 
     pub fn supports_shared_lowrank_population_forward(&self) -> bool {
         !self.y_neuron_recurrence.enabled
+            && !self.hierarchical_dragon.enabled
             && self.rollout_fast_steps_per_slow_step == 1
             && self.language_head.uses_flat_token_logits()
     }
@@ -933,6 +1006,12 @@ impl<B: Backend> DragonModel<B> {
                 self.next_latent_transition, fresh.next_latent_transition
             ));
         }
+        if self.hierarchical_dragon != fresh.hierarchical_dragon {
+            return Err(format!(
+                "widening cannot change hierarchical_dragon (current={:?} target={:?})",
+                self.hierarchical_dragon, fresh.hierarchical_dragon
+            ));
+        }
         if new_latent_total % self.n_head != 0 {
             return Err(format!(
                 "target latent_total must be divisible by n_head (target={new_latent_total}, n_head={})",
@@ -973,9 +1052,18 @@ impl<B: Backend> DragonModel<B> {
             .map(|head| Param::from_tensor(head.val()));
         widened.latent_refiner_in = self.latent_refiner_in.as_ref().map(clone_linear_value);
         widened.latent_refiner_out = self.latent_refiner_out.as_ref().map(clone_linear_value);
+        widened.latent_refiner_gate = self
+            .latent_refiner_gate
+            .as_ref()
+            .map(|gate| Param::from_tensor(gate.val()));
         widened.latent_energy_head = self.latent_energy_head.as_ref().map(clone_linear_value);
         widened.latent_stop_head = self.latent_stop_head.as_ref().map(clone_linear_value);
         widened.latent_jepa_predictor = self.latent_jepa_predictor.as_ref().map(clone_linear_value);
+        widened.latent_step_decoder_embedding = self
+            .latent_step_decoder_embedding
+            .as_ref()
+            .map(|embedding| Param::from_tensor(embedding.val()));
+        widened.hierarchical_dragon = self.hierarchical_dragon.clone();
         widened.next_latent_transition_in = self
             .next_latent_transition_in
             .as_ref()
@@ -1008,6 +1096,45 @@ impl<B: Backend> DragonModel<B> {
             old_latent_per_head,
             new_latent_per_head,
         )?);
+        widened.slow_encoder = match (&self.slow_encoder, &fresh.slow_encoder) {
+            (Some(current), Some(fresh)) => {
+                Some(Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+                    current.val(),
+                    fresh.val(),
+                    old_latent_per_head,
+                    new_latent_per_head,
+                )?))
+            }
+            (None, None) => None,
+            _ => {
+                return Err("widening cannot change slow_encoder parameter presence".to_string());
+            }
+        };
+        widened.slow_encoder_v = match (&self.slow_encoder_v, &fresh.slow_encoder_v) {
+            (Some(current), Some(fresh)) => Some(Param::from_tensor(widen_3d_last_dim_prefix(
+                current.val(),
+                fresh.val(),
+                old_latent_per_head,
+                new_latent_per_head,
+            )?)),
+            (None, None) => None,
+            _ => {
+                return Err("widening cannot change slow_encoder_v parameter presence".to_string());
+            }
+        };
+        widened.slow_decoder = match (&self.slow_decoder, &fresh.slow_decoder) {
+            (Some(current), Some(fresh)) => Some(Param::from_tensor(widen_2d_headed_row_prefix(
+                current.val(),
+                fresh.val(),
+                self.n_head,
+                old_latent_per_head,
+                new_latent_per_head,
+            )?)),
+            (None, None) => None,
+            _ => {
+                return Err("widening cannot change slow_decoder parameter presence".to_string());
+            }
+        };
         widened.gated_deltanet2 = match (&self.gated_deltanet2, &fresh.gated_deltanet2) {
             (Some(current), Some(fresh)) => Some(current.widened_from_prefix(
                 fresh,
@@ -1080,6 +1207,10 @@ impl<B: Backend> DragonModel<B> {
             !self.y_neuron_recurrence.enabled,
             "shared lowrank population forward does not support y-neuron recurrence"
         );
+        assert!(
+            !self.hierarchical_dragon.enabled,
+            "shared lowrank population forward does not support hierarchical Dragon"
+        );
         assert_eq!(
             self.rollout_fast_steps_per_slow_step, 1,
             "shared lowrank population forward requires rollout_fast_steps_per_slow_step = 1"
@@ -1121,6 +1252,10 @@ impl<B: Backend> DragonModel<B> {
         assert!(
             !self.y_neuron_recurrence.enabled,
             "shared lowrank population factor forward does not support y-neuron recurrence"
+        );
+        assert!(
+            !self.hierarchical_dragon.enabled,
+            "shared lowrank population factor forward does not support hierarchical Dragon"
         );
         assert_eq!(
             self.rollout_fast_steps_per_slow_step, 1,
@@ -1168,6 +1303,10 @@ impl<B: Backend> DragonModel<B> {
             !self.y_neuron_recurrence.enabled,
             "language pipeline execution is not supported with y-neuron recurrence enabled"
         );
+        assert!(
+            !self.hierarchical_dragon.enabled,
+            "language pipeline execution is not supported with hierarchical Dragon enabled"
+        );
         self.initialize_language_pipeline_state(embedded)
     }
 
@@ -1209,7 +1348,7 @@ impl<B: Backend> DragonModel<B> {
         state: &mut ModelState<B>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let hidden = self.finish_language_pipeline_hidden_with_state(pipeline_state, state);
-        let logits = self.project_hidden_to_logits(hidden.clone());
+        let logits = self.logits_from_hidden(hidden.clone());
         (hidden, logits)
     }
 
@@ -1352,23 +1491,24 @@ impl<B: Backend> DragonModel<B> {
         total / self.n_head
     }
 
-    fn layer_lowrank_weights(
+    fn layer_lowrank_weights_from_params(
         &self,
         layer_idx: usize,
+        encoder_param: &Param<Tensor<B, 3>>,
+        encoder_v_param: &Param<Tensor<B, 3>>,
+        decoder_param: &Param<Tensor<B, 2>>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
         let latent_per_head = self.layer_latent_per_head(layer_idx);
         let capacity_per_head = self.latent_per_head_capacity();
-        let encoder = self
-            .encoder
+        let encoder = encoder_param
             .val()
             .slice([0..self.n_head, 0..self.n_embd, 0..latent_per_head])
             .reshape([1, self.n_head, self.n_embd, latent_per_head]);
-        let encoder_v = self
-            .encoder_v
+        let encoder_v = encoder_v_param
             .val()
             .slice([0..self.n_head, 0..self.n_embd, 0..latent_per_head])
             .reshape([1, self.n_head, self.n_embd, latent_per_head]);
-        let decoder_capacity = self.decoder.val();
+        let decoder_capacity = decoder_param.val();
         let decoder = Tensor::cat(
             (0..self.n_head)
                 .map(|head| {
@@ -1381,6 +1521,284 @@ impl<B: Backend> DragonModel<B> {
             0,
         );
         (encoder, encoder_v, decoder, latent_per_head)
+    }
+
+    fn layer_lowrank_weights(
+        &self,
+        layer_idx: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
+        self.layer_lowrank_weights_from_params(
+            layer_idx,
+            &self.encoder,
+            &self.encoder_v,
+            &self.decoder,
+        )
+    }
+
+    fn layer_lowrank_weights_for_hierarchical_branch(
+        &self,
+        layer_idx: usize,
+        branch: HierarchicalDragonBranch,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
+        if branch == HierarchicalDragonBranch::Slow
+            && matches!(
+                self.hierarchical_dragon.weight_sharing,
+                HierarchicalDragonSharing::Split
+            )
+        {
+            return self.layer_lowrank_weights_from_params(
+                layer_idx,
+                self.slow_encoder
+                    .as_ref()
+                    .expect("split hierarchical slow encoder missing"),
+                self.slow_encoder_v
+                    .as_ref()
+                    .expect("split hierarchical slow encoder_v missing"),
+                self.slow_decoder
+                    .as_ref()
+                    .expect("split hierarchical slow decoder missing"),
+            );
+        }
+        self.layer_lowrank_weights(layer_idx)
+    }
+
+    fn hierarchical_dragon_applies_to_layer(&self, layer_idx: usize) -> bool {
+        if !self.hierarchical_dragon.enabled {
+            return false;
+        }
+        let first_layer = self
+            .hierarchical_dragon
+            .last_layers
+            .map(|last_layers| self.n_layer.max(1).saturating_sub(last_layers))
+            .unwrap_or(0);
+        layer_idx >= first_layer
+    }
+
+    fn hierarchical_slow_sequence_slot(&self) -> HierarchicalSequenceSlot {
+        if matches!(
+            self.hierarchical_dragon.rho_sharing,
+            HierarchicalDragonSharing::Split
+        ) {
+            HierarchicalSequenceSlot::Slow
+        } else {
+            HierarchicalSequenceSlot::Fast
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_attention_with_plan_in_hierarchical_slot(
+        &self,
+        query: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+        layer_state: &mut LayerState<B>,
+        position: usize,
+        position_mode: RecurrentPositionMode,
+        fused_plan: Option<&CompiledRecurrentAttentionPlan<B>>,
+        slot: HierarchicalSequenceSlot,
+    ) -> Tensor<B, 4> {
+        match slot {
+            HierarchicalSequenceSlot::Fast => self.recurrent_attention_with_plan(
+                query,
+                value,
+                layer_state,
+                position,
+                position_mode,
+                fused_plan,
+            ),
+            HierarchicalSequenceSlot::Slow => {
+                layer_state.swap_fast_slow_sequence_state();
+                let context = self.recurrent_attention_with_plan(
+                    query,
+                    value,
+                    layer_state,
+                    position,
+                    position_mode,
+                    fused_plan,
+                );
+                layer_state.swap_fast_slow_sequence_state();
+                context
+            }
+        }
+    }
+
+    fn hierarchical_slow_hidden(
+        &self,
+        layer_state: &LayerState<B>,
+        flat_batch: usize,
+        branch_dim: usize,
+    ) -> Option<Tensor<B, 4>> {
+        let hidden = layer_state.hierarchical_slow_hidden.as_ref()?;
+        (hidden.shape().dims::<4>() == [flat_batch, 1, 1, branch_dim]).then(|| hidden.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_hierarchical_lowrank_step(
+        &self,
+        branch_flat: Tensor<B, 4>,
+        layer_state: &mut LayerState<B>,
+        layer_idx: usize,
+        start_pos: usize,
+        position_mode: RecurrentPositionMode,
+        branch: HierarchicalDragonBranch,
+        slot: HierarchicalSequenceSlot,
+    ) -> Tensor<B, 4> {
+        let [flat_batch, views, branch_time, branch_dim] = branch_flat.shape().dims::<4>();
+        debug_assert_eq!(views, 1, "hierarchical Dragon expects a single branch view");
+        if branch_time == 0 {
+            return branch_flat;
+        }
+
+        let (encoder, encoder_v, decoder, latent) =
+            self.layer_lowrank_weights_for_hierarchical_branch(layer_idx, branch);
+        let fused = self.kernel.enabled;
+        let latent_pattern = &self.kernel.block_sparse.latent;
+        let sparse_mask = if fused && latent_pattern.is_sparse() {
+            Some(latent_pattern.mask::<B>(latent, &branch_flat.device()))
+        } else {
+            None
+        };
+        let fused_recurrent_plan = if matches!(
+            (
+                self.sequence_kernel.memory_system,
+                self.sequence_kernel.executor,
+            ),
+            (
+                SequenceMemorySystem::LinearAttention,
+                SequenceTrainingExecutor::Reference,
+            )
+        ) && self.kernel.enabled
+            && self.kernel.wgpu_recurrent_kernel
+            && supports_recurrent_backend::<B>()
+        {
+            Some(CompiledRecurrentAttentionPlan::new(
+                flat_batch,
+                self.n_head,
+                1,
+                branch_time,
+                latent,
+                branch_dim,
+                &branch_flat.device(),
+            ))
+        } else {
+            None
+        };
+
+        let x_neuron = self.project_lowrank_positive(LowrankProjectionRequest {
+            dense: branch_flat.clone(),
+            projector: encoder,
+            relu_threshold: self.x_relu_threshold,
+            use_fused: fused && self.kernel.projection_executor.use_x(),
+            latent_pattern,
+            sparse_mask: sparse_mask.clone(),
+        });
+        let context = self.recurrent_attention_with_plan_in_hierarchical_slot(
+            x_neuron.clone(),
+            branch_flat.clone(),
+            layer_state,
+            start_pos,
+            position_mode,
+            fused_recurrent_plan.as_ref(),
+            slot,
+        );
+        let y_gate = self.project_lowrank_positive(LowrankProjectionRequest {
+            dense: self.norm.forward(context),
+            projector: encoder_v,
+            relu_threshold: self.y_relu_threshold,
+            use_fused: fused && self.kernel.projection_executor.use_y(),
+            latent_pattern,
+            sparse_mask,
+        });
+        let y_neuron = self.dropout.forward(x_neuron * y_gate);
+        if branch == HierarchicalDragonBranch::Fast
+            && let Some(runtime) = self.shared_lowrank_continual_backprop_runtime()
+            && runtime.should_sample_step()
+        {
+            runtime.record_y_neuron_stats(y_neuron.clone());
+        }
+        let mixed = y_neuron.swap_dims(1, 2);
+        let mixed_flat = mixed.reshape([flat_batch * branch_time, self.n_head * latent]);
+        let mlp_flat = mixed_flat.matmul(decoder);
+        let mlp_out = mlp_flat.reshape([flat_batch, 1, branch_time, branch_dim]);
+        let mlp_out = self.norm.forward(mlp_out);
+        self.norm.forward(branch_flat + mlp_out)
+    }
+
+    fn forward_hierarchical_branch_layer(
+        &self,
+        branch_flat: Tensor<B, 4>,
+        layer_state: &mut LayerState<B>,
+        layer_idx: usize,
+        start_pos: usize,
+        position_mode: RecurrentPositionMode,
+    ) -> Tensor<B, 4> {
+        let [flat_batch, _views, branch_time, branch_dim] = branch_flat.shape().dims::<4>();
+        if branch_time == 0 {
+            return branch_flat;
+        }
+
+        let mut fast = branch_flat;
+        let mut slow_hidden = self.hierarchical_slow_hidden(layer_state, flat_batch, branch_dim);
+        let fast_cycles = self.hierarchical_dragon.fast_cycles.max(1);
+        let slow_cycles = self.hierarchical_dragon.slow_cycles.max(1);
+        let slow_to_fast_scale = self.hierarchical_dragon.slow_to_fast_scale.max(0.0);
+        let fast_to_slow_scale = self.hierarchical_dragon.fast_to_slow_scale.max(0.0);
+        let slow_slot = self.hierarchical_slow_sequence_slot();
+
+        for _ in 0..slow_cycles {
+            if slow_to_fast_scale > 0.0
+                && let Some(slow) = slow_hidden.as_ref()
+            {
+                fast = self.norm.forward(
+                    fast + slow
+                        .clone()
+                        .repeat_dim(2, branch_time)
+                        .mul_scalar(slow_to_fast_scale),
+                );
+            }
+            for _ in 0..fast_cycles {
+                fast = self.forward_hierarchical_lowrank_step(
+                    fast,
+                    layer_state,
+                    layer_idx,
+                    start_pos,
+                    position_mode,
+                    HierarchicalDragonBranch::Fast,
+                    HierarchicalSequenceSlot::Fast,
+                );
+            }
+
+            let mut slow_input = fast
+                .clone()
+                .mean_dim(2)
+                .reshape([flat_batch, 1, 1, branch_dim]);
+            if fast_to_slow_scale > 0.0
+                && let Some(previous_slow) = slow_hidden.as_ref()
+            {
+                slow_input = self
+                    .norm
+                    .forward(slow_input + previous_slow.clone().mul_scalar(fast_to_slow_scale));
+            }
+            let next_slow = self.forward_hierarchical_lowrank_step(
+                slow_input,
+                layer_state,
+                layer_idx,
+                start_pos,
+                position_mode,
+                HierarchicalDragonBranch::Slow,
+                slow_slot,
+            );
+            slow_hidden = Some(next_slow.clone());
+            if slow_to_fast_scale > 0.0 {
+                fast = self.norm.forward(
+                    fast + next_slow
+                        .repeat_dim(2, branch_time)
+                        .mul_scalar(slow_to_fast_scale),
+                );
+            }
+        }
+
+        layer_state.hierarchical_slow_hidden = slow_hidden;
+        fast
     }
 
     fn assert_shared_lowrank_population_shapes(&self, lowrank: &SharedLowrankPopulationWeights<B>) {
@@ -2025,6 +2443,14 @@ impl<B: Backend> DragonModel<B> {
         self.reason_hidden_final(hidden)
     }
 
+    fn latent_decoder_step(&self) -> usize {
+        if self.latent_reasoning_enabled() {
+            self.latent_reasoning.max_steps
+        } else {
+            0
+        }
+    }
+
     fn forward_with_state_from_embedded_rollout_host_loop(
         &self,
         embedded: Tensor<B, 3>,
@@ -2161,7 +2587,7 @@ impl<B: Backend> DragonModel<B> {
             let last = fast_steps - 1;
             let hidden_last =
                 self.reason_hidden_final(hidden_rollout.slice_dim(1, last..fast_steps));
-            let logits_last = self.project_hidden_to_logits(hidden_last.clone());
+            let logits_last = self.logits_from_hidden(hidden_last.clone());
             hidden_slow.push(hidden_last);
             logits_slow.push(logits_last);
             state.position = state.position.saturating_add(1);
@@ -2981,6 +3407,15 @@ impl<B: Backend> DragonModel<B> {
         &self.latent_reasoning
     }
 
+    pub fn with_fixed_latent_reasoning_steps(mut self, steps: usize) -> Self {
+        assert!(steps > 0, "fixed latent reasoning steps must be > 0");
+        self.latent_reasoning.enabled = true;
+        self.latent_reasoning.max_steps = steps;
+        self.latent_reasoning.min_steps = steps;
+        self.latent_reasoning.adaptive_halting = false;
+        self
+    }
+
     pub fn latent_reasoning_enabled(&self) -> bool {
         self.latent_reasoning.enabled
             && self.latent_reasoning.max_steps > 0
@@ -2996,6 +3431,21 @@ impl<B: Backend> DragonModel<B> {
         refiner_out: &Linear<B>,
     ) -> Tensor<B, 3> {
         let update = refiner_out.forward(activation::gelu(refiner_in.forward(current.clone())));
+        let update = if let Some(gate) = self.latent_refiner_gate.as_ref() {
+            let [batch, time, dim] = update.shape().dims();
+            let [gate_dim] = gate.val().shape().dims();
+            if gate_dim == dim {
+                let gate = activation::sigmoid(gate.val())
+                    .reshape([1, 1, dim])
+                    .repeat_dim(0, batch)
+                    .repeat_dim(1, time);
+                update * gate
+            } else {
+                update
+            }
+        } else {
+            update
+        };
         if self.latent_reasoning.normalize_steps {
             self.norm.forward(current + update)
         } else {
@@ -3212,8 +3662,54 @@ impl<B: Backend> DragonModel<B> {
         logits
     }
 
-    pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn apply_latent_decoder_step_conditioning(
+        &self,
+        hidden: Tensor<B, 3>,
+        step: usize,
+    ) -> Tensor<B, 3> {
+        if !self.latent_reasoning.step_conditioned_decoder
+            || self.latent_reasoning.step_conditioned_decoder_scale <= f32::EPSILON
+        {
+            return hidden;
+        }
+        let Some(embedding) = self.latent_step_decoder_embedding.as_ref() else {
+            return hidden;
+        };
+        let [batch, time, dim] = hidden.shape().dims();
+        let [steps, width] = embedding.val().shape().dims();
+        if steps == 0 || width != dim {
+            return hidden;
+        }
+        let step = step.min(steps - 1);
+        let bias = embedding
+            .val()
+            .slice([step..step + 1, 0..dim])
+            .reshape([1, 1, dim])
+            .repeat_dim(0, batch)
+            .repeat_dim(1, time)
+            .mul_scalar(self.latent_reasoning.step_conditioned_decoder_scale);
+        hidden + bias
+    }
+
+    fn project_hidden_to_logits_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        step: usize,
+    ) -> Tensor<B, 3> {
+        let hidden = self.apply_latent_decoder_step_conditioning(hidden, step);
         self.project_hidden_to_logits(hidden)
+    }
+
+    pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.project_hidden_to_logits_for_latent_step(hidden, self.latent_decoder_step())
+    }
+
+    pub fn logits_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        step: usize,
+    ) -> Tensor<B, 3> {
+        self.project_hidden_to_logits_for_latent_step(hidden, step)
     }
 
     pub fn uses_factorized_language_head(&self) -> bool {
@@ -3474,6 +3970,94 @@ mod tests {
     }
 
     #[test]
+    fn latent_residual_refinement_gate_scales_learned_updates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let hidden = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..32).map(|value| value as f32 / 16.0 - 1.0).collect(),
+                [1, 2, 16],
+            ),
+            &device,
+        );
+
+        TestBackend::seed(&device, 13);
+        let mut gated_config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        gated_config.latent_reasoning.enabled = true;
+        gated_config.latent_reasoning.max_steps = 1;
+        gated_config.latent_reasoning.min_steps = 1;
+        gated_config.latent_reasoning.residual_refinement_gate = true;
+        gated_config.latent_reasoning.residual_refinement_gate_init = 0.25;
+        let mut gated_model = DragonModel::<TestBackend>::new(gated_config, &device);
+
+        let out = gated_model
+            .latent_refiner_out
+            .as_mut()
+            .expect("latent refiner output");
+        let [rows, cols] = out.weight.val().shape().dims();
+        out.weight = Param::from_tensor(
+            Tensor::<TestBackend, 2>::ones([rows, cols], &device).mul_scalar(0.01),
+        );
+        if let Some(bias) = out.bias.as_mut() {
+            let [dim] = bias.val().shape().dims();
+            *bias = Param::from_tensor(Tensor::<TestBackend, 1>::zeros([dim], &device));
+        }
+
+        let gate = gated_model.latent_refiner_gate.take();
+        let open_delta = gated_model.reason_hidden(hidden.clone()).final_hidden - hidden.clone();
+        gated_model.latent_refiner_gate = gate;
+        let gated_delta = gated_model.reason_hidden(hidden.clone()).final_hidden - hidden;
+        let expected = open_delta.mul_scalar(0.25);
+        let diff = max_abs_diff(tensor_values(gated_delta), tensor_values(expected));
+
+        assert!(
+            diff <= 1.0e-5,
+            "residual refinement gate should scale update by init multiplier; diff={diff}"
+        );
+    }
+
+    #[test]
+    fn latent_step_conditioned_decoder_starts_neutral_and_can_shift_step_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 2;
+        config.latent_reasoning.step_conditioned_decoder = true;
+        let mut model = DragonModel::<TestBackend>::new(config, &device);
+        let hidden = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..32).map(|value| value as f32 / 32.0).collect(),
+                [1, 2, 16],
+            ),
+            &device,
+        );
+
+        let neutral_step0 = model.logits_from_hidden_for_latent_step(hidden.clone(), 0);
+        let neutral_step2 = model.logits_from_hidden_for_latent_step(hidden.clone(), 2);
+        let neutral_diff = max_abs_diff(tensor_values(neutral_step0), tensor_values(neutral_step2));
+        assert!(
+            neutral_diff <= 1.0e-6,
+            "zero-initialized step decoder should preserve logits; diff={neutral_diff}"
+        );
+
+        let mut values = vec![0.0f32; 3 * 16];
+        for index in 0..16 {
+            values[2 * 16 + index] = 0.05;
+        }
+        model.latent_step_decoder_embedding = Some(Param::from_tensor(
+            Tensor::<TestBackend, 2>::from_data(TensorData::new(values, [3, 16]), &device),
+        ));
+
+        let shifted_step0 = model.logits_from_hidden_for_latent_step(hidden.clone(), 0);
+        let shifted_step2 = model.logits_from_hidden_for_latent_step(hidden, 2);
+        let shifted_diff = max_abs_diff(tensor_values(shifted_step0), tensor_values(shifted_step2));
+        assert!(
+            shifted_diff > 1.0e-5,
+            "nonzero step decoder embedding should change step-specific logits"
+        );
+    }
+
+    #[test]
     fn next_latent_transition_starts_as_identity_delta() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
@@ -3502,6 +4086,81 @@ mod tests {
         assert!(
             forward_diff <= 1.0e-6,
             "NextLat transition should not alter forward_hidden; diff={forward_diff}"
+        );
+    }
+
+    #[test]
+    fn hierarchical_dragon_split_rho_shared_weights_forward_persists_slow_state() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.hierarchical_dragon.enabled = true;
+        config.hierarchical_dragon.last_layers = Some(1);
+        config.hierarchical_dragon.fast_cycles = 1;
+        config.hierarchical_dragon.slow_cycles = 1;
+        config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        config.hierarchical_dragon.weight_sharing = HierarchicalDragonSharing::Shared;
+        config.hierarchical_dragon.slow_to_fast_scale = 0.1;
+        config.hierarchical_dragon.fast_to_slow_scale = 0.1;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let mut state = model.init_state();
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        let logits = model.forward_with_state(tokens, &mut state);
+
+        assert_eq!(logits.shape().dims(), [1, 4, 32]);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+        assert!(state.layers[0].rho.is_some(), "fast rho should be written");
+        assert!(
+            state.layers[0].slow_rho.is_some(),
+            "split slow rho should be written"
+        );
+        assert!(
+            state.layers[0].hierarchical_slow_hidden.is_some(),
+            "slow hidden summary should be retained"
+        );
+        assert!(model.slow_encoder.is_none());
+        assert!(model.slow_encoder_v.is_none());
+        assert!(model.slow_decoder.is_none());
+        assert!(!model.supports_shared_lowrank_population_forward());
+        assert!(!model.supports_shared_lowrank_continual_backprop());
+    }
+
+    #[test]
+    fn hierarchical_dragon_split_weights_forward_and_record_round_trip() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.hierarchical_dragon.enabled = true;
+        config.hierarchical_dragon.last_layers = Some(1);
+        config.hierarchical_dragon.fast_cycles = 1;
+        config.hierarchical_dragon.slow_cycles = 1;
+        config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        config.hierarchical_dragon.weight_sharing = HierarchicalDragonSharing::Split;
+        let model = DragonModel::<TestBackend>::new(config.clone(), &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        let logits = model.forward(tokens.clone());
+        let record = model.clone().into_record();
+        let reloaded = DragonModel::<TestBackend>::new(config, &device).load_record(record);
+        let reloaded_logits = reloaded.forward(tokens);
+        let diff = max_abs_diff(
+            tensor_values(logits.clone()),
+            tensor_values(reloaded_logits),
+        );
+
+        assert_eq!(logits.shape().dims(), [1, 4, 32]);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+        assert!(model.slow_encoder.is_some());
+        assert!(model.slow_encoder_v.is_some());
+        assert!(model.slow_decoder.is_some());
+        assert!(
+            diff <= 1.0e-6,
+            "split hierarchical record round-trip drifted by {diff}"
         );
     }
 
@@ -3882,6 +4541,66 @@ mod tests {
         );
     }
 
+    fn assert_slow_lowrank_prefix_preserved(
+        source: &DragonModel<TestBackend>,
+        widened: &DragonModel<TestBackend>,
+    ) {
+        let old_latent_per_head = source.latent_per_head_capacity();
+        let source_encoder = source.slow_encoder.as_ref().expect("source slow encoder");
+        let source_encoder_v = source
+            .slow_encoder_v
+            .as_ref()
+            .expect("source slow encoder_v");
+        let source_decoder = source.slow_decoder.as_ref().expect("source slow decoder");
+        let widened_encoder = widened.slow_encoder.as_ref().expect("widened slow encoder");
+        let widened_encoder_v = widened
+            .slow_encoder_v
+            .as_ref()
+            .expect("widened slow encoder_v");
+        let widened_decoder = widened.slow_decoder.as_ref().expect("widened slow decoder");
+
+        assert_eq!(
+            tensor_values(source_encoder.val()),
+            tensor_values(widened_encoder.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                0..old_latent_per_head
+            ]))
+        );
+        assert_eq!(
+            tensor_values(source_encoder_v.val()),
+            tensor_values(widened_encoder_v.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                0..old_latent_per_head
+            ]))
+        );
+        for head in 0..source.n_head {
+            let source_start = head * old_latent_per_head;
+            let widened_start = head * widened.latent_per_head_capacity();
+            assert_eq!(
+                tensor_values(source_decoder.val().slice([
+                    source_start..source_start + old_latent_per_head,
+                    0..source.n_embd
+                ])),
+                tensor_values(widened_decoder.val().slice([
+                    widened_start..widened_start + old_latent_per_head,
+                    0..source.n_embd
+                ]))
+            );
+        }
+        assert!(
+            tensor_values(widened_encoder.val().slice([
+                0..source.n_head,
+                0..source.n_embd,
+                old_latent_per_head..widened.latent_per_head_capacity()
+            ]))
+            .iter()
+            .all(|value| *value == 0.0),
+            "widened slow query encoder tail should start as a no-op"
+        );
+    }
+
     #[test]
     fn tiny_reservoir_model_constructs_and_runs_forward() {
         let device = burn::tensor::Device::<TestBackend>::default();
@@ -3947,6 +4666,67 @@ mod tests {
     }
 
     #[test]
+    fn hierarchical_dragon_split_rho_mamba3_forward_persists_slow_state() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::Mamba3StateSpaceDuality,
+        ));
+        config.mamba = super::super::sequence::mamba::MambaSequenceConfig {
+            headdim: 8,
+            chunk_size: 4,
+            ..Default::default()
+        };
+        config.hierarchical_dragon.enabled = true;
+        config.hierarchical_dragon.last_layers = Some(1);
+        config.hierarchical_dragon.fast_cycles = 1;
+        config.hierarchical_dragon.slow_cycles = 1;
+        config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let mut state = model.init_state();
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+
+        let logits = model.forward_with_state(tokens, &mut state);
+
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+        assert!(state.layers[0].rho.is_some(), "fast Mamba3 state");
+        assert!(state.layers[0].slow_rho.is_some(), "slow Mamba3 state");
+        assert!(
+            state.layers[0].slow_mamba_angle_state.is_some(),
+            "slow Mamba3 angle state"
+        );
+    }
+
+    #[test]
+    fn hierarchical_dragon_split_rho_gdn2_forward_persists_slow_state() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::GatedDeltaNet2,
+        ));
+        config.hierarchical_dragon.enabled = true;
+        config.hierarchical_dragon.last_layers = Some(1);
+        config.hierarchical_dragon.fast_cycles = 1;
+        config.hierarchical_dragon.slow_cycles = 1;
+        config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let mut state = model.init_state();
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3], [1, 3]),
+            &device,
+        );
+
+        let logits = model.forward_with_state(tokens, &mut state);
+
+        assert_eq!(logits.shape().dims(), [1, 3, 32]);
+        assert!(tensor_values(logits).iter().all(|value| value.is_finite()));
+        assert!(state.layers[0].rho.is_some(), "fast GDN2 state");
+        assert!(state.layers[0].slow_rho.is_some(), "slow GDN2 state");
+    }
+
+    #[test]
     fn widen_latent_total_supports_linear_attention() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let source_config = tiny_scaling_source_config(SequenceKernelConfig::reference(
@@ -3964,6 +4744,36 @@ mod tests {
         assert_eq!(report.new_latent_total, 64);
         assert_eq!(widened.latent_total_capacity(), 64);
         assert_shared_lowrank_prefix_preserved(&source, &widened);
+        assert_widened_forward_matches_source(&source, &widened, 1.0e-5);
+        assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-5);
+        assert_widened_forward_is_finite(&widened);
+    }
+
+    #[test]
+    fn widen_latent_total_supports_split_hierarchical_dragon_weights() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut source_config = tiny_scaling_source_config(SequenceKernelConfig::reference(
+            SequenceMemorySystem::LinearAttention,
+        ));
+        source_config.hierarchical_dragon.enabled = true;
+        source_config.hierarchical_dragon.last_layers = Some(1);
+        source_config.hierarchical_dragon.fast_cycles = 1;
+        source_config.hierarchical_dragon.slow_cycles = 1;
+        source_config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        source_config.hierarchical_dragon.weight_sharing = HierarchicalDragonSharing::Split;
+        let target_config = DragonConfig {
+            mlp_internal_dim_multiplier: 4,
+            ..source_config.clone()
+        };
+        let source = DragonModel::<TestBackend>::new(source_config, &device);
+        let (widened, report) = source
+            .widen_latent_total(target_config.clone(), &device)
+            .expect("widen split hierarchy");
+
+        assert_eq!(report.old_latent_total, 32);
+        assert_eq!(report.new_latent_total, 64);
+        assert_shared_lowrank_prefix_preserved(&source, &widened);
+        assert_slow_lowrank_prefix_preserved(&source, &widened);
         assert_widened_forward_matches_source(&source, &widened, 1.0e-5);
         assert_widened_record_round_trip_matches_source(&source, &widened, target_config, 1.0e-5);
         assert_widened_forward_is_finite(&widened);

@@ -30,6 +30,14 @@
 - Avoid random/seed functions that create obvious periodic or moire artifacts. Validate distribution coverage and keep tests/smokes for sample sanity.
 - Metrics should surface difficulty, entropy, hash-noise, verifier failures, and learning progress in local runs, not only in P2P paths.
 
+## Experimental Accountability
+
+- Training, optimizer, architecture, dataset, continual-learning, and ruliad-pipeline changes must end with an explicit baseline comparison, matrix result, ablation, or experiment summary whenever feasible.
+- Do not treat tests and smokes alone as sufficient validation for learning-behavior changes. Tests prove mechanics; ablations prove direction.
+- When proposing or evaluating next steps, the expected output is a concrete ablation plan or completed ablation table with metrics, not a loose list of ideas.
+- Report the baseline, changed condition, run duration/steps, model scale, backend, batch/population settings, throughput, loss/validation/verifier metrics, and any observed failure mode.
+- If a full experiment is too expensive for the current turn, run the smallest meaningful smoke/matrix and state exactly what larger ablation remains unproven.
+
 ## Browser P2P Deployment Notes
 
 - Browser Pages config is not driven only by `BURN_DRAGON_P2P_PAGES_SEED_NODE_URLS`. The Pages build also derives browser seeds from the live edge, so seed bugs often require checking both the environment variable and `xtask/src/deploy_settings.rs`.

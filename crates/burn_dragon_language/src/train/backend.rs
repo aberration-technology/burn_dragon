@@ -727,6 +727,7 @@ where
         .with_dynamics_anchor(training.dynamics_anchor.clone())
         .with_predictive_coding(training.predictive_coding.clone())
         .with_latent_reasoning(training.latent_reasoning.clone())
+        .with_ruliad_supervision(training.ruliad_supervision)
         .with_tbptt_chunk_size(training.tbptt_chunk_size);
     let model = Some(prepared_model);
     let eggroll_chunk_autotune = if let Some(model_ref) = model.as_ref() {
@@ -1253,6 +1254,7 @@ where
         .with_dynamics_anchor(training.dynamics_anchor.clone())
         .with_predictive_coding(training.predictive_coding.clone())
         .with_latent_reasoning(training.latent_reasoning.clone())
+        .with_ruliad_supervision(training.ruliad_supervision)
         .with_pipeline_plan(pipeline_plan.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size)
         .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)

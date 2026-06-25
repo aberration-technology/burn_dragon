@@ -17,6 +17,18 @@ pub struct RuliadSampleTelemetry {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadCapabilityFeedback {
+    pub group_label: String,
+    pub item_count: usize,
+    pub verifier_rate: f32,
+    pub partial_credit_rate: f32,
+    pub schema_valid_wrong_rate: f32,
+    pub malformed_rate: f32,
+    pub missing_rate: f32,
+    pub completion_health_rate: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadMetricSnapshot {
     pub sample_count: usize,
     pub verifier_failures: usize,

@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ruliad::metrics::{
-    RuliadBucketMetric, RuliadGroupMetric, RuliadMetricSnapshot, RuliadSampleTelemetry,
+    RuliadBucketMetric, RuliadCapabilityFeedback, RuliadGroupMetric, RuliadMetricSnapshot,
+    RuliadSampleTelemetry,
 };
 
 const SNAPSHOT_TOP_BUCKET_COUNT: usize = 12;
@@ -310,6 +311,38 @@ impl RuliadFrontierSampler {
         }
     }
 
+    pub fn record_capability_feedback(&mut self, feedback: &RuliadCapabilityFeedback) {
+        if feedback.item_count == 0 {
+            return;
+        }
+        if !capability_feedback_can_update_sampler(feedback) {
+            return;
+        }
+        let target_loss = self.config.target_loss.max(1e-6);
+        let loss = capability_feedback_loss(feedback, target_loss);
+        let gradient_alignment = capability_feedback_alignment(feedback);
+        let promotion_weight = capability_feedback_promotion_weight(feedback);
+        if promotion_weight <= f32::EPSILON {
+            return;
+        }
+        for candidate in &mut self.candidates {
+            if !candidate_matches_capability_feedback(candidate, &feedback.group_label) {
+                continue;
+            }
+            let lowers_loss = loss < candidate.loss_ema;
+            if !lowers_loss {
+                continue;
+            }
+            let update_alpha = 0.15 * promotion_weight;
+            let previous_loss = candidate.loss_ema;
+            let next_loss = candidate.loss_ema * (1.0 - update_alpha) + loss * update_alpha;
+            candidate.previous_loss_ema = previous_loss;
+            candidate.loss_ema = next_loss;
+            candidate.gradient_alignment =
+                candidate.gradient_alignment * 0.85 + gradient_alignment * 0.15 * promotion_weight;
+        }
+    }
+
     pub fn snapshot(&self) -> RuliadMetricSnapshot {
         let probs = self.probabilities();
         self.snapshot_with_probabilities(&probs)
@@ -433,6 +466,85 @@ impl RuliadFrontierSampler {
 
 fn difficulty_gate(loss_ema: f32, target_loss: f32) -> f32 {
     1.0 / (1.0 + (loss_ema - target_loss).abs())
+}
+
+fn capability_feedback_structural_error(feedback: &RuliadCapabilityFeedback) -> f32 {
+    feedback.schema_valid_wrong_rate.clamp(0.0, 1.0)
+        + feedback.malformed_rate.clamp(0.0, 1.0) * 2.0
+        + feedback.missing_rate.clamp(0.0, 1.0) * 2.0
+        + (0.50 - feedback.completion_health_rate.clamp(0.0, 1.0)).max(0.0) * 2.0
+}
+
+fn capability_feedback_is_difficulty_group(feedback: &RuliadCapabilityFeedback) -> bool {
+    feedback.group_label.starts_with("difficulty:")
+}
+
+fn capability_feedback_can_update_sampler(feedback: &RuliadCapabilityFeedback) -> bool {
+    capability_feedback_is_difficulty_group(feedback)
+        && feedback.verifier_rate >= 0.05
+        && capability_feedback_structural_error(feedback) <= 0.35
+}
+
+fn capability_feedback_promotion_weight(feedback: &RuliadCapabilityFeedback) -> f32 {
+    let verifier = feedback.verifier_rate.clamp(0.0, 1.0);
+    let partial = feedback.partial_credit_rate.clamp(0.0, 1.0);
+    let schema_wrong = feedback.schema_valid_wrong_rate.clamp(0.0, 1.0);
+    let malformed = feedback.malformed_rate.clamp(0.0, 1.0);
+    let missing = feedback.missing_rate.clamp(0.0, 1.0);
+    let completion = feedback.completion_health_rate.clamp(0.0, 1.0);
+    let structurally_healthy =
+        completion >= 0.60 && malformed <= 0.05 && missing <= 0.05 && schema_wrong <= 0.25;
+    if !structurally_healthy {
+        return 0.0;
+    }
+    if verifier < 0.05 {
+        return 0.0;
+    }
+    (verifier * 2.0 + partial * 0.5).clamp(0.05, 1.0)
+}
+
+fn capability_feedback_loss(feedback: &RuliadCapabilityFeedback, target_loss: f32) -> f32 {
+    let verifier_gap = 1.0 - feedback.verifier_rate.clamp(0.0, 1.0);
+    let partial_credit = feedback.partial_credit_rate.clamp(0.0, 1.0);
+    target_loss * (0.75 + verifier_gap * 0.50 - partial_credit * 0.15).max(0.35)
+}
+
+fn capability_feedback_alignment(feedback: &RuliadCapabilityFeedback) -> f32 {
+    let structure_health = feedback.completion_health_rate.clamp(0.0, 1.0)
+        * (1.0 - feedback.malformed_rate.clamp(0.0, 1.0))
+        * (1.0 - feedback.missing_rate.clamp(0.0, 1.0))
+        * (1.0 - feedback.schema_valid_wrong_rate.clamp(0.0, 1.0));
+    let verifier = feedback.verifier_rate.clamp(0.0, 1.0);
+    let partial = if verifier >= 0.05 {
+        feedback.partial_credit_rate.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (structure_health * (verifier + partial * 0.25)).clamp(0.0, 1.0)
+}
+
+fn candidate_matches_capability_feedback(
+    candidate: &RuliadSamplerCandidate,
+    group_label: &str,
+) -> bool {
+    if let Some(difficulty) = group_label
+        .strip_prefix("difficulty:")
+        .and_then(|label| label.strip_prefix('d'))
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return candidate.difficulty_level == difficulty;
+    }
+    if let Some(family) = group_label.strip_prefix("family:") {
+        return candidate.family == family;
+    }
+    if let Some(task) = group_label.strip_prefix("task:") {
+        return candidate.task_kind == task
+            || format!("{}:{}", candidate.family, candidate.task_kind) == task;
+    }
+    if let Some(label) = group_label.strip_prefix("bucket:") {
+        return candidate.oracle_hash == label;
+    }
+    candidate.oracle_hash == group_label
 }
 
 fn top_bucket_metrics(
@@ -696,6 +808,241 @@ mod tests {
         let probs = sampler.probabilities();
         assert!(probs[0] > probs[1]);
         assert!(sampler.snapshot().hash_noise_probability < 0.5);
+    }
+
+    #[test]
+    fn capability_feedback_does_not_promote_structured_wrong_without_verifier() {
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![
+                RuliadSamplerCandidate {
+                    oracle_hash: "category:verify_category_law@d2#00000001".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "verify_category_law".to_string(),
+                    difficulty_level: 2,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+                RuliadSamplerCandidate {
+                    oracle_hash: "proof_tree:prove_theorem@d2#00000002".to_string(),
+                    family: "proof_tree".to_string(),
+                    task_kind: "prove_theorem".to_string(),
+                    difficulty_level: 2,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+            ],
+        );
+        let before = sampler.snapshot();
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: "family:category".to_string(),
+            item_count: 16,
+            verifier_rate: 0.0,
+            partial_credit_rate: 0.25,
+            schema_valid_wrong_rate: 0.05,
+            malformed_rate: 0.0,
+            missing_rate: 0.0,
+            completion_health_rate: 0.95,
+        });
+        let snapshot = sampler.snapshot();
+        let category = snapshot
+            .top_buckets
+            .iter()
+            .find(|bucket| bucket.family == "category")
+            .expect("category bucket");
+        let proof = snapshot
+            .top_buckets
+            .iter()
+            .find(|bucket| bucket.family == "proof_tree")
+            .expect("proof bucket");
+
+        assert!(
+            category.probability <= proof.probability,
+            "partial-only structured feedback should not promote a bucket before verifier signal"
+        );
+        assert_eq!(category.learning_progress, 0.0);
+        assert_eq!(snapshot.mean_difficulty_level, before.mean_difficulty_level);
+    }
+
+    #[test]
+    fn capability_feedback_ignores_malformed_non_difficulty_groups() {
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![RuliadSamplerCandidate {
+                oracle_hash: "category:verify_category_law@d1#00000001".to_string(),
+                family: "category".to_string(),
+                task_kind: "verify_category_law".to_string(),
+                difficulty_level: 1,
+                params_hash: String::new(),
+                prior: 1.0,
+                cost: 1.0,
+                loss_ema: 2.0,
+                previous_loss_ema: 2.0,
+                gradient_alignment: 0.0,
+                is_hash_noise: false,
+            }],
+        );
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: "task:verify_category_law".to_string(),
+            item_count: 16,
+            verifier_rate: 0.0,
+            partial_credit_rate: 0.0,
+            schema_valid_wrong_rate: 0.20,
+            malformed_rate: 0.40,
+            missing_rate: 0.10,
+            completion_health_rate: 0.30,
+        });
+        let candidate = sampler.candidates().first().expect("candidate");
+
+        assert_eq!(candidate.cost, 1.0);
+        assert_eq!(candidate.loss_ema, 2.0);
+        assert_eq!(candidate.previous_loss_ema, 2.0);
+    }
+
+    #[test]
+    fn zero_verifier_difficulty_feedback_does_not_advance_frontier() {
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                mastery_escape_weight: 0.0,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![
+                RuliadSamplerCandidate {
+                    oracle_hash: "category:verify_category_law@d0#00000001".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "verify_category_law".to_string(),
+                    difficulty_level: 0,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+                RuliadSamplerCandidate {
+                    oracle_hash: "category:verify_category_law@d12#00000002".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "verify_category_law".to_string(),
+                    difficulty_level: 12,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+            ],
+        );
+        let before = sampler.snapshot().mean_difficulty_level;
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: "difficulty:d12".to_string(),
+            item_count: 32,
+            verifier_rate: 0.0,
+            partial_credit_rate: 0.0,
+            schema_valid_wrong_rate: 0.0,
+            malformed_rate: 0.0,
+            missing_rate: 0.0,
+            completion_health_rate: 1.0,
+        });
+        let snapshot = sampler.snapshot();
+        let hard = sampler
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.difficulty_level == 12)
+            .expect("hard candidate");
+
+        assert!(
+            snapshot.mean_difficulty_level <= before,
+            "zero-verifier difficulty feedback should not raise mean difficulty: before={before} after={}",
+            snapshot.mean_difficulty_level
+        );
+        assert_eq!(hard.loss_ema, 8.0);
+        assert_eq!(hard.previous_loss_ema, 8.0);
+        assert_eq!(hard.cost, 1.0);
+    }
+
+    #[test]
+    fn verified_difficulty_feedback_can_advance_frontier() {
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                exploration_floor: 0.0,
+                target_loss: 2.0,
+                mastery_escape_weight: 0.0,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![
+                RuliadSamplerCandidate {
+                    oracle_hash: "category:verify_category_law@d0#00000001".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "verify_category_law".to_string(),
+                    difficulty_level: 0,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+                RuliadSamplerCandidate {
+                    oracle_hash: "category:verify_category_law@d12#00000002".to_string(),
+                    family: "category".to_string(),
+                    task_kind: "verify_category_law".to_string(),
+                    difficulty_level: 12,
+                    params_hash: String::new(),
+                    prior: 1.0,
+                    cost: 1.0,
+                    loss_ema: 8.0,
+                    previous_loss_ema: 8.0,
+                    gradient_alignment: 0.0,
+                    is_hash_noise: false,
+                },
+            ],
+        );
+        let before = sampler.snapshot().mean_difficulty_level;
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: "difficulty:d12".to_string(),
+            item_count: 32,
+            verifier_rate: 0.25,
+            partial_credit_rate: 0.25,
+            schema_valid_wrong_rate: 0.0,
+            malformed_rate: 0.0,
+            missing_rate: 0.0,
+            completion_health_rate: 1.0,
+        });
+        let snapshot = sampler.snapshot();
+
+        assert!(
+            snapshot.mean_difficulty_level > before,
+            "verified difficulty feedback should be able to advance mean difficulty: before={before} after={}",
+            snapshot.mean_difficulty_level
+        );
     }
 
     #[test]

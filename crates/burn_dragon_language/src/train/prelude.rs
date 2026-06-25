@@ -53,14 +53,16 @@ pub(crate) use serde::Serialize;
 pub(crate) use crate::config::{
     CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig, DragonStateConsistencyConfig,
     DynamicsAnchorConfig, DynamicsAnchorMask, GreedyRolloutUnlikelihoodConfig,
-    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LatentReasoningConstraintBalancerConfig,
-    LatentReasoningSigRegConfig, LatentReasoningSigRegTarget, LatentReasoningTrainingConfig,
+    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LatentReasoningAuxiliaryStartPolicy,
+    LatentReasoningConstraintBalancerConfig, LatentReasoningSigRegConfig,
+    LatentReasoningSigRegTarget, LatentReasoningTrainingConfig, LatentStepContractConfig,
     LogitEntropyFloorConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
     PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation, SdftObjectiveConfig,
-    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
-    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    ValidationDatasetConfig,
+    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
+    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadSupervisionConfig,
+    RuliadSupervisionMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
 };
 pub(crate) use crate::dataset::{
     Dataset, DatasetSplit, RandomDataLoader, SequenceBatch, StreamingDataLoader, build_dataset,

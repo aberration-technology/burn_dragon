@@ -28,6 +28,10 @@ checkpoint_interval_iters = 2048
 log_frequency = 64
 seed = 1337
 
+[training.ruliad_supervision]
+mode = "answer_completion"
+mask_high_entropy_spans = true
+
 [training.auto_batch_size]
 enabled = true
 min_batch_size = 4

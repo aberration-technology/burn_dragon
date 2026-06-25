@@ -12,7 +12,8 @@ use crate::ruliad::eval::RuliadEvalItem;
 use crate::ruliad::oracles::{
     GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
     compact_ruliad_label, default_proof_tasks, generate_sample, generate_sample_for_source_bucket,
-    load_proof_tasks, ruliad_expected_answer, ruliad_prompt_prefix,
+    load_proof_tasks, ruliad_answer_contract, ruliad_answer_values, ruliad_expected_answer,
+    ruliad_prompt_prefix,
 };
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::search::RuliadSamplerCandidate;
@@ -38,6 +39,7 @@ pub struct RuliadRuntimeSampleDocument {
     pub verifier_version: u32,
     pub math_domains: Vec<String>,
     pub reasoning_modes: Vec<String>,
+    pub source_difficulty_level: Option<usize>,
     pub token_count: usize,
     pub tokens: Vec<u32>,
     pub serialized_preview: String,
@@ -218,6 +220,7 @@ impl OnlineRuliadCorpus {
             match result {
                 Ok(mut document) => {
                     document.sample_index = sample_index;
+                    document.source_difficulty_level = Some(bucket.id.difficulty_level);
                     return Ok(document);
                 }
                 Err(error) if is_document_payload_capacity_error(&error) => {
@@ -362,7 +365,9 @@ impl OnlineRuliadCorpus {
             .cloned()
             .ok_or_else(|| anyhow!("multi-chunk ruliad source document has no root sample"))?;
         let text = multi_chunk_proof_tree_text(&samples);
-        self.document_from_sample_text(split, sample_index, root, text)
+        let mut document = self.document_from_sample_text(split, sample_index, root, text)?;
+        document.source_difficulty_level = Some(bucket.id.difficulty_level);
+        Ok(document)
     }
 
     fn document_from_sample_text(
@@ -419,6 +424,7 @@ impl OnlineRuliadCorpus {
             verifier_version: sample.verifier_version,
             math_domains,
             reasoning_modes,
+            source_difficulty_level: None,
             token_count,
             tokens,
             serialized_preview: text,
@@ -554,10 +560,10 @@ fn multi_chunk_proof_tree_text(samples: &[GeneratedRuliadSample]) -> String {
         text.push('\n');
     }
     text.push_str(&format!(
-        "?:root {}\n!:{};nodes={}\n[/R2]\n",
+        "?:root {}\nA:{}\n!:{}\n[/R2]\n",
         compact_runtime_text(root_view.query.as_str(), 96),
-        compact_runtime_text(root_view.answer.as_str(), 96),
-        samples.len()
+        ruliad_answer_contract(&root.spec),
+        compact_runtime_text(&ruliad_answer_values(&root.spec), 96)
     ));
     text
 }
@@ -726,6 +732,7 @@ fn eval_item_from_document(document: RuliadRuntimeSampleDocument) -> RuliadEvalI
         reasoning_modes: document.reasoning_modes,
         prompt,
         expected_answer,
+        difficulty_level: document.source_difficulty_level,
         spec: Some(document.spec),
     }
 }
@@ -821,6 +828,18 @@ mod tests {
         assert!(doc.serialized_preview.contains("k=0;rem=2;phase=first"));
         assert!(doc.serialized_preview.contains("k=1;rem=1;phase=mid"));
         assert!(doc.serialized_preview.contains("k=2;rem=0;phase=last"));
+        assert!(
+            !doc.serialized_preview.contains(";nodes="),
+            "multi-chunk root answers must use the canonical compact answer dialect"
+        );
+        assert!(
+            doc.serialized_preview.contains("\nA:"),
+            "multi-chunk root prompts must expose the canonical answer-key contract"
+        );
+        assert!(
+            doc.serialized_preview.find("\nA:") < doc.serialized_preview.find("\n!:"),
+            "multi-chunk root answer-key contract must precede the answer slot"
+        );
         assert!(doc.serialized_preview.contains("[/R2]"));
     }
 

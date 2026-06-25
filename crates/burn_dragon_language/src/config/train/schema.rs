@@ -621,6 +621,15 @@ pub enum LatentReasoningTargetEncoder {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum LatentReasoningAuxiliaryStartPolicy {
+    #[default]
+    FixedStep,
+    CapabilityGate,
+    FixedStepAndCapabilityGate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum LatentReasoningNegativeSource {
     #[default]
     InBatchAndCorruptAnswer,
@@ -635,6 +644,8 @@ pub struct LatentReasoningSigRegConfig {
     pub every_steps: Option<usize>,
     #[serde(default)]
     pub start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
     pub mode: LatentReasoningSigRegMode,
     pub target: LatentReasoningSigRegTarget,
     pub target_variance: f32,
@@ -649,6 +660,7 @@ impl Default for LatentReasoningSigRegConfig {
             enabled: true,
             every_steps: None,
             start_after_steps: None,
+            start_policy: None,
             mode: LatentReasoningSigRegMode::default(),
             target: LatentReasoningSigRegTarget::default(),
             target_variance: 1.0,
@@ -707,6 +719,8 @@ pub struct NextLatentPredictionConfig {
     pub every_steps: Option<usize>,
     #[serde(default)]
     pub start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
     pub horizon: usize,
     pub regression_weight: f32,
     pub token_kl_weight: f32,
@@ -720,6 +734,7 @@ impl Default for NextLatentPredictionConfig {
             enabled: false,
             every_steps: None,
             start_after_steps: None,
+            start_policy: None,
             horizon: 1,
             regression_weight: 1.0,
             token_kl_weight: 0.0,
@@ -737,6 +752,8 @@ pub struct DragonStateConsistencyConfig {
     pub every_steps: Option<usize>,
     #[serde(default)]
     pub start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
     pub rho_weight: f32,
     pub rho_energy_weight: f32,
     pub smooth_l1_beta: f32,
@@ -749,6 +766,7 @@ impl Default for DragonStateConsistencyConfig {
             enabled: false,
             every_steps: None,
             start_after_steps: None,
+            start_policy: None,
             rho_weight: 1.0,
             rho_energy_weight: 0.25,
             smooth_l1_beta: 1.0,
@@ -759,13 +777,93 @@ impl Default for DragonStateConsistencyConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
+pub struct LatentEnergyModelConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub every_steps: Option<usize>,
+    #[serde(default)]
+    pub start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
+    pub contrastive_weight: f32,
+    pub monotonic_weight: f32,
+    pub contractive_weight: f32,
+    pub margin: f32,
+    pub monotonic_tolerance: f32,
+    pub trust_radius: f32,
+    pub max_rollout_steps_for_loss: usize,
+}
+
+impl Default for LatentEnergyModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: None,
+            start_after_steps: None,
+            start_policy: None,
+            contrastive_weight: 1.0,
+            monotonic_weight: 0.25,
+            contractive_weight: 0.05,
+            margin: 1.0,
+            monotonic_tolerance: 0.0,
+            trust_radius: 1.0,
+            max_rollout_steps_for_loss: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LatentStepContractConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub every_steps: Option<usize>,
+    #[serde(default)]
+    pub start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
+    pub max_rollout_steps_for_loss: usize,
+    pub ce_weight: f32,
+    pub token_kl_weight: f32,
+    pub monotonic_ce_weight: f32,
+    pub contractive_weight: f32,
+    pub ce_tolerance: f32,
+    pub trust_radius: f32,
+}
+
+impl Default for LatentStepContractConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: None,
+            start_after_steps: None,
+            start_policy: None,
+            max_rollout_steps_for_loss: 4,
+            ce_weight: 0.0,
+            token_kl_weight: 0.0,
+            monotonic_ce_weight: 1.0,
+            contractive_weight: 0.05,
+            ce_tolerance: 0.0,
+            trust_radius: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
 pub struct LatentReasoningTrainingConfig {
     pub enabled: bool,
     pub every_steps: usize,
     #[serde(default)]
+    pub start_after_capability_gate_passed: bool,
+    #[serde(default)]
+    pub eval_step_sweep: Vec<usize>,
+    #[serde(default)]
     pub jepa_every_steps: Option<usize>,
     #[serde(default)]
     pub jepa_start_after_steps: Option<usize>,
+    #[serde(default)]
+    pub jepa_start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
     #[serde(default = "default_latent_reasoning_future_offsets")]
     pub jepa_future_offsets: Vec<usize>,
     pub target_encoder: LatentReasoningTargetEncoder,
@@ -774,6 +872,8 @@ pub struct LatentReasoningTrainingConfig {
     pub negative_source: LatentReasoningNegativeSource,
     pub next_latent: NextLatentPredictionConfig,
     pub dragon_state: DragonStateConsistencyConfig,
+    pub energy_model: LatentEnergyModelConfig,
+    pub step_contract: LatentStepContractConfig,
     pub sigreg: LatentReasoningSigRegConfig,
     pub constraint_balancer: LatentReasoningConstraintBalancerConfig,
 }
@@ -783,14 +883,19 @@ impl Default for LatentReasoningTrainingConfig {
         Self {
             enabled: false,
             every_steps: 1,
+            start_after_capability_gate_passed: false,
+            eval_step_sweep: Vec::new(),
             jepa_every_steps: None,
             jepa_start_after_steps: None,
+            jepa_start_policy: None,
             jepa_future_offsets: default_latent_reasoning_future_offsets(),
             target_encoder: LatentReasoningTargetEncoder::default(),
             teacher_update_rate: default_latent_reasoning_teacher_update_rate(),
             negative_source: LatentReasoningNegativeSource::default(),
             next_latent: NextLatentPredictionConfig::default(),
             dragon_state: DragonStateConsistencyConfig::default(),
+            energy_model: LatentEnergyModelConfig::default(),
+            step_contract: LatentStepContractConfig::default(),
             sigreg: LatentReasoningSigRegConfig::default(),
             constraint_balancer: LatentReasoningConstraintBalancerConfig::default(),
         }
@@ -903,11 +1008,26 @@ impl RuliadSupervisionMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct RuliadSupervisionConfig {
     pub mode: RuliadSupervisionMode,
     pub mask_high_entropy_spans: bool,
+    pub answer_close_marker_stride: usize,
+    pub answer_ranking: RuliadAnswerRankingConfig,
+    pub answer_denoising: RuliadAnswerDenoisingConfig,
+}
+
+impl Default for RuliadSupervisionConfig {
+    fn default() -> Self {
+        Self {
+            mode: RuliadSupervisionMode::default(),
+            mask_high_entropy_spans: false,
+            answer_close_marker_stride: 1,
+            answer_ranking: RuliadAnswerRankingConfig::default(),
+            answer_denoising: RuliadAnswerDenoisingConfig::default(),
+        }
+    }
 }
 
 impl RuliadSupervisionConfig {
@@ -927,6 +1047,46 @@ impl RuliadSupervisionConfig {
     ) -> bool {
         self.mode
             .prefer_answer_window(validation, epoch_index, absolute_step)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadAnswerRankingConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub margin: f32,
+    pub corrupt_offset: i64,
+}
+
+impl Default for RuliadAnswerRankingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.25,
+            margin: 0.5,
+            corrupt_offset: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadAnswerDenoisingConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub probability: f32,
+    pub corrupt_offset: i64,
+}
+
+impl Default for RuliadAnswerDenoisingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.5,
+            probability: 1.0,
+            corrupt_offset: 1,
+        }
     }
 }
 

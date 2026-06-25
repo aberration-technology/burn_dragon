@@ -1,4 +1,5 @@
 pub use burn_ecs::{
+    CapabilityProbeExample, CapabilityProbeGroupMetric, CapabilityProbeSample,
     CapacityPlateauDetected, CapacityPlateauPlugin, CapacityPlateauState, CapacityScalingPolicy,
     CheckpointEvent, ContinualBackpropSample, ControlRequest, DynamicsControlEvent,
     DynamicsEquilibriumPlugin, DynamicsEquilibriumPolicy, DynamicsEquilibriumState, DynamicsMode,

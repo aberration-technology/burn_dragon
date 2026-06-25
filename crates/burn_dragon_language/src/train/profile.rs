@@ -50,6 +50,8 @@ pub(crate) struct LatentReasoningProfileSnapshot {
     pub next_latent_components: usize,
     pub dragon_state_components: usize,
     pub jepa_components: usize,
+    pub energy_model_components: usize,
+    pub step_contract_components: usize,
     pub sigreg_components: usize,
     pub configured_steps_sum: usize,
     pub configured_steps_samples: usize,
@@ -61,6 +63,8 @@ impl LatentReasoningProfileSnapshot {
             || self.next_latent_components > 0
             || self.dragon_state_components > 0
             || self.jepa_components > 0
+            || self.energy_model_components > 0
+            || self.step_contract_components > 0
             || self.sigreg_components > 0
     }
 
@@ -298,6 +302,8 @@ pub(crate) fn record_latent_reasoning(
     next_latent_components: usize,
     dragon_state_components: usize,
     jepa_components: usize,
+    energy_model_components: usize,
+    step_contract_components: usize,
     sigreg_components: usize,
     configured_steps: usize,
 ) {
@@ -311,6 +317,12 @@ pub(crate) fn record_latent_reasoning(
             .dragon_state_components
             .saturating_add(dragon_state_components);
         latent.jepa_components = latent.jepa_components.saturating_add(jepa_components);
+        latent.energy_model_components = latent
+            .energy_model_components
+            .saturating_add(energy_model_components);
+        latent.step_contract_components = latent
+            .step_contract_components
+            .saturating_add(step_contract_components);
         latent.sigreg_components = latent.sigreg_components.saturating_add(sigreg_components);
         latent.configured_steps_sum = latent.configured_steps_sum.saturating_add(configured_steps);
         latent.configured_steps_samples = latent.configured_steps_samples.saturating_add(1);

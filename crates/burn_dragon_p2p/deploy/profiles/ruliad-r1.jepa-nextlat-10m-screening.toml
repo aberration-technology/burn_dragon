@@ -1,0 +1,13 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-probe128-fixed-ablation.toml"]
+
+[training.events]
+flush_every_steps = 1
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 64
+
+[training.gates]
+capability_zero_verifier_patience_epochs = 8
+capability_schema_wrong_max_rate = 0.50
+capability_output_entropy_min_bits = 1.25
+capability_distinct_2_min_fraction = 0.30

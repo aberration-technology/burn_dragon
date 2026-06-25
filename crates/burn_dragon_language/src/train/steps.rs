@@ -669,6 +669,47 @@ fn scalar_tensor_to_f64<B: BackendTrait>(tensor: Tensor<B, 1>) -> f64 {
     values.first().copied().unwrap_or(0.0) as f64
 }
 
+fn latent_energy_contrastive_margin_loss<B: BackendTrait>(
+    positive_energy: Tensor<B, 3>,
+    negative_energy: Tensor<B, 3>,
+    margin: f32,
+) -> Tensor<B, 1> {
+    activation::softplus(positive_energy - negative_energy + margin.max(0.0), 1.0)
+        .mean()
+        .reshape([1])
+}
+
+fn latent_energy_monotonic_penalty<B: BackendTrait>(
+    previous_energy: Tensor<B, 3>,
+    current_energy: Tensor<B, 3>,
+    tolerance: f32,
+) -> Tensor<B, 1> {
+    (current_energy - previous_energy.detach())
+        .add_scalar(-tolerance.max(0.0))
+        .clamp_min(0.0)
+        .mean()
+        .reshape([1])
+}
+
+fn latent_energy_contractivity_penalty<B: BackendTrait>(
+    state: Tensor<B, 3>,
+    target: Tensor<B, 3>,
+    trust_radius: f32,
+) -> Tensor<B, 1> {
+    let target_scale = target
+        .clone()
+        .powf_scalar(2.0)
+        .mean()
+        .sqrt()
+        .reshape([1])
+        .detach()
+        .clamp_min(1.0e-6);
+    let delta_rms = (state - target).powf_scalar(2.0).mean().sqrt().reshape([1]);
+    (delta_rms / target_scale)
+        .add_scalar(-trust_radius.max(0.0))
+        .clamp_min(0.0)
+}
+
 #[derive(Module, Debug)]
 pub struct LanguageTrainModel<B: BackendTrait> {
     pub model: DragonModel<B>,
@@ -693,6 +734,10 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     predictive_coding: PredictiveCodingConfig,
     #[module(skip)]
     latent_reasoning: LatentReasoningTrainingConfig,
+    #[module(skip)]
+    ruliad_supervision: RuliadSupervisionConfig,
+    #[module(skip)]
+    latent_reasoning_capability_gate_open: Arc<AtomicBool>,
     #[module(skip)]
     greedy_rollout_recovery_active: Arc<AtomicBool>,
     #[module(skip)]
@@ -726,6 +771,26 @@ pub(crate) struct OutputDegeneracyStats {
     pub prompt_dominant_period_2_to_64: usize,
     pub prompt_tokens: Vec<i64>,
     pub generated_tokens: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LatentReasoningStepDiagnostics {
+    pub raw_loss: f64,
+    pub final_loss: f64,
+    pub raw_entropy_bits: f64,
+    pub final_entropy_bits: f64,
+    pub final_delta_rms: f64,
+    pub final_raw_cosine: f64,
+    pub step_loss: Vec<f64>,
+    pub step_ce_delta: Vec<f64>,
+    pub step_ce_monotonic_violation_rate: Vec<f64>,
+    pub step_entropy_bits: Vec<f64>,
+    pub step_delta_rms: Vec<f64>,
+    pub step_raw_cosine: Vec<f64>,
+    pub step_energy_mean: Vec<f64>,
+    pub step_energy_delta: Vec<f64>,
+    pub step_energy_monotonic_violation_rate: Vec<f64>,
+    pub best_energy_step: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -849,6 +914,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             dynamics_anchor: DynamicsAnchorConfig::default(),
             predictive_coding: PredictiveCodingConfig::default(),
             latent_reasoning: LatentReasoningTrainingConfig::default(),
+            ruliad_supervision: RuliadSupervisionConfig::default(),
+            latent_reasoning_capability_gate_open: Arc::new(AtomicBool::new(false)),
             greedy_rollout_recovery_active: Arc::new(AtomicBool::new(false)),
             teacher_model: None,
             streaming_runtime_key: next_streaming_runtime_key(),
@@ -959,9 +1026,19 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub fn with_ruliad_supervision(mut self, config: RuliadSupervisionConfig) -> Self {
+        self.ruliad_supervision = config;
+        self
+    }
+
     pub fn set_recovery_auxiliary_active(&self, active: bool) {
         self.greedy_rollout_recovery_active
             .store(active, Ordering::Relaxed);
+    }
+
+    pub fn set_latent_reasoning_capability_gate_open(&self, open: bool) {
+        self.latent_reasoning_capability_gate_open
+            .store(open, Ordering::Relaxed);
     }
 
     pub fn with_gradient_scale_schedule(
@@ -1097,14 +1174,30 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         targets: Tensor<B, 2, Int>,
         loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 1> {
+        self.language_loss_from_hidden_for_latent_step(
+            hidden,
+            targets,
+            loss_mask,
+            self.model.latent_reasoning_config().max_steps,
+        )
+    }
+
+    fn language_loss_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        step: usize,
+    ) -> Tensor<B, 1> {
         if let Some(mask) = loss_mask {
             return masked_token_mean(
                 self.model
-                    .language_token_losses_from_hidden(hidden, targets),
+                    .language_token_losses_from_hidden_for_latent_step(hidden, targets, step),
                 Some(mask),
             );
         }
-        self.model.language_loss_from_hidden(hidden, targets)
+        self.model
+            .language_loss_from_hidden_for_latent_step(hidden, targets, step)
     }
 
     fn language_loss_from_logits(
@@ -1275,6 +1368,140 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let loss_value: LossValue<B> = output.adapt();
         let stats = self.output_degeneracy_for_batch(batch, probe_tokens, eos_id);
         (loss_value.value(), stats)
+    }
+
+    pub(crate) fn latent_reasoning_step_diagnostics(
+        &self,
+        batch: SequenceBatch<B>,
+    ) -> Option<LatentReasoningStepDiagnostics> {
+        if !self.model.latent_reasoning_enabled()
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+        {
+            return None;
+        }
+        let raw = self.model.forward_hidden_raw(batch.inputs);
+        let output = self.model.reason_hidden(raw.clone());
+        if output.step_hiddens.is_empty() {
+            return None;
+        }
+        let raw_loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+            raw.clone(),
+            batch.targets.clone(),
+            batch.loss_mask.clone(),
+            0,
+        ));
+        let raw_entropy_bits = self.hidden_entropy_bits_for_latent_step(raw.clone(), 0);
+        let final_loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+            output.final_hidden.clone(),
+            batch.targets.clone(),
+            batch.loss_mask.clone(),
+            output.steps_used,
+        ));
+        let final_entropy_bits = self
+            .hidden_entropy_bits_for_latent_step(output.final_hidden.clone(), output.steps_used);
+        let final_delta_rms = Self::tensor_delta_rms(raw.clone(), output.final_hidden.clone());
+        let final_raw_cosine = Self::tensor_cosine(raw.clone(), output.final_hidden.clone());
+        let mut previous = raw.clone();
+        let mut previous_ce = raw_loss;
+        let mut step_loss = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_ce_delta = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_ce_monotonic_violation_rate = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_entropy_bits = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_delta_rms = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_raw_cosine = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_energy_mean = Vec::with_capacity(output.energies.len());
+        let mut step_energy_delta = Vec::with_capacity(output.energies.len());
+        let mut step_energy_monotonic_violation_rate = Vec::with_capacity(output.energies.len());
+        let mut previous_energy = self.model.latent_energy_from_hidden(raw.clone());
+        for (index, hidden) in output.step_hiddens.into_iter().enumerate() {
+            let step = index.saturating_add(1);
+            let loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+                hidden.clone(),
+                batch.targets.clone(),
+                batch.loss_mask.clone(),
+                step,
+            ));
+            let ce_delta = loss - previous_ce;
+            step_loss.push(loss);
+            step_ce_delta.push(ce_delta);
+            step_ce_monotonic_violation_rate.push(f64::from(ce_delta > 1.0e-6));
+            previous_ce = loss;
+            step_entropy_bits.push(self.hidden_entropy_bits_for_latent_step(hidden.clone(), step));
+            step_delta_rms.push(Self::tensor_delta_rms(previous.clone(), hidden.clone()));
+            step_raw_cosine.push(Self::tensor_cosine(raw.clone(), hidden.clone()));
+            previous = hidden;
+            if let Some(energy) = output.energies.get(index) {
+                step_energy_mean.push(scalar_tensor_to_f64(energy.clone().mean().reshape([1])));
+                if let Some(prev_energy) = previous_energy.as_ref() {
+                    let energy_delta = energy.clone() - prev_energy.clone();
+                    step_energy_delta.push(scalar_tensor_to_f64(
+                        energy_delta.clone().mean().reshape([1]),
+                    ));
+                    let violations = energy_delta.greater_elem(0.0).float().mean().reshape([1]);
+                    step_energy_monotonic_violation_rate.push(scalar_tensor_to_f64(violations));
+                }
+                previous_energy = Some(energy.clone());
+            }
+        }
+        let best_energy_step = step_energy_mean
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| value.is_finite())
+            .min_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+            .map(|(index, _)| index.saturating_add(1));
+        Some(LatentReasoningStepDiagnostics {
+            raw_loss,
+            final_loss,
+            raw_entropy_bits,
+            final_entropy_bits,
+            final_delta_rms,
+            final_raw_cosine,
+            step_loss,
+            step_ce_delta,
+            step_ce_monotonic_violation_rate,
+            step_entropy_bits,
+            step_delta_rms,
+            step_raw_cosine,
+            step_energy_mean,
+            step_energy_delta,
+            step_energy_monotonic_violation_rate,
+            best_energy_step,
+        })
+    }
+
+    fn hidden_entropy_bits(&self, hidden: Tensor<B, 3>) -> f64 {
+        self.hidden_entropy_bits_for_latent_step(
+            hidden,
+            self.model.latent_reasoning_config().max_steps,
+        )
+    }
+
+    fn hidden_entropy_bits_for_latent_step(&self, hidden: Tensor<B, 3>, step: usize) -> f64 {
+        let logits = self.model.logits_from_hidden_for_latent_step(hidden, step);
+        let [batch, time, vocab] = logits.shape().dims::<3>();
+        if batch == 0 || time == 0 || vocab == 0 {
+            return 0.0;
+        }
+        let log_probs = activation::log_softmax(logits.reshape([batch * time, vocab]), 1);
+        let entropy = (log_probs.clone().exp() * log_probs)
+            .sum_dim(1)
+            .mean()
+            .mul_scalar(-1.0 / std::f32::consts::LN_2);
+        scalar_tensor_to_f64(entropy.reshape([1]))
+    }
+
+    fn tensor_delta_rms(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>) -> f64 {
+        scalar_tensor_to_f64((rhs - lhs).powf_scalar(2.0).mean().sqrt().reshape([1]))
+    }
+
+    fn tensor_cosine(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>) -> f64 {
+        let dot = scalar_tensor_to_f64((lhs.clone() * rhs.clone()).mean().reshape([1]));
+        let lhs_rms = scalar_tensor_to_f64(lhs.powf_scalar(2.0).mean().sqrt().reshape([1]));
+        let rhs_rms = scalar_tensor_to_f64(rhs.powf_scalar(2.0).mean().sqrt().reshape([1]));
+        let denom = (lhs_rms * rhs_rms).max(1.0e-12);
+        dot / denom
     }
 
     fn output_degeneracy_for_batch(
@@ -1879,6 +2106,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let log_probs = log_probs_from_logits(logits.clone());
         let mut loss =
             next_token_loss_from_log_probs(log_probs.clone(), targets.clone(), loss_mask.clone());
+        if let Some(answer_ranking_loss) = self.ruliad_answer_ranking_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            loss_mask.clone(),
+        ) {
+            loss = loss + answer_ranking_loss;
+        }
         let weight = self.repeat_unlikelihood_weight();
         let cycle_weight = self.repeat_cycle_weight();
         let cycle_margin_weight = self.repeat_cycle_margin_weight();
@@ -2099,26 +2333,148 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             && self.logit_entropy_floor_weight() <= f32::EPSILON
             && self.logit_marginal_entropy_floor_weight() <= f32::EPSILON
             && self.logit_target_coverage_weight() <= f32::EPSILON
+            && self.ruliad_answer_ranking_weight() <= f32::EPSILON
+            && self.ruliad_answer_denoising_weight() <= f32::EPSILON
             && dynamics_teacher_logits.is_none())
             || self.model.uses_factorized_language_head()
         {
-            let loss = self.language_loss_from_hidden(hidden.clone(), targets, loss_mask);
-            return self
-                .latent_reasoning_auxiliary_loss(hidden, clean_inputs)
-                .map(|aux| loss.clone() + aux)
-                .unwrap_or(loss);
+            let mut loss =
+                self.language_loss_from_hidden(hidden.clone(), targets.clone(), loss_mask.clone());
+            if let Some(aux) = self.latent_reasoning_auxiliary_loss(
+                hidden,
+                clean_inputs.clone(),
+                Some(targets.clone()),
+                loss_mask.clone(),
+            ) {
+                loss = loss + aux;
+            }
+            if let Some(denoising) =
+                self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
+            {
+                loss = loss + denoising;
+            }
+            return loss;
         }
         let logits = self.model.logits_from_hidden(hidden.clone());
-        let loss = self.next_token_loss_from_logits(
+        let mut loss = self.next_token_loss_from_logits(
             logits,
-            targets,
+            targets.clone(),
             clean_inputs.clone(),
-            loss_mask,
+            loss_mask.clone(),
             dynamics_teacher_logits,
         );
-        self.latent_reasoning_auxiliary_loss(hidden, clean_inputs)
-            .map(|aux| loss.clone() + aux)
-            .unwrap_or(loss)
+        if let Some(aux) = self.latent_reasoning_auxiliary_loss(
+            hidden,
+            clean_inputs.clone(),
+            Some(targets.clone()),
+            loss_mask.clone(),
+        ) {
+            loss = loss + aux;
+        }
+        if let Some(denoising) = self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
+        {
+            loss = loss + denoising;
+        }
+        loss
+    }
+
+    fn ruliad_answer_ranking_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_ranking;
+        if config.enabled {
+            config.weight.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn ruliad_answer_ranking_loss_from_logits(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_ranking;
+        let weight = self.ruliad_answer_ranking_weight();
+        if weight <= f32::EPSILON {
+            return None;
+        }
+        let mask = loss_mask?;
+        let [batch, time, vocab] = logits.shape().dims();
+        if batch == 0 || time == 0 || vocab <= 1 {
+            return None;
+        }
+        let offset = (config.corrupt_offset % vocab as i64).max(1);
+        let corrupt_targets = targets
+            .clone()
+            .add_scalar(offset)
+            .remainder_scalar(vocab as i64);
+        let oracle_logits = selected_token_logits(logits.clone(), targets);
+        let corrupt_logits = selected_token_logits(logits, corrupt_targets);
+        let penalty =
+            activation::softplus(corrupt_logits - oracle_logits + config.margin.max(0.0), 1.0);
+        Some(masked_token_mean(penalty, Some(mask)).mul_scalar(weight))
+    }
+
+    fn ruliad_answer_denoising_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_denoising;
+        if config.enabled {
+            config.weight.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn ruliad_answer_denoising_loss(
+        &self,
+        clean_inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_denoising;
+        let weight = self.ruliad_answer_denoising_weight();
+        if weight <= f32::EPSILON || self.pipeline_enabled() {
+            return None;
+        }
+        let mask = loss_mask?;
+        let prefix_mask = answer_prefix_input_mask(mask.clone());
+        let corrupted_inputs =
+            self.corrupt_ruliad_answer_prefix_inputs(clean_inputs, prefix_mask, config);
+        let hidden = self.model.forward_hidden(corrupted_inputs);
+        Some(
+            self.language_loss_from_hidden(hidden, targets, Some(mask))
+                .mul_scalar(weight),
+        )
+    }
+
+    fn corrupt_ruliad_answer_prefix_inputs(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        prefix_mask: Tensor<B, 2, Int>,
+        config: RuliadAnswerDenoisingConfig,
+    ) -> Tensor<B, 2, Int> {
+        let probability = config.probability.clamp(0.0, 1.0);
+        if probability <= f32::EPSILON {
+            return inputs;
+        }
+        let [batch, time] = inputs.shape().dims();
+        if batch == 0 || time == 0 || self.input_vocab_size <= 1 {
+            return inputs;
+        }
+        let vocab = self.input_vocab_size as i64;
+        let offset = (config.corrupt_offset % vocab).max(1);
+        let mut mask = prefix_mask.equal_elem(1);
+        if probability < 1.0 {
+            let device = inputs.device();
+            let keep = Tensor::<B, 2>::random(
+                [batch, time],
+                TensorDistribution::Uniform(0.0, 1.0),
+                &device,
+            )
+            .lower_elem(probability);
+            mask = mask.bool_and(keep);
+        }
+        let replacements = inputs.clone().add_scalar(offset).remainder_scalar(vocab);
+        inputs.mask_where(mask, replacements)
     }
 
     fn latent_reasoning_target_hidden(
@@ -2430,6 +2786,231 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         )
     }
 
+    fn latent_energy_model_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        target_hidden: Tensor<B, 3>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.energy_model;
+        if !config.enabled || !self.model.latent_reasoning_enabled() {
+            return (None, 0);
+        }
+        let contrastive_weight = config.contrastive_weight.max(0.0);
+        let monotonic_weight = config.monotonic_weight.max(0.0);
+        let contractive_weight = config.contractive_weight.max(0.0);
+        if contrastive_weight <= f32::EPSILON
+            && monotonic_weight <= f32::EPSILON
+            && contractive_weight <= f32::EPSILON
+        {
+            return (None, 0);
+        }
+        let Some(mut previous_energy) = self.model.latent_energy_from_hidden(hidden.clone()) else {
+            return (None, 0);
+        };
+        let output = self.model.reason_hidden(hidden);
+        if output.step_hiddens.is_empty() || output.energies.is_empty() {
+            return (None, 0);
+        }
+        let target = target_hidden.detach();
+        let negative = match self.latent_reasoning.negative_source {
+            crate::config::LatentReasoningNegativeSource::InBatchAndCorruptAnswer
+            | crate::config::LatentReasoningNegativeSource::TemporalShift => {
+                Self::shifted_latent_negative(target.clone()).detach()
+            }
+        };
+        let negative_energy = self.model.latent_energy_from_hidden(negative);
+        let step_limit = config
+            .max_rollout_steps_for_loss
+            .min(output.step_hiddens.len())
+            .min(output.energies.len());
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        for step_index in 0..step_limit {
+            let state = output
+                .step_hiddens
+                .get(step_index)
+                .expect("step hidden")
+                .clone();
+            let energy = output
+                .energies
+                .get(step_index)
+                .expect("step energy")
+                .clone();
+            if contrastive_weight > f32::EPSILON
+                && let Some(negative_energy) = negative_energy.as_ref()
+            {
+                let contrastive = latent_energy_contrastive_margin_loss(
+                    energy.clone(),
+                    negative_energy.clone(),
+                    config.margin,
+                )
+                .mul_scalar(contrastive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contrastive,
+                    None => contrastive,
+                });
+                components = components.saturating_add(1);
+            }
+            if monotonic_weight > f32::EPSILON {
+                let monotonic = latent_energy_monotonic_penalty(
+                    previous_energy.clone(),
+                    energy.clone(),
+                    config.monotonic_tolerance,
+                )
+                .mul_scalar(monotonic_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + monotonic,
+                    None => monotonic,
+                });
+                components = components.saturating_add(1);
+            }
+            if contractive_weight > f32::EPSILON {
+                let contractive =
+                    latent_energy_contractivity_penalty(state, target.clone(), config.trust_radius)
+                        .mul_scalar(contractive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contractive,
+                    None => contractive,
+                });
+                components = components.saturating_add(1);
+            }
+            previous_energy = energy;
+        }
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
+    fn latent_step_contract_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Option<Tensor<B, 2, Int>>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.step_contract;
+        if !config.enabled || !self.model.latent_reasoning_enabled() {
+            return (None, 0);
+        }
+        let ce_weight = config.ce_weight.max(0.0);
+        let token_kl_weight = config.token_kl_weight.max(0.0);
+        let monotonic_ce_weight = config.monotonic_ce_weight.max(0.0);
+        let contractive_weight = config.contractive_weight.max(0.0);
+        if ce_weight <= f32::EPSILON
+            && token_kl_weight <= f32::EPSILON
+            && monotonic_ce_weight <= f32::EPSILON
+            && contractive_weight <= f32::EPSILON
+        {
+            return (None, 0);
+        }
+
+        let output = self.model.reason_hidden(hidden.clone());
+        if output.step_hiddens.is_empty() {
+            return (None, 0);
+        }
+
+        let step_limit = config
+            .max_rollout_steps_for_loss
+            .max(1)
+            .min(output.step_hiddens.len());
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        let mut previous_hidden = hidden.clone().detach();
+        let mut previous_ce = targets.as_ref().map(|targets| {
+            self.language_loss_from_hidden_for_latent_step(
+                hidden.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                0,
+            )
+            .detach()
+        });
+        let reference_logits = (token_kl_weight > f32::EPSILON
+            && !self.model.uses_factorized_language_head())
+        .then(|| {
+            self.model
+                .logits_from_hidden_for_latent_step(output.final_hidden, output.steps_used)
+                .detach()
+        });
+
+        for (index, state) in output.step_hiddens.into_iter().take(step_limit).enumerate() {
+            let step = index.saturating_add(1);
+            let step_ce = targets.as_ref().map(|targets| {
+                self.language_loss_from_hidden_for_latent_step(
+                    state.clone(),
+                    targets.clone(),
+                    loss_mask.clone(),
+                    step,
+                )
+            });
+            if ce_weight > f32::EPSILON
+                && let Some(step_ce) = step_ce.as_ref()
+            {
+                let component = step_ce.clone().mul_scalar(ce_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + component,
+                    None => component,
+                });
+                components = components.saturating_add(1);
+            }
+            if monotonic_ce_weight > f32::EPSILON
+                && let (Some(step_ce), Some(previous_ce_value)) =
+                    (step_ce.as_ref(), previous_ce.as_ref())
+            {
+                let penalty = (step_ce.clone()
+                    - previous_ce_value
+                        .clone()
+                        .add_scalar(config.ce_tolerance.max(0.0)))
+                .clamp_min(0.0)
+                .mul_scalar(monotonic_ce_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + penalty,
+                    None => penalty,
+                });
+                components = components.saturating_add(1);
+            }
+            if token_kl_weight > f32::EPSILON
+                && let Some(reference_logits) = reference_logits.as_ref()
+            {
+                let step_logits = self
+                    .model
+                    .logits_from_hidden_for_latent_step(state.clone(), step);
+                let token_kl = crate::train::next_latent::token_kl_mean_from_logits(
+                    step_logits,
+                    reference_logits.clone(),
+                )
+                .mul_scalar(token_kl_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + token_kl,
+                    None => token_kl,
+                });
+                components = components.saturating_add(1);
+            }
+            if contractive_weight > f32::EPSILON {
+                let contractive = latent_energy_contractivity_penalty(
+                    state.clone(),
+                    previous_hidden.clone(),
+                    config.trust_radius,
+                )
+                .mul_scalar(contractive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contractive,
+                    None => contractive,
+                });
+                components = components.saturating_add(1);
+            }
+            previous_hidden = state.detach();
+            if let Some(step_ce) = step_ce {
+                previous_ce = Some(step_ce.detach());
+            }
+        }
+
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
     fn latent_reasoning_fallback_every_steps(&self) -> usize {
         self.latent_reasoning.every_steps.max(1)
     }
@@ -2451,6 +3032,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
     }
 
+    fn latent_reasoning_default_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        if self.latent_reasoning.start_after_capability_gate_passed {
+            LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        } else {
+            LatentReasoningAuxiliaryStartPolicy::FixedStep
+        }
+    }
+
+    fn latent_reasoning_jepa_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .jepa_start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
     fn latent_reasoning_next_latent_every_steps(&self) -> usize {
         self.latent_reasoning
             .next_latent
@@ -2464,6 +3059,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .next_latent
             .start_after_steps
             .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_next_latent_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .next_latent
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
     }
 
     fn latent_reasoning_dragon_state_every_steps(&self) -> usize {
@@ -2481,6 +3083,57 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
     }
 
+    fn latent_reasoning_dragon_state_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .dragon_state
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_energy_model_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .energy_model
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_energy_model_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .energy_model
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_energy_model_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .energy_model
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_step_contract_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .step_contract
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_step_contract_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .step_contract
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_step_contract_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .step_contract
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
     fn latent_reasoning_sigreg_every_steps(&self) -> usize {
         self.latent_reasoning
             .sigreg
@@ -2496,10 +3149,18 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
     }
 
+    fn latent_reasoning_sigreg_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .sigreg
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
     fn latent_reasoning_auxiliary_scale(&self) -> Option<f32> {
         self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_fallback_every_steps(),
             self.latent_reasoning_fallback_start_after_steps(),
+            self.latent_reasoning_default_start_policy(),
         )
     }
 
@@ -2507,6 +3168,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self.latent_reasoning_auxiliary_scale_for_schedule(
             every_steps,
             self.latent_reasoning_fallback_start_after_steps(),
+            self.latent_reasoning_default_start_policy(),
         )
     }
 
@@ -2514,13 +3176,31 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         &self,
         every_steps: usize,
         start_after_steps: usize,
+        start_policy: LatentReasoningAuxiliaryStartPolicy,
     ) -> Option<f32> {
         if !self.latent_reasoning.enabled {
             return None;
         }
+        let requires_capability = matches!(
+            start_policy,
+            LatentReasoningAuxiliaryStartPolicy::CapabilityGate
+                | LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        let requires_fixed_step = matches!(
+            start_policy,
+            LatentReasoningAuxiliaryStartPolicy::FixedStep
+                | LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        if requires_capability
+            && !self
+                .latent_reasoning_capability_gate_open
+                .load(Ordering::Relaxed)
+        {
+            return None;
+        }
         let step = self.gradient_scale_step.load(Ordering::Relaxed);
         let current_step = step.saturating_add(1);
-        if start_after_steps > 0 && current_step <= start_after_steps {
+        if requires_fixed_step && start_after_steps > 0 && current_step <= start_after_steps {
             return None;
         }
         let every_steps = every_steps.max(1);
@@ -2534,7 +3214,12 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .max(0.0);
         let warmup_steps = self.latent_reasoning.constraint_balancer.warmup_steps;
         if warmup_steps > 0 {
-            let active_step = current_step.saturating_sub(start_after_steps).max(1);
+            let warmup_start = if requires_fixed_step {
+                start_after_steps
+            } else {
+                0
+            };
+            let active_step = current_step.saturating_sub(warmup_start).max(1);
             let progress = (active_step as f32 / warmup_steps as f32).min(1.0);
             aux_scale *= progress;
         }
@@ -2545,9 +3230,12 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_sigreg_every_steps(),
             self.latent_reasoning_sigreg_start_after_steps(),
+            self.latent_reasoning_sigreg_start_policy(),
         )?;
         let loss = self.sigreg_loss_from_rho_memory_state(state)?;
         crate::train::profile::record_latent_reasoning(
+            0,
+            0,
             0,
             0,
             0,
@@ -2575,6 +3263,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_dragon_state_every_steps(),
             self.latent_reasoning_dragon_state_start_after_steps(),
+            self.latent_reasoning_dragon_state_start_policy(),
         )?;
         let teacher_state = teacher_state?;
         let (loss, components) = self.dragon_state_consistency_loss(student_state, teacher_state);
@@ -2582,6 +3271,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             crate::train::profile::record_latent_reasoning(
                 0,
                 components,
+                0,
+                0,
                 0,
                 0,
                 self.model.latent_reasoning_config().max_steps,
@@ -2605,29 +3296,50 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         &self,
         hidden: Tensor<B, 3>,
         clean_inputs: Tensor<B, 2, Int>,
+        targets: Option<Tensor<B, 2, Int>>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> Option<Tensor<B, 1>> {
         let next_latent_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_next_latent_every_steps(),
             self.latent_reasoning_next_latent_start_after_steps(),
+            self.latent_reasoning_next_latent_start_policy(),
         );
         let jepa_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_jepa_every_steps(),
             self.latent_reasoning_jepa_start_after_steps(),
+            self.latent_reasoning_jepa_start_policy(),
+        );
+        let energy_model_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_energy_model_every_steps(),
+            self.latent_reasoning_energy_model_start_after_steps(),
+            self.latent_reasoning_energy_model_start_policy(),
+        );
+        let step_contract_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_step_contract_every_steps(),
+            self.latent_reasoning_step_contract_start_after_steps(),
+            self.latent_reasoning_step_contract_start_policy(),
         );
         let sigreg_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
             self.latent_reasoning_sigreg_every_steps(),
             self.latent_reasoning_sigreg_start_after_steps(),
+            self.latent_reasoning_sigreg_start_policy(),
         );
-        if next_latent_aux_scale.is_none() && jepa_aux_scale.is_none() && sigreg_aux_scale.is_none()
+        if next_latent_aux_scale.is_none()
+            && jepa_aux_scale.is_none()
+            && energy_model_aux_scale.is_none()
+            && step_contract_aux_scale.is_none()
+            && sigreg_aux_scale.is_none()
         {
             return None;
         }
         let [batch, time, dim] = hidden.shape().dims();
-        if batch == 0 || time < 2 || dim == 0 {
+        if batch == 0 || time == 0 || dim == 0 {
             let aux_scale = sigreg_aux_scale?;
             let loss = self.sigreg_loss_from_hidden(hidden);
             if loss.is_some() {
                 crate::train::profile::record_latent_reasoning(
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -2692,6 +3404,34 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 jepa_components = jepa_components.saturating_add(1);
             }
         }
+        let mut energy_model_components = 0usize;
+        if let Some(energy_model_aux_scale) = energy_model_aux_scale {
+            let (energy_model_loss, active_components) =
+                self.latent_energy_model_auxiliary_loss(hidden.clone(), target_hidden.clone());
+            energy_model_components = active_components;
+            if let Some(energy_model_loss) = energy_model_loss {
+                let energy_model_loss = energy_model_loss.mul_scalar(energy_model_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + energy_model_loss,
+                    None => energy_model_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
+        let mut step_contract_components = 0usize;
+        if let Some(step_contract_aux_scale) = step_contract_aux_scale {
+            let (step_contract_loss, active_components) =
+                self.latent_step_contract_auxiliary_loss(hidden.clone(), targets, loss_mask);
+            step_contract_components = active_components;
+            if let Some(step_contract_loss) = step_contract_loss {
+                let step_contract_loss = step_contract_loss.mul_scalar(step_contract_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + step_contract_loss,
+                    None => step_contract_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
         let mut sigreg_components = 0usize;
         if let Some(sigreg_aux_scale) = sigreg_aux_scale
             && let Some(sigreg) = self.sigreg_loss_from_hidden(hidden)
@@ -2709,6 +3449,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 next_latent_components,
                 0,
                 jepa_components,
+                energy_model_components,
+                step_contract_components,
                 sigreg_components,
                 self.model.latent_reasoning_config().max_steps,
             );
@@ -4781,6 +5523,20 @@ fn selected_token_logits<B: BackendTrait>(
         .reshape([batch, time])
 }
 
+fn answer_prefix_input_mask<B: BackendTrait>(loss_mask: Tensor<B, 2, Int>) -> Tensor<B, 2, Int> {
+    let [batch, time] = loss_mask.shape().dims();
+    let device = loss_mask.device();
+    if time == 0 {
+        return Tensor::<B, 2, Int>::zeros([batch, 0], &device);
+    }
+    let head = Tensor::<B, 2, Int>::zeros([batch, 1], &device);
+    if time == 1 {
+        return head;
+    }
+    let previous_targets = loss_mask.slice([0..batch, 0..(time - 1)]);
+    Tensor::cat(vec![head, previous_targets], 1)
+}
+
 fn next_token_loss_from_log_probs<B: BackendTrait>(
     log_probs: Tensor<B, 3>,
     targets: Tensor<B, 2, Int>,
@@ -5435,6 +6191,157 @@ mod objective_step_tests {
             masked < 1.0e-3,
             "masked loss should keep only the confident first token"
         );
+    }
+
+    #[test]
+    fn ruliad_answer_ranking_penalizes_corrupt_answer_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_ranking: RuliadAnswerRankingConfig {
+                enabled: true,
+                weight: 1.0,
+                margin: 0.5,
+                corrupt_offset: 1,
+            },
+            ..Default::default()
+        });
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let mask =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 1], [1, 2]), &device);
+        let preferred = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 5.0, -2.0, 0.0, //
+                    0.0, 0.0, 5.0, -2.0,
+                ],
+                [1, 2, 4],
+            ),
+            &device,
+        );
+        let inverted = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, -2.0, 5.0, 0.0, //
+                    0.0, 0.0, -2.0, 5.0,
+                ],
+                [1, 2, 4],
+            ),
+            &device,
+        );
+
+        let preferred_loss = tensor_scalar(
+            model
+                .ruliad_answer_ranking_loss_from_logits(
+                    preferred,
+                    targets.clone(),
+                    Some(mask.clone()),
+                )
+                .expect("preferred ranking loss"),
+        );
+        let inverted_loss = tensor_scalar(
+            model
+                .ruliad_answer_ranking_loss_from_logits(inverted, targets, Some(mask))
+                .expect("inverted ranking loss"),
+        );
+
+        assert!(
+            inverted_loss > preferred_loss + 5.0,
+            "ranking loss should reward oracle answer logits over corrupt answer logits: preferred={preferred_loss} inverted={inverted_loss}"
+        );
+    }
+
+    #[test]
+    fn answer_prefix_input_mask_shifts_target_answer_mask_right() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 0, 1], [1, 5]),
+            &device,
+        );
+        let shifted = answer_prefix_input_mask(mask)
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("shifted mask");
+        assert_eq!(shifted, vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_corrupts_only_answer_prefix_inputs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![10, 11, 12, 13, 14], [1, 5]),
+            &device,
+        );
+        let target_mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 0, 1], [1, 5]),
+            &device,
+        );
+        let prefix_mask = answer_prefix_input_mask(target_mask);
+        let corrupted = model
+            .corrupt_ruliad_answer_prefix_inputs(
+                inputs,
+                prefix_mask,
+                RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 1.0,
+                    probability: 1.0,
+                    corrupt_offset: 1,
+                },
+            )
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(corrupted, vec![10, 11, 13, 14, 14]);
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_loss_is_finite_for_masked_answer_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_denoising: RuliadAnswerDenoisingConfig {
+                enabled: true,
+                weight: 0.5,
+                probability: 1.0,
+                corrupt_offset: 1,
+            },
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3, 4, 5], [1, 6]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3, 4, 5, 6], [1, 6]),
+            &device,
+        );
+        let mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 1, 0, 0], [1, 6]),
+            &device,
+        );
+        let loss = tensor_scalar(
+            model
+                .ruliad_answer_denoising_loss(inputs, targets, Some(mask))
+                .expect("denoising loss"),
+        );
+        assert!(loss.is_finite(), "denoising loss should be finite: {loss}");
+        assert!(loss > 0.0, "denoising loss should be non-zero: {loss}");
     }
 
     #[test]
@@ -6194,6 +7101,254 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn latent_energy_margin_loss_prefers_lower_positive_energy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let low_positive = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.1], [1, 2, 1]),
+            &device,
+        );
+        let high_negative = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, 2.5], [1, 2, 1]),
+            &device,
+        );
+        let high_positive = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, 2.5], [1, 2, 1]),
+            &device,
+        );
+        let low_negative = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.1], [1, 2, 1]),
+            &device,
+        );
+
+        let preferred = tensor_scalar(latent_energy_contrastive_margin_loss(
+            low_positive,
+            high_negative,
+            1.0,
+        ));
+        let inverted = tensor_scalar(latent_energy_contrastive_margin_loss(
+            high_positive,
+            low_negative,
+            1.0,
+        ));
+        assert!(
+            inverted > preferred + 2.0,
+            "contrastive energy should prefer low positives: preferred={preferred} inverted={inverted}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_monotonic_penalty_catches_ascending_energy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let previous = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0], [1, 2, 1]),
+            &device,
+        );
+        let descending = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.75, 0.5], [1, 2, 1]),
+            &device,
+        );
+        let ascending = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.25, 1.5], [1, 2, 1]),
+            &device,
+        );
+
+        let descending = tensor_scalar(latent_energy_monotonic_penalty(
+            previous.clone(),
+            descending,
+            0.0,
+        ));
+        let ascending = tensor_scalar(latent_energy_monotonic_penalty(previous, ascending, 0.0));
+        assert!(
+            descending <= 1.0e-6,
+            "descending energy should have no monotonic penalty: {descending}"
+        );
+        assert!(
+            ascending > 0.25,
+            "ascending energy should be penalized: {ascending}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_contractivity_penalty_catches_large_hidden_drift() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let target = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, -1.0], [1, 1, 2]),
+            &device,
+        );
+        let close = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.05, -0.95], [1, 1, 2]),
+            &device,
+        );
+        let far = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, -3.0], [1, 1, 2]),
+            &device,
+        );
+
+        let close = tensor_scalar(latent_energy_contractivity_penalty(
+            close,
+            target.clone(),
+            0.5,
+        ));
+        let far = tensor_scalar(latent_energy_contractivity_penalty(far, target, 0.5));
+        assert!(
+            close <= 1.0e-6,
+            "nearby hidden states should fit within the trust radius: {close}"
+        );
+        assert!(
+            far > close + 1.0,
+            "large hidden drift should be penalized: close={close} far={far}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_model_train_step_runs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 2;
+        config.latent_reasoning.energy_head = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                energy_model: crate::config::LatentEnergyModelConfig {
+                    enabled: true,
+                    max_rollout_steps_for_loss: 2,
+                    ..Default::default()
+                },
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected latent EBM loss: {loss}");
+    }
+
+    #[test]
+    fn latent_step_contract_train_step_runs_and_records_components() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        crate::train::profile::reset();
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 2;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                step_contract: LatentStepContractConfig {
+                    enabled: true,
+                    max_rollout_steps_for_loss: 2,
+                    ce_weight: 0.1,
+                    monotonic_ce_weight: 0.5,
+                    contractive_weight: 0.05,
+                    ..Default::default()
+                },
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(
+            loss.is_finite(),
+            "unexpected latent step contract loss: {loss}"
+        );
+        let snapshot = crate::train::profile::take_latent_reasoning();
+        assert!(
+            snapshot.step_contract_components > 0,
+            "step contract should record active components: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_step_diagnostics_are_finite() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 3;
+        config.latent_reasoning.min_steps = 3;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device));
+
+        let diagnostics = model
+            .latent_reasoning_step_diagnostics(batch(&device))
+            .expect("latent diagnostics");
+        assert_eq!(diagnostics.step_loss.len(), 3);
+        assert_eq!(diagnostics.step_ce_delta.len(), 3);
+        assert_eq!(diagnostics.step_ce_monotonic_violation_rate.len(), 3);
+        assert_eq!(diagnostics.step_entropy_bits.len(), 3);
+        assert_eq!(diagnostics.step_delta_rms.len(), 3);
+        assert_eq!(diagnostics.step_raw_cosine.len(), 3);
+        for value in [
+            diagnostics.raw_loss,
+            diagnostics.final_loss,
+            diagnostics.raw_entropy_bits,
+            diagnostics.final_entropy_bits,
+            diagnostics.final_delta_rms,
+            diagnostics.final_raw_cosine,
+        ]
+        .into_iter()
+        .chain(diagnostics.step_loss)
+        .chain(diagnostics.step_ce_delta)
+        .chain(diagnostics.step_ce_monotonic_violation_rate)
+        .chain(diagnostics.step_entropy_bits)
+        .chain(diagnostics.step_delta_rms)
+        .chain(diagnostics.step_raw_cosine)
+        {
+            assert!(
+                value.is_finite(),
+                "diagnostic value was not finite: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn latent_reasoning_step_diagnostics_include_energy_when_head_enabled() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 3;
+        config.latent_reasoning.min_steps = 3;
+        config.latent_reasoning.energy_head = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device));
+
+        let diagnostics = model
+            .latent_reasoning_step_diagnostics(batch(&device))
+            .expect("latent diagnostics");
+        assert_eq!(diagnostics.step_energy_mean.len(), 3);
+        assert_eq!(diagnostics.step_energy_delta.len(), 3);
+        assert_eq!(diagnostics.step_energy_monotonic_violation_rate.len(), 3);
+        assert!(diagnostics.best_energy_step.is_some());
+        for value in diagnostics
+            .step_energy_mean
+            .into_iter()
+            .chain(diagnostics.step_energy_delta)
+            .chain(diagnostics.step_energy_monotonic_violation_rate)
+        {
+            assert!(
+                value.is_finite(),
+                "energy diagnostic value was not finite: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn latent_reasoning_auxiliary_scale_respects_start_after_steps() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
@@ -6217,6 +7372,31 @@ mod objective_step_tests {
         model.gradient_scale_step.store(1, Ordering::Relaxed);
         assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
         model.gradient_scale_step.store(2, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
+    }
+
+    #[test]
+    fn latent_reasoning_auxiliary_scale_can_wait_for_capability_gate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                start_after_capability_gate_passed: true,
+                jepa_future_offsets: vec![1],
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(32, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.set_latent_reasoning_capability_gate_open(true);
         assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
     }
 
@@ -6255,7 +7435,8 @@ mod objective_step_tests {
         assert_eq!(
             model.latent_reasoning_auxiliary_scale_for_schedule(
                 model.latent_reasoning_next_latent_every_steps(),
-                model.latent_reasoning_next_latent_start_after_steps()
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
             ),
             None
         );
@@ -6263,10 +7444,139 @@ mod objective_step_tests {
         assert_eq!(
             model.latent_reasoning_auxiliary_scale_for_schedule(
                 model.latent_reasoning_next_latent_every_steps(),
-                model.latent_reasoning_next_latent_start_after_steps()
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
             ),
             Some(0.25)
         );
+    }
+
+    #[test]
+    fn latent_reasoning_start_policy_can_gate_specific_objectives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                jepa_start_policy: Some(LatentReasoningAuxiliaryStartPolicy::FixedStep),
+                jepa_future_offsets: vec![1],
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    start_policy: Some(
+                        LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate,
+                    ),
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    start_after_steps: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(4, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_jepa_every_steps(),
+                model.latent_reasoning_jepa_start_after_steps(),
+                model.latent_reasoning_jepa_start_policy()
+            ),
+            Some(0.25)
+        );
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            None
+        );
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_capability_gate_policy_can_ignore_fixed_step_start() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    start_after_steps: Some(512),
+                    start_policy: Some(LatentReasoningAuxiliaryStartPolicy::CapabilityGate),
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(0, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            None
+        );
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_global_capability_gate_remains_compatibility_default() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                start_after_capability_gate_passed: true,
+                jepa_future_offsets: vec![1],
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    start_after_steps: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(2, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_jepa_start_policy(),
+            LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
     }
 
     #[test]

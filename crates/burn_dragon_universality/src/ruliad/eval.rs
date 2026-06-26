@@ -22,7 +22,7 @@ use crate::ruliad::source_selection::{RuliadSourceBucket, ruliad_source_buckets}
 use crate::stats::SampleStats;
 
 pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 1;
-pub const RULIAD_EVAL_REPORT_VERSION: u32 = 3;
+pub const RULIAD_EVAL_REPORT_VERSION: u32 = 4;
 pub const RULIAD_REASONING_SCORE_VERSION: u32 = 2;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
@@ -196,6 +196,8 @@ pub struct RuliadEvalGroupScore {
     #[serde(default)]
     pub mean_completion_quality: f32,
     #[serde(default)]
+    pub expected_answer_distinct_fraction: f32,
+    #[serde(default)]
     pub actual_answer_distinct_fraction: f32,
 }
 
@@ -241,6 +243,8 @@ pub struct RuliadEvalReport {
     pub answer_termination_rate: f32,
     #[serde(default)]
     pub mean_completion_quality: f32,
+    #[serde(default)]
+    pub expected_answer_distinct_fraction: f32,
     #[serde(default)]
     pub actual_answer_distinct_fraction: f32,
     pub mean_certificate_prefix_coverage: f32,
@@ -634,6 +638,8 @@ struct EvalAccumulator {
     answer_field_expected_count: usize,
     answer_terminated_count: usize,
     completion_quality_ppm_sum: usize,
+    expected_answer_count: usize,
+    expected_answers: BTreeSet<String>,
     actual_answer_count: usize,
     actual_answers: BTreeSet<String>,
 }
@@ -866,6 +872,8 @@ pub fn evaluate_completions(
     let mut answer_field_expected_count = 0usize;
     let mut answer_terminated_count = 0usize;
     let mut completion_quality_ppm_sum = 0usize;
+    let mut expected_answer_count = 0usize;
+    let mut expected_answers = BTreeSet::new();
     let mut actual_answer_count = 0usize;
     let mut actual_answers = BTreeSet::new();
     let mut certificate_prefix_ppm_sum = 0usize;
@@ -895,6 +903,10 @@ pub fn evaluate_completions(
         answer_terminated_count += usize::from(outcome.answer_terminated);
         completion_quality_ppm_sum = completion_quality_ppm_sum
             .saturating_add(outcome.reasoning_score.completion_quality_ppm);
+        if !item.expected_answer.trim().is_empty() {
+            expected_answer_count = expected_answer_count.saturating_add(1);
+            expected_answers.insert(item.expected_answer.clone());
+        }
         if let Some(actual_answer) = outcome.actual_answer.as_deref() {
             actual_answer_count = actual_answer_count.saturating_add(1);
             actual_answers.insert(actual_answer.to_string());
@@ -907,20 +919,21 @@ pub fn evaluate_completions(
             canary_count += 1;
             canary_semantic_match_count += usize::from(outcome.semantic_match);
         }
-        add_group_score(&mut family_scores, &item.family, &outcome);
-        add_group_score(&mut task_scores, &item.task_kind, &outcome);
+        add_group_score(&mut family_scores, &item.family, item, &outcome);
+        add_group_score(&mut task_scores, &item.task_kind, item, &outcome);
         if let Some(difficulty_level) = item.difficulty_level {
             add_group_score(
                 &mut difficulty_scores,
                 &format!("d{difficulty_level}"),
+                item,
                 &outcome,
             );
         }
         for domain in &item.math_domains {
-            add_group_score(&mut math_domain_scores, domain, &outcome);
+            add_group_score(&mut math_domain_scores, domain, item, &outcome);
         }
         for mode in &item.reasoning_modes {
-            add_group_score(&mut reasoning_mode_scores, mode, &outcome);
+            add_group_score(&mut reasoning_mode_scores, mode, item, &outcome);
         }
         if !outcome.semantic_match && failures.len() < MAX_REPORTED_EVAL_FAILURES {
             failures.push(RuliadEvalFailure {
@@ -965,6 +978,7 @@ pub fn evaluate_completions(
         answer_terminated_count,
         answer_termination_rate: ratio(answer_terminated_count, items.len()),
         mean_completion_quality: ratio_ppm(completion_quality_ppm_sum, items.len()),
+        expected_answer_distinct_fraction: ratio(expected_answers.len(), expected_answer_count),
         actual_answer_distinct_fraction: ratio(actual_answers.len(), actual_answer_count),
         mean_certificate_prefix_coverage: ratio_ppm(certificate_prefix_ppm_sum, items.len()),
         mean_completion_tokens: ratio_f32(completion_token_sum as f32, items.len()),
@@ -1694,6 +1708,7 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
 fn add_group_score(
     scores: &mut BTreeMap<String, EvalAccumulator>,
     label: &str,
+    item: &RuliadEvalItem,
     outcome: &EvalOutcome,
 ) {
     let score = scores.entry(label.to_string()).or_default();
@@ -1719,6 +1734,10 @@ fn add_group_score(
     score.completion_quality_ppm_sum = score
         .completion_quality_ppm_sum
         .saturating_add(outcome.reasoning_score.completion_quality_ppm);
+    if !item.expected_answer.trim().is_empty() {
+        score.expected_answer_count = score.expected_answer_count.saturating_add(1);
+        score.expected_answers.insert(item.expected_answer.clone());
+    }
     if let Some(actual_answer) = outcome.actual_answer.as_deref() {
         score.actual_answer_count = score.actual_answer_count.saturating_add(1);
         score.actual_answers.insert(actual_answer.to_string());
@@ -1752,6 +1771,10 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
             answer_terminated_count: score.answer_terminated_count,
             answer_termination_rate: ratio(score.answer_terminated_count, score.count),
             mean_completion_quality: ratio_ppm(score.completion_quality_ppm_sum, score.count),
+            expected_answer_distinct_fraction: ratio(
+                score.expected_answers.len(),
+                score.expected_answer_count,
+            ),
             actual_answer_distinct_fraction: ratio(
                 score.actual_answers.len(),
                 score.actual_answer_count,
@@ -2385,6 +2408,7 @@ mod tests {
 
         assert_eq!(report.item_count, 2);
         assert_eq!(report.scored_count, 2);
+        assert_eq!(report.expected_answer_distinct_fraction, 1.0);
         assert_eq!(report.actual_answer_distinct_fraction, 0.5);
         assert!(
             report.mean_completion_quality < 0.5,
@@ -2392,6 +2416,10 @@ mod tests {
             report.mean_completion_quality
         );
         assert_eq!(report.family_scores.len(), 1);
+        assert_eq!(
+            report.family_scores[0].expected_answer_distinct_fraction,
+            1.0
+        );
         assert_eq!(report.family_scores[0].actual_answer_distinct_fraction, 0.5);
         assert!(
             report.family_scores[0].mean_completion_quality < 0.5,

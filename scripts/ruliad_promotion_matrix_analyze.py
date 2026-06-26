@@ -30,6 +30,7 @@ METRIC_COLUMNS = [
     "ruliad_answer_field_accuracy_last",
     "ruliad_answer_termination_rate_last",
     "ruliad_completion_quality_last",
+    "ruliad_expected_answer_distinct_last",
     "ruliad_answer_distinct_last",
     "completion_health_last",
     "completion_distinct_2_last",
@@ -96,6 +97,7 @@ RAW_COMPLETION_METRIC_COLUMNS = [
     "raw_completion_quality_mean",
     "raw_completion_generated_tokens_mean",
     "raw_completion_hash_canary_rate",
+    "raw_completion_expected_answer_distinct_fraction",
     "raw_completion_actual_answer_distinct_fraction",
     "raw_completion_status_entropy_bits",
     "raw_completion_dominant_status_fraction",
@@ -308,6 +310,11 @@ def read_raw_completion_samples(run_dir: str | None) -> dict[str, float | int | 
         for row in selected
         if row.get("actual_answer") is not None
     ]
+    expected_answers = [
+        str(row.get("expected_answer"))
+        for row in selected
+        if row.get("expected_answer") is not None
+    ]
     statuses = [str(row.get("status") or "") for row in selected]
 
     return {
@@ -323,6 +330,9 @@ def read_raw_completion_samples(run_dir: str | None) -> dict[str, float | int | 
         "raw_completion_quality_mean": numeric_mean("completion_quality_ppm", 1_000_000.0),
         "raw_completion_generated_tokens_mean": numeric_mean("generated_token_count"),
         "raw_completion_hash_canary_rate": bool_rate("hash_canary"),
+        "raw_completion_expected_answer_distinct_fraction": (
+            len(set(expected_answers)) / len(expected_answers) if expected_answers else None
+        ),
         "raw_completion_actual_answer_distinct_fraction": (
             len(set(answers)) / len(answers) if answers else None
         ),
@@ -447,6 +457,11 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         )
         recovery_control_fraction = value(row, "recovery_control_fraction_mean", 0.0)
         raw_completion_quality = value(row, "raw_completion_quality_mean_mean", 1.0)
+        raw_completion_expected_distinct = value(
+            row,
+            "raw_completion_expected_answer_distinct_fraction_mean",
+            1.0,
+        )
         raw_completion_answer_distinct = value(
             row,
             "raw_completion_actual_answer_distinct_fraction_mean",
@@ -513,7 +528,10 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             reasons.append("recovery_thrash")
         if raw_completion_quality < args.min_raw_completion_quality:
             reasons.append("raw_completion_quality_collapse")
-        if raw_completion_answer_distinct < args.min_raw_completion_answer_distinct:
+        if (
+            raw_completion_expected_distinct >= args.min_raw_completion_answer_distinct
+            and raw_completion_answer_distinct < args.min_raw_completion_answer_distinct
+        ):
             reasons.append("raw_completion_answer_collapse")
         if policy_completion_rows > 0.0 and policy_clip_fraction > args.max_policy_advantage_clip_fraction:
             reasons.append("policy_advantage_clip_saturation")
@@ -638,8 +656,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                 + ", ".join(f"`{arm}`" for arm in summary["unhealthy_control_arms"])
                 + "\n\n"
             )
-        handle.write("| arm | decision | ok/trials | healthy | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | cap drop | rec frac | q rec | raw q | raw distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | healthy | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | cap drop | rec frac | q rec | raw q | raw exp distinct | raw actual distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -671,6 +689,7 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("recovery_control_fraction_mean")),
                         fmt(row.get("capability_quality_recovery_count_mean")),
                         fmt(row.get("raw_completion_quality_mean_mean")),
+                        fmt(row.get("raw_completion_expected_answer_distinct_fraction_mean")),
                         fmt(row.get("raw_completion_actual_answer_distinct_fraction_mean")),
                         fmt(row.get("completion_distinct_2_last_mean")),
                         fmt(row.get("completion_period_2_to_64_last_mean")),

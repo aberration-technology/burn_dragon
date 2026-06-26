@@ -179,11 +179,15 @@ fn ruliad_capability_gate_status(
         ));
     }
     if report.scored_count > 1
+        && report.expected_answer_distinct_fraction
+            >= gates.capability_distinct_2_min_fraction as f32
         && report.actual_answer_distinct_fraction < gates.capability_distinct_2_min_fraction as f32
     {
         reasons.push(format!(
-            "answer_distinct={:.3}<{}",
-            report.actual_answer_distinct_fraction, gates.capability_distinct_2_min_fraction
+            "answer_distinct={:.3}<{} with expected_distinct={:.3}",
+            report.actual_answer_distinct_fraction,
+            gates.capability_distinct_2_min_fraction,
+            report.expected_answer_distinct_fraction
         ));
     }
     if let Some(stats) = output_degeneracy {
@@ -216,6 +220,8 @@ fn ruliad_completion_quality_collapse(
     let (_, _, _, completion_health_rate) = ruliad_capability_rates(report);
     completion_health_rate < gates.capability_completion_health_min_rate
         || (report.scored_count > 1
+            && report.expected_answer_distinct_fraction
+                >= gates.capability_distinct_2_min_fraction as f32
             && report.actual_answer_distinct_fraction
                 < gates.capability_distinct_2_min_fraction as f32)
 }
@@ -301,7 +307,7 @@ fn update_capability_run_control_state<B>(
         let quality_collapse = ruliad_completion_quality_collapse(report, gates);
         if quality_collapse && !*recovery_requested {
             let message = format!(
-                "ruliad completion quality collapsed during capability grace window; requesting PlasticityRecovery while keeping continual backprop active: {reasons}"
+                "ruliad completion quality/diversity collapsed during capability grace window; requesting PlasticityRecovery while keeping continual backprop active: {reasons}"
             );
             emit_policy_gate_with_action(
                 env,
@@ -3820,6 +3826,10 @@ fn emit_ruliad_correctness_metrics_with_labels(
             f64::from(report.mean_completion_quality),
         ),
         (
+            "Ruliad Expected Answer Distinct Fraction",
+            f64::from(report.expected_answer_distinct_fraction),
+        ),
+        (
             "Ruliad Actual Answer Distinct Fraction",
             f64::from(report.actual_answer_distinct_fraction),
         ),
@@ -7258,6 +7268,7 @@ mod tests {
             answer_terminated_count: item_count,
             answer_termination_rate: 1.0,
             mean_completion_quality: 1.0,
+            expected_answer_distinct_fraction: 1.0,
             actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: certificate_prefix_coverage,
             mean_completion_tokens: 12.0,
@@ -7441,7 +7452,29 @@ mod tests {
             status
                 .reasons
                 .iter()
-                .any(|reason| reason.starts_with("answer_distinct=0.010<")),
+                .any(|reason| reason.starts_with("answer_distinct=0.010<")
+                    && reason.contains("expected_distinct=1.000")),
+            "{:?}",
+            status.reasons
+        );
+    }
+
+    #[test]
+    fn ruliad_capability_gate_does_not_flag_low_actual_diversity_when_targets_are_low_diversity() {
+        let mut gates = ruliad_degeneracy_gates();
+        gates.capability_completion_health_min_rate = 0.0;
+        gates.capability_distinct_2_min_fraction = 0.30;
+        let mut report = ruliad_eval_report(0.0, 0.0, 0.0, 0.0);
+        report.expected_answer_distinct_fraction = 0.05;
+        report.actual_answer_distinct_fraction = 0.01;
+
+        let status = ruliad_capability_gate_status(&report, None, &gates);
+
+        assert!(
+            status
+                .reasons
+                .iter()
+                .all(|reason| !reason.starts_with("answer_distinct=")),
             "{:?}",
             status.reasons
         );
@@ -7705,7 +7738,7 @@ mod tests {
             control
                 .get("reason")
                 .and_then(|value| value.as_str())
-                .is_some_and(|reason| reason.contains("completion quality collapsed")),
+                .is_some_and(|reason| reason.contains("completion quality/diversity collapsed")),
             "{control:?}"
         );
         assert!(
@@ -8180,6 +8213,7 @@ mod tests {
             answer_terminated_count: 3,
             answer_termination_rate: 0.75,
             mean_completion_quality: 1.0,
+            expected_answer_distinct_fraction: 1.0,
             actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 12.0,
@@ -8208,6 +8242,7 @@ mod tests {
                 answer_terminated_count: 3,
                 answer_termination_rate: 0.75,
                 mean_completion_quality: 1.0,
+                expected_answer_distinct_fraction: 1.0,
                 actual_answer_distinct_fraction: 1.0,
             }],
             math_domain_scores: Vec::new(),
@@ -8234,6 +8269,11 @@ mod tests {
         assert_eq!(metric_value("Ruliad Eval Items"), 4.0);
         assert_eq!(metric_value("Ruliad Verifier Accuracy"), 0.5);
         assert_eq!(metric_value("Ruliad Competence Verifier PPM"), 500_000.0);
+        assert_eq!(
+            metric_value("Ruliad Expected Answer Distinct Fraction"),
+            1.0
+        );
+        assert_eq!(metric_value("Ruliad Actual Answer Distinct Fraction"), 1.0);
         assert_eq!(
             metric_value("Ruliad Competence Completion Health PPM"),
             500_000.0
@@ -8540,6 +8580,7 @@ mod tests {
             answer_terminated_count: 2,
             answer_termination_rate: 1.0,
             mean_completion_quality: 1.0,
+            expected_answer_distinct_fraction: 1.0,
             actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 8.0,

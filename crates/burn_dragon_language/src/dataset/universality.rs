@@ -3522,6 +3522,7 @@ mod tests {
             answer_termination_rate: count.saturating_sub(malformed_completion_count) as f32
                 / count.max(1) as f32,
             mean_completion_quality: 1.0,
+            expected_answer_distinct_fraction: 1.0,
             actual_answer_distinct_fraction: 1.0,
         }
     }
@@ -3555,6 +3556,7 @@ mod tests {
             answer_terminated_count: family.answer_terminated_count,
             answer_termination_rate: family.answer_termination_rate,
             mean_completion_quality: family.mean_completion_quality,
+            expected_answer_distinct_fraction: family.expected_answer_distinct_fraction,
             actual_answer_distinct_fraction: family.actual_answer_distinct_fraction,
             mean_certificate_prefix_coverage: 0.0,
             mean_completion_tokens: 8.0,

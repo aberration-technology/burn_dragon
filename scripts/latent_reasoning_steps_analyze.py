@@ -59,6 +59,7 @@ SUMMARY_COLUMNS = [
     "ruliad_answer_field_accuracy_last",
     "ruliad_answer_termination_rate_last",
     "ruliad_completion_quality_last",
+    "ruliad_expected_answer_distinct_last",
     "ruliad_answer_distinct_last",
     "ruliad_mean_completion_tokens_last",
     "completion_health_last",
@@ -712,6 +713,9 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "ruliad_answer_termination_rate_last": capability.get("answer_termination_rate"),
         "ruliad_completion_quality_last": last_metric(
             events, "valid", "Ruliad Mean Completion Quality"
+        ),
+        "ruliad_expected_answer_distinct_last": last_metric(
+            events, "valid", "Ruliad Expected Answer Distinct Fraction"
         ),
         "ruliad_answer_distinct_last": last_metric(
             events, "valid", "Ruliad Actual Answer Distinct Fraction"

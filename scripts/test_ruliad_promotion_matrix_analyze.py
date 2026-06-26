@@ -66,6 +66,7 @@ def healthy_arm_row(arm: str) -> dict[str, float | int | str]:
         "completion_period_2_to_64_last_mean": 0.0,
         "completion_repetition_last_mean": 0.0,
         "raw_completion_quality_mean_mean": 0.8,
+        "raw_completion_expected_answer_distinct_fraction_mean": 0.8,
         "raw_completion_actual_answer_distinct_fraction_mean": 0.8,
         "policy_completion_rows_mean": 0.0,
         "policy_advantage_clip_fraction_mean": 0.0,
@@ -102,6 +103,7 @@ class RawCompletionSampleTests(unittest.TestCase):
                     "completion_quality_ppm": 0,
                     "generated_token_count": 32,
                     "hash_canary": False,
+                    "expected_answer": "old",
                     "actual_answer": "old-loop",
                 },
                 {
@@ -118,6 +120,7 @@ class RawCompletionSampleTests(unittest.TestCase):
                     "completion_quality_ppm": 1_000_000,
                     "generated_token_count": 4,
                     "hash_canary": False,
+                    "expected_answer": "eval",
                     "actual_answer": "eval-sweep",
                 },
                 {
@@ -134,6 +137,7 @@ class RawCompletionSampleTests(unittest.TestCase):
                     "completion_quality_ppm": 1_000_000,
                     "generated_token_count": 3,
                     "hash_canary": False,
+                    "expected_answer": "ok=1;l=2;r=2",
                     "actual_answer": "ok=1;l=2;r=2",
                 },
                 {
@@ -150,6 +154,7 @@ class RawCompletionSampleTests(unittest.TestCase):
                     "completion_quality_ppm": 500_000,
                     "generated_token_count": 5,
                     "hash_canary": False,
+                    "expected_answer": "ok=1;l=3;r=3",
                     "actual_answer": "ok=0;l=2;r=9",
                 },
             ]
@@ -169,6 +174,7 @@ class RawCompletionSampleTests(unittest.TestCase):
         self.assertEqual(summary["raw_completion_termination_rate"], 0.5)
         self.assertEqual(summary["raw_completion_quality_mean"], 0.75)
         self.assertEqual(summary["raw_completion_generated_tokens_mean"], 4.0)
+        self.assertEqual(summary["raw_completion_expected_answer_distinct_fraction"], 1.0)
         self.assertEqual(summary["raw_completion_actual_answer_distinct_fraction"], 1.0)
         self.assertEqual(summary["raw_completion_status_entropy_bits"], 1.0)
         self.assertEqual(summary["raw_completion_dominant_status_fraction"], 0.5)
@@ -238,6 +244,19 @@ class PromotionGateTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "validated_candidate")
         self.assertEqual(summary["promoted_arms"], ["candidate"])
+
+    def test_low_raw_answer_diversity_requires_diverse_expected_answers(self) -> None:
+        args = promotion_args()
+        candidate = {
+            **healthy_arm_row("candidate"),
+            "raw_completion_expected_answer_distinct_fraction_mean": 0.05,
+            "raw_completion_actual_answer_distinct_fraction_mean": 0.05,
+        }
+
+        gated = ANALYZE.add_gate_decisions([healthy_arm_row("baseline"), candidate], args)
+        candidate_row = next(row for row in gated if row["arm"] == "candidate")
+
+        self.assertNotIn("raw_completion_answer_collapse", candidate_row["fail_reasons"])
 
 
 if __name__ == "__main__":

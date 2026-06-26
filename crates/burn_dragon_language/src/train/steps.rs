@@ -1027,6 +1027,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     pub fn with_ruliad_supervision(mut self, config: RuliadSupervisionConfig) -> Self {
+        if config.verifier_reward.enabled && config.verifier_reward.kl_weight > f32::EPSILON {
+            let key = (self.streaming_runtime_key, TypeId::of::<B>());
+            let teacher_model = detach_teacher_model(&self.model);
+            self.teacher_model = Some(teacher_model.clone());
+            let mut teachers = lock_teacher_model_store();
+            teachers
+                .entry(key)
+                .or_insert_with(|| Box::new(TeacherModelRuntime::new(teacher_model)));
+        }
         self.ruliad_supervision = config;
         self
     }
@@ -2475,6 +2484,248 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         let replacements = inputs.clone().add_scalar(offset).remainder_scalar(vocab);
         inputs.mask_where(mask, replacements)
+    }
+
+    fn ruliad_verifier_reward_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index % config.every_steps != 0 {
+            return 0.0;
+        }
+        config.weight
+    }
+
+    fn mix_ruliad_policy_seed(mut value: u64) -> u64 {
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn ruliad_vpo_scalarizations(
+        &self,
+        sample_index: usize,
+        count: usize,
+    ) -> Vec<[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM]> {
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed) as u64;
+        let seed = Self::mix_ruliad_policy_seed(
+            step_index
+                ^ (sample_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (count as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
+        );
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scalarizations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut weights =
+                [0.0f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM];
+            let mut sum = 0.0f32;
+            for weight in weights.iter_mut() {
+                let draw = -rng.gen_range(f32::MIN_POSITIVE..1.0).ln();
+                *weight = draw;
+                sum += draw;
+            }
+            if !sum.is_finite() || sum <= f32::EPSILON {
+                let uniform = 1.0 / weights.len() as f32;
+                weights.fill(uniform);
+            } else {
+                for weight in weights.iter_mut() {
+                    *weight /= sum;
+                }
+            }
+            scalarizations.push(weights);
+        }
+        scalarizations
+    }
+
+    fn ruliad_verifier_policy_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_verifier_reward_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+        let group_size = config.group_size.max(2);
+
+        #[derive(Clone)]
+        struct PolicyRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            advantage: f32,
+        }
+
+        let mut rows = Vec::new();
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let mut group_rows = Vec::with_capacity(group_size);
+            let mut scores = Vec::with_capacity(group_size);
+            for _ in 0..group_size {
+                let generated = crate::generation::generate_tokens(
+                    &self.model,
+                    prompt.clone(),
+                    device,
+                    crate::generation::GenerationSettings {
+                        max_new_tokens: Some(completion_budget),
+                        temperature: config.temperature,
+                        top_k: Some(config.top_k),
+                        strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: policy_batch.stop_token_id,
+                    },
+                    None,
+                )
+                .ok()?;
+                if generated.len() <= prompt.len() {
+                    continue;
+                }
+                let completion = generated[prompt.len()..].to_vec();
+                if completion.is_empty() {
+                    continue;
+                }
+                let completion_tokens = completion
+                    .iter()
+                    .filter_map(|token| u32::try_from(*token).ok())
+                    .collect::<Vec<_>>();
+                let completion_text = tokenizer.decode_payload(&completion_tokens, true);
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                scores.push(score);
+
+                let mut sequence = prompt.clone();
+                sequence.extend_from_slice(&completion);
+                if sequence.len() < 2 {
+                    continue;
+                }
+                let input_len = sequence.len() - 1;
+                let inputs = sequence[..input_len].to_vec();
+                let targets = sequence[1..].to_vec();
+                let mut mask = vec![0.0f32; input_len];
+                let completion_start = prompt.len().saturating_sub(1).min(input_len);
+                for value in mask.iter_mut().skip(completion_start) {
+                    *value = 1.0;
+                }
+                group_rows.push((inputs, targets, mask));
+            }
+            if group_rows.is_empty() || scores.len() != group_rows.len() {
+                continue;
+            }
+            let rewards = match config.mode {
+                crate::config::train::RuliadVerifierRewardMode::Scalar => scores
+                    .iter()
+                    .map(|score| {
+                        burn_dragon_universality::ruliad::ruliad_verifier_reward(
+                            score,
+                            config.reward,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                crate::config::train::RuliadVerifierRewardMode::VpoIndependent => {
+                    let scalarizations = self.ruliad_vpo_scalarizations(
+                        sample.item.sample_index,
+                        config.vpo_scalarizations.max(1),
+                    );
+                    burn_dragon_universality::ruliad::ruliad_vpo_independent_utilities(
+                        &scores,
+                        &scalarizations,
+                    )
+                }
+            };
+            let advantages = burn_dragon_universality::ruliad::normalized_advantages(
+                &rewards,
+                config.advantage_epsilon,
+            );
+            rows.extend(group_rows.into_iter().zip(advantages).map(
+                |((inputs, targets, mask), advantage)| PolicyRow {
+                    inputs,
+                    targets,
+                    mask,
+                    advantage: advantage.clamp(-config.clip_range, config.clip_range),
+                },
+            ));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0.0f32; row_count * max_len];
+        let mut advantage_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+            for value in advantage_values[offset..offset + len].iter_mut() {
+                *value = row.advantage;
+            }
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_values, [row_count, max_len]), device);
+        let advantages = Tensor::<B, 2>::from_data(
+            TensorData::new(advantage_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs.clone());
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs.clone(), targets);
+        let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+        let mut loss = (token_log_probs * advantages * mask.clone())
+            .sum()
+            .reshape([1])
+            .div(active)
+            .mul_scalar(-weight);
+        if config.kl_weight > f32::EPSILON && self.teacher_model.is_some() {
+            let teacher_log_probs =
+                log_probs_from_logits(self.current_teacher_model().forward(inputs).detach());
+            let [rows, time, _vocab] = log_probs.shape().dims();
+            let per_token_kl = (log_probs.clone().exp() * (log_probs - teacher_log_probs))
+                .sum_dim(2)
+                .reshape([rows, time]);
+            let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+            let kl_loss = (per_token_kl * mask)
+                .sum()
+                .reshape([1])
+                .div(active)
+                .mul_scalar(config.kl_weight);
+            loss = loss + kl_loss;
+        }
+        Some(loss)
     }
 
     fn latent_reasoning_target_hidden(
@@ -4031,6 +4282,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         temperature: config.temperature,
                         top_k: config.top_k,
                         strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: None,
                     },
                     None,
                 )
@@ -4397,6 +4649,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let clean_inputs = batch.inputs;
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
+        let ruliad_policy_batch = batch.ruliad_policy_batch;
         if !self.objective.is_next_token() {
             self.update_teacher_runtime();
             let loss = self.objective_loss(clean_inputs, targets);
@@ -4821,6 +5074,14 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             self.greedy_rollout_unlikelihood_loss(clean_inputs_for_aux)
         {
             loss + rollout_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
+            && let Some(policy_loss) =
+                self.ruliad_verifier_policy_loss(policy_batch, &targets.device(), block_size)
+        {
+            loss + policy_loss
         } else {
             loss
         };
@@ -6342,6 +6603,130 @@ mod objective_step_tests {
         );
         assert!(loss.is_finite(), "denoising loss should be finite: {loss}");
         assert!(loss > 0.0, "denoising loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_builds_from_policy_metadata() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 0,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("verifier policy loss");
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_supports_vpo_mode() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 11);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                kl_weight: 0.0,
+                vpo_scalarizations: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let scalarizations = model.ruliad_vpo_scalarizations(17, 4);
+        assert_eq!(scalarizations.len(), 4);
+        for scalarization in scalarizations {
+            assert!(
+                scalarization.iter().all(|weight| *weight >= 0.0),
+                "VPO scalarization weights should be non-negative"
+            );
+            let sum = scalarization.iter().sum::<f32>();
+            assert!(
+                (sum - 1.0).abs() < 1.0e-5,
+                "VPO scalarization should sum to one, got {sum}"
+            );
+        }
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 17,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("VPO verifier policy loss");
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "VPO verifier policy loss should be finite: {loss}"
+        );
     }
 
     #[test]

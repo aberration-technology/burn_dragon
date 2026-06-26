@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use super::DatasetSplit;
 use super::prepared_chunks::{ChunkRuntimeCache, load_cached_chunk_from_mutex, mmap_as_u32_slice};
-use super::scheduler::{SequenceBatch, TokenSequenceDataset};
+use super::scheduler::{
+    RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, TokenSequenceDataset,
+};
 use crate::config::RuliadSupervisionConfig;
 use crate::summary_events::summary_event_mask_tensor;
 use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
@@ -232,6 +234,14 @@ trait OnlineUniversalityCorpus: Send + Sync {
 
     fn decode_ruliad_payload_tokens(&self, _tokens: &[u32], _stop_at_eos: bool) -> Option<String> {
         None
+    }
+
+    fn ruliad_document_end_token_id(&self) -> Option<u32> {
+        let tokens = self.encode_ruliad_payload_tokens("[/R2]")?;
+        match tokens.as_slice() {
+            [token] => Some(*token),
+            _ => None,
+        }
     }
 }
 
@@ -1721,6 +1731,13 @@ impl UniversalityDataset {
             .corpus
             .decode_ruliad_payload_tokens(&tokens, stop_at_eos)
     }
+
+    pub fn ruliad_document_end_token_id(&self) -> Option<u32> {
+        let UniversalityStorage::OnTheFly(storage) = &self.storage else {
+            return None;
+        };
+        storage.corpus.ruliad_document_end_token_id()
+    }
 }
 
 impl TokenSequenceDataset for UniversalityDataset {
@@ -1832,6 +1849,32 @@ impl TokenSequenceDataset for UniversalityDataset {
                     batch_size,
                     block_size,
                     self.ruliad_answer_completion_active(split, epoch_index, absolute_step),
+                ),
+            _ => None,
+        }
+    }
+
+    fn source_selected_ruliad_policy_batch(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<RuliadPolicyBatch> {
+        match (split, &self.storage) {
+            (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_ruliad_policy_batch(
+                    burn_dragon_universality::SampleSplit::Train,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
+                ),
+            (DatasetSplit::Val, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_ruliad_policy_batch(
+                    burn_dragon_universality::SampleSplit::Validation,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
                 ),
             _ => None,
         }
@@ -2056,6 +2099,68 @@ impl OnTheFlyStorage {
             block_size,
             prefer_answer_window,
         ))
+    }
+
+    fn source_selected_ruliad_policy_batch(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<RuliadPolicyBatch> {
+        let source_selection = self.source_selection.as_ref()?;
+        let tokenization = self.corpus.ruliad_config()?.tokenization.clone();
+        let bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train => {
+                source_selection.choose_bucket_label_for_step(epoch_index, absolute_step)?
+            }
+            burn_dragon_universality::SampleSplit::Validation => source_selection
+                .choose_bucket_label_for_validation_step(epoch_index, absolute_step)?,
+        };
+        let sample_count = match split {
+            burn_dragon_universality::SampleSplit::Train => self.corpus.train_samples(),
+            burn_dragon_universality::SampleSplit::Validation => self.corpus.validation_samples(),
+        }
+        .max(1);
+        let mut samples = Vec::with_capacity(batch_size.max(1));
+        for sample_rank in 0..batch_size.max(1) {
+            let sample_index = live_source_selection_sample_index(
+                sample_count,
+                split,
+                epoch_index,
+                absolute_step,
+                &bucket_label,
+                sample_rank,
+            );
+            let item = self
+                .corpus
+                .generate_ruliad_eval_item_for_source_bucket(
+                    split,
+                    epoch_index,
+                    sample_index,
+                    &bucket_label,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to generate live source-selected ruliad policy item split={split:?} epoch_index={epoch_index} absolute_step={absolute_step} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                    )
+                })?;
+            let prompt_tokens = self
+                .corpus
+                .encode_ruliad_payload_tokens(&item.prompt)?
+                .into_iter()
+                .map(i64::from)
+                .collect();
+            samples.push(RuliadPolicySample {
+                item,
+                prompt_tokens,
+            });
+        }
+        Some(RuliadPolicyBatch {
+            samples,
+            tokenization,
+            stop_token_id: self.corpus.ruliad_document_end_token_id().map(i64::from),
+        })
     }
 
     fn source_selected_stream_token_windows(
@@ -3409,6 +3514,13 @@ mod tests {
             verifier_accuracy,
             partial_credit_rate,
             mean_partial_progress: partial_credit_rate,
+            answer_field_correct_count: (partial_credit_rate.clamp(0.0, 1.0) * count as f32).round()
+                as usize,
+            answer_field_expected_count: count,
+            answer_field_accuracy: partial_credit_rate,
+            answer_terminated_count: count.saturating_sub(malformed_completion_count),
+            answer_termination_rate: count.saturating_sub(malformed_completion_count) as f32
+                / count.max(1) as f32,
         }
     }
 
@@ -3435,6 +3547,11 @@ mod tests {
             verifier_accuracy: family.verifier_accuracy,
             partial_credit_rate: family.partial_credit_rate,
             mean_partial_progress: family.mean_partial_progress,
+            answer_field_correct_count: family.answer_field_correct_count,
+            answer_field_expected_count: family.answer_field_expected_count,
+            answer_field_accuracy: family.answer_field_accuracy,
+            answer_terminated_count: family.answer_terminated_count,
+            answer_termination_rate: family.answer_termination_rate,
             mean_certificate_prefix_coverage: 0.0,
             mean_completion_tokens: 8.0,
             canary_count: 0,
@@ -4003,6 +4120,29 @@ mod tests {
                 .all(|window| !contains_period_filler_pattern(window)),
             "source-selected training windows must not expose ruliad padding filler"
         );
+        let policy_batch =
+            crate::dataset::TokenSequenceDataset::source_selected_ruliad_policy_batch(
+                &wrapped,
+                DatasetSplit::Train,
+                0,
+                0,
+                2,
+            )
+            .expect("source-selected ruliad policy batch");
+        assert_eq!(policy_batch.samples.len(), 2);
+        for sample in policy_batch.samples.iter() {
+            assert!(!sample.prompt_tokens.is_empty());
+            let prompt = dataset
+                .decode_ruliad_payload_tokens(&sample.prompt_tokens, true)
+                .expect("decode ruliad prompt");
+            assert!(prompt.contains("!:"));
+            let oracle_completion = format!("!:{}\n[/R2]", sample.item.expected_answer);
+            let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                &sample.item,
+                Some(&oracle_completion),
+            );
+            assert!(score.verifier_match(), "oracle answer should verify");
+        }
         let validation_windows =
             crate::dataset::TokenSequenceDataset::source_selected_token_windows(
                 &wrapped,
@@ -4310,6 +4450,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn on_the_fly_ruliad_dataset_exposes_structured_document_end_token_id() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-structured.toml");
+        let mut config = fixed_ruliad_runtime_config();
+        config.tokenization = RuliadTokenizationConfig::StructuredSymbolic {
+            vocab_size: 272,
+            eos_id: Some(271),
+        };
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            64,
+            2,
+            &TokenizerConfig {
+                vocab_path: None,
+                kind: TokenizerKind::Pretokenized(PretokenizedTokenizerConfig {
+                    vocab_size: 272,
+                    bos_id: None,
+                    eos_id: Some(271),
+                    pad_id: None,
+                    unk_id: None,
+                }),
+            },
+        )
+        .expect("dataset");
+
+        assert_eq!(
+            dataset.ruliad_document_end_token_id(),
+            Some(RULIAD_SYMBOLIC_DOCUMENT_END_TOKEN)
+        );
     }
 
     #[test]

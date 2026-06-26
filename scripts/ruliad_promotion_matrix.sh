@@ -7,6 +7,7 @@ BACKEND="${BURN_DRAGON_PROMOTION_BACKEND:-cuda}"
 FEATURES="${BURN_DRAGON_PROMOTION_FEATURES:-train,cuda}"
 OUT_DIR="${BURN_DRAGON_PROMOTION_OUT_DIR:-$ROOT_DIR/target/ruliad-promotion-matrix/$(date -u +%Y%m%dT%H%M%SZ)}"
 ARMS_CSV="${BURN_DRAGON_PROMOTION_ARMS:-jepa,jepa_nextlat,jepa_nextlat_pc_warm,cap_feedback}"
+BASELINE_ARM="${BURN_DRAGON_PROMOTION_BASELINE_ARM:-jepa}"
 SEEDS_CSV="${BURN_DRAGON_PROMOTION_SEEDS:-20260624,20260625,20260626}"
 MAX_ITERS="${BURN_DRAGON_PROMOTION_MAX_ITERS:-2048}"
 BATCH_SIZE="${BURN_DRAGON_PROMOTION_BATCH_SIZE:-4}"
@@ -37,7 +38,15 @@ Usage:
   scripts/ruliad_promotion_matrix.sh [options]
 
 Options:
-  --arms <csv>              jepa,jepa_nextlat,jepa_nextlat_pc,jepa_nextlat_pc_warm,cap_feedback.
+  --arms <csv>              jepa,jepa_nextlat,jepa_nextlat_pc,jepa_nextlat_pc_warm,cap_feedback,
+                            ruliad_1m_la16k_answer_window,ruliad_1m_la16k_answer_completion,
+                            ruliad_1m_la16k_answer_completion_ranking,
+                            ruliad_1m_la16k_answer_completion_denoising,
+                            ruliad_1m_la16k_answer_completion_ranking_denoising,
+                            ruliad_1m_la16k_verifier_reward,
+                            ruliad_1m_la16k_verifier_vpo,
+                            ruliad_1m_la16k_mixed.
+  --baseline-arm <name>     Analyzer control arm. Default: jepa.
   --seeds <csv>             Seed list. Default: 20260624,20260625,20260626.
   --max-iters <n>           Iterations per trial. Default: 2048.
   --batch-size <n>          Batch size. Default: 4.
@@ -67,6 +76,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arms) ARMS_CSV="$2"; shift 2 ;;
+    --baseline-arm) BASELINE_ARM="$2"; shift 2 ;;
     --seeds) SEEDS_CSV="$2"; shift 2 ;;
     --max-iters) MAX_ITERS="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
@@ -115,6 +125,30 @@ profile_for_arm() {
     cap_feedback)
       printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-probe128-fixed-ablation.toml"
       ;;
+    ruliad_1m_la16k_answer_window)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.self-recovery.training.toml"
+      ;;
+    ruliad_1m_la16k_answer_completion)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion.self-recovery.training.toml"
+      ;;
+    ruliad_1m_la16k_answer_completion_ranking)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion-ranking.self-recovery.training.toml"
+      ;;
+    ruliad_1m_la16k_answer_completion_denoising)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion-denoising.self-recovery.training.toml"
+      ;;
+    ruliad_1m_la16k_answer_completion_ranking_denoising)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion-ranking-denoising.self-recovery.training.toml"
+      ;;
+    ruliad_1m_la16k_verifier_reward)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.verifier-reward.training.toml"
+      ;;
+    ruliad_1m_la16k_verifier_vpo)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.verifier-vpo.training.toml"
+      ;;
+    ruliad_1m_la16k_mixed)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.mixed.self-recovery.training.toml"
+      ;;
     *)
       echo "unknown promotion arm: $1" >&2
       exit 2
@@ -150,7 +184,7 @@ IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
 mkdir -p "$OUT_DIR/profiles"
 
 echo "ruliad promotion matrix output: $OUT_DIR"
-echo "arms=${ARMS_CSV} seeds=${SEEDS_CSV} max_iters=${MAX_ITERS} max_steps=${MAX_STEPS} backend=${BACKEND}"
+echo "arms=${ARMS_CSV} baseline=${BASELINE_ARM} seeds=${SEEDS_CSV} max_iters=${MAX_ITERS} max_steps=${MAX_STEPS} backend=${BACKEND}"
 echo "shape: n_layer=$N_LAYER n_embd=$N_EMBD n_head=$N_HEAD latent_total=$LATENT_TOTAL block_size=$BLOCK_SIZE batch_size=$BATCH_SIZE"
 echo "RAM guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB"
 
@@ -202,7 +236,7 @@ for arm in "${ARMS[@]}"; do
 done
 
 if (( DRY_RUN == 0 )); then
-  python3 "$ROOT_DIR/scripts/ruliad_promotion_matrix_analyze.py" "$OUT_DIR"
+  python3 "$ROOT_DIR/scripts/ruliad_promotion_matrix_analyze.py" "$OUT_DIR" --baseline-arm "$BASELINE_ARM"
 fi
 
 echo "ruliad promotion matrix complete: $OUT_DIR"

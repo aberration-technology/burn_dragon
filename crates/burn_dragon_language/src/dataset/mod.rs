@@ -10,8 +10,8 @@ use burn::tensor::backend::Backend;
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
 pub use scheduler::{
-    RandomDataLoader, SequenceBatch, StreamingDataLoader, TokenSequenceDataset,
-    sample_batch_with_shape,
+    RandomDataLoader, RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, StreamingDataLoader,
+    TokenSequenceDataset, sample_batch_with_shape,
 };
 pub use universality::{
     RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, UniversalityDataset,
@@ -154,6 +154,13 @@ impl Dataset {
             }
         }
     }
+
+    pub fn ruliad_document_end_token_id(&self) -> Option<u32> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.ruliad_document_end_token_id(),
+        }
+    }
 }
 
 impl TokenSequenceDataset for Dataset {
@@ -265,6 +272,29 @@ impl TokenSequenceDataset for Dataset {
                 absolute_step,
                 batch_size,
                 block_size,
+            ),
+        }
+    }
+
+    fn source_selected_ruliad_policy_batch(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+    ) -> Option<RuliadPolicyBatch> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.source_selected_ruliad_policy_batch(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+            ),
+            Dataset::Universality(dataset) => dataset.source_selected_ruliad_policy_batch(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
             ),
         }
     }

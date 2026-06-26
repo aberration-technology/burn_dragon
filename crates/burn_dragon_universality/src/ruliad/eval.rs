@@ -22,7 +22,7 @@ use crate::ruliad::source_selection::{RuliadSourceBucket, ruliad_source_buckets}
 use crate::stats::SampleStats;
 
 pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 1;
-pub const RULIAD_EVAL_REPORT_VERSION: u32 = 2;
+pub const RULIAD_EVAL_REPORT_VERSION: u32 = 3;
 pub const RULIAD_REASONING_SCORE_VERSION: u32 = 1;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
@@ -183,6 +183,16 @@ pub struct RuliadEvalGroupScore {
     pub verifier_accuracy: f32,
     pub partial_credit_rate: f32,
     pub mean_partial_progress: f32,
+    #[serde(default)]
+    pub answer_field_correct_count: usize,
+    #[serde(default)]
+    pub answer_field_expected_count: usize,
+    #[serde(default)]
+    pub answer_field_accuracy: f32,
+    #[serde(default)]
+    pub answer_terminated_count: usize,
+    #[serde(default)]
+    pub answer_termination_rate: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,6 +225,16 @@ pub struct RuliadEvalReport {
     pub verifier_accuracy: f32,
     pub partial_credit_rate: f32,
     pub mean_partial_progress: f32,
+    #[serde(default)]
+    pub answer_field_correct_count: usize,
+    #[serde(default)]
+    pub answer_field_expected_count: usize,
+    #[serde(default)]
+    pub answer_field_accuracy: f32,
+    #[serde(default)]
+    pub answer_terminated_count: usize,
+    #[serde(default)]
+    pub answer_termination_rate: f32,
     pub mean_certificate_prefix_coverage: f32,
     pub mean_completion_tokens: f32,
     pub canary_count: usize,
@@ -320,11 +340,211 @@ pub fn ruliad_reasoning_rank_fitness(scores: &[RuliadReasoningScore]) -> Vec<f32
     fitness
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadVerifierRewardWeights {
+    pub verifier_match: f32,
+    pub semantic_match: f32,
+    pub partial_progress: f32,
+    pub field_accuracy: f32,
+    pub certificate_prefix: f32,
+    pub compactness: f32,
+    pub malformed_penalty: f32,
+    pub missing_penalty: f32,
+    pub schema_wrong_penalty: f32,
+    pub hash_canary_wrong_penalty: f32,
+}
+
+impl Default for RuliadVerifierRewardWeights {
+    fn default() -> Self {
+        Self {
+            verifier_match: 1.0,
+            semantic_match: 0.85,
+            partial_progress: 0.35,
+            field_accuracy: 0.35,
+            certificate_prefix: 0.15,
+            compactness: 0.0,
+            malformed_penalty: -0.35,
+            missing_penalty: -0.5,
+            schema_wrong_penalty: -0.15,
+            hash_canary_wrong_penalty: -0.35,
+        }
+    }
+}
+
+pub fn ruliad_verifier_reward(
+    score: &RuliadReasoningScore,
+    weights: RuliadVerifierRewardWeights,
+) -> f32 {
+    let mut reward = match score.status {
+        RuliadAnswerStatus::VerifierMatch => weights.verifier_match,
+        RuliadAnswerStatus::SemanticMatch => weights.semantic_match,
+        RuliadAnswerStatus::Partial => 0.0,
+        RuliadAnswerStatus::SchemaValidWrong => weights.schema_wrong_penalty,
+        RuliadAnswerStatus::Malformed => weights.malformed_penalty,
+        RuliadAnswerStatus::Missing => weights.missing_penalty,
+    };
+    let partial = score.partial_progress_ppm as f32 / SCORE_PPM_DENOMINATOR as f32;
+    let field_accuracy = if score.expected_field_count == 0 {
+        0.0
+    } else {
+        score.correct_field_count as f32 / score.expected_field_count as f32
+    };
+    let certificate = score.certificate_prefix_ppm as f32 / SCORE_PPM_DENOMINATOR as f32;
+    reward += weights.partial_progress * partial;
+    reward += weights.field_accuracy * field_accuracy;
+    reward += weights.certificate_prefix * certificate;
+    if weights.compactness != 0.0 && score.generated_token_count > 0 {
+        reward += weights.compactness / score.generated_token_count as f32;
+    }
+    if score.hash_canary && !score.verifier_match() {
+        reward += weights.hash_canary_wrong_penalty;
+    }
+    reward
+}
+
+pub const RULIAD_VERIFIER_REWARD_VECTOR_DIM: usize = 8;
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+pub struct RuliadVerifierRewardVector {
+    pub verifier_match: f32,
+    pub semantic_match: f32,
+    pub partial_progress: f32,
+    pub field_accuracy: f32,
+    pub certificate_prefix: f32,
+    pub compactness: f32,
+    pub schema_quality: f32,
+    pub hash_safety: f32,
+}
+
+impl RuliadVerifierRewardVector {
+    pub fn components(self) -> [f32; RULIAD_VERIFIER_REWARD_VECTOR_DIM] {
+        [
+            self.verifier_match,
+            self.semantic_match,
+            self.partial_progress,
+            self.field_accuracy,
+            self.certificate_prefix,
+            self.compactness,
+            self.schema_quality,
+            self.hash_safety,
+        ]
+    }
+
+    pub fn scalarize(self, weights: &[f32; RULIAD_VERIFIER_REWARD_VECTOR_DIM]) -> f32 {
+        self.components()
+            .into_iter()
+            .zip(weights.iter().copied())
+            .map(|(component, weight)| component * weight)
+            .sum()
+    }
+}
+
+pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVerifierRewardVector {
+    let partial_progress = score.partial_progress_ppm as f32 / SCORE_PPM_DENOMINATOR as f32;
+    let field_accuracy = if score.expected_field_count == 0 {
+        0.0
+    } else {
+        score.correct_field_count as f32 / score.expected_field_count as f32
+    };
+    let certificate_prefix = score.certificate_prefix_ppm as f32 / SCORE_PPM_DENOMINATOR as f32;
+    let schema_quality = match score.status {
+        RuliadAnswerStatus::VerifierMatch
+        | RuliadAnswerStatus::SemanticMatch
+        | RuliadAnswerStatus::Partial
+        | RuliadAnswerStatus::SchemaValidWrong => 1.0,
+        RuliadAnswerStatus::Malformed | RuliadAnswerStatus::Missing => 0.0,
+    };
+    let compactness = if score.generated_token_count == 0 {
+        0.0
+    } else {
+        1.0 / (score.generated_token_count as f32).sqrt()
+    };
+    RuliadVerifierRewardVector {
+        verifier_match: if score.status == RuliadAnswerStatus::VerifierMatch {
+            1.0
+        } else {
+            0.0
+        },
+        semantic_match: if matches!(
+            score.status,
+            RuliadAnswerStatus::VerifierMatch | RuliadAnswerStatus::SemanticMatch
+        ) {
+            1.0
+        } else {
+            0.0
+        },
+        partial_progress,
+        field_accuracy,
+        certificate_prefix,
+        compactness,
+        schema_quality,
+        hash_safety: if !score.hash_canary || score.verifier_match() {
+            1.0
+        } else {
+            0.0
+        },
+    }
+}
+
+pub fn ruliad_vpo_independent_utilities(
+    scores: &[RuliadReasoningScore],
+    scalarizations: &[[f32; RULIAD_VERIFIER_REWARD_VECTOR_DIM]],
+) -> Vec<f32> {
+    let mut utilities = vec![0.0f32; scores.len()];
+    if scores.is_empty() || scalarizations.is_empty() {
+        return utilities;
+    }
+    let vectors = scores
+        .iter()
+        .map(ruliad_verifier_reward_vector)
+        .collect::<Vec<_>>();
+    for weights in scalarizations {
+        let mut best_index = 0usize;
+        let mut best_value = f32::NEG_INFINITY;
+        for (index, vector) in vectors.iter().copied().enumerate() {
+            let value = vector.scalarize(weights);
+            if value > best_value {
+                best_index = index;
+                best_value = value;
+            }
+        }
+        if best_value.is_finite() {
+            utilities[best_index] += best_value;
+        }
+    }
+    let scale = scalarizations.len() as f32;
+    for utility in utilities.iter_mut() {
+        *utility /= scale;
+    }
+    utilities
+}
+
+pub fn centered_advantages(rewards: &[f32]) -> Vec<f32> {
+    if rewards.is_empty() {
+        return Vec::new();
+    }
+    let mean = rewards.iter().copied().sum::<f32>() / rewards.len() as f32;
+    rewards.iter().map(|reward| reward - mean).collect()
+}
+
+pub fn normalized_advantages(rewards: &[f32], epsilon: f32) -> Vec<f32> {
+    let centered = centered_advantages(rewards);
+    if centered.len() < 2 {
+        return centered;
+    }
+    let variance = centered.iter().map(|value| value * value).sum::<f32>() / centered.len() as f32;
+    let scale = variance.sqrt().max(epsilon.max(0.0));
+    centered.into_iter().map(|value| value / scale).collect()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuliadExtractedCompletion {
     pub answer: Option<String>,
     pub certificate_lines: Vec<String>,
     pub generated_token_count: usize,
+    #[serde(default)]
+    pub answer_terminated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -363,6 +583,9 @@ struct EvalAccumulator {
     malformed_completion_count: usize,
     missing_completion_count: usize,
     partial_progress_ppm_sum: usize,
+    answer_field_correct_count: usize,
+    answer_field_expected_count: usize,
+    answer_terminated_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +594,7 @@ struct EvalOutcome {
     semantic_match: bool,
     malformed: bool,
     missing: bool,
+    answer_terminated: bool,
     actual_answer: Option<String>,
     reasoning_score: RuliadReasoningScore,
 }
@@ -544,7 +768,7 @@ pub fn baseline_completions(
             };
             RuliadCompletionRecord {
                 oracle_hash: item.oracle_hash.clone(),
-                completion: format!("!:{answer}"),
+                completion: format!("!:{answer}\n[/R2]"),
             }
         })
         .collect()
@@ -588,6 +812,9 @@ pub fn evaluate_completions(
     let mut canary_count = 0usize;
     let mut canary_semantic_match_count = 0usize;
     let mut partial_progress_ppm_sum = 0usize;
+    let mut answer_field_correct_count = 0usize;
+    let mut answer_field_expected_count = 0usize;
+    let mut answer_terminated_count = 0usize;
     let mut certificate_prefix_ppm_sum = 0usize;
     let mut completion_token_sum = 0usize;
     let mut failures = Vec::new();
@@ -608,6 +835,11 @@ pub fn evaluate_completions(
         missing_completion_count += usize::from(outcome.missing);
         partial_progress_ppm_sum =
             partial_progress_ppm_sum.saturating_add(outcome.reasoning_score.partial_progress_ppm);
+        answer_field_correct_count =
+            answer_field_correct_count.saturating_add(outcome.reasoning_score.correct_field_count);
+        answer_field_expected_count = answer_field_expected_count
+            .saturating_add(outcome.reasoning_score.expected_field_count);
+        answer_terminated_count += usize::from(outcome.answer_terminated);
         certificate_prefix_ppm_sum = certificate_prefix_ppm_sum
             .saturating_add(outcome.reasoning_score.certificate_prefix_ppm);
         completion_token_sum =
@@ -668,6 +900,11 @@ pub fn evaluate_completions(
         verifier_accuracy: ratio(verifier_match_count, items.len()),
         partial_credit_rate: ratio(partial_credit_count, items.len()),
         mean_partial_progress: ratio_ppm(partial_progress_ppm_sum, items.len()),
+        answer_field_correct_count,
+        answer_field_expected_count,
+        answer_field_accuracy: ratio(answer_field_correct_count, answer_field_expected_count),
+        answer_terminated_count,
+        answer_termination_rate: ratio(answer_terminated_count, items.len()),
         mean_certificate_prefix_coverage: ratio_ppm(certificate_prefix_ppm_sum, items.len()),
         mean_completion_tokens: ratio_f32(completion_token_sum as f32, items.len()),
         canary_count,
@@ -687,9 +924,12 @@ pub fn extract_ruliad_answer(completion: &str) -> Option<String> {
 
 pub fn extract_ruliad_completion(completion: &str) -> RuliadExtractedCompletion {
     let answer_start = completion.find("!:").map(|offset| offset + 2).unwrap_or(0);
+    let completion_body = &completion[answer_start..];
+    let answer_terminated =
+        completion_body.contains("[/R2]") || completion_body.contains("[/RTREE]");
     let mut answer = None;
     let mut certificate_lines = Vec::new();
-    for line in completion[answer_start..].lines() {
+    for line in completion_body.lines() {
         let candidate = line
             .split("[/R2]")
             .next()
@@ -713,7 +953,8 @@ pub fn extract_ruliad_completion(completion: &str) -> RuliadExtractedCompletion 
     RuliadExtractedCompletion {
         answer,
         certificate_lines,
-        generated_token_count: completion[answer_start..].split_whitespace().count(),
+        generated_token_count: completion_body.split_whitespace().count(),
+        answer_terminated,
     }
 }
 
@@ -731,6 +972,7 @@ fn extracted_expected_completion(
         answer: None,
         certificate_lines: Vec::new(),
         generated_token_count: 0,
+        answer_terminated: false,
     })
 }
 
@@ -769,6 +1011,7 @@ pub fn score_ruliad_answer(
         answer: Some(answer.to_string()),
         certificate_lines: Vec::new(),
         generated_token_count: answer.split_whitespace().count(),
+        answer_terminated: false,
     });
     score_ruliad_completion_parts(spec, expected_answer, &[], completion)
 }
@@ -1283,17 +1526,21 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
             semantic_match: false,
             malformed: false,
             missing: true,
+            answer_terminated: false,
             actual_answer: None,
             reasoning_score,
         };
     };
-    let actual_answer = extract_ruliad_answer(completion);
+    let extracted = extract_ruliad_completion(completion);
+    let answer_terminated = extracted.answer_terminated;
+    let actual_answer = extracted.answer;
     let Some(actual) = actual_answer.as_deref() else {
         return EvalOutcome {
             exact_match: false,
             semantic_match: false,
             malformed: true,
             missing: false,
+            answer_terminated,
             actual_answer,
             reasoning_score,
         };
@@ -1305,6 +1552,7 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
         semantic_match,
         malformed: false,
         missing: false,
+        answer_terminated,
         actual_answer,
         reasoning_score,
     }
@@ -1328,6 +1576,13 @@ fn add_group_score(
     score.partial_progress_ppm_sum = score
         .partial_progress_ppm_sum
         .saturating_add(outcome.reasoning_score.partial_progress_ppm);
+    score.answer_field_correct_count = score
+        .answer_field_correct_count
+        .saturating_add(outcome.reasoning_score.correct_field_count);
+    score.answer_field_expected_count = score
+        .answer_field_expected_count
+        .saturating_add(outcome.reasoning_score.expected_field_count);
+    score.answer_terminated_count += usize::from(outcome.answer_terminated);
 }
 
 fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<RuliadEvalGroupScore> {
@@ -1348,6 +1603,14 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
             verifier_accuracy: ratio(score.verifier_match_count, score.count),
             partial_credit_rate: ratio(score.partial_credit_count, score.count),
             mean_partial_progress: ratio_ppm(score.partial_progress_ppm_sum, score.count),
+            answer_field_correct_count: score.answer_field_correct_count,
+            answer_field_expected_count: score.answer_field_expected_count,
+            answer_field_accuracy: ratio(
+                score.answer_field_correct_count,
+                score.answer_field_expected_count,
+            ),
+            answer_terminated_count: score.answer_terminated_count,
+            answer_termination_rate: ratio(score.answer_terminated_count, score.count),
         })
         .collect()
 }
@@ -1822,6 +2085,119 @@ mod tests {
     }
 
     #[test]
+    fn verifier_reward_orders_reasoning_quality() {
+        let weights = RuliadVerifierRewardWeights::default();
+        let exact = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("ok=1;l=3;r=3"));
+        let partial = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("ok=1;l=2;r=7"));
+        let wrong = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("bad=0"));
+        let malformed = score_ruliad_completion(None, "ok=1;l=3;r=3", Some("bad completion"));
+        let missing = score_ruliad_completion(None, "ok=1;l=3;r=3", None);
+
+        let exact_reward = ruliad_verifier_reward(&exact, weights);
+        let partial_reward = ruliad_verifier_reward(&partial, weights);
+        let wrong_reward = ruliad_verifier_reward(&wrong, weights);
+        let malformed_reward = ruliad_verifier_reward(&malformed, weights);
+        let missing_reward = ruliad_verifier_reward(&missing, weights);
+
+        assert!(exact_reward > partial_reward);
+        assert!(partial_reward > wrong_reward);
+        assert!(wrong_reward > malformed_reward);
+        assert!(malformed_reward > missing_reward);
+    }
+
+    #[test]
+    fn verifier_reward_can_prefer_compact_correct_answers() {
+        let weights = RuliadVerifierRewardWeights {
+            compactness: 0.5,
+            ..RuliadVerifierRewardWeights::default()
+        };
+        let mut short = score_ruliad_answer(None, "ok=1;l=3;r=3", Some("ok=1;l=3;r=3"));
+        short.generated_token_count = 2;
+        let mut long = short.clone();
+        long.generated_token_count = 20;
+        assert!(ruliad_verifier_reward(&short, weights) > ruliad_verifier_reward(&long, weights));
+    }
+
+    #[test]
+    fn verifier_reward_vector_exposes_independent_quality_axes() {
+        let score = RuliadReasoningScore {
+            version: RULIAD_REASONING_SCORE_VERSION,
+            status: RuliadAnswerStatus::VerifierMatch,
+            correct_field_count: 2,
+            expected_field_count: 4,
+            partial_progress_ppm: SCORE_PPM_DENOMINATOR / 2,
+            certificate_valid_prefix_steps: 1,
+            certificate_expected_steps: 4,
+            certificate_prefix_ppm: SCORE_PPM_DENOMINATOR / 4,
+            generated_token_count: 16,
+            hash_canary: false,
+        };
+        let vector = ruliad_verifier_reward_vector(&score);
+        assert_eq!(vector.verifier_match, 1.0);
+        assert_eq!(vector.semantic_match, 1.0);
+        assert_eq!(vector.partial_progress, 0.5);
+        assert_eq!(vector.field_accuracy, 0.5);
+        assert_eq!(vector.certificate_prefix, 0.25);
+        assert_eq!(vector.compactness, 0.25);
+        assert_eq!(vector.schema_quality, 1.0);
+        assert_eq!(vector.hash_safety, 1.0);
+    }
+
+    #[test]
+    fn vpo_independent_utilities_select_pareto_useful_completions() {
+        let exact_long = RuliadReasoningScore {
+            version: RULIAD_REASONING_SCORE_VERSION,
+            status: RuliadAnswerStatus::VerifierMatch,
+            correct_field_count: 4,
+            expected_field_count: 4,
+            partial_progress_ppm: SCORE_PPM_DENOMINATOR,
+            certificate_valid_prefix_steps: 4,
+            certificate_expected_steps: 4,
+            certificate_prefix_ppm: SCORE_PPM_DENOMINATOR,
+            generated_token_count: 100,
+            hash_canary: false,
+        };
+        let compact_partial = RuliadReasoningScore {
+            version: RULIAD_REASONING_SCORE_VERSION,
+            status: RuliadAnswerStatus::Partial,
+            correct_field_count: 2,
+            expected_field_count: 4,
+            partial_progress_ppm: SCORE_PPM_DENOMINATOR / 2,
+            certificate_valid_prefix_steps: 1,
+            certificate_expected_steps: 4,
+            certificate_prefix_ppm: SCORE_PPM_DENOMINATOR / 4,
+            generated_token_count: 1,
+            hash_canary: false,
+        };
+        let verifier_axis = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let compactness_axis = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let utilities = ruliad_vpo_independent_utilities(
+            &[exact_long, compact_partial],
+            &[verifier_axis, compactness_axis],
+        );
+        assert!(
+            utilities[0] > 0.0,
+            "verifier scalarization should select exact answer"
+        );
+        assert!(
+            utilities[1] > 0.0,
+            "compactness scalarization should select compact answer"
+        );
+    }
+
+    #[test]
+    fn verifier_reward_advantages_are_centered_and_normalized() {
+        let rewards = [1.0, 0.0, -0.5, 0.5];
+        let centered = centered_advantages(&rewards);
+        assert!((centered.iter().sum::<f32>()).abs() < 1.0e-6);
+        let normalized = normalized_advantages(&rewards, 1.0e-6);
+        assert!((normalized.iter().sum::<f32>()).abs() < 1.0e-6);
+        let variance =
+            normalized.iter().map(|value| value * value).sum::<f32>() / normalized.len() as f32;
+        assert!((variance - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn oracle_baseline_scores_all_eval_items() {
         let dir = tempdir().expect("tempdir");
         let mut config = test_config();
@@ -1843,7 +2219,60 @@ mod tests {
         assert_eq!(eval.verifier_match_count, 16);
         assert_eq!(eval.partial_credit_count, 16);
         assert_eq!(eval.mean_partial_progress, 1.0);
+        assert_eq!(eval.answer_termination_rate, 1.0);
         assert_eq!(eval.failures.len(), 0);
+    }
+
+    #[test]
+    fn eval_report_tracks_answer_field_and_termination_health() {
+        let items = vec![
+            RuliadEvalItem {
+                oracle_hash: "h0".to_string(),
+                sample_index: 0,
+                split: SampleSplit::Validation,
+                family: "law".to_string(),
+                task_kind: "category_law".to_string(),
+                math_domains: vec!["category".to_string()],
+                reasoning_modes: vec!["equational".to_string()],
+                prompt: "?:q\nA:ok,l,r\n!:".to_string(),
+                expected_answer: "ok=1;l=3;r=3".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+            RuliadEvalItem {
+                oracle_hash: "h1".to_string(),
+                sample_index: 1,
+                split: SampleSplit::Validation,
+                family: "law".to_string(),
+                task_kind: "category_law".to_string(),
+                math_domains: vec!["category".to_string()],
+                reasoning_modes: vec!["equational".to_string()],
+                prompt: "?:q\nA:ok,l,r\n!:".to_string(),
+                expected_answer: "ok=1;l=2;r=2".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+        ];
+        let completions = vec![
+            RuliadCompletionRecord {
+                oracle_hash: "h0".to_string(),
+                completion: "!:1;3;3\n[/R2]".to_string(),
+            },
+            RuliadCompletionRecord {
+                oracle_hash: "h1".to_string(),
+                completion: "!:ok=1;l=0;r=2".to_string(),
+            },
+        ];
+
+        let eval = evaluate_completions("ruliad-eval-test", &items, &completions);
+        assert_eq!(eval.answer_field_correct_count, 5);
+        assert_eq!(eval.answer_field_expected_count, 6);
+        assert!((eval.answer_field_accuracy - (5.0 / 6.0)).abs() < 1.0e-6);
+        assert_eq!(eval.answer_terminated_count, 1);
+        assert_eq!(eval.answer_termination_rate, 0.5);
+        let difficulty = eval.difficulty_scores.first().expect("difficulty group");
+        assert_eq!(difficulty.answer_field_correct_count, 5);
+        assert_eq!(difficulty.answer_terminated_count, 1);
     }
 
     #[test]

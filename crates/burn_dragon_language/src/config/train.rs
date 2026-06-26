@@ -21,10 +21,10 @@ pub use schema::{
     PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
     PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepeatUnlikelihoodConfig,
     RepromptTruncation, RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig,
-    RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig,
-    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
-    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    ValidationDatasetConfig,
+    RuliadSupervisionConfig, RuliadSupervisionMode, RuliadVerifierRewardConfig,
+    RuliadVerifierRewardMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
 };
 
 use crate::tokenizer::TokenizerConfig;

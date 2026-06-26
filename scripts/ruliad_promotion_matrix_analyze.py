@@ -15,6 +15,8 @@ TRIAL_SUMMARY = "latent_reasoning_steps_summary.csv"
 METRIC_COLUMNS = [
     "stage_model_tokens_per_sec",
     "gpu_util_mean",
+    "elapsed_seconds",
+    "peak_used_mb",
     "valid_teacher_ce_last",
     "source_mean_difficulty_last",
     "source_entropy_bits_last",
@@ -24,11 +26,17 @@ METRIC_COLUMNS = [
     "ruliad_partial_last",
     "ruliad_schema_wrong_last",
     "ruliad_malformed_last",
+    "ruliad_answer_field_accuracy_last",
+    "ruliad_answer_termination_rate_last",
     "completion_health_last",
+    "completion_distinct_2_last",
+    "completion_period_2_to_64_last",
+    "completion_repetition_last",
     "capability_score_auc",
     "capability_verifier_auc",
     "capability_bucket_lagging_count",
     "output_entropy_bits_last",
+    "output_distinct_2_last",
     "output_repetition_last",
     "output_period_2_to_64_last",
     "fatal_gate_count",
@@ -47,7 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-schema-wrong-delta", type=float, default=0.10)
     parser.add_argument("--max-malformed-delta", type=float, default=0.05)
     parser.add_argument("--max-completion-regression", type=float, default=0.10)
+    parser.add_argument("--max-answer-field-regression", type=float, default=0.05)
+    parser.add_argument("--max-answer-termination-regression", type=float, default=0.10)
+    parser.add_argument("--min-completion-distinct-2", type=float, default=0.20)
+    parser.add_argument("--max-completion-period", type=float, default=0.70)
+    parser.add_argument("--max-completion-repetition", type=float, default=0.70)
     parser.add_argument("--min-output-entropy", type=float, default=0.25)
+    parser.add_argument("--min-output-distinct-2", type=float, default=0.10)
     parser.add_argument("--min-throughput-ratio", type=float, default=0.85)
     return parser.parse_args()
 
@@ -142,8 +156,11 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
     base_partial = value(baseline, "ruliad_partial_last_mean", 0.0)
     base_schema = value(baseline, "ruliad_schema_wrong_last_mean", 0.0)
     base_malformed = value(baseline, "ruliad_malformed_last_mean", 0.0)
+    base_answer_field = value(baseline, "ruliad_answer_field_accuracy_last_mean", 0.0)
+    base_answer_termination = value(baseline, "ruliad_answer_termination_rate_last_mean", 0.0)
     base_completion = value(baseline, "completion_health_last_mean", 0.0)
     base_entropy = value(baseline, "output_entropy_bits_last_mean", 0.0)
+    base_distinct2 = value(baseline, "output_distinct_2_last_mean", 0.0)
 
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -155,8 +172,14 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         partial = value(row, "ruliad_partial_last_mean", 0.0)
         schema = value(row, "ruliad_schema_wrong_last_mean", 0.0)
         malformed = value(row, "ruliad_malformed_last_mean", 0.0)
+        answer_field = value(row, "ruliad_answer_field_accuracy_last_mean", 0.0)
+        answer_termination = value(row, "ruliad_answer_termination_rate_last_mean", 0.0)
         completion = value(row, "completion_health_last_mean", 0.0)
+        completion_distinct2 = value(row, "completion_distinct_2_last_mean", 1.0)
+        completion_period = value(row, "completion_period_2_to_64_last_mean", 0.0)
+        completion_repetition = value(row, "completion_repetition_last_mean", 0.0)
         entropy = value(row, "output_entropy_bits_last_mean", 0.0)
+        distinct2 = value(row, "output_distinct_2_last_mean", 0.0)
         throughput_ratio = model_tps / base_model_tps if base_model_tps > 0.0 else 0.0
         valid_delta = valid - base_valid
         source_delta = source - base_source
@@ -164,8 +187,11 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         partial_delta = partial - base_partial
         schema_delta = schema - base_schema
         malformed_delta = malformed - base_malformed
+        answer_field_delta = answer_field - base_answer_field
+        answer_termination_delta = answer_termination - base_answer_termination
         completion_delta = completion - base_completion
         entropy_delta = entropy - base_entropy
+        distinct2_delta = distinct2 - base_distinct2
         fatal_gate_count = value(row, "fatal_gate_count_mean", 0.0)
 
         reasons: list[str] = []
@@ -187,18 +213,33 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             reasons.append("malformed_regression")
         if completion_delta < -args.max_completion_regression:
             reasons.append("completion_regression")
+        if answer_field_delta < -args.max_answer_field_regression:
+            reasons.append("answer_field_regression")
+        if answer_termination_delta < -args.max_answer_termination_regression:
+            reasons.append("answer_termination_regression")
+        if completion_distinct2 < args.min_completion_distinct_2:
+            reasons.append("completion_distinct2_collapse")
+        if completion_period > args.max_completion_period:
+            reasons.append("completion_period_collapse")
+        if completion_repetition > args.max_completion_repetition:
+            reasons.append("completion_repetition_collapse")
         if entropy < args.min_output_entropy:
             reasons.append("entropy_collapse")
+        if distinct2 < args.min_output_distinct_2:
+            reasons.append("output_distinct2_collapse")
 
         score_delta = (
             verifier_delta * 6.0
             + partial_delta * 2.0
             - schema_delta * 2.0
             + completion_delta * 1.5
+            + answer_field_delta
+            + answer_termination_delta * 0.5
             - valid_delta
             - max(source_delta, 0.0) * 0.20
             + (throughput_ratio - 1.0) * 0.50
             + entropy_delta * 0.05
+            + distinct2_delta * 0.5
         )
         if arm == args.baseline_arm:
             decision = "control"
@@ -228,7 +269,10 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
                 "schema_wrong_delta": schema_delta,
                 "malformed_delta": malformed_delta,
                 "completion_delta": completion_delta,
+                "answer_field_delta": answer_field_delta,
+                "answer_termination_delta": answer_termination_delta,
                 "output_entropy_delta": entropy_delta,
+                "output_distinct_2_delta": distinct2_delta,
             }
         )
         out.append(item)
@@ -247,8 +291,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | model tok/s | tput | valid CE | dCE | source diff | dsource | verifier | dver | partial | schema | dschema | completion | dcomp | out H | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -257,20 +301,27 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         str(row.get("arm") or ""),
                         str(row.get("decision") or ""),
                         f"{row.get('ok_trials', 0)}/{row.get('trials', 0)}",
+                        fmt(row.get("elapsed_seconds_mean")),
+                        fmt(row.get("peak_used_mb_mean")),
                         fmt(row.get("stage_model_tokens_per_sec_mean")),
                         fmt(row.get("throughput_ratio")),
                         fmt(row.get("valid_teacher_ce_last_mean")),
                         fmt(row.get("valid_ce_delta")),
                         fmt(row.get("source_mean_difficulty_last_mean")),
-                        fmt(row.get("source_difficulty_delta")),
                         fmt(row.get("ruliad_verifier_last_mean")),
                         fmt(row.get("verifier_delta")),
                         fmt(row.get("ruliad_partial_last_mean")),
                         fmt(row.get("ruliad_schema_wrong_last_mean")),
                         fmt(row.get("schema_wrong_delta")),
+                        fmt(row.get("ruliad_answer_field_accuracy_last_mean")),
+                        fmt(row.get("answer_field_delta")),
+                        fmt(row.get("ruliad_answer_termination_rate_last_mean")),
+                        fmt(row.get("answer_termination_delta")),
                         fmt(row.get("completion_health_last_mean")),
                         fmt(row.get("completion_delta")),
-                        fmt(row.get("output_entropy_bits_last_mean")),
+                        fmt(row.get("completion_distinct_2_last_mean")),
+                        fmt(row.get("completion_period_2_to_64_last_mean")),
+                        fmt(row.get("output_distinct_2_last_mean")),
                         fmt(row.get("promotion_score_delta")),
                         str(row.get("fail_reasons") or ""),
                     ]
@@ -303,7 +354,10 @@ def main() -> None:
             "schema_wrong_delta",
             "malformed_delta",
             "completion_delta",
+            "answer_field_delta",
+            "answer_termination_delta",
             "output_entropy_delta",
+            "output_distinct_2_delta",
         ]
     )
     trial_fields = ["arm"] + [field for field in trials[0].keys() if field != "arm"]

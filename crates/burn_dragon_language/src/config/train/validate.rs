@@ -12,7 +12,7 @@ use burn_dragon_train::{
 
 use super::{
     DatasetSourceConfig, PredictiveCodingBackwardMode, PredictiveCodingMode,
-    PredictiveCodingParameterUpdate, TrainingConfig,
+    PredictiveCodingParameterUpdate, RuliadVerifierRewardMode, TrainingConfig,
 };
 use crate::tokenizer::TokenizerKind;
 
@@ -1796,6 +1796,11 @@ impl TrainingConfig {
                     self.training.ruliad_supervision.mode
                 ));
             }
+            if self.training.ruliad_supervision.verifier_reward.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support training.ruliad_supervision.verifier_reward.enabled"
+                ));
+            }
         }
         if self.training.ruliad_supervision.answer_ranking.enabled {
             let ranking = self.training.ruliad_supervision.answer_ranking;
@@ -1845,6 +1850,115 @@ impl TrainingConfig {
             if self.parallel.pipeline.enabled {
                 return Err(anyhow!(
                     "training.ruliad_supervision.answer_denoising.enabled does not yet support parallel.pipeline.enabled"
+                ));
+            }
+        }
+        if self.training.ruliad_supervision.verifier_reward.enabled {
+            let verifier_reward = self.training.ruliad_supervision.verifier_reward;
+            if !verifier_reward.weight.is_finite() || verifier_reward.weight <= 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.weight must be finite and positive"
+                ));
+            }
+            if verifier_reward.group_size < 2 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.group_size must be at least 2"
+                ));
+            }
+            if verifier_reward.max_completion_tokens == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.max_completion_tokens must be positive"
+                ));
+            }
+            if verifier_reward.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.every_steps must be positive"
+                ));
+            }
+            if !verifier_reward.temperature.is_finite() || verifier_reward.temperature <= 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.temperature must be finite and positive"
+                ));
+            }
+            if verifier_reward.top_k == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.top_k must be positive"
+                ));
+            }
+            if !verifier_reward.kl_weight.is_finite() || verifier_reward.kl_weight < 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.kl_weight must be finite and non-negative"
+                ));
+            }
+            if !verifier_reward.clip_range.is_finite() || verifier_reward.clip_range <= 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.clip_range must be finite and positive"
+                ));
+            }
+            if !verifier_reward.advantage_epsilon.is_finite()
+                || verifier_reward.advantage_epsilon <= 0.0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.advantage_epsilon must be finite and positive"
+                ));
+            }
+            if matches!(
+                verifier_reward.mode,
+                RuliadVerifierRewardMode::VpoIndependent
+            ) && verifier_reward.vpo_scalarizations == 0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.vpo_scalarizations must be positive when mode=\"vpo_independent\""
+                ));
+            }
+            let reward_weights = verifier_reward.reward;
+            for (field, value) in [
+                ("verifier_match", reward_weights.verifier_match),
+                ("semantic_match", reward_weights.semantic_match),
+                ("partial_progress", reward_weights.partial_progress),
+                ("field_accuracy", reward_weights.field_accuracy),
+                ("certificate_prefix", reward_weights.certificate_prefix),
+                ("compactness", reward_weights.compactness),
+                ("malformed_penalty", reward_weights.malformed_penalty),
+                ("missing_penalty", reward_weights.missing_penalty),
+                ("schema_wrong_penalty", reward_weights.schema_wrong_penalty),
+                (
+                    "hash_canary_wrong_penalty",
+                    reward_weights.hash_canary_wrong_penalty,
+                ),
+            ] {
+                if !value.is_finite() {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.reward.{field} must be finite"
+                    ));
+                }
+            }
+            if !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            ) {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled requires dataset.type=\"universality_ruliad\""
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled does not yet support parallel.pipeline.enabled"
+                ));
+            }
+            if self.training.tbptt_chunk_size.is_some() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled does not yet support training.tbptt_chunk_size"
+                ));
+            }
+            if self.training.tbptt_persist_across_steps {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled does not yet support training.tbptt_persist_across_steps"
+                ));
+            }
+            if !self.training.objective.is_next_token() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled currently supports only the next-token training objective"
                 ));
             }
         }
@@ -3140,6 +3254,94 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn ruliad_1m_la16k_verifier_proxy_profiles_validate() {
+        for (profile, ranking, denoising) in [
+            (
+                "ruliad-1m-la-16k.answer-completion.self-recovery.training.toml",
+                false,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.answer-completion-ranking.self-recovery.training.toml",
+                true,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.answer-completion-denoising.self-recovery.training.toml",
+                false,
+                true,
+            ),
+            (
+                "ruliad-1m-la-16k.answer-completion-ranking-denoising.self-recovery.training.toml",
+                true,
+                true,
+            ),
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            assert_eq!(
+                config.training.ruliad_supervision.mode,
+                RuliadSupervisionMode::AnswerCompletion,
+                "{profile}"
+            );
+            assert!(
+                config.training.ruliad_supervision.uses_target_loss_mask(),
+                "{profile} should expose answer masks for verifier-proxy objectives"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.answer_ranking.enabled, ranking,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.answer_denoising.enabled, denoising,
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_verifier_reward_profile_validates() {
+        let config = load_profile("ruliad-1m-la-16k.verifier-reward.training.toml");
+        config
+            .validate()
+            .expect("ruliad verifier-reward profile should validate");
+        assert!(config.training.ruliad_supervision.verifier_reward.enabled);
+        assert_eq!(
+            config.training.ruliad_supervision.verifier_reward.mode,
+            RuliadVerifierRewardMode::Scalar
+        );
+        assert!(config.training.tbptt_chunk_size.is_none());
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(config.training.objective.is_next_token());
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_verifier_vpo_profile_validates() {
+        let config = load_profile("ruliad-1m-la-16k.verifier-vpo.training.toml");
+        config
+            .validate()
+            .expect("ruliad verifier VPO profile should validate");
+        assert!(config.training.ruliad_supervision.verifier_reward.enabled);
+        assert_eq!(
+            config.training.ruliad_supervision.verifier_reward.mode,
+            RuliadVerifierRewardMode::VpoIndependent
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .vpo_scalarizations
+                > 0
+        );
+        assert!(config.training.tbptt_chunk_size.is_none());
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(config.training.objective.is_next_token());
+    }
+
+    #[test]
     fn ruliad_1m_jepa_default_profiles_validate() {
         for profile in [
             "ruliad-1m.jepa.training.toml",
@@ -3661,6 +3863,109 @@ start_policy = "capability_gate"
             .expect_err("invalid denoising probability should fail");
         assert!(
             err.to_string().contains("answer_denoising.probability"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_requires_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("verifier reward should require ruliad data");
+        assert!(
+            err.to_string().contains("universality_ruliad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_rejects_invalid_parameters() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .group_size = 1;
+        let err = config
+            .validate()
+            .expect_err("single-sample verifier reward group should fail");
+        assert!(
+            err.to_string().contains("verifier_reward.group_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_validates_for_local_ruliad_next_token() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config
+            .validate()
+            .expect("verifier reward should validate for local ruliad next-token training");
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_vpo_rejects_zero_scalarizations() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.mode =
+            RuliadVerifierRewardMode::VpoIndependent;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .vpo_scalarizations = 0;
+        let err = config
+            .validate()
+            .expect_err("zero VPO scalarization count should fail");
+        assert!(
+            err.to_string().contains("vpo_scalarizations"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_rejects_streaming_tbptt() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.tbptt_persist_across_steps = true;
+        let err = config
+            .validate()
+            .expect_err("verifier reward should reject persistent TBPTT");
+        assert!(
+            err.to_string().contains("tbptt_persist_across_steps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_rejects_tbptt_chunking() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.tbptt_chunk_size = Some(128);
+        let err = config
+            .validate()
+            .expect_err("verifier reward should reject TBPTT chunking");
+        assert!(
+            err.to_string().contains("tbptt_chunk_size"),
             "unexpected error: {err}"
         );
     }

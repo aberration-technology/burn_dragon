@@ -18,6 +18,19 @@ use crate::tokenizer::SharedTokenizer;
 
 use super::DatasetSplit;
 
+#[derive(Clone, Debug)]
+pub struct RuliadPolicySample {
+    pub item: burn_dragon_universality::RuliadEvalItem,
+    pub prompt_tokens: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuliadPolicyBatch {
+    pub samples: Vec<RuliadPolicySample>,
+    pub tokenization: burn_dragon_universality::RuliadTokenizationConfig,
+    pub stop_token_id: Option<i64>,
+}
+
 /// Abstraction over text corpora that can be converted into DragonModel-compatible batches.
 pub trait TokenSequenceDataset: Send + Sync {
     /// Return a shared tokenizer handle (cloned per call).
@@ -78,6 +91,19 @@ pub trait TokenSequenceDataset: Send + Sync {
         _batch_size: usize,
         _block_size: usize,
     ) -> Option<Vec<Vec<u32>>> {
+        None
+    }
+
+    /// Return ruliad prompt/eval metadata aligned to a live source-selected step, if available.
+    /// The random data loader requests this only when a verifier-reward policy auxiliary is
+    /// explicitly enabled, keeping ordinary batch construction on the token-only hot path.
+    fn source_selected_ruliad_policy_batch(
+        &self,
+        _split: DatasetSplit,
+        _epoch_index: usize,
+        _absolute_step: usize,
+        _batch_size: usize,
+    ) -> Option<RuliadPolicyBatch> {
         None
     }
 
@@ -291,6 +317,7 @@ fn sample_host_batch_with_shape<T>(
     block_size: usize,
     epoch_index: usize,
     absolute_step: usize,
+    include_ruliad_policy_batch: bool,
 ) -> HostSequenceBatch
 where
     T: TokenSequenceDataset + ?Sized,
@@ -308,6 +335,7 @@ where
         .then(|| vec![0i64; batch_size * block_size]);
     #[cfg(not(feature = "train"))]
     let mut sample = vec![0u32; block_size + 1];
+    let mut ruliad_policy_batch = None;
 
     if let Some(source_windows) = dataset.source_selected_token_windows(
         split,
@@ -336,6 +364,11 @@ where
                     &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
                 );
             }
+        }
+        if include_ruliad_policy_batch {
+            ruliad_policy_batch = dataset
+                .source_selected_ruliad_policy_batch(split, epoch_index, absolute_step, batch_size)
+                .map(Arc::new);
         }
     } else if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
@@ -492,6 +525,7 @@ where
         inputs,
         targets,
         loss_mask,
+        ruliad_policy_batch,
         dataloader_cpu_ns: cpu_start
             .map(|start| start.elapsed().as_nanos())
             .unwrap_or_default(),
@@ -508,7 +542,15 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
     epoch_index: usize,
     device: &B::Device,
 ) -> SequenceBatch<B> {
-    let host = sample_host_batch_with_shape(dataset, split, batch_size, block_size, epoch_index, 0);
+    let host = sample_host_batch_with_shape(
+        dataset,
+        split,
+        batch_size,
+        block_size,
+        epoch_index,
+        0,
+        false,
+    );
     if crate::train::profile::enabled() {
         crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);
     }
@@ -528,6 +570,7 @@ pub struct SequenceBatch<B: Backend> {
     pub targets: Tensor<B, 2, Int>,
     pub loss_mask: Option<Tensor<B, 2, Int>>,
     pub summary_event_mask: Option<Tensor<B, 2, Int>>,
+    pub ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
     pub reset_stream_state: bool,
 }
 
@@ -535,6 +578,7 @@ struct HostSequenceBatch {
     inputs: Vec<i64>,
     targets: Vec<i64>,
     loss_mask: Option<Vec<i64>>,
+    ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
     dataloader_cpu_ns: u128,
     reset_stream_state: bool,
 }
@@ -558,6 +602,7 @@ impl RandomPrefetch {
         total_steps: Option<usize>,
         depth: usize,
         workers: usize,
+        include_ruliad_policy_batch: bool,
     ) -> Self {
         let worker_count = workers.max(1);
         let current_epoch = absolute_step_start / steps_per_epoch.max(1);
@@ -594,6 +639,7 @@ impl RandomPrefetch {
                         block_size,
                         epoch_index,
                         task_index,
+                        include_ruliad_policy_batch,
                     );
                     if sender.send((task_index, batch)).is_err() {
                         return;
@@ -679,12 +725,21 @@ impl<B: Backend> SequenceBatch<B> {
             targets,
             loss_mask: None,
             summary_event_mask,
+            ruliad_policy_batch: None,
             reset_stream_state: false,
         }
     }
 
     pub fn with_loss_mask(mut self, loss_mask: Option<Tensor<B, 2, Int>>) -> Self {
         self.loss_mask = loss_mask;
+        self
+    }
+
+    pub fn with_ruliad_policy_batch(
+        mut self,
+        ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
+    ) -> Self {
+        self.ruliad_policy_batch = ruliad_policy_batch;
         self
     }
 
@@ -741,6 +796,7 @@ fn finalize_host_batch_on_device<B: Backend>(
         inputs,
         targets,
         loss_mask,
+        ruliad_policy_batch,
         dataloader_cpu_ns,
         reset_stream_state,
     } = host;
@@ -775,6 +831,7 @@ fn finalize_host_batch_on_device<B: Backend>(
 
     SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
         .with_loss_mask(loss_mask_tensor)
+        .with_ruliad_policy_batch(ruliad_policy_batch)
         .with_reset_stream_state(reset_stream_state)
 }
 
@@ -789,6 +846,7 @@ pub struct RandomDataLoader<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
+    include_ruliad_policy_batch: bool,
     prefetch: Arc<Mutex<Option<RandomPrefetch>>>,
     seed: u64,
 }
@@ -819,6 +877,7 @@ impl<B: Backend> Clone for RandomDataLoader<B> {
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             prefetch: Arc::clone(&self.prefetch),
             seed: self.seed,
         }
@@ -871,6 +930,7 @@ impl<B: Backend> RandomDataLoader<B> {
             total_steps,
             consumed_steps,
             summary_event_token_ids: None,
+            include_ruliad_policy_batch: false,
             prefetch: Arc::new(Mutex::new(None)),
             seed: 0,
         }
@@ -886,6 +946,12 @@ impl<B: Backend> RandomDataLoader<B> {
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
+    }
+
+    pub fn with_ruliad_policy_batch(mut self, enabled: bool) -> Self {
+        self.include_ruliad_policy_batch = enabled;
         self.prefetch = Arc::new(Mutex::new(None));
         self
     }
@@ -1058,6 +1124,7 @@ where
                     self.total_steps,
                     prefetch_depth,
                     prefetch_workers,
+                    self.include_ruliad_policy_batch,
                 ));
             } else if let Some(prefetch) = slot.as_mut() {
                 prefetch.seek_to(absolute_step_start);
@@ -1075,6 +1142,7 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.clone(),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             epoch_index: self
                 .consumed_steps
                 .as_ref()
@@ -1099,6 +1167,7 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             prefetch: Arc::clone(&self.prefetch),
             seed: self.seed,
         })
@@ -1121,6 +1190,7 @@ where
             total_steps,
             consumed_steps,
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             prefetch: Arc::new(Mutex::new(None)),
             seed: self.seed,
         })
@@ -1728,6 +1798,7 @@ mod streaming_tests {
                 dataset.block_size,
                 0,
                 absolute_step,
+                false,
             );
             for row in 0..dataset.batch_size {
                 let input_row =
@@ -1865,6 +1936,7 @@ struct RandomIterator<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
+    include_ruliad_policy_batch: bool,
     epoch_index: usize,
     prefetch: Option<Arc<Mutex<Option<RandomPrefetch>>>>,
 }
@@ -1901,6 +1973,7 @@ impl<B: Backend> Iterator for RandomIterator<B> {
                 self.block_size,
                 self.epoch_index,
                 absolute_step,
+                self.include_ruliad_policy_batch,
             );
             if prof_enabled {
                 crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);

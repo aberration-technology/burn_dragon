@@ -1,0 +1,104 @@
+extends = "ruliad-1m.training.toml"
+
+[model]
+n_layer = 4
+n_embd = 256
+n_head = 4
+latent_total = 16384
+sequence_kernel = "linear_attention"
+rotary_embedding = "alibi"
+dropout = 0.0
+
+[training]
+block_size = 256
+batch_size = 4
+max_iters = 4096
+checkpoint_interval_iters = 512
+log_frequency = 16
+
+[training.events]
+flush_every_steps = 8
+source_selection_every_steps = 8
+source_weighted_validation_batches = 1
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 64
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 64
+
+[training.ruliad_supervision]
+mode = "answer_window"
+mask_high_entropy_spans = true
+
+[training.ruliad_supervision.verifier_reward]
+enabled = true
+weight = 0.03
+group_size = 4
+max_completion_tokens = 32
+every_steps = 16
+temperature = 0.8
+top_k = 64
+kl_weight = 0.01
+clip_range = 0.2
+advantage_epsilon = 0.000001
+
+[training.input_corruption]
+enabled = true
+probability = 0.025
+warmup_steps = 16
+ramp_steps = 96
+
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.008
+target_entropy_bits = 1.5
+marginal_weight = 0.012
+target_marginal_entropy_bits = 4.5
+target_coverage_weight = 0.006
+target_coverage_epsilon = 0.000001
+warmup_steps = 16
+ramp_steps = 96
+every_steps = 1
+
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.006
+cycle_weight = 0.012
+cycle_margin_weight = 0.003
+cycle_margin = 0.35
+cycle_min_lag = 2
+cycle_max_lag = 64
+cycle_lags_per_step = 4
+warmup_steps = 16
+ramp_steps = 96
+every_steps = 4
+history_lags = [2, 3, 4, 8, 16, 32, 64]
+epsilon = 0.0001
+
+[training.dynamics_anchor]
+enabled = true
+weight = 0.035
+teacher_update_rate = 0.005
+kl = "jensen_shannon"
+mask = "all_tokens"
+warmup_steps = 0
+ramp_steps = 128
+every_steps = 1
+
+[training.gates]
+validation_regression_patience_epochs = 1
+degeneracy_entropy_min_bits = 1.35
+degeneracy_max_probability_max = 0.82
+degeneracy_distinct_2_min_fraction = 0.35
+degeneracy_eos_max_fraction = 0.20
+degeneracy_repetition_max_fraction = 0.45
+degeneracy_period_2_max_fraction = 0.35
+degeneracy_period_3_max_fraction = 0.35
+degeneracy_period_2_to_16_max_fraction = 0.35
+degeneracy_period_2_to_64_max_fraction = 0.35
+degeneracy_patience = 1
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.0003
+weight_decay = 0.01

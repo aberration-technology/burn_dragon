@@ -56,7 +56,16 @@ SUMMARY_COLUMNS = [
     "ruliad_schema_wrong_last",
     "ruliad_malformed_last",
     "ruliad_missing_last",
+    "ruliad_answer_field_accuracy_last",
+    "ruliad_answer_termination_rate_last",
+    "ruliad_mean_completion_tokens_last",
     "completion_health_last",
+    "completion_repetition_last",
+    "completion_distinct_1_last",
+    "completion_distinct_2_last",
+    "completion_period_2_to_16_last",
+    "completion_period_2_to_64_last",
+    "completion_dominant_period_2_to_64_last",
     "capability_gate_passed_last",
     "capability_gate_failure_count_last",
     "capability_completion_health_metric_last",
@@ -348,11 +357,15 @@ def capability_score_from_probe(row: dict[str, Any]) -> float:
     schema_wrong = finite(row.get("schema_valid_wrong_rate")) or 0.0
     malformed = finite(row.get("malformed_rate")) or 0.0
     missing = finite(row.get("missing_rate")) or 0.0
+    answer_field = finite(row.get("answer_field_accuracy")) or 0.0
+    answer_termination = finite(row.get("answer_termination_rate")) or 0.0
     return (
         verifier * 6.0
         + semantic * 3.0
         + partial * 2.0
         + completion
+        + answer_field
+        + answer_termination * 0.5
         - schema_wrong * 2.0
         - malformed * 3.0
         - missing * 2.0
@@ -445,9 +458,21 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     malformed = finite(row.get("ruliad_malformed_last"))
     missing = finite(row.get("ruliad_missing_last"))
     completion = finite(row.get("completion_health_last")) or 0.0
+    answer_field = finite(row.get("ruliad_answer_field_accuracy_last")) or 0.0
+    answer_termination = finite(row.get("ruliad_answer_termination_rate_last")) or 0.0
+    completion_distinct2 = finite(row.get("completion_distinct_2_last"))
+    completion_period = finite(row.get("completion_period_2_to_64_last"))
+    completion_repetition = finite(row.get("completion_repetition_last"))
     capability_passed = finite(row.get("capability_gate_passed_last"))
     capability_failures = finite(row.get("capability_gate_failure_count_last")) or 0.0
-    score += verifier * 6.0 + semantic * 3.0 + partial * 2.0 + completion
+    score += (
+        verifier * 6.0
+        + semantic * 3.0
+        + partial * 2.0
+        + completion
+        + answer_field
+        + answer_termination * 0.5
+    )
     if schema_wrong is not None:
         score -= schema_wrong * 2.0
     if malformed is not None:
@@ -472,6 +497,12 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     )
     if collapse_like:
         score -= 2.0
+    if completion_distinct2 is not None and completion_distinct2 < 0.20:
+        score -= 1.0
+    if completion_period is not None and completion_period > 0.70:
+        score -= 1.0
+    if completion_repetition is not None and completion_repetition > 0.70:
+        score -= 1.0
     fatal = int(row.get("fatal_gate_count") or 0)
     score -= fatal * 2.0
     healthy = (
@@ -481,6 +512,9 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
         and not collapse_like
         and (repetition is None or repetition <= 0.85)
         and (period is None or period <= 0.85)
+        and (completion_distinct2 is None or completion_distinct2 >= 0.20)
+        and (completion_period is None or completion_period <= 0.70)
+        and (completion_repetition is None or completion_repetition <= 0.70)
     )
     return healthy, score
 
@@ -574,7 +608,22 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "ruliad_schema_wrong_last": capability.get("schema_valid_wrong_rate"),
         "ruliad_malformed_last": capability.get("malformed_rate"),
         "ruliad_missing_last": capability.get("missing_rate"),
+        "ruliad_answer_field_accuracy_last": capability.get("answer_field_accuracy"),
+        "ruliad_answer_termination_rate_last": capability.get("answer_termination_rate"),
+        "ruliad_mean_completion_tokens_last": capability.get("mean_completion_tokens"),
         "completion_health_last": capability.get("completion_health_rate"),
+        "completion_repetition_last": capability.get("completion_repetition_fraction"),
+        "completion_distinct_1_last": capability.get("completion_distinct_1_fraction"),
+        "completion_distinct_2_last": capability.get("completion_distinct_2_fraction"),
+        "completion_period_2_to_16_last": capability.get(
+            "completion_max_period_2_to_16_fraction"
+        ),
+        "completion_period_2_to_64_last": capability.get(
+            "completion_max_period_2_to_64_fraction"
+        ),
+        "completion_dominant_period_2_to_64_last": capability.get(
+            "completion_dominant_period_2_to_64"
+        ),
         "capability_gate_passed_last": last_metric(
             events, "valid", "Ruliad Capability Gate Passed"
         ),
@@ -625,8 +674,8 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
     rank_rows = sorted(rows, key=lambda row: finite(row.get("rank_score")) or -1e9, reverse=True)
     with md_path.open("w") as handle:
         handle.write("# Latent Reasoning Max Steps Ablation\n\n")
-        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | verifier | semantic | partial | schema wrong | malformed | missing | completion | cap gate | cap fails | cap first | cap auc | lag buckets | best eval steps | best eval verifier | energy comps | step comps | final CE d | CE viol | best E step | final E delta | E viol | out H | gpu util | score |\n")
-        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | verifier | semantic | partial | schema wrong | malformed | field | term | completion | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | lag buckets | best eval steps | best eval verifier | energy comps | step comps | out H | out d2 | gpu util | score |\n")
+        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for row in rank_rows:
             handle.write(
                 "| "
@@ -642,8 +691,11 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("ruliad_partial_last")),
                         fmt(row.get("ruliad_schema_wrong_last")),
                         fmt(row.get("ruliad_malformed_last")),
-                        fmt(row.get("ruliad_missing_last")),
+                        fmt(row.get("ruliad_answer_field_accuracy_last")),
+                        fmt(row.get("ruliad_answer_termination_rate_last")),
                         fmt(row.get("completion_health_last")),
+                        fmt(row.get("completion_distinct_2_last")),
+                        fmt(row.get("completion_period_2_to_64_last")),
                         fmt(row.get("capability_gate_passed_last")),
                         fmt(row.get("capability_gate_failure_count_last")),
                         fmt(row.get("capability_first_pass_epoch")),
@@ -653,12 +705,8 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("best_eval_verifier")),
                         fmt(row.get("latent_energy_model_components_last")),
                         fmt(row.get("latent_step_contract_components_last")),
-                        fmt(row.get("latent_eval_final_ce_delta_last")),
-                        fmt(row.get("latent_eval_final_ce_violation_last")),
-                        fmt(row.get("latent_eval_best_energy_step_last")),
-                        fmt(row.get("latent_eval_final_energy_delta_last")),
-                        fmt(row.get("latent_eval_final_energy_violation_last")),
                         fmt(row.get("output_entropy_bits_last")),
+                        fmt(row.get("output_distinct_2_last")),
                         fmt(row.get("gpu_util_mean")),
                         fmt(row.get("rank_score")),
                     ]
@@ -688,7 +736,11 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
             schema = finite(bucket.get("schema_valid_wrong_rate")) or 0.0
             malformed = finite(bucket.get("malformed_rate")) or 0.0
             missing = finite(bucket.get("missing_rate")) or 0.0
-            completion = max(0.0, 1.0 - schema - malformed - missing)
+            completion = finite(bucket.get("completion_health_rate"))
+            if completion is None:
+                completion = max(0.0, 1.0 - schema - malformed - missing)
+            answer_field = finite(bucket.get("answer_field_accuracy"))
+            answer_termination = finite(bucket.get("answer_termination_rate"))
             mastered = verifier >= 0.50 and completion >= 0.80 and max(schema, malformed, missing) <= 0.10
             lagging = completion >= 0.60 and verifier <= 0.05
             bucket_rows.append(
@@ -702,6 +754,8 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
                     "semantic_rate": semantic,
                     "partial_credit_rate": partial,
                     "completion_health_rate": completion,
+                    "answer_field_accuracy": answer_field,
+                    "answer_termination_rate": answer_termination,
                     "schema_valid_wrong_rate": schema,
                     "malformed_rate": malformed,
                     "missing_rate": missing,
@@ -724,6 +778,8 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
         "semantic_rate",
         "partial_credit_rate",
         "completion_health_rate",
+        "answer_field_accuracy",
+        "answer_termination_rate",
         "schema_valid_wrong_rate",
         "malformed_rate",
         "missing_rate",
@@ -743,8 +799,8 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
         writer.writerows(bucket_rows)
     with md_path.open("w") as handle:
         handle.write("# Capability Bucket Summary\n\n")
-        handle.write("| trial | bucket | items | verifier | partial | completion | schema wrong | malformed | missing | mastered | lagging |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
+        handle.write("| trial | bucket | items | verifier | partial | field | terminated | completion | schema wrong | malformed | missing | mastered | lagging |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
         for item in bucket_rows:
             handle.write(
                 "| "
@@ -755,6 +811,8 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
                         fmt(item.get("item_count")),
                         fmt(item.get("verifier_rate")),
                         fmt(item.get("partial_credit_rate")),
+                        fmt(item.get("answer_field_accuracy")),
+                        fmt(item.get("answer_termination_rate")),
                         fmt(item.get("completion_health_rate")),
                         fmt(item.get("schema_valid_wrong_rate")),
                         fmt(item.get("malformed_rate")),

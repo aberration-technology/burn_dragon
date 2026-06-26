@@ -693,6 +693,7 @@ where
             Some(total_steps),
         )
         .with_initial_consumed_steps(resume_consumed_steps)
+        .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -707,6 +708,7 @@ where
             valid_steps,
             None,
         )
+        .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -1214,6 +1216,7 @@ where
                     Some(total_steps),
                 )
                 .with_initial_consumed_steps(resume_consumed_steps)
+                .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
                 .with_summary_event_token_ids(summary_event_token_ids.clone()),
             )
         };
@@ -1232,6 +1235,7 @@ where
                 valid_steps,
                 None,
             )
+            .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
             .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 

@@ -29,6 +29,7 @@ pub struct GenerationSettings {
     pub temperature: f32,
     pub top_k: Option<usize>,
     pub strategy: ContextStrategy,
+    pub stop_on_token: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -471,6 +472,7 @@ pub fn generate_tokens<B: Backend>(
         temperature,
         top_k,
         strategy,
+        stop_on_token,
     } = settings;
 
     let mut full_tokens = prompt_tokens;
@@ -493,6 +495,9 @@ pub fn generate_tokens<B: Backend>(
 
         if let Some(callback) = &mut on_token {
             callback(next);
+        }
+        if stop_on_token == Some(next) {
+            break;
         }
 
         if let ContextStrategy::Sliding { window } = strategy
@@ -522,7 +527,9 @@ pub fn generate_tokens_chunked<B: Backend>(
         temperature,
         top_k,
         strategy,
+        stop_on_token: settings_stop_on_token,
     } = settings;
+    let stop_on_token = stop_on_token.or(settings_stop_on_token);
 
     let chunk_tokens = chunk_tokens.max(1);
     let device_buffer_tokens = device_buffer_tokens.max(chunk_tokens);
@@ -538,6 +545,7 @@ pub fn generate_tokens_chunked<B: Backend>(
                 temperature,
                 top_k,
                 strategy,
+                stop_on_token,
             },
             None,
         )?;
@@ -628,6 +636,7 @@ pub fn generate_text<B: Backend>(
         temperature: generation.temperature,
         top_k: generation.top_k,
         strategy,
+        stop_on_token: None,
     };
     let tokens_all = generate_tokens(model, prompt_tokens, device, settings, None)?;
 

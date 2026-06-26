@@ -14,7 +14,7 @@ use burn_dragon_train::train::events::{
 };
 #[cfg(feature = "ddp")]
 use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader};
 #[cfg(feature = "ddp")]
 use std::marker::PhantomData;
@@ -1953,6 +1953,7 @@ where
             )
             .with_batch_size(batch_size)
             .with_initial_consumed_steps(consumed_steps)
+            .with_ruliad_policy_batch(env.training.ruliad_supervision.verifier_reward.enabled)
             .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
         )
     }
@@ -1978,6 +1979,7 @@ where
             None,
         )
         .with_batch_size(batch_size.max(1))
+        .with_ruliad_policy_batch(env.training.ruliad_supervision.verifier_reward.enabled)
         .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
     )
 }
@@ -3256,6 +3258,8 @@ where
     let max_new_tokens = training.events.ruliad_correctness_probe_tokens;
     let mut items = Vec::with_capacity(probe_items.len());
     let mut completions = Vec::with_capacity(probe_items.len());
+    let mut generated_token_rows = Vec::with_capacity(probe_items.len());
+    let close_token_id = dataset.ruliad_document_end_token_id().map(i64::from);
     let generation_settings = crate::generation::GenerationSettings {
         max_new_tokens: Some(max_new_tokens),
         temperature: 1.0,
@@ -3264,6 +3268,7 @@ where
             &training.context_strategy,
             training.block_size,
         ),
+        stop_on_token: close_token_id,
     };
 
     for probe in probe_items.iter().cloned() {
@@ -3282,6 +3287,7 @@ where
         let completion = dataset
             .decode_ruliad_payload_tokens(&generated_tokens, true)
             .unwrap_or_else(|| dataset.decode(&generated_tokens));
+        generated_token_rows.push(generated_tokens);
         completions.push(burn_dragon_universality::RuliadCompletionRecord {
             oracle_hash: probe.item.oracle_hash.clone(),
             completion,
@@ -3291,6 +3297,8 @@ where
 
     let report = burn_dragon_universality::evaluate_completions(dataset_name, &items, &completions);
     let schema_alignment = ruliad_answer_schema_alignment_summary(&items, &completions);
+    let completion_degeneracy =
+        ruliad_completion_degeneracy_summary(&generated_token_rows, close_token_id);
     let examples = ruliad_probe_examples(
         &items,
         &completions,
@@ -3307,6 +3315,7 @@ where
         output_degeneracy,
         &examples,
         schema_alignment,
+        completion_degeneracy,
     );
     Ok(report)
 }
@@ -3315,6 +3324,18 @@ where
 struct RuliadAnswerSchemaAlignmentSummary {
     key_match_rate: f64,
     mean_key_overlap: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RuliadCompletionDegeneracySummary {
+    sequence_count: usize,
+    token_count: usize,
+    repetition_fraction: f64,
+    distinct_1_fraction: f64,
+    distinct_2_fraction: f64,
+    max_period_2_to_16_fraction: f64,
+    max_period_2_to_64_fraction: f64,
+    dominant_period_2_to_64: usize,
 }
 
 fn ruliad_answer_schema_alignment_summary(
@@ -3352,6 +3373,108 @@ fn ruliad_answer_schema_alignment_summary(
         key_match_rate: exact_matches as f64 / item_count,
         mean_key_overlap: overlap_ppm_sum as f64 / (item_count * 1_000_000.0),
     }
+}
+
+fn ruliad_completion_degeneracy_summary(
+    completions: &[Vec<i64>],
+    stop_on_token: Option<i64>,
+) -> Option<RuliadCompletionDegeneracySummary> {
+    let trimmed_rows = completions
+        .iter()
+        .map(|tokens| ruliad_completion_tokens_until_stop(tokens, stop_on_token))
+        .filter(|tokens| !tokens.is_empty())
+        .collect::<Vec<_>>();
+    let rows = trimmed_rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    let token_count = rows.iter().map(|tokens| tokens.len()).sum::<usize>();
+    Some(RuliadCompletionDegeneracySummary {
+        sequence_count: rows.len(),
+        token_count,
+        repetition_fraction: repeated_token_fraction(&rows),
+        distinct_1_fraction: row_weighted_distinct_n_fraction(&rows, 1),
+        distinct_2_fraction: row_weighted_distinct_n_fraction(&rows, 2),
+        max_period_2_to_16_fraction: row_weighted_max_period_fraction(&rows, 2..=16).1,
+        max_period_2_to_64_fraction: row_weighted_max_period_fraction(&rows, 2..=64).1,
+        dominant_period_2_to_64: row_weighted_max_period_fraction(&rows, 2..=64).0,
+    })
+}
+
+fn ruliad_completion_tokens_until_stop(tokens: &[i64], stop_on_token: Option<i64>) -> Vec<i64> {
+    let Some(stop) = stop_on_token else {
+        return tokens.to_vec();
+    };
+    match tokens.iter().position(|token| *token == stop) {
+        Some(index) => tokens[..=index].to_vec(),
+        None => tokens.to_vec(),
+    }
+}
+
+fn repeated_token_fraction(rows: &[&[i64]]) -> f64 {
+    let mut repeats = 0usize;
+    let mut comparisons = 0usize;
+    for tokens in rows {
+        for pair in tokens.windows(2) {
+            comparisons = comparisons.saturating_add(1);
+            repeats += usize::from(pair[0] == pair[1]);
+        }
+    }
+    ratio_usize(repeats, comparisons)
+}
+
+fn row_weighted_distinct_n_fraction(rows: &[&[i64]], n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let mut distinct_sum = 0usize;
+    let mut window_sum = 0usize;
+    for tokens in rows.iter().copied().filter(|tokens| tokens.len() >= n) {
+        let window_count = tokens.len() + 1 - n;
+        window_sum = window_sum.saturating_add(window_count);
+        distinct_sum = distinct_sum.saturating_add(
+            tokens
+                .windows(n)
+                .map(|window| window.to_vec())
+                .collect::<HashSet<_>>()
+                .len(),
+        );
+    }
+    ratio_usize(distinct_sum, window_sum)
+}
+
+fn row_weighted_max_period_fraction(
+    rows: &[&[i64]],
+    periods: impl IntoIterator<Item = usize>,
+) -> (usize, f64) {
+    periods
+        .into_iter()
+        .map(|period| (period, row_weighted_period_fraction(rows, period)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or((0, 0.0))
+}
+
+fn row_weighted_period_fraction(rows: &[&[i64]], period: usize) -> f64 {
+    if period == 0 {
+        return 0.0;
+    }
+    let mut matches = 0usize;
+    let mut comparisons = 0usize;
+    for tokens in rows
+        .iter()
+        .copied()
+        .filter(|tokens| tokens.len() >= period.saturating_mul(2))
+    {
+        comparisons = comparisons.saturating_add(tokens.len() - period);
+        matches = matches.saturating_add(
+            (period..tokens.len())
+                .filter(|idx| tokens[*idx] == tokens[*idx - period])
+                .count(),
+        );
+    }
+    ratio_usize(matches, comparisons)
 }
 
 fn ruliad_probe_examples(
@@ -3442,6 +3565,7 @@ fn emit_ruliad_correctness_metrics(
         None,
         &[],
         RuliadAnswerSchemaAlignmentSummary::default(),
+        None,
     );
 }
 
@@ -3456,6 +3580,7 @@ fn emit_ruliad_correctness_metrics_with_labels(
     output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
     examples: &[CapabilityProbeExample],
     schema_alignment: RuliadAnswerSchemaAlignmentSummary,
+    completion_degeneracy: Option<RuliadCompletionDegeneracySummary>,
 ) {
     let item_count = report.item_count.max(1) as f64;
     let competence = ruliad_competence_key(report).unwrap_or_default();
@@ -3513,6 +3638,14 @@ fn emit_ruliad_correctness_metrics_with_labels(
             f64::from(report.mean_partial_progress),
         ),
         (
+            "Ruliad Answer Field Accuracy",
+            f64::from(report.answer_field_accuracy),
+        ),
+        (
+            "Ruliad Answer Termination Rate",
+            f64::from(report.answer_termination_rate),
+        ),
+        (
             "Ruliad Certificate Prefix Coverage",
             f64::from(report.mean_certificate_prefix_coverage),
         ),
@@ -3544,6 +3677,48 @@ fn emit_ruliad_correctness_metrics_with_labels(
             running_value: value,
         });
     }
+    if let Some(degeneracy) = completion_degeneracy {
+        for (name, value) in [
+            (
+                "Ruliad Completion Repetition Fraction",
+                degeneracy.repetition_fraction,
+            ),
+            (
+                "Ruliad Completion Distinct-1 Fraction",
+                degeneracy.distinct_1_fraction,
+            ),
+            (
+                "Ruliad Completion Distinct-2 Fraction",
+                degeneracy.distinct_2_fraction,
+            ),
+            (
+                "Ruliad Completion Max Period 2..16 Fraction",
+                degeneracy.max_period_2_to_16_fraction,
+            ),
+            (
+                "Ruliad Completion Max Period 2..64 Fraction",
+                degeneracy.max_period_2_to_64_fraction,
+            ),
+            (
+                "Ruliad Completion Dominant Period 2..64",
+                degeneracy.dominant_period_2_to_64 as f64,
+            ),
+        ] {
+            let metric_name = metric_prefix
+                .map(|prefix| format!("{prefix} {name}"))
+                .unwrap_or_else(|| name.to_string());
+            let _ = bus.send_metric_sample(TrainingMetricSample {
+                run_id: run_name.to_string(),
+                split: TrainingMetricSplit::Valid,
+                epoch,
+                step_in_epoch: 0,
+                absolute_step,
+                name: metric_name,
+                value,
+                running_value: value,
+            });
+        }
+    }
     let _ = bus.send_capability_probe_sample(ruliad_capability_probe_sample(
         run_name,
         epoch,
@@ -3553,6 +3728,7 @@ fn emit_ruliad_correctness_metrics_with_labels(
         probe_name,
         output_degeneracy,
         examples,
+        completion_degeneracy,
     ));
 }
 
@@ -3618,6 +3794,7 @@ fn ruliad_capability_probe_sample(
     probe_name: &str,
     output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
     examples: &[CapabilityProbeExample],
+    completion_degeneracy: Option<RuliadCompletionDegeneracySummary>,
 ) -> CapabilityProbeSample {
     let item_count = report.item_count.max(1) as f64;
     let mut group_buckets = Vec::new();
@@ -3645,10 +3822,24 @@ fn ruliad_capability_probe_sample(
         certificate_rate: f64::from(competence.certificate_ppm) / 1_000_000.0,
         completion_health_rate: f64::from(competence.completion_health_ppm) / 1_000_000.0,
         mean_partial_progress: f64::from(report.mean_partial_progress),
+        answer_field_accuracy: f64::from(report.answer_field_accuracy),
+        answer_termination_rate: f64::from(report.answer_termination_rate),
         mean_completion_tokens: f64::from(report.mean_completion_tokens),
         achieved_difficulty_level: ruliad_achieved_verifier_difficulty(report),
         output_entropy_bits: output_degeneracy.map(|stats| stats.entropy_bits),
         output_distinct_2_fraction: output_degeneracy.map(|stats| stats.distinct_2_fraction),
+        completion_repetition_fraction: completion_degeneracy
+            .map(|stats| stats.repetition_fraction),
+        completion_distinct_1_fraction: completion_degeneracy
+            .map(|stats| stats.distinct_1_fraction),
+        completion_distinct_2_fraction: completion_degeneracy
+            .map(|stats| stats.distinct_2_fraction),
+        completion_max_period_2_to_16_fraction: completion_degeneracy
+            .map(|stats| stats.max_period_2_to_16_fraction),
+        completion_max_period_2_to_64_fraction: completion_degeneracy
+            .map(|stats| stats.max_period_2_to_64_fraction),
+        completion_dominant_period_2_to_64: completion_degeneracy
+            .map(|stats| stats.dominant_period_2_to_64),
         group_buckets,
         examples: examples.to_vec(),
     }
@@ -3670,6 +3861,8 @@ fn extend_ruliad_capability_groups(
         malformed_rate: ratio_usize(group.malformed_completion_count, group.count),
         missing_rate: ratio_usize(group.missing_completion_count, group.count),
         mean_partial_progress: f64::from(group.mean_partial_progress),
+        answer_field_accuracy: f64::from(group.answer_field_accuracy),
+        answer_termination_rate: f64::from(group.answer_termination_rate),
     }));
 }
 
@@ -5768,6 +5961,7 @@ fn broadcast_sequence_batch_rooted<B: AutodiffBackend>(
         targets,
         loss_mask,
         summary_event_mask,
+        ruliad_policy_batch: None,
         reset_stream_state,
     })
 }
@@ -6862,6 +7056,12 @@ mod tests {
             verifier_accuracy,
             partial_credit_rate: mean_partial_progress,
             mean_partial_progress,
+            answer_field_correct_count: (mean_partial_progress.clamp(0.0, 1.0) * item_count as f32)
+                .round() as usize,
+            answer_field_expected_count: item_count,
+            answer_field_accuracy: mean_partial_progress,
+            answer_terminated_count: item_count,
+            answer_termination_rate: 1.0,
             mean_certificate_prefix_coverage: certificate_prefix_coverage,
             mean_completion_tokens: 12.0,
             canary_count: 0,
@@ -7625,6 +7825,11 @@ mod tests {
             verifier_accuracy: 0.5,
             partial_credit_rate: 0.75,
             mean_partial_progress: 0.625,
+            answer_field_correct_count: 5,
+            answer_field_expected_count: 8,
+            answer_field_accuracy: 0.625,
+            answer_terminated_count: 3,
+            answer_termination_rate: 0.75,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 12.0,
             canary_count: 0,
@@ -7646,6 +7851,11 @@ mod tests {
                 verifier_accuracy: 0.5,
                 partial_credit_rate: 0.75,
                 mean_partial_progress: 0.625,
+                answer_field_correct_count: 5,
+                answer_field_expected_count: 8,
+                answer_field_accuracy: 0.625,
+                answer_terminated_count: 3,
+                answer_termination_rate: 0.75,
             }],
             math_domain_scores: Vec::new(),
             reasoning_mode_scores: Vec::new(),
@@ -7675,6 +7885,8 @@ mod tests {
             metric_value("Ruliad Competence Completion Health PPM"),
             500_000.0
         );
+        assert_eq!(metric_value("Ruliad Answer Field Accuracy"), 0.625);
+        assert_eq!(metric_value("Ruliad Answer Termination Rate"), 0.75);
         assert_eq!(metric_value("Ruliad Malformed Completion Rate"), 0.25);
         let capability = events
             .iter()
@@ -7699,6 +7911,18 @@ mod tests {
                 .get("verifier_rate")
                 .and_then(|value| value.as_f64()),
             Some(0.5)
+        );
+        assert_eq!(
+            capability
+                .get("answer_field_accuracy")
+                .and_then(|value| value.as_f64()),
+            Some(0.625)
+        );
+        assert_eq!(
+            capability
+                .get("answer_termination_rate")
+                .and_then(|value| value.as_f64()),
+            Some(0.75)
         );
         let capability_jsonl =
             std::fs::read_to_string(run_dir.join("events/capability_probe.jsonl"))
@@ -7736,6 +7960,37 @@ mod tests {
         assert_eq!(examples[0].reason, "answer_mismatch");
         assert!(examples[0].prompt.contains("\\nA:ok,l,r\\n!:"));
         assert_eq!(examples[0].generated_tokens, 2);
+    }
+
+    #[test]
+    fn ruliad_completion_degeneracy_summary_tracks_periodic_answers() {
+        let summary =
+            ruliad_completion_degeneracy_summary(&[vec![1, 2, 1, 2, 1, 2], vec![3, 4, 5, 6]], None)
+                .expect("summary");
+
+        assert_eq!(summary.sequence_count, 2);
+        assert_eq!(summary.token_count, 10);
+        assert!(summary.distinct_2_fraction < 1.0);
+        assert_eq!(summary.dominant_period_2_to_64, 2);
+        assert!(
+            summary.max_period_2_to_64_fraction > 0.5,
+            "{}",
+            summary.max_period_2_to_64_fraction
+        );
+    }
+
+    #[test]
+    fn ruliad_completion_degeneracy_summary_trims_after_close_token() {
+        let summary = ruliad_completion_degeneracy_summary(
+            &[vec![10, 11, 99, 7, 7, 7, 7, 7], vec![12, 13, 99, 8, 8, 8]],
+            Some(99),
+        )
+        .expect("summary");
+
+        assert_eq!(summary.sequence_count, 2);
+        assert_eq!(summary.token_count, 6);
+        assert!(summary.repetition_fraction < 0.1, "{summary:?}");
+        assert!(summary.max_period_2_to_64_fraction < 0.1, "{summary:?}");
     }
 
     #[test]
@@ -7843,6 +8098,11 @@ mod tests {
             verifier_accuracy: 0.5,
             partial_credit_rate: 0.5,
             mean_partial_progress: 0.5,
+            answer_field_correct_count: 1,
+            answer_field_expected_count: 2,
+            answer_field_accuracy: 0.5,
+            answer_terminated_count: 2,
+            answer_termination_rate: 1.0,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 8.0,
             canary_count: 0,
@@ -7865,6 +8125,7 @@ mod tests {
             None,
             &[],
             RuliadAnswerSchemaAlignmentSummary::default(),
+            None,
         );
         let _ = bus.flush();
         drop(handles);

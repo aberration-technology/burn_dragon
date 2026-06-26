@@ -21,7 +21,8 @@ pub use train::{
     PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
     PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
     RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadSupervisionConfig,
-    RuliadSupervisionMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
+    RuliadSupervisionMode, RuliadVerifierRewardConfig, RuliadVerifierRewardMode,
+    SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
 };

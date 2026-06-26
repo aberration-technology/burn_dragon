@@ -1016,6 +1016,7 @@ pub struct RuliadSupervisionConfig {
     pub answer_close_marker_stride: usize,
     pub answer_ranking: RuliadAnswerRankingConfig,
     pub answer_denoising: RuliadAnswerDenoisingConfig,
+    pub verifier_reward: RuliadVerifierRewardConfig,
 }
 
 impl Default for RuliadSupervisionConfig {
@@ -1026,6 +1027,7 @@ impl Default for RuliadSupervisionConfig {
             answer_close_marker_stride: 1,
             answer_ranking: RuliadAnswerRankingConfig::default(),
             answer_denoising: RuliadAnswerDenoisingConfig::default(),
+            verifier_reward: RuliadVerifierRewardConfig::default(),
         }
     }
 }
@@ -1086,6 +1088,57 @@ impl Default for RuliadAnswerDenoisingConfig {
             weight: 0.5,
             probability: 1.0,
             corrupt_offset: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadVerifierRewardMode {
+    Scalar,
+    VpoIndependent,
+}
+
+impl Default for RuliadVerifierRewardMode {
+    fn default() -> Self {
+        Self::Scalar
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadVerifierRewardConfig {
+    pub enabled: bool,
+    pub mode: RuliadVerifierRewardMode,
+    pub weight: f32,
+    pub group_size: usize,
+    pub max_completion_tokens: usize,
+    pub every_steps: usize,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub kl_weight: f32,
+    pub clip_range: f32,
+    pub advantage_epsilon: f32,
+    pub vpo_scalarizations: usize,
+    pub reward: burn_dragon_universality::RuliadVerifierRewardWeights,
+}
+
+impl Default for RuliadVerifierRewardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: RuliadVerifierRewardMode::Scalar,
+            weight: 0.05,
+            group_size: 4,
+            max_completion_tokens: 64,
+            every_steps: 16,
+            temperature: 0.8,
+            top_k: 64,
+            kl_weight: 0.01,
+            clip_range: 0.2,
+            advantage_epsilon: 1.0e-6,
+            vpo_scalarizations: 16,
+            reward: burn_dragon_universality::RuliadVerifierRewardWeights::default(),
         }
     }
 }

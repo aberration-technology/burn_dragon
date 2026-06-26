@@ -206,6 +206,20 @@ fn ruliad_capability_gate_status(
     }
 }
 
+fn ruliad_completion_quality_collapse(
+    report: &burn_dragon_universality::RuliadEvalReport,
+    gates: &burn_dragon_train::TrainingGatesConfig,
+) -> bool {
+    if report.item_count == 0 || report.scored_count == 0 {
+        return true;
+    }
+    let (_, _, _, completion_health_rate) = ruliad_capability_rates(report);
+    completion_health_rate < gates.capability_completion_health_min_rate
+        || (report.scored_count > 1
+            && report.actual_answer_distinct_fraction
+                < gates.capability_distinct_2_min_fraction as f32)
+}
+
 fn validation_ruliad_correctness_improved(
     validation: &DynamicValidationReport,
     state: &ContinualLearningStabilityState,
@@ -284,6 +298,33 @@ fn update_capability_run_control_state<B>(
     let before_grace =
         state.first_capability_pass_epoch.is_none() && epoch <= gates.capability_grace_epochs;
     if before_grace {
+        let quality_collapse = ruliad_completion_quality_collapse(report, gates);
+        if quality_collapse && !*recovery_requested {
+            let message = format!(
+                "ruliad completion quality collapsed during capability grace window; requesting PlasticityRecovery while keeping continual backprop active: {reasons}"
+            );
+            emit_policy_gate_with_action(
+                env,
+                bus,
+                "continual_learning_capability_quality_recovery",
+                TrainingGateAction::Alert,
+                TrainingGateSeverity::Warning,
+                epoch,
+                absolute_step,
+                message.clone(),
+            );
+            emit_dynamics_control(
+                env,
+                bus,
+                &env.training.dynamics,
+                DynamicsMode::PlasticityRecovery,
+                epoch,
+                absolute_step,
+                None,
+                message,
+            );
+            *recovery_requested = true;
+        }
         emit_policy_gate_with_action(
             env,
             bus,
@@ -4678,6 +4719,21 @@ fn apply_continual_learning_stability_policy<B>(
     let policy = &env.training.dynamics;
     let mut recovery_requested = false;
     let ruliad_correctness_improved = validation_ruliad_correctness_improved(&validation, state);
+    let capability_gate_failed = validation
+        .ruliad_eval_report
+        .as_ref()
+        .is_some_and(|report| {
+            !ruliad_capability_gate_status(
+                report,
+                validation.output_degeneracy.as_ref(),
+                &env.training.gates,
+            )
+            .passed
+        });
+    let output_degeneracy_failed = validation
+        .output_degeneracy
+        .as_ref()
+        .is_some_and(|stats| output_degeneracy_tripped(&env.training.gates, stats));
     let improved = state.best_valid_loss.is_none_or(|best| {
         valid_loss < best * (1.0 - env.training.gates.plateau_min_relative_improvement)
     });
@@ -4685,16 +4741,18 @@ fn apply_continual_learning_stability_policy<B>(
         state.best_valid_loss = Some(valid_loss);
         state.consecutive_validation_regressions = 0;
         state.consecutive_ruliad_correctness_regressions = 0;
-        emit_dynamics_control(
-            env,
-            bus,
-            policy,
-            DynamicsMode::Stable,
-            epoch,
-            absolute_step,
-            None,
-            "validation improved; returning stability controls to baseline".to_string(),
-        );
+        if !capability_gate_failed && !output_degeneracy_failed {
+            emit_dynamics_control(
+                env,
+                bus,
+                policy,
+                DynamicsMode::Stable,
+                epoch,
+                absolute_step,
+                None,
+                "validation improved; returning stability controls to baseline".to_string(),
+            );
+        }
     } else if let Some(best) = state.best_valid_loss {
         if valid_loss > best * (1.0 + env.training.gates.validation_regression_max_relative) {
             if ruliad_correctness_improved {
@@ -7536,6 +7594,128 @@ mod tests {
         }));
         assert_eq!(state.first_capability_pass_epoch, Some(4));
         assert_eq!(state.consecutive_capability_gate_failures, 2);
+    }
+
+    #[test]
+    fn capability_quality_collapse_requests_plasticity_recovery_during_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams();
+        training.events.flush_every_steps = 1;
+        training.gates = burn_dragon_train::TrainingGatesConfig {
+            capability_grace_epochs: 3,
+            capability_completion_health_min_rate: 0.80,
+            capability_distinct_2_min_fraction: 0.30,
+            ..ruliad_degeneracy_gates()
+        };
+        let model_config = tiny_model_config();
+        let devices = vec![device.clone()];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name: "capability-quality-collapse-recovery-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<TestBackend>(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            )])),
+            valid_loader: Arc::new(StaticSequenceLoader::new(vec![make_batch::<
+                TestValidBackend,
+            >(
+                &valid_device,
+                &[0, 0, 1, 1, 2, 2, 3, 3],
+                &[0, 1, 1, 2, 2, 3, 3, 0],
+                [2, 4],
+            )])),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 1,
+            total_steps: 1,
+            valid_steps: 1,
+        };
+        let handles = crate::train::events::build_training_event_handles(
+            env.run_name,
+            &run_dir,
+            1,
+            &training,
+            None,
+            None,
+            None,
+        )
+        .expect("event handles");
+        let bus = handles.metric_logger.bus();
+        let mut state = ContinualLearningStabilityState::default();
+        let mut collapsed_report = ruliad_eval_report(0.0, 0.0, 0.0, 0.0);
+        collapsed_report.mean_completion_quality = 0.0;
+        collapsed_report.actual_answer_distinct_fraction = 0.01;
+
+        apply_continual_learning_stability_policy(
+            &env,
+            DynamicValidationReport {
+                loss: 1.0,
+                source_weighted_loss: None,
+                stream_warm_loss: None,
+                output_degeneracy: None,
+                ruliad_eval_report: Some(collapsed_report),
+            },
+            1,
+            0,
+            &mut state,
+            &bus,
+        );
+        let _ = bus.flush();
+        drop(handles);
+
+        let events = read_training_events(&run_dir);
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("gate")
+                && event.get("gate").and_then(|value| value.as_str())
+                    == Some("continual_learning_capability_quality_recovery")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|value| value.as_str()) == Some("gate")
+                && event.get("gate").and_then(|value| value.as_str())
+                    == Some("continual_learning_capability_gate_grace")
+        }));
+        let control = events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(|value| value.as_str()) == Some("dynamics_control")
+                    && event.get("mode").and_then(|value| value.as_str())
+                        == Some("plasticity_recovery")
+            })
+            .expect("quality collapse should request dynamics control");
+        assert!(
+            control
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .is_some_and(|reason| reason.contains("completion quality collapsed")),
+            "{control:?}"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.get("type").and_then(|value| value.as_str()) != Some("dynamics_control")
+                    || event.get("mode").and_then(|value| value.as_str()) != Some("stable")
+            }),
+            "free-run capability collapse must not emit a contradictory stable control"
+        );
+        assert!(state.first_capability_pass_epoch.is_none());
     }
 
     #[test]

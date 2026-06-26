@@ -56,6 +56,8 @@ POLICY_METRIC_COLUMNS = [
     "policy_advantage_mean",
     "policy_advantage_std",
     "policy_advantage_clip_fraction",
+    "policy_update_applied_fraction",
+    "policy_update_skipped_count",
     "policy_vector_verifier_match_mean",
     "policy_vector_semantic_match_mean",
     "policy_vector_partial_progress_mean",
@@ -90,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-entropy", type=float, default=0.25)
     parser.add_argument("--min-output-distinct-2", type=float, default=0.10)
     parser.add_argument("--min-throughput-ratio", type=float, default=0.85)
+    parser.add_argument("--max-policy-advantage-clip-fraction", type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -193,6 +196,14 @@ def read_policy_telemetry(run_dir: str | None) -> dict[str, float | int | None]:
         "policy_advantage_mean": weighted_mean("advantage_mean"),
         "policy_advantage_std": weighted_mean("advantage_std"),
         "policy_advantage_clip_fraction": weighted_mean("advantage_clip_fraction"),
+        "policy_update_applied_fraction": mean([
+            1.0 if record.get("policy_update_applied", True) else 0.0
+            for record in records
+        ]),
+        "policy_update_skipped_count": sum(
+            0 if record.get("policy_update_applied", True) else 1
+            for record in records
+        ),
         "policy_vector_verifier_match_mean": weighted_mean("vector_verifier_match_mean", "vector_sample_count"),
         "policy_vector_semantic_match_mean": weighted_mean("vector_semantic_match_mean", "vector_sample_count"),
         "policy_vector_partial_progress_mean": weighted_mean("vector_partial_progress_mean", "vector_sample_count"),
@@ -276,6 +287,9 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         completion_distinct2 = value(row, "completion_distinct_2_last_mean", 1.0)
         completion_period = value(row, "completion_period_2_to_64_last_mean", 0.0)
         completion_repetition = value(row, "completion_repetition_last_mean", 0.0)
+        policy_completion_rows = value(row, "policy_completion_rows_mean", 0.0)
+        policy_clip_fraction = value(row, "policy_advantage_clip_fraction_mean", 0.0)
+        policy_skipped = value(row, "policy_update_skipped_count_mean", 0.0)
         entropy = value(row, "output_entropy_bits_last_mean", 0.0)
         distinct2 = value(row, "output_distinct_2_last_mean", 0.0)
         throughput_ratio = model_tps / base_model_tps if base_model_tps > 0.0 else 0.0
@@ -321,6 +335,10 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             reasons.append("completion_period_collapse")
         if completion_repetition > args.max_completion_repetition:
             reasons.append("completion_repetition_collapse")
+        if policy_completion_rows > 0.0 and policy_clip_fraction > args.max_policy_advantage_clip_fraction:
+            reasons.append("policy_advantage_clip_saturation")
+        if policy_skipped > 0.0:
+            reasons.append("policy_update_skipped")
         if entropy < args.min_output_entropy:
             reasons.append("entropy_collapse")
         if distinct2 < args.min_output_distinct_2:
@@ -389,8 +407,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy comp | policy health | vpo compact | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -422,6 +440,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("output_distinct_2_last_mean")),
                         fmt(row.get("policy_reward_std_mean")),
                         fmt(row.get("policy_advantage_clip_fraction_mean")),
+                        fmt(row.get("policy_update_applied_fraction_mean")),
+                        fmt(row.get("policy_update_skipped_count_mean")),
                         fmt(row.get("policy_vector_compactness_mean_mean")),
                         fmt(row.get("policy_vector_completion_health_mean_mean")),
                         fmt(row.get("policy_vpo_dominant_compactness_mean")),

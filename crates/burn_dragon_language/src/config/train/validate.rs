@@ -1895,6 +1895,13 @@ impl TrainingConfig {
                     "training.ruliad_supervision.verifier_reward.clip_range must be finite and positive"
                 ));
             }
+            if let Some(max_clip_fraction) = verifier_reward.max_advantage_clip_fraction
+                && (!max_clip_fraction.is_finite() || !(0.0..=1.0).contains(&max_clip_fraction))
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.max_advantage_clip_fraction must be finite and in [0, 1] when set"
+                ));
+            }
             if !verifier_reward.advantage_epsilon.is_finite()
                 || verifier_reward.advantage_epsilon <= 0.0
             {
@@ -3382,6 +3389,30 @@ start_policy = "capability_gate"
                 .vpo_compactness_max_weight
                 <= 0.05
         );
+        assert_eq!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .start_after_steps,
+            512
+        );
+        assert_eq!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .max_advantage_clip_fraction,
+            Some(0.95)
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .clip_range
+                >= 1.0
+        );
         assert!(config.training.tbptt_chunk_size.is_none());
         assert!(!config.training.tbptt_persist_across_steps);
         assert!(config.training.objective.is_next_token());
@@ -4006,6 +4037,27 @@ start_policy = "capability_gate"
             .expect_err("VPO mass floors above one should fail");
         assert!(
             err.to_string().contains("mass floors"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_rejects_invalid_advantage_clip_gate() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .max_advantage_clip_fraction = Some(1.25);
+        let err = config
+            .validate()
+            .expect_err("invalid advantage clip fraction should fail");
+        assert!(
+            err.to_string().contains("max_advantage_clip_fraction"),
             "unexpected error: {err}"
         );
     }

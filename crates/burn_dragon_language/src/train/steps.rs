@@ -770,6 +770,8 @@ struct RuliadPolicyRewardTelemetry {
     advantage_mean: f64,
     advantage_std: f64,
     advantage_clip_fraction: f64,
+    policy_update_applied: bool,
+    policy_skip_reason: Option<String>,
     vector_sample_count: usize,
     vector_verifier_match_mean: f64,
     vector_semantic_match_mean: f64,
@@ -803,6 +805,8 @@ struct RuliadPolicyRewardTelemetryAccumulator {
     rewards: Vec<f32>,
     advantages: Vec<f32>,
     clipped_advantage_count: usize,
+    policy_update_applied: bool,
+    policy_skip_reason: Option<String>,
     vector_sums: [f64; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
     vector_sample_count: usize,
     vpo_scalarization_dominant_axis_counts:
@@ -825,6 +829,8 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             rewards: Vec::new(),
             advantages: Vec::new(),
             clipped_advantage_count: 0,
+            policy_update_applied: true,
+            policy_skip_reason: None,
             vector_sums: [0.0; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
             vector_sample_count: 0,
             vpo_scalarization_dominant_axis_counts: [0;
@@ -882,12 +888,26 @@ impl RuliadPolicyRewardTelemetryAccumulator {
         }
     }
 
+    fn advantage_clip_fraction(&self) -> f64 {
+        if self.advantages.is_empty() {
+            0.0
+        } else {
+            self.clipped_advantage_count as f64 / self.advantages.len() as f64
+        }
+    }
+
+    fn mark_skipped(&mut self, reason: impl Into<String>) {
+        self.policy_update_applied = false;
+        self.policy_skip_reason = Some(reason.into());
+    }
+
     fn finish(self) -> Option<RuliadPolicyRewardTelemetry> {
         if self.completion_rows == 0 {
             return None;
         }
         let (reward_mean, reward_std, reward_min, reward_max) = stats_f64(&self.rewards);
         let (advantage_mean, advantage_std, _, _) = stats_f64(&self.advantages);
+        let advantage_clip_fraction = self.advantage_clip_fraction();
         let vector_mean = |index: usize| {
             if self.vector_sample_count == 0 {
                 0.0
@@ -908,11 +928,9 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             reward_max,
             advantage_mean,
             advantage_std,
-            advantage_clip_fraction: if self.advantages.is_empty() {
-                0.0
-            } else {
-                self.clipped_advantage_count as f64 / self.advantages.len() as f64
-            },
+            advantage_clip_fraction,
+            policy_update_applied: self.policy_update_applied,
+            policy_skip_reason: self.policy_skip_reason,
             vector_sample_count: self.vector_sample_count,
             vector_verifier_match_mean: vector_mean(0),
             vector_semantic_match_mean: vector_mean(1),
@@ -2718,6 +2736,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return 0.0;
         }
         let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.start_after_steps {
+            return 0.0;
+        }
         if step_index % config.every_steps != 0 {
             return 0.0;
         }
@@ -3038,6 +3059,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         if rows.is_empty() {
             return None;
+        }
+        if let Some(max_clip_fraction) = config.max_advantage_clip_fraction {
+            let clip_fraction = telemetry.advantage_clip_fraction();
+            if clip_fraction > f64::from(max_clip_fraction) {
+                telemetry.mark_skipped(format!("advantage_clip_fraction>{max_clip_fraction:.6}"));
+                if let Some(telemetry) = telemetry.finish() {
+                    self.write_ruliad_policy_telemetry(telemetry);
+                }
+                return None;
+            }
         }
         if let Some(telemetry) = telemetry.finish() {
             self.write_ruliad_policy_telemetry(telemetry);
@@ -7027,6 +7058,49 @@ mod objective_step_tests {
         assert!(
             loss.is_finite(),
             "verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_respects_start_after_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                weight: 0.1,
+                every_steps: 1,
+                start_after_steps: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert_eq!(model.ruliad_verifier_reward_weight(), 0.0);
+        model.gradient_scale_step.store(4, Ordering::Relaxed);
+        assert_eq!(model.ruliad_verifier_reward_weight(), 0.1);
+    }
+
+    #[test]
+    fn ruliad_policy_telemetry_marks_saturated_updates_as_skipped() {
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            64,
+        );
+        telemetry.record_rewards_and_advantages(&[0.0, 1.0, -1.0], &[0.0, 1.0, -1.0], 0.2);
+        assert!(
+            telemetry.advantage_clip_fraction() > 0.5,
+            "test should exercise a saturated policy update"
+        );
+        telemetry.mark_skipped("advantage_clip_fraction>0.500000");
+        let telemetry = telemetry.finish().expect("telemetry");
+        assert!(!telemetry.policy_update_applied);
+        assert_eq!(
+            telemetry.policy_skip_reason.as_deref(),
+            Some("advantage_clip_fraction>0.500000")
         );
     }
 

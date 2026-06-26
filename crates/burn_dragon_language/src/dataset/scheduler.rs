@@ -94,6 +94,37 @@ pub trait TokenSequenceDataset: Send + Sync {
         None
     }
 
+    /// Return concrete source-selected token windows and optional precomputed loss masks for a
+    /// batch. Datasets with step-dependent supervision can override this to avoid deriving masks
+    /// from a static dataset-level mode.
+    fn source_selected_token_windows_with_loss_masks(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        let windows = self.source_selected_token_windows(
+            split,
+            epoch_index,
+            absolute_step,
+            batch_size,
+            block_size,
+        )?;
+        let masks = self.uses_target_loss_mask().then(|| {
+            windows
+                .iter()
+                .map(|window| {
+                    let mut mask = vec![0; block_size];
+                    self.target_loss_mask_for_window(window, &mut mask);
+                    mask
+                })
+                .collect::<Vec<_>>()
+        });
+        Some((windows, masks))
+    }
+
     /// Return ruliad prompt/eval metadata aligned to a live source-selected step, if available.
     /// The random data loader requests this only when a verifier-reward policy auxiliary is
     /// explicitly enabled, keeping ordinary batch construction on the token-only hot path.
@@ -370,18 +401,27 @@ where
     let mut sample = vec![0u32; block_size + 1];
     let mut ruliad_policy_batch = None;
 
-    if let Some(source_windows) = dataset.source_selected_token_windows(
-        split,
-        epoch_index,
-        absolute_step,
-        batch_size,
-        block_size,
-    ) {
+    if let Some((source_windows, source_loss_masks)) = dataset
+        .source_selected_token_windows_with_loss_masks(
+            split,
+            epoch_index,
+            absolute_step,
+            batch_size,
+            block_size,
+        )
+    {
         assert_eq!(
             source_windows.len(),
             batch_size,
             "source-selected token windows must match batch size"
         );
+        if let Some(source_loss_masks) = source_loss_masks.as_ref() {
+            assert_eq!(
+                source_loss_masks.len(),
+                batch_size,
+                "source-selected token masks must match batch size"
+            );
+        }
         for (batch_idx, window) in source_windows.iter().take(batch_size).enumerate() {
             assert!(
                 window.len() > block_size,
@@ -392,10 +432,16 @@ where
                 targets[batch_idx * block_size + t] = window[t + 1] as i64;
             }
             if let Some(mask) = loss_mask.as_mut() {
-                dataset.target_loss_mask_for_window(
-                    window,
-                    &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
-                );
+                let mask_row = &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size];
+                if let Some(source_loss_masks) = source_loss_masks.as_ref() {
+                    mask_row.copy_from_slice(
+                        source_loss_masks
+                            .get(batch_idx)
+                            .expect("source-selected token mask row must exist"),
+                    );
+                } else {
+                    dataset.target_loss_mask_for_window(window, mask_row);
+                }
             }
         }
         if include_ruliad_policy_batch {

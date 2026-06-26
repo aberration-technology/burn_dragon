@@ -369,13 +369,10 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             functors: Vec::new(),
             laws: vec!["path_composition_is_associative".to_string()],
             query: "compose the local-rule step morphism along a bounded trajectory".to_string(),
-            answer: format!(
-                "target={}",
-                trace
-                    .last()
-                    .map(|value| compact_symbolic_word(value, 48))
-                    .unwrap_or_default()
-            ),
+            answer: trace
+                .last()
+                .map(|value| symbolic_word_certificate("target", value, "01"))
+                .unwrap_or_else(|| symbolic_word_certificate("target", "", "01")),
             categorical_core: true,
         },
         RuliadSampleSpec::Simulation {
@@ -423,7 +420,10 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             categorical_core: true,
         },
         RuliadSampleSpec::Rewrite {
-            steps, normal_form, ..
+            alphabet,
+            steps,
+            normal_form,
+            ..
         } => RuliadCategoricalPresentation {
             abstraction: "finite_category_reasoning".to_string(),
             source_family: RuliadFamilyKind::Rewrite.label().to_string(),
@@ -434,7 +434,7 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             functors: Vec::new(),
             laws: vec!["rewrite_paths_compose".to_string()],
             query: "compose rewrite morphisms until no reducing rule applies".to_string(),
-            answer: format!("normal_form={}", compact_symbolic_word(normal_form, 48)),
+            answer: symbolic_word_certificate("normal_form", normal_form, alphabet),
             categorical_core: true,
         },
         RuliadSampleSpec::Algebra { law, holds, .. } => RuliadCategoricalPresentation {
@@ -993,7 +993,7 @@ fn proof_tape_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> RuliadProo
         query: compact_query(spec),
         answer_contract: compact_answer_keys(&answer),
         proof_steps: compact_proof_steps(spec),
-        answer: compact_answer_values(&answer),
+        answer,
         data: compact_data(spec),
     }
 }
@@ -1127,20 +1127,17 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
 
 fn compact_answer(spec: &RuliadSampleSpec) -> String {
     match spec {
-        RuliadSampleSpec::Eca { trace, .. } => {
-            format!(
-                "x={}",
-                trace
-                    .last()
-                    .map(|value| compact_symbolic_word(value, 32))
-                    .unwrap_or_default()
-            )
-        }
+        RuliadSampleSpec::Eca { trace, .. } => trace
+            .last()
+            .map(|value| symbolic_word_certificate("x", value, "01"))
+            .unwrap_or_else(|| symbolic_word_certificate("x", "", "01")),
         RuliadSampleSpec::Simulation { .. } => "ok=1".to_string(),
         RuliadSampleSpec::Automaton { accepted, .. } => format!("acc={}", bit(*accepted)),
-        RuliadSampleSpec::Rewrite { normal_form, .. } => {
-            format!("nf={}", compact_symbolic_word(normal_form, 32))
-        }
+        RuliadSampleSpec::Rewrite {
+            alphabet,
+            normal_form,
+            ..
+        } => symbolic_word_certificate("nf", normal_form, alphabet),
         RuliadSampleSpec::Algebra { holds, .. } => format!("ok={}", bit(*holds)),
         RuliadSampleSpec::Category {
             lhs, rhs, holds, ..
@@ -1185,6 +1182,29 @@ fn compact_answer_values(answer: &str) -> String {
     } else {
         values.join(";")
     }
+}
+
+fn symbolic_word_certificate(prefix: &str, value: &str, alphabet: &str) -> String {
+    let len = value.chars().count();
+    let alphabet = if alphabet.is_empty() { "_" } else { alphabet };
+    let counts = alphabet
+        .chars()
+        .map(|symbol| {
+            value
+                .chars()
+                .filter(|candidate| *candidate == symbol)
+                .count()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let edge = match (value.chars().next(), value.chars().last()) {
+        (Some(first), Some(last)) => format!("{first}{last}"),
+        _ => "_".to_string(),
+    };
+    format!(
+        "{prefix}len={len};{prefix}alpha={alphabet};{prefix}counts={counts};{prefix}edge={edge}"
+    )
 }
 
 fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
@@ -2847,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn categorical_presentation_compacts_symbolic_payload_answers() {
+    fn categorical_presentation_uses_low_entropy_symbolic_certificates() {
         let binary = "0101".repeat(24);
         let eca = RuliadSampleSpec::Eca {
             rule: 30,
@@ -2858,8 +2878,13 @@ mod tests {
             task: RuliadTaskKind::MultiStepState,
         };
         let eca_answer = ruliad_categorical_presentation(&eca).answer;
-        assert!(eca_answer.starts_with("target=b96:"), "{eca_answer}");
+        assert!(
+            eca_answer.starts_with("targetlen=96;targetalpha=01;"),
+            "{eca_answer}"
+        );
+        assert!(eca_answer.contains(";targetcounts=48,48;"), "{eca_answer}");
         assert!(!eca_answer.contains("010101010101"), "{eca_answer}");
+        assert!(!eca_answer.contains(":h"), "{eca_answer}");
 
         let normal_form = "AB".repeat(32);
         let rewrite = RuliadSampleSpec::Rewrite {
@@ -2876,10 +2901,15 @@ mod tests {
         };
         let rewrite_answer = ruliad_categorical_presentation(&rewrite).answer;
         assert!(
-            rewrite_answer.starts_with("normal_form=s64:"),
+            rewrite_answer.starts_with("normal_formlen=64;normal_formalpha=AB;"),
+            "{rewrite_answer}"
+        );
+        assert!(
+            rewrite_answer.contains(";normal_formcounts=32,32;"),
             "{rewrite_answer}"
         );
         assert!(!rewrite_answer.contains("ABABABAB"), "{rewrite_answer}");
+        assert!(!rewrite_answer.contains(":h"), "{rewrite_answer}");
     }
 
     #[test]
@@ -2916,6 +2946,28 @@ mod tests {
         );
         assert!(!prompt.contains("ok=1"));
         assert!(!prompt.contains("[/R2]"));
+    }
+
+    #[test]
+    fn sample_text_answer_slot_matches_verifier_expected_answer() {
+        let mut config = config();
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 5, max: 5 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+        }];
+        let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
+        let text = sample_text(&sample.spec, &sample.oracle_hash);
+        let expected_line = format!("!:{}", ruliad_expected_answer(&sample.spec));
+        assert!(
+            text.contains(&expected_line),
+            "canonical ruliad documents must train the full keyed verifier answer: {text}"
+        );
+        assert!(
+            !text.contains("\n!:1;"),
+            "canonical ruliad documents must not train compact value-only answers: {text}"
+        );
     }
 
     #[test]
@@ -3004,7 +3056,7 @@ mod tests {
         let text = sample_text(&spec, &report.oracle_hash);
         assert!(text.starts_with("[R2 "));
         assert!(text.contains("\nA:ok,l,r\n"));
-        assert!(text.contains("\n!:1;"));
+        assert!(text.contains("\n!:ok="));
         assert!(!text.to_lowercase().contains("pythag"));
     }
 

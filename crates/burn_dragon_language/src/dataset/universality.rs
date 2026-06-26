@@ -1269,17 +1269,39 @@ impl UniversalityDataset {
         self
     }
 
+    fn effective_ruliad_supervision(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+    ) -> RuliadSupervisionConfig {
+        let mut supervision = self.ruliad_supervision;
+        if matches!(supervision.mode, RuliadSupervisionMode::Mixed) {
+            supervision.mode = if self.ruliad_supervision.prefer_answer_window(
+                matches!(split, DatasetSplit::Val),
+                epoch_index,
+                absolute_step,
+            ) {
+                RuliadSupervisionMode::AnswerCompletion
+            } else {
+                RuliadSupervisionMode::FullDocument
+            };
+        }
+        supervision
+    }
+
     fn ruliad_answer_completion_active(
         &self,
         split: DatasetSplit,
         epoch_index: usize,
         absolute_step: usize,
     ) -> bool {
-        self.ruliad_supervision.prefer_answer_window(
-            matches!(split, DatasetSplit::Val),
-            epoch_index,
-            absolute_step,
-        )
+        self.effective_ruliad_supervision(split, epoch_index, absolute_step)
+            .prefer_answer_window(
+                matches!(split, DatasetSplit::Val),
+                epoch_index,
+                absolute_step,
+            )
     }
 
     pub fn with_source_selection_state_path(mut self, path: Option<&Path>) -> io::Result<Self> {
@@ -1475,10 +1497,10 @@ impl UniversalityDataset {
         let batch_size = batch_size.max(1);
         let mut inputs = vec![0i64; batch_size * self.block_size];
         let mut targets = vec![0i64; batch_size * self.block_size];
-        let answer_completion =
-            self.ruliad_answer_completion_active(DatasetSplit::Val, epoch_index, absolute_step);
-        let mut loss_mask = self
-            .ruliad_supervision
+        let effective_supervision =
+            self.effective_ruliad_supervision(DatasetSplit::Val, epoch_index, absolute_step);
+        let answer_completion = effective_supervision.uses_answer_target_mask();
+        let mut loss_mask = effective_supervision
             .uses_target_loss_mask()
             .then(|| vec![0i64; batch_size * self.block_size]);
         for (batch_idx, document) in documents.iter().enumerate() {
@@ -1517,7 +1539,7 @@ impl UniversalityDataset {
                 ruliad_target_loss_mask(
                     &document[start..start + self.block_size + 1],
                     &mut mask[batch_idx * self.block_size..(batch_idx + 1) * self.block_size],
-                    self.ruliad_supervision,
+                    effective_supervision,
                 );
             }
         }
@@ -1854,6 +1876,37 @@ impl TokenSequenceDataset for UniversalityDataset {
         }
     }
 
+    fn source_selected_token_windows_with_loss_masks(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        let supervision = self.effective_ruliad_supervision(split, epoch_index, absolute_step);
+        let windows = self.source_selected_token_windows(
+            split,
+            epoch_index,
+            absolute_step,
+            batch_size,
+            block_size,
+        )?;
+        let emit_masks =
+            self.ruliad_supervision.uses_target_loss_mask() || supervision.uses_target_loss_mask();
+        let masks = emit_masks.then(|| {
+            windows
+                .iter()
+                .map(|window| {
+                    let mut mask = vec![0; block_size];
+                    ruliad_target_loss_mask(window, &mut mask, supervision);
+                    mask
+                })
+                .collect::<Vec<_>>()
+        });
+        Some((windows, masks))
+    }
+
     fn source_selected_ruliad_policy_batch(
         &self,
         split: DatasetSplit,
@@ -1929,6 +1982,10 @@ impl TokenSequenceDataset for UniversalityDataset {
         batch_size: usize,
         block_size: usize,
     ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        let supervision = self.effective_ruliad_supervision(split, epoch_index, absolute_step);
+        let prefer_answer_window = matches!(supervision.mode, RuliadSupervisionMode::AnswerWindow);
+        let emit_loss_masks =
+            self.ruliad_supervision.uses_target_loss_mask() || supervision.uses_target_loss_mask();
         match (split, &self.storage) {
             (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
                 .source_selected_stream_token_windows_with_loss_masks(
@@ -1938,11 +1995,9 @@ impl TokenSequenceDataset for UniversalityDataset {
                     chunk_index_in_document,
                     batch_size,
                     block_size,
-                    matches!(
-                        self.ruliad_supervision.mode,
-                        RuliadSupervisionMode::AnswerWindow
-                    ),
-                    self.ruliad_supervision,
+                    prefer_answer_window,
+                    supervision,
+                    emit_loss_masks,
                 ),
             (DatasetSplit::Val, UniversalityStorage::OnTheFly(storage)) => storage
                 .source_selected_stream_token_windows_with_loss_masks(
@@ -1952,11 +2007,9 @@ impl TokenSequenceDataset for UniversalityDataset {
                     chunk_index_in_document,
                     batch_size,
                     block_size,
-                    matches!(
-                        self.ruliad_supervision.mode,
-                        RuliadSupervisionMode::AnswerWindow
-                    ),
-                    self.ruliad_supervision,
+                    prefer_answer_window,
+                    supervision,
+                    emit_loss_masks,
                 ),
             _ => None,
         }
@@ -2259,6 +2312,7 @@ impl OnTheFlyStorage {
         block_size: usize,
         prefer_answer_window: bool,
         supervision: RuliadSupervisionConfig,
+        emit_loss_masks: bool,
     ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
         let source_selection = self.source_selection.as_ref()?;
         let selection_step =
@@ -2286,7 +2340,7 @@ impl OnTheFlyStorage {
             chunk_index_in_document,
             prefer_answer_window,
         );
-        let masks = supervision.uses_target_loss_mask().then(|| {
+        let masks = emit_loss_masks.then(|| {
             if prefer_answer_window {
                 windows
                     .iter()
@@ -4708,10 +4762,20 @@ mod tests {
                     answer_rows = answer_rows.saturating_add(1);
                     let window_u32 = window.iter().map(|token| *token as u32).collect::<Vec<_>>();
                     let mut expected_mask = vec![0; 128];
-                    assert!(
-                        ruliad_answer_target_loss_mask(&window_u32, &mut expected_mask),
-                        "step {step} row {row} answer mask should match the natural streamed window: {window:?}"
-                    );
+                    if ruliad_answer_target_loss_mask(&window_u32, &mut expected_mask) {
+                        assert_eq!(
+                            mask_row, expected_mask,
+                            "step {step} row {row} answer mask should match the local streamed window"
+                        );
+                    } else {
+                        let has_local_answer_marker = window_u32
+                            .windows(2)
+                            .any(|pair| pair == [u32::from(b'!'), u32::from(b':')]);
+                        assert!(
+                            !has_local_answer_marker,
+                            "step {step} row {row} masked answer continuation should not miss a local answer marker: {window:?}"
+                        );
+                    }
                 } else {
                     context_only_rows = context_only_rows.saturating_add(1);
                 }
@@ -4724,6 +4788,107 @@ mod tests {
         assert!(
             answer_rows > 0,
             "profile-sized answer-completion stream should include natural answer rows"
+        );
+    }
+
+    #[test]
+    fn live_ruliad_mixed_profile_sized_streaming_alternates_answer_and_full_masks() {
+        type TestBackend = NdArray<f32>;
+
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let mut config = live_ruliad_runtime_config();
+        config.serialization.document_tokens = 512;
+        config.tokenization = RuliadTokenizationConfig::StructuredSymbolic {
+            vocab_size: 272,
+            eos_id: Some(271),
+        };
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            128,
+            32,
+            &TokenizerConfig {
+                vocab_path: None,
+                kind: TokenizerKind::Pretokenized(PretokenizedTokenizerConfig {
+                    vocab_size: 272,
+                    bos_id: None,
+                    eos_id: Some(271),
+                    pad_id: None,
+                    unk_id: None,
+                }),
+            },
+        )
+        .expect("load structured ruliad dataset")
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::Mixed,
+            mask_high_entropy_spans: false,
+            ..Default::default()
+        });
+        let wrapped = Arc::new(crate::dataset::Dataset::from_universality(dataset));
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let loader = crate::dataset::StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&wrapped),
+            DatasetSplit::Train,
+            &device,
+            4,
+            Some(4),
+            Some(512),
+            1337,
+        );
+        let mut iter = loader.iter();
+        let answer_batch = iter.next().expect("mixed answer-supervised batch");
+        let full_batch = iter.next().expect("mixed full-document batch");
+
+        let answer_mask = answer_batch
+            .loss_mask
+            .expect("mixed answer batch should expose a mask")
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("answer mask");
+        assert_eq!(answer_mask.len(), 32 * 128);
+        assert!(
+            answer_mask.iter().any(|value| *value == 0),
+            "mixed answer step should not degrade into a full-document all-ones mask"
+        );
+        assert!(
+            answer_mask.iter().any(|value| *value == 1),
+            "mixed answer step should retain answer targets somewhere in the batch"
+        );
+
+        let full_inputs = full_batch
+            .inputs
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("full inputs");
+        let full_mask = full_batch
+            .loss_mask
+            .expect("mixed full-document batch should expose an explicit mask")
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("full mask");
+        assert_eq!(full_mask.len(), 32 * 128);
+        let eos_id = 271i64;
+        let mut expected_valid_targets = Vec::with_capacity(32 * 128);
+        for input_row in full_inputs.chunks(128) {
+            let mut reached_padding = false;
+            for input in input_row {
+                if reached_padding || *input == eos_id {
+                    reached_padding = true;
+                    expected_valid_targets.push(0);
+                } else {
+                    expected_valid_targets.push(1);
+                }
+            }
+        }
+        assert_eq!(
+            full_mask, expected_valid_targets,
+            "mixed full-document step should supervise every valid target and only mask padding"
         );
     }
 

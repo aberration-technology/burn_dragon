@@ -163,6 +163,39 @@ source_feedback_for_arm() {
   esac
 }
 
+answer_ranking_for_arm() {
+  case "$1" in
+    ruliad_1m_la16k_answer_completion_ranking|ruliad_1m_la16k_answer_completion_ranking_denoising)
+      printf 'true\n'
+      ;;
+    *)
+      printf '%s\n' "${BURN_DRAGON_PROMOTION_ANSWER_RANKING:-false}"
+      ;;
+  esac
+}
+
+answer_denoising_for_arm() {
+  case "$1" in
+    ruliad_1m_la16k_answer_completion_denoising|ruliad_1m_la16k_answer_completion_ranking_denoising)
+      printf 'true\n'
+      ;;
+    *)
+      printf '%s\n' "${BURN_DRAGON_PROMOTION_ANSWER_DENOISING:-false}"
+      ;;
+  esac
+}
+
+ruliad_mask_high_entropy_for_arm() {
+  case "$1" in
+    jepa|jepa_nextlat|jepa_nextlat_pc|jepa_nextlat_pc_warm|cap_feedback|ruliad_*)
+      printf '%s\n' "${BURN_DRAGON_PROMOTION_RULIAD_MASK_HIGH_ENTROPY:-true}"
+      ;;
+    *)
+      printf '%s\n' "${BURN_DRAGON_PROMOTION_RULIAD_MASK_HIGH_ENTROPY:-false}"
+      ;;
+  esac
+}
+
 write_arm_profile() {
   local arm="$1"
   local profile="$2"
@@ -192,6 +225,9 @@ first_arm=1
 for arm in "${ARMS[@]}"; do
   arm_profile="$OUT_DIR/profiles/${arm}.toml"
   arm_out="$OUT_DIR/$arm"
+  arm_answer_ranking="$(answer_ranking_for_arm "$arm")"
+  arm_answer_denoising="$(answer_denoising_for_arm "$arm")"
+  arm_mask_high_entropy="$(ruliad_mask_high_entropy_for_arm "$arm")"
   write_arm_profile "$arm" "$arm_profile"
 
   args=(
@@ -227,6 +263,9 @@ for arm in "${ARMS[@]}"; do
     BURN_DRAGON_LR_STEPS_CHECKPOINT_INTERVAL_ITERS="$CHECKPOINT_INTERVAL_ITERS" \
     BURN_DRAGON_LR_STEPS_MAX_SYSTEM_MEMORY_FRACTION="$MAX_SYSTEM_MEMORY_FRACTION" \
     BURN_DRAGON_LR_STEPS_MIN_AVAILABLE_MB="$MIN_AVAILABLE_MB" \
+    BURN_DRAGON_LR_STEPS_RULIAD_MASK_HIGH_ENTROPY="$arm_mask_high_entropy" \
+    BURN_DRAGON_LR_STEPS_ANSWER_RANKING="$arm_answer_ranking" \
+    BURN_DRAGON_LR_STEPS_ANSWER_DENOISING="$arm_answer_denoising" \
     "$ROOT_DIR/scripts/latent_reasoning_steps_ablation.sh" "${args[@]}"
 
   if (( DRY_RUN == 0 )); then

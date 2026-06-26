@@ -74,6 +74,25 @@ POLICY_METRIC_COLUMNS = [
     "policy_vpo_dominant_completion_health",
 ]
 
+RAW_COMPLETION_FILE = "events/ruliad_completion_samples.jsonl"
+RAW_COMPLETION_METRIC_COLUMNS = [
+    "raw_completion_rows",
+    "raw_completion_verifier_rate",
+    "raw_completion_semantic_rate",
+    "raw_completion_partial_rate",
+    "raw_completion_schema_wrong_rate",
+    "raw_completion_malformed_rate",
+    "raw_completion_missing_rate",
+    "raw_completion_field_accuracy_mean",
+    "raw_completion_termination_rate",
+    "raw_completion_quality_mean",
+    "raw_completion_generated_tokens_mean",
+    "raw_completion_hash_canary_rate",
+    "raw_completion_actual_answer_distinct_fraction",
+    "raw_completion_status_entropy_bits",
+    "raw_completion_dominant_status_fraction",
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -95,6 +114,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-distinct-2", type=float, default=0.10)
     parser.add_argument("--min-throughput-ratio", type=float, default=0.85)
     parser.add_argument("--max-policy-advantage-clip-fraction", type=float, default=0.95)
+    parser.add_argument("--min-raw-completion-quality", type=float, default=0.20)
+    parser.add_argument("--min-raw-completion-answer-distinct", type=float, default=0.20)
     return parser.parse_args()
 
 
@@ -223,6 +244,114 @@ def read_policy_telemetry(run_dir: str | None) -> dict[str, float | int | None]:
     }
 
 
+def read_raw_completion_samples(run_dir: str | None) -> dict[str, float | int | None]:
+    if not run_dir:
+        return {column: None for column in RAW_COMPLETION_METRIC_COLUMNS}
+    path = Path(run_dir) / RAW_COMPLETION_FILE
+    if not path.exists():
+        return {column: None for column in RAW_COMPLETION_METRIC_COLUMNS}
+
+    records: list[dict[str, Any]] = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            records.append(row)
+    if not records:
+        return {column: None for column in RAW_COMPLETION_METRIC_COLUMNS}
+
+    base_records = [row for row in records if row.get("probe_name") == "ruliad_correctness"]
+    selected = latest_probe_records(base_records or records)
+    if not selected:
+        return {column: None for column in RAW_COMPLETION_METRIC_COLUMNS}
+
+    def bool_rate(key: str) -> float | None:
+        values = [row.get(key) for row in selected if isinstance(row.get(key), bool)]
+        return mean([1.0 if value else 0.0 for value in values])
+
+    def numeric_mean(key: str, scale: float = 1.0) -> float | None:
+        clean = [value for value in (finite(row.get(key)) for row in selected) if value is not None]
+        return mean([value / scale for value in clean])
+
+    def status_rate(status: str) -> float:
+        return sum(1 for row in selected if row.get("status") == status) / len(selected)
+
+    field_scores: list[float] = []
+    for row in selected:
+        correct = finite(row.get("correct_field_count"))
+        expected = finite(row.get("expected_field_count"))
+        if correct is None or expected is None or expected <= 0.0:
+            continue
+        field_scores.append(max(0.0, min(correct / expected, 1.0)))
+
+    answers = [
+        str(row.get("actual_answer"))
+        for row in selected
+        if row.get("actual_answer") is not None
+    ]
+    statuses = [str(row.get("status") or "") for row in selected]
+
+    return {
+        "raw_completion_rows": len(selected),
+        "raw_completion_verifier_rate": bool_rate("verifier_match"),
+        "raw_completion_semantic_rate": bool_rate("semantic_match"),
+        "raw_completion_partial_rate": bool_rate("partial_credit"),
+        "raw_completion_schema_wrong_rate": status_rate("SchemaValidWrong"),
+        "raw_completion_malformed_rate": status_rate("Malformed"),
+        "raw_completion_missing_rate": status_rate("Missing"),
+        "raw_completion_field_accuracy_mean": mean(field_scores),
+        "raw_completion_termination_rate": bool_rate("answer_terminated"),
+        "raw_completion_quality_mean": numeric_mean("completion_quality_ppm", 1_000_000.0),
+        "raw_completion_generated_tokens_mean": numeric_mean("generated_token_count"),
+        "raw_completion_hash_canary_rate": bool_rate("hash_canary"),
+        "raw_completion_actual_answer_distinct_fraction": (
+            len(set(answers)) / len(answers) if answers else None
+        ),
+        "raw_completion_status_entropy_bits": entropy_bits(statuses),
+        "raw_completion_dominant_status_fraction": dominant_fraction(statuses),
+    }
+
+
+def latest_probe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not records:
+        return []
+
+    def group_key(row: dict[str, Any]) -> tuple[float, float, str]:
+        epoch = finite(row.get("epoch")) or 0.0
+        step = finite(row.get("absolute_step")) or 0.0
+        probe = str(row.get("probe_name") or "")
+        return epoch, step, probe
+
+    latest_key = max(group_key(row) for row in records)
+    return [row for row in records if group_key(row) == latest_key]
+
+
+def entropy_bits(values: list[str]) -> float | None:
+    if not values:
+        return None
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    total = len(values)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def dominant_fraction(values: list[str]) -> float | None:
+    if not values:
+        return None
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return max(counts.values()) / len(values)
+
+
 def collect_trials(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for summary in sorted(root.glob(f"*/analysis/{TRIAL_SUMMARY}")):
@@ -231,6 +360,7 @@ def collect_trials(root: Path) -> list[dict[str, Any]]:
             out: dict[str, Any] = {"arm": arm}
             out.update(row)
             out.update(read_policy_telemetry(row.get("run_dir")))
+            out.update(read_raw_completion_samples(row.get("run_dir")))
             rows.append(out)
     return rows
 
@@ -245,7 +375,7 @@ def summarize_by_arm(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "trials": len(arm_rows),
             "ok_trials": len(ok_rows),
         }
-        for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS:
+        for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS + RAW_COMPLETION_METRIC_COLUMNS:
             clean = [value for value in (finite(row.get(column)) for row in ok_rows) if value is not None]
             summary[f"{column}_mean"] = mean(clean)
         summaries.append(summary)
@@ -291,6 +421,12 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         completion_distinct2 = value(row, "completion_distinct_2_last_mean", 1.0)
         completion_period = value(row, "completion_period_2_to_64_last_mean", 0.0)
         completion_repetition = value(row, "completion_repetition_last_mean", 0.0)
+        raw_completion_quality = value(row, "raw_completion_quality_mean_mean", 1.0)
+        raw_completion_answer_distinct = value(
+            row,
+            "raw_completion_actual_answer_distinct_fraction_mean",
+            1.0,
+        )
         policy_completion_rows = value(row, "policy_completion_rows_mean", 0.0)
         policy_clip_fraction = value(row, "policy_advantage_clip_fraction_mean", 0.0)
         policy_skipped = value(row, "policy_update_skipped_count_mean", 0.0)
@@ -339,6 +475,10 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             reasons.append("completion_period_collapse")
         if completion_repetition > args.max_completion_repetition:
             reasons.append("completion_repetition_collapse")
+        if raw_completion_quality < args.min_raw_completion_quality:
+            reasons.append("raw_completion_quality_collapse")
+        if raw_completion_answer_distinct < args.min_raw_completion_answer_distinct:
+            reasons.append("raw_completion_answer_collapse")
         if policy_completion_rows > 0.0 and policy_clip_fraction > args.max_policy_advantage_clip_fraction:
             reasons.append("policy_advantage_clip_saturation")
         if policy_skipped > 0.0:
@@ -411,8 +551,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | raw q | raw distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -439,6 +579,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("answer_termination_delta")),
                         fmt(row.get("completion_health_last_mean")),
                         fmt(row.get("completion_delta")),
+                        fmt(row.get("raw_completion_quality_mean_mean")),
+                        fmt(row.get("raw_completion_actual_answer_distinct_fraction_mean")),
                         fmt(row.get("completion_distinct_2_last_mean")),
                         fmt(row.get("completion_period_2_to_64_last_mean")),
                         fmt(row.get("output_distinct_2_last_mean")),
@@ -471,7 +613,10 @@ def main() -> None:
     gated = add_gate_decisions(arms, args)
     arm_fields = (
         ["arm", "decision", "fail_reasons", "trials", "ok_trials"]
-        + [f"{column}_mean" for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS]
+        + [
+            f"{column}_mean"
+            for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS + RAW_COMPLETION_METRIC_COLUMNS
+        ]
         + [
             "promotion_score_delta",
             "throughput_ratio",

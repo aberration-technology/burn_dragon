@@ -15,7 +15,7 @@ use burn_dragon_train::train::events::{
 #[cfg(feature = "ddp")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(feature = "ddp")]
 use std::marker::PhantomData;
 
@@ -2522,6 +2522,7 @@ where
         run_source_weighted_validation(env, &valid_model, epoch, steps_per_epoch, batch_size, bus)?;
     let ruliad_eval_report = run_ruliad_correctness_validation(
         env.run_name,
+        env.run_dir,
         env.training,
         env.source_selection_dataset
             .as_ref()
@@ -2759,6 +2760,7 @@ where
         run_source_weighted_validation_forward_only(env, model, epoch, steps_per_epoch, bus)?;
     let ruliad_eval_report = run_ruliad_correctness_validation(
         env.run_name,
+        env.run_dir,
         env.training,
         env.source_selection_dataset.as_ref(),
         model,
@@ -3159,6 +3161,7 @@ where
 
 fn run_ruliad_correctness_validation<B>(
     run_name: &str,
+    run_dir: &Path,
     training: &TrainingHyperparameters,
     dataset: Option<&Arc<Dataset>>,
     model: &LanguageTrainModel<B>,
@@ -3197,6 +3200,7 @@ where
 
     let base_report = run_ruliad_correctness_validation_for_items(
         run_name,
+        run_dir,
         dataset,
         model,
         epoch,
@@ -3217,6 +3221,7 @@ where
             let probe_name = format!("ruliad_correctness_eval_steps_{steps}");
             let _ = run_ruliad_correctness_validation_for_items(
                 run_name,
+                run_dir,
                 dataset,
                 &eval_model,
                 epoch,
@@ -3238,6 +3243,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_ruliad_correctness_validation_for_items<B>(
     run_name: &str,
+    run_dir: &Path,
     dataset: &Dataset,
     model: &LanguageTrainModel<B>,
     epoch: usize,
@@ -3304,6 +3310,15 @@ where
         &completions,
         training.events.capability_probe_example_count,
     );
+    write_ruliad_completion_probe_records(
+        run_dir,
+        run_name,
+        epoch,
+        absolute_step,
+        probe_name,
+        &items,
+        &completions,
+    )?;
     emit_ruliad_correctness_metrics_with_labels(
         run_name,
         epoch,
@@ -3533,6 +3548,109 @@ fn ruliad_probe_examples(
         }
     }
     examples
+}
+
+#[derive(Debug, Serialize)]
+struct RuliadCompletionProbeRecord {
+    version: u32,
+    run_id: String,
+    epoch: usize,
+    absolute_step: usize,
+    probe_name: String,
+    sample_index: usize,
+    oracle_hash: String,
+    split: String,
+    family: String,
+    task_kind: String,
+    difficulty_level: Option<usize>,
+    math_domains: Vec<String>,
+    reasoning_modes: Vec<String>,
+    prompt: String,
+    expected_answer: String,
+    completion: String,
+    actual_answer: Option<String>,
+    status: String,
+    verifier_match: bool,
+    semantic_match: bool,
+    partial_credit: bool,
+    partial_progress_ppm: usize,
+    correct_field_count: usize,
+    expected_field_count: usize,
+    certificate_prefix_ppm: usize,
+    completion_quality_ppm: usize,
+    generated_token_count: usize,
+    answer_terminated: bool,
+    hash_canary: bool,
+}
+
+fn write_ruliad_completion_probe_records(
+    run_dir: &Path,
+    run_name: &str,
+    epoch: usize,
+    absolute_step: usize,
+    probe_name: &str,
+    items: &[burn_dragon_universality::RuliadEvalItem],
+    completions: &[burn_dragon_universality::RuliadCompletionRecord],
+) -> Result<()> {
+    if items.is_empty() || completions.is_empty() {
+        return Ok(());
+    }
+    let events_dir = run_dir.join("events");
+    fs::create_dir_all(&events_dir)
+        .with_context(|| format!("failed to create events directory {}", events_dir.display()))?;
+    let path = events_dir.join("ruliad_completion_samples.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    for (item, completion) in items.iter().zip(completions.iter()) {
+        let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+            item,
+            Some(&completion.completion),
+        );
+        let extracted =
+            burn_dragon_universality::ruliad::extract_ruliad_completion(&completion.completion);
+        let record = RuliadCompletionProbeRecord {
+            version: 1,
+            run_id: run_name.to_string(),
+            epoch,
+            absolute_step,
+            probe_name: probe_name.to_string(),
+            sample_index: item.sample_index,
+            oracle_hash: item.oracle_hash.clone(),
+            split: format!("{:?}", item.split),
+            family: item.family.clone(),
+            task_kind: item.task_kind.clone(),
+            difficulty_level: item.difficulty_level,
+            math_domains: item.math_domains.clone(),
+            reasoning_modes: item.reasoning_modes.clone(),
+            prompt: item.prompt.clone(),
+            expected_answer: item.expected_answer.clone(),
+            completion: completion.completion.clone(),
+            actual_answer: extracted.answer,
+            status: format!("{:?}", score.status),
+            verifier_match: score.verifier_match(),
+            semantic_match: matches!(
+                score.status,
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                    | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch
+            ),
+            partial_credit: score.partial_credit(),
+            partial_progress_ppm: score.partial_progress_ppm,
+            correct_field_count: score.correct_field_count,
+            expected_field_count: score.expected_field_count,
+            certificate_prefix_ppm: score.certificate_prefix_ppm,
+            completion_quality_ppm: score.completion_quality_ppm,
+            generated_token_count: score.generated_token_count,
+            answer_terminated: score.answer_terminated,
+            hash_canary: score.hash_canary,
+        };
+        let line =
+            serde_json::to_string(&record).context("serializing ruliad completion probe record")?;
+        writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn compact_probe_example_text(text: &str, max_chars: usize) -> String {
@@ -7960,6 +8078,89 @@ mod tests {
         assert_eq!(examples[0].reason, "answer_mismatch");
         assert!(examples[0].prompt.contains("\\nA:ok,l,r\\n!:"));
         assert_eq!(examples[0].generated_tokens, 2);
+    }
+
+    #[test]
+    fn ruliad_completion_probe_records_write_raw_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "hash-a".to_string(),
+            sample_index: 7,
+            split: burn_dragon_universality::SampleSplit::Validation,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category_theory".to_string()],
+            reasoning_modes: vec!["equational_reasoning".to_string()],
+            prompt: "[R2 hash-a v1 P/thm/proof]\nA:ok,l,r\n!:".to_string(),
+            expected_answer: "ok=1;l=2;r=2".to_string(),
+            difficulty_level: Some(3),
+            spec: None,
+        };
+        let completion = burn_dragon_universality::RuliadCompletionRecord {
+            oracle_hash: "hash-a".to_string(),
+            completion: "!:ok=1;l=2;r=2\n[/R2]\n".to_string(),
+        };
+
+        write_ruliad_completion_probe_records(
+            &run_dir,
+            "raw-probe-test",
+            5,
+            128,
+            "ruliad_correctness",
+            &[item],
+            &[completion],
+        )
+        .expect("write records");
+
+        let path = run_dir.join("events/ruliad_completion_samples.jsonl");
+        let contents = std::fs::read_to_string(path).expect("raw completion jsonl");
+        let records = contents.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(records[0]).expect("valid sample json");
+        assert_eq!(
+            record.get("run_id").and_then(|value| value.as_str()),
+            Some("raw-probe-test")
+        );
+        assert_eq!(
+            record.get("probe_name").and_then(|value| value.as_str()),
+            Some("ruliad_correctness")
+        );
+        assert_eq!(
+            record.get("sample_index").and_then(|value| value.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            record
+                .get("expected_answer")
+                .and_then(|value| value.as_str()),
+            Some("ok=1;l=2;r=2")
+        );
+        assert_eq!(
+            record.get("actual_answer").and_then(|value| value.as_str()),
+            Some("ok=1;l=2;r=2")
+        );
+        assert_eq!(
+            record.get("status").and_then(|value| value.as_str()),
+            Some("SemanticMatch")
+        );
+        assert_eq!(
+            record
+                .get("verifier_match")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            record
+                .get("semantic_match")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            record.get("completion").and_then(|value| value.as_str()),
+            Some("!:ok=1;l=2;r=2\n[/R2]\n")
+        );
     }
 
     #[test]

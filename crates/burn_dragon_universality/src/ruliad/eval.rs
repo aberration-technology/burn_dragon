@@ -1010,7 +1010,7 @@ fn ruliad_completion_quality_ppm(completion_body: &str) -> usize {
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<Vec<_>>();
-    if symbols.len() < 48 {
+    if symbols.len() < 16 {
         return SCORE_PPM_DENOMINATOR;
     }
     let period_penalty = max_char_period_fraction(&symbols, 2..=64);
@@ -2291,6 +2291,18 @@ mod tests {
             cyclic.completion_quality_ppm < SCORE_PPM_DENOMINATOR / 2,
             "cyclic completion should have low quality, got {}",
             cyclic.completion_quality_ppm
+        );
+    }
+
+    #[test]
+    fn completion_quality_penalizes_short_answer_loops() {
+        let healthy = extract_ruliad_completion("!:ok=1;l=3;r=3\n[/R2]");
+        let looped = extract_ruliad_completion("!:11:h11:h11:h11:h11:h11:h11:h11:h[/R2]");
+        assert_eq!(healthy.completion_quality_ppm, SCORE_PPM_DENOMINATOR);
+        assert!(
+            looped.completion_quality_ppm < SCORE_PPM_DENOMINATOR / 2,
+            "short periodic answer loops should have low quality, got {}",
+            looped.completion_quality_ppm
         );
     }
 

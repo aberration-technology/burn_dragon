@@ -123,6 +123,39 @@ pub trait TokenSequenceDataset: Send + Sync {
         None
     }
 
+    /// Return concrete source-selected token windows and optional precomputed loss masks for a
+    /// streaming TBPTT chunk. Datasets with document-level target structure can override this to
+    /// avoid deriving masks from an isolated chunk window.
+    fn source_selected_stream_token_windows_with_loss_masks(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        chunk_index_in_document: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        let windows = self.source_selected_stream_token_windows(
+            split,
+            epoch_index,
+            absolute_step,
+            chunk_index_in_document,
+            batch_size,
+            block_size,
+        )?;
+        let masks = self.uses_target_loss_mask().then(|| {
+            windows
+                .iter()
+                .map(|window| {
+                    let mut mask = vec![0; block_size];
+                    self.target_loss_mask_for_window(window, &mut mask);
+                    mask
+                })
+                .collect::<Vec<_>>()
+        });
+        Some((windows, masks))
+    }
+
     /// Feed aggregate loss telemetry for a previously selected source bucket.
     fn record_source_selection_loss(
         &self,
@@ -1256,22 +1289,31 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         #[cfg(not(feature = "train"))]
         let mut sample = vec![0u32; block_size + 1];
         let document_span = self.logical_document_tokens + 1;
-        let reset_stream_state =
-            self.chunk_index_in_document == 0 || self.dataset.uses_target_loss_mask();
+        let reset_stream_state = self.chunk_index_in_document == 0;
 
-        if let Some(source_windows) = self.dataset.source_selected_stream_token_windows(
-            self.split,
-            self.epoch_index,
-            absolute_step,
-            self.chunk_index_in_document,
-            batch_size,
-            block_size,
-        ) {
+        if let Some((source_windows, source_loss_masks)) = self
+            .dataset
+            .source_selected_stream_token_windows_with_loss_masks(
+                self.split,
+                self.epoch_index,
+                absolute_step,
+                self.chunk_index_in_document,
+                batch_size,
+                block_size,
+            )
+        {
             assert_eq!(
                 source_windows.len(),
                 batch_size,
                 "source-selected stream windows must match batch size"
             );
+            if let Some(source_loss_masks) = source_loss_masks.as_ref() {
+                assert_eq!(
+                    source_loss_masks.len(),
+                    batch_size,
+                    "source-selected stream masks must match batch size"
+                );
+            }
             for (batch_idx, window) in source_windows.iter().enumerate() {
                 assert!(
                     window.len() > block_size,
@@ -1282,14 +1324,30 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
                 let mask_row = loss_mask
                     .as_mut()
                     .map(|mask| &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size]);
-                fill_rows_from_window(
-                    self.dataset.as_ref(),
-                    window,
-                    block_size,
-                    input_row,
-                    target_row,
-                    mask_row,
-                );
+                if let Some(mask_row) = mask_row {
+                    for t in 0..block_size {
+                        input_row[t] = window[t] as i64;
+                        target_row[t] = window[t + 1] as i64;
+                    }
+                    if let Some(source_loss_masks) = source_loss_masks.as_ref() {
+                        mask_row.copy_from_slice(
+                            source_loss_masks
+                                .get(batch_idx)
+                                .expect("source-selected stream mask missing row"),
+                        );
+                    } else {
+                        self.dataset.target_loss_mask_for_window(window, mask_row);
+                    }
+                } else {
+                    fill_rows_from_window(
+                        self.dataset.as_ref(),
+                        window,
+                        block_size,
+                        input_row,
+                        target_row,
+                        None,
+                    );
+                }
             }
         } else {
             #[cfg(feature = "train")]

@@ -328,6 +328,37 @@ impl TokenSequenceDataset for Dataset {
         }
     }
 
+    fn source_selected_stream_token_windows_with_loss_masks(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        chunk_index_in_document: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset
+                .source_selected_stream_token_windows_with_loss_masks(
+                    split,
+                    epoch_index,
+                    absolute_step,
+                    chunk_index_in_document,
+                    batch_size,
+                    block_size,
+                ),
+            Dataset::Universality(dataset) => dataset
+                .source_selected_stream_token_windows_with_loss_masks(
+                    split,
+                    epoch_index,
+                    absolute_step,
+                    chunk_index_in_document,
+                    batch_size,
+                    block_size,
+                ),
+        }
+    }
+
     fn record_source_selection_loss(
         &self,
         absolute_step: usize,

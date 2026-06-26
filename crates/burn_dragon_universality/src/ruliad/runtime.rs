@@ -12,8 +12,7 @@ use crate::ruliad::eval::RuliadEvalItem;
 use crate::ruliad::oracles::{
     GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
     compact_ruliad_label, default_proof_tasks, generate_sample, generate_sample_for_source_bucket,
-    load_proof_tasks, ruliad_answer_contract, ruliad_answer_values, ruliad_expected_answer,
-    ruliad_prompt_prefix,
+    load_proof_tasks, ruliad_answer_contract, ruliad_expected_answer, ruliad_prompt_prefix,
 };
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::search::RuliadSamplerCandidate;
@@ -563,7 +562,7 @@ fn multi_chunk_proof_tree_text(samples: &[GeneratedRuliadSample]) -> String {
         "?:root {}\nA:{}\n!:{}\n[/R2]\n",
         compact_runtime_text(root_view.query.as_str(), 96),
         ruliad_answer_contract(&root.spec),
-        compact_runtime_text(&ruliad_answer_values(&root.spec), 96)
+        compact_runtime_text(&ruliad_expected_answer(&root.spec), 96)
     ));
     text
 }
@@ -839,6 +838,19 @@ mod tests {
         assert!(
             doc.serialized_preview.find("\nA:") < doc.serialized_preview.find("\n!:"),
             "multi-chunk root answer-key contract must precede the answer slot"
+        );
+        let answer_line = doc
+            .serialized_preview
+            .lines()
+            .find(|line| line.starts_with("!:"))
+            .expect("multi-chunk document answer line");
+        assert_eq!(
+            answer_line,
+            format!(
+                "!:{}",
+                compact_runtime_text(&ruliad_expected_answer(&doc.spec), 96)
+            ),
+            "multi-chunk root answer slot must train the full keyed expected answer"
         );
         assert!(doc.serialized_preview.contains("[/R2]"));
     }

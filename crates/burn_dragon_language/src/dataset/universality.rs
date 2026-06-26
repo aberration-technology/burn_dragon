@@ -21,7 +21,7 @@ use super::prepared_chunks::{ChunkRuntimeCache, load_cached_chunk_from_mutex, mm
 use super::scheduler::{
     RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, TokenSequenceDataset,
 };
-use crate::config::RuliadSupervisionConfig;
+use crate::config::{RuliadSupervisionConfig, RuliadSupervisionMode};
 use crate::summary_events::summary_event_mask_tensor;
 use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
 
@@ -1898,7 +1898,10 @@ impl TokenSequenceDataset for UniversalityDataset {
                     chunk_index_in_document,
                     batch_size,
                     block_size,
-                    self.ruliad_answer_completion_active(split, epoch_index, absolute_step),
+                    matches!(
+                        self.ruliad_supervision.mode,
+                        RuliadSupervisionMode::AnswerWindow
+                    ),
                 ),
             (DatasetSplit::Val, UniversalityStorage::OnTheFly(storage)) => storage
                 .source_selected_stream_token_windows(
@@ -1908,7 +1911,52 @@ impl TokenSequenceDataset for UniversalityDataset {
                     chunk_index_in_document,
                     batch_size,
                     block_size,
-                    self.ruliad_answer_completion_active(split, epoch_index, absolute_step),
+                    matches!(
+                        self.ruliad_supervision.mode,
+                        RuliadSupervisionMode::AnswerWindow
+                    ),
+                ),
+            _ => None,
+        }
+    }
+
+    fn source_selected_stream_token_windows_with_loss_masks(
+        &self,
+        split: DatasetSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        chunk_index_in_document: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        match (split, &self.storage) {
+            (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_stream_token_windows_with_loss_masks(
+                    burn_dragon_universality::SampleSplit::Train,
+                    epoch_index,
+                    absolute_step,
+                    chunk_index_in_document,
+                    batch_size,
+                    block_size,
+                    matches!(
+                        self.ruliad_supervision.mode,
+                        RuliadSupervisionMode::AnswerWindow
+                    ),
+                    self.ruliad_supervision,
+                ),
+            (DatasetSplit::Val, UniversalityStorage::OnTheFly(storage)) => storage
+                .source_selected_stream_token_windows_with_loss_masks(
+                    burn_dragon_universality::SampleSplit::Validation,
+                    epoch_index,
+                    absolute_step,
+                    chunk_index_in_document,
+                    batch_size,
+                    block_size,
+                    matches!(
+                        self.ruliad_supervision.mode,
+                        RuliadSupervisionMode::AnswerWindow
+                    ),
+                    self.ruliad_supervision,
                 ),
             _ => None,
         }
@@ -2199,6 +2247,67 @@ impl OnTheFlyStorage {
             chunk_index_in_document,
             prefer_answer_window,
         ))
+    }
+
+    fn source_selected_stream_token_windows_with_loss_masks(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        epoch_index: usize,
+        absolute_step: usize,
+        chunk_index_in_document: usize,
+        batch_size: usize,
+        block_size: usize,
+        prefer_answer_window: bool,
+        supervision: RuliadSupervisionConfig,
+    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+        let source_selection = self.source_selection.as_ref()?;
+        let selection_step =
+            absolute_step.saturating_sub(chunk_index_in_document.min(absolute_step));
+        let bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train => source_selection
+                .choose_bucket_label_for_stream_step(epoch_index, selection_step, absolute_step)?,
+            burn_dragon_universality::SampleSplit::Validation => source_selection
+                .choose_bucket_label_for_validation_step(epoch_index, selection_step)?,
+        };
+        let documents = self.generate_source_bucket_documents(
+            split,
+            epoch_index,
+            selection_step,
+            &bucket_label,
+            batch_size.max(1),
+        );
+        let windows = source_selected_stream_windows_from_documents(
+            &documents,
+            self.corpus.eos_id(),
+            epoch_index,
+            absolute_step,
+            batch_size,
+            block_size,
+            chunk_index_in_document,
+            prefer_answer_window,
+        );
+        let masks = supervision.uses_target_loss_mask().then(|| {
+            if prefer_answer_window {
+                windows
+                    .iter()
+                    .map(|window| {
+                        let mut mask = vec![0; block_size];
+                        ruliad_target_loss_mask(window, &mut mask, supervision);
+                        mask
+                    })
+                    .collect()
+            } else {
+                source_selected_stream_loss_masks_from_documents(
+                    &documents,
+                    self.corpus.eos_id(),
+                    batch_size,
+                    block_size,
+                    chunk_index_in_document,
+                    supervision,
+                )
+            }
+        });
+        Some((windows, masks))
     }
 
     fn source_weighted_validation_documents(
@@ -2755,6 +2864,63 @@ fn source_selected_stream_windows_from_documents(
             window
         })
         .collect()
+}
+
+fn source_selected_stream_loss_masks_from_documents(
+    documents: &[Arc<Vec<u32>>],
+    eos_id: Option<u32>,
+    batch_size: usize,
+    block_size: usize,
+    chunk_index_in_document: usize,
+    supervision: RuliadSupervisionConfig,
+) -> Vec<Vec<i64>> {
+    if documents.is_empty() {
+        return Vec::new();
+    }
+    let start = chunk_index_in_document.saturating_mul(block_size);
+    (0..batch_size)
+        .map(|batch_index| {
+            let document = documents
+                .get(batch_index % documents.len())
+                .expect("source-selected stream document set must be non-empty");
+            let usable_len = valid_document_token_count(document, eos_id);
+            let mut mask = vec![0; block_size];
+            ruliad_target_loss_mask_for_document_range(
+                document,
+                usable_len,
+                start,
+                block_size,
+                &mut mask,
+                supervision,
+            );
+            mask
+        })
+        .collect()
+}
+
+fn ruliad_target_loss_mask_for_document_range(
+    document: &[u32],
+    usable_len: usize,
+    start: usize,
+    block_size: usize,
+    mask: &mut [i64],
+    supervision: RuliadSupervisionConfig,
+) -> bool {
+    mask.fill(0);
+    let usable_len = usable_len.min(document.len());
+    if usable_len < 2 || block_size == 0 {
+        return false;
+    }
+    let mut document_mask = vec![0; usable_len - 1];
+    if !ruliad_target_loss_mask(&document[..usable_len], &mut document_mask, supervision) {
+        return false;
+    }
+    for (offset, slot) in mask.iter_mut().take(block_size).enumerate() {
+        if let Some(value) = document_mask.get(start.saturating_add(offset)) {
+            *slot = *value;
+        }
+    }
+    mask.iter().any(|value| *value != 0)
 }
 
 fn valid_document_token_count(document: &[u32], eos_id: Option<u32>) -> usize {
@@ -3334,6 +3500,31 @@ mod tests {
         let mut config = fixed_ruliad_runtime_config();
         config.source_selection.enabled = true;
         config
+    }
+
+    fn masked_ascii_targets(targets: &[i64], mask: &[i64]) -> String {
+        targets
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(target, mask)| {
+                (*mask == 1 && (0..=255).contains(target)).then_some(*target as u8 as char)
+            })
+            .collect()
+    }
+
+    fn masked_ruliad_target_text(
+        dataset: &crate::dataset::Dataset,
+        targets: &[i64],
+        mask: &[i64],
+    ) -> String {
+        let masked_tokens = targets
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(target, mask)| (*mask == 1).then_some(*target))
+            .collect::<Vec<_>>();
+        dataset
+            .decode_ruliad_payload_tokens(&masked_tokens, true)
+            .unwrap_or_else(|| masked_ascii_targets(targets, mask))
     }
 
     #[test]
@@ -4306,12 +4497,18 @@ mod tests {
     }
 
     #[test]
-    fn live_ruliad_answer_completion_streaming_resets_and_masks_answer_windows() {
+    fn live_ruliad_answer_completion_streaming_preserves_context_state_and_masks_answers() {
         type TestBackend = NdArray<f32>;
 
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("ruliad-live.toml");
-        let config = live_ruliad_runtime_config();
+        let mut config = live_ruliad_runtime_config();
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::Simulation,
+            weight: 1,
+            width: Some(burn_dragon_universality::UsizeRangeConfig { min: 12, max: 12 }),
+            steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+        }];
         fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
             .expect("write config");
 
@@ -4333,9 +4530,9 @@ mod tests {
             Arc::clone(&wrapped),
             DatasetSplit::Train,
             &device,
-            4,
-            Some(4),
-            Some(64),
+            16,
+            Some(16),
+            Some(512),
             1337,
         );
         let mut iter = loader.iter();
@@ -4346,10 +4543,19 @@ mod tests {
         assert_eq!(second.inputs.shape().dims::<2>(), [2, 32]);
         assert!(first.reset_stream_state);
         assert!(
-            second.reset_stream_state,
-            "answer-completion streaming samples independent answer windows and must reset state"
+            !second.reset_stream_state,
+            "answer-completion masks should not force recurrent state resets"
         );
-        for (label, batch) in [("first", first), ("second", second)] {
+        let mut batches = vec![("first".to_string(), first), ("second".to_string(), second)];
+        batches.extend(
+            iter.take(14)
+                .enumerate()
+                .map(|(index, batch)| (format!("later-{index}"), batch)),
+        );
+        let mut saw_context_only_chunk = false;
+        let mut answer_mask_rows = 0usize;
+        let mut supervised_examples = Vec::new();
+        for (_label, batch) in batches {
             let targets = batch
                 .targets
                 .to_data()
@@ -4363,22 +4569,64 @@ mod tests {
                 .convert::<i64>()
                 .into_vec::<i64>()
                 .expect("loss mask");
-            assert!(
-                mask.iter().any(|value| *value == 1),
-                "{label} answer-completion stream window should expose trainable answer targets"
-            );
-            assert!(
-                targets
-                    .iter()
-                    .zip(mask.iter())
-                    .any(|(target, mask)| *mask == 1 && *target != 0),
-                "{label} masked targets should point at non-padding answer tokens"
-            );
+            let supervised = masked_ruliad_target_text(wrapped.as_ref(), &targets, &mask);
+            if mask.iter().all(|value| *value == 0) {
+                saw_context_only_chunk = true;
+            }
+            if mask.iter().any(|value| *value == 1) {
+                answer_mask_rows = answer_mask_rows.saturating_add(1);
+                if supervised_examples.len() < 4 {
+                    supervised_examples.push(supervised.clone());
+                }
+            }
         }
+        assert!(
+            saw_context_only_chunk,
+            "streaming answer-completion should preserve prompt/proof context chunks before the answer"
+        );
+        assert!(
+            answer_mask_rows > 0,
+            "streaming answer-completion should eventually supervise natural answer targets; supervised_examples={supervised_examples:?}"
+        );
     }
 
     #[test]
-    fn live_ruliad_answer_completion_profile_sized_streaming_masks_every_row() {
+    fn ruliad_document_range_loss_mask_preserves_answer_schema_across_chunk_boundaries() {
+        let document = b"?:q\n!:ok=1\n[/R2]\n"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let supervision = RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            ..Default::default()
+        };
+        let mut supervised = String::new();
+        for start in (0..document.len()).step_by(3) {
+            let mut mask = vec![0; 3];
+            ruliad_target_loss_mask_for_document_range(
+                &document,
+                document.len(),
+                start,
+                3,
+                &mut mask,
+                supervision,
+            );
+            let targets = (0..3)
+                .filter_map(|offset| document.get(start + offset + 1).copied())
+                .collect::<Vec<_>>();
+            supervised.push_str(
+                &targets
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(target, mask)| (*mask == 1).then_some(*target as u8 as char))
+                    .collect::<String>(),
+            );
+        }
+        assert_eq!(supervised, "ok=1\n[/R2]");
+    }
+
+    #[test]
+    fn live_ruliad_answer_completion_profile_sized_streaming_masks_natural_answer_chunks() {
         type TestBackend = NdArray<f32>;
 
         let dir = tempdir().expect("tempdir");
@@ -4423,8 +4671,14 @@ mod tests {
             Some(512),
             1337,
         );
+        let mut context_only_rows = 0usize;
+        let mut answer_rows = 0usize;
         for (step, batch) in loader.iter().take(20).enumerate() {
-            assert!(batch.reset_stream_state, "step {step} must reset state");
+            assert_eq!(
+                batch.reset_stream_state,
+                step % 4 == 0,
+                "step {step} should reset only at logical document boundaries"
+            );
             let inputs = batch
                 .inputs
                 .to_data()
@@ -4450,12 +4704,27 @@ mod tests {
                 let target_row = &targets[row * 128..(row + 1) * 128];
                 let mut window = input_row.to_vec();
                 window.push(target_row[127]);
-                assert!(
-                    mask_row.iter().any(|value| *value == 1),
-                    "step {step} row {row} should expose trainable answer targets: {window:?}"
-                );
+                if mask_row.iter().any(|value| *value == 1) {
+                    answer_rows = answer_rows.saturating_add(1);
+                    let window_u32 = window.iter().map(|token| *token as u32).collect::<Vec<_>>();
+                    let mut expected_mask = vec![0; 128];
+                    assert!(
+                        ruliad_answer_target_loss_mask(&window_u32, &mut expected_mask),
+                        "step {step} row {row} answer mask should match the natural streamed window: {window:?}"
+                    );
+                } else {
+                    context_only_rows = context_only_rows.saturating_add(1);
+                }
             }
         }
+        assert!(
+            context_only_rows > 0,
+            "profile-sized answer-completion stream should include unmasked context rows"
+        );
+        assert!(
+            answer_rows > 0,
+            "profile-sized answer-completion stream should include natural answer rows"
+        );
     }
 
     #[test]

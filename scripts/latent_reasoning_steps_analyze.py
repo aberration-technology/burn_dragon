@@ -80,8 +80,24 @@ SUMMARY_COLUMNS = [
     "capability_completion_auc",
     "capability_schema_wrong_auc",
     "capability_malformed_auc",
+    "capability_score_first",
+    "capability_score_last",
+    "capability_score_best",
+    "capability_score_drop_from_best",
+    "capability_verifier_best",
+    "capability_verifier_drop_from_best",
+    "capability_completion_best",
+    "capability_completion_drop_from_best",
     "capability_bucket_mastered_count",
     "capability_bucket_lagging_count",
+    "dynamics_control_count",
+    "stable_control_count",
+    "recovery_control_count",
+    "recovery_control_fraction",
+    "rollback_control_count",
+    "hard_recovery_control_count",
+    "capability_quality_recovery_count",
+    "capability_gate_failed_count",
     "eval_step_sweep",
     "best_eval_steps",
     "best_eval_verifier",
@@ -276,6 +292,44 @@ def count_gates(events: list[dict[str, Any]]) -> tuple[int, int]:
     return gate_count, fatal_count
 
 
+def dynamics_and_gate_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    recovery_modes = {
+        "plasticity_recovery",
+        "validation_recovery",
+        "rollback_recovery",
+        "hard_recovery",
+        "hard_collapse",
+    }
+    controls = [
+        str(event.get("mode") or "").lower()
+        for event in events
+        if event.get("type") == "dynamics_control"
+    ]
+    recovery_count = sum(1 for mode in controls if mode in recovery_modes)
+    control_count = len(controls)
+    gate_names = [
+        str(event.get("gate") or "")
+        for event in events
+        if event.get("type") in {"gate", "training_gate"}
+    ]
+    return {
+        "dynamics_control_count": control_count,
+        "stable_control_count": sum(1 for mode in controls if mode == "stable"),
+        "recovery_control_count": recovery_count,
+        "recovery_control_fraction": (
+            recovery_count / control_count if control_count > 0 else 0.0
+        ),
+        "rollback_control_count": sum(1 for mode in controls if mode == "rollback_recovery"),
+        "hard_recovery_control_count": sum(
+            1 for mode in controls if mode in {"hard_recovery", "hard_collapse"}
+        ),
+        "capability_quality_recovery_count": gate_names.count(
+            "continual_learning_capability_quality_recovery"
+        ),
+        "capability_gate_failed_count": gate_names.count("ruliad_capability_gate_failed"),
+    }
+
+
 def last_source_selection(run_dir: Path) -> dict[str, Any] | None:
     source_events = read_jsonl(run_dir / "events" / "source_selection.jsonl")
     if source_events:
@@ -410,7 +464,21 @@ def capability_probe_summary(run_dir: Path, events: list[dict[str, Any]]) -> dic
     first_epoch, first_step = capability_first_pass(events)
     scored = [(capability_score_from_probe(row), row) for row in probes]
     best_score, best = max(scored, key=lambda item: item[0])
+    first_score = scored[0][0]
+    last_score = scored[-1][0]
     latest = probes[-1]
+    verifier_values = [
+        value for value in (finite(row.get("verifier_rate")) for row in probes) if value is not None
+    ]
+    completion_values = [
+        value
+        for value in (finite(row.get("completion_health_rate")) for row in probes)
+        if value is not None
+    ]
+    verifier_last = verifier_values[-1] if verifier_values else None
+    verifier_best = max(verifier_values) if verifier_values else None
+    completion_last = completion_values[-1] if completion_values else None
+    completion_best = max(completion_values) if completion_values else None
     buckets = latest.get("group_buckets") or []
     mastered = 0
     lagging = 0
@@ -440,6 +508,22 @@ def capability_probe_summary(run_dir: Path, events: list[dict[str, Any]]) -> dic
         "capability_completion_auc": mean_auc(probes, "completion_health_rate"),
         "capability_schema_wrong_auc": mean_auc(probes, "schema_valid_wrong_rate"),
         "capability_malformed_auc": mean_auc(probes, "malformed_rate"),
+        "capability_score_first": first_score,
+        "capability_score_last": last_score,
+        "capability_score_best": best_score,
+        "capability_score_drop_from_best": max(0.0, best_score - last_score),
+        "capability_verifier_best": verifier_best,
+        "capability_verifier_drop_from_best": (
+            max(0.0, verifier_best - verifier_last)
+            if verifier_best is not None and verifier_last is not None
+            else None
+        ),
+        "capability_completion_best": completion_best,
+        "capability_completion_drop_from_best": (
+            max(0.0, completion_best - completion_last)
+            if completion_best is not None and completion_last is not None
+            else None
+        ),
         "capability_bucket_mastered_count": mastered,
         "capability_bucket_lagging_count": lagging,
     }
@@ -467,6 +551,11 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     completion_repetition = finite(row.get("completion_repetition_last"))
     capability_passed = finite(row.get("capability_gate_passed_last"))
     capability_failures = finite(row.get("capability_gate_failure_count_last")) or 0.0
+    capability_score_drop = finite(row.get("capability_score_drop_from_best")) or 0.0
+    capability_verifier_drop = finite(row.get("capability_verifier_drop_from_best")) or 0.0
+    capability_completion_drop = finite(row.get("capability_completion_drop_from_best")) or 0.0
+    recovery_fraction = finite(row.get("recovery_control_fraction")) or 0.0
+    quality_recoveries = finite(row.get("capability_quality_recovery_count")) or 0.0
     score += (
         verifier * 6.0
         + semantic * 3.0
@@ -484,6 +573,11 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     score -= capability_failures * 0.5
     if capability_passed == 0.0:
         score -= 2.0
+    score -= min(3.0, capability_score_drop)
+    score -= capability_verifier_drop * 4.0
+    score -= capability_completion_drop * 2.0
+    score -= min(2.0, recovery_fraction * 2.0)
+    score -= min(1.0, quality_recoveries * 0.25)
     entropy = finite(row.get("output_entropy_bits_last"))
     distinct2 = finite(row.get("output_distinct_2_last"))
     repetition = finite(row.get("output_repetition_last"))
@@ -517,6 +611,10 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
         and (completion_distinct2 is None or completion_distinct2 >= 0.20)
         and (completion_period is None or completion_period <= 0.70)
         and (completion_repetition is None or completion_repetition <= 0.70)
+        and capability_score_drop <= 1.0
+        and capability_verifier_drop <= 0.125
+        and capability_completion_drop <= 0.30
+        and recovery_fraction <= 0.50
     )
     return healthy, score
 
@@ -655,6 +753,7 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
     row.update(latent_energy_eval_metrics(events, manifest.get("max_steps")))
     row.update(eval_summary)
     row.update(capability_probe_summary(run_dir, events))
+    row.update(dynamics_and_gate_summary(events))
     healthy, score = health_and_score(row)
     row["healthy"] = healthy
     row["rank_score"] = score
@@ -682,8 +781,8 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
     rank_rows = sorted(rows, key=lambda row: finite(row.get("rank_score")) or -1e9, reverse=True)
     with md_path.open("w") as handle:
         handle.write("# Latent Reasoning Max Steps Ablation\n\n")
-        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | verifier | semantic | partial | schema wrong | malformed | field | term | completion | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | lag buckets | best eval steps | best eval verifier | energy comps | step comps | out H | out d2 | gpu util | score |\n")
-        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | verifier | semantic | partial | schema wrong | malformed | field | term | completion | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | cap drop | rec frac | q rec | lag buckets | best eval steps | best eval verifier | energy comps | step comps | out H | out d2 | gpu util | score |\n")
+        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for row in rank_rows:
             handle.write(
                 "| "
@@ -708,6 +807,9 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("capability_gate_failure_count_last")),
                         fmt(row.get("capability_first_pass_epoch")),
                         fmt(row.get("capability_score_auc")),
+                        fmt(row.get("capability_score_drop_from_best")),
+                        fmt(row.get("recovery_control_fraction")),
+                        fmt(row.get("capability_quality_recovery_count")),
                         fmt(row.get("capability_bucket_lagging_count")),
                         fmt(row.get("best_eval_steps")),
                         fmt(row.get("best_eval_verifier")),

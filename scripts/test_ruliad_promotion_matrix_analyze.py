@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).with_name("ruliad_promotion_matrix_analyze.py")
@@ -117,6 +118,79 @@ class RawCompletionSampleTests(unittest.TestCase):
 
         self.assertEqual(set(summary), set(ANALYZE.RAW_COMPLETION_METRIC_COLUMNS))
         self.assertTrue(all(value is None for value in summary.values()))
+
+
+class PromotionGateTests(unittest.TestCase):
+    def test_capability_drop_rejects_candidate(self) -> None:
+        args = SimpleNamespace(
+            baseline_arm="baseline",
+            max_valid_ce_delta=0.15,
+            max_source_difficulty_delta=0.75,
+            max_verifier_regression=0.03125,
+            max_schema_wrong_delta=0.10,
+            max_malformed_delta=0.05,
+            max_completion_regression=0.10,
+            max_answer_field_regression=0.05,
+            max_answer_termination_regression=0.10,
+            min_completion_distinct_2=0.20,
+            max_completion_period=0.70,
+            max_completion_repetition=0.70,
+            min_output_entropy=0.25,
+            min_output_distinct_2=0.10,
+            min_throughput_ratio=0.85,
+            max_capability_score_drop=1.0,
+            max_verifier_drop_from_best=0.125,
+            max_completion_drop_from_best=0.30,
+            max_recovery_control_fraction=0.50,
+            max_policy_advantage_clip_fraction=0.95,
+            min_raw_completion_quality=0.20,
+            min_raw_completion_answer_distinct=0.20,
+        )
+        shared = {
+            "trials": 1,
+            "ok_trials": 1,
+            "stage_model_tokens_per_sec_mean": 1000.0,
+            "valid_teacher_ce_last_mean": 1.0,
+            "source_mean_difficulty_last_mean": 5.0,
+            "ruliad_verifier_last_mean": 0.25,
+            "ruliad_partial_last_mean": 0.5,
+            "ruliad_schema_wrong_last_mean": 0.0,
+            "ruliad_malformed_last_mean": 0.0,
+            "ruliad_answer_field_accuracy_last_mean": 0.8,
+            "ruliad_answer_termination_rate_last_mean": 0.9,
+            "completion_health_last_mean": 0.8,
+            "completion_distinct_2_last_mean": 0.5,
+            "completion_period_2_to_64_last_mean": 0.0,
+            "completion_repetition_last_mean": 0.0,
+            "raw_completion_quality_mean_mean": 0.8,
+            "raw_completion_actual_answer_distinct_fraction_mean": 0.8,
+            "policy_completion_rows_mean": 0.0,
+            "policy_advantage_clip_fraction_mean": 0.0,
+            "policy_update_skipped_count_mean": 0.0,
+            "output_entropy_bits_last_mean": 2.0,
+            "output_distinct_2_last_mean": 0.5,
+            "fatal_gate_count_mean": 0.0,
+            "capability_score_drop_from_best_mean": 0.0,
+            "capability_verifier_drop_from_best_mean": 0.0,
+            "capability_completion_drop_from_best_mean": 0.0,
+            "recovery_control_fraction_mean": 0.0,
+        }
+        rows = [
+            {"arm": "baseline", **shared},
+            {
+                "arm": "candidate",
+                **shared,
+                "capability_score_drop_from_best_mean": 1.5,
+                "capability_verifier_drop_from_best_mean": 0.2,
+            },
+        ]
+
+        gated = ANALYZE.add_gate_decisions(rows, args)
+        candidate = next(row for row in gated if row["arm"] == "candidate")
+
+        self.assertEqual(candidate["decision"], "reject")
+        self.assertIn("capability_score_drop", candidate["fail_reasons"])
+        self.assertIn("verifier_drop_from_best", candidate["fail_reasons"])
 
 
 if __name__ == "__main__":

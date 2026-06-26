@@ -37,7 +37,13 @@ METRIC_COLUMNS = [
     "completion_repetition_last",
     "capability_score_auc",
     "capability_verifier_auc",
+    "capability_score_drop_from_best",
+    "capability_verifier_drop_from_best",
+    "capability_completion_drop_from_best",
     "capability_bucket_lagging_count",
+    "recovery_control_fraction",
+    "capability_quality_recovery_count",
+    "capability_gate_failed_count",
     "output_entropy_bits_last",
     "output_distinct_2_last",
     "output_repetition_last",
@@ -115,6 +121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-entropy", type=float, default=0.25)
     parser.add_argument("--min-output-distinct-2", type=float, default=0.10)
     parser.add_argument("--min-throughput-ratio", type=float, default=0.85)
+    parser.add_argument("--max-capability-score-drop", type=float, default=1.0)
+    parser.add_argument("--max-verifier-drop-from-best", type=float, default=0.125)
+    parser.add_argument("--max-completion-drop-from-best", type=float, default=0.30)
+    parser.add_argument("--max-recovery-control-fraction", type=float, default=0.50)
     parser.add_argument("--max-policy-advantage-clip-fraction", type=float, default=0.95)
     parser.add_argument("--min-raw-completion-quality", type=float, default=0.20)
     parser.add_argument("--min-raw-completion-answer-distinct", type=float, default=0.20)
@@ -372,10 +382,15 @@ def summarize_by_arm(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for arm in sorted({str(row.get("arm") or "") for row in rows}):
         arm_rows = [row for row in rows if row.get("arm") == arm]
         ok_rows = [row for row in arm_rows if row.get("status") == "ok"]
+        healthy_values = [
+            1.0 if str(row.get("healthy") or "").lower() == "true" else 0.0
+            for row in ok_rows
+        ]
         summary: dict[str, Any] = {
             "arm": arm,
             "trials": len(arm_rows),
             "ok_trials": len(ok_rows),
+            "healthy_trial_fraction": mean(healthy_values),
         }
         for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS + RAW_COMPLETION_METRIC_COLUMNS:
             clean = [value for value in (finite(row.get(column)) for row in ok_rows) if value is not None]
@@ -423,6 +438,14 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         completion_distinct2 = value(row, "completion_distinct_2_last_mean", 1.0)
         completion_period = value(row, "completion_period_2_to_64_last_mean", 0.0)
         completion_repetition = value(row, "completion_repetition_last_mean", 0.0)
+        capability_score_drop = value(row, "capability_score_drop_from_best_mean", 0.0)
+        verifier_drop_from_best = value(
+            row, "capability_verifier_drop_from_best_mean", 0.0
+        )
+        completion_drop_from_best = value(
+            row, "capability_completion_drop_from_best_mean", 0.0
+        )
+        recovery_control_fraction = value(row, "recovery_control_fraction_mean", 0.0)
         raw_completion_quality = value(row, "raw_completion_quality_mean_mean", 1.0)
         raw_completion_answer_distinct = value(
             row,
@@ -434,6 +457,7 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         policy_skipped = value(row, "policy_update_skipped_count_mean", 0.0)
         entropy = value(row, "output_entropy_bits_last_mean", 0.0)
         distinct2 = value(row, "output_distinct_2_last_mean", 0.0)
+        healthy_fraction = value(row, "healthy_trial_fraction", 1.0)
         throughput_ratio = model_tps / base_model_tps if base_model_tps > 0.0 else 0.0
         valid_delta = valid - base_valid
         source_delta = source - base_source
@@ -451,6 +475,8 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         reasons: list[str] = []
         if int(row.get("ok_trials") or 0) < int(row.get("trials") or 0):
             reasons.append("failed_trials")
+        if healthy_fraction < 1.0:
+            reasons.append("unhealthy_trials")
         if fatal_gate_count > 0.0:
             reasons.append("fatal_gates")
         if throughput_ratio < args.min_throughput_ratio:
@@ -477,6 +503,14 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             reasons.append("completion_period_collapse")
         if completion_repetition > args.max_completion_repetition:
             reasons.append("completion_repetition_collapse")
+        if capability_score_drop > args.max_capability_score_drop:
+            reasons.append("capability_score_drop")
+        if verifier_drop_from_best > args.max_verifier_drop_from_best:
+            reasons.append("verifier_drop_from_best")
+        if completion_drop_from_best > args.max_completion_drop_from_best:
+            reasons.append("completion_drop_from_best")
+        if recovery_control_fraction > args.max_recovery_control_fraction:
+            reasons.append("recovery_thrash")
         if raw_completion_quality < args.min_raw_completion_quality:
             reasons.append("raw_completion_quality_collapse")
         if raw_completion_answer_distinct < args.min_raw_completion_answer_distinct:
@@ -502,6 +536,11 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             + (throughput_ratio - 1.0) * 0.50
             + entropy_delta * 0.05
             + distinct2_delta * 0.5
+            - (1.0 - healthy_fraction) * 2.0
+            - capability_score_drop
+            - verifier_drop_from_best * 4.0
+            - completion_drop_from_best * 2.0
+            - recovery_control_fraction
         )
         if arm == args.baseline_arm:
             decision = "control"
@@ -553,8 +592,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | raw q | raw distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | healthy | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | cap drop | rec frac | q rec | raw q | raw distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -563,6 +602,7 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         str(row.get("arm") or ""),
                         str(row.get("decision") or ""),
                         f"{row.get('ok_trials', 0)}/{row.get('trials', 0)}",
+                        fmt(row.get("healthy_trial_fraction")),
                         fmt(row.get("elapsed_seconds_mean")),
                         fmt(row.get("peak_used_mb_mean")),
                         fmt(row.get("stage_model_tokens_per_sec_mean")),
@@ -581,6 +621,9 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("answer_termination_delta")),
                         fmt(row.get("completion_health_last_mean")),
                         fmt(row.get("completion_delta")),
+                        fmt(row.get("capability_score_drop_from_best_mean")),
+                        fmt(row.get("recovery_control_fraction_mean")),
+                        fmt(row.get("capability_quality_recovery_count_mean")),
                         fmt(row.get("raw_completion_quality_mean_mean")),
                         fmt(row.get("raw_completion_actual_answer_distinct_fraction_mean")),
                         fmt(row.get("completion_distinct_2_last_mean")),
@@ -614,7 +657,14 @@ def main() -> None:
     arms = summarize_by_arm(trials)
     gated = add_gate_decisions(arms, args)
     arm_fields = (
-        ["arm", "decision", "fail_reasons", "trials", "ok_trials"]
+        [
+            "arm",
+            "decision",
+            "fail_reasons",
+            "trials",
+            "ok_trials",
+            "healthy_trial_fraction",
+        ]
         + [
             f"{column}_mean"
             for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS + RAW_COMPLETION_METRIC_COLUMNS

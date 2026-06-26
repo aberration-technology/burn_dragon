@@ -1902,6 +1902,16 @@ impl TrainingConfig {
                     "training.ruliad_supervision.verifier_reward.max_advantage_clip_fraction must be finite and in [0, 1] when set"
                 ));
             }
+            if verifier_reward.positive_advantage_min_partial_progress_ppm > 1_000_000 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.positive_advantage_min_partial_progress_ppm must be <= 1000000"
+                ));
+            }
+            if verifier_reward.positive_advantage_min_completion_quality_ppm > 1_000_000 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.positive_advantage_min_completion_quality_ppm must be <= 1000000"
+                ));
+            }
             if !verifier_reward.advantage_epsilon.is_finite()
                 || verifier_reward.advantage_epsilon <= 0.0
             {
@@ -3388,6 +3398,29 @@ start_policy = "capability_gate"
                 .verifier_reward
                 .vpo_compactness_max_weight
                 <= 0.05
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .positive_advantage_requires_correctness
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .positive_advantage_min_partial_progress_ppm
+                >= 500_000
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .positive_advantage_min_completion_quality_ppm
+                >= 750_000
         );
         assert_eq!(
             config

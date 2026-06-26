@@ -23,7 +23,7 @@ use crate::stats::SampleStats;
 
 pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 1;
 pub const RULIAD_EVAL_REPORT_VERSION: u32 = 3;
-pub const RULIAD_REASONING_SCORE_VERSION: u32 = 1;
+pub const RULIAD_REASONING_SCORE_VERSION: u32 = 2;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
 const SCORE_PPM_DENOMINATOR: usize = 1_000_000;
@@ -283,6 +283,8 @@ pub struct RuliadReasoningScore {
     pub hash_canary: bool,
     #[serde(default)]
     pub answer_terminated: bool,
+    #[serde(default = "default_completion_quality_ppm")]
+    pub completion_quality_ppm: usize,
 }
 
 impl RuliadReasoningScore {
@@ -457,11 +459,11 @@ pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVeri
     let schema_quality = match score.status {
         RuliadAnswerStatus::VerifierMatch
         | RuliadAnswerStatus::SemanticMatch
-        | RuliadAnswerStatus::Partial
-        | RuliadAnswerStatus::SchemaValidWrong => 1.0,
+        | RuliadAnswerStatus::Partial => 1.0,
+        RuliadAnswerStatus::SchemaValidWrong => 0.25,
         RuliadAnswerStatus::Malformed | RuliadAnswerStatus::Missing => 0.0,
     };
-    let completion_health = match score.status {
+    let raw_completion_health = match score.status {
         RuliadAnswerStatus::VerifierMatch
         | RuliadAnswerStatus::SemanticMatch
         | RuliadAnswerStatus::Partial => 1.0,
@@ -469,6 +471,9 @@ pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVeri
         | RuliadAnswerStatus::Malformed
         | RuliadAnswerStatus::Missing => 0.0,
     };
+    let completion_quality = score.completion_quality_ppm.min(SCORE_PPM_DENOMINATOR) as f32
+        / SCORE_PPM_DENOMINATOR as f32;
+    let completion_health = raw_completion_health * completion_quality;
     let has_correctness_signal = matches!(
         score.status,
         RuliadAnswerStatus::VerifierMatch
@@ -484,7 +489,7 @@ pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVeri
     {
         0.0
     } else {
-        1.0 / (score.generated_token_count as f32).sqrt()
+        completion_quality / (score.generated_token_count as f32).sqrt()
     };
     RuliadVerifierRewardVector {
         verifier_match: if score.status == RuliadAnswerStatus::VerifierMatch {
@@ -573,6 +578,12 @@ pub struct RuliadExtractedCompletion {
     pub generated_token_count: usize,
     #[serde(default)]
     pub answer_terminated: bool,
+    #[serde(default = "default_completion_quality_ppm")]
+    pub completion_quality_ppm: usize,
+}
+
+fn default_completion_quality_ppm() -> usize {
+    SCORE_PPM_DENOMINATOR
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -983,7 +994,65 @@ pub fn extract_ruliad_completion(completion: &str) -> RuliadExtractedCompletion 
         certificate_lines,
         generated_token_count: completion_body.split_whitespace().count(),
         answer_terminated,
+        completion_quality_ppm: ruliad_completion_quality_ppm(completion_body),
     }
+}
+
+fn ruliad_completion_quality_ppm(completion_body: &str) -> usize {
+    let body = completion_body
+        .split("[/R2]")
+        .next()
+        .unwrap_or_default()
+        .split("[/RTREE]")
+        .next()
+        .unwrap_or_default();
+    let symbols = body
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    if symbols.len() < 48 {
+        return SCORE_PPM_DENOMINATOR;
+    }
+    let period_penalty = max_char_period_fraction(&symbols, 2..=64);
+    let line_penalty = repeated_line_fraction(body);
+    let penalty = period_penalty.max(line_penalty);
+    if penalty <= 0.45 {
+        return SCORE_PPM_DENOMINATOR;
+    }
+    let normalized_penalty = ((penalty - 0.45) / 0.55).clamp(0.0, 1.0);
+    ((1.0 - normalized_penalty) * SCORE_PPM_DENOMINATOR as f64).round() as usize
+}
+
+fn max_char_period_fraction(symbols: &[char], periods: impl IntoIterator<Item = usize>) -> f64 {
+    periods
+        .into_iter()
+        .filter(|period| symbols.len() >= period.saturating_mul(2))
+        .map(|period| char_period_fraction(symbols, period))
+        .fold(0.0, f64::max)
+}
+
+fn char_period_fraction(symbols: &[char], period: usize) -> f64 {
+    if period == 0 || symbols.len() < period.saturating_mul(2) {
+        return 0.0;
+    }
+    let comparisons = symbols.len() - period;
+    let matches = (period..symbols.len())
+        .filter(|idx| symbols[*idx] == symbols[*idx - period])
+        .count();
+    f64::from(ratio(matches, comparisons))
+}
+
+fn repeated_line_fraction(body: &str) -> f64 {
+    let lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.len() >= 4)
+        .collect::<Vec<_>>();
+    if lines.len() < 4 {
+        return 0.0;
+    }
+    let unique = lines.iter().copied().collect::<BTreeSet<_>>().len();
+    f64::from(ratio(lines.len().saturating_sub(unique), lines.len()))
 }
 
 fn extracted_expected_completion(
@@ -1001,6 +1070,7 @@ fn extracted_expected_completion(
         certificate_lines: Vec::new(),
         generated_token_count: 0,
         answer_terminated: false,
+        completion_quality_ppm: 0,
     })
 }
 
@@ -1040,6 +1110,7 @@ pub fn score_ruliad_answer(
         certificate_lines: Vec::new(),
         generated_token_count: answer.split_whitespace().count(),
         answer_terminated: false,
+        completion_quality_ppm: SCORE_PPM_DENOMINATOR,
     });
     score_ruliad_completion_parts(spec, expected_answer, &[], completion)
 }
@@ -1062,10 +1133,12 @@ fn score_ruliad_completion_parts(
             0,
             hash_canary,
             false,
+            0,
         );
     };
     let generated_token_count = completion.generated_token_count;
     let answer_terminated = completion.answer_terminated;
+    let completion_quality_ppm = completion.completion_quality_ppm;
     let Some(actual_answer) = completion.answer.as_deref() else {
         return reasoning_score(
             RuliadAnswerStatus::Malformed,
@@ -1077,6 +1150,7 @@ fn score_ruliad_completion_parts(
             generated_token_count,
             hash_canary,
             answer_terminated,
+            completion_quality_ppm,
         );
     };
 
@@ -1093,6 +1167,7 @@ fn score_ruliad_completion_parts(
         generated_token_count,
         hash_canary,
         answer_terminated,
+        completion_quality_ppm,
     )
     .with_certificate_prefix_ppm(certificate_prefix_ppm)
 }
@@ -1228,6 +1303,7 @@ fn reasoning_score(
     generated_token_count: usize,
     hash_canary: bool,
     answer_terminated: bool,
+    completion_quality_ppm: usize,
 ) -> RuliadReasoningScore {
     let certificate_prefix_ppm = if certificate_expected_steps == 0 {
         0
@@ -1247,6 +1323,7 @@ fn reasoning_score(
         generated_token_count,
         hash_canary,
         answer_terminated,
+        completion_quality_ppm,
     }
 }
 
@@ -2166,6 +2243,7 @@ mod tests {
             generated_token_count: 16,
             hash_canary: false,
             answer_terminated: true,
+            completion_quality_ppm: SCORE_PPM_DENOMINATOR,
         };
         let vector = ruliad_verifier_reward_vector(&score);
         assert_eq!(vector.verifier_match, 1.0);
@@ -2194,11 +2272,50 @@ mod tests {
             generated_token_count: 1,
             hash_canary: false,
             answer_terminated: true,
+            completion_quality_ppm: SCORE_PPM_DENOMINATOR,
         };
         let vector = ruliad_verifier_reward_vector(&score);
         assert_eq!(vector.compactness, 0.0);
         assert_eq!(vector.completion_health, 0.0);
+        assert_eq!(vector.schema_quality, 0.25);
         assert_eq!(vector.answer_termination, 1.0);
+    }
+
+    #[test]
+    fn completion_quality_penalizes_periodic_tails() {
+        let healthy = extract_ruliad_completion("!:ok=1;l=3;r=3\n[/R2]");
+        let cyclic_tail = "?:ca^20:x\n>x0=b35:h17\n".repeat(12);
+        let cyclic = extract_ruliad_completion(&format!("!:ok=1;l=3;r=3\n{cyclic_tail}[/R2]"));
+        assert_eq!(healthy.completion_quality_ppm, SCORE_PPM_DENOMINATOR);
+        assert!(
+            cyclic.completion_quality_ppm < SCORE_PPM_DENOMINATOR / 2,
+            "cyclic completion should have low quality, got {}",
+            cyclic.completion_quality_ppm
+        );
+    }
+
+    #[test]
+    fn verifier_reward_vector_completion_health_reflects_completion_quality() {
+        let healthy = score_ruliad_completion(None, "ok=1;l=3;r=3", Some("!:ok=1;l=3;r=3\n[/R2]"));
+        let cyclic_tail = "?:ca^20:x\n>x0=b35:h17\n".repeat(12);
+        let cyclic = score_ruliad_completion(
+            None,
+            "ok=1;l=3;r=3",
+            Some(&format!("!:ok=1;l=3;r=3\n{cyclic_tail}[/R2]")),
+        );
+        let healthy_vector = ruliad_verifier_reward_vector(&healthy);
+        let cyclic_vector = ruliad_verifier_reward_vector(&cyclic);
+        assert_eq!(healthy_vector.completion_health, 1.0);
+        assert!(
+            cyclic_vector.completion_health < healthy_vector.completion_health * 0.5,
+            "cyclic completion health should be reduced: healthy={} cyclic={}",
+            healthy_vector.completion_health,
+            cyclic_vector.completion_health
+        );
+        assert!(
+            cyclic_vector.compactness < healthy_vector.compactness,
+            "cyclic completion should not win compactness"
+        );
     }
 
     #[test]
@@ -2215,6 +2332,7 @@ mod tests {
             generated_token_count: 100,
             hash_canary: false,
             answer_terminated: true,
+            completion_quality_ppm: SCORE_PPM_DENOMINATOR,
         };
         let compact_partial = RuliadReasoningScore {
             version: RULIAD_REASONING_SCORE_VERSION,
@@ -2228,6 +2346,7 @@ mod tests {
             generated_token_count: 1,
             hash_canary: false,
             answer_terminated: true,
+            completion_quality_ppm: SCORE_PPM_DENOMINATOR,
         };
         let verifier_axis = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let compactness_axis = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];

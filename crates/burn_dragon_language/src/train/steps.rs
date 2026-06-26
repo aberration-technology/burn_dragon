@@ -762,6 +762,8 @@ struct RuliadPolicyRewardTelemetry {
     mode: String,
     sample_groups: usize,
     completion_rows: usize,
+    gated_sample_groups: usize,
+    gated_completion_rows: usize,
     scalarization_count: usize,
     reward_mean: f64,
     reward_std: f64,
@@ -801,6 +803,8 @@ struct RuliadPolicyRewardTelemetryAccumulator {
     step_index: usize,
     sample_groups: usize,
     completion_rows: usize,
+    gated_sample_groups: usize,
+    gated_completion_rows: usize,
     scalarization_count: usize,
     rewards: Vec<f32>,
     advantages: Vec<f32>,
@@ -825,6 +829,8 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             step_index,
             sample_groups: 0,
             completion_rows: 0,
+            gated_sample_groups: 0,
+            gated_completion_rows: 0,
             scalarization_count: 0,
             rewards: Vec::new(),
             advantages: Vec::new(),
@@ -869,6 +875,15 @@ impl RuliadPolicyRewardTelemetryAccumulator {
         );
     }
 
+    fn record_gated_group(&mut self, completion_rows: usize) {
+        self.gated_sample_groups = self.gated_sample_groups.saturating_add(1);
+        self.gated_completion_rows = self.gated_completion_rows.saturating_add(completion_rows);
+    }
+
+    fn has_observations(&self) -> bool {
+        self.completion_rows > 0 || self.gated_completion_rows > 0 || self.vector_sample_count > 0
+    }
+
     fn record_vpo_scalarization(
         &mut self,
         weights: &[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
@@ -902,7 +917,7 @@ impl RuliadPolicyRewardTelemetryAccumulator {
     }
 
     fn finish(self) -> Option<RuliadPolicyRewardTelemetry> {
-        if self.completion_rows == 0 {
+        if !self.has_observations() {
             return None;
         }
         let (reward_mean, reward_std, reward_min, reward_max) = stats_f64(&self.rewards);
@@ -921,6 +936,8 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             mode: self.mode,
             sample_groups: self.sample_groups,
             completion_rows: self.completion_rows,
+            gated_sample_groups: self.gated_sample_groups,
+            gated_completion_rows: self.gated_completion_rows,
             scalarization_count: self.scalarization_count,
             reward_mean,
             reward_std,
@@ -2903,6 +2920,63 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         utilities
     }
 
+    fn ruliad_score_has_policy_correctness_signal(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        min_partial_progress_ppm: usize,
+        min_completion_quality_ppm: usize,
+    ) -> bool {
+        if score.completion_quality_ppm < min_completion_quality_ppm {
+            return false;
+        }
+        matches!(
+            score.status,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch
+        ) || (score.status == burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial
+            && score.partial_progress_ppm >= min_partial_progress_ppm)
+    }
+
+    fn ruliad_score_passes_policy_positive_advantage_gate(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) -> bool {
+        Self::ruliad_score_has_policy_correctness_signal(
+            score,
+            config.positive_advantage_min_partial_progress_ppm,
+            config.positive_advantage_min_completion_quality_ppm,
+        )
+    }
+
+    fn constrain_ruliad_policy_advantages(
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+        advantages: &mut [f32],
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) -> bool {
+        if !config.positive_advantage_requires_correctness {
+            return true;
+        }
+        let mut has_correctness_candidate = false;
+        for score in scores {
+            if Self::ruliad_score_passes_policy_positive_advantage_gate(score, config) {
+                has_correctness_candidate = true;
+                break;
+            }
+        }
+        if !has_correctness_candidate {
+            return false;
+        }
+        for (score, advantage) in scores.iter().zip(advantages.iter_mut()) {
+            if *advantage > 0.0
+                && !Self::ruliad_score_passes_policy_positive_advantage_gate(score, config)
+            {
+                *advantage = 0.0;
+            }
+        }
+        advantages
+            .iter()
+            .any(|advantage| advantage.abs() > f32::EPSILON)
+    }
+
     fn write_ruliad_policy_telemetry(&self, telemetry: RuliadPolicyRewardTelemetry) {
         let Some(path) = self.ruliad_policy_telemetry_path.as_ref() else {
             return;
@@ -3043,10 +3117,14 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     )
                 }
             };
-            let advantages = burn_dragon_universality::ruliad::normalized_advantages(
+            let mut advantages = burn_dragon_universality::ruliad::normalized_advantages(
                 &rewards,
                 config.advantage_epsilon,
             );
+            if !Self::constrain_ruliad_policy_advantages(&scores, &mut advantages, config) {
+                telemetry.record_gated_group(rewards.len());
+                continue;
+            }
             telemetry.record_rewards_and_advantages(&rewards, &advantages, config.clip_range);
             rows.extend(group_rows.into_iter().zip(advantages).map(
                 |((inputs, targets, mask), advantage)| PolicyRow {
@@ -3058,6 +3136,12 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             ));
         }
         if rows.is_empty() {
+            if telemetry.has_observations() {
+                telemetry.mark_skipped("positive_advantage_gate");
+                if let Some(telemetry) = telemetry.finish() {
+                    self.write_ruliad_policy_telemetry(telemetry);
+                }
+            }
             return None;
         }
         if let Some(max_clip_fraction) = config.max_advantage_clip_fraction {
@@ -7101,6 +7185,156 @@ mod objective_step_tests {
         assert_eq!(
             telemetry.policy_skip_reason.as_deref(),
             Some("advantage_clip_fraction>0.500000")
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_telemetry_reports_gated_groups_without_rows() {
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            64,
+        );
+        telemetry.record_gated_group(4);
+        telemetry.mark_skipped("positive_advantage_gate");
+        let telemetry = telemetry.finish().expect("telemetry");
+        assert_eq!(telemetry.completion_rows, 0);
+        assert_eq!(telemetry.gated_sample_groups, 1);
+        assert_eq!(telemetry.gated_completion_rows, 4);
+        assert!(!telemetry.policy_update_applied);
+        assert_eq!(
+            telemetry.policy_skip_reason.as_deref(),
+            Some("positive_advantage_gate")
+        );
+    }
+
+    fn strict_policy_advantage_gate_config() -> crate::config::train::RuliadVerifierRewardConfig {
+        crate::config::train::RuliadVerifierRewardConfig {
+            positive_advantage_requires_correctness: true,
+            positive_advantage_min_partial_progress_ppm: 500_000,
+            positive_advantage_min_completion_quality_ppm: 750_000,
+            ..Default::default()
+        }
+    }
+
+    fn policy_score(
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        partial_progress_ppm: usize,
+        completion_quality_ppm: usize,
+    ) -> burn_dragon_universality::ruliad::RuliadReasoningScore {
+        let expected_field_count = 4;
+        let correct_field_count = partial_progress_ppm
+            .saturating_mul(expected_field_count)
+            .div_ceil(1_000_000)
+            .min(expected_field_count);
+        burn_dragon_universality::ruliad::RuliadReasoningScore {
+            version: burn_dragon_universality::ruliad::RULIAD_REASONING_SCORE_VERSION,
+            status,
+            correct_field_count,
+            expected_field_count,
+            partial_progress_ppm,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: 0,
+            certificate_prefix_ppm: 0,
+            generated_token_count: if partial_progress_ppm > 0 { 8 } else { 1 },
+            hash_canary: false,
+            answer_terminated: status
+                != burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+            completion_quality_ppm,
+        }
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_blocks_positive_wrong_schema() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                500_000,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [-0.4, 0.9];
+        assert!(
+            LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+        assert_eq!(advantages[0], -0.4);
+        assert_eq!(advantages[1], 0.0);
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_all_wrong_groups() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [0.9, -0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_weak_partial_groups() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                250_000,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [0.9, -0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_low_quality_partials() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            500_000,
+            250_000,
+        )];
+        let mut advantages = [0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
         );
     }
 

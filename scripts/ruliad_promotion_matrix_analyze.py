@@ -48,6 +48,8 @@ POLICY_TELEMETRY_FILE = "events/ruliad_verifier_policy.jsonl"
 POLICY_METRIC_COLUMNS = [
     "policy_sample_groups",
     "policy_completion_rows",
+    "policy_gated_sample_groups",
+    "policy_gated_completion_rows",
     "policy_scalarization_count",
     "policy_reward_mean",
     "policy_reward_std",
@@ -188,6 +190,8 @@ def read_policy_telemetry(run_dir: str | None) -> dict[str, float | int | None]:
     return {
         "policy_sample_groups": last_sum("sample_groups"),
         "policy_completion_rows": last_sum("completion_rows"),
+        "policy_gated_sample_groups": last_sum("gated_sample_groups"),
+        "policy_gated_completion_rows": last_sum("gated_completion_rows"),
         "policy_scalarization_count": last_sum("scalarization_count"),
         "policy_reward_mean": weighted_mean("reward_mean"),
         "policy_reward_std": weighted_mean("reward_std"),
@@ -407,8 +411,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy comp | policy health | vpo compact | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -442,6 +446,7 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("policy_advantage_clip_fraction_mean")),
                         fmt(row.get("policy_update_applied_fraction_mean")),
                         fmt(row.get("policy_update_skipped_count_mean")),
+                        fmt(row.get("policy_gated_sample_groups_mean")),
                         fmt(row.get("policy_vector_compactness_mean_mean")),
                         fmt(row.get("policy_vector_completion_health_mean_mean")),
                         fmt(row.get("policy_vpo_dominant_compactness_mean")),

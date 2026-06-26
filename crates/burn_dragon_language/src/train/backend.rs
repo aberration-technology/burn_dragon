@@ -720,6 +720,11 @@ where
         &device,
         backend_name,
     )?;
+    let ruliad_policy_telemetry_path = training
+        .ruliad_supervision
+        .verifier_reward
+        .enabled
+        .then(|| run_dir.join("events").join("ruliad_verifier_policy.jsonl"));
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_objective(training.objective.clone())
         .with_input_corruption(training.input_corruption.clone())
@@ -730,6 +735,7 @@ where
         .with_predictive_coding(training.predictive_coding.clone())
         .with_latent_reasoning(training.latent_reasoning.clone())
         .with_ruliad_supervision(training.ruliad_supervision)
+        .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_tbptt_chunk_size(training.tbptt_chunk_size);
     let model = Some(prepared_model);
     let eggroll_chunk_autotune = if let Some(model_ref) = model.as_ref() {
@@ -1249,6 +1255,11 @@ where
         backend_name,
     )?;
     validate_dragon_continual_backprop(training, &base_model, parallel_runtime.world_size)?;
+    let ruliad_policy_telemetry_path = training
+        .ruliad_supervision
+        .verifier_reward
+        .enabled
+        .then(|| run_dir.join("events").join("ruliad_verifier_policy.jsonl"));
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_objective(training.objective.clone())
         .with_input_corruption(training.input_corruption.clone())
@@ -1259,6 +1270,7 @@ where
         .with_predictive_coding(training.predictive_coding.clone())
         .with_latent_reasoning(training.latent_reasoning.clone())
         .with_ruliad_supervision(training.ruliad_supervision)
+        .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_pipeline_plan(pipeline_plan.clone())
         .with_tbptt_chunk_size(training.tbptt_chunk_size)
         .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)

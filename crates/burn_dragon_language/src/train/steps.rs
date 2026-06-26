@@ -5,6 +5,7 @@ use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -750,6 +751,215 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     gradient_scale_schedule: GradientScaleSchedule,
     #[module(skip)]
     gradient_scale_step: Arc<AtomicUsize>,
+    #[module(skip)]
+    ruliad_policy_telemetry_path: Option<Arc<PathBuf>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadPolicyRewardTelemetry {
+    version: u32,
+    step_index: usize,
+    mode: String,
+    sample_groups: usize,
+    completion_rows: usize,
+    scalarization_count: usize,
+    reward_mean: f64,
+    reward_std: f64,
+    reward_min: f64,
+    reward_max: f64,
+    advantage_mean: f64,
+    advantage_std: f64,
+    advantage_clip_fraction: f64,
+    vector_sample_count: usize,
+    vector_verifier_match_mean: f64,
+    vector_semantic_match_mean: f64,
+    vector_partial_progress_mean: f64,
+    vector_field_accuracy_mean: f64,
+    vector_certificate_prefix_mean: f64,
+    vector_compactness_mean: f64,
+    vector_schema_quality_mean: f64,
+    vector_hash_safety_mean: f64,
+    vpo_scalarization_dominant_verifier_match: usize,
+    vpo_scalarization_dominant_semantic_match: usize,
+    vpo_scalarization_dominant_partial_progress: usize,
+    vpo_scalarization_dominant_field_accuracy: usize,
+    vpo_scalarization_dominant_certificate_prefix: usize,
+    vpo_scalarization_dominant_compactness: usize,
+    vpo_scalarization_dominant_schema_quality: usize,
+    vpo_scalarization_dominant_hash_safety: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadPolicyRewardTelemetryAccumulator {
+    mode: String,
+    step_index: usize,
+    sample_groups: usize,
+    completion_rows: usize,
+    scalarization_count: usize,
+    rewards: Vec<f32>,
+    advantages: Vec<f32>,
+    clipped_advantage_count: usize,
+    vector_sums: [f64; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    vector_sample_count: usize,
+    vpo_scalarization_dominant_axis_counts:
+        [usize; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+}
+
+impl RuliadPolicyRewardTelemetryAccumulator {
+    fn new(mode: crate::config::train::RuliadVerifierRewardMode, step_index: usize) -> Self {
+        Self {
+            mode: match mode {
+                crate::config::train::RuliadVerifierRewardMode::Scalar => "scalar".to_string(),
+                crate::config::train::RuliadVerifierRewardMode::VpoIndependent => {
+                    "vpo_independent".to_string()
+                }
+            },
+            step_index,
+            sample_groups: 0,
+            completion_rows: 0,
+            scalarization_count: 0,
+            rewards: Vec::new(),
+            advantages: Vec::new(),
+            clipped_advantage_count: 0,
+            vector_sums: [0.0; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+            vector_sample_count: 0,
+            vpo_scalarization_dominant_axis_counts: [0;
+                burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        }
+    }
+
+    fn record_vectors(
+        &mut self,
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+    ) {
+        for score in scores {
+            let vector = burn_dragon_universality::ruliad::ruliad_verifier_reward_vector(score);
+            for (index, component) in vector.components().into_iter().enumerate() {
+                self.vector_sums[index] += f64::from(component);
+            }
+            self.vector_sample_count = self.vector_sample_count.saturating_add(1);
+        }
+    }
+
+    fn record_rewards_and_advantages(
+        &mut self,
+        rewards: &[f32],
+        advantages: &[f32],
+        clip_range: f32,
+    ) {
+        self.sample_groups = self.sample_groups.saturating_add(1);
+        self.completion_rows = self.completion_rows.saturating_add(rewards.len());
+        self.rewards.extend_from_slice(rewards);
+        self.advantages.extend_from_slice(advantages);
+        self.clipped_advantage_count = self.clipped_advantage_count.saturating_add(
+            advantages
+                .iter()
+                .filter(|advantage| advantage.abs() > clip_range)
+                .count(),
+        );
+    }
+
+    fn record_vpo_scalarization(
+        &mut self,
+        weights: &[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    ) {
+        self.scalarization_count = self.scalarization_count.saturating_add(1);
+        let axis = weights
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        if let Some(count) = self.vpo_scalarization_dominant_axis_counts.get_mut(axis) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> Option<RuliadPolicyRewardTelemetry> {
+        if self.completion_rows == 0 {
+            return None;
+        }
+        let (reward_mean, reward_std, reward_min, reward_max) = stats_f64(&self.rewards);
+        let (advantage_mean, advantage_std, _, _) = stats_f64(&self.advantages);
+        let vector_mean = |index: usize| {
+            if self.vector_sample_count == 0 {
+                0.0
+            } else {
+                self.vector_sums[index] / self.vector_sample_count as f64
+            }
+        };
+        Some(RuliadPolicyRewardTelemetry {
+            version: 1,
+            step_index: self.step_index,
+            mode: self.mode,
+            sample_groups: self.sample_groups,
+            completion_rows: self.completion_rows,
+            scalarization_count: self.scalarization_count,
+            reward_mean,
+            reward_std,
+            reward_min,
+            reward_max,
+            advantage_mean,
+            advantage_std,
+            advantage_clip_fraction: if self.advantages.is_empty() {
+                0.0
+            } else {
+                self.clipped_advantage_count as f64 / self.advantages.len() as f64
+            },
+            vector_sample_count: self.vector_sample_count,
+            vector_verifier_match_mean: vector_mean(0),
+            vector_semantic_match_mean: vector_mean(1),
+            vector_partial_progress_mean: vector_mean(2),
+            vector_field_accuracy_mean: vector_mean(3),
+            vector_certificate_prefix_mean: vector_mean(4),
+            vector_compactness_mean: vector_mean(5),
+            vector_schema_quality_mean: vector_mean(6),
+            vector_hash_safety_mean: vector_mean(7),
+            vpo_scalarization_dominant_verifier_match: self.vpo_scalarization_dominant_axis_counts
+                [0],
+            vpo_scalarization_dominant_semantic_match: self.vpo_scalarization_dominant_axis_counts
+                [1],
+            vpo_scalarization_dominant_partial_progress: self
+                .vpo_scalarization_dominant_axis_counts[2],
+            vpo_scalarization_dominant_field_accuracy: self.vpo_scalarization_dominant_axis_counts
+                [3],
+            vpo_scalarization_dominant_certificate_prefix: self
+                .vpo_scalarization_dominant_axis_counts[4],
+            vpo_scalarization_dominant_compactness: self.vpo_scalarization_dominant_axis_counts[5],
+            vpo_scalarization_dominant_schema_quality: self.vpo_scalarization_dominant_axis_counts
+                [6],
+            vpo_scalarization_dominant_hash_safety: self.vpo_scalarization_dominant_axis_counts[7],
+        })
+    }
+}
+
+fn stats_f64(values: &[f32]) -> (f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    for value in values.iter().copied().map(f64::from) {
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+    }
+    let mean = sum / values.len() as f64;
+    let variance = values
+        .iter()
+        .copied()
+        .map(f64::from)
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    (mean, variance.sqrt(), min, max)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -921,6 +1131,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             streaming_runtime_key: next_streaming_runtime_key(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
             gradient_scale_step: Arc::new(AtomicUsize::new(0)),
+            ruliad_policy_telemetry_path: None,
         }
     }
 
@@ -1037,6 +1248,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 .or_insert_with(|| Box::new(TeacherModelRuntime::new(teacher_model)));
         }
         self.ruliad_supervision = config;
+        self
+    }
+
+    pub fn with_ruliad_policy_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_policy_telemetry_path = path.map(Arc::new);
         self
     }
 
@@ -2541,6 +2757,63 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         scalarizations
     }
 
+    fn ruliad_vpo_independent_utilities_with_telemetry(
+        &self,
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+        scalarizations: &[
+            [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM]
+        ],
+        telemetry: &mut RuliadPolicyRewardTelemetryAccumulator,
+    ) -> Vec<f32> {
+        let mut utilities = vec![0.0f32; scores.len()];
+        if scores.is_empty() || scalarizations.is_empty() {
+            return utilities;
+        }
+        let vectors = scores
+            .iter()
+            .map(burn_dragon_universality::ruliad::ruliad_verifier_reward_vector)
+            .collect::<Vec<_>>();
+        for weights in scalarizations {
+            telemetry.record_vpo_scalarization(weights);
+            let mut best_index = 0usize;
+            let mut best_value = f32::NEG_INFINITY;
+            for (index, vector) in vectors.iter().copied().enumerate() {
+                let value = vector.scalarize(weights);
+                if value > best_value {
+                    best_index = index;
+                    best_value = value;
+                }
+            }
+            if best_value.is_finite() {
+                utilities[best_index] += best_value;
+            }
+        }
+        let scale = scalarizations.len() as f32;
+        for utility in utilities.iter_mut() {
+            *utility /= scale;
+        }
+        utilities
+    }
+
+    fn write_ruliad_policy_telemetry(&self, telemetry: RuliadPolicyRewardTelemetry) {
+        let Some(path) = self.ruliad_policy_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
     fn ruliad_verifier_policy_loss(
         &self,
         policy_batch: &crate::dataset::RuliadPolicyBatch,
@@ -2573,6 +2846,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
 
         let mut rows = Vec::new();
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            config.mode,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        );
         for sample in policy_batch.samples.iter() {
             let mut prompt = sample.prompt_tokens.clone();
             if prompt.is_empty() {
@@ -2634,6 +2911,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             if group_rows.is_empty() || scores.len() != group_rows.len() {
                 continue;
             }
+            telemetry.record_vectors(&scores);
             let rewards = match config.mode {
                 crate::config::train::RuliadVerifierRewardMode::Scalar => scores
                     .iter()
@@ -2649,9 +2927,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         sample.item.sample_index,
                         config.vpo_scalarizations.max(1),
                     );
-                    burn_dragon_universality::ruliad::ruliad_vpo_independent_utilities(
+                    self.ruliad_vpo_independent_utilities_with_telemetry(
                         &scores,
                         &scalarizations,
+                        &mut telemetry,
                     )
                 }
             };
@@ -2659,6 +2938,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 &rewards,
                 config.advantage_epsilon,
             );
+            telemetry.record_rewards_and_advantages(&rewards, &advantages, config.clip_range);
             rows.extend(group_rows.into_iter().zip(advantages).map(
                 |((inputs, targets, mask), advantage)| PolicyRow {
                     inputs,
@@ -2670,6 +2950,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         if rows.is_empty() {
             return None;
+        }
+        if let Some(telemetry) = telemetry.finish() {
+            self.write_ruliad_policy_telemetry(telemetry);
         }
         let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
         let row_count = rows.len();
@@ -6726,6 +7009,78 @@ mod objective_step_tests {
         assert!(
             loss.is_finite(),
             "VPO verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_writes_reward_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 13);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                kl_weight: 0.0,
+                vpo_scalarizations: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 23,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let line = content.lines().next().expect("telemetry line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("telemetry json");
+        assert_eq!(value["mode"], "vpo_independent");
+        assert_eq!(value["scalarization_count"], 4);
+        assert_eq!(value["completion_rows"], 2);
+        assert!(
+            value["reward_mean"]
+                .as_f64()
+                .expect("reward mean")
+                .is_finite(),
+            "reward mean should be finite"
         );
     }
 

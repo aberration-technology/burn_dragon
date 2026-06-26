@@ -43,6 +43,7 @@ Options:
                             ruliad_1m_la16k_answer_completion_ranking,
                             ruliad_1m_la16k_answer_completion_denoising,
                             ruliad_1m_la16k_answer_completion_ranking_denoising,
+                            ruliad_1m_la16k_answer_completion_rollout,
                             ruliad_1m_la16k_verifier_reward,
                             ruliad_1m_la16k_verifier_vpo,
                             ruliad_1m_la16k_mixed.
@@ -140,6 +141,9 @@ profile_for_arm() {
     ruliad_1m_la16k_answer_completion_ranking_denoising)
       printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion-ranking-denoising.self-recovery.training.toml"
       ;;
+    ruliad_1m_la16k_answer_completion_rollout)
+      printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.answer-completion.self-recovery.training.toml"
+      ;;
     ruliad_1m_la16k_verifier_reward)
       printf '%s\n' "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.verifier-reward.training.toml"
       ;;
@@ -196,6 +200,29 @@ ruliad_mask_high_entropy_for_arm() {
   esac
 }
 
+rollout_unlikelihood_for_arm() {
+  case "$1" in
+    ruliad_1m_la16k_answer_completion_rollout)
+      printf 'true\n'
+      ;;
+    *)
+      printf '%s\n' "${BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD:-false}"
+      ;;
+  esac
+}
+
+rollout_value_for_arm() {
+  local arm="$1"
+  local env_name="$2"
+  local rollout_default="$3"
+  local default_value="$4"
+  if [[ "$arm" == "ruliad_1m_la16k_answer_completion_rollout" ]]; then
+    printf '%s\n' "${!env_name:-$rollout_default}"
+  else
+    printf '%s\n' "${!env_name:-$default_value}"
+  fi
+}
+
 write_arm_profile() {
   local arm="$1"
   local profile="$2"
@@ -228,6 +255,26 @@ for arm in "${ARMS[@]}"; do
   arm_answer_ranking="$(answer_ranking_for_arm "$arm")"
   arm_answer_denoising="$(answer_denoising_for_arm "$arm")"
   arm_mask_high_entropy="$(ruliad_mask_high_entropy_for_arm "$arm")"
+  arm_rollout_unlikelihood="$(rollout_unlikelihood_for_arm "$arm")"
+  arm_rollout_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_WEIGHT 0.02 0.0)"
+  arm_rollout_margin_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_MARGIN_WEIGHT 0.0 0.0)"
+  arm_rollout_margin="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_MARGIN 0.0 0.0)"
+  arm_rollout_recovery_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_RECOVERY_WEIGHT 0.0 0.0)"
+  arm_rollout_sequence_recovery_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_SEQUENCE_RECOVERY_WEIGHT 0.0 0.0)"
+  arm_rollout_entropy_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_ENTROPY_WEIGHT 0.005 0.0)"
+  arm_rollout_target_entropy_bits="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_TARGET_ENTROPY_BITS 2.0 0.0)"
+  arm_rollout_cycle_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_CYCLE_WEIGHT 0.05 0.0)"
+  arm_rollout_cycle_margin_weight="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_CYCLE_MARGIN_WEIGHT 0.0 0.0)"
+  arm_rollout_cycle_min_lag="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_CYCLE_MIN_LAG 2 2)"
+  arm_rollout_cycle_max_lag="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_CYCLE_MAX_LAG 64 64)"
+  arm_rollout_every_steps="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_EVERY_STEPS 32 64)"
+  arm_rollout_prompt_tokens="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_PROMPT_TOKENS 32 32)"
+  arm_rollout_rollout_tokens="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_ROLLOUT_TOKENS 16 8)"
+  arm_rollout_history_tokens="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_HISTORY_TOKENS 16 8)"
+  arm_rollout_batch_prompts="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_BATCH_PROMPTS 1 1)"
+  arm_rollout_warmup_steps="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_WARMUP_STEPS 64 0)"
+  arm_rollout_ramp_steps="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_RAMP_STEPS 128 0)"
+  arm_rollout_recovery_only="$(rollout_value_for_arm "$arm" BURN_DRAGON_PROMOTION_ROLLOUT_UNLIKELIHOOD_RECOVERY_ONLY false false)"
   write_arm_profile "$arm" "$arm_profile"
 
   args=(
@@ -266,6 +313,26 @@ for arm in "${ARMS[@]}"; do
     BURN_DRAGON_LR_STEPS_RULIAD_MASK_HIGH_ENTROPY="$arm_mask_high_entropy" \
     BURN_DRAGON_LR_STEPS_ANSWER_RANKING="$arm_answer_ranking" \
     BURN_DRAGON_LR_STEPS_ANSWER_DENOISING="$arm_answer_denoising" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD="$arm_rollout_unlikelihood" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_WEIGHT="$arm_rollout_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_MARGIN_WEIGHT="$arm_rollout_margin_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_MARGIN="$arm_rollout_margin" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_RECOVERY_WEIGHT="$arm_rollout_recovery_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_SEQUENCE_RECOVERY_WEIGHT="$arm_rollout_sequence_recovery_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_ENTROPY_WEIGHT="$arm_rollout_entropy_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_TARGET_ENTROPY_BITS="$arm_rollout_target_entropy_bits" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_CYCLE_WEIGHT="$arm_rollout_cycle_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_CYCLE_MARGIN_WEIGHT="$arm_rollout_cycle_margin_weight" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_CYCLE_MIN_LAG="$arm_rollout_cycle_min_lag" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_CYCLE_MAX_LAG="$arm_rollout_cycle_max_lag" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_EVERY_STEPS="$arm_rollout_every_steps" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_PROMPT_TOKENS="$arm_rollout_prompt_tokens" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_ROLLOUT_TOKENS="$arm_rollout_rollout_tokens" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_HISTORY_TOKENS="$arm_rollout_history_tokens" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_BATCH_PROMPTS="$arm_rollout_batch_prompts" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_WARMUP_STEPS="$arm_rollout_warmup_steps" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_RAMP_STEPS="$arm_rollout_ramp_steps" \
+    BURN_DRAGON_LR_STEPS_ROLLOUT_UNLIKELIHOOD_RECOVERY_ONLY="$arm_rollout_recovery_only" \
     "$ROOT_DIR/scripts/latent_reasoning_steps_ablation.sh" "${args[@]}"
 
   if (( DRY_RUN == 0 )); then

@@ -3249,7 +3249,7 @@ where
         return Ok(None);
     };
 
-    let base_absolute_step = epoch.saturating_sub(1).saturating_mul(steps_per_epoch);
+    let base_absolute_step = ruliad_probe_absolute_step(epoch, steps_per_epoch);
     let probe_items =
         dataset.sample_ruliad_validation_probe_items(epoch, base_absolute_step, requested_items);
     if probe_items.is_empty() {
@@ -3296,6 +3296,10 @@ where
         }
     }
     Ok(Some(base_report))
+}
+
+fn ruliad_probe_absolute_step(epoch: usize, steps_per_epoch: usize) -> usize {
+    epoch.saturating_mul(steps_per_epoch).saturating_sub(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8407,6 +8411,14 @@ mod tests {
             Some(7)
         );
         assert_eq!(
+            record.get("epoch").and_then(|value| value.as_u64()),
+            Some(5)
+        );
+        assert_eq!(
+            record.get("absolute_step").and_then(|value| value.as_u64()),
+            Some(128)
+        );
+        assert_eq!(
             record
                 .get("expected_answer")
                 .and_then(|value| value.as_str()),
@@ -8436,6 +8448,13 @@ mod tests {
             record.get("completion").and_then(|value| value.as_str()),
             Some("!:ok=1;l=2;r=2\n[/R2]\n")
         );
+    }
+
+    #[test]
+    fn ruliad_probe_absolute_step_points_to_epoch_end() {
+        assert_eq!(ruliad_probe_absolute_step(1, 256), 255);
+        assert_eq!(ruliad_probe_absolute_step(2, 256), 511);
+        assert_eq!(ruliad_probe_absolute_step(0, 256), 0);
     }
 
     #[test]

@@ -1120,6 +1120,9 @@ pub struct RuliadVerifierRewardConfig {
     pub clip_range: f32,
     pub advantage_epsilon: f32,
     pub vpo_scalarizations: usize,
+    pub vpo_correctness_mass_floor: f32,
+    pub vpo_completion_health_mass_floor: f32,
+    pub vpo_compactness_max_weight: f32,
     pub reward: burn_dragon_universality::RuliadVerifierRewardWeights,
 }
 
@@ -1138,6 +1141,9 @@ impl Default for RuliadVerifierRewardConfig {
             clip_range: 0.2,
             advantage_epsilon: 1.0e-6,
             vpo_scalarizations: 16,
+            vpo_correctness_mass_floor: 0.70,
+            vpo_completion_health_mass_floor: 0.10,
+            vpo_compactness_max_weight: 0.05,
             reward: burn_dragon_universality::RuliadVerifierRewardWeights::default(),
         }
     }

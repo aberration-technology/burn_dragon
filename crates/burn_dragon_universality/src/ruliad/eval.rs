@@ -281,6 +281,8 @@ pub struct RuliadReasoningScore {
     pub certificate_prefix_ppm: usize,
     pub generated_token_count: usize,
     pub hash_canary: bool,
+    #[serde(default)]
+    pub answer_terminated: bool,
 }
 
 impl RuliadReasoningScore {
@@ -403,7 +405,7 @@ pub fn ruliad_verifier_reward(
     reward
 }
 
-pub const RULIAD_VERIFIER_REWARD_VECTOR_DIM: usize = 8;
+pub const RULIAD_VERIFIER_REWARD_VECTOR_DIM: usize = 10;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct RuliadVerifierRewardVector {
@@ -415,6 +417,8 @@ pub struct RuliadVerifierRewardVector {
     pub compactness: f32,
     pub schema_quality: f32,
     pub hash_safety: f32,
+    pub answer_termination: f32,
+    pub completion_health: f32,
 }
 
 impl RuliadVerifierRewardVector {
@@ -428,6 +432,8 @@ impl RuliadVerifierRewardVector {
             self.compactness,
             self.schema_quality,
             self.hash_safety,
+            self.answer_termination,
+            self.completion_health,
         ]
     }
 
@@ -455,7 +461,27 @@ pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVeri
         | RuliadAnswerStatus::SchemaValidWrong => 1.0,
         RuliadAnswerStatus::Malformed | RuliadAnswerStatus::Missing => 0.0,
     };
-    let compactness = if score.generated_token_count == 0 {
+    let completion_health = match score.status {
+        RuliadAnswerStatus::VerifierMatch
+        | RuliadAnswerStatus::SemanticMatch
+        | RuliadAnswerStatus::Partial => 1.0,
+        RuliadAnswerStatus::SchemaValidWrong
+        | RuliadAnswerStatus::Malformed
+        | RuliadAnswerStatus::Missing => 0.0,
+    };
+    let has_correctness_signal = matches!(
+        score.status,
+        RuliadAnswerStatus::VerifierMatch
+            | RuliadAnswerStatus::SemanticMatch
+            | RuliadAnswerStatus::Partial
+    ) || partial_progress > 0.0
+        || field_accuracy > 0.0
+        || certificate_prefix > 0.0;
+    let compactness = if score.generated_token_count == 0
+        || !has_correctness_signal
+        || completion_health <= 0.0
+        || !score.answer_terminated
+    {
         0.0
     } else {
         1.0 / (score.generated_token_count as f32).sqrt()
@@ -484,6 +510,8 @@ pub fn ruliad_verifier_reward_vector(score: &RuliadReasoningScore) -> RuliadVeri
         } else {
             0.0
         },
+        answer_termination: if score.answer_terminated { 1.0 } else { 0.0 },
+        completion_health,
     }
 }
 
@@ -1033,9 +1061,11 @@ fn score_ruliad_completion_parts(
             expected_certificate.len(),
             0,
             hash_canary,
+            false,
         );
     };
     let generated_token_count = completion.generated_token_count;
+    let answer_terminated = completion.answer_terminated;
     let Some(actual_answer) = completion.answer.as_deref() else {
         return reasoning_score(
             RuliadAnswerStatus::Malformed,
@@ -1046,6 +1076,7 @@ fn score_ruliad_completion_parts(
             expected_certificate.len(),
             generated_token_count,
             hash_canary,
+            answer_terminated,
         );
     };
 
@@ -1061,6 +1092,7 @@ fn score_ruliad_completion_parts(
         expected_certificate.len(),
         generated_token_count,
         hash_canary,
+        answer_terminated,
     )
     .with_certificate_prefix_ppm(certificate_prefix_ppm)
 }
@@ -1195,6 +1227,7 @@ fn reasoning_score(
     certificate_expected_steps: usize,
     generated_token_count: usize,
     hash_canary: bool,
+    answer_terminated: bool,
 ) -> RuliadReasoningScore {
     let certificate_prefix_ppm = if certificate_expected_steps == 0 {
         0
@@ -1213,6 +1246,7 @@ fn reasoning_score(
         certificate_prefix_ppm,
         generated_token_count,
         hash_canary,
+        answer_terminated,
     }
 }
 
@@ -2131,6 +2165,7 @@ mod tests {
             certificate_prefix_ppm: SCORE_PPM_DENOMINATOR / 4,
             generated_token_count: 16,
             hash_canary: false,
+            answer_terminated: true,
         };
         let vector = ruliad_verifier_reward_vector(&score);
         assert_eq!(vector.verifier_match, 1.0);
@@ -2141,6 +2176,29 @@ mod tests {
         assert_eq!(vector.compactness, 0.25);
         assert_eq!(vector.schema_quality, 1.0);
         assert_eq!(vector.hash_safety, 1.0);
+        assert_eq!(vector.answer_termination, 1.0);
+        assert_eq!(vector.completion_health, 1.0);
+    }
+
+    #[test]
+    fn verifier_reward_vector_does_not_reward_compact_bad_outputs() {
+        let score = RuliadReasoningScore {
+            version: RULIAD_REASONING_SCORE_VERSION,
+            status: RuliadAnswerStatus::SchemaValidWrong,
+            correct_field_count: 0,
+            expected_field_count: 4,
+            partial_progress_ppm: 0,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: 4,
+            certificate_prefix_ppm: 0,
+            generated_token_count: 1,
+            hash_canary: false,
+            answer_terminated: true,
+        };
+        let vector = ruliad_verifier_reward_vector(&score);
+        assert_eq!(vector.compactness, 0.0);
+        assert_eq!(vector.completion_health, 0.0);
+        assert_eq!(vector.answer_termination, 1.0);
     }
 
     #[test]
@@ -2156,6 +2214,7 @@ mod tests {
             certificate_prefix_ppm: SCORE_PPM_DENOMINATOR,
             generated_token_count: 100,
             hash_canary: false,
+            answer_terminated: true,
         };
         let compact_partial = RuliadReasoningScore {
             version: RULIAD_REASONING_SCORE_VERSION,
@@ -2168,9 +2227,10 @@ mod tests {
             certificate_prefix_ppm: SCORE_PPM_DENOMINATOR / 4,
             generated_token_count: 1,
             hash_canary: false,
+            answer_terminated: true,
         };
-        let verifier_axis = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let compactness_axis = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let verifier_axis = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let compactness_axis = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let utilities = ruliad_vpo_independent_utilities(
             &[exact_long, compact_partial],
             &[verifier_axis, compactness_axis],

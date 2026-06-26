@@ -3,3 +3,6 @@ extends = "ruliad-1m-la-16k.verifier-reward.training.toml"
 [training.ruliad_supervision.verifier_reward]
 mode = "vpo_independent"
 vpo_scalarizations = 16
+vpo_correctness_mass_floor = 0.70
+vpo_completion_health_mass_floor = 0.10
+vpo_compactness_max_weight = 0.05

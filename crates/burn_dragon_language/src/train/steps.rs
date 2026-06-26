@@ -779,6 +779,8 @@ struct RuliadPolicyRewardTelemetry {
     vector_compactness_mean: f64,
     vector_schema_quality_mean: f64,
     vector_hash_safety_mean: f64,
+    vector_answer_termination_mean: f64,
+    vector_completion_health_mean: f64,
     vpo_scalarization_dominant_verifier_match: usize,
     vpo_scalarization_dominant_semantic_match: usize,
     vpo_scalarization_dominant_partial_progress: usize,
@@ -787,6 +789,8 @@ struct RuliadPolicyRewardTelemetry {
     vpo_scalarization_dominant_compactness: usize,
     vpo_scalarization_dominant_schema_quality: usize,
     vpo_scalarization_dominant_hash_safety: usize,
+    vpo_scalarization_dominant_answer_termination: usize,
+    vpo_scalarization_dominant_completion_health: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -918,6 +922,8 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             vector_compactness_mean: vector_mean(5),
             vector_schema_quality_mean: vector_mean(6),
             vector_hash_safety_mean: vector_mean(7),
+            vector_answer_termination_mean: vector_mean(8),
+            vector_completion_health_mean: vector_mean(9),
             vpo_scalarization_dominant_verifier_match: self.vpo_scalarization_dominant_axis_counts
                 [0],
             vpo_scalarization_dominant_semantic_match: self.vpo_scalarization_dominant_axis_counts
@@ -932,6 +938,10 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             vpo_scalarization_dominant_schema_quality: self.vpo_scalarization_dominant_axis_counts
                 [6],
             vpo_scalarization_dominant_hash_safety: self.vpo_scalarization_dominant_axis_counts[7],
+            vpo_scalarization_dominant_answer_termination: self
+                .vpo_scalarization_dominant_axis_counts[8],
+            vpo_scalarization_dominant_completion_health: self
+                .vpo_scalarization_dominant_axis_counts[9],
         })
     }
 }
@@ -2726,6 +2736,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         &self,
         sample_index: usize,
         count: usize,
+        config: crate::config::train::RuliadVerifierRewardConfig,
     ) -> Vec<[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM]> {
         let step_index = self.gradient_scale_step.load(Ordering::Relaxed) as u64;
         let seed = Self::mix_ruliad_policy_seed(
@@ -2752,9 +2763,85 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     *weight /= sum;
                 }
             }
+            Self::constrain_ruliad_vpo_scalarization(&mut weights, config);
             scalarizations.push(weights);
         }
         scalarizations
+    }
+
+    fn constrain_ruliad_vpo_scalarization(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) {
+        const CORRECTNESS_AXES: &[usize] = &[0, 1, 2, 3, 4];
+        const HEALTH_AXES: &[usize] = &[8, 9];
+        const COMPACTNESS_AXIS: usize = 5;
+        let original = *weights;
+        let correctness_floor = config.vpo_correctness_mass_floor.clamp(0.0, 1.0);
+        let health_floor = config
+            .vpo_completion_health_mass_floor
+            .clamp(0.0, 1.0 - correctness_floor);
+        let residual_mass = (1.0 - correctness_floor - health_floor).max(0.0);
+        for (weight, original_weight) in weights.iter_mut().zip(original) {
+            *weight = original_weight * residual_mass;
+        }
+        Self::add_weighted_group_mass(weights, &original, CORRECTNESS_AXES, correctness_floor);
+        Self::add_weighted_group_mass(weights, &original, HEALTH_AXES, health_floor);
+        let compactness_max = config.vpo_compactness_max_weight.clamp(0.0, 1.0);
+        if weights[COMPACTNESS_AXIS] > compactness_max {
+            let excess = weights[COMPACTNESS_AXIS] - compactness_max;
+            weights[COMPACTNESS_AXIS] = compactness_max;
+            Self::add_uniform_mass(weights, CORRECTNESS_AXES, excess * 0.75);
+            Self::add_uniform_mass(weights, HEALTH_AXES, excess * 0.25);
+        }
+        Self::renormalize_scalarization(weights);
+    }
+
+    fn add_weighted_group_mass(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        original: &[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        axes: &[usize],
+        mass: f32,
+    ) {
+        if axes.is_empty() || mass <= f32::EPSILON {
+            return;
+        }
+        let group_mass = axes.iter().map(|axis| original[*axis]).sum::<f32>();
+        if group_mass <= f32::EPSILON {
+            Self::add_uniform_mass(weights, axes, mass);
+            return;
+        }
+        for axis in axes {
+            weights[*axis] += mass * original[*axis] / group_mass;
+        }
+    }
+
+    fn add_uniform_mass(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        axes: &[usize],
+        mass: f32,
+    ) {
+        if axes.is_empty() || mass <= f32::EPSILON {
+            return;
+        }
+        let share = mass / axes.len() as f32;
+        for axis in axes {
+            weights[*axis] += share;
+        }
+    }
+
+    fn renormalize_scalarization(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    ) {
+        let sum = weights.iter().copied().sum::<f32>();
+        if sum <= f32::EPSILON || !sum.is_finite() {
+            let uniform = 1.0 / weights.len() as f32;
+            weights.fill(uniform);
+            return;
+        }
+        for weight in weights.iter_mut() {
+            *weight = (*weight / sum).max(0.0);
+        }
     }
 
     fn ruliad_vpo_independent_utilities_with_telemetry(
@@ -2926,6 +3013,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     let scalarizations = self.ruliad_vpo_scalarizations(
                         sample.item.sample_index,
                         config.vpo_scalarizations.max(1),
+                        config,
                     );
                     self.ruliad_vpo_independent_utilities_with_telemetry(
                         &scores,
@@ -6965,7 +7053,15 @@ mod objective_step_tests {
             },
             ..Default::default()
         });
-        let scalarizations = model.ruliad_vpo_scalarizations(17, 4);
+        let vpo_config = crate::config::train::RuliadVerifierRewardConfig {
+            enabled: true,
+            mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            vpo_correctness_mass_floor: 0.70,
+            vpo_completion_health_mass_floor: 0.10,
+            vpo_compactness_max_weight: 0.05,
+            ..Default::default()
+        };
+        let scalarizations = model.ruliad_vpo_scalarizations(17, 4, vpo_config);
         assert_eq!(scalarizations.len(), 4);
         for scalarization in scalarizations {
             assert!(
@@ -6976,6 +7072,20 @@ mod objective_step_tests {
             assert!(
                 (sum - 1.0).abs() < 1.0e-5,
                 "VPO scalarization should sum to one, got {sum}"
+            );
+            let correctness_mass = scalarization[0..=4].iter().sum::<f32>();
+            let health_mass = scalarization[8..=9].iter().sum::<f32>();
+            assert!(
+                correctness_mass >= 0.70 - 1.0e-5,
+                "correctness mass floor should hold, got {correctness_mass}"
+            );
+            assert!(
+                health_mass >= 0.10 - 1.0e-5,
+                "health mass floor should hold, got {health_mass}"
+            );
+            assert!(
+                scalarization[5] <= 0.05 + 1.0e-5,
+                "compactness weight should be capped"
             );
         }
         let item = burn_dragon_universality::RuliadEvalItem {

@@ -1905,11 +1905,41 @@ impl TrainingConfig {
             if matches!(
                 verifier_reward.mode,
                 RuliadVerifierRewardMode::VpoIndependent
-            ) && verifier_reward.vpo_scalarizations == 0
-            {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.vpo_scalarizations must be positive when mode=\"vpo_independent\""
-                ));
+            ) {
+                if verifier_reward.vpo_scalarizations == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.vpo_scalarizations must be positive when mode=\"vpo_independent\""
+                    ));
+                }
+                if !verifier_reward.vpo_correctness_mass_floor.is_finite()
+                    || !(0.0..=1.0).contains(&verifier_reward.vpo_correctness_mass_floor)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.vpo_correctness_mass_floor must be finite and in [0, 1]"
+                    ));
+                }
+                if !verifier_reward.vpo_completion_health_mass_floor.is_finite()
+                    || !(0.0..=1.0).contains(&verifier_reward.vpo_completion_health_mass_floor)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.vpo_completion_health_mass_floor must be finite and in [0, 1]"
+                    ));
+                }
+                if verifier_reward.vpo_correctness_mass_floor
+                    + verifier_reward.vpo_completion_health_mass_floor
+                    > 1.0 + f32::EPSILON
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward VPO mass floors must sum to <= 1"
+                    ));
+                }
+                if !verifier_reward.vpo_compactness_max_weight.is_finite()
+                    || !(0.0..=1.0).contains(&verifier_reward.vpo_compactness_max_weight)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.vpo_compactness_max_weight must be finite and in [0, 1]"
+                    ));
+                }
             }
             let reward_weights = verifier_reward.reward;
             for (field, value) in [
@@ -3336,6 +3366,22 @@ start_policy = "capability_gate"
                 .vpo_scalarizations
                 > 0
         );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .vpo_correctness_mass_floor
+                >= 0.70
+        );
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .verifier_reward
+                .vpo_compactness_max_weight
+                <= 0.05
+        );
         assert!(config.training.tbptt_chunk_size.is_none());
         assert!(!config.training.tbptt_persist_across_steps);
         assert!(config.training.objective.is_next_token());
@@ -3932,6 +3978,34 @@ start_policy = "capability_gate"
             .expect_err("zero VPO scalarization count should fail");
         assert!(
             err.to_string().contains("vpo_scalarizations"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_reward_vpo_rejects_invalid_mass_floors() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.mode =
+            RuliadVerifierRewardMode::VpoIndependent;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .vpo_correctness_mass_floor = 0.8;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .vpo_completion_health_mass_floor = 0.3;
+        let err = config
+            .validate()
+            .expect_err("VPO mass floors above one should fail");
+        assert!(
+            err.to_string().contains("mass floors"),
             "unexpected error: {err}"
         );
     }

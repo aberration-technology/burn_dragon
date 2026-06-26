@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,32 @@ METRIC_COLUMNS = [
     "output_period_2_to_64_last",
     "fatal_gate_count",
     "rank_score",
+]
+
+POLICY_TELEMETRY_FILE = "events/ruliad_verifier_policy.jsonl"
+POLICY_METRIC_COLUMNS = [
+    "policy_sample_groups",
+    "policy_completion_rows",
+    "policy_scalarization_count",
+    "policy_reward_mean",
+    "policy_reward_std",
+    "policy_reward_min",
+    "policy_reward_max",
+    "policy_advantage_mean",
+    "policy_advantage_std",
+    "policy_advantage_clip_fraction",
+    "policy_vector_verifier_match_mean",
+    "policy_vector_semantic_match_mean",
+    "policy_vector_partial_progress_mean",
+    "policy_vector_field_accuracy_mean",
+    "policy_vector_certificate_prefix_mean",
+    "policy_vector_compactness_mean",
+    "policy_vector_schema_quality_mean",
+    "policy_vector_hash_safety_mean",
+    "policy_vector_answer_termination_mean",
+    "policy_vector_completion_health_mean",
+    "policy_vpo_dominant_compactness",
+    "policy_vpo_dominant_completion_health",
 ]
 
 
@@ -111,6 +138,76 @@ def mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def read_policy_telemetry(run_dir: str | None) -> dict[str, float | int | None]:
+    if not run_dir:
+        return {column: None for column in POLICY_METRIC_COLUMNS}
+    path = Path(run_dir) / POLICY_TELEMETRY_FILE
+    if not path.exists():
+        return {column: None for column in POLICY_METRIC_COLUMNS}
+    records: list[dict[str, Any]] = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not records:
+        return {column: None for column in POLICY_METRIC_COLUMNS}
+
+    def last_sum(key: str) -> float | None:
+        values = [finite(record.get(key)) for record in records]
+        clean = [value for value in values if value is not None]
+        return sum(clean) if clean else None
+
+    def weighted_mean(key: str, weight_key: str = "completion_rows") -> float | None:
+        total = 0.0
+        weight_sum = 0.0
+        for record in records:
+            value = finite(record.get(key))
+            weight = finite(record.get(weight_key))
+            if value is None or weight is None or weight <= 0.0:
+                continue
+            total += value * weight
+            weight_sum += weight
+        return total / weight_sum if weight_sum > 0.0 else None
+
+    def min_value(key: str) -> float | None:
+        clean = [value for value in (finite(record.get(key)) for record in records) if value is not None]
+        return min(clean) if clean else None
+
+    def max_value(key: str) -> float | None:
+        clean = [value for value in (finite(record.get(key)) for record in records) if value is not None]
+        return max(clean) if clean else None
+
+    return {
+        "policy_sample_groups": last_sum("sample_groups"),
+        "policy_completion_rows": last_sum("completion_rows"),
+        "policy_scalarization_count": last_sum("scalarization_count"),
+        "policy_reward_mean": weighted_mean("reward_mean"),
+        "policy_reward_std": weighted_mean("reward_std"),
+        "policy_reward_min": min_value("reward_min"),
+        "policy_reward_max": max_value("reward_max"),
+        "policy_advantage_mean": weighted_mean("advantage_mean"),
+        "policy_advantage_std": weighted_mean("advantage_std"),
+        "policy_advantage_clip_fraction": weighted_mean("advantage_clip_fraction"),
+        "policy_vector_verifier_match_mean": weighted_mean("vector_verifier_match_mean", "vector_sample_count"),
+        "policy_vector_semantic_match_mean": weighted_mean("vector_semantic_match_mean", "vector_sample_count"),
+        "policy_vector_partial_progress_mean": weighted_mean("vector_partial_progress_mean", "vector_sample_count"),
+        "policy_vector_field_accuracy_mean": weighted_mean("vector_field_accuracy_mean", "vector_sample_count"),
+        "policy_vector_certificate_prefix_mean": weighted_mean("vector_certificate_prefix_mean", "vector_sample_count"),
+        "policy_vector_compactness_mean": weighted_mean("vector_compactness_mean", "vector_sample_count"),
+        "policy_vector_schema_quality_mean": weighted_mean("vector_schema_quality_mean", "vector_sample_count"),
+        "policy_vector_hash_safety_mean": weighted_mean("vector_hash_safety_mean", "vector_sample_count"),
+        "policy_vector_answer_termination_mean": weighted_mean("vector_answer_termination_mean", "vector_sample_count"),
+        "policy_vector_completion_health_mean": weighted_mean("vector_completion_health_mean", "vector_sample_count"),
+        "policy_vpo_dominant_compactness": last_sum("vpo_scalarization_dominant_compactness"),
+        "policy_vpo_dominant_completion_health": last_sum("vpo_scalarization_dominant_completion_health"),
+    }
+
+
 def collect_trials(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for summary in sorted(root.glob(f"*/analysis/{TRIAL_SUMMARY}")):
@@ -118,6 +215,7 @@ def collect_trials(root: Path) -> list[dict[str, Any]]:
         for row in read_csv(summary):
             out: dict[str, Any] = {"arm": arm}
             out.update(row)
+            out.update(read_policy_telemetry(row.get("run_dir")))
             rows.append(out)
     return rows
 
@@ -132,7 +230,7 @@ def summarize_by_arm(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "trials": len(arm_rows),
             "ok_trials": len(ok_rows),
         }
-        for column in METRIC_COLUMNS:
+        for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS:
             clean = [value for value in (finite(row.get(column)) for row in ok_rows) if value is not None]
             summary[f"{column}_mean"] = mean(clean)
         summaries.append(summary)
@@ -291,8 +389,8 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
-        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | score d | reasons |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+        handle.write("| arm | decision | ok/trials | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | comp d2 | comp period | out d2 | policy rstd | policy clip | policy comp | policy health | vpo compact | score d | reasons |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
                 "| "
@@ -322,6 +420,11 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
                         fmt(row.get("completion_distinct_2_last_mean")),
                         fmt(row.get("completion_period_2_to_64_last_mean")),
                         fmt(row.get("output_distinct_2_last_mean")),
+                        fmt(row.get("policy_reward_std_mean")),
+                        fmt(row.get("policy_advantage_clip_fraction_mean")),
+                        fmt(row.get("policy_vector_compactness_mean_mean")),
+                        fmt(row.get("policy_vector_completion_health_mean_mean")),
+                        fmt(row.get("policy_vpo_dominant_compactness_mean")),
                         fmt(row.get("promotion_score_delta")),
                         str(row.get("fail_reasons") or ""),
                     ]
@@ -343,7 +446,7 @@ def main() -> None:
     gated = add_gate_decisions(arms, args)
     arm_fields = (
         ["arm", "decision", "fail_reasons", "trials", "ok_trials"]
-        + [f"{column}_mean" for column in METRIC_COLUMNS]
+        + [f"{column}_mean" for column in METRIC_COLUMNS + POLICY_METRIC_COLUMNS]
         + [
             "promotion_score_delta",
             "throughput_ratio",

@@ -29,6 +29,8 @@ METRIC_COLUMNS = [
     "ruliad_malformed_last",
     "ruliad_answer_field_accuracy_last",
     "ruliad_answer_termination_rate_last",
+    "ruliad_completion_quality_last",
+    "ruliad_answer_distinct_last",
     "completion_health_last",
     "completion_distinct_2_last",
     "completion_period_2_to_64_last",

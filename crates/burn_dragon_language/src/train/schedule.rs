@@ -79,7 +79,8 @@ fn ruliad_competence_key(
         .saturating_add(report.missing_completion_count)
         .saturating_add(report.schema_valid_wrong_count)
         .min(item_count);
-    let completion_health = item_count.saturating_sub(unhealthy_count) as f32 / item_count as f32;
+    let status_health = item_count.saturating_sub(unhealthy_count) as f32 / item_count as f32;
+    let completion_health = status_health * report.mean_completion_quality.clamp(0.0, 1.0);
     Some(RuliadCompetenceKey {
         verifier_ppm: ratio_to_ppm(report.verifier_accuracy),
         semantic_ppm: ratio_to_ppm(report.semantic_accuracy),
@@ -115,11 +116,13 @@ fn ruliad_capability_rates(
         .saturating_add(report.malformed_completion_count)
         .saturating_add(report.missing_completion_count)
         .min(report.item_count);
-    let completion_health_rate = if report.item_count == 0 {
+    let status_health_rate = if report.item_count == 0 {
         0.0
     } else {
         report.item_count.saturating_sub(unhealthy_count) as f64 / report.item_count as f64
     };
+    let completion_health_rate =
+        status_health_rate * f64::from(report.mean_completion_quality.clamp(0.0, 1.0));
     (
         schema_wrong_rate,
         malformed_rate,
@@ -173,6 +176,14 @@ fn ruliad_capability_gate_status(
         reasons.push(format!(
             "completion_health={completion_health_rate:.3}<{}",
             gates.capability_completion_health_min_rate
+        ));
+    }
+    if report.scored_count > 1
+        && report.actual_answer_distinct_fraction < gates.capability_distinct_2_min_fraction as f32
+    {
+        reasons.push(format!(
+            "answer_distinct={:.3}<{}",
+            report.actual_answer_distinct_fraction, gates.capability_distinct_2_min_fraction
         ));
     }
     if let Some(stats) = output_degeneracy {
@@ -3764,6 +3775,14 @@ fn emit_ruliad_correctness_metrics_with_labels(
             f64::from(report.answer_termination_rate),
         ),
         (
+            "Ruliad Mean Completion Quality",
+            f64::from(report.mean_completion_quality),
+        ),
+        (
+            "Ruliad Actual Answer Distinct Fraction",
+            f64::from(report.actual_answer_distinct_fraction),
+        ),
+        (
             "Ruliad Certificate Prefix Coverage",
             f64::from(report.mean_certificate_prefix_coverage),
         ),
@@ -7180,6 +7199,8 @@ mod tests {
             answer_field_accuracy: mean_partial_progress,
             answer_terminated_count: item_count,
             answer_termination_rate: 1.0,
+            mean_completion_quality: 1.0,
+            actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: certificate_prefix_coverage,
             mean_completion_tokens: 12.0,
             canary_count: 0,
@@ -7335,6 +7356,36 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.starts_with("output_distinct2="))
+        );
+    }
+
+    #[test]
+    fn ruliad_capability_gate_status_flags_low_quality_answer_collapse() {
+        let mut gates = ruliad_degeneracy_gates();
+        gates.capability_completion_health_min_rate = 0.80;
+        gates.capability_distinct_2_min_fraction = 0.30;
+        let mut report = ruliad_eval_report(0.0, 0.0, 0.0, 0.0);
+        report.mean_completion_quality = 0.0;
+        report.actual_answer_distinct_fraction = 0.01;
+
+        let status = ruliad_capability_gate_status(&report, None, &gates);
+
+        assert!(!status.passed);
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("completion_health=0.000<")),
+            "{:?}",
+            status.reasons
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("answer_distinct=0.010<")),
+            "{:?}",
+            status.reasons
         );
     }
 
@@ -7948,6 +7999,8 @@ mod tests {
             answer_field_accuracy: 0.625,
             answer_terminated_count: 3,
             answer_termination_rate: 0.75,
+            mean_completion_quality: 1.0,
+            actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 12.0,
             canary_count: 0,
@@ -7974,6 +8027,8 @@ mod tests {
                 answer_field_accuracy: 0.625,
                 answer_terminated_count: 3,
                 answer_termination_rate: 0.75,
+                mean_completion_quality: 1.0,
+                actual_answer_distinct_fraction: 1.0,
             }],
             math_domain_scores: Vec::new(),
             reasoning_mode_scores: Vec::new(),
@@ -8304,6 +8359,8 @@ mod tests {
             answer_field_accuracy: 0.5,
             answer_terminated_count: 2,
             answer_termination_rate: 1.0,
+            mean_completion_quality: 1.0,
+            actual_answer_distinct_fraction: 1.0,
             mean_certificate_prefix_coverage: 0.5,
             mean_completion_tokens: 8.0,
             canary_count: 0,

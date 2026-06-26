@@ -58,6 +58,8 @@ SUMMARY_COLUMNS = [
     "ruliad_missing_last",
     "ruliad_answer_field_accuracy_last",
     "ruliad_answer_termination_rate_last",
+    "ruliad_completion_quality_last",
+    "ruliad_answer_distinct_last",
     "ruliad_mean_completion_tokens_last",
     "completion_health_last",
     "completion_repetition_last",
@@ -610,6 +612,12 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "ruliad_missing_last": capability.get("missing_rate"),
         "ruliad_answer_field_accuracy_last": capability.get("answer_field_accuracy"),
         "ruliad_answer_termination_rate_last": capability.get("answer_termination_rate"),
+        "ruliad_completion_quality_last": last_metric(
+            events, "valid", "Ruliad Mean Completion Quality"
+        ),
+        "ruliad_answer_distinct_last": last_metric(
+            events, "valid", "Ruliad Actual Answer Distinct Fraction"
+        ),
         "ruliad_mean_completion_tokens_last": capability.get("mean_completion_tokens"),
         "completion_health_last": capability.get("completion_health_rate"),
         "completion_repetition_last": capability.get("completion_repetition_fraction"),

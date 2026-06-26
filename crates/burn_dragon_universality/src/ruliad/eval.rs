@@ -193,6 +193,10 @@ pub struct RuliadEvalGroupScore {
     pub answer_terminated_count: usize,
     #[serde(default)]
     pub answer_termination_rate: f32,
+    #[serde(default)]
+    pub mean_completion_quality: f32,
+    #[serde(default)]
+    pub actual_answer_distinct_fraction: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -235,6 +239,10 @@ pub struct RuliadEvalReport {
     pub answer_terminated_count: usize,
     #[serde(default)]
     pub answer_termination_rate: f32,
+    #[serde(default)]
+    pub mean_completion_quality: f32,
+    #[serde(default)]
+    pub actual_answer_distinct_fraction: f32,
     pub mean_certificate_prefix_coverage: f32,
     pub mean_completion_tokens: f32,
     pub canary_count: usize,
@@ -625,6 +633,9 @@ struct EvalAccumulator {
     answer_field_correct_count: usize,
     answer_field_expected_count: usize,
     answer_terminated_count: usize,
+    completion_quality_ppm_sum: usize,
+    actual_answer_count: usize,
+    actual_answers: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -854,6 +865,9 @@ pub fn evaluate_completions(
     let mut answer_field_correct_count = 0usize;
     let mut answer_field_expected_count = 0usize;
     let mut answer_terminated_count = 0usize;
+    let mut completion_quality_ppm_sum = 0usize;
+    let mut actual_answer_count = 0usize;
+    let mut actual_answers = BTreeSet::new();
     let mut certificate_prefix_ppm_sum = 0usize;
     let mut completion_token_sum = 0usize;
     let mut failures = Vec::new();
@@ -879,6 +893,12 @@ pub fn evaluate_completions(
         answer_field_expected_count = answer_field_expected_count
             .saturating_add(outcome.reasoning_score.expected_field_count);
         answer_terminated_count += usize::from(outcome.answer_terminated);
+        completion_quality_ppm_sum = completion_quality_ppm_sum
+            .saturating_add(outcome.reasoning_score.completion_quality_ppm);
+        if let Some(actual_answer) = outcome.actual_answer.as_deref() {
+            actual_answer_count = actual_answer_count.saturating_add(1);
+            actual_answers.insert(actual_answer.to_string());
+        }
         certificate_prefix_ppm_sum = certificate_prefix_ppm_sum
             .saturating_add(outcome.reasoning_score.certificate_prefix_ppm);
         completion_token_sum =
@@ -944,6 +964,8 @@ pub fn evaluate_completions(
         answer_field_accuracy: ratio(answer_field_correct_count, answer_field_expected_count),
         answer_terminated_count,
         answer_termination_rate: ratio(answer_terminated_count, items.len()),
+        mean_completion_quality: ratio_ppm(completion_quality_ppm_sum, items.len()),
+        actual_answer_distinct_fraction: ratio(actual_answers.len(), actual_answer_count),
         mean_certificate_prefix_coverage: ratio_ppm(certificate_prefix_ppm_sum, items.len()),
         mean_completion_tokens: ratio_f32(completion_token_sum as f32, items.len()),
         canary_count,
@@ -1694,6 +1716,13 @@ fn add_group_score(
         .answer_field_expected_count
         .saturating_add(outcome.reasoning_score.expected_field_count);
     score.answer_terminated_count += usize::from(outcome.answer_terminated);
+    score.completion_quality_ppm_sum = score
+        .completion_quality_ppm_sum
+        .saturating_add(outcome.reasoning_score.completion_quality_ppm);
+    if let Some(actual_answer) = outcome.actual_answer.as_deref() {
+        score.actual_answer_count = score.actual_answer_count.saturating_add(1);
+        score.actual_answers.insert(actual_answer.to_string());
+    }
 }
 
 fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<RuliadEvalGroupScore> {
@@ -1722,6 +1751,11 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
             ),
             answer_terminated_count: score.answer_terminated_count,
             answer_termination_rate: ratio(score.answer_terminated_count, score.count),
+            mean_completion_quality: ratio_ppm(score.completion_quality_ppm_sum, score.count),
+            actual_answer_distinct_fraction: ratio(
+                score.actual_answers.len(),
+                score.actual_answer_count,
+            ),
         })
         .collect()
 }
@@ -2303,6 +2337,66 @@ mod tests {
             looped.completion_quality_ppm < SCORE_PPM_DENOMINATOR / 2,
             "short periodic answer loops should have low quality, got {}",
             looped.completion_quality_ppm
+        );
+    }
+
+    #[test]
+    fn eval_report_tracks_completion_quality_and_answer_collapse() {
+        let items = vec![
+            RuliadEvalItem {
+                oracle_hash: "a".to_string(),
+                sample_index: 0,
+                split: SampleSplit::Validation,
+                family: "proof_tree".to_string(),
+                task_kind: "prove_theorem".to_string(),
+                math_domains: vec!["category_theory".to_string()],
+                reasoning_modes: vec!["equational_reasoning".to_string()],
+                prompt: "!:".to_string(),
+                expected_answer: "ok=1;l=2;r=2".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+            RuliadEvalItem {
+                oracle_hash: "b".to_string(),
+                sample_index: 1,
+                split: SampleSplit::Validation,
+                family: "proof_tree".to_string(),
+                task_kind: "prove_theorem".to_string(),
+                math_domains: vec!["category_theory".to_string()],
+                reasoning_modes: vec!["equational_reasoning".to_string()],
+                prompt: "!:".to_string(),
+                expected_answer: "ok=1;l=3;r=3".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+        ];
+        let completions = vec![
+            RuliadCompletionRecord {
+                oracle_hash: "a".to_string(),
+                completion: "!:11:h11:h11:h11:h11:h11:h11:h11:h[/R2]".to_string(),
+            },
+            RuliadCompletionRecord {
+                oracle_hash: "b".to_string(),
+                completion: "!:11:h11:h11:h11:h11:h11:h11:h11:h[/R2]".to_string(),
+            },
+        ];
+
+        let report = evaluate_completions("collapse", &items, &completions);
+
+        assert_eq!(report.item_count, 2);
+        assert_eq!(report.scored_count, 2);
+        assert_eq!(report.actual_answer_distinct_fraction, 0.5);
+        assert!(
+            report.mean_completion_quality < 0.5,
+            "{}",
+            report.mean_completion_quality
+        );
+        assert_eq!(report.family_scores.len(), 1);
+        assert_eq!(report.family_scores[0].actual_answer_distinct_fraction, 0.5);
+        assert!(
+            report.family_scores[0].mean_completion_quality < 0.5,
+            "{}",
+            report.family_scores[0].mean_completion_quality
         );
     }
 

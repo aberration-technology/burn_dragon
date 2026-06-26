@@ -544,7 +544,7 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         )
         if arm == args.baseline_arm:
             decision = "control"
-            reasons_text = ""
+            reasons_text = ",".join(reasons)
             score_delta = 0.0
         elif reasons:
             decision = "reject"
@@ -587,11 +587,57 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
     )
 
 
+def validation_summary(rows: list[dict[str, Any]], baseline_arm: str) -> dict[str, Any]:
+    promoted = [
+        str(row.get("arm") or "")
+        for row in rows
+        if row.get("decision") == "promote" and not row.get("fail_reasons")
+    ]
+    healthy = [
+        str(row.get("arm") or "")
+        for row in rows
+        if value(row, "healthy_trial_fraction", 0.0) >= 1.0
+            and int(row.get("ok_trials") or 0) == int(row.get("trials") or 0)
+    ]
+    unhealthy_controls = [
+        str(row.get("arm") or "")
+        for row in rows
+        if row.get("decision") == "control" and row.get("fail_reasons")
+    ]
+    status = "validated_candidate" if promoted else "no_validated_candidate"
+    return {
+        "status": status,
+        "baseline_arm": baseline_arm,
+        "arm_count": len(rows),
+        "healthy_arm_count": len(healthy),
+        "promoted_arm_count": len(promoted),
+        "rejected_arm_count": sum(1 for row in rows if row.get("decision") == "reject"),
+        "hold_arm_count": sum(1 for row in rows if row.get("decision") == "hold"),
+        "unhealthy_control_count": len(unhealthy_controls),
+        "healthy_arms": healthy,
+        "promoted_arms": promoted,
+        "unhealthy_control_arms": unhealthy_controls,
+    }
+
+
 def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str) -> None:
     path = out_dir / "ruliad_promotion_matrix_summary.md"
+    summary = validation_summary(rows, baseline_arm)
     with path.open("w") as handle:
         handle.write("# Ruliad Promotion Matrix\n\n")
         handle.write(f"Baseline arm: `{baseline_arm}`\n\n")
+        handle.write(f"Validation status: `{summary['status']}`\n\n")
+        handle.write(
+            "Validated/promoted arms: "
+            + (", ".join(f"`{arm}`" for arm in summary["promoted_arms"]) or "none")
+            + "\n\n"
+        )
+        if summary["unhealthy_control_arms"]:
+            handle.write(
+                "Unhealthy controls: "
+                + ", ".join(f"`{arm}`" for arm in summary["unhealthy_control_arms"])
+                + "\n\n"
+            )
         handle.write("| arm | decision | ok/trials | healthy | seconds | peak MB | model tok/s | tput | valid CE | dCE | source diff | verifier | dver | partial | schema | dschema | field | dfield | term | dterm | completion | dcomp | cap drop | rec frac | q rec | raw q | raw distinct | comp d2 | comp period | out d2 | policy rstd | policy clip | policy applied | policy skipped | policy gated | policy comp | policy health | vpo compact | score d | reasons |\n")
         handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
         for row in rows:
@@ -646,6 +692,12 @@ def write_markdown(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str)
     print(path)
 
 
+def write_validation_summary(rows: list[dict[str, Any]], out_dir: Path, baseline_arm: str) -> None:
+    path = out_dir / "ruliad_promotion_matrix_validation.json"
+    path.write_text(json.dumps(validation_summary(rows, baseline_arm), indent=2) + "\n")
+    print(path)
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.input)
@@ -689,6 +741,7 @@ def main() -> None:
     write_csv(out_dir / "ruliad_promotion_matrix_trials.csv", trials, trial_fields)
     write_csv(out_dir / "ruliad_promotion_matrix_arm_summary.csv", gated, arm_fields)
     write_markdown(gated, out_dir, args.baseline_arm)
+    write_validation_summary(gated, out_dir, args.baseline_arm)
     print(out_dir / "ruliad_promotion_matrix_arm_summary.csv")
     print(out_dir / "ruliad_promotion_matrix_trials.csv")
 

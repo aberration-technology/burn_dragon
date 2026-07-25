@@ -707,10 +707,7 @@ mod tests {
             "[T] G:A=ABC|R=AA>A,AB>C\n?:nf(x0)<=96\n>0:a,b;c=d\n!:ok=1\n",
             64,
         );
-        for separator in [
-            b',', b';', b':', b'=', b'|', b'(', b')', b'.', b'*', b'+', b'@', b'/', b'<', b'>',
-            b'[', b']', b'?', b'!', b'\n',
-        ] {
+        for separator in *b",;:=|().*+@/<>[]?!\n" {
             assert!(
                 !tokens.contains(&u32::from(separator)),
                 "symbolic token stream should not expose separator byte {}",
@@ -868,7 +865,7 @@ mod tests {
         );
         let eos = tokens.iter().position(|token| *token == 271).expect("eos");
         let payload = &tokens[..eos];
-        for separator in [b',', b';', b':', b'=', b'|', b'(', b')', b'<', b'>'] {
+        for separator in *b",;:=|()<>" {
             assert!(
                 payload.contains(&u32::from(separator)),
                 "structured symbolic token stream should preserve formal separator byte {}",

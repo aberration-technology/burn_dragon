@@ -1214,7 +1214,6 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             width,
             steps,
             initial,
-            trace: _,
             ..
         } => vec![
             format!("r={rule};w={width};n={steps}"),

@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use burn_dragon_train::train::events::{DynamicsControlEvent, DynamicsMode};
-use burn_ecs::prelude::IntoScheduleConfigs;
+use burn_ecs::bevy_ecs;
+use burn_ecs::prelude::{Component, IntoScheduleConfigs};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Component, Default)]
 pub struct DragonDynamicsControlSlot {
     inner: Arc<Mutex<Option<DynamicsControlEvent>>>,
 }
@@ -30,21 +31,12 @@ impl DragonDynamicsControlSlot {
     }
 }
 
-impl burn_ecs::prelude::Resource for DragonDynamicsControlSlot {}
-
-pub struct DragonDynamicsControlPlugin {
-    slot: DragonDynamicsControlSlot,
-}
-
-impl DragonDynamicsControlPlugin {
-    pub fn new(slot: DragonDynamicsControlSlot) -> Self {
-        Self { slot }
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DragonDynamicsControlPlugin;
 
 impl burn_ecs::prelude::Plugin for DragonDynamicsControlPlugin {
     fn build(&self, app: &mut burn_ecs::prelude::App) {
-        app.insert_resource(self.slot.clone()).add_systems(
+        app.add_systems(
             burn_ecs::prelude::Update,
             capture_dynamics_controls.in_set(burn_ecs::prelude::TrainingSet::Sinks),
         );
@@ -53,20 +45,24 @@ impl burn_ecs::prelude::Plugin for DragonDynamicsControlPlugin {
 
 fn capture_dynamics_controls(
     mut controls: burn_ecs::prelude::MessageReader<DynamicsControlEvent>,
-    slot: burn_ecs::prelude::Res<DragonDynamicsControlSlot>,
+    registry: burn_ecs::prelude::Res<burn_ecs::prelude::TrainingRunRegistry>,
+    slots: burn_ecs::prelude::Query<&DragonDynamicsControlSlot>,
 ) {
     for event in controls.read() {
-        slot.store(event.clone());
+        if let Some(slot) = registry.get_query(&event.run_id, &slots) {
+            slot.store(event.clone());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_ecs::prelude::{App, TrainingAppExt, TrainingPlugins, TrainingRunConfig};
 
     fn control_event(mode: DynamicsMode) -> DynamicsControlEvent {
         DynamicsControlEvent {
-            run_id: "run".to_string(),
+            run_id: "run".into(),
             epoch: Some(1),
             absolute_step: Some(1),
             mode,
@@ -99,6 +95,45 @@ mod tests {
 
         let event = slot.take().expect("pending control");
         assert_eq!(event.mode, DynamicsMode::RollbackRecovery);
+    }
+
+    #[test]
+    fn dynamics_controls_are_isolated_by_training_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        app.add_plugins(TrainingPlugins)
+            .add_plugins(DragonDynamicsControlPlugin);
+        let run_a = app
+            .try_add_training_run(TrainingRunConfig::new(
+                "run-a",
+                "run-a",
+                dir.path().join("a"),
+                1,
+            ))
+            .expect("run a");
+        let run_b = app
+            .try_add_training_run(TrainingRunConfig::new(
+                "run-b",
+                "run-b",
+                dir.path().join("b"),
+                1,
+            ))
+            .expect("run b");
+        let slot_a = DragonDynamicsControlSlot::default();
+        let slot_b = DragonDynamicsControlSlot::default();
+        app.world_mut().entity_mut(run_a).insert(slot_a.clone());
+        app.world_mut().entity_mut(run_b).insert(slot_b.clone());
+        let mut event = control_event(DynamicsMode::PlasticityRecovery);
+        event.run_id = "run-a".into();
+        app.world_mut().write_message(event);
+
+        app.update();
+
+        assert_eq!(
+            slot_a.take().expect("run-a control").mode,
+            DynamicsMode::PlasticityRecovery
+        );
+        assert!(slot_b.take().is_none());
     }
 }
 

@@ -555,7 +555,7 @@ fn emit_teacher_forced_validation_metric(
         return;
     };
     let _ = bus.send_metric_sample(TrainingMetricSample {
-        run_id: run_name.to_string(),
+        run_id: run_name.to_string().into(),
         split: TrainingMetricSplit::Valid,
         epoch,
         step_in_epoch,
@@ -1215,7 +1215,7 @@ where
                 .saturating_add(iteration.saturating_sub(1));
             if emit_step_events {
                 let _ = bus.send_step_started(StepStarted {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     absolute_step,
                     epoch,
                 });
@@ -1319,7 +1319,7 @@ where
             }
             if mean_train_loss.is_finite() {
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1349,7 +1349,7 @@ where
                     0.0
                 };
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1359,7 +1359,7 @@ where
                     running_value: metrics.fitness_std as f64,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1369,7 +1369,7 @@ where
                     running_value: metrics.coefficient_rms as f64,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1379,7 +1379,7 @@ where
                     running_value: metrics.coefficient_clip_fraction as f64,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1389,7 +1389,7 @@ where
                     running_value: elapsed_ms,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1399,7 +1399,7 @@ where
                     running_value: timing.candidate_eval_ms,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1409,7 +1409,7 @@ where
                     running_value: timing.update_ms,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1419,7 +1419,7 @@ where
                     running_value: candidate_eval_fraction,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1429,7 +1429,7 @@ where
                     running_value: update_fraction,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1439,7 +1439,7 @@ where
                     running_value: forward_evaluations_per_second,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1449,7 +1449,7 @@ where
                     running_value: eggroll.population.population_size as f64,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1459,7 +1459,7 @@ where
                     running_value: eggroll.population.population_chunk_size as f64,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1472,7 +1472,7 @@ where
                     EggrollPerturbationScope::DragonCoreProjection => 1.0,
                 };
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -1484,7 +1484,7 @@ where
             }
             if emit_step_events {
                 let _ = bus.send_step_finished(StepFinished {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     absolute_step,
                     epoch,
                     loss: mean_train_loss.is_finite().then_some(mean_train_loss),
@@ -1494,7 +1494,7 @@ where
         drop(iterator);
 
         let _ = bus.send_epoch_summary(TrainingEpochSummary {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Train,
             epoch,
         });
@@ -1547,7 +1547,7 @@ where
             &[best_valid_epoch, best_ruliad_checkpoint_epoch],
         )?;
         let _ = bus.send_checkpoint(CheckpointEvent {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             checkpoint_id: format!("model-{epoch}"),
             epoch: Some(epoch),
             absolute_step: Some(absolute_step),
@@ -2275,7 +2275,7 @@ where
                 .saturating_add(iteration.saturating_sub(1));
             if emit_step_events {
                 let _ = bus.send_step_started(StepStarted {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     absolute_step,
                     epoch,
                 });
@@ -2332,7 +2332,7 @@ where
 
             if log_train_metrics && let Some(mean_train_loss) = mean_train_loss {
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -2342,7 +2342,7 @@ where
                     running_value: mean_train_loss,
                 });
                 let _ = bus.send_metric_sample(TrainingMetricSample {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
                     step_in_epoch: iteration,
@@ -2363,7 +2363,7 @@ where
             }
             if emit_step_events {
                 let _ = bus.send_step_finished(StepFinished {
-                    run_id: env.run_name.to_string(),
+                    run_id: env.run_name.to_string().into(),
                     absolute_step,
                     epoch,
                     loss: mean_train_loss,
@@ -2417,7 +2417,7 @@ where
         }
         drop(iterator);
         let _ = bus.send_epoch_summary(TrainingEpochSummary {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Train,
             epoch,
         });
@@ -2494,7 +2494,7 @@ where
             &bus,
         );
         let _ = bus.send_checkpoint(CheckpointEvent {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             checkpoint_id: format!("model-{epoch}"),
             epoch: Some(epoch),
             absolute_step: Some(absolute_step),
@@ -2657,7 +2657,7 @@ where
             latent_eval_sweep_emitted = true;
         }
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
@@ -2688,7 +2688,7 @@ where
             .saturating_mul(steps_per_epoch)
             .saturating_add(count);
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count.saturating_add(1),
@@ -2758,7 +2758,7 @@ where
             ("Source Weighted Loss Ratio", ratio),
         ] {
             let _ = bus.send_metric_sample(TrainingMetricSample {
-                run_id: env.run_name.to_string(),
+                run_id: env.run_name.to_string().into(),
                 split: TrainingMetricSplit::Valid,
                 epoch,
                 step_in_epoch: count.saturating_add(1),
@@ -2770,12 +2770,12 @@ where
         }
     }
     let _ = bus.send_epoch_summary(TrainingEpochSummary {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         split: TrainingMetricSplit::Valid,
         epoch,
     });
     let _ = bus.send_validation_finished(ValidationFinished {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch,
         absolute_step: Some(epoch.saturating_mul(steps_per_epoch).saturating_sub(1)),
         loss: Some(mean),
@@ -2827,7 +2827,7 @@ where
         count += 1;
         total += loss;
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
@@ -2911,7 +2911,7 @@ where
             latent_eval_sweep_emitted = true;
         }
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
@@ -2989,7 +2989,7 @@ where
             ("Source Weighted Loss Ratio", ratio),
         ] {
             let _ = bus.send_metric_sample(TrainingMetricSample {
-                run_id: env.run_name.to_string(),
+                run_id: env.run_name.to_string().into(),
                 split: TrainingMetricSplit::Valid,
                 epoch,
                 step_in_epoch: count.saturating_add(1),
@@ -3001,12 +3001,12 @@ where
         }
     }
     let _ = bus.send_epoch_summary(TrainingEpochSummary {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         split: TrainingMetricSplit::Valid,
         epoch,
     });
     let _ = bus.send_validation_finished(ValidationFinished {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch,
         absolute_step: Some(epoch.saturating_mul(steps_per_epoch).saturating_sub(1)),
         loss: Some(mean),
@@ -3075,7 +3075,7 @@ fn emit_latent_eval_step_validation_sweep<B>(
         let loss = mean_scalar_from_loss(loss);
         let prefix = format!("Latent Eval Steps {steps}");
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -3130,7 +3130,7 @@ fn emit_latent_reasoning_step_diagnostics(
         ),
     ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -3271,7 +3271,7 @@ fn emit_latent_step_metric(
     bus: &TrainingEventBus,
 ) {
     let _ = bus.send_metric_sample(TrainingMetricSample {
-        run_id: run_name.to_string(),
+        run_id: run_name.to_string().into(),
         split: TrainingMetricSplit::Valid,
         epoch,
         step_in_epoch: 0,
@@ -3325,7 +3325,7 @@ where
         count += 1;
         total += loss;
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
@@ -4452,7 +4452,7 @@ fn emit_ruliad_correctness_metrics_with_labels(
             .map(|prefix| format!("{prefix} {name}"))
             .unwrap_or_else(|| name.to_string());
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -4493,7 +4493,7 @@ fn emit_ruliad_correctness_metrics_with_labels(
                 .map(|prefix| format!("{prefix} {name}"))
                 .unwrap_or_else(|| name.to_string());
             let _ = bus.send_metric_sample(TrainingMetricSample {
-                run_id: run_name.to_string(),
+                run_id: run_name.to_string().into(),
                 split: TrainingMetricSplit::Valid,
                 epoch,
                 step_in_epoch: 0,
@@ -4543,7 +4543,7 @@ fn emit_ruliad_capability_gate_metrics(
         ),
     ] {
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -4555,7 +4555,7 @@ fn emit_ruliad_capability_gate_metrics(
     }
     if gates.enabled && !status.passed {
         let _ = bus.send_gate_event(TrainingGateEvent {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             gate: "ruliad_capability_gate_failed".to_string(),
             action: TrainingGateAction::Alert,
             severity: TrainingGateSeverity::Warning,
@@ -4595,7 +4595,7 @@ fn ruliad_capability_probe_sample(
     extend_ruliad_capability_groups(&mut group_buckets, "mode", &report.reasoning_mode_scores);
 
     CapabilityProbeSample {
-        run_id: run_name.to_string(),
+        run_id: run_name.to_string().into(),
         split: TrainingMetricSplit::Valid,
         epoch,
         absolute_step,
@@ -4724,7 +4724,7 @@ where
         count += 1;
         total += loss;
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
@@ -4895,7 +4895,7 @@ fn emit_output_degeneracy_sample_with_prefix(
 ) {
     if metric_prefix.is_none() {
         let _ = bus.send_output_degeneracy_sample(OutputDegeneracySample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             absolute_step,
@@ -4941,7 +4941,7 @@ fn emit_output_degeneracy_sample_with_prefix(
             .map(|prefix| format!("{prefix} {name}"))
             .unwrap_or_else(|| name.to_string());
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: run_name.to_string(),
+            run_id: run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: 0,
@@ -5032,7 +5032,7 @@ fn emit_continual_backprop_telemetry<B>(
     }
     *last_emitted_optimizer_step = telemetry.optimizer_step;
     let _ = bus.send_continual_backprop_sample(ContinualBackpropSample {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch: Some(epoch),
         absolute_step,
         optimizer_step: telemetry.optimizer_step,
@@ -5081,7 +5081,7 @@ fn emit_predictive_coding_telemetry<B>(
     let grad_norm_max = snapshot.grad_norm_max();
     let delta_rms_mean = snapshot.delta_rms_mean();
     let _ = bus.send_predictive_coding_sample(PredictiveCodingSample {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch: Some(epoch),
         absolute_step,
         optimizer_step,
@@ -5113,7 +5113,7 @@ fn emit_predictive_coding_telemetry<B>(
             continue;
         };
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Train,
             epoch,
             step_in_epoch,
@@ -5181,7 +5181,7 @@ fn emit_latent_reasoning_telemetry<B>(
             continue;
         };
         let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Train,
             epoch,
             step_in_epoch,
@@ -5218,7 +5218,7 @@ where
         model.set_recovery_auxiliary_active(active.recovery_auxiliary_active());
         return DynamicsControlOutcome::Continue;
     };
-    if event.run_id != env.run_name {
+    if event.run_id.as_str() != env.run_name {
         return DynamicsControlOutcome::Continue;
     }
     apply_dynamics_control_event(env, &event, active, optimizer, model)
@@ -5281,7 +5281,7 @@ where
     let Some(event) = slot.take() else {
         return Ok(DynamicsControlOutcome::Continue);
     };
-    if event.run_id != env.run_name {
+    if event.run_id.as_str() != env.run_name {
         return Ok(DynamicsControlOutcome::Continue);
     }
     let rollback_epoch = event.rollback_to_epoch;
@@ -5716,7 +5716,7 @@ fn emit_dynamics_control<B>(
         ),
     };
     let _ = bus.send_dynamics_control(DynamicsControlEvent {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch: Some(epoch),
         absolute_step: Some(absolute_step),
         mode,
@@ -5878,7 +5878,7 @@ fn emit_policy_gate_with_action<B>(
     B::Device: Clone,
 {
     let _ = bus.send_gate_event(TrainingGateEvent {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         gate: gate.to_string(),
         action,
         severity,
@@ -6225,7 +6225,7 @@ where
     let current_latent_total = model.model.latent_total_capacity();
     let skip = |reason: String, bus: &TrainingEventBus| {
         let _ = bus.send_model_scale_skipped(ModelScaleSkipped {
-            run_id: env.run_name.to_string(),
+            run_id: env.run_name.to_string().into(),
             epoch: Some(epoch),
             absolute_step: Some(absolute_step),
             from_capacity_units: current_latent_total,
@@ -6234,7 +6234,7 @@ where
         });
     };
 
-    if request.run_id != env.run_name {
+    if request.run_id.as_str() != env.run_name {
         skip(
             format!(
                 "scale request run_id {} does not match active run {}",
@@ -6334,7 +6334,7 @@ where
     *scale_generation = scale_generation.saturating_add(1);
 
     let _ = bus.send_model_scale_applied(ModelScaleApplied {
-        run_id: env.run_name.to_string(),
+        run_id: env.run_name.to_string().into(),
         epoch: Some(epoch),
         absolute_step: Some(absolute_step),
         from_capacity_units: report.old_latent_total,
@@ -11121,7 +11121,7 @@ mod tests {
             &mut current_model_config,
             &mut scale_generation,
             ModelScaleRequest {
-                run_id: "dynamic-scale-smoke".to_string(),
+                run_id: "dynamic-scale-smoke".to_string().into(),
                 epoch: Some(1),
                 absolute_step: Some(0),
                 from_capacity_units: 8,
@@ -11160,7 +11160,7 @@ mod tests {
         let devices = vec![device.clone()];
         let request_slot = crate::train::neuron_scaling::NeuronScaleRequestSlot::default();
         assert!(request_slot.set_if_empty(ModelScaleRequest {
-            run_id: "dynamic-scale-loop-smoke".to_string(),
+            run_id: "dynamic-scale-loop-smoke".to_string().into(),
             epoch: Some(1),
             absolute_step: Some(0),
             from_capacity_units: 8,

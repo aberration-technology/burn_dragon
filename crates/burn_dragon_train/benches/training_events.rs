@@ -1,6 +1,7 @@
 use burn_dragon_train::train::events::{
-    TrainingAppBuilder, TrainingAppConfig, TrainingEventBus, TrainingMetricSample,
-    TrainingMetricSplit, TrainingRunContext,
+    App, TrainingAppExt, TrainingEventBus, TrainingEventBusConfig, TrainingMetricSample,
+    TrainingMetricSplit, TrainingPlugins, TrainingRunContext, TrainingRunOptions, TrainingRuntime,
+    TrainingRuntimeThread,
 };
 use burn_dragon_train::{TrainingEventsConfig, TrainingGatesConfig};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -8,7 +9,7 @@ use std::hint::black_box;
 
 fn metric_sample(step: usize) -> TrainingMetricSample {
     TrainingMetricSample {
-        run_id: "bench".to_string(),
+        run_id: "bench".into(),
         split: TrainingMetricSplit::Train,
         epoch: 1 + step / 1024,
         step_in_epoch: 1 + step % 1024,
@@ -34,13 +35,23 @@ fn threaded_event_bus_metric_step(c: &mut Criterion) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let mut events = TrainingEventsConfig::default();
     events.flush_every_steps = usize::MAX;
-    let runtime = TrainingAppBuilder::new(TrainingAppConfig {
-        run: TrainingRunContext::new("bench", "bench", tempdir.path(), 1024),
-        events,
-        gates: TrainingGatesConfig::default(),
-        bus: Default::default(),
-    })
-    .spawn_threaded()
+    let run_dir = tempdir.path().to_owned();
+    let runtime = TrainingRuntimeThread::spawn(
+        move || {
+            let mut app = App::new();
+            app.add_plugins(TrainingPlugins);
+            app.try_add_training_run_with(
+                TrainingRunContext::new("bench", "bench", run_dir, 1024),
+                TrainingRunOptions {
+                    sinks: events,
+                    gates: TrainingGatesConfig::default(),
+                    ..TrainingRunOptions::default()
+                },
+            )?;
+            Ok(app)
+        },
+        TrainingEventBusConfig::default(),
+    )
     .expect("event runtime");
     let bus: TrainingEventBus = runtime.bus();
     let mut step = 0usize;
@@ -60,21 +71,25 @@ fn event_runtime_metric_step(c: &mut Criterion) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let mut events = TrainingEventsConfig::default();
     events.flush_every_steps = usize::MAX;
-    let mut runtime = TrainingAppBuilder::new(TrainingAppConfig {
-        run: TrainingRunContext::new("bench", "bench", tempdir.path(), 1024),
-        events,
-        gates: TrainingGatesConfig::default(),
-        bus: Default::default(),
-    })
-    .build()
-    .expect("event runtime");
+    let mut app = App::new();
+    app.add_plugins(TrainingPlugins);
+    app.try_add_training_run_with(
+        TrainingRunContext::new("bench", "bench", tempdir.path(), 1024),
+        TrainingRunOptions {
+            sinks: events,
+            gates: TrainingGatesConfig::default(),
+            ..TrainingRunOptions::default()
+        },
+    )
+    .expect("training run");
+    let mut runtime = TrainingRuntime::new(app);
     let mut step = 0usize;
 
     c.bench_function("training_event_metric_step", |b| {
         b.iter(|| {
             let current_step = step;
             step = step.wrapping_add(1);
-            runtime.write_metric_sample(black_box(metric_sample(current_step)));
+            runtime.write_message(black_box(metric_sample(current_step)));
             runtime.update();
         });
     });

@@ -6,6 +6,7 @@ mod deploy_settings;
 mod local_browser_e2e;
 mod native_canary;
 mod revision_contract;
+mod stack_lock;
 mod workflow_contracts;
 mod workflow_tools;
 

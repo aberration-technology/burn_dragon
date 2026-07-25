@@ -899,7 +899,13 @@ fn metric_float(stats: &std::collections::BTreeMap<String, MetricValue>, key: &s
 }
 
 fn metric_integer(stats: &std::collections::BTreeMap<String, MetricValue>, key: &str) -> i64 {
-    match stats.get(key).expect("metric") {
+    let Some(metric) = stats.get(key) else {
+        panic!(
+            "missing integer metric {key}; available metrics: {:?}",
+            stats.keys().collect::<Vec<_>>()
+        );
+    };
+    match metric {
         MetricValue::Integer(value) => *value,
         other => panic!("expected integer metric for {key}, got {other:?}"),
     }

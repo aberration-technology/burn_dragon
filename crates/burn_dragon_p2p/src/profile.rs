@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 #[cfg(feature = "native")]
 use anyhow::bail;
 use anyhow::{Result, anyhow};
-use burn_p2p::{BrowserRole, ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt};
+use burn_p2p::{
+    BrowserRole, ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, TrainingProtocol,
+};
 use burn_p2p_workload::{
     DirectoryMetadataAttachment, find_matching_directory_entry_with_predicate,
 };
@@ -1037,6 +1039,9 @@ pub fn browser_training_config_from_profile(
     entry: &ExperimentDirectoryEntry,
     profile: &DragonExperimentProfile,
 ) -> Result<Option<DragonBrowserTrainingConfig>> {
+    if !browser_training_protocol_supported(entry) {
+        return Ok(None);
+    }
     if !entry.browser_role_allowed(BrowserRole::TrainerWgpu) {
         return Ok(None);
     }
@@ -1075,6 +1080,10 @@ pub fn browser_training_config_from_profile(
             revision_contract: None,
         }),
     }))
+}
+
+fn browser_training_protocol_supported(entry: &ExperimentDirectoryEntry) -> bool {
+    matches!(&entry.training_protocol, TrainingProtocol::ArtifactWindows)
 }
 
 #[cfg(feature = "native")]
@@ -1168,6 +1177,14 @@ mod tests {
             .expect("profile should be present");
 
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn browser_training_is_hidden_for_diloco_revisions() {
+        let mut entry = sample_entry();
+        assert!(browser_training_protocol_supported(&entry));
+        entry.training_protocol = TrainingProtocol::DiLoCo(burn_p2p::DiLoCoPolicy::default());
+        assert!(!browser_training_protocol_supported(&entry));
     }
 
     #[test]

@@ -204,6 +204,42 @@ Run the release gate with
 hard assertion. Detailed methodology and remaining production gates are in
 [P2P production readiness](../../docs/p2p-production-readiness.md).
 
+## Protocol-Aware Native Training
+
+The native operator separates network service from training:
+
+- `run-peer` joins, synchronizes, serves, and reports a peer; it does not execute
+  optimizer steps.
+- `run-trainer-daemon` is the long-running trainer service. It reads the active
+  signed revision and dispatches each step through `train_protocol_once`, so an
+  ArtifactWindows revision cannot accidentally execute as DiLoCo or vice
+  versa.
+- `train-window-once` is the bounded ArtifactWindows operator primitive and
+  intentionally rejects DiLoCo revisions.
+
+The trainer daemon restores the canonical head before training and does not
+initialize a private genesis unless explicitly requested for isolated
+development. It pauses while its live role set is read-only, resumes after a
+capability upgrade, backs off on disconnect/failure, and exports ECS ingress
+pressure with its status. Use `--max-protocol-steps` for a finite deployment
+smoke; the default of zero runs until shutdown.
+
+```bash
+cargo run -p burn_dragon_p2p --bin burn_dragon_p2p_native -- \
+  run-trainer-daemon \
+  --config ./crates/burn_dragon_p2p/deploy/native-peer.toml.example \
+  --experiment-kind nca \
+  --backend wgpu
+```
+
+Browser training currently implements ArtifactWindows only. A browser that
+selects a DiLoCo revision is not offered a trainer configuration, and the
+runtime also rejects stale/bypassed trainer configuration before loading
+weights. It may still participate as an observer or verifier. Native DiLoCo is
+therefore the convergence candidate today; mixed native/browser DiLoCo
+training remains an explicit missing implementation rather than an implicit
+fallback.
+
 ## Compact Browser Updates
 
 The browser EGGROLL path publishes a `SeededFitness` compact update: shared

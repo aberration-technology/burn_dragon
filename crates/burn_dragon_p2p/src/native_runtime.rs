@@ -9,14 +9,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use burn::tensor::backend::AutodiffBackend;
+use burn_ecs::prelude::App;
 use burn_ecs::{
-    EventBusConfig, PipelineComputeClass, PipelineParticipation, TrainingAppBuilder,
-    TrainingAppConfig, TrainingEcsThread, TrainingRunConfig,
+    PipelineComputeClass, PipelineParticipation, TrainingAppExt, TrainingEventBusConfig,
+    TrainingPlugins, TrainingRunConfig, TrainingRunOptions, TrainingRuntimeThread,
 };
 use burn_p2p::{
     ControlHandle, NodeTelemetrySnapshot, PeerRole, PeerRoleSet, RunningNode, RuntimeStatus,
     SelectedWorkloadProject, TelemetryHandle,
-    ecs::{P2pCapabilityAssessment, P2pTrainingEcsObserver, P2pTrainingIngressPlugin},
+    ecs::{
+        P2pCapabilityAssessment, P2pTrainingEcsObserver, P2pTrainingEventBus,
+        P2pTrainingEventBusStats, P2pTrainingIngressPlugin,
+    },
 };
 
 use crate::capability_reprobe::{
@@ -36,7 +40,8 @@ where
 {
     prepared: Option<PreparedNativePeer<B>>,
     running: Option<RunningNode<SelectedWorkloadProject<DragonProjectFamily<B>>>>,
-    p2p_event_thread: Option<TrainingEcsThread>,
+    p2p_event_thread: Option<TrainingRuntimeThread>,
+    p2p_event_bus: P2pTrainingEventBus,
     stop_flag: Arc<AtomicBool>,
     monitor_thread: Option<JoinHandle<()>>,
 }
@@ -89,6 +94,11 @@ where
 
     pub fn snapshot(&self) -> NodeTelemetrySnapshot {
         self.telemetry().snapshot()
+    }
+
+    /// Returns point-in-time pressure and delivery counters for the run's ECS ingress.
+    pub fn p2p_event_bus_stats(&self) -> P2pTrainingEventBusStats {
+        self.p2p_event_bus.stats()
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -170,22 +180,29 @@ where
             .map(|entry| entry.current_revision_id.as_str())
             .unwrap_or("revision"),
     );
-    let event_bus_config = EventBusConfig::default();
+    let event_bus_config = TrainingEventBusConfig::default();
     let (p2p_plugin, p2p_event_bus) =
         P2pTrainingIngressPlugin::channel(event_bus_config.queue_capacity);
-    let p2p_event_thread = TrainingAppBuilder::new(TrainingAppConfig {
-        run: TrainingRunConfig::new(
-            p2p_run_id.clone(),
-            p2p_run_id.clone(),
-            prepared.storage_root.join("ecs/p2p"),
-            1,
-        ),
-        events: prepared.config.training.events.clone(),
+    let p2p_run = TrainingRunConfig::new(
+        p2p_run_id.clone(),
+        p2p_run_id.clone(),
+        prepared.storage_root.join("ecs/p2p"),
+        1,
+    );
+    let p2p_run_options = TrainingRunOptions {
+        sinks: prepared.config.training.events.clone(),
         gates: prepared.config.training.gates.clone(),
-        bus: event_bus_config,
-    })
-    .with_plugin(p2p_plugin)
-    .spawn_threaded()?;
+        ..TrainingRunOptions::default()
+    };
+    let p2p_event_thread = TrainingRuntimeThread::spawn(
+        move || {
+            let mut app = App::new();
+            app.add_plugins(TrainingPlugins).add_plugins(p2p_plugin);
+            app.try_add_training_run_with(p2p_run, p2p_run_options)?;
+            Ok(app)
+        },
+        event_bus_config,
+    )?;
     let running = prepared
         .builder
         .clone()
@@ -230,6 +247,7 @@ where
         prepared: Some(prepared),
         running: Some(running),
         p2p_event_thread: Some(p2p_event_thread),
+        p2p_event_bus,
         stop_flag,
         monitor_thread,
     })
@@ -387,7 +405,7 @@ fn contains_trainer_role(roles: &PeerRoleSet) -> bool {
 
 fn read_only_capability_assessment(run_id: &str, reason: String) -> P2pCapabilityAssessment {
     P2pCapabilityAssessment {
-        run_id: run_id.to_owned(),
+        run_id: run_id.into(),
         participation: PipelineParticipation::Observer,
         compute: PipelineComputeClass::None,
         supported_participation: BTreeSet::from([
@@ -404,7 +422,7 @@ fn trainer_capability_assessment(
     reason: String,
 ) -> P2pCapabilityAssessment {
     P2pCapabilityAssessment {
-        run_id: run_id.to_owned(),
+        run_id: run_id.into(),
         participation: PipelineParticipation::Trainer,
         compute: if backend_label.eq_ignore_ascii_case("cpu")
             || backend_label.eq_ignore_ascii_case("ndarray")
@@ -455,7 +473,7 @@ where
         supported_participation.insert(PipelineParticipation::Validator);
     }
     P2pCapabilityAssessment {
-        run_id: run_id.to_owned(),
+        run_id: run_id.into(),
         participation,
         compute,
         supported_participation,

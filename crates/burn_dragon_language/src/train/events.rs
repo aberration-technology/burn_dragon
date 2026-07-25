@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use burn_dragon_train::train::events::{
-    BurnInterrupterControl, TrainingAppBuilder, TrainingAppConfig, TrainingEventMetricLogger,
-    TrainingRunContext,
+    BurnInterrupterControl, DynamicsEquilibriumPlugin, ModelCapacityConfig, ModelCapacityState,
+    TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext, TrainingRunOptions,
+    TrainingRuntimeThread,
 };
+use burn_ecs::bevy_ecs;
 use burn_ecs::prelude::{
-    App, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Res,
-    SourceSelectionBucketMetric, SourceSelectionGroupMetric, SourceSelectionSample,
-    TrainingMetricSample, TrainingMetricSplit, TrainingSet, Update,
+    App, Component, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Query, Res,
+    SourceSelectionBucketMetric, SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt,
+    TrainingMetricSample, TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry,
+    TrainingSet, Update,
 };
 
 use crate::config::TrainingHyperparameters;
@@ -16,15 +19,13 @@ use crate::dataset::Dataset;
 use crate::train::dynamics::{DragonDynamicsControlPlugin, DragonDynamicsControlSlot};
 use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
 
-#[derive(Clone)]
-pub struct RuliadSourceSelectionResource {
+#[derive(Clone, Component)]
+pub struct RuliadSourceSelectionConfig {
     dataset: Arc<Dataset>,
     source_selection_every_steps: usize,
 }
 
-impl burn_ecs::prelude::Resource for RuliadSourceSelectionResource {}
-
-impl RuliadSourceSelectionResource {
+impl RuliadSourceSelectionConfig {
     pub fn new(dataset: Arc<Dataset>, source_selection_every_steps: usize) -> Self {
         Self {
             dataset,
@@ -62,46 +63,75 @@ pub fn build_training_event_handles(
     dynamics_control_slot: Option<DragonDynamicsControlSlot>,
 ) -> Result<TrainingEventHandles> {
     let interrupter = burn_train::Interrupter::new();
-    let mut event_app = TrainingAppBuilder::new(TrainingAppConfig {
-        run: TrainingRunContext::new(run_name, run_name, run_dir, steps_per_epoch),
-        events: training.events.clone(),
+    let control = BurnInterrupterControl::new(interrupter.clone());
+    let run = TrainingRunContext::new(run_name, run_name, run_dir, steps_per_epoch);
+    let source_selection = source_selection_dataset
+        .filter(|dataset| dataset.uses_live_source_selection())
+        .map(|dataset| {
+            RuliadSourceSelectionConfig::new(dataset, training.events.source_selection_every_steps)
+        });
+    let neuron_scaling = (training
+        .neuron_scaling
+        .enabled
+        .then_some(training.neuron_scaling.clone()))
+    .zip(neuron_scaling_slot);
+    let capacity = neuron_scaling
+        .as_ref()
+        .map(|(config, (current_latent_total, _))| ModelCapacityConfig {
+            policy: crate::train::neuron_scaling::capacity_policy_from_neuron_scaling(config),
+            capacity: Some(ModelCapacityState::new(
+                *current_latent_total,
+                config.max_latent_total.max(*current_latent_total),
+            )),
+        });
+    let options = TrainingRunOptions {
+        sinks: training.events.clone(),
         gates: training.gates.clone(),
-        bus: Default::default(),
-    })
-    .with_control(BurnInterrupterControl::new(interrupter.clone()));
-
-    if let Some(dataset) =
-        source_selection_dataset.filter(|dataset| dataset.uses_live_source_selection())
-    {
-        let source_selection_every_steps = training.events.source_selection_every_steps;
-        event_app = event_app.with_plugin(RuliadSourceSelectionTelemetryPlugin::new(
-            dataset,
-            source_selection_every_steps,
-        ));
-    }
-
-    if training.neuron_scaling.enabled
-        && let Some((current_latent_total, request_slot)) = neuron_scaling_slot
-    {
-        event_app = event_app.with_plugin(DragonNeuronScalingPlugin::new(
-            training.neuron_scaling.clone(),
-            current_latent_total,
-            request_slot,
-        ));
-    }
-
-    if training.dynamics.enabled {
-        event_app = event_app.with_plugin(
-            burn_dragon_train::train::events::DynamicsEquilibriumPlugin::new(
-                training.dynamics.clone(),
-            ),
-        );
-        if let Some(slot) = dynamics_control_slot {
-            event_app = event_app.with_plugin(DragonDynamicsControlPlugin::new(slot));
-        }
-    }
-
-    let event_thread = event_app.spawn_threaded()?;
+        dynamics: training
+            .dynamics
+            .enabled
+            .then_some(training.dynamics.clone()),
+        capacity,
+    };
+    let dynamics_enabled = training.dynamics.enabled;
+    let event_thread = TrainingRuntimeThread::spawn(
+        move || {
+            let mut app = App::new();
+            app.add_plugins(TrainingPlugins)
+                .insert_training_control(control);
+            if source_selection.is_some() {
+                app.add_plugins(RuliadSourceSelectionTelemetryPlugin);
+            }
+            if neuron_scaling.is_some() {
+                app.add_plugins(DragonNeuronScalingPlugin);
+            }
+            if dynamics_enabled {
+                app.add_plugins(DynamicsEquilibriumPlugin);
+                if dynamics_control_slot.is_some() {
+                    app.add_plugins(DragonDynamicsControlPlugin);
+                }
+            }
+            let run_entity = app.try_add_training_run_with(run, options)?;
+            if let Some(source_selection) = source_selection {
+                app.world_mut()
+                    .entity_mut(run_entity)
+                    .insert(source_selection);
+            }
+            if let Some((config, (_, request_slot))) = neuron_scaling {
+                app.world_mut().entity_mut(run_entity).insert(
+                    crate::train::neuron_scaling::DragonNeuronScalingState::new(
+                        config,
+                        request_slot,
+                    ),
+                );
+            }
+            if let Some(slot) = dynamics_control_slot {
+                app.world_mut().entity_mut(run_entity).insert(slot);
+            }
+            Ok(app)
+        },
+        TrainingEventBusConfig::default(),
+    )?;
     let metric_logger =
         TrainingEventMetricLogger::with_thread(event_thread, run_name, steps_per_epoch);
     Ok(TrainingEventHandles {
@@ -110,34 +140,22 @@ pub fn build_training_event_handles(
     })
 }
 
-pub struct RuliadSourceSelectionTelemetryPlugin {
-    source_selection: RuliadSourceSelectionResource,
-}
-
-impl RuliadSourceSelectionTelemetryPlugin {
-    pub fn new(dataset: Arc<Dataset>, source_selection_every_steps: usize) -> Self {
-        Self {
-            source_selection: RuliadSourceSelectionResource::new(
-                dataset,
-                source_selection_every_steps,
-            ),
-        }
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuliadSourceSelectionTelemetryPlugin;
 
 impl Plugin for RuliadSourceSelectionTelemetryPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(self.source_selection.clone())
-            .add_systems(
-                Update,
-                record_ruliad_source_selection_from_loss.in_set(TrainingSet::Telemetry),
-            );
+        app.add_systems(
+            Update,
+            record_ruliad_source_selection_from_loss.in_set(TrainingSet::Telemetry),
+        );
     }
 }
 
 fn record_ruliad_source_selection_from_loss(
     mut metrics: MessageReader<TrainingMetricSample>,
-    source_selection: Res<RuliadSourceSelectionResource>,
+    registry: Res<TrainingRunRegistry>,
+    source_selection_runs: Query<&RuliadSourceSelectionConfig>,
     mut source_selection_events: MessageWriter<SourceSelectionSample>,
 ) {
     for sample in metrics.read() {
@@ -146,6 +164,10 @@ fn record_ruliad_source_selection_from_loss(
         {
             continue;
         }
+        let Some(source_selection) = registry.get_query(&sample.run_id, &source_selection_runs)
+        else {
+            continue;
+        };
         if sample.absolute_step % source_selection.source_selection_every_steps != 0 {
             continue;
         }
@@ -168,11 +190,12 @@ fn record_ruliad_source_selection_from_loss(
 }
 
 pub(crate) fn source_selection_sample_from_snapshot(
-    run_id: String,
+    run_id: impl Into<TrainingRunId>,
     absolute_step: usize,
     loss: Option<f32>,
     snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
 ) -> SourceSelectionSample {
+    let run_id = run_id.into();
     SourceSelectionSample {
         run_id,
         absolute_step,

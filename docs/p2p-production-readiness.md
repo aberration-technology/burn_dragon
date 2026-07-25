@@ -5,9 +5,8 @@ Dragon training deployment. It covers the dependency stack:
 
 ```text
 burn_ecs -> burn_p2p -> burn_dragon
-                |
-                +-> burn_eggroll
-                +-> burn_pc
+burn_eggroll ----------------^
+burn_pc ---------------------^
 ```
 
 `burn_ecs` is the run-scoped orchestration layer. `burn_p2p` owns
@@ -24,14 +23,14 @@ describe the public training network as adversarially production-ready.
 | --- | --- | --- |
 | revision identity | hardware-neutral signed contract, strict trust validation, atomic live rollout, and authority rotation tooling | execute the rotation and disaster-recovery drill against staging |
 | initial weights | signed full-head genesis, content-addressed artifact verification, and canonical decoded-tensor verification on native and browser loaders | clean-storage staging canary using the production artifact |
-| native training | one-shot/continuous windows, head reconcile, TBPTT state, capability downgrade, hysteretic in-process recovery, exact three-peer candidate/root replay, and three-seed DiLoCo convergence parity | run a 24-hour restart and partition soak |
-| browser training | WebGPU AdamW and forward-only seeded-fitness paths, WASM/WebGPU compile, lease-scoped Firefox execution, and clean no-WebGPU downgrade | deployed Chrome/Pages/edge/WebGPU training canary against a signed production contract |
+| native training | one-shot/continuous windows, a protocol-aware managed trainer daemon, head reconcile, TBPTT state, capability downgrade/upgrade, exact three-peer candidate/root replay, and three-seed DiLoCo convergence parity | run a 24-hour restart and partition soak |
+| browser training | ArtifactWindows WebGPU AdamW and forward-only seeded-fitness paths, WASM/WebGPU compile, lease-scoped Firefox execution, clean no-WebGPU downgrade, and fail-closed DiLoCo selection | deployed Chrome/Pages/edge/WebGPU training canary against a signed ArtifactWindows production contract; implement browser DiLoCo before claiming mixed-protocol trainer parity |
 | compact updates | bounded seeded-fitness publication, deterministic reconstruction, authenticated lease recovery, and independent sampled fitness replay | untrusted multi-validator quorum and quarantine drill |
 | capability policy | conservative preflight, persistent downgrade, revisioned live roles, memory-headroom re-probe, success hysteresis, and bounded backoff | device-loss/recreation drill on each supported GPU backend |
 | read-only peers | observer/verifier scopes, projections, and role replacement rather than stale-role union | public UI authorization drill |
 | ECS integration | run-scoped lifecycle, capability, window, reconcile, and bounded ingress state | sustained multi-run ingress soak |
 | checkpoint scaling | deterministic GDN2 widening and versioned metadata | mixed-width network activation and rollback drill |
-| bandwidth | measured canonical payload sizes, topology simulations, networked DiLoCo, persistent outer SGD/momentum state, and FP32/FP16/int8 DiLoCo quality matrix | live WAN and heterogeneous native/browser measurements |
+| bandwidth | measured canonical payload sizes, topology simulations, networked DiLoCo, persistent outer SGD/momentum state, and FP32/FP16/int8 DiLoCo quality matrix | live WAN and heterogeneous native measurements; browser DiLoCo quality is not implemented |
 
 Unit tests prove contract mechanics and deterministic behavior. The release
 matrix provides bounded local convergence evidence; it does not prove
@@ -155,15 +154,20 @@ The machine-readable reports for the final enforced matrix are under
 `target/test-artifacts/p2p-diloco-release-enforced-final-v2/`. Every report uses
 schema version 3, records the release build profile and ndarray CPU backend,
 contains 17 enforced gate assertions, and was produced by the executable above.
+The current-stack seed-1337 rerun independently reproduced `2.638148` P2P
+loss, `2.585947` synchronized loss, `98.329%` progress parity, all 17 passing
+gates, 108 peer-local inner updates, 3.030 aggregate inner steps per network
+second, and 59,277,440 estimated wire payload bytes excluding control
+overhead.
 
 ### Local transport and recovery gate
 
 The convergence matrix runs above the complete local protocol suites:
 
-- `burn_p2p_swarm`: 83 serial tests, including rendezvous registration,
+- `burn_p2p_swarm`: 84 serial tests, including rendezvous registration,
   Kademlia recovery, relay reservation, 192 KiB relayed transfer, direct-route
   handoff, and post-transfer single-route reconciliation
-- `burn_p2p`: 234 serial tests, including DiLoCo cohort/reducer behavior,
+- `burn_p2p`: 266 serial tests, including DiLoCo cohort/reducer behavior,
   runtime restart, security-state restoration, diffusion, and control-plane
   projection
 - the four-peer rotating-reducer authority scenario passed eight consecutive
@@ -250,6 +254,23 @@ validators reconstruct browser compact updates from the canonical base model.
 
 Browser CPU remains a development smoke path, not a production trainer.
 
+Protocol compatibility is explicit rather than inferred from backend:
+
+- `run-peer` joins and serves network state but performs no training.
+- the managed `run-trainer-daemon` checks the live trainer role and dispatches
+  every iteration through `train_protocol_once`.
+- ArtifactWindows training waits for canonical advancement before opening the
+  next local window; DiLoCo advances through its round cursor and persistent
+  outer state.
+- browser training configuration is exposed only for ArtifactWindows. Both
+  profile resolution and the live browser runtime reject DiLoCo training.
+
+This means native DiLoCo and browser ArtifactWindows are separately coherent
+execution paths, not yet one mixed trainer cohort. A signed protocol revision
+must choose one. Browsers can remain read-only metric/verifier peers on a
+DiLoCo revision, but browser DiLoCo training is a remaining implementation and
+quality gate.
+
 ## recurrent state contract
 
 Dragon TBPTT state is run- and stream-local. Its identity includes revision,
@@ -275,7 +296,10 @@ Dragon exports contiguous stream segments as indivisible groups so TBPTT rows
 cannot be split across peers inside a segment. Groups are packed largest-first
 into the least-loaded microshard, which avoids key-order skew while preserving
 recurrent continuity. Window selection rotates over bounded micro-epochs
-instead of replaying the first shard prefix.
+instead of replaying the first shard prefix. Dataset materialization caps the
+physical shard count to the number of records, or to the number of indivisible
+groups for grouped data, so the lease planner cannot assign a valid-but-empty
+training shard.
 
 The number of independently leasable microshards must cover the simultaneous
 trainer cohort. When trainers outnumber available partitions, assignment fails
@@ -379,8 +403,14 @@ The following bounded checks have passed on the current ARM development host.
 Unless explicitly identified as a learning matrix above, they are
 wiring/correctness evidence rather than convergence claims:
 
-- complete `burn_dragon_p2p` library suite: 70 tests
+- complete `burn_dragon_p2p` library suite: 72 tests
+- all 18 non-ignored native integration tests, including shard-backed NCA,
+  live-source Ruliad, mixed native/browser roles, persistence, and diffusion
 - strict native and WASM package Clippy for the P2P surfaces
+- real headless Chromium WebGPU execution of generated NCA browser training
+  from the WASM package
+- production Pages shell build with the WebGPU WASM bundle and auth callback
+  routes
 - real Firefox WASM execution for lease-scoped shard selection
 - real Firefox no-WebGPU downgrade to a read-only role
 - signed three-peer restart recovery in 3.008 seconds with persistent peer
@@ -405,18 +435,20 @@ The canonical 100M-parameter bandwidth ablation measured:
 | update | payload bytes | reduction vs dense fp32 |
 | --- | ---: | ---: |
 | dense fp32 | 400,000,000 | 1x |
-| subspace, 1,280 fp32 coefficients | 7,624 | 52,466x |
-| subspace, 1,280 int8 coefficients | 2,723 | 146,897x |
-| subspace, 4,096 int8 coefficients | 8,082 | 49,493x |
-| seeded fitness, population 256 int8 | 3,258 | 122,775x |
-| seeded fitness, population 1,024 int8 | 4,719 | 84,764x |
-| seeded fitness, population 4,096 int8 | 10,566 | 37,857x |
+| subspace, 1,280 fp32 coefficients | 5,394 | 74,157x |
+| subspace, 1,280 int8 coefficients | 1,566 | 255,428x |
+| subspace, 4,096 int8 coefficients | 4,382 | 91,283x |
+| seeded fitness, population 256 int8 | 3,026 | 132,188x |
+| seeded fitness, population 1,024 int8 | 3,794 | 105,430x |
+| seeded fitness, population 4,096 int8 | 6,866 | 58,258x |
 
 For 64 peers, the topology simulation reduced the 400 MB dense global
-all-to-all estimate from 1.4884 TB/window to 10.1 MB for 1,280-dimensional
-subspace updates or 39.3 MB for population-4,096 seeded fitness. These are
-canonical wire-size and topology measurements. They do not establish equal
-learning quality. The current `SubspaceLatent` implementation is a seeded
+all-to-all estimate from 1.4884 TB/window to 5.83 MB for 1,280-dimensional
+int8 subspace updates or 25.55 MB for population-4,096 seeded fitness. The
+central-reducer and replicated-DAG totals for the 1,280-dimensional int8
+condition were 95,526 and 200,448 bytes, respectively. These are canonical
+wire-size and topology measurements. They do not establish equal learning
+quality. The current `SubspaceLatent` implementation is a seeded
 CountSketch-style affine map; it is compatible with the communication
 principle of lightweight subspace fine-tuning, but it is not a learned
 low-rank reconstructor.
@@ -451,5 +483,7 @@ deployment experiments. Public arbitrary-peer training remains blocked on:
 - GPU device-loss/recreation drills across supported backends
 - heterogeneous native/browser compact-versus-dense learning-quality and
   live-WAN evidence
+- browser DiLoCo execution and convergence evidence before enabling browser
+  trainers on the native DiLoCo revision
 
 Those are concrete release gates, not optional follow-up polish.

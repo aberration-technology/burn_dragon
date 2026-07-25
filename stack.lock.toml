@@ -1,0 +1,25 @@
+schema_version = 1
+
+[[repositories]]
+name = "burn_ecs"
+path = "../burn_ecs"
+url = "https://github.com/aberration-technology/burn_ecs.git"
+revision = "76f75bed78d1c78cbdbcc480d73832628f903436"
+
+[[repositories]]
+name = "burn_p2p"
+path = "../burn_p2p"
+url = "https://github.com/aberration-technology/burn_p2p.git"
+revision = "c1a1e2e4c6486c09a86be959f2212112a211429c"
+
+[[repositories]]
+name = "burn_eggroll"
+path = "../burn_eggroll"
+url = "https://github.com/aberration-technology/burn_eggroll.git"
+revision = "a1510b5782b9d4a594df79ebdbf362bb14a40277"
+
+[[repositories]]
+name = "burn_pc"
+path = "../burn_pc"
+url = "https://github.com/aberration-technology/burn_pc.git"
+revision = "fff44de6c567632349a0acfbe18375d4f43eaaa3"

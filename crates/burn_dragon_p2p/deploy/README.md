@@ -195,6 +195,9 @@ That workflow:
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
 - creates or reuses the S3 bucket used for durable direct artifact publication
 - optionally creates an autoscaled managed trainer pool that installs `burn_dragon_p2p_native` from crates.io and fetches its auth bundle from SSM
+- runs managed trainer instances with the protocol-aware
+  `run-trainer-daemon` command; `run-peer` is reserved for non-training network
+  service
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
@@ -202,6 +205,13 @@ That workflow:
 - derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
 
 The supported production bootstrap path is the published `burn_p2p_bootstrap` crate. The `git` install path is still supported, but only as a deliberate pre-release validation path for unpublished upstream `burn_p2p` revisions.
+
+The trainer daemon follows the `TrainingProtocol` in the active signed
+directory revision. The currently browser-compatible public profile uses
+ArtifactWindows; the convergence-qualified native candidate uses DiLoCo.
+Browsers fail closed to observer/verifier on a DiLoCo revision until browser
+DiLoCo is implemented. Do not advertise one mixed native/browser trainer
+cohort across those two protocol revisions.
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. By default that also replaces bootstrap-local root-volume state. If you enable retained bootstrap storage, Terraform reattaches the retained data volume so local peer/runtime/auth state survives a normal rebuild. Artifact publication remains externalized in S3 either way.
 
@@ -461,6 +471,10 @@ Recommended Midwest baseline:
 
 ### Required Environment Secrets
 
+- `BURN_STACK_TOKEN`
+  - read-only GitHub token covering `burn_ecs`, `burn_p2p`, `burn_eggroll`,
+    and `burn_pc` when any locked sibling is private. The bootstrap action uses
+    the ordinary job token when all siblings are publicly readable.
 - `BURN_DRAGON_P2P_AUTH_CLIENT_ID`
 - `BURN_DRAGON_P2P_AUTH_CLIENT_SECRET`
   - generic OAuth/OIDC client credentials used when the selected auth connector needs them

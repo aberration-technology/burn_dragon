@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use burn_dragon_train::train::events::{
-    CapacityPlateauDetected, CapacityScalingPolicy, ModelCapacityState, ModelScaleRequest,
+    CapacityPlateauDetected, CapacityScalingPolicy, ModelScaleRequest,
 };
+use burn_ecs::bevy_ecs;
 use burn_ecs::prelude::{
-    App, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Res, Resource, TrainingSet,
-    Update,
+    App, Component, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Query, Res,
+    TrainingRunRegistry, TrainingSet, Update,
 };
 
 use crate::config::train::{NeuronScalingConfig, NeuronScalingGrowth};
@@ -32,50 +33,31 @@ impl NeuronScaleRequestSlot {
     }
 }
 
-#[derive(Clone)]
-struct DragonNeuronScalingResource {
+#[derive(Clone, Component)]
+pub(crate) struct DragonNeuronScalingState {
     config: NeuronScalingConfig,
     request_slot: NeuronScaleRequestSlot,
 }
 
-impl Resource for DragonNeuronScalingResource {}
-
-pub struct DragonNeuronScalingPlugin {
-    resource: DragonNeuronScalingResource,
-    initial_capacity: ModelCapacityState,
-}
-
-impl DragonNeuronScalingPlugin {
-    pub fn new(
-        config: NeuronScalingConfig,
-        current_latent_total: usize,
-        request_slot: NeuronScaleRequestSlot,
-    ) -> Self {
-        let max_latent_total = config.max_latent_total.max(current_latent_total);
+impl DragonNeuronScalingState {
+    pub(crate) fn new(config: NeuronScalingConfig, request_slot: NeuronScaleRequestSlot) -> Self {
         Self {
-            resource: DragonNeuronScalingResource {
-                config,
-                request_slot,
-            },
-            initial_capacity: ModelCapacityState::new(current_latent_total, max_latent_total),
+            config,
+            request_slot,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DragonNeuronScalingPlugin;
+
 impl Plugin for DragonNeuronScalingPlugin {
     fn build(&self, app: &mut App) {
-        let policy = capacity_policy_from_neuron_scaling(&self.resource.config);
-        app.add_plugins(
-            burn_dragon_train::train::events::CapacityPlateauPlugin::new(
-                policy,
-                self.initial_capacity.clone(),
-            ),
-        )
-        .insert_resource(self.resource.clone())
-        .add_systems(
-            Update,
-            request_neuron_scale_on_capacity_plateau.in_set(TrainingSet::Control),
-        );
+        app.add_plugins(burn_dragon_train::train::events::CapacityPlateauPlugin)
+            .add_systems(
+                Update,
+                request_neuron_scale_on_capacity_plateau.in_set(TrainingSet::Control),
+            );
     }
 }
 
@@ -105,10 +87,14 @@ pub fn next_latent_total(
 
 fn request_neuron_scale_on_capacity_plateau(
     mut plateaus: MessageReader<CapacityPlateauDetected>,
-    scaling: Res<DragonNeuronScalingResource>,
+    registry: Res<TrainingRunRegistry>,
+    scaling_runs: Query<&DragonNeuronScalingState>,
     mut requests: MessageWriter<ModelScaleRequest>,
 ) {
     for plateau in plateaus.read() {
+        let Some(scaling) = registry.get_query(&plateau.run_id, &scaling_runs) else {
+            continue;
+        };
         let Some(target) = next_latent_total(plateau.current_capacity_units, &scaling.config)
         else {
             continue;
@@ -131,6 +117,7 @@ fn request_neuron_scale_on_capacity_plateau(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_ecs::prelude::{App, TrainingAppExt, TrainingPlugins, TrainingRunConfig};
 
     #[test]
     fn next_latent_total_doubles_until_cap() {
@@ -161,5 +148,66 @@ mod tests {
         assert_eq!(policy.max_scale_events, 3);
         assert_eq!(policy.capacity_patience_epochs, 4);
         assert!(!policy.require_source_selection);
+    }
+
+    #[test]
+    fn scale_requests_are_isolated_by_training_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        app.add_plugins(TrainingPlugins)
+            .add_plugins(DragonNeuronScalingPlugin);
+        let run_a = app
+            .try_add_training_run(TrainingRunConfig::new(
+                "run-a",
+                "run-a",
+                dir.path().join("a"),
+                1,
+            ))
+            .expect("run a");
+        let run_b = app
+            .try_add_training_run(TrainingRunConfig::new(
+                "run-b",
+                "run-b",
+                dir.path().join("b"),
+                1,
+            ))
+            .expect("run b");
+        let config = NeuronScalingConfig {
+            enabled: true,
+            max_latent_total: 8192,
+            ..NeuronScalingConfig::default()
+        };
+        let slot_a = NeuronScaleRequestSlot::default();
+        let slot_b = NeuronScaleRequestSlot::default();
+        app.world_mut()
+            .entity_mut(run_a)
+            .insert(DragonNeuronScalingState::new(
+                config.clone(),
+                slot_a.clone(),
+            ));
+        app.world_mut()
+            .entity_mut(run_b)
+            .insert(DragonNeuronScalingState::new(config, slot_b.clone()));
+        app.world_mut().write_message(CapacityPlateauDetected {
+            run_id: "run-a".into(),
+            epoch: 4,
+            absolute_step: 400,
+            current_capacity_units: 1024,
+            max_capacity_units: 8192,
+            best_valid_epoch: 1,
+            best_valid_loss: 1.0,
+            current_valid_loss: 1.0,
+            stagnant_epochs: 3,
+            mean_learning_progress: Some(0.0),
+            entropy_bits: Some(4.0),
+            hash_noise_probability: Some(0.0),
+            message: "test capacity plateau".into(),
+        });
+
+        app.update();
+
+        let request = slot_a.take().expect("run-a scale request");
+        assert_eq!(request.to_capacity_units, 2048);
+        assert!(slot_b.take().is_none());
     }
 }

@@ -22,7 +22,7 @@ use burn_p2p::{
     ArtifactId, ArtifactKind, COMPACT_UPDATE_PAYLOAD_VERSION, ChunkingScheme,
     CompactScalarEncoding, CompactScalarVector, CompactUpdateBody, CompactUpdatePayload, ContentId,
     ExperimentId, ExperimentScope, HeadDescriptor, HeadId, Precision, RevisionId,
-    SeededFitnessGeneration, StudyId, WorkloadId, WorkloadTrainingArtifact,
+    SeededFitnessGeneration, StudyId, TrainingProtocol, WorkloadId, WorkloadTrainingArtifact,
     WorkloadTrainingArtifactChunk, WorkloadTrainingContribution, WorkloadTrainingLease,
     WorkloadUpdateEnvelope,
 };
@@ -2244,6 +2244,22 @@ async fn start_live_browser_participant(
         return Ok(None);
     };
     let snapshot = fetch_edge_snapshot(edge_base_url).await?;
+    let directory_entry = snapshot
+        .directory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.experiment_id.as_str() == live.experiment_id
+                && entry.current_revision_id.as_str() == live.revision_id
+        })
+        .ok_or_else(|| anyhow!("browser training experiment revision is absent from the edge"))?;
+    ensure!(
+        matches!(
+            &directory_entry.training_protocol,
+            TrainingProtocol::ArtifactWindows
+        ),
+        "browser training does not implement the selected DiLoCo revision; participate as an observer or verifier"
+    );
     let revision_contract = resolve_browser_revision_contract(&snapshot, config, live)?;
     let bootstrap_head = revision_contract
         .as_ref()

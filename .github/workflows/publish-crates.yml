@@ -27,8 +27,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: bootstrap locked sibling stack
         uses: ./.github/actions/bootstrap-stack
-        with:
-          token: ${{ secrets.BURN_STACK_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: publish crates in dependency order

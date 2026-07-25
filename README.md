@@ -34,10 +34,8 @@ is pinned in `stack.lock.toml`. Run `scripts/bootstrap_stack.py` to clone
 missing siblings, `--verify` to reject revision/remote drift, or
 `--repair-existing` to move only clean existing siblings to the locked
 revisions. CI uses the same lock through the shared bootstrap action.
-For private siblings, configure the repository secret `BURN_STACK_TOKEN` with
-read-only contents access to all four repositories. GitHub's repository-scoped
-job token does not provide cross-repository access and is intentionally not
-used as a fallback.
+All locked providers are public and clone over HTTPS, so stack bootstrap
+requires no cross-repository credential.
 
 Use `local-browser-e2e` as the first browser/p2p production-parity gate. It runs
 the deployment config drift checks, a local edge/auth/browser training receipt

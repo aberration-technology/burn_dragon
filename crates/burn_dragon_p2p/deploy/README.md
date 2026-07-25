@@ -471,10 +471,6 @@ Recommended Midwest baseline:
 
 ### Required Environment Secrets
 
-- `BURN_STACK_TOKEN`
-  - read-only GitHub token covering `burn_ecs`, `burn_p2p`, `burn_eggroll`,
-    and `burn_pc`. The repository-scoped job token cannot read private sibling
-    repositories and is intentionally not used as a fallback.
 - `BURN_DRAGON_P2P_AUTH_CLIENT_ID`
 - `BURN_DRAGON_P2P_AUTH_CLIENT_SECRET`
   - generic OAuth/OIDC client credentials used when the selected auth connector needs them

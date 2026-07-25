@@ -227,18 +227,15 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
         "stack bootstrap action invokes the pre-Cargo bootstrap",
     )?;
     for snippet in [
-        "inputs:",
-        "token:",
-        "require cross-repository read token",
-        "BURN_STACK_TOKEN must have read access",
-        "GIT_CONFIG_COUNT: 1",
-        "GIT_CONFIG_KEY_0: url.https://x-access-token:${{ inputs.token }}@github.com/.insteadOf",
-        "GIT_CONFIG_VALUE_0: https://github.com/",
+        "BURN_STACK_TOKEN",
+        "x-access-token",
+        ".insteadOf",
+        "${{ inputs.token }}",
     ] {
-        require_contains(
+        require_absent(
             &action,
             snippet,
-            "stack bootstrap action authenticates private sibling clones",
+            "public stack bootstrap action does not require credentials",
         )?;
     }
 
@@ -253,15 +250,10 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
                 "uses: ./.github/actions/bootstrap-stack",
                 &format!("{path} materializes the locked sibling stack before Cargo"),
             )?;
-            require_contains(
-                &text,
-                "token: ${{ secrets.BURN_STACK_TOKEN }}",
-                &format!("{path} supplies cross-repository read credentials"),
-            )?;
             require_absent(
                 &text,
-                "secrets.BURN_STACK_TOKEN || github.token",
-                &format!("{path} does not use a repository-scoped token for sibling clones"),
+                "BURN_STACK_TOKEN",
+                &format!("{path} does not require credentials for public sibling clones"),
             )?;
         }
         require_absent(

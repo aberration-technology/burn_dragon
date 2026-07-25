@@ -1,0 +1,7 @@
+extends = ["ruliad-1m-la-16k.verifier-vpo-oracle.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+include_structured_negative_candidates = true
+structured_negative_count = 2
+structured_template_negative_count = 2
+structured_schema_negative_count = 6

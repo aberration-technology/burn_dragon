@@ -32,6 +32,21 @@ extend_when_max_difficulty_probability_at_least = 0.25
 # Zero means no hard materialization limit; the ruliad frontier can keep expanding forever.
 max_materialized_levels = 0
 
+[source_selection.cold_start]
+enabled = true
+# Initial training should learn the answer contract on easy buckets before the live frontier opens.
+# This is a warm-start curriculum cap, not a global difficulty ceiling.
+max_difficulty_level = 0
+hold_steps = 1024
+ramp_steps = 8192
+release_requires_mastery = true
+mastery_min_feedback_count = 1
+mastery_verifier_min = 0.50
+mastery_completion_health_min = 0.75
+mastery_schema_wrong_max = 0.25
+mastery_malformed_max = 0.05
+mastery_missing_max = 0.05
+
 [source_selection.sampler]
 exploration_floor = 0.02
 mastery_escape_weight = 1.0
@@ -39,6 +54,8 @@ mastery_escape_threshold = 0.80
 mastery_min_normalized_difficulty = 0.85
 mastery_min_max_difficulty_probability = 0.40
 mastery_hash_noise_max_probability = 0.0
+max_answer_contract_probability = 0.35
+min_answer_contract_probability = 0.10
 
 [[families]]
 kind = "eca"

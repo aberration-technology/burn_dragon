@@ -13,7 +13,7 @@ use burn_dragon_universality::NcaCorpusConfig;
 use burn_p2p::NetworkManifest;
 use burn_p2p::{
     AuthConfig, EdgeEnrollmentConfig, ExperimentScope, IdentityConfig, PeerRole, PeerRoleSet,
-    PrincipalSession, SwarmAddress,
+    PrincipalSession, SwarmAddress, TrainingProtocol,
 };
 #[cfg(target_arch = "wasm32")]
 use burn_p2p_browser::BrowserSiteBootstrapConfig;
@@ -21,9 +21,21 @@ use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use chrono::{DateTime, TimeZone, Utc};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+use sha2::{Digest, Sha256};
 use url::form_urlencoded;
 
 const GIB: u64 = 1024 * 1024 * 1024;
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+pub fn dragon_model_schema_hash(model_config: &DragonConfig) -> burn_p2p::ContentId {
+    let bytes = serde_json::to_vec(model_config).expect("Dragon model config should serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(b"dragon-model-schema");
+    hasher.update([0]);
+    hasher.update(bytes);
+    burn_p2p::ContentId::new(format!("dragon-model-schema-{:x}", hasher.finalize()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonCapabilityPolicy {
@@ -41,6 +53,8 @@ pub struct DragonCapabilityPolicy {
     pub allow_native_validator_fallback: bool,
     #[serde(default = "default_allow_browser_verifier_fallback")]
     pub allow_browser_verifier_fallback: bool,
+    #[serde(default)]
+    pub native_reprobe: DragonNativeCapabilityReprobePolicy,
 }
 
 impl Default for DragonCapabilityPolicy {
@@ -53,6 +67,7 @@ impl Default for DragonCapabilityPolicy {
             browser_wgpu_memory_budget_bytes: default_browser_wgpu_memory_budget_bytes(),
             allow_native_validator_fallback: default_allow_native_validator_fallback(),
             allow_browser_verifier_fallback: default_allow_browser_verifier_fallback(),
+            native_reprobe: DragonNativeCapabilityReprobePolicy::default(),
         }
     }
 }
@@ -83,6 +98,87 @@ impl DragonCapabilityPolicy {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragonNativeCapabilityReprobePolicy {
+    /// Enables in-process recovery from a read-only capability downgrade.
+    #[serde(default = "default_native_reprobe_enabled")]
+    pub enabled: bool,
+    /// Minimum delay after a fit failure before the first recovery probe.
+    #[serde(default = "default_native_reprobe_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Base interval between recovery probes.
+    #[serde(default = "default_native_reprobe_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum exponential-backoff interval after repeated fit failures.
+    #[serde(default = "default_native_reprobe_max_interval_secs")]
+    pub max_interval_secs: u64,
+    /// Consecutive successful probes required before trainer roles return.
+    #[serde(default = "default_native_reprobe_required_successes")]
+    pub required_successes: u32,
+    /// Available host-memory headroom required relative to the estimated
+    /// training footprint.
+    #[serde(default = "default_native_reprobe_memory_headroom_percent")]
+    pub memory_headroom_percent: u16,
+    /// Absolute available host-memory floor for a successful probe.
+    #[serde(default = "default_native_reprobe_min_available_memory_bytes")]
+    pub min_available_memory_bytes: u64,
+}
+
+impl Default for DragonNativeCapabilityReprobePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_native_reprobe_enabled(),
+            cooldown_secs: default_native_reprobe_cooldown_secs(),
+            interval_secs: default_native_reprobe_interval_secs(),
+            max_interval_secs: default_native_reprobe_max_interval_secs(),
+            required_successes: default_native_reprobe_required_successes(),
+            memory_headroom_percent: default_native_reprobe_memory_headroom_percent(),
+            min_available_memory_bytes: default_native_reprobe_min_available_memory_bytes(),
+        }
+    }
+}
+
+impl DragonNativeCapabilityReprobePolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.interval_secs > 0
+                && self.max_interval_secs >= self.interval_secs
+                && self.required_successes > 0
+                && self.memory_headroom_percent >= 100,
+            "native capability re-probe policy requires interval > 0, max interval >= interval, required successes > 0, and memory headroom >= 100%"
+        );
+        Ok(())
+    }
+}
+
+fn default_native_reprobe_enabled() -> bool {
+    true
+}
+
+fn default_native_reprobe_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_native_reprobe_interval_secs() -> u64 {
+    15
+}
+
+fn default_native_reprobe_max_interval_secs() -> u64 {
+    300
+}
+
+fn default_native_reprobe_required_successes() -> u32 {
+    2
+}
+
+fn default_native_reprobe_memory_headroom_percent() -> u16 {
+    125
+}
+
+fn default_native_reprobe_min_available_memory_bytes() -> u64 {
+    512 * 1024 * 1024
 }
 
 fn default_native_cpu_memory_budget_bytes() -> Option<u64> {
@@ -307,6 +403,32 @@ impl DragonPeerNetworkConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragonAggregationConfig {
+    #[serde(default = "default_root_ema_update_basis_points")]
+    pub root_ema_update_basis_points: u16,
+}
+
+impl DragonAggregationConfig {
+    pub const MAX_BASIS_POINTS: u16 = 10_000;
+
+    pub fn root_ema_update_weight(&self) -> f64 {
+        f64::from(self.root_ema_update_basis_points) / f64::from(Self::MAX_BASIS_POINTS)
+    }
+}
+
+impl Default for DragonAggregationConfig {
+    fn default() -> Self {
+        Self {
+            root_ema_update_basis_points: default_root_ema_update_basis_points(),
+        }
+    }
+}
+
+const fn default_root_ema_update_basis_points() -> u16 {
+    DragonAggregationConfig::MAX_BASIS_POINTS
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonManifestSeed {
     pub project_family_id: String,
     pub network_id: String,
@@ -322,6 +444,19 @@ pub struct DragonManifestSeed {
     pub authority_public_keys: Vec<String>,
     #[serde(default)]
     pub bootstrap_addrs: Vec<String>,
+    #[serde(default)]
+    pub revision_contract_path: Option<PathBuf>,
+    #[serde(default)]
+    pub require_signed_revision_contracts: bool,
+    /// Selects the distributed training protocol bound to this revision.
+    ///
+    /// Artifact windows remain the backward-compatible default. DiLoCo
+    /// parameters are part of the signed revision contract and therefore
+    /// cannot be changed by a peer at runtime.
+    #[serde(default)]
+    pub training_protocol: TrainingProtocol,
+    #[serde(default)]
+    pub aggregation: DragonAggregationConfig,
     #[serde(default = "default_manifest_timestamp")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_manifest_timestamp")]
@@ -341,6 +476,10 @@ impl Default for DragonManifestSeed {
             protocol_major: 0,
             authority_public_keys: Vec::new(),
             bootstrap_addrs: Vec::new(),
+            revision_contract_path: None,
+            require_signed_revision_contracts: false,
+            training_protocol: TrainingProtocol::default(),
+            aggregation: DragonAggregationConfig::default(),
             created_at: default_manifest_timestamp(),
             release_built_at: default_manifest_timestamp(),
         }
@@ -387,7 +526,7 @@ pub struct DragonNativePeerConfig {
     pub network: DragonPeerNetworkConfig,
     #[serde(default)]
     pub target: Option<DragonNativeTarget>,
-    #[serde(default)]
+    #[serde(default = "default_native_identity")]
     pub identity: IdentityConfig,
     #[serde(default)]
     pub bootstrap_peers: Vec<SwarmAddress>,
@@ -410,6 +549,10 @@ pub struct DragonNativePeerConfig {
 
 fn default_app_semver() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version")
+}
+
+fn default_native_identity() -> IdentityConfig {
+    IdentityConfig::Persistent
 }
 
 fn dedupe_swarm_addresses(addresses: Vec<SwarmAddress>) -> Vec<SwarmAddress> {
@@ -568,11 +711,17 @@ pub struct DragonNativeAuthBundle {
     pub certificate_not_after: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenWindowRecord {
     pub inputs: Vec<i64>,
     pub targets: Vec<i64>,
     pub reset_stream_state: bool,
+    #[serde(default)]
+    pub stream_group_id: Option<u64>,
+    #[serde(default)]
+    pub stream_row: Option<usize>,
+    #[serde(default)]
+    pub chunk_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,7 +765,7 @@ pub enum DragonBrowserTokenSource {
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserLiveParticipantConfig {
     #[serde(default)]
     pub principal_id: Option<String>,
@@ -628,6 +777,9 @@ pub struct DragonBrowserLiveParticipantConfig {
     pub publish_canonical_update: bool,
     #[serde(default = "default_browser_load_active_head_artifact")]
     pub load_active_head_artifact: bool,
+    /// Signed semantic contract and canonical genesis for this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_contract: Option<burn_p2p::RevisionContractBundle>,
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
@@ -666,6 +818,50 @@ impl DragonBrowserExecutionBackend {
 }
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DragonBrowserOptimizerConfig {
+    /// Reverse-mode AdamW. Canonical publication requires model-record readback.
+    #[default]
+    Adamw,
+    /// Forward-only deterministic perturbations with compact fitness transport.
+    SeededFitness {
+        eggroll: burn_eggroll::EggrollConfig,
+        #[serde(default = "default_browser_fitness_scalar_encoding")]
+        scalar_encoding: burn_p2p::CompactScalarEncoding,
+    },
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+impl DragonBrowserOptimizerConfig {
+    pub fn update_codec(&self) -> Result<burn_p2p::UpdateCodec, String> {
+        match self {
+            Self::Adamw => Ok(burn_p2p::UpdateCodec::FullModel),
+            Self::SeededFitness { eggroll, .. } => {
+                eggroll.validate().map_err(|error| error.to_string())?;
+                Ok(burn_p2p::UpdateCodec::SeededFitness {
+                    population: u32::try_from(eggroll.population.population_size)
+                        .map_err(|_| "browser EGGROLL population exceeds u32::MAX")?,
+                    rank: u32::try_from(eggroll.population.rank)
+                        .map_err(|_| "browser EGGROLL rank exceeds u32::MAX")?,
+                    seed: eggroll.population.seed,
+                    replay: burn_p2p::SeededFitnessReplayPolicy::default(),
+                })
+            }
+        }
+    }
+
+    pub fn is_forward_only(&self) -> bool {
+        matches!(self, Self::SeededFitness { .. })
+    }
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+fn default_browser_fitness_scalar_encoding() -> burn_p2p::CompactScalarEncoding {
+    burn_p2p::CompactScalarEncoding::SymmetricInt16
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserTrainingConfig {
     pub experiment_kind: DragonExperimentKind,
@@ -673,9 +869,17 @@ pub struct DragonBrowserTrainingConfig {
     #[serde(default)]
     pub training_objective: DragonBrowserTrainingObjectiveConfig,
     #[serde(default)]
+    pub optimizer: DragonBrowserOptimizerConfig,
+    #[serde(default)]
     pub execution_backend: DragonBrowserExecutionBackend,
     #[serde(default = "default_browser_block_size")]
     pub block_size: usize,
+    /// Optional through-time truncation inside each token window.
+    #[serde(default)]
+    pub tbptt_chunk_size: Option<usize>,
+    /// Retains recurrent Dragon state across stream-aligned token windows.
+    #[serde(default)]
+    pub tbptt_persist_across_steps: bool,
     #[serde(default = "default_browser_learning_rate")]
     pub learning_rate: f64,
     #[serde(default)]
@@ -717,14 +921,28 @@ fn default_browser_batch_size() -> usize {
 pub struct DragonManifestBundle {
     pub release_manifest: burn_p2p::ClientReleaseManifest,
     pub network_manifest: NetworkManifest,
+    pub revision_manifest: burn_p2p::RevisionManifest,
     pub supported_workload: burn_p2p::SupportedWorkload,
     pub experiment_directory: Vec<burn_p2p::ExperimentDirectoryEntry>,
     pub workload_config: burn_p2p::burn::BurnWorkloadConfig,
+    pub training_contract: burn_p2p::TrainingContractManifest,
+    pub training_contract_id: burn_p2p::ContentId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_aggregation_defaults_to_full_federated_average() {
+        let aggregation = DragonAggregationConfig::default();
+
+        assert_eq!(
+            aggregation.root_ema_update_basis_points,
+            DragonAggregationConfig::MAX_BASIS_POINTS
+        );
+        assert_eq!(aggregation.root_ema_update_weight(), 1.0);
+    }
 
     #[test]
     fn seed_node_list_parser_normalizes_and_deduplicates() {
@@ -810,6 +1028,37 @@ mod tests {
         };
 
         assert_eq!(config.target_or_default(), DragonNativeTarget::Auto);
+    }
+
+    #[test]
+    fn native_peer_serde_defaults_to_persistent_identity() {
+        let config = DragonNativePeerConfig {
+            training_overrides: Default::default(),
+            training_config_paths: Vec::new(),
+            storage_root: PathBuf::from("tmp"),
+            network: DragonPeerNetworkConfig::default(),
+            target: None,
+            identity: IdentityConfig::Ephemeral,
+            bootstrap_peers: Vec::new(),
+            manifest: DragonManifestSeed::default(),
+            app_semver: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("valid burn_dragon version"),
+            git_commit: None,
+            enabled_features_label: None,
+            auth: None,
+            capability_policy: DragonCapabilityPolicy::default(),
+            shard_export: None,
+            existing_shard_dataset: None,
+        };
+        let mut value = serde_json::to_value(config).expect("serialize native config");
+        value
+            .as_object_mut()
+            .expect("native config object")
+            .remove("identity");
+        let decoded: DragonNativePeerConfig =
+            serde_json::from_value(value).expect("deserialize native config");
+
+        assert_eq!(decoded.identity, IdentityConfig::Persistent);
     }
 
     #[test]

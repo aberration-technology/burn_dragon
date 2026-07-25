@@ -1,0 +1,14 @@
+extends = ["ruliad-1m-la-64k.answer-contract.training.toml"]
+
+[training.ruliad_supervision]
+answer_close_marker_stride = 1
+answer_close_marker_weight = 2
+answer_schema_token_weight = 1
+answer_value_token_weight = 6
+
+[training.ruliad_supervision.answer_contract]
+weight = 0.50
+schema_token_weight = 1.0
+value_token_weight = 8.0
+other_token_weight = 0.25
+premature_close_unlikelihood_weight = 0.75

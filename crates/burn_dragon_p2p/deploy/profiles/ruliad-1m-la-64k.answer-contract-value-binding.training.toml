@@ -1,0 +1,5 @@
+extends = ["ruliad-1m-la-64k.answer-contract-schema-field-binding.training.toml"]
+
+[training.ruliad_supervision.answer_contract]
+prompt_schema_value_weight = 4.0
+prompt_schema_max_rows_per_step = 4

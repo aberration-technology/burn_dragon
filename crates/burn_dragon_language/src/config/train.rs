@@ -20,11 +20,12 @@ pub use schema::{
     NeuronScalingGrowth, NeuronScalingStabilizationConfig, NextLatentPredictionConfig,
     PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
     PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepeatUnlikelihoodConfig,
-    RepromptTruncation, RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig,
-    RuliadSupervisionConfig, RuliadSupervisionMode, RuliadVerifierRewardConfig,
-    RuliadVerifierRewardMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
+    RepromptTruncation, RuliadAnswerContractConfig, RuliadAnswerDenoisingConfig,
+    RuliadAnswerRankingConfig, RuliadSupervisionConfig, RuliadSupervisionMode,
+    RuliadVerifierRewardConfig, RuliadVerifierRewardMode, SdftObjectiveConfig,
+    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
+    TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    ValidationDatasetConfig,
 };
 
 use crate::tokenizer::TokenizerConfig;

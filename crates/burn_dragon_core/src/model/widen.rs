@@ -260,7 +260,7 @@ pub(super) fn widen_1d_headed_last_dim_prefix_zero_tail<B: Backend>(
             vec![
                 current
                     .clone()
-                    .slice([current_start..current_start + old_per_head]),
+                    .slice_dim(0, current_start..current_start + old_per_head),
                 Tensor::<B, 1>::zeros([new_per_head.saturating_sub(old_per_head)], &device),
             ],
             0,

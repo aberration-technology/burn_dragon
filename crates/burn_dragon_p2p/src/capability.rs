@@ -1,7 +1,5 @@
 #[cfg(all(not(feature = "native"), feature = "wasm-peer"))]
-use burn_dragon_core::{
-    DragonConfig, SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor,
-};
+use burn_dragon_core::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecutor};
 #[cfg(feature = "native")]
 use burn_dragon_language::{DragonConfig, SequenceMemorySystem, SequenceTrainingExecutor};
 use burn_p2p::WorkloadTrainingBudget;
@@ -97,6 +95,14 @@ pub struct DragonNativeCapabilityAssessment {
 #[cfg(feature = "native")]
 impl DragonNativeTargetDecision {
     pub fn burn_target(&self, backend_class: DragonCapabilityClass) -> BurnTarget {
+        if !self.can_train
+            && matches!(
+                self.effective_target,
+                DragonNativeTarget::Auto | DragonNativeTarget::Trainer
+            )
+        {
+            return BurnTarget::Custom(PeerRoleSet::new([PeerRole::Viewer]));
+        }
         match self.effective_target {
             DragonNativeTarget::Auto | DragonNativeTarget::Trainer => match backend_class {
                 DragonCapabilityClass::NativeCpu => {
@@ -583,6 +589,23 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native")]
+    #[test]
+    fn runtime_failed_trainer_maps_to_read_only_role() {
+        let decision = DragonNativeTargetDecision {
+            requested_target: DragonNativeTarget::Trainer,
+            effective_target: DragonNativeTarget::Trainer,
+            can_train: false,
+            trainer_memory_budget_bytes: Some(1024),
+            downgrade_reason: Some("runtime fit failure".into()),
+        };
+
+        assert_eq!(
+            decision.burn_target(DragonCapabilityClass::NativeWgpu),
+            BurnTarget::Custom(PeerRoleSet::new([PeerRole::Viewer]))
+        );
+    }
+
     #[cfg(all(feature = "wasm-ui", feature = "wasm-peer"))]
     fn browser_training_config_with_budget(
         budget_bytes: u64,
@@ -597,8 +620,11 @@ mod tests {
                 ..DragonConfig::default()
             },
             training_objective: crate::config::DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
             block_size: 512,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 6,

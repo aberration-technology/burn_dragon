@@ -1,0 +1,13 @@
+extends = ["ruliad-1m-la-16k.verifier-reward.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+enabled = true
+weight = 0.0
+max_completion_tokens = 64
+structured_negative_count = 2
+structured_template_negative_count = 0
+structured_schema_negative_count = 6
+structured_contrast_weight = 0.005
+structured_contrast_every_steps = 16
+structured_contrast_start_after_steps = 0
+structured_contrast_margin = 0.10

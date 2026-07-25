@@ -264,7 +264,7 @@ where
     A: ContinualBackpropAdapter<B, M>,
 {
     Standard(ResolvedOptimizer<B, M>),
-    ContinualBackprop(ContinualBackpropAdamWOptimizer<B, M, A>),
+    ContinualBackprop(Box<ContinualBackpropAdamWOptimizer<B, M, A>>),
 }
 
 pub fn resolve_optimizer_with_continual_backprop<B, M, A>(
@@ -279,11 +279,9 @@ where
     A: ContinualBackpropAdapter<B, M>,
 {
     let kind = if config.enabled {
-        ContinualBackpropOptimizerKind::ContinualBackprop(ContinualBackpropAdamWOptimizer::new(
-            optimizer_cfg,
-            config.clone(),
-            fresh_model,
-        )?)
+        ContinualBackpropOptimizerKind::ContinualBackprop(Box::new(
+            ContinualBackpropAdamWOptimizer::new(optimizer_cfg, config.clone(), fresh_model)?,
+        ))
     } else {
         ContinualBackpropOptimizerKind::Standard(resolve_optimizer::<B, M>(
             optimizer_cfg,
@@ -872,13 +870,13 @@ where
                 )
             }
             (ContinualBackpropOptimizerKind::ContinualBackprop(optimizer), 1) => {
-                ContinualBackpropOptimizerKind::ContinualBackprop(
-                    optimizer.load_record(
+                ContinualBackpropOptimizerKind::ContinualBackprop(Box::new(
+                    (*optimizer).load_record(
                         record
                             .continual_backprop
                             .expect("continual backprop adamw record"),
                     ),
-                )
+                ))
             }
             (variant, kind) => panic!(
                 "continual backprop optimizer record kind {kind} does not match optimizer variant {}",

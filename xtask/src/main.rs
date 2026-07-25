@@ -5,6 +5,7 @@ mod browser_site;
 mod deploy_settings;
 mod local_browser_e2e;
 mod native_canary;
+mod revision_contract;
 mod workflow_contracts;
 mod workflow_tools;
 
@@ -53,6 +54,10 @@ enum CommandKind {
     ResolveBootstrapStackSettings(workflow_tools::BootstrapStackSettingsArgs),
     SyncBootstrapRuntimeConfig,
     RunLiveNativeTrainingCanary,
+    BuildRevisionContract(revision_contract::BuildRevisionContractArgs),
+    VerifyRevisionContract(revision_contract::VerifyRevisionContractArgs),
+    RotateRevisionContracts(revision_contract::RotateRevisionContractsArgs),
+    RolloutRevisionContracts(revision_contract::RolloutRevisionContractsArgs),
     PublishCrates(workflow_tools::PublishCratesArgs),
     AgentTask {
         #[command(subcommand)]
@@ -129,6 +134,18 @@ fn main() -> Result<()> {
         CommandKind::SyncBootstrapRuntimeConfig => workflow_tools::sync_bootstrap_runtime_config(),
         CommandKind::RunLiveNativeTrainingCanary => {
             workflow_tools::run_live_native_training_canary()
+        }
+        CommandKind::BuildRevisionContract(args) => {
+            revision_contract::build_revision_contract(&args)
+        }
+        CommandKind::VerifyRevisionContract(args) => {
+            revision_contract::verify_revision_contract(&args)
+        }
+        CommandKind::RotateRevisionContracts(args) => {
+            revision_contract::rotate_revision_contracts(&args)
+        }
+        CommandKind::RolloutRevisionContracts(args) => {
+            revision_contract::rollout_revision_contracts(&args)
         }
         CommandKind::PublishCrates(args) => workflow_tools::publish_crates(&args),
         CommandKind::AgentTask { command } => agent_task::run(command),
@@ -600,6 +617,21 @@ fn ensure_chromedriver(chrome: &Path) -> Result<PathBuf> {
     }
 
     let version = chrome_version(chrome)?;
+    for candidate in [
+        "/snap/chromium/current/usr/lib/chromium-browser/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ] {
+        let candidate = PathBuf::from(candidate);
+        if candidate.is_file() && chromedriver_version_matches(&candidate, &version) {
+            return Ok(candidate);
+        }
+    }
+    ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "automatic ChromeDriver download is only available for Linux x86-64; \
+         install a driver matching Chrome {version} or set CHROMEDRIVER"
+    );
     let cache_root = workspace_root()
         .join("target")
         .join("xtask")
@@ -660,6 +692,16 @@ fn ensure_chromedriver(chrome: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
+fn chromedriver_version_matches(driver: &Path, chrome_version: &str) -> bool {
+    Command::new(driver)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|output| output.split_whitespace().any(|part| part == chrome_version))
+}
+
 fn chrome_version(chrome: &Path) -> Result<String> {
     let output = Command::new(chrome)
         .arg("--version")
@@ -718,6 +760,9 @@ fn resolve_chrome_path() -> Option<PathBuf> {
         &[
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         ],
     )
@@ -727,6 +772,9 @@ fn resolve_chrome_path() -> Option<PathBuf> {
             &[
                 "/usr/bin/google-chrome",
                 "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/snap/bin/chromium",
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             ],
         )

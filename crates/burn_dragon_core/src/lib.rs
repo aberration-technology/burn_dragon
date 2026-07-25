@@ -2,6 +2,12 @@
 
 //! Shared Dragon core math and state contracts for the focused language-training repo.
 
+/// Canonical Burn record schema used by Dragon checkpoints.
+///
+/// Version 2 records GDN2 width-normalization state as a frozen tensor so
+/// save/reload preserves function-preserving neuron widening.
+pub const DRAGON_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+
 pub mod constants;
 pub mod experimental;
 pub mod kernel;

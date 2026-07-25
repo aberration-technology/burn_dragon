@@ -24,8 +24,10 @@ use burn_dragon_language::config::ValidationDatasetConfig;
 use burn_dragon_language::{
     DatasetSourceConfig, DragonConfig, TrainingConfig, load_training_config,
 };
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+use burn_dragon_universality::NcaCorpusConfig;
 #[cfg(feature = "native")]
-use burn_dragon_universality::{NcaCorpusConfig, RuliadCorpusConfig};
+use burn_dragon_universality::RuliadCorpusConfig;
 #[cfg(feature = "native")]
 use burn_p2p::BrowserEdgeSnapshot;
 
@@ -37,14 +39,15 @@ use crate::config::{
 };
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
 use crate::config::{
-    DragonBrowserLiveParticipantConfig, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
-    DragonBrowserTrainingObjectiveConfig,
+    DragonBrowserLiveParticipantConfig, DragonBrowserOptimizerConfig, DragonBrowserTokenSource,
+    DragonBrowserTrainingConfig, DragonBrowserTrainingObjectiveConfig,
 };
 #[cfg(feature = "native")]
 use crate::config::{DragonManifestSeed, DragonNativePeerConfig, DragonNativeTrainingOverrides};
 
 pub const DRAGON_PROFILE_VERSION_METADATA_KEY: &str = "dragon_profile_version";
 pub const DRAGON_PROFILE_JSON_METADATA_KEY: &str = "dragon_profile_json";
+pub const DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION: &str = "dragon.browser_execution.v1";
 const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
@@ -238,8 +241,16 @@ pub struct DragonNativeExperimentProfile {
 pub struct DragonBrowserExperimentProfile {
     pub model_config: DragonConfig,
     #[serde(default)]
+    pub training_objective: DragonBrowserTrainingObjectiveConfig,
+    #[serde(default)]
+    pub optimizer: DragonBrowserOptimizerConfig,
+    #[serde(default)]
     pub execution_backend: DragonBrowserExecutionBackend,
     pub block_size: usize,
+    #[serde(default)]
+    pub tbptt_chunk_size: Option<usize>,
+    #[serde(default)]
+    pub tbptt_persist_across_steps: bool,
     pub learning_rate: f64,
     #[serde(default)]
     pub weight_decay: f32,
@@ -277,6 +288,142 @@ pub enum DragonBrowserProfileTokenSource {
         #[serde(default)]
         max_documents: Option<usize>,
     },
+}
+
+fn normalized_browser_profile_source(
+    source: &DragonBrowserProfileTokenSource,
+) -> Result<serde_json::Value> {
+    Ok(match source {
+        DragonBrowserProfileTokenSource::Inline { records } => {
+            serde_json::json!({"type": "inline", "records": records})
+        }
+        DragonBrowserProfileTokenSource::HttpJson { url } => {
+            serde_json::json!({"type": "http_json", "url": url})
+        }
+        DragonBrowserProfileTokenSource::ShardManifestHttp {
+            manifest_url,
+            selection,
+            max_shards_per_window,
+        } => serde_json::json!({
+            "type": "shard_manifest_http",
+            "manifest_url": manifest_url,
+            "selection": selection,
+            "max_shards_per_window": max_shards_per_window,
+        }),
+        DragonBrowserProfileTokenSource::GeneratedNca {
+            corpus_toml,
+            split,
+            max_documents,
+        } => {
+            let corpus: NcaCorpusConfig = toml::from_str(corpus_toml)
+                .map_err(|error| anyhow!("invalid browser NCA corpus TOML: {error}"))?;
+            serde_json::json!({
+                "type": "generated_nca",
+                "corpus": corpus,
+                "split": split,
+                "max_documents": max_documents,
+            })
+        }
+    })
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+fn normalized_browser_runtime_source(source: &DragonBrowserTokenSource) -> serde_json::Value {
+    match source {
+        DragonBrowserTokenSource::Inline { records } => {
+            serde_json::json!({"type": "inline", "records": records})
+        }
+        DragonBrowserTokenSource::HttpJson { url } => {
+            serde_json::json!({"type": "http_json", "url": url})
+        }
+        DragonBrowserTokenSource::ShardManifestHttp {
+            manifest_url,
+            selection,
+            max_shards_per_window,
+        } => serde_json::json!({
+            "type": "shard_manifest_http",
+            "manifest_url": manifest_url,
+            "selection": selection,
+            "max_shards_per_window": max_shards_per_window,
+        }),
+        DragonBrowserTokenSource::GeneratedNca {
+            corpus,
+            split,
+            max_documents,
+        } => serde_json::json!({
+            "type": "generated_nca",
+            "corpus": corpus,
+            "split": split,
+            "max_documents": max_documents,
+        }),
+    }
+}
+
+fn browser_execution_contract_hash(execution: serde_json::Value) -> Result<burn_p2p::ContentId> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = serde_json::to_vec(&execution)?;
+    let mut hasher = Sha256::new();
+    hasher.update(DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(bytes);
+    Ok(burn_p2p::ContentId::new(format!(
+        "dragon-browser-execution-{:x}",
+        hasher.finalize()
+    )))
+}
+
+pub fn browser_profile_execution_contract_hash(
+    experiment_kind: DragonExperimentKind,
+    profile: &DragonBrowserExperimentProfile,
+) -> Result<burn_p2p::ContentId> {
+    browser_execution_contract_hash(serde_json::json!({
+        "version": 1,
+        "experiment_kind": experiment_kind,
+        "model_config": profile.model_config,
+        "training_objective": profile.training_objective,
+        "optimizer": profile.optimizer,
+        "block_size": profile.block_size,
+        "tbptt_chunk_size": profile.tbptt_chunk_size,
+        "tbptt_persist_across_steps": profile.tbptt_persist_across_steps,
+        "learning_rate": profile.learning_rate,
+        "weight_decay": profile.weight_decay,
+        "batch_size": profile.batch_size,
+        "max_train_batches": profile.max_train_batches,
+        "max_eval_batches": profile.max_eval_batches,
+        "train_source": normalized_browser_profile_source(&profile.train_source)?,
+        "eval_source": profile
+            .eval_source
+            .as_ref()
+            .map(normalized_browser_profile_source)
+            .transpose()?,
+    }))
+}
+
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+pub fn browser_runtime_execution_contract_hash(
+    config: &DragonBrowserTrainingConfig,
+) -> Result<burn_p2p::ContentId> {
+    browser_execution_contract_hash(serde_json::json!({
+        "version": 1,
+        "experiment_kind": config.experiment_kind,
+        "model_config": config.model_config,
+        "training_objective": config.training_objective,
+        "optimizer": config.optimizer,
+        "block_size": config.block_size,
+        "tbptt_chunk_size": config.tbptt_chunk_size,
+        "tbptt_persist_across_steps": config.tbptt_persist_across_steps,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "batch_size": config.batch_size,
+        "max_train_batches": config.max_train_batches,
+        "max_eval_batches": config.max_eval_batches,
+        "train_source": normalized_browser_runtime_source(&config.train_source),
+        "eval_source": config
+            .eval_source
+            .as_ref()
+            .map(normalized_browser_runtime_source),
+    }))
 }
 
 #[cfg(feature = "native")]
@@ -416,6 +563,14 @@ fn browser_profile_from_native_config(
     revision_id: Option<&str>,
     browser_climbmix_manifest_url: Option<&str>,
 ) -> Result<Option<DragonBrowserExperimentProfile>> {
+    let optimizer = match config.optimizer.name {
+        burn_dragon_train::OptimizerKind::Adamw => DragonBrowserOptimizerConfig::Adamw,
+        burn_dragon_train::OptimizerKind::Eggroll => DragonBrowserOptimizerConfig::SeededFitness {
+            eggroll: config.optimizer.effective_eggroll_config(),
+            scalar_encoding: burn_p2p::CompactScalarEncoding::SymmetricInt16,
+        },
+        burn_dragon_train::OptimizerKind::PredictiveCoding => return Ok(None),
+    };
     match (&config.dataset.source, experiment_kind) {
         (
             DatasetSourceConfig::UniversalityNca {
@@ -444,8 +599,12 @@ fn browser_profile_from_native_config(
             };
             Ok(Some(DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
+                training_objective: config.training.objective.clone(),
+                optimizer: optimizer.clone(),
                 execution_backend: DragonBrowserExecutionBackend::Auto,
                 block_size: config.training.block_size,
+                tbptt_chunk_size: config.training.tbptt_chunk_size,
+                tbptt_persist_across_steps: config.training.tbptt_persist_across_steps,
                 learning_rate: config.optimizer.learning_rate,
                 weight_decay: config.optimizer.weight_decay,
                 batch_size: window_tuning.batch_size,
@@ -469,8 +628,12 @@ fn browser_profile_from_native_config(
             DragonExperimentKind::ClimbMixPretraining,
         ) => Ok(Some(DragonBrowserExperimentProfile {
             model_config: model_config.clone(),
+            training_objective: config.training.objective.clone(),
+            optimizer,
             execution_backend: DragonBrowserExecutionBackend::Auto,
             block_size: config.training.block_size,
+            tbptt_chunk_size: config.training.tbptt_chunk_size,
+            tbptt_persist_across_steps: config.training.tbptt_persist_across_steps,
             learning_rate: config.optimizer.learning_rate,
             weight_decay: config.optimizer.weight_decay,
             batch_size: config.training.batch_size,
@@ -883,9 +1046,12 @@ pub fn browser_training_config_from_profile(
     Ok(Some(DragonBrowserTrainingConfig {
         experiment_kind: profile.experiment_kind,
         model_config: browser.model_config,
-        training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+        training_objective: browser.training_objective,
+        optimizer: browser.optimizer,
         execution_backend: browser.execution_backend,
         block_size: browser.block_size,
+        tbptt_chunk_size: browser.tbptt_chunk_size,
+        tbptt_persist_across_steps: browser.tbptt_persist_across_steps,
         learning_rate: browser.learning_rate,
         weight_decay: browser.weight_decay,
         batch_size: browser.batch_size,
@@ -906,6 +1072,7 @@ pub fn browser_training_config_from_profile(
             workload_id: entry.workload_id.as_str().to_owned(),
             publish_canonical_update: true,
             load_active_head_artifact: true,
+            revision_contract: None,
         }),
     }))
 }
@@ -1001,6 +1168,86 @@ mod tests {
             .expect("profile should be present");
 
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn browser_profile_and_runtime_execution_contracts_match_exactly() {
+        let browser = DragonBrowserExperimentProfile {
+            model_config: DragonConfig::default(),
+            training_objective: Default::default(),
+            optimizer: Default::default(),
+            execution_backend: DragonBrowserExecutionBackend::Auto,
+            block_size: 8,
+            tbptt_chunk_size: Some(4),
+            tbptt_persist_across_steps: true,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.01,
+            batch_size: 2,
+            max_train_batches: Some(3),
+            max_eval_batches: Some(1),
+            capability_policy: DragonCapabilityPolicy::default(),
+            train_source: DragonBrowserProfileTokenSource::Inline {
+                records: vec![TokenWindowRecord {
+                    inputs: vec![1; 8],
+                    targets: vec![2; 8],
+                    reset_stream_state: true,
+                    stream_group_id: Some(1),
+                    stream_row: Some(0),
+                    chunk_index: Some(0),
+                }],
+            },
+            eval_source: None,
+        };
+        let profile = DragonExperimentProfile {
+            version: DRAGON_PROFILE_VERSION,
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            native: DragonNativeExperimentProfile {
+                training_toml: String::new(),
+                nca_corpus_toml: None,
+                ruliad_corpus_toml: None,
+            },
+            browser: Some(browser.clone()),
+        };
+        let runtime = DragonBrowserTrainingConfig {
+            experiment_kind: profile.experiment_kind,
+            model_config: browser.model_config.clone(),
+            training_objective: browser.training_objective.clone(),
+            optimizer: browser.optimizer.clone(),
+            execution_backend: browser.execution_backend,
+            block_size: browser.block_size,
+            tbptt_chunk_size: browser.tbptt_chunk_size,
+            tbptt_persist_across_steps: browser.tbptt_persist_across_steps,
+            learning_rate: browser.learning_rate,
+            weight_decay: browser.weight_decay,
+            batch_size: browser.batch_size,
+            max_train_batches: browser.max_train_batches,
+            max_eval_batches: browser.max_eval_batches,
+            capability_policy: browser.capability_policy.clone(),
+            training_lease: None,
+            train_source: browser_source_from_profile(browser.train_source.clone())
+                .expect("runtime train source"),
+            eval_source: browser
+                .eval_source
+                .clone()
+                .map(browser_source_from_profile)
+                .transpose()
+                .expect("runtime eval source"),
+            live_participant: None,
+        };
+
+        assert_eq!(
+            browser_profile_execution_contract_hash(profile.experiment_kind, &browser)
+                .expect("profile hash"),
+            browser_runtime_execution_contract_hash(&runtime).expect("runtime hash"),
+        );
+
+        let mut changed = runtime;
+        changed.tbptt_chunk_size = Some(2);
+        assert_ne!(
+            browser_profile_execution_contract_hash(profile.experiment_kind, &browser)
+                .expect("profile hash"),
+            browser_runtime_execution_contract_hash(&changed).expect("changed runtime hash"),
+        );
     }
 
     #[cfg(feature = "native")]

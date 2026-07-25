@@ -830,8 +830,9 @@ mod tests {
         assert!(
             payload.iter().all(|token| {
                 let token = *token as usize;
-                token < STRUCTURED_CLASS_TOKEN_START
-                    || token >= STRUCTURED_CLASS_TOKEN_START + STRUCTURED_CLASS_TOKEN_COUNT
+                !(STRUCTURED_CLASS_TOKEN_START
+                    ..STRUCTURED_CLASS_TOKEN_START + STRUCTURED_CLASS_TOKEN_COUNT)
+                    .contains(&token)
             }),
             "structured payload should not emit reserved class-marker targets: {payload:?}"
         );

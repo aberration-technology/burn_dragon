@@ -1,0 +1,13 @@
+extends = ["ruliad-1m-la-64k.answer-contract-schema.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+enabled = true
+weight = 0.0
+field_binding_contrast_weight = 0.05
+field_binding_contrast_every_steps = 8
+field_binding_contrast_start_after_steps = 0
+field_binding_contrast_margin = 0.25
+field_binding_contrast_pair_weight = 0.50
+field_binding_contrast_max_pairs = 8
+field_binding_contrast_rank_metric_every_steps = 8
+field_binding_contrast_replay_capacity = 64

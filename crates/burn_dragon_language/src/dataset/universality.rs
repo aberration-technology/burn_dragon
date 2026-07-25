@@ -474,6 +474,7 @@ impl LiveSourceSelectionState {
             &self.cold_start,
             effective_step,
         );
+        sampler.apply_probability_constraints(&mut probabilities);
         probabilities
     }
 
@@ -496,6 +497,7 @@ impl LiveSourceSelectionState {
             &self.cold_start,
             effective_step,
         );
+        sampler.apply_probability_constraints(&mut probabilities);
         sampler
             .candidates()
             .iter()
@@ -680,6 +682,7 @@ impl LiveSourceSelectionState {
     fn record_capability_feedback(
         &self,
         report: &burn_dragon_universality::RuliadEvalReport,
+        absolute_step: Option<usize>,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         let mut sampler = self
             .sampler
@@ -689,7 +692,7 @@ impl LiveSourceSelectionState {
             sampler.record_capability_feedback(&feedback);
         }
         self.maybe_extend_frontier_locked(&mut sampler);
-        Some(self.snapshot_locked_for_step(&sampler, None))
+        Some(self.snapshot_locked_for_step(&sampler, absolute_step))
     }
 
     fn snapshot(&self) -> burn_dragon_universality::RuliadMetricSnapshot {
@@ -726,6 +729,7 @@ impl LiveSourceSelectionState {
             &self.cold_start,
             effective_step,
         );
+        sampler.apply_probability_constraints(&mut probabilities);
         let mut snapshot = sampler.snapshot_with_probabilities(&probabilities);
         snapshot.frontier_extension_count = self.frontier_extension_count.load(Ordering::Relaxed);
         snapshot.frontier_saturated = self.frontier_saturated(&snapshot);
@@ -847,6 +851,9 @@ fn ruliad_capability_feedback_from_report(
     extend_ruliad_capability_feedback(&mut feedback, "difficulty", &report.difficulty_scores);
     extend_ruliad_capability_feedback(&mut feedback, "family", &report.family_scores);
     extend_ruliad_capability_feedback(&mut feedback, "task", &report.task_scores);
+    extend_ruliad_capability_feedback(&mut feedback, "contract", &report.answer_contract_scores);
+    extend_ruliad_capability_feedback(&mut feedback, "domain", &report.math_domain_scores);
+    extend_ruliad_capability_feedback(&mut feedback, "mode", &report.reasoning_mode_scores);
     feedback
 }
 
@@ -862,17 +869,66 @@ fn extend_ruliad_capability_feedback(
             .saturating_add(group.malformed_completion_count)
             .saturating_add(group.missing_completion_count)
             .min(count);
+        let raw_schema_wrong_rate = group.schema_valid_wrong_count as f32 / count as f32;
+        let binding_error = ruliad_capability_group_binding_error(group);
+        let raw_completion_health = count.saturating_sub(unhealthy) as f32 / count as f32;
         burn_dragon_universality::RuliadCapabilityFeedback {
             group_label: format!("{prefix}:{}", group.label),
             item_count: group.count,
             verifier_rate: group.verifier_accuracy,
             partial_credit_rate: group.partial_credit_rate,
-            schema_valid_wrong_rate: group.schema_valid_wrong_count as f32 / count as f32,
+            schema_valid_wrong_rate: raw_schema_wrong_rate.max(binding_error * 0.50),
             malformed_rate: group.malformed_completion_count as f32 / count as f32,
             missing_rate: group.missing_completion_count as f32 / count as f32,
-            completion_health_rate: count.saturating_sub(unhealthy) as f32 / count as f32,
+            completion_health_rate: ruliad_capability_group_completion_health(
+                group,
+                raw_completion_health,
+                binding_error,
+            ),
         }
     }));
+}
+
+fn ruliad_capability_group_binding_error(
+    group: &burn_dragon_universality::RuliadEvalGroupScore,
+) -> f32 {
+    let answer_error = if group.expected_answer_distinct_fraction >= 0.20 {
+        let expected = group.expected_answer_distinct_fraction.max(1.0e-6);
+        (1.0 - group.actual_answer_distinct_fraction / expected).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let field_distinct_error = if group.expected_field_value_distinct_fraction > 0.0 {
+        (1.0 - group.field_value_distinct_ratio).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let field_dominance_error = if group.count >= 4 {
+        ((group.actual_field_value_dominant_fraction - 0.85) / 0.15).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let field_coverage_error = if group.answer_field_expected_count > 0 {
+        (1.0 - group.answer_field_coverage).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    answer_error
+        .max(field_distinct_error)
+        .max(field_dominance_error)
+        .max(field_coverage_error)
+}
+
+fn ruliad_capability_group_completion_health(
+    group: &burn_dragon_universality::RuliadEvalGroupScore,
+    raw_completion_health: f32,
+    binding_error: f32,
+) -> f32 {
+    raw_completion_health.clamp(0.0, 1.0)
+        * group.mean_completion_quality.clamp(0.0, 1.0)
+        * group.answer_field_coverage.clamp(0.0, 1.0)
+        * group.answer_termination_rate.clamp(0.0, 1.0)
+        * (1.0 - binding_error * 0.50).clamp(0.0, 1.0)
 }
 
 fn apply_source_selection_control(
@@ -966,17 +1022,81 @@ fn current_cold_start_max_difficulty(
     if start_cap >= max_difficulty {
         return None;
     }
+    let time_cap =
+        timed_cold_start_max_difficulty(start_cap, max_difficulty, cold_start, absolute_step);
+    let max_allowed_difficulty = if cold_start.release_requires_mastery {
+        time_cap.min(mastery_gated_cold_start_max_difficulty(
+            candidates,
+            cold_start,
+            start_cap,
+            max_difficulty,
+        ))
+    } else {
+        time_cap
+    };
+    if max_allowed_difficulty >= max_difficulty {
+        None
+    } else {
+        Some(max_allowed_difficulty)
+    }
+}
+
+fn timed_cold_start_max_difficulty(
+    start_cap: usize,
+    max_difficulty: usize,
+    cold_start: &burn_dragon_universality::RuliadSourceSelectionColdStartConfig,
+    absolute_step: usize,
+) -> usize {
     if absolute_step <= cold_start.hold_steps {
-        return Some(start_cap);
+        return start_cap;
     }
     let ramp_steps = cold_start.ramp_steps.max(1);
     let ramp_step = absolute_step.saturating_sub(cold_start.hold_steps);
     if ramp_step >= ramp_steps {
-        return None;
+        return max_difficulty;
     }
     let span = max_difficulty.saturating_sub(start_cap);
     let increment = span.saturating_mul(ramp_step) / ramp_steps;
-    Some(start_cap.saturating_add(increment).min(max_difficulty))
+    start_cap.saturating_add(increment).min(max_difficulty)
+}
+
+fn mastery_gated_cold_start_max_difficulty(
+    candidates: &[burn_dragon_universality::RuliadSamplerCandidate],
+    cold_start: &burn_dragon_universality::RuliadSourceSelectionColdStartConfig,
+    start_cap: usize,
+    max_difficulty: usize,
+) -> usize {
+    let mut allowed = start_cap;
+    while allowed < max_difficulty
+        && cold_start_difficulty_mastered(candidates, cold_start, allowed)
+    {
+        allowed = allowed.saturating_add(1);
+    }
+    allowed
+}
+
+fn cold_start_difficulty_mastered(
+    candidates: &[burn_dragon_universality::RuliadSamplerCandidate],
+    cold_start: &burn_dragon_universality::RuliadSourceSelectionColdStartConfig,
+    difficulty_level: usize,
+) -> bool {
+    let mut saw_candidate = false;
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.difficulty_level == difficulty_level)
+    {
+        saw_candidate = true;
+        if candidate.capability_feedback_count < cold_start.mastery_min_feedback_count
+            || candidate.capability_verifier_ema < cold_start.mastery_verifier_min
+            || candidate.capability_completion_health_ema < cold_start.mastery_completion_health_min
+            || candidate.capability_schema_wrong_ema > cold_start.mastery_schema_wrong_max
+            || candidate.capability_malformed_ema > cold_start.mastery_malformed_max
+            || candidate.capability_missing_ema > cold_start.mastery_missing_max
+        {
+            return false;
+        }
+    }
+    saw_candidate
 }
 
 fn normalize_source_probabilities(probabilities: &mut [f32]) {
@@ -1646,12 +1766,24 @@ impl UniversalityDataset {
         &self,
         report: &burn_dragon_universality::RuliadEvalReport,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        self.record_ruliad_capability_feedback_at_step(report, None)
+    }
+
+    pub fn record_ruliad_capability_feedback_at_step(
+        &self,
+        report: &burn_dragon_universality::RuliadEvalReport,
+        absolute_step: Option<usize>,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         match &self.storage {
             UniversalityStorage::Manifest(_) => None,
-            UniversalityStorage::OnTheFly(storage) => storage
-                .source_selection
-                .as_ref()
-                .and_then(|source_selection| source_selection.record_capability_feedback(report)),
+            UniversalityStorage::OnTheFly(storage) => {
+                storage
+                    .source_selection
+                    .as_ref()
+                    .and_then(|source_selection| {
+                        source_selection.record_capability_feedback(report, absolute_step)
+                    })
+            }
         }
     }
 
@@ -1752,6 +1884,13 @@ impl UniversalityDataset {
         storage
             .corpus
             .decode_ruliad_payload_tokens(&tokens, stop_at_eos)
+    }
+
+    pub fn encode_ruliad_payload_tokens(&self, text: &str) -> Option<Vec<u32>> {
+        let UniversalityStorage::OnTheFly(storage) = &self.storage else {
+            return None;
+        };
+        storage.corpus.encode_ruliad_payload_tokens(text)
     }
 
     pub fn ruliad_document_end_token_id(&self) -> Option<u32> {
@@ -3120,22 +3259,54 @@ fn is_semantic_window_anchor(document: &[u32], index: usize, token: u32) -> bool
 }
 
 fn ruliad_answer_target_loss_mask(window: &[u32], mask: &mut [i64]) -> bool {
-    ruliad_answer_target_loss_mask_with_close_stride(window, mask, 1)
+    ruliad_answer_target_loss_mask_with_close_stride(window, mask, 1, 1, 1, 1, 1)
 }
 
 fn ruliad_answer_target_loss_mask_with_close_stride(
     window: &[u32],
     mask: &mut [i64],
     close_marker_stride: usize,
+    answer_close_marker_weight: i64,
+    answer_schema_token_weight: i64,
+    answer_schema_start_token_weight: i64,
+    answer_value_token_weight: i64,
 ) -> bool {
-    mask.fill(0);
+    ruliad_answer_target_loss_mask_with_base_weight(
+        window,
+        mask,
+        close_marker_stride,
+        answer_close_marker_weight,
+        answer_schema_token_weight,
+        answer_schema_start_token_weight,
+        answer_value_token_weight,
+        0,
+    )
+}
+
+fn ruliad_answer_target_loss_mask_with_base_weight(
+    window: &[u32],
+    mask: &mut [i64],
+    close_marker_stride: usize,
+    answer_close_marker_weight: i64,
+    answer_schema_token_weight: i64,
+    answer_schema_start_token_weight: i64,
+    answer_value_token_weight: i64,
+    base_weight: i64,
+) -> bool {
+    mask.fill(base_weight);
     if window.len() < mask.len().saturating_add(1) {
         return false;
     }
     let mut in_answer = false;
     let mut in_close_marker = false;
+    let mut in_answer_value = false;
     let mut answer_hash = 0u64;
+    let answer_close_marker_weight = answer_close_marker_weight.clamp(1, 16);
+    let answer_schema_token_weight = answer_schema_token_weight.clamp(1, 16);
+    let answer_schema_start_token_weight = answer_schema_start_token_weight.clamp(1, 16);
+    let answer_value_token_weight = answer_value_token_weight.clamp(1, 16);
     let mut any = false;
+    let mut schema_key_start_pending = false;
     for t in 0..mask.len() {
         let input = window[t];
         let target = window[t + 1];
@@ -3143,6 +3314,12 @@ fn ruliad_answer_target_loss_mask_with_close_stride(
             || (input == u32::from(b':') && t > 0 && window.get(t - 1) == Some(&u32::from(b'!')))
         {
             in_answer = true;
+            in_answer_value = false;
+            schema_key_start_pending = true;
+        }
+        if in_answer && !in_close_marker && token_byte(input) == Some(b'=') {
+            in_answer_value = true;
+            schema_key_start_pending = false;
         }
         let close_marker_start = target == RULIAD_SYMBOLIC_DOCUMENT_END_TOKEN
             || (target == u32::from(b'[') && window.get(t + 2) == Some(&u32::from(b'/')));
@@ -3154,8 +3331,30 @@ fn ruliad_answer_target_loss_mask_with_close_stride(
             if close_marker_start && !supervise_close_marker {
                 in_answer = false;
                 in_close_marker = false;
+                in_answer_value = false;
             } else {
-                mask[t] = 1;
+                let target_byte = token_byte(target);
+                let close_marker_target = close_marker_start || in_close_marker;
+                let value_target = !close_marker_target
+                    && in_answer_value
+                    && target_byte.is_some_and(is_ruliad_answer_value_byte);
+                let schema_target = !close_marker_target
+                    && !value_target
+                    && target_byte.is_some_and(is_ruliad_answer_schema_byte);
+                let schema_start_target = schema_target
+                    && schema_key_start_pending
+                    && target_byte.is_some_and(is_ruliad_answer_key_start_byte);
+                mask[t] = if close_marker_target {
+                    answer_close_marker_weight
+                } else if schema_start_target {
+                    answer_schema_start_token_weight.max(answer_schema_token_weight)
+                } else if value_target {
+                    answer_value_token_weight
+                } else if schema_target {
+                    answer_schema_token_weight
+                } else {
+                    1
+                };
                 any = true;
                 if close_marker_start {
                     in_close_marker = true;
@@ -3163,20 +3362,45 @@ fn ruliad_answer_target_loss_mask_with_close_stride(
                     answer_hash = answer_hash
                         .wrapping_mul(1_099_511_628_211)
                         .wrapping_add(u64::from(target).wrapping_add(1));
+                    if matches!(
+                        token_byte(target),
+                        Some(b';') | Some(b'\n') | Some(b'\r') | Some(b'|')
+                    ) {
+                        in_answer_value = false;
+                        schema_key_start_pending = true;
+                    } else if schema_start_target {
+                        schema_key_start_pending = false;
+                    }
                 }
             }
         }
         if close_marker_end {
             in_answer = false;
             in_close_marker = false;
+            in_answer_value = false;
+            schema_key_start_pending = false;
         }
         if target == RULIAD_SYMBOLIC_ANSWER_TOKEN {
             in_answer = true;
             in_close_marker = false;
+            in_answer_value = false;
+            schema_key_start_pending = true;
             answer_hash = 0;
         }
     }
     any
+}
+
+fn is_ruliad_answer_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.')
+}
+
+fn is_ruliad_answer_schema_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'=' | b';' | b',' | b'|')
+}
+
+fn is_ruliad_answer_key_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
 }
 
 fn ruliad_target_loss_mask(
@@ -3188,11 +3412,17 @@ fn ruliad_target_loss_mask(
         mask.fill(0);
         return false;
     }
-    let mut any = if supervision.uses_answer_target_mask() {
+    let mut any = if supervision.uses_trace_answer_target_mask() {
+        ruliad_trace_answer_target_loss_mask(window, mask, supervision)
+    } else if supervision.uses_answer_target_mask() {
         ruliad_answer_target_loss_mask_with_close_stride(
             window,
             mask,
             supervision.answer_close_marker_stride,
+            supervision.answer_close_marker_weight,
+            supervision.answer_schema_token_weight,
+            supervision.answer_schema_start_token_weight,
+            supervision.answer_value_token_weight,
         )
     } else {
         mask.fill(1);
@@ -3203,6 +3433,23 @@ fn ruliad_target_loss_mask(
         any = mask.iter().any(|value| *value != 0);
     }
     any
+}
+
+fn ruliad_trace_answer_target_loss_mask(
+    window: &[u32],
+    mask: &mut [i64],
+    supervision: RuliadSupervisionConfig,
+) -> bool {
+    ruliad_answer_target_loss_mask_with_base_weight(
+        window,
+        mask,
+        supervision.answer_close_marker_stride,
+        supervision.answer_close_marker_weight,
+        supervision.answer_schema_token_weight,
+        supervision.answer_schema_start_token_weight,
+        supervision.answer_value_token_weight,
+        1,
+    ) || !mask.is_empty()
 }
 
 fn mask_high_entropy_ruliad_targets(window: &[u32], mask: &mut [i64]) {
@@ -3614,6 +3861,114 @@ mod tests {
     }
 
     #[test]
+    fn ruliad_answer_target_loss_mask_can_emphasize_answer_values() {
+        let window = b"?:q\n!:n=20;alpha=ABC;ok=1\n[/R2]"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_target_loss_mask(
+            &window,
+            &mut mask,
+            RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_value_token_weight: 3,
+                ..Default::default()
+            },
+        ));
+        let weighted = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 3).then_some(*token as u8 as char))
+            .collect::<String>();
+        let baseline = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 1).then_some(*token as u8 as char))
+            .collect::<String>();
+        assert_eq!(weighted, "20ABC1");
+        assert!(
+            baseline.contains("n=;alpha=;ok=\n[/R2]"),
+            "field names and syntax should remain baseline-supervised: {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_target_loss_mask_can_emphasize_answer_schema() {
+        let window = b"?:q\n!:n=20;alpha=ABC;ok=1\n[/R2]"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_target_loss_mask(
+            &window,
+            &mut mask,
+            RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_schema_token_weight: 3,
+                answer_value_token_weight: 1,
+                ..Default::default()
+            },
+        ));
+        let weighted = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 3).then_some(*token as u8 as char))
+            .collect::<String>();
+        let baseline = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 1).then_some(*token as u8 as char))
+            .collect::<String>();
+        assert_eq!(weighted, "n=;alpha=;ok=");
+        assert!(
+            baseline.contains("20ABC1\n[/R2]"),
+            "answer values and close marker should remain baseline-supervised: {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_target_loss_mask_can_emphasize_schema_starts() {
+        let window = b"?:q\n!:xlen=12;xalpha=01;xcounts=8,4;xedge=10\n[/R2]"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_target_loss_mask(
+            &window,
+            &mut mask,
+            RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_schema_token_weight: 2,
+                answer_schema_start_token_weight: 7,
+                answer_value_token_weight: 1,
+                ..Default::default()
+            },
+        ));
+        let schema_starts = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 7).then_some(*token as u8 as char))
+            .collect::<String>();
+        let ordinary_schema = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 2).then_some(*token as u8 as char))
+            .collect::<String>();
+        assert_eq!(schema_starts, "xxxx");
+        assert!(
+            ordinary_schema.contains("len=;alpha=;counts=,;edge="),
+            "only the first key byte should be schema-start weighted: {ordinary_schema:?}"
+        );
+    }
+
+    #[test]
     fn ruliad_answer_target_loss_mask_can_thin_close_markers() {
         let window = b"?:q\n!:ok=1\n[/R2]"
             .iter()
@@ -3636,6 +3991,31 @@ mod tests {
             .filter_map(|(token, mask)| (*mask == 1).then_some(*token as u8 as char))
             .collect::<String>();
         assert_eq!(targets, "ok=1\n");
+    }
+
+    #[test]
+    fn ruliad_answer_target_loss_mask_can_emphasize_close_markers() {
+        let window = b"?:q\n!:ok=1\n[/R2]"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_target_loss_mask(
+            &window,
+            &mut mask,
+            RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_close_marker_weight: 4,
+                ..Default::default()
+            },
+        ));
+        let close = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 4).then_some(*token as u8 as char))
+            .collect::<String>();
+        assert_eq!(close, "[/R2]");
     }
 
     #[test]
@@ -3697,6 +4077,60 @@ mod tests {
     }
 
     #[test]
+    fn ruliad_trace_answer_target_loss_mask_supervises_trace_and_weights_answer() {
+        let window = b"G:x:h0123456789abcdef;sum=12\n>sum=12\n!:n=20;ok=1\n[/R2]"
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_target_loss_mask(
+            &window,
+            &mut mask,
+            RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::TraceAndAnswer,
+                mask_high_entropy_spans: true,
+                answer_close_marker_weight: 3,
+                answer_schema_token_weight: 4,
+                answer_value_token_weight: 2,
+                ..Default::default()
+            },
+        ));
+        let baseline = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 1).then_some(*token as u8 as char))
+            .collect::<String>();
+        let values = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 2).then_some(*token as u8 as char))
+            .collect::<String>();
+        let close = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 3).then_some(*token as u8 as char))
+            .collect::<String>();
+        let schema = window
+            .iter()
+            .skip(1)
+            .zip(mask.iter())
+            .filter_map(|(token, mask)| (*mask == 4).then_some(*token as u8 as char))
+            .collect::<String>();
+
+        assert!(baseline.contains(":x:h;sum=12\n>sum=12\n!:"));
+        assert!(
+            !baseline.contains("0123456789abcdef"),
+            "hash payload should be masked even in trace-answer mode: {baseline:?}"
+        );
+        assert_eq!(schema, "n=;ok=");
+        assert_eq!(values, "201");
+        assert_eq!(close, "[/R2]");
+    }
+
+    #[test]
     fn ruliad_answer_target_loss_mask_leaves_prefix_only_windows_empty() {
         let window = vec![RULIAD_SYMBOLIC_QUERY_TOKEN, 11, 12, 13];
         let mut mask = vec![1; window.len() - 1];
@@ -3719,7 +4153,25 @@ mod tests {
             previous_loss_ema: 0.0,
             gradient_alignment: 0.0,
             is_hash_noise: false,
+            capability_feedback_count: 0,
+            capability_verifier_ema: 0.0,
+            capability_partial_ema: 0.0,
+            capability_completion_health_ema: 0.0,
+            capability_schema_wrong_ema: 0.0,
+            capability_malformed_ema: 0.0,
+            capability_missing_ema: 0.0,
         }
+    }
+
+    fn mark_source_selection_candidate_mastered(
+        candidate: &mut burn_dragon_universality::RuliadSamplerCandidate,
+    ) {
+        candidate.capability_feedback_count = 1;
+        candidate.capability_verifier_ema = 0.90;
+        candidate.capability_completion_health_ema = 0.95;
+        candidate.capability_schema_wrong_ema = 0.05;
+        candidate.capability_malformed_ema = 0.0;
+        candidate.capability_missing_ema = 0.0;
     }
 
     fn live_source_selection_state(dataset: &UniversalityDataset) -> Arc<LiveSourceSelectionState> {
@@ -3763,12 +4215,19 @@ mod tests {
                 as usize,
             answer_field_expected_count: count,
             answer_field_accuracy: partial_credit_rate,
+            answer_field_observed_count: count,
+            answer_field_coverage: 1.0,
             answer_terminated_count: count.saturating_sub(malformed_completion_count),
             answer_termination_rate: count.saturating_sub(malformed_completion_count) as f32
                 / count.max(1) as f32,
             mean_completion_quality: 1.0,
             expected_answer_distinct_fraction: 1.0,
             actual_answer_distinct_fraction: 1.0,
+            actual_answer_dominant_fraction: 1.0 / count.max(1) as f32,
+            expected_field_value_distinct_fraction: 1.0,
+            actual_field_value_distinct_fraction: 1.0,
+            field_value_distinct_ratio: 1.0,
+            actual_field_value_dominant_fraction: 1.0 / count.max(1) as f32,
         }
     }
 
@@ -3798,11 +4257,18 @@ mod tests {
             answer_field_correct_count: family.answer_field_correct_count,
             answer_field_expected_count: family.answer_field_expected_count,
             answer_field_accuracy: family.answer_field_accuracy,
+            answer_field_observed_count: family.answer_field_observed_count,
+            answer_field_coverage: family.answer_field_coverage,
             answer_terminated_count: family.answer_terminated_count,
             answer_termination_rate: family.answer_termination_rate,
             mean_completion_quality: family.mean_completion_quality,
             expected_answer_distinct_fraction: family.expected_answer_distinct_fraction,
             actual_answer_distinct_fraction: family.actual_answer_distinct_fraction,
+            actual_answer_dominant_fraction: family.actual_answer_dominant_fraction,
+            expected_field_value_distinct_fraction: family.expected_field_value_distinct_fraction,
+            actual_field_value_distinct_fraction: family.actual_field_value_distinct_fraction,
+            field_value_distinct_ratio: family.field_value_distinct_ratio,
+            actual_field_value_dominant_fraction: family.actual_field_value_dominant_fraction,
             mean_certificate_prefix_coverage: 0.0,
             mean_completion_tokens: 8.0,
             canary_count: 0,
@@ -3810,6 +4276,7 @@ mod tests {
             family_scores: vec![family],
             task_scores: Vec::new(),
             difficulty_scores: Vec::new(),
+            answer_contract_scores: Vec::new(),
             math_domain_scores: Vec::new(),
             reasoning_mode_scores: Vec::new(),
             failures: Vec::new(),
@@ -3841,6 +4308,18 @@ mod tests {
             .sum()
     }
 
+    fn family_probability(
+        snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
+        family: &str,
+    ) -> f32 {
+        snapshot
+            .family_buckets
+            .iter()
+            .find(|bucket| bucket.label == family)
+            .map(|bucket| bucket.probability)
+            .unwrap_or(0.0)
+    }
+
     #[test]
     fn live_ruliad_source_selection_cold_start_caps_and_releases_difficulty() {
         let candidates = (0..=4).map(source_selection_candidate).collect::<Vec<_>>();
@@ -3849,6 +4328,7 @@ mod tests {
             max_difficulty_level: 2,
             hold_steps: 10,
             ramp_steps: 10,
+            ..Default::default()
         };
 
         let mut held = vec![0.2; candidates.len()];
@@ -3872,6 +4352,46 @@ mod tests {
     }
 
     #[test]
+    fn live_ruliad_source_selection_cold_start_mastery_gate_blocks_blind_release() {
+        let mut candidates = (0..=4).map(source_selection_candidate).collect::<Vec<_>>();
+        let cold_start = burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+            enabled: true,
+            max_difficulty_level: 0,
+            hold_steps: 0,
+            ramp_steps: 1,
+            release_requires_mastery: true,
+            mastery_min_feedback_count: 1,
+            ..Default::default()
+        };
+
+        let mut unmastered = vec![0.2; candidates.len()];
+        apply_source_selection_cold_start(&mut unmastered, &candidates, &cold_start, Some(10));
+        assert!(unmastered[0] > 0.0);
+        assert_eq!(unmastered[1], 0.0);
+        assert_eq!(unmastered[2], 0.0);
+        assert_eq!(unmastered[3], 0.0);
+        assert_eq!(unmastered[4], 0.0);
+
+        mark_source_selection_candidate_mastered(&mut candidates[0]);
+        let mut d0_mastered = vec![0.2; candidates.len()];
+        apply_source_selection_cold_start(&mut d0_mastered, &candidates, &cold_start, Some(10));
+        assert!(d0_mastered[0] > 0.0);
+        assert!(d0_mastered[1] > 0.0);
+        assert_eq!(d0_mastered[2], 0.0);
+        assert_eq!(d0_mastered[3], 0.0);
+        assert_eq!(d0_mastered[4], 0.0);
+
+        mark_source_selection_candidate_mastered(&mut candidates[1]);
+        let mut d1_mastered = vec![0.2; candidates.len()];
+        apply_source_selection_cold_start(&mut d1_mastered, &candidates, &cold_start, Some(10));
+        assert!(d1_mastered[0] > 0.0);
+        assert!(d1_mastered[1] > 0.0);
+        assert!(d1_mastered[2] > 0.0);
+        assert_eq!(d1_mastered[3], 0.0);
+        assert_eq!(d1_mastered[4], 0.0);
+    }
+
+    #[test]
     fn live_ruliad_source_selection_state_handoff_continues_curriculum() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("ruliad-live.toml");
@@ -3885,6 +4405,7 @@ mod tests {
                 max_difficulty_level: 0,
                 hold_steps: 100,
                 ramp_steps: 100,
+                ..Default::default()
             };
         fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
             .expect("write config");
@@ -4476,6 +4997,253 @@ mod tests {
     }
 
     #[test]
+    fn live_ruliad_capability_feedback_snapshot_honors_cold_start_step() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let mut config = live_ruliad_runtime_config();
+        config.source_selection.difficulty_levels =
+            burn_dragon_universality::UsizeRangeConfig { min: 0, max: 4 };
+        config.source_selection.cold_start =
+            burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+                enabled: true,
+                max_difficulty_level: 1,
+                hold_steps: 100,
+                ramp_steps: 100,
+                ..Default::default()
+            };
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        let mut report =
+            capability_feedback_report(capability_group("simulation", 16, 1.0, 0.5, 0, 0, 0));
+        report.difficulty_scores = vec![capability_group("d0", 8, 1.0, 0.5, 0, 0, 0)];
+
+        let unconstrained = dataset
+            .record_ruliad_capability_feedback(&report)
+            .expect("unconstrained capability snapshot");
+        let held = dataset
+            .record_ruliad_capability_feedback_at_step(&report, Some(0))
+            .expect("step-aware capability snapshot");
+
+        assert!(
+            unconstrained.mean_difficulty_level > held.mean_difficulty_level,
+            "legacy snapshot should expose the full sampler while step-aware telemetry should reflect the held curriculum"
+        );
+        assert!(
+            held.difficulty_buckets
+                .iter()
+                .filter(|bucket| bucket.mean_difficulty_level > 1.0)
+                .all(|bucket| bucket.probability <= 1e-6),
+            "cold-start telemetry must not report probability mass above the active cap: {:?}",
+            held.difficulty_buckets
+        );
+        assert!(
+            held.top_buckets
+                .iter()
+                .filter(|bucket| bucket.probability > 1e-6)
+                .all(|bucket| bucket.difficulty_level <= 1),
+            "positive-probability top buckets should match the current cold-start cap: {:?}",
+            held.top_buckets
+        );
+    }
+
+    #[test]
+    fn live_ruliad_source_selection_records_domain_and_mode_capability_feedback() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let mut config = live_ruliad_runtime_config();
+        config.families = vec![
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Category,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Rewrite,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+        ];
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        let before = dataset.source_selection_snapshot().expect("snapshot");
+        let before_category = family_probability(&before, "category");
+        let before_rewrite = family_probability(&before, "rewrite");
+        let mut report =
+            capability_feedback_report(capability_group("unused_family", 16, 0.0, 0.0, 0, 0, 0));
+        report.family_scores.clear();
+        report.math_domain_scores =
+            vec![capability_group("category_theory", 16, 0.0, 0.25, 12, 0, 0)];
+
+        let after_domain = dataset
+            .record_ruliad_capability_feedback(&report)
+            .expect("domain capability feedback snapshot");
+        let after_domain_rewrite = family_probability(&after_domain, "rewrite");
+        assert!(
+            family_probability(&after_domain, "category") > before_category,
+            "category-theory domain feedback should raise category sampling probability"
+        );
+
+        report.math_domain_scores.clear();
+        report.reasoning_mode_scores =
+            vec![capability_group("normalization", 16, 0.0, 0.25, 12, 0, 0)];
+        let after_mode = dataset
+            .record_ruliad_capability_feedback(&report)
+            .expect("mode capability feedback snapshot");
+        assert!(
+            family_probability(&after_mode, "rewrite") > after_domain_rewrite
+                && family_probability(&after_mode, "rewrite") > before_rewrite * 0.90,
+            "normalization-mode feedback should raise rewrite sampling probability"
+        );
+    }
+
+    #[test]
+    fn live_ruliad_source_selection_records_answer_contract_capability_feedback() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let mut config = live_ruliad_runtime_config();
+        config.families = vec![
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Category,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Automaton,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+        ];
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        let before = dataset.source_selection_snapshot().expect("snapshot");
+        let before_category = family_probability(&before, "category");
+        let before_automaton = family_probability(&before, "automaton");
+        let mut report =
+            capability_feedback_report(capability_group("unused_family", 16, 0.0, 0.0, 0, 0, 0));
+        report.family_scores.clear();
+        report.difficulty_scores.clear();
+        report.answer_contract_scores = vec![capability_group("ok,l,r", 16, 0.75, 0.85, 1, 0, 0)];
+
+        let after = dataset
+            .record_ruliad_capability_feedback(&report)
+            .expect("contract capability feedback snapshot");
+        assert!(
+            family_probability(&after, "category") > before_category,
+            "ok/l/r contract feedback should raise category sampling probability"
+        );
+        assert!(
+            family_probability(&after, "automaton") <= before_automaton,
+            "ok/l/r contract feedback should not promote automaton acc buckets"
+        );
+    }
+
+    #[test]
+    fn live_ruliad_source_selection_treats_field_collapse_as_contract_remediation() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let mut config = live_ruliad_runtime_config();
+        config.families = vec![
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Category,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Automaton,
+                weight: 1,
+                width: Some(burn_dragon_universality::UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(burn_dragon_universality::UsizeRangeConfig { min: 2, max: 2 }),
+            },
+        ];
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+        let before = dataset.source_selection_snapshot().expect("snapshot");
+        let before_category = family_probability(&before, "category");
+        let before_automaton = family_probability(&before, "automaton");
+        let mut report =
+            capability_feedback_report(capability_group("unused_family", 16, 0.0, 0.0, 0, 0, 0));
+        report.family_scores.clear();
+        report.difficulty_scores.clear();
+        let mut collapsed_contract = capability_group("ok,l,r", 16, 0.75, 0.85, 0, 0, 0);
+        collapsed_contract.field_value_distinct_ratio = 0.05;
+        collapsed_contract.actual_field_value_distinct_fraction = 0.05;
+        collapsed_contract.actual_field_value_dominant_fraction = 0.95;
+        report.answer_contract_scores = vec![collapsed_contract];
+
+        let after = dataset
+            .record_ruliad_capability_feedback(&report)
+            .expect("contract capability feedback snapshot");
+        let state = live_source_selection_state(&dataset);
+        let sampler = state.sampler.lock().expect("ruliad sampler lock");
+        let category_feedback = sampler
+            .candidates()
+            .iter()
+            .filter(|candidate| candidate.family == "category")
+            .find(|candidate| candidate.capability_feedback_count > 0)
+            .expect("category ok/l/r candidate feedback");
+        let automaton_feedback = sampler
+            .candidates()
+            .iter()
+            .filter(|candidate| candidate.family == "automaton")
+            .all(|candidate| candidate.capability_feedback_count == 0);
+
+        assert!(
+            family_probability(&after, "category") > before_category,
+            "field collapse in ok/l/r contract should raise category remediation probability"
+        );
+        assert!(
+            family_probability(&after, "automaton") <= before_automaton,
+            "field collapse in ok/l/r contract should not target automaton acc buckets"
+        );
+        assert!(
+            category_feedback.capability_schema_wrong_ema >= 0.45,
+            "field collapse should become schema/binding remediation pressure: {category_feedback:?}"
+        );
+        assert!(
+            category_feedback.capability_completion_health_ema < 0.80,
+            "field collapse should lower effective completion health: {category_feedback:?}"
+        );
+        assert!(automaton_feedback);
+    }
+
+    #[test]
     fn live_ruliad_streaming_records_chunk_loss_feedback_without_epoch_cache() {
         type TestBackend = NdArray<f32>;
 
@@ -5048,6 +5816,12 @@ mod tests {
         for candidate in &mut candidates {
             candidate.loss_ema = 0.1;
             candidate.previous_loss_ema = 0.2;
+            candidate.capability_feedback_count = 1;
+            candidate.capability_verifier_ema = 1.0;
+            candidate.capability_completion_health_ema = 1.0;
+            candidate.capability_schema_wrong_ema = 0.0;
+            candidate.capability_malformed_ema = 0.0;
+            candidate.capability_missing_ema = 0.0;
         }
         let pre_extension_snapshot = burn_dragon_universality::RuliadFrontierSampler::new(
             config.source_selection.sampler,

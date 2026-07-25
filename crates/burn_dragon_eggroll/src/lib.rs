@@ -8,8 +8,9 @@ use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn_eggroll::{
     AntitheticSign, BackendTensorOptimizerState, EggrollConfig, EggrollMetrics,
-    MatrixNoiseCoefficient, MatrixNoiseMode, MatrixNoiseSpec, accumulate_gaussian_gradient_tensor,
-    accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode, eggroll_metrics,
+    MatrixNoiseAggregationSpec, MatrixNoiseCoefficient, MatrixNoiseMode, MatrixNoiseSpec,
+    accumulate_gaussian_gradient_tensor,
+    accumulate_low_rank_gradient_matrix_stack_from_coefficients, eggroll_metrics,
     normalize_fitness, perturb_gaussian_tensor, perturb_matrix_stack_with_mode, tensor_update,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub struct MatrixParamInfo {
     pub path: String,
     pub param_id: u64,
+    /// Stable path-derived key used to regenerate perturbations across processes.
+    pub perturbation_key: u64,
     pub rank: usize,
     pub shape: Vec<usize>,
 }
@@ -125,6 +128,7 @@ where
         sigma: config.effective_sigma(generation),
         sign,
         allowed_param_ids,
+        path: Vec::new(),
         perturbed_params: 0,
     };
     module.map(&mut mapper)
@@ -224,6 +228,7 @@ where
         update: &config.update,
         state,
         allowed_param_ids,
+        path: Vec::new(),
         updated_params: 0,
     };
     let module = module.map(&mut mapper);
@@ -232,7 +237,8 @@ where
 
 pub fn apply_antithetic_update_to_tensor_with_coefficients<B, const D: usize>(
     tensor: Tensor<B, D>,
-    param_id: u64,
+    optimizer_state_key: u64,
+    perturbation_key: u64,
     config: &EggrollConfig,
     generation: u64,
     coefficients: &[PairGradientCoefficient],
@@ -253,7 +259,7 @@ where
             .fold(None, |accumulated, coefficient| {
                 let spec = MatrixNoiseSpec::new(
                     config.population.seed,
-                    param_id,
+                    perturbation_key,
                     generation,
                     coefficient.pair_index,
                     config.population.rank,
@@ -269,14 +275,16 @@ where
             .expect("non-empty coefficients should produce a gradient")
     } else {
         let coefficients = matrix_noise_coefficients(coefficients);
-        accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode(
+        accumulate_low_rank_gradient_matrix_stack_from_coefficients(
             shape,
-            config.population.seed,
-            param_id,
-            generation,
-            config.population.rank,
-            &coefficients,
-            config.population.matrix_noise,
+            MatrixNoiseAggregationSpec::new(
+                config.population.seed,
+                perturbation_key,
+                generation,
+                config.population.rank,
+                &coefficients,
+                config.population.matrix_noise,
+            ),
             &device,
         )
     };
@@ -284,7 +292,7 @@ where
     tensor_update(
         tensor.reshape([elements]),
         gradient.reshape([elements]),
-        state.params.entry(param_id).or_default(),
+        state.params.entry(optimizer_state_key).or_default(),
         &config.update,
     )
     .reshape(shape)
@@ -306,20 +314,24 @@ fn matrix_noise_coefficients(
 #[derive(Default)]
 struct MatrixParamCatalogVisitor {
     params: Vec<MatrixParamInfo>,
+    path: Vec<String>,
 }
 
 impl<B: Backend> ModuleVisitor<B> for MatrixParamCatalogVisitor {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-        self.push_param("", param.id, param.val().shape().dims::<D>());
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
     }
 
-    fn visit_float_with_path<const D: usize>(
-        &mut self,
-        path: &[String],
-        id: ParamId,
-        tensor: &Tensor<B, D>,
-    ) {
-        self.push_param(&path.join("."), id, tensor.shape().dims::<D>());
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.push_param(
+            &self.path.join("."),
+            param.id,
+            param.val().shape().dims::<D>(),
+        );
     }
 }
 
@@ -334,10 +346,32 @@ impl MatrixParamCatalogVisitor {
         self.params.push(MatrixParamInfo {
             path: path.to_string(),
             param_id: id.val(),
+            perturbation_key: stable_parameter_key(path),
             rank: D,
             shape: shape.to_vec(),
         });
     }
+}
+
+/// Derives the process-independent key used by seeded perturbation generators.
+///
+/// Burn `ParamId` values identify parameters inside one runtime. They are not a
+/// wire contract, so decentralized reconstruction uses the canonical module
+/// path instead.
+pub fn stable_parameter_key(path: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    // `LanguageTrainModel` wraps the canonical Dragon module in a field named
+    // `model`, while browser peers execute the same Dragon module directly.
+    // The wrapper is runtime plumbing and must not change the perturbation field.
+    let canonical_path = path.strip_prefix("model.").unwrap_or(path);
+    canonical_path
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 struct EggrollPerturbMapper<'a> {
@@ -349,10 +383,19 @@ struct EggrollPerturbMapper<'a> {
     sigma: f32,
     sign: AntitheticSign,
     allowed_param_ids: Option<&'a BTreeSet<u64>>,
+    path: Vec<String>,
     perturbed_params: usize,
 }
 
 impl<B: Backend> ModuleMapper<B> for EggrollPerturbMapper<'_> {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, tensor, mapper) = param.consume();
         let require_grad = tensor.is_require_grad();
@@ -365,7 +408,7 @@ impl<B: Backend> ModuleMapper<B> for EggrollPerturbMapper<'_> {
         }
         let spec = MatrixNoiseSpec::new(
             self.seed,
-            id.val(),
+            stable_parameter_key(&self.path.join(".")),
             self.generation,
             self.pair_index,
             self.rank,
@@ -391,10 +434,19 @@ struct EggrollUpdateMapper<'a, B: Backend> {
     update: &'a burn_eggroll::EggrollUpdateConfig,
     state: &'a mut EggrollModuleOptimizerState<B>,
     allowed_param_ids: Option<&'a BTreeSet<u64>>,
+    path: Vec<String>,
     updated_params: usize,
 }
 
 impl<B: Backend> ModuleMapper<B> for EggrollUpdateMapper<'_, B> {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, tensor, mapper) = param.consume();
         let require_grad = tensor.is_require_grad();
@@ -408,13 +460,14 @@ impl<B: Backend> ModuleMapper<B> for EggrollUpdateMapper<'_, B> {
         }
         let shape: [usize; D] = tensor.shape().dims();
         let device = tensor.device();
+        let perturbation_key = stable_parameter_key(&self.path.join("."));
         let gradient = if D < 2 {
             self.coefficients
                 .iter()
                 .fold(None, |accumulated, coefficient| {
                     let spec = MatrixNoiseSpec::new(
                         self.seed,
-                        id.val(),
+                        perturbation_key,
                         self.generation,
                         coefficient.pair_index,
                         self.rank,
@@ -430,14 +483,16 @@ impl<B: Backend> ModuleMapper<B> for EggrollUpdateMapper<'_, B> {
                 .expect("non-empty eggroll coefficients should produce a gradient")
         } else {
             let coefficients = matrix_noise_coefficients(self.coefficients);
-            accumulate_low_rank_gradient_matrix_stack_from_coefficients_with_mode(
+            accumulate_low_rank_gradient_matrix_stack_from_coefficients(
                 shape,
-                self.seed,
-                id.val(),
-                self.generation,
-                self.rank,
-                &coefficients,
-                self.matrix_noise,
+                MatrixNoiseAggregationSpec::new(
+                    self.seed,
+                    perturbation_key,
+                    self.generation,
+                    self.rank,
+                    &coefficients,
+                    self.matrix_noise,
+                ),
                 &device,
             )
         };
@@ -516,8 +571,39 @@ mod tests {
         let catalog = collect_matrix_params::<TestBackend, _>(&module);
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog.parameter_elements(), 36);
-        assert!(catalog.params.iter().any(|param| param.shape == [3, 4]));
-        assert!(catalog.params.iter().any(|param| param.shape == [2, 3, 4]));
+        assert!(catalog.params.iter().any(|param| {
+            param.path == "weight"
+                && param.perturbation_key == stable_parameter_key("weight")
+                && param.shape == [3, 4]
+        }));
+        assert!(catalog.params.iter().any(|param| {
+            param.path == "stack"
+                && param.perturbation_key == stable_parameter_key("stack")
+                && param.shape == [2, 3, 4]
+        }));
+    }
+
+    #[test]
+    fn perturbation_is_stable_across_independent_parameter_ids() {
+        let config = EggrollConfig {
+            sigma: 0.01,
+            ..EggrollConfig::default()
+        };
+        let first = toy_module();
+        let second = toy_module();
+        assert_ne!(first.weight.id, second.weight.id);
+
+        let first = perturb_module::<TestBackend, _>(first, &config, 3, 7, AntitheticSign::Plus);
+        let second = perturb_module::<TestBackend, _>(second, &config, 3, 7, AntitheticSign::Plus);
+
+        assert_eq!(
+            tensor_values(first.weight.val()),
+            tensor_values(second.weight.val())
+        );
+        assert_eq!(
+            tensor_values(first.stack.val()),
+            tensor_values(second.stack.val())
+        );
     }
 
     #[test]
@@ -735,6 +821,7 @@ mod tests {
         let tensor = apply_antithetic_update_to_tensor_with_coefficients(
             base.stack.val(),
             base.stack.id.val(),
+            stable_parameter_key("stack"),
             &config,
             0,
             &coefficients,

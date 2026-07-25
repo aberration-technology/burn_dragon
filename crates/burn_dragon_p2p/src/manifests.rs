@@ -1,21 +1,28 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use burn_dragon_language::DragonConfig;
+use burn_dragon_language::{DragonConfig, TrainingConfig};
 use burn_p2p::burn::{BurnArtifactConfig, BurnRecordPrecision, BurnWorkloadConfig};
 use burn_p2p::{
     BrowserRolePolicy, BrowserVisibilityPolicy, ChunkingScheme, ClientPlatform,
     ClientReleaseManifest, ContentId, DatasetViewId, DiffusionSteadyStatePolicy,
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentOptInPolicy,
     ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadPromotionMode,
-    HeadPromotionPolicy, MergeStrategy, MergeTopologyPolicy, NetworkId, NetworkManifest, PeerRole,
-    PeerRoleSet, Precision, ProjectFamilyId, RevisionId, RevisionManifest, RobustnessPolicy,
-    StudyId, SupportedWorkload, TrainingProtocol, WindowActivation, WindowId, WorkloadId,
+    HeadPromotionPolicy, LocalOptimizerStatePolicy, MergeStrategy, MergeTopologyPolicy, NetworkId,
+    NetworkManifest, PeerRole, PeerRoleSet, Precision, ProjectFamilyId, RecurrentStatePolicy,
+    RevisionId, RevisionManifest, RobustnessPolicy, SchedulerStatePolicy, StudyId,
+    SupportedWorkload, TRAINING_CONTRACT_VERSION, TrainingContractManifest, TrainingProtocol,
+    UpdateCodec, WindowActivation, WindowId, WorkloadId,
 };
 use sha2::{Digest, Sha256};
 
 use crate::capability::{DragonCapabilityClass, DragonTrainingFootprint};
-use crate::config::{DragonExperimentKind, DragonManifestBundle, DragonManifestSeed};
-use crate::profile::DragonExperimentProfile;
+use crate::config::{
+    DragonExperimentKind, DragonManifestBundle, DragonManifestSeed, dragon_model_schema_hash,
+};
+use crate::profile::{
+    DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION, DragonBrowserExperimentProfile,
+    DragonExperimentProfile, browser_profile_execution_contract_hash,
+};
 
 fn stable_content_id<T: serde::Serialize>(label: &str, value: &T) -> ContentId {
     let bytes = serde_json::to_vec(value).expect("stable content id json");
@@ -24,6 +31,205 @@ fn stable_content_id<T: serde::Serialize>(label: &str, value: &T) -> ContentId {
     hasher.update([0]);
     hasher.update(bytes);
     ContentId::new(format!("{label}-{:x}", hasher.finalize()))
+}
+
+fn dragon_target_artifact_hash(
+    target_artifact_id: &str,
+    target_platform: ClientPlatform,
+    release_train_hash: &ContentId,
+) -> ContentId {
+    stable_content_id(
+        "dragon-target-artifact",
+        &serde_json::json!({
+            "target_artifact_id": target_artifact_id,
+            "target_platform": target_platform,
+            "release_train_hash": release_train_hash,
+        }),
+    )
+}
+
+struct DragonTrainingContractInput<'a> {
+    experiment_kind: DragonExperimentKind,
+    model_config: &'a DragonConfig,
+    training_config: Option<&'a TrainingConfig>,
+    dataset_view_id: DatasetViewId,
+    checkpoint_format_hash: ContentId,
+    merge_topology_policy: &'a MergeTopologyPolicy,
+    root_ema_update_basis_points: u16,
+    browser_profile: Option<&'a DragonBrowserExperimentProfile>,
+}
+
+fn dragon_training_contract(
+    input: DragonTrainingContractInput<'_>,
+) -> anyhow::Result<(TrainingContractManifest, ContentId)> {
+    let DragonTrainingContractInput {
+        experiment_kind,
+        model_config,
+        training_config,
+        dataset_view_id,
+        checkpoint_format_hash,
+        merge_topology_policy,
+        root_ema_update_basis_points,
+        browser_profile,
+    } = input;
+    let update_codec = match training_config.map(|config| config.optimizer.name) {
+        Some(burn_dragon_train::OptimizerKind::Eggroll) => {
+            let eggroll = &training_config
+                .expect("training config matched above")
+                .optimizer
+                .eggroll;
+            UpdateCodec::SeededFitness {
+                population: u32::try_from(eggroll.population.population_size)
+                    .map_err(|_| anyhow::anyhow!("EGGROLL population exceeds u32::MAX"))?,
+                rank: u32::try_from(eggroll.population.rank)
+                    .map_err(|_| anyhow::anyhow!("EGGROLL rank exceeds u32::MAX"))?,
+                seed: eggroll.population.seed,
+                replay: burn_p2p::SeededFitnessReplayPolicy::default(),
+            }
+        }
+        _ => UpdateCodec::FullModel,
+    };
+    let forward_only_update = matches!(update_codec, UpdateCodec::SeededFitness { .. });
+    let model_program_hash = stable_content_id(
+        "dragon-model-program",
+        &serde_json::json!({
+            "arch": "dragon_dragon",
+            "n_embd": model_config.n_embd,
+            "n_head": model_config.n_head,
+            "n_layer": model_config.n_layer,
+            "latent_total": model_config.latent_total(),
+            "latent_per_head": model_config.latent_per_head(),
+            "sequence_kernel": model_config.sequence_kernel,
+            "vocab_size": model_config.vocab_size,
+            "language_head": model_config.language_head,
+            "hierarchical_dragon": model_config.hierarchical_dragon,
+            "latent_reasoning": model_config.latent_reasoning,
+            "next_latent_transition": model_config.next_latent_transition,
+        }),
+    );
+    let tokenizer_hash = stable_content_id(
+        "dragon-tokenizer",
+        &training_config.map(|config| &config.dataset.tokenizer),
+    );
+    let preprocessing_hash = stable_content_id(
+        "dragon-preprocessing",
+        &training_config.map(|config| {
+            serde_json::json!({
+                "dataset": config.dataset,
+                "block_size": config.training.block_size,
+                "tbptt_chunk_size": config.training.tbptt_chunk_size,
+                "context_strategy": config.training.context_strategy,
+            })
+        }),
+    );
+    let objective_hash = stable_content_id(
+        "dragon-objective",
+        &training_config.map(|config| {
+            serde_json::json!({
+                "objective": config.training.objective,
+                "input_corruption": config.training.input_corruption,
+                "logit_entropy_floor": config.training.logit_entropy_floor,
+                "repeat_unlikelihood": config.training.repeat_unlikelihood,
+                "greedy_rollout_unlikelihood": config.training.greedy_rollout_unlikelihood,
+                "dynamics_anchor": config.training.dynamics_anchor,
+                "predictive_coding": config.training.predictive_coding,
+                "latent_reasoning": config.training.latent_reasoning,
+                "ruliad_supervision": config.training.ruliad_supervision,
+                "gdpo": config.training.gdpo,
+            })
+        }),
+    );
+    let optimizer_hash = stable_content_id(
+        "dragon-optimizer",
+        &training_config.map(|config| {
+            serde_json::json!({
+                "optimizer": config.optimizer,
+                "module_lr_scales": config.training.module_lr_scales,
+                "continual_backprop": config.training.continual_backprop,
+                "neuron_scaling": config.training.neuron_scaling,
+            })
+        }),
+    );
+    let scheduler_hash = stable_content_id(
+        "dragon-scheduler",
+        &training_config.map(|config| &config.optimizer),
+    );
+    let initialization_hash = stable_content_id(
+        "dragon-initialization",
+        &training_config.map(|config| {
+            serde_json::json!({
+                "seed": config.training.seed,
+                "init_transfer": config.training.init_transfer,
+                "init_checkpoint_path": config.training.init_checkpoint_path,
+                "init_checkpoint_epoch": config.training.init_checkpoint_epoch,
+                "model": model_config,
+            })
+        }),
+    );
+    let validation_hash = stable_content_id(
+        "dragon-validation",
+        &training_config.map(|config| {
+            serde_json::json!({
+                "validation_dataset": config.dataset.validation,
+                "generation": config.generation,
+                "gates": config.training.gates,
+            })
+        }),
+    );
+    let mut extensions = BTreeMap::from([(
+        "experiment_kind".into(),
+        stable_content_id("dragon-experiment-kind", &experiment_kind),
+    )]);
+    if let Some(browser_profile) = browser_profile {
+        extensions.insert(
+            DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION.into(),
+            browser_profile_execution_contract_hash(experiment_kind, browser_profile)?,
+        );
+    }
+    let contract = TrainingContractManifest {
+        version: TRAINING_CONTRACT_VERSION,
+        workload_id: WorkloadId::new(format!("dragon-{}", experiment_kind.workload_slug())),
+        model_program_hash,
+        model_schema_hash: dragon_model_schema_hash(model_config),
+        checkpoint_format_hash,
+        dataset_view_id,
+        tokenizer_hash,
+        preprocessing_hash,
+        objective_hash,
+        optimizer_hash,
+        scheduler_hash,
+        // The current learner adapter reconstructs optimizer and scheduler state
+        // for each distributed window. The contract makes that behavior explicit.
+        optimizer_state_policy: if forward_only_update {
+            LocalOptimizerStatePolicy::StatelessForwardOnly
+        } else {
+            LocalOptimizerStatePolicy::ResetPerWindow
+        },
+        scheduler_state_policy: if forward_only_update {
+            SchedulerStatePolicy::CanonicalAcceptedWork
+        } else {
+            SchedulerStatePolicy::ResetPerWindow
+        },
+        recurrent_state_policy: RecurrentStatePolicy::LeaseScoped,
+        update_codec: update_codec.clone(),
+        aggregation_hash: stable_content_id(
+            "dragon-aggregation",
+            &serde_json::json!({
+                "merge_topology": merge_topology_policy,
+                "model_merge": {
+                    "strategy": "weighted_mean_single_root_ema",
+                    "root_ema_update_basis_points": root_ema_update_basis_points,
+                },
+                "update_codec": update_codec,
+            }),
+        ),
+        validation_hash,
+        initialization_hash,
+        extensions,
+    };
+    contract.validate()?;
+    let contract_id = contract.contract_id()?;
+    Ok((contract, contract_id))
 }
 
 fn backend_resource_class(backend_label: &str) -> String {
@@ -38,35 +244,11 @@ fn backend_resource_class(backend_label: &str) -> String {
     }
 }
 
-fn trainer_minimum_role(backend_label: &str) -> PeerRole {
-    if backend_label.eq_ignore_ascii_case("cpu") || backend_label.eq_ignore_ascii_case("ndarray") {
-        PeerRole::TrainerCpu
-    } else {
-        PeerRole::TrainerGpu
-    }
-}
-
-fn minimum_device_memory_bytes(
-    backend_label: &str,
-    footprint: &DragonTrainingFootprint,
-) -> Option<u64> {
-    match trainer_minimum_role(backend_label) {
-        PeerRole::TrainerCpu => None,
-        PeerRole::TrainerGpu => Some(footprint.estimated_training_bytes),
-        _ => None,
-    }
-}
-
-fn minimum_system_memory_bytes(backend_label: &str, footprint: &DragonTrainingFootprint) -> u64 {
-    let floor = 512 * 1024 * 1024;
-    match trainer_minimum_role(backend_label) {
-        PeerRole::TrainerCpu => footprint.estimated_training_bytes.max(floor),
-        PeerRole::TrainerGpu => footprint
-            .estimated_checkpoint_bytes
-            .saturating_add(footprint.estimated_shard_bytes)
-            .max(floor),
-        _ => floor,
-    }
+fn canonical_minimum_system_memory_bytes(footprint: &DragonTrainingFootprint) -> u64 {
+    footprint
+        .estimated_checkpoint_bytes
+        .saturating_add(footprint.estimated_shard_bytes)
+        .max(512 * 1024 * 1024)
 }
 
 const DRAGON_DIFFUSION_ARTIFACT_SYNC_TIMEOUT_SECS: u32 = 120;
@@ -129,6 +311,7 @@ pub fn build_manifest_bundle(
     experiment_kind: DragonExperimentKind,
     backend_label: &str,
     model_config: &DragonConfig,
+    training_config: Option<&TrainingConfig>,
     profile: &DragonExperimentProfile,
     dataset_view_id: DatasetViewId,
     footprint: &DragonTrainingFootprint,
@@ -136,10 +319,18 @@ pub fn build_manifest_bundle(
     git_commit: &str,
     enabled_features_label: &str,
 ) -> anyhow::Result<DragonManifestBundle> {
-    let workload_id = WorkloadId::new(format!(
-        "dragon-{}-{backend_label}",
-        experiment_kind.workload_slug()
-    ));
+    seed.training_protocol
+        .validate()
+        .map_err(anyhow::Error::from)?;
+    anyhow::ensure!(
+        seed.aggregation.root_ema_update_basis_points
+            <= crate::config::DragonAggregationConfig::MAX_BASIS_POINTS,
+        "root EMA update weight must be at most {} basis points, got {}",
+        crate::config::DragonAggregationConfig::MAX_BASIS_POINTS,
+        seed.aggregation.root_ema_update_basis_points,
+    );
+    let root_ema_update_weight = seed.aggregation.root_ema_update_weight();
+    let workload_id = WorkloadId::new(format!("dragon-{}", experiment_kind.workload_slug()));
     let model_program_hash = stable_content_id(
         "dragon-model-program",
         &serde_json::json!({
@@ -151,7 +342,6 @@ pub fn build_manifest_bundle(
             "latent_per_head": model_config.latent_per_head(),
             "sequence_kernel": model_config.sequence_kernel,
             "vocab_size": model_config.vocab_size,
-            "backend": backend_label,
         }),
     );
     let checkpoint_format_hash = stable_content_id(
@@ -160,21 +350,18 @@ pub fn build_manifest_bundle(
             "format": "named_mpk",
             "precision": "half",
             "chunk_size_bytes": 1024 * 1024,
+            "dragon_schema_version": burn_dragon_core::DRAGON_CHECKPOINT_SCHEMA_VERSION,
         }),
     );
     let revision_family_hash = stable_content_id(
         "dragon-revision-family",
         &serde_json::json!({
             "experiment_kind": experiment_kind,
-            "backend": backend_label,
         }),
     );
     let supported_workload = SupportedWorkload {
         workload_id: workload_id.clone(),
-        workload_name: format!(
-            "burn_dragon {} ({backend_label})",
-            experiment_kind.display_name()
-        ),
+        workload_name: format!("burn_dragon {}", experiment_kind.display_name()),
         model_program_hash,
         checkpoint_format_hash: checkpoint_format_hash.clone(),
         supported_revision_family: revision_family_hash,
@@ -184,7 +371,6 @@ pub fn build_manifest_bundle(
         "dragon-release-train",
         &serde_json::json!({
             "project_family_id": seed.project_family_id,
-            "backend": backend_label,
             "experiment_kind": experiment_kind,
             "app_semver": app_semver,
         }),
@@ -199,13 +385,10 @@ pub fn build_manifest_bundle(
         "native-cpu"
     };
     let target_platform = ClientPlatform::Native;
-    let target_artifact_hash = stable_content_id(
-        "dragon-target-artifact",
-        &serde_json::json!({
-            "target_artifact_id": target_artifact_id,
-            "target_platform": target_platform,
-            "release_train_hash": release_train_hash,
-        }),
+    let target_artifact_hash = dragon_target_artifact_hash(
+        target_artifact_id,
+        target_platform.clone(),
+        &release_train_hash,
     );
     let release_manifest = ClientReleaseManifest {
         project_family_id: ProjectFamilyId::new(&seed.project_family_id),
@@ -227,8 +410,19 @@ pub fn build_manifest_bundle(
         project_family_id: release_manifest.project_family_id.clone(),
         protocol_major: seed.protocol_major,
         minimum_client_version: release_manifest.app_semver.clone(),
-        required_release_train_hash: release_train_hash,
-        allowed_target_artifact_hashes: BTreeSet::from([target_artifact_hash]),
+        required_release_train_hash: release_train_hash.clone(),
+        allowed_target_artifact_hashes: [
+            ("native-cpu", ClientPlatform::Native),
+            ("native-wgpu", ClientPlatform::Native),
+            ("native-cuda", ClientPlatform::Native),
+            ("native-rocm", ClientPlatform::Native),
+            ("browser-wasm", ClientPlatform::Browser),
+        ]
+        .into_iter()
+        .map(|(target, platform)| {
+            dragon_target_artifact_hash(target, platform, &release_train_hash)
+        })
+        .collect(),
         authority_public_keys: seed.authority_public_keys.clone(),
         bootstrap_addrs: seed.bootstrap_addrs.clone(),
         auth_policy_hash: stable_content_id("dragon-auth-policy", &seed.project_family_id),
@@ -237,10 +431,24 @@ pub fn build_manifest_bundle(
     };
     let experiment_id = ExperimentId::new(&seed.experiment_id);
     let merge_topology_policy = dragon_diffusion_merge_topology(experiment_kind);
+    let (training_contract, training_contract_id) =
+        dragon_training_contract(DragonTrainingContractInput {
+            experiment_kind,
+            model_config,
+            training_config,
+            dataset_view_id: dataset_view_id.clone(),
+            checkpoint_format_hash: checkpoint_format_hash.clone(),
+            merge_topology_policy: &merge_topology_policy,
+            root_ema_update_basis_points: seed.aggregation.root_ema_update_basis_points,
+            browser_profile: profile.browser.as_ref(),
+        })?;
     let resource_requirements = ExperimentResourceRequirements {
         minimum_roles: BTreeSet::new(),
-        minimum_device_memory_bytes: minimum_device_memory_bytes(backend_label, footprint),
-        minimum_system_memory_bytes: Some(minimum_system_memory_bytes(backend_label, footprint)),
+        // Runtime capability advertisements decide whether a concrete peer can
+        // train. The authority-signed revision must remain identical across
+        // CPU, GPU, and browser release artifacts.
+        minimum_device_memory_bytes: None,
+        minimum_system_memory_bytes: Some(canonical_minimum_system_memory_bytes(footprint)),
         estimated_download_bytes: footprint
             .estimated_checkpoint_bytes
             .saturating_add(footprint.estimated_shard_bytes),
@@ -248,16 +456,20 @@ pub fn build_manifest_bundle(
     };
     let browser_trainer_wgpu = browser_trainer_wgpu_enabled(profile, footprint);
     let mut allowed_role_values = vec![
-        trainer_minimum_role(backend_label),
+        PeerRole::TrainerCpu,
+        PeerRole::TrainerGpu,
         PeerRole::Archive,
         PeerRole::Viewer,
-        PeerRole::BrowserObserver,
     ];
+    if profile.browser.is_some() {
+        allowed_role_values.push(PeerRole::BrowserObserver);
+        allowed_role_values.push(PeerRole::BrowserVerifier);
+    }
     if browser_trainer_wgpu {
         allowed_role_values.push(PeerRole::BrowserTrainerWgpu);
     }
     let allowed_roles = PeerRoleSet::new(allowed_role_values);
-    let allowed_scopes = BTreeSet::from([
+    let mut allowed_scopes = BTreeSet::from([
         ExperimentScope::Connect,
         ExperimentScope::Discover,
         ExperimentScope::Train {
@@ -267,12 +479,16 @@ pub fn build_manifest_bundle(
             experiment_id: experiment_id.clone(),
         },
     ]);
-    let metadata = BTreeMap::from([
+    if profile.browser.is_some() {
+        allowed_scopes.insert(ExperimentScope::Validate {
+            experiment_id: experiment_id.clone(),
+        });
+    }
+    let mut metadata = BTreeMap::from([
         (
             "experiment_kind".into(),
             experiment_kind.workload_slug().into(),
         ),
-        ("backend".into(), backend_label.into()),
         (
             "estimated_training_bytes".into(),
             footprint.estimated_training_bytes.to_string(),
@@ -289,7 +505,33 @@ pub fn build_manifest_bundle(
             "estimated_tokens_per_second".into(),
             format!("{:.1}", footprint.estimated_tokens_per_second),
         ),
+        (
+            "root_ema_update_basis_points".into(),
+            seed.aggregation.root_ema_update_basis_points.to_string(),
+        ),
+        (
+            "training_protocol".into(),
+            match &seed.training_protocol {
+                TrainingProtocol::ArtifactWindows => "artifact_windows",
+                TrainingProtocol::DiLoCo(_) => "diloco",
+            }
+            .into(),
+        ),
     ]);
+    if let TrainingProtocol::DiLoCo(policy) = &seed.training_protocol {
+        metadata.insert(
+            "diloco_num_inner_steps".into(),
+            policy.num_inner_steps.to_string(),
+        );
+        metadata.insert(
+            "diloco_target_group_size".into(),
+            policy.target_group_size.to_string(),
+        );
+        metadata.insert(
+            "diloco_minimum_group_size".into(),
+            policy.minimum_group_size.to_string(),
+        );
+    }
     let mut experiment_directory_entry = ExperimentDirectoryEntry {
         network_id: network_manifest.network_id.clone(),
         study_id: StudyId::new(&seed.study_id),
@@ -305,12 +547,12 @@ pub fn build_manifest_bundle(
         current_head_id: None,
         allowed_roles,
         allowed_scopes,
-        training_protocol: Default::default(),
+        training_protocol: seed.training_protocol.clone(),
         metadata,
     };
     profile.attach_to_entry(&mut experiment_directory_entry)?;
     let robustness_policy = dragon_robustness_policy(experiment_kind);
-    experiment_directory_entry.apply_revision_policy(&RevisionManifest {
+    let revision_manifest = RevisionManifest {
         experiment_id: experiment_id.clone(),
         revision_id: RevisionId::new(&seed.revision_id),
         workload_id: workload_id.clone(),
@@ -318,19 +560,12 @@ pub fn build_manifest_bundle(
         model_schema_hash: experiment_directory_entry.model_schema_hash.clone(),
         checkpoint_format_hash: checkpoint_format_hash.clone(),
         dataset_view_id: experiment_directory_entry.dataset_view_id.clone(),
-        training_config_hash: stable_content_id(
-            "dragon-training-config",
-            &serde_json::json!({
-                "experiment_kind": experiment_kind,
-                "backend": backend_label,
-                "vocab_size": model_config.vocab_size,
-            }),
-        ),
+        training_config_hash: training_contract_id.clone(),
         merge_topology_policy_hash: stable_content_id(
             "dragon-merge-topology",
             &merge_topology_policy,
         ),
-        training_protocol: TrainingProtocol::default(),
+        training_protocol: seed.training_protocol.clone(),
         slot_requirements: experiment_directory_entry.resource_requirements.clone(),
         activation_window: WindowActivation {
             activation_window: WindowId(0),
@@ -342,7 +577,7 @@ pub fn build_manifest_bundle(
         browser_enabled: profile.browser.is_some(),
         browser_role_policy: BrowserRolePolicy {
             observer: true,
-            verifier: false,
+            verifier: profile.browser.is_some(),
             trainer_wgpu: browser_trainer_wgpu,
             fallback: true,
         },
@@ -354,7 +589,8 @@ pub fn build_manifest_bundle(
         recommended_browser_precision: Some(Precision::Fp16),
         visibility_policy: BrowserVisibilityPolicy::SwarmEligible,
         description: seed.description.clone(),
-    });
+    };
+    experiment_directory_entry.apply_revision_policy(&revision_manifest);
     experiment_directory_entry.metadata.insert(
         "burn_p2p.revision.merge_topology.policy_json".into(),
         serde_json::to_string(&merge_topology_policy)
@@ -365,19 +601,25 @@ pub fn build_manifest_bundle(
         supported_workload.clone(),
         BurnArtifactConfig::named_mpk(BurnRecordPrecision::Half, ChunkingScheme::new(1024 * 1024)?),
     )
-    .with_root_ema(BurnWorkloadConfig::standard_root_ema_decay());
+    .with_model_schema_hash(training_contract.model_schema_hash.clone())
+    .with_root_ema(root_ema_update_weight);
     Ok(DragonManifestBundle {
         release_manifest,
         network_manifest,
+        revision_manifest,
         supported_workload,
         experiment_directory,
         workload_config,
+        training_contract,
+        training_contract_id,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_p2p::burn::BurnMergeConfig;
+    use burn_p2p::{DiLoCoPolicy, GradientCodec, OuterOptimizerPolicy};
     use semver::Version;
 
     fn seed() -> DragonManifestSeed {
@@ -397,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_manifests_publish_device_memory_requirements() {
+    fn manifests_publish_backend_neutral_revision_requirements() {
         let model_config = DragonConfig::default();
         let footprint = DragonTrainingFootprint {
             estimated_parameter_bytes: 1024,
@@ -413,6 +655,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "wgpu",
             &model_config,
+            None,
             &DragonExperimentProfile {
                 version: 1,
                 experiment_kind: DragonExperimentKind::NcaPrepretraining,
@@ -431,10 +674,7 @@ mod tests {
         )
         .expect("manifest bundle");
         let requirements = &bundle.experiment_directory[0].resource_requirements;
-        assert_eq!(
-            requirements.minimum_device_memory_bytes,
-            Some(footprint.estimated_training_bytes)
-        );
+        assert_eq!(requirements.minimum_device_memory_bytes, None);
         assert_eq!(
             requirements.minimum_system_memory_bytes,
             Some(
@@ -449,6 +689,16 @@ mod tests {
             footprint
                 .estimated_checkpoint_bytes
                 .saturating_add(footprint.estimated_shard_bytes)
+        );
+        assert!(
+            bundle.experiment_directory[0]
+                .allowed_roles
+                .contains(&PeerRole::TrainerCpu)
+        );
+        assert!(
+            bundle.experiment_directory[0]
+                .allowed_roles
+                .contains(&PeerRole::TrainerGpu)
         );
     }
 
@@ -470,6 +720,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             &DragonExperimentProfile {
                 version: 1,
                 experiment_kind: DragonExperimentKind::NcaPrepretraining,
@@ -518,8 +769,12 @@ mod tests {
             },
             browser: Some(crate::profile::DragonBrowserExperimentProfile {
                 model_config: model_config.clone(),
+                training_objective: Default::default(),
+                optimizer: Default::default(),
                 execution_backend: crate::config::DragonBrowserExecutionBackend::Auto,
                 block_size: 8,
+                tbptt_chunk_size: None,
+                tbptt_persist_across_steps: false,
                 learning_rate: 1.0e-3,
                 weight_decay: 0.0,
                 batch_size: 1,
@@ -537,6 +792,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             &profile,
             DatasetViewId::new("dataset-view"),
             &footprint,
@@ -548,7 +804,25 @@ mod tests {
 
         let entry = &bundle.experiment_directory[0];
         assert!(entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
+        assert!(entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
         assert!(entry.browser_role_policy().trainer_wgpu);
+        assert!(entry.browser_role_policy().verifier);
+        assert_eq!(
+            bundle
+                .training_contract
+                .extensions
+                .get(DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION),
+            Some(
+                &browser_profile_execution_contract_hash(
+                    profile.experiment_kind,
+                    profile.browser.as_ref().expect("browser profile"),
+                )
+                .expect("browser execution contract")
+            ),
+        );
+        assert!(entry.allowed_scopes.contains(&ExperimentScope::Validate {
+            experiment_id: entry.experiment_id.clone(),
+        }));
         let browser_training =
             crate::profile::browser_training_config_from_profile(entry, &profile)
                 .expect("browser training profile")
@@ -558,6 +832,89 @@ mod tests {
             .expect("browser live participant config");
         assert!(live.publish_canonical_update);
         assert!(live.load_active_head_artifact);
+    }
+
+    #[test]
+    fn heterogeneous_backends_share_workload_revision_and_training_contract() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let profile = DragonExperimentProfile {
+            version: 1,
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            native: crate::profile::DragonNativeExperimentProfile {
+                training_toml: String::new(),
+                nca_corpus_toml: None,
+                ruliad_corpus_toml: None,
+            },
+            browser: None,
+        };
+        let build = |backend| {
+            build_manifest_bundle(
+                &seed(),
+                DragonExperimentKind::NcaPrepretraining,
+                backend,
+                &model_config,
+                None,
+                &profile,
+                DatasetViewId::new("dataset-view"),
+                &footprint,
+                Version::parse(env!("CARGO_PKG_VERSION")).expect("version"),
+                "test",
+                backend,
+            )
+            .expect("manifest bundle")
+        };
+
+        let cpu = build("cpu");
+        let wgpu = build("wgpu");
+        assert_eq!(
+            cpu.supported_workload.workload_id,
+            wgpu.supported_workload.workload_id
+        );
+        assert_eq!(
+            cpu.supported_workload.model_program_hash,
+            wgpu.supported_workload.model_program_hash
+        );
+        assert_eq!(
+            cpu.supported_workload.supported_revision_family,
+            wgpu.supported_workload.supported_revision_family
+        );
+        assert_eq!(
+            cpu.release_manifest.release_train_hash,
+            wgpu.release_manifest.release_train_hash
+        );
+        assert_eq!(cpu.training_contract_id, wgpu.training_contract_id);
+        assert_eq!(cpu.training_contract, wgpu.training_contract);
+        assert_eq!(
+            cpu.revision_manifest.training_config_hash,
+            cpu.training_contract_id
+        );
+        assert_eq!(cpu.revision_manifest, wgpu.revision_manifest);
+        assert_eq!(
+            cpu.workload_config.model_schema_hash.as_ref(),
+            Some(&cpu.training_contract.model_schema_hash),
+        );
+        assert_eq!(
+            wgpu.workload_config.model_schema_hash.as_ref(),
+            Some(&wgpu.training_contract.model_schema_hash),
+        );
+        assert_eq!(
+            cpu.network_manifest.allowed_target_artifact_hashes,
+            wgpu.network_manifest.allowed_target_artifact_hashes
+        );
+        assert_eq!(cpu.experiment_directory, wgpu.experiment_directory);
+        assert_ne!(
+            cpu.release_manifest.target_artifact_hash, wgpu.release_manifest.target_artifact_hash,
+            "hardware builds remain distinct release artifacts"
+        );
     }
 
     #[test]
@@ -577,6 +934,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             &DragonExperimentProfile {
                 version: 1,
                 experiment_kind: DragonExperimentKind::NcaPrepretraining,
@@ -597,6 +955,14 @@ mod tests {
 
         let entry = &bundle.experiment_directory[0];
         assert_eq!(entry.training_protocol(), TrainingProtocol::ArtifactWindows);
+        assert_eq!(
+            bundle.revision_manifest.training_protocol,
+            TrainingProtocol::ArtifactWindows
+        );
+        assert_eq!(
+            entry.metadata.get("training_protocol").map(String::as_str),
+            Some("artifact_windows")
+        );
         assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
         assert!(!entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
         assert!(!entry.allowed_roles.contains(&PeerRole::BrowserTrainerWgpu));
@@ -640,5 +1006,228 @@ mod tests {
             robustness.validator_canary_policy.maximum_regression_delta,
             1.0
         );
+    }
+
+    #[test]
+    fn diloco_protocol_is_validated_and_bound_to_directory_and_revision() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let profile = DragonExperimentProfile {
+            version: 1,
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            native: crate::profile::DragonNativeExperimentProfile {
+                training_toml: String::new(),
+                nca_corpus_toml: None,
+                ruliad_corpus_toml: None,
+            },
+            browser: None,
+        };
+        let policy = DiLoCoPolicy {
+            num_inner_steps: 7,
+            target_group_size: 3,
+            minimum_group_size: 2,
+            checkpoint_interval_rounds: 4,
+            codec: GradientCodec::Fp32,
+            outer_optimizer_policy: OuterOptimizerPolicy::Sgd {
+                learning_rate_micros: 750_000,
+                momentum_micros: Some(500_000),
+                nesterov: true,
+                weight_decay_micros: None,
+            },
+            ..DiLoCoPolicy::default()
+        };
+        let mut diloco_seed = seed();
+        diloco_seed.training_protocol = TrainingProtocol::DiLoCo(policy.clone());
+
+        let bundle = build_manifest_bundle(
+            &diloco_seed,
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            None,
+            &profile,
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
+            "test",
+            "native,cpu",
+        )
+        .expect("DiLoCo manifest bundle");
+
+        let expected = TrainingProtocol::DiLoCo(policy);
+        let entry = &bundle.experiment_directory[0];
+        assert_eq!(entry.training_protocol(), expected);
+        assert_eq!(bundle.revision_manifest.training_protocol, expected);
+        assert_eq!(
+            entry.metadata.get("training_protocol").map(String::as_str),
+            Some("diloco")
+        );
+        assert_eq!(
+            entry
+                .metadata
+                .get("diloco_num_inner_steps")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            entry
+                .metadata
+                .get("diloco_target_group_size")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            entry
+                .metadata
+                .get("diloco_minimum_group_size")
+                .map(String::as_str),
+            Some("2")
+        );
+
+        let mut invalid_seed = diloco_seed;
+        let TrainingProtocol::DiLoCo(policy) = &mut invalid_seed.training_protocol else {
+            unreachable!("test seed is DiLoCo");
+        };
+        policy.num_inner_steps = 0;
+        let error = build_manifest_bundle(
+            &invalid_seed,
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            None,
+            &profile,
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("valid burn_dragon version"),
+            "test",
+            "native,cpu",
+        )
+        .expect_err("invalid DiLoCo policy must fail at manifest construction");
+        assert!(error.to_string().contains("num_inner_steps"));
+    }
+
+    #[test]
+    fn aggregation_weight_is_revision_bound_and_matches_runtime_merge() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let profile = DragonExperimentProfile {
+            version: 1,
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            native: crate::profile::DragonNativeExperimentProfile {
+                training_toml: String::new(),
+                nca_corpus_toml: None,
+                ruliad_corpus_toml: None,
+            },
+            browser: None,
+        };
+        let build = |root_ema_update_basis_points| {
+            let mut seed = seed();
+            seed.aggregation.root_ema_update_basis_points = root_ema_update_basis_points;
+            build_manifest_bundle(
+                &seed,
+                DragonExperimentKind::NcaPrepretraining,
+                "cpu",
+                &model_config,
+                None,
+                &profile,
+                DatasetViewId::new("dataset-view"),
+                &footprint,
+                Version::parse(env!("CARGO_PKG_VERSION")).expect("version"),
+                "test",
+                "native,cpu",
+            )
+        };
+
+        let smoothed = build(3_500).expect("smoothed manifest");
+        let direct = build(10_000).expect("direct manifest");
+
+        assert_ne!(
+            smoothed.training_contract.aggregation_hash,
+            direct.training_contract.aggregation_hash
+        );
+        assert_ne!(smoothed.training_contract_id, direct.training_contract_id);
+        assert_eq!(
+            smoothed.experiment_directory[0]
+                .metadata
+                .get("root_ema_update_basis_points")
+                .map(String::as_str),
+            Some("3500")
+        );
+        assert_eq!(
+            direct.experiment_directory[0]
+                .metadata
+                .get("root_ema_update_basis_points")
+                .map(String::as_str),
+            Some("10000")
+        );
+        match smoothed.workload_config.merge {
+            BurnMergeConfig::WeightedMeanWithRootEma { decay } => {
+                assert!((decay - 0.35).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected root-EMA merge"),
+        }
+        match direct.workload_config.merge {
+            BurnMergeConfig::WeightedMeanWithRootEma { decay } => {
+                assert!((decay - 1.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected root-EMA merge"),
+        }
+    }
+
+    #[test]
+    fn aggregation_weight_rejects_values_above_one() {
+        let model_config = DragonConfig::default();
+        let footprint = DragonTrainingFootprint {
+            estimated_parameter_bytes: 1024,
+            estimated_optimizer_state_bytes: 2048,
+            estimated_activation_bytes: 4096,
+            estimated_training_bytes: 8192,
+            estimated_checkpoint_bytes: 4096,
+            estimated_shard_bytes: 2048,
+            estimated_tokens_per_second: 1234.0,
+        };
+        let mut invalid_seed = seed();
+        invalid_seed.aggregation.root_ema_update_basis_points = 10_001;
+        let result = build_manifest_bundle(
+            &invalid_seed,
+            DragonExperimentKind::NcaPrepretraining,
+            "cpu",
+            &model_config,
+            None,
+            &DragonExperimentProfile {
+                version: 1,
+                experiment_kind: DragonExperimentKind::NcaPrepretraining,
+                native: crate::profile::DragonNativeExperimentProfile {
+                    training_toml: String::new(),
+                    nca_corpus_toml: None,
+                    ruliad_corpus_toml: None,
+                },
+                browser: None,
+            },
+            DatasetViewId::new("dataset-view"),
+            &footprint,
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("version"),
+            "test",
+            "native,cpu",
+        );
+
+        let error = result.expect_err("invalid root-EMA weight should fail");
+        assert!(error.to_string().contains("at most 10000 basis points"));
     }
 }

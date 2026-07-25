@@ -1996,10 +1996,13 @@ dependencies = [
  "burn-train",
  "burn-wgpu",
  "burn_dragon_core",
+ "burn_dragon_eggroll",
  "burn_dragon_language",
  "burn_dragon_time",
  "burn_dragon_train",
  "burn_dragon_universality",
+ "burn_ecs",
+ "burn_eggroll",
  "burn_p2p",
  "burn_p2p_admin",
  "burn_p2p_app",
@@ -2171,6 +2174,7 @@ dependencies = [
  "burn_p2p_limits",
  "burn_p2p_security",
  "burn_p2p_swarm",
+ "burn_p2p_tensor_identity",
  "burn_p2p_views",
  "burn_p2p_workload",
  "chrono",
@@ -2289,6 +2293,7 @@ dependencies = [
  "hex",
  "semver",
  "serde",
+ "serde_bytes",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "web-time",
@@ -2317,6 +2322,7 @@ dependencies = [
  "burn_p2p_checkpoint",
  "burn_p2p_core",
  "burn_p2p_experiment",
+ "burn_p2p_tensor_identity",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -2408,10 +2414,24 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "burn_p2p_tensor_identity"
+version = "0.21.8"
+dependencies = [
+ "burn",
+ "burn-store",
+ "burn_p2p_core",
+ "ciborium",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2486,6 +2506,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -15236,11 +15257,14 @@ dependencies = [
  "base64 0.22.1",
  "burn_dragon_p2p",
  "burn_p2p",
+ "burn_p2p_admin",
  "burn_p2p_app",
  "burn_p2p_browser",
  "burn_p2p_core",
  "chrono",
  "clap 4.6.1",
+ "hex",
+ "libp2p-identity",
  "reqwest",
  "semver",
  "serde",

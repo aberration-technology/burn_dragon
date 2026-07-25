@@ -2915,7 +2915,7 @@ mod tests {
     #[test]
     fn compact_proof_step_runs_collapse_repeated_identity_chains() {
         let mut steps = vec!["a*b=c".to_string()];
-        steps.extend(std::iter::repeat("c*id=c".to_string()).take(32));
+        steps.extend(std::iter::repeat_n("c*id=c".to_string(), 32));
         steps.push("close".to_string());
         let compacted = compact_proof_step_runs(&steps, 32);
         assert_eq!(
@@ -3374,11 +3374,13 @@ mod tests {
         let near = scale_family_for_difficulty(&family, 32);
         let far = scale_family_for_difficulty(&family, 96);
         assert!(
-            far.width.unwrap().max > near.width.unwrap().max,
+            far.width.as_ref().expect("far width").max
+                > near.width.as_ref().expect("near width").max,
             "far-out proof-tree modulus range should exceed the legacy d32 clamp"
         );
         assert!(
-            far.steps.unwrap().max > near.steps.unwrap().max,
+            far.steps.as_ref().expect("far steps").max
+                > near.steps.as_ref().expect("near steps").max,
             "far-out proof-tree depth range should exceed the legacy d32 clamp"
         );
     }

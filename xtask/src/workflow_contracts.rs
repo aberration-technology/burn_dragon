@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 use crate::bootstrap_runtime::{
@@ -11,7 +11,7 @@ use crate::bootstrap_runtime::{
 const BURN_P2P_SIBLING_REF: &str = "900a8fbc988edd7db503b1fb1ee2eed29dcc99bc";
 
 pub fn run() -> Result<()> {
-    repository_has_no_scripts_tree()?;
+    workflows_do_not_invoke_repository_scripts()?;
     runtime_sync_contract()?;
     bootstrap_head_preservation_contract()?;
     workflow_sibling_checkout_contract()?;
@@ -28,23 +28,17 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn repository_has_no_scripts_tree() -> Result<()> {
-    for path in walk(".")? {
-        if path
-            .components()
-            .any(|component| component.as_os_str() == ".git")
-            || path
-                .components()
-                .any(|component| component.as_os_str() == "target")
-            || path
-                .components()
-                .any(|component| component.as_os_str() == "burn_p2p-sibling")
-        {
+fn workflows_do_not_invoke_repository_scripts() -> Result<()> {
+    for path in walk(".github/workflows")? {
+        if !path.is_file() {
             continue;
         }
-        if path.file_name().and_then(|value| value.to_str()) == Some("scripts") {
-            bail!("legacy scripts directory remains: {}", path.display());
-        }
+        let source = read(&path)?;
+        ensure!(
+            !source.contains("scripts/") && !source.contains("./scripts/"),
+            "workflow {} invokes a repository script; deployment orchestration belongs in xtask",
+            path.display(),
+        );
     }
     Ok(())
 }

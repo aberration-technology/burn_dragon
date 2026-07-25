@@ -224,6 +224,50 @@ impl<B: Backend> SharedLowrankPopulationFactors<B> {
     }
 }
 
+struct PopulationLayerLowrankFactors<B: Backend> {
+    encoder_a: Tensor<B, 4>,
+    encoder_b: Tensor<B, 4>,
+    encoder_v_a: Tensor<B, 4>,
+    encoder_v_b: Tensor<B, 4>,
+    decoder_a: Tensor<B, 3>,
+    decoder_b: Tensor<B, 3>,
+    signs: Tensor<B, 1>,
+    latent_per_head: usize,
+}
+
+struct SharedLowrankPopulationProjection<'a, B: Backend> {
+    dense: Tensor<B, 4>,
+    projector: Tensor<B, 4>,
+    population: usize,
+    relu_threshold: f32,
+    use_fused: bool,
+    latent_pattern: &'a crate::kernel::BlockPattern1d,
+    sparse_mask: Option<Tensor<B, 4>>,
+}
+
+struct FactorizedPopulationProjection<'a, B: Backend> {
+    dense: Tensor<B, 4>,
+    base_projector: Tensor<B, 4>,
+    factor_a: Tensor<B, 4>,
+    factor_b: Tensor<B, 4>,
+    signs: Tensor<B, 1>,
+    sigma_scale: f64,
+    population: usize,
+    relu_threshold: f32,
+    latent_pattern: &'a crate::kernel::BlockPattern1d,
+    sparse_mask: Option<Tensor<B, 4>>,
+}
+
+struct FactorizedPopulationDecode<B: Backend> {
+    y_neuron: Tensor<B, 4>,
+    base_decoder: Tensor<B, 2>,
+    factor_a: Tensor<B, 3>,
+    factor_b: Tensor<B, 3>,
+    signs: Tensor<B, 1>,
+    sigma_scale: f64,
+    population: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HierarchicalDragonBranch {
     Fast,
@@ -1012,7 +1056,7 @@ impl<B: Backend> DragonModel<B> {
                 self.hierarchical_dragon, fresh.hierarchical_dragon
             ));
         }
-        if new_latent_total % self.n_head != 0 {
+        if !new_latent_total.is_multiple_of(self.n_head) {
             return Err(format!(
                 "target latent_total must be divisible by n_head (target={new_latent_total}, n_head={})",
                 self.n_head
@@ -1951,16 +1995,7 @@ impl<B: Backend> DragonModel<B> {
         &self,
         layer_idx: usize,
         factors: &SharedLowrankPopulationFactors<B>,
-    ) -> (
-        Tensor<B, 4>,
-        Tensor<B, 4>,
-        Tensor<B, 4>,
-        Tensor<B, 4>,
-        Tensor<B, 3>,
-        Tensor<B, 3>,
-        Tensor<B, 1>,
-        usize,
-    ) {
+    ) -> PopulationLayerLowrankFactors<B> {
         let latent_per_head = self.layer_latent_per_head(layer_idx);
         let capacity_per_head = self.latent_per_head_capacity();
         let population = factors.population_size();
@@ -1993,31 +2028,34 @@ impl<B: Backend> DragonModel<B> {
                 .collect(),
             1,
         );
-        (
+        PopulationLayerLowrankFactors {
             encoder_a,
             encoder_b,
             encoder_v_a,
             encoder_v_b,
             decoder_a,
-            factors.decoder_b.clone(),
-            factors.signs.clone(),
+            decoder_b: factors.decoder_b.clone(),
+            signs: factors.signs.clone(),
             latent_per_head,
-        )
+        }
     }
 
     fn project_shared_lowrank_population_positive(
         &self,
-        dense: Tensor<B, 4>,
-        projector: Tensor<B, 4>,
-        population: usize,
-        relu_threshold: f32,
-        use_fused: bool,
-        latent_pattern: &crate::kernel::BlockPattern1d,
-        sparse_mask: Option<Tensor<B, 4>>,
+        request: SharedLowrankPopulationProjection<'_, B>,
     ) -> Tensor<B, 4>
     where
         B::FloatTensorPrimitive: 'static,
     {
+        let SharedLowrankPopulationProjection {
+            dense,
+            projector,
+            population,
+            relu_threshold,
+            use_fused,
+            latent_pattern,
+            sparse_mask,
+        } = request;
         let [flat_batch, streams, time, embd] = dense.shape().dims::<4>();
         assert_eq!(
             flat_batch % population,
@@ -2113,17 +2151,20 @@ impl<B: Backend> DragonModel<B> {
 
     fn project_shared_lowrank_population_factorized_positive(
         &self,
-        dense: Tensor<B, 4>,
-        base_projector: Tensor<B, 4>,
-        factor_a: Tensor<B, 4>,
-        factor_b: Tensor<B, 4>,
-        signs: Tensor<B, 1>,
-        sigma_scale: f64,
-        population: usize,
-        relu_threshold: f32,
-        latent_pattern: &crate::kernel::BlockPattern1d,
-        sparse_mask: Option<Tensor<B, 4>>,
+        request: FactorizedPopulationProjection<'_, B>,
     ) -> Tensor<B, 4> {
+        let FactorizedPopulationProjection {
+            dense,
+            base_projector,
+            factor_a,
+            factor_b,
+            signs,
+            sigma_scale,
+            population,
+            relu_threshold,
+            latent_pattern,
+            sparse_mask,
+        } = request;
         let [flat_batch, streams, time, embd] = dense.shape().dims::<4>();
         assert_eq!(
             flat_batch % population,
@@ -2270,14 +2311,17 @@ impl<B: Backend> DragonModel<B> {
 
     fn decode_shared_lowrank_population_factors_tail(
         &self,
-        y_neuron: Tensor<B, 4>,
-        base_decoder: Tensor<B, 2>,
-        factor_a: Tensor<B, 3>,
-        factor_b: Tensor<B, 3>,
-        signs: Tensor<B, 1>,
-        sigma_scale: f64,
-        population: usize,
+        request: FactorizedPopulationDecode<B>,
     ) -> Tensor<B, 4> {
+        let FactorizedPopulationDecode {
+            y_neuron,
+            base_decoder,
+            factor_a,
+            factor_b,
+            signs,
+            sigma_scale,
+            population,
+        } = request;
         let [flat_batch, heads, time, latent] = y_neuron.shape().dims::<4>();
         assert_eq!(
             flat_batch % population,
@@ -2738,13 +2782,15 @@ impl<B: Backend> DragonModel<B> {
             };
 
             let x_neuron = self.project_shared_lowrank_population_positive(
-                branch_flat.clone(),
-                encoder,
-                population,
-                self.x_relu_threshold,
-                fused && self.kernel.projection_executor.use_x(),
-                latent_pattern,
-                sparse_mask.clone(),
+                SharedLowrankPopulationProjection {
+                    dense: branch_flat.clone(),
+                    projector: encoder,
+                    population,
+                    relu_threshold: self.x_relu_threshold,
+                    use_fused: fused && self.kernel.projection_executor.use_x(),
+                    latent_pattern,
+                    sparse_mask: sparse_mask.clone(),
+                },
             );
             let attn = self.recurrent_attention_with_plan(
                 x_neuron.clone(),
@@ -2756,13 +2802,15 @@ impl<B: Backend> DragonModel<B> {
             );
             let attn = self.norm.forward(attn);
             let y_gate = self.project_shared_lowrank_population_positive(
-                attn,
-                encoder_v,
-                population,
-                self.y_relu_threshold,
-                fused && self.kernel.projection_executor.use_y(),
-                latent_pattern,
-                sparse_mask,
+                SharedLowrankPopulationProjection {
+                    dense: attn,
+                    projector: encoder_v,
+                    population,
+                    relu_threshold: self.y_relu_threshold,
+                    use_fused: fused && self.kernel.projection_executor.use_y(),
+                    latent_pattern,
+                    sparse_mask,
+                },
             );
             let y_neuron = self.dropout.forward(x_neuron * y_gate);
             let mlp_out = self.decode_shared_lowrank_population_tail(y_neuron, decoder, population);
@@ -2856,7 +2904,7 @@ impl<B: Backend> DragonModel<B> {
             let branch_flat = branch_input.reshape([flat_batch, 1, branch_time, branch_dim]);
             let (base_encoder, base_encoder_v, base_decoder, latent) =
                 self.layer_lowrank_weights(layer_idx);
-            let (
+            let PopulationLayerLowrankFactors {
                 encoder_a,
                 encoder_b,
                 encoder_v_a,
@@ -2864,8 +2912,8 @@ impl<B: Backend> DragonModel<B> {
                 decoder_a,
                 decoder_b,
                 signs,
-                factor_latent,
-            ) = self.population_layer_lowrank_factors(layer_idx, factors);
+                latent_per_head: factor_latent,
+            } = self.population_layer_lowrank_factors(layer_idx, factors);
             assert_eq!(
                 latent, factor_latent,
                 "population factor latent slice mismatch"
@@ -2904,16 +2952,18 @@ impl<B: Backend> DragonModel<B> {
             };
 
             let x_neuron = self.project_shared_lowrank_population_factorized_positive(
-                branch_flat.clone(),
-                base_encoder,
-                encoder_a,
-                encoder_b,
-                signs.clone(),
-                factors.sigma as f64 * factors.encoder_scale,
-                population,
-                self.x_relu_threshold,
-                latent_pattern,
-                sparse_mask.clone(),
+                FactorizedPopulationProjection {
+                    dense: branch_flat.clone(),
+                    base_projector: base_encoder,
+                    factor_a: encoder_a,
+                    factor_b: encoder_b,
+                    signs: signs.clone(),
+                    sigma_scale: factors.sigma as f64 * factors.encoder_scale,
+                    population,
+                    relu_threshold: self.x_relu_threshold,
+                    latent_pattern,
+                    sparse_mask: sparse_mask.clone(),
+                },
             );
             let attn = self.recurrent_attention_with_plan(
                 x_neuron.clone(),
@@ -2925,27 +2975,30 @@ impl<B: Backend> DragonModel<B> {
             );
             let attn = self.norm.forward(attn);
             let y_gate = self.project_shared_lowrank_population_factorized_positive(
-                attn,
-                base_encoder_v,
-                encoder_v_a,
-                encoder_v_b,
-                signs.clone(),
-                factors.sigma as f64 * factors.encoder_v_scale,
-                population,
-                self.y_relu_threshold,
-                latent_pattern,
-                sparse_mask,
+                FactorizedPopulationProjection {
+                    dense: attn,
+                    base_projector: base_encoder_v,
+                    factor_a: encoder_v_a,
+                    factor_b: encoder_v_b,
+                    signs: signs.clone(),
+                    sigma_scale: factors.sigma as f64 * factors.encoder_v_scale,
+                    population,
+                    relu_threshold: self.y_relu_threshold,
+                    latent_pattern,
+                    sparse_mask,
+                },
             );
             let y_neuron = self.dropout.forward(x_neuron * y_gate);
-            let mlp_out = self.decode_shared_lowrank_population_factors_tail(
-                y_neuron,
-                base_decoder,
-                decoder_a,
-                decoder_b,
-                signs,
-                factors.sigma as f64 * factors.decoder_scale,
-                population,
-            );
+            let mlp_out =
+                self.decode_shared_lowrank_population_factors_tail(FactorizedPopulationDecode {
+                    y_neuron,
+                    base_decoder,
+                    factor_a: decoder_a,
+                    factor_b: decoder_b,
+                    signs,
+                    sigma_scale: factors.sigma as f64 * factors.decoder_scale,
+                    population,
+                });
             let mlp_out = self.norm.forward(mlp_out);
             let branch_out = self.norm.forward(branch_flat + mlp_out).reshape([
                 branch_batch,
@@ -4851,6 +4904,7 @@ mod tests {
     #[test]
     fn widen_latent_total_supports_gdn2_adapter_and_preserves_latent_prefix() {
         let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 31);
         let source_config = tiny_scaling_source_config(SequenceKernelConfig::reference(
             SequenceMemorySystem::GatedDeltaNet2,
         ));

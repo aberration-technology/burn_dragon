@@ -74,6 +74,13 @@ fn sampler_candidates(count: usize) -> Vec<RuliadSamplerCandidate> {
             previous_loss_ema: 1.5 + (index % 13) as f32 * 0.25,
             gradient_alignment: if index % 5 == 0 { 0.5 } else { 0.0 },
             is_hash_noise: index % 17 == 0,
+            capability_feedback_count: 0,
+            capability_verifier_ema: 0.0,
+            capability_partial_ema: 0.0,
+            capability_completion_health_ema: 0.0,
+            capability_schema_wrong_ema: 0.0,
+            capability_malformed_ema: 0.0,
+            capability_missing_ema: 0.0,
         })
         .collect()
 }

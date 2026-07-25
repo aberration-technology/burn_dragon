@@ -86,6 +86,7 @@ fn sample_edge_snapshot() -> BrowserEdgeSnapshot {
             entries: Vec::new(),
         },
         heads: Vec::new(),
+        revision_contracts: Vec::new(),
         leaderboard: BrowserLeaderboardSnapshot {
             network_id: NetworkId::new("burn-dragon-mainnet"),
             score_version: "leaderboard_score_v1".into(),

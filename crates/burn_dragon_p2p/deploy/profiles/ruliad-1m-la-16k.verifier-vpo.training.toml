@@ -12,5 +12,6 @@ positive_advantage_min_partial_progress_ppm = 500000
 positive_advantage_min_completion_quality_ppm = 750000
 vpo_scalarizations = 8
 vpo_correctness_mass_floor = 0.85
+vpo_schema_quality_mass_floor = 0.10
 vpo_completion_health_mass_floor = 0.0
 vpo_compactness_max_weight = 0.05

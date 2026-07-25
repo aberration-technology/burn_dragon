@@ -1,8 +1,5 @@
-use burn::module::{
-    AutodiffModule, Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
-    ModuleVisitor, Param,
-};
-use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::module::{Module, Param};
+use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution as TensorDistribution, Tensor, activation};
 pub use burn_gdn::GatedDeltaNet2GateMode;
 use serde::{Deserialize, Serialize};
@@ -103,80 +100,6 @@ pub struct ResolvedGatedDeltaNet2Config {
     pub output_scale: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct GatedDeltaNet2OutputScale {
-    value: f32,
-}
-
-impl GatedDeltaNet2OutputScale {
-    fn new(value: f32) -> Self {
-        Self { value }
-    }
-
-    fn value(self) -> f32 {
-        self.value
-    }
-
-    fn scaled(self, scale: f32) -> Self {
-        Self {
-            value: self.value * scale,
-        }
-    }
-}
-
-impl<B: Backend> Module<B> for GatedDeltaNet2OutputScale {
-    type Record = f32;
-
-    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
-        devices
-    }
-
-    fn fork(self, _device: &B::Device) -> Self {
-        self
-    }
-
-    fn to_device(self, _device: &B::Device) -> Self {
-        self
-    }
-
-    fn visit<Visitor: ModuleVisitor<B>>(&self, _visitor: &mut Visitor) {}
-
-    fn map<Mapper: ModuleMapper<B>>(self, _mapper: &mut Mapper) -> Self {
-        self
-    }
-
-    fn load_record(self, record: Self::Record) -> Self {
-        Self { value: record }
-    }
-
-    fn into_record(self) -> Self::Record {
-        self.value
-    }
-}
-
-impl<B: AutodiffBackend> AutodiffModule<B> for GatedDeltaNet2OutputScale {
-    type InnerModule = GatedDeltaNet2OutputScale;
-
-    fn valid(&self) -> Self::InnerModule {
-        *self
-    }
-
-    fn from_inner(module: Self::InnerModule) -> Self {
-        module
-    }
-}
-
-impl ModuleDisplayDefault for GatedDeltaNet2OutputScale {
-    fn content(&self, content: Content) -> Option<Content> {
-        content
-            .set_top_level_type("GatedDeltaNet2OutputScale")
-            .add("value", &self.value)
-            .optional()
-    }
-}
-
-impl ModuleDisplay for GatedDeltaNet2OutputScale {}
-
 impl GatedDeltaNet2Config {
     pub fn validate(
         &self,
@@ -265,7 +188,7 @@ pub struct GatedDeltaNet2Parameters<B: Backend> {
     decay_bias: Param<Tensor<B, 2>>,
     write_proj: Param<Tensor<B, 3>>,
     write_bias: Param<Tensor<B, 2>>,
-    output_scale: GatedDeltaNet2OutputScale,
+    output_scale: Param<Tensor<B, 1>>,
 }
 
 #[derive(Debug)]
@@ -316,7 +239,10 @@ impl<B: Backend> GatedDeltaNet2Parameters<B> {
                 [config.n_head, config.dense_dim],
                 device,
             )),
-            output_scale: GatedDeltaNet2OutputScale::new(config.output_scale),
+            output_scale: Param::from_tensor(
+                Tensor::<B, 1>::ones([1], device).mul_scalar(config.output_scale),
+            )
+            .no_grad(),
         }
     }
 
@@ -384,7 +310,8 @@ impl<B: Backend> GatedDeltaNet2Parameters<B> {
         widened.write_proj = Param::from_tensor(self.write_proj.val());
         widened.write_bias = Param::from_tensor(self.write_bias.val());
         let scale = (new_latent_per_head as f32 / old_latent_per_head.max(1) as f32).sqrt();
-        widened.output_scale = self.output_scale.scaled(scale);
+        widened.output_scale =
+            Param::from_tensor(self.output_scale.val().mul_scalar(scale)).no_grad();
         Ok(widened)
     }
 
@@ -393,8 +320,8 @@ impl<B: Backend> GatedDeltaNet2Parameters<B> {
         self.key_proj.val()
     }
 
-    pub(crate) fn output_scale(&self) -> f32 {
-        self.output_scale.value()
+    pub(crate) fn apply_output_scale(&self, context: Tensor<B, 4>) -> Tensor<B, 4> {
+        context * self.output_scale.val().reshape([1, 1, 1, 1])
     }
 
     pub fn project_inputs(
@@ -596,6 +523,72 @@ mod tests {
             .zip(rhs)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn widened_adapter_is_function_preserving_for_zero_query_tail() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 41);
+        let heads = 2;
+        let dense = 4;
+        let time = 3;
+        let old_latent = 3;
+        let new_latent = 6;
+        let source_config = GatedDeltaNet2Config::default().resolve(heads, dense, old_latent);
+        let target_config = GatedDeltaNet2Config::default().resolve(heads, dense, new_latent);
+        let source = GatedDeltaNet2Parameters::<TestBackend>::new(source_config, &device);
+        let fresh = GatedDeltaNet2Parameters::<TestBackend>::new(target_config, &device);
+        let widened = source
+            .widened_from_prefix(&fresh, old_latent, new_latent)
+            .expect("widen adapter");
+        let dense_values = (0..heads * time * dense)
+            .map(|index| (index as f32 - 9.0) / 17.0)
+            .collect();
+        let query_values = (0..heads * time * old_latent)
+            .map(|index| (index as f32 - 5.0) / 13.0)
+            .collect();
+        let dense_stream = tensor4(dense_values, [1, heads, time, dense]);
+        let source_query = tensor4(query_values, [1, heads, time, old_latent]);
+        let widened_query = Tensor::cat(
+            vec![
+                source_query.clone(),
+                Tensor::<TestBackend, 4>::zeros([1, heads, time, new_latent - old_latent], &device),
+            ],
+            3,
+        );
+        let source_inputs = source.project_inputs(dense_stream.clone(), old_latent, source_config);
+        let widened_inputs =
+            widened.project_inputs(dense_stream.clone(), new_latent, target_config);
+        let (source_output, _) = gated_deltanet2_reference(
+            source_query,
+            source_inputs.key,
+            dense_stream.clone(),
+            source_inputs.erase,
+            source_inputs.write,
+            source_inputs.log_decay,
+            None,
+            source_config.qk_l2_norm,
+            source_config.state_epsilon,
+        );
+        let (widened_output, _) = gated_deltanet2_reference(
+            widened_query,
+            widened_inputs.key,
+            dense_stream,
+            widened_inputs.erase,
+            widened_inputs.write,
+            widened_inputs.log_decay,
+            None,
+            target_config.qk_l2_norm,
+            target_config.state_epsilon,
+        );
+        let diff = max_abs_diff(
+            source.apply_output_scale(source_output),
+            widened.apply_output_scale(widened_output),
+        );
+        assert!(
+            diff <= 1.0e-6,
+            "widened GDN2 adapter changed the active prefix by {diff}"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

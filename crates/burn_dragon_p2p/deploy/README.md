@@ -80,6 +80,83 @@ Role split:
 
 Canonical promotion in the supported deploy path uses trainer-only diffusion steady-state.
 
+That minimal topology is a trusted-fleet deployment shape. Trainer-only
+diffusion is not a sufficient authority boundary for arbitrary public peers.
+Before enabling untrusted trainer membership, deploy separate validators,
+require a quorum greater than one, and enable independent compact-update replay
+as described in
+[the production-readiness ledger](../../../docs/p2p-production-readiness.md).
+
+## Signed Revision Provisioning
+
+Production native and browser peers must converge on the same signed revision
+contract and exact full-head genesis artifact.
+
+The bootstrap accepts one or more JSON contract bundle files through the
+comma-separated `BURN_P2P_REVISION_CONTRACT_FILES` environment variable. On
+startup it:
+
+1. loads the active authority trust bundle
+2. verifies the genesis and revision-contract Ed25519 signatures
+3. rejects stale content IDs, cross-revision mismatches, and conflicts
+4. publishes only verified bundles in the browser-edge snapshot
+
+Native peer config points to the same bundle with:
+
+```toml
+[manifest]
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
+require_signed_revision_contracts = true
+```
+
+Provision the referenced genesis artifact before starting peers. Verify from a
+clean native storage root and a clean browser profile that both peers load the
+same contract ID, genesis payload ID, tensor digest, artifact ID, and head ID.
+Missing or invalid material must prevent training rather than falling back to
+peer-local random initialization.
+
+Build and verify a bundle from explicit authority material:
+
+```bash
+cargo run -p xtask -- build-revision-contract \
+  --spec /secure/nca-r1.contract-spec.json \
+  --artifact-store-root /var/lib/burn-p2p/artifacts \
+  --authority-key /secure/authority.key \
+  --output /secure/nca-r1.revision-contract.json
+
+cargo run -p xtask -- verify-revision-contract \
+  --bundle /secure/nca-r1.revision-contract.json \
+  --trust-bundle /secure/trust-bundle.json \
+  --artifact-store-root /var/lib/burn-p2p/artifacts
+```
+
+The build command verifies the complete artifact descriptor and every
+content-addressed byte before signing. The authority supplies the canonical
+tensor digest in the spec; every native and browser training peer independently
+recomputes it after decoding and fails closed on mismatch.
+
+Rotate a set of bundles into a new atomically installed directory, then roll
+them out through the authenticated live admin API:
+
+```bash
+cargo run -p xtask -- rotate-revision-contracts \
+  --bundle /secure/nca-r1.revision-contract.json \
+  --new-authority-key /secure/next-authority.key \
+  --output-dir /secure/contracts-next
+
+cargo run -p xtask -- rollout-revision-contracts \
+  --edge-url https://edge.dragon.aberration.technology \
+  --bundle /secure/contracts-next/nca-r1.revision-contract.json \
+  --session-id "$BURN_P2P_ADMIN_SESSION_ID" \
+  --allow-signature-rotation
+```
+
+The rollout validates the complete replacement set before one atomic
+control-plane update; readers never observe a partially rotated revision set.
+Terraform deliberately does not manufacture authority keys or signed
+contracts. Secret custody, staging rotation, and disaster-recovery rehearsal
+remain operator release gates.
+
 ## Artifact Storage
 
 Checkpoint artifacts, including model weights and exported metric bundles, are published from the bootstrap host into S3 using the EC2 instance role and the upstream `S3Compatible` publication target. The default Dragon deploy now uses a hybrid publication policy: canonical serve-checkpoint aliases are mirrored eagerly, while heavier exports remain on-demand. When `disaster_recovery_region` is configured, Terraform also enables cross-region S3 replication into a warm-DR replica bucket.

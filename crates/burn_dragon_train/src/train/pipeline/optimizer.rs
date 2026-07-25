@@ -73,6 +73,9 @@ where
     PredictiveCodingDiagonalNatural(OptimizerAdaptor<PredictiveCodingDiagonalNatural, M, B>),
 }
 
+type ResolvedSgdOptimizerRecord<M, B> =
+    <OptimizerAdaptor<Sgd<<B as AutodiffBackend>::InnerBackend>, M, B> as Optimizer<M, B>>::Record;
+
 #[derive(Record, Clone)]
 pub struct ResolvedOptimizerRecord<M, B>
 where
@@ -81,7 +84,7 @@ where
 {
     kind: u8,
     adamw: <OptimizerAdaptor<AdamW, M, B> as Optimizer<M, B>>::Record,
-    sgd: Option<<OptimizerAdaptor<Sgd<B::InnerBackend>, M, B> as Optimizer<M, B>>::Record>,
+    sgd: Option<ResolvedSgdOptimizerRecord<M, B>>,
     diagonal_natural: Option<
         <OptimizerAdaptor<PredictiveCodingDiagonalNatural, M, B> as Optimizer<M, B>>::Record,
     >,

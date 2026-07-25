@@ -27,7 +27,7 @@ ruliad_correctness_probe_items = 128
 ruliad_correctness_probe_tokens = 64
 
 [training.ruliad_supervision]
-mode = "answer_window"
+mode = "answer_completion"
 mask_high_entropy_spans = true
 
 [training.ruliad_supervision.verifier_reward]

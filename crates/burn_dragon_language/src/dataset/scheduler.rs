@@ -444,11 +444,6 @@ where
                 }
             }
         }
-        if include_ruliad_policy_batch {
-            ruliad_policy_batch = dataset
-                .source_selected_ruliad_policy_batch(split, epoch_index, absolute_step, batch_size)
-                .map(Arc::new);
-        }
     } else if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
         let num_documents = (span / document_span).max(1);
@@ -598,6 +593,12 @@ where
                 );
             }
         }
+    }
+
+    if include_ruliad_policy_batch && ruliad_policy_batch.is_none() {
+        ruliad_policy_batch = dataset
+            .source_selected_ruliad_policy_batch(split, epoch_index, absolute_step, batch_size)
+            .map(Arc::new);
     }
 
     HostSequenceBatch {
@@ -940,6 +941,7 @@ pub struct StreamingDataLoader<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
+    include_ruliad_policy_batch: bool,
     logical_document_tokens: usize,
     seed: u64,
 }
@@ -975,6 +977,7 @@ impl<B: Backend> Clone for StreamingDataLoader<B> {
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
         }
@@ -1127,6 +1130,7 @@ impl<B: Backend> StreamingDataLoader<B> {
             total_steps,
             consumed_steps,
             summary_event_token_ids: None,
+            include_ruliad_policy_batch: false,
             logical_document_tokens,
             seed,
         }
@@ -1142,6 +1146,11 @@ impl<B: Backend> StreamingDataLoader<B> {
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
+        self
+    }
+
+    pub fn with_ruliad_policy_batch(mut self, enabled: bool) -> Self {
+        self.include_ruliad_policy_batch = enabled;
         self
     }
 
@@ -1287,6 +1296,7 @@ struct StreamingIterator<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
+    include_ruliad_policy_batch: bool,
     steps_per_epoch: usize,
     logical_document_tokens: usize,
     chunks_per_document: usize,
@@ -1498,6 +1508,20 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         if prof_enabled {
             crate::train::profile::record_dataloader_foreground_wait(cpu_ns);
         }
+        let ruliad_policy_batch = if self.include_ruliad_policy_batch {
+            let selection_step =
+                absolute_step.saturating_sub(self.chunk_index_in_document.min(absolute_step));
+            self.dataset
+                .source_selected_ruliad_policy_batch(
+                    self.split,
+                    self.epoch_index,
+                    selection_step,
+                    batch_size,
+                )
+                .map(Arc::new)
+        } else {
+            None
+        };
 
         let tensor_copy_start = prof_enabled.then(Instant::now);
         let summary_event_mask = summary_event_mask_tensor::<B>(
@@ -1544,6 +1568,7 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         Some(
             SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
                 .with_loss_mask(loss_mask_tensor)
+                .with_ruliad_policy_batch(ruliad_policy_batch)
                 .with_reset_stream_state(reset_stream_state),
         )
     }
@@ -1607,6 +1632,7 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.clone(),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             steps_per_epoch: self.steps_per_epoch,
             logical_document_tokens,
             chunks_per_document,
@@ -1634,6 +1660,7 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
         })
@@ -1656,6 +1683,7 @@ where
             total_steps,
             consumed_steps,
             summary_event_token_ids: self.summary_event_token_ids.clone(),
+            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
         })
@@ -2136,6 +2164,7 @@ mod random_loader_tests {
         batch_size: usize,
         tokenizer: SharedTokenizer,
         selected_steps: Arc<Mutex<Vec<usize>>>,
+        policy_steps: Option<Arc<Mutex<Vec<usize>>>>,
     }
 
     impl TokenSequenceDataset for EpochAwareDataset {
@@ -2224,6 +2253,47 @@ mod random_loader_tests {
             Some(vec![0; batch_size])
         }
 
+        fn source_selected_ruliad_policy_batch(
+            &self,
+            _split: DatasetSplit,
+            _epoch_index: usize,
+            absolute_step: usize,
+            batch_size: usize,
+        ) -> Option<RuliadPolicyBatch> {
+            let policy_steps = self.policy_steps.as_ref()?;
+            policy_steps
+                .lock()
+                .expect("policy steps lock")
+                .push(absolute_step);
+            let samples = (0..batch_size)
+                .map(|idx| RuliadPolicySample {
+                    item: burn_dragon_universality::RuliadEvalItem {
+                        oracle_hash: format!("h{absolute_step}-{idx}"),
+                        sample_index: absolute_step.saturating_add(idx),
+                        split: burn_dragon_universality::SampleSplit::Train,
+                        family: "policy".to_string(),
+                        task_kind: "logical_document".to_string(),
+                        math_domains: vec!["test".to_string()],
+                        reasoning_modes: vec!["test".to_string()],
+                        prompt: "?:policy\n!:".to_string(),
+                        expected_answer: "ok=1".to_string(),
+                        difficulty_level: Some(0),
+                        spec: None,
+                    },
+                    prompt_tokens: vec![1, 2, 3],
+                })
+                .collect();
+            Some(RuliadPolicyBatch {
+                samples,
+                tokenization:
+                    burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                        vocab_size: 512,
+                        eos_id: Some(511),
+                    },
+                stop_token_id: Some(511),
+            })
+        }
+
         fn train_len(&self) -> usize {
             64
         }
@@ -2241,7 +2311,7 @@ mod random_loader_tests {
         }
 
         fn preferred_logical_document_tokens(&self, _split: DatasetSplit) -> Option<usize> {
-            Some(self.block_size)
+            Some(self.block_size.saturating_mul(2))
         }
     }
 
@@ -2319,6 +2389,7 @@ mod random_loader_tests {
             batch_size: 1,
             tokenizer: tiny_pretokenized_tokenizer(),
             selected_steps: Arc::clone(&selected_steps),
+            policy_steps: None,
         });
 
         let loader = RandomDataLoader::<TestBackend>::new(
@@ -2340,5 +2411,114 @@ mod random_loader_tests {
         );
 
         let _ = iter.next().expect("prefetched live batch");
+    }
+
+    #[test]
+    fn random_loader_attaches_ruliad_policy_batch_for_logical_document_source_selection() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::clone(&selected_steps),
+            policy_steps: Some(Arc::clone(&policy_steps)),
+        });
+
+        let batch = RandomDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            1,
+            Some(1),
+        )
+        .with_ruliad_policy_batch(true)
+        .iter()
+        .next()
+        .expect("batch");
+
+        let policy_batch = batch
+            .ruliad_policy_batch
+            .as_ref()
+            .expect("policy batch should be attached");
+        assert_eq!(policy_batch.samples.len(), 1);
+        assert_eq!(policy_batch.samples[0].item.expected_answer, "ok=1");
+        assert!(
+            policy_steps.lock().expect("policy steps lock").contains(&0),
+            "policy batch should be requested for the current absolute step"
+        );
+    }
+
+    #[test]
+    fn streaming_loader_attaches_ruliad_policy_batch_for_live_source_selection() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps,
+            policy_steps: Some(Arc::clone(&policy_steps)),
+        });
+
+        let batch = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            1,
+            Some(1),
+            Some(4),
+            1337,
+        )
+        .with_ruliad_policy_batch(true)
+        .iter()
+        .next()
+        .expect("streaming batch");
+
+        let policy_batch = batch
+            .ruliad_policy_batch
+            .as_ref()
+            .expect("streaming policy batch should be attached");
+        assert_eq!(policy_batch.samples.len(), 1);
+        assert_eq!(policy_batch.samples[0].item.expected_answer, "ok=1");
+        assert!(
+            policy_steps.lock().expect("policy steps lock").contains(&0),
+            "streaming policy batch should be requested for the current absolute step"
+        );
+    }
+
+    #[test]
+    fn streaming_loader_reuses_document_selection_step_for_tbptt_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&policy_steps)),
+        });
+
+        let loader = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Train,
+            &device,
+            2,
+            Some(2),
+            None,
+            1337,
+        )
+        .with_ruliad_policy_batch(true);
+        let mut iterator = loader.iter();
+        let _ = iterator.next().expect("first stream chunk");
+        let _ = iterator.next().expect("second stream chunk");
+
+        assert_eq!(
+            *policy_steps.lock().expect("policy steps lock"),
+            vec![0, 0],
+            "all chunks from one streamed logical document should use the same source-selection policy step"
+        );
     }
 }

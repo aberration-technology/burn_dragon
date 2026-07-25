@@ -209,15 +209,15 @@ where
             "training.neuron_scaling.enabled currently requires parallel.mode=single; in-process Dragon neuron scaling mutates model and optimizer state between validation epochs"
         ));
     }
-    let use_event_scheduler = use_dynamic_scaling
-        || context.training.predictive_coding.enabled
-        || (context.parallel_runtime.mode == ParallelismKind::Single
-            && (context.training.dynamics.enabled
-                || (context.training.events.source_weighted_validation_batches > 0
-                    && context
-                        .source_selection_dataset
-                        .as_ref()
-                        .is_some_and(|dataset| dataset.uses_live_source_selection()))));
+    let source_selection_uses_live_policy = context
+        .source_selection_dataset
+        .as_ref()
+        .is_some_and(|dataset| dataset.uses_live_source_selection());
+    let use_event_scheduler = use_event_scheduler_for_training(
+        context.training,
+        context.parallel_runtime.mode,
+        source_selection_uses_live_policy,
+    );
     match scheduler {
         ResolvedLrScheduler::Constant(lr) => {
             if use_event_scheduler {
@@ -261,6 +261,74 @@ where
                 train_with_scheduler(context, model, optimizer, scheduler)
             }
         }
+    }
+}
+
+fn use_event_scheduler_for_training(
+    training: &TrainingHyperparameters,
+    parallel_mode: ParallelismKind,
+    source_selection_uses_live_policy: bool,
+) -> bool {
+    let local_runtime_objectives = training.dynamics.enabled
+        || (training.events.source_weighted_validation_batches > 0
+            && source_selection_uses_live_policy);
+
+    training.neuron_scaling.enabled
+        || training.predictive_coding.enabled
+        || (parallel_mode == ParallelismKind::Single && local_runtime_objectives)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_profile(file_name: &str) -> TrainingConfig {
+        let profile_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../burn_dragon_p2p/deploy/profiles")
+            .join(file_name);
+        crate::config::train::load_training_config(&[profile_path.clone()])
+            .unwrap_or_else(|err| panic!("load {}: {err}", profile_path.display()))
+    }
+
+    #[test]
+    fn ruliad_policy_runtime_objectives_attach_batch_metadata() {
+        let control =
+            load_profile("ruliad-1m-la-16k.answer-completion.self-recovery.training.toml");
+        assert!(
+            !control
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+
+        let training = load_profile(
+            "ruliad-1m-la-16k.answer-completion-recovery-denoising.self-recovery.training.toml",
+        );
+        assert!(
+            training
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+
+        let contract = load_profile("ruliad-1m-la-64k.answer-contract.training.toml");
+        assert!(
+            contract
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn verifier_reward_runtime_objective_attaches_batch_metadata() {
+        let training = load_profile("ruliad-1m-la-16k.verifier-reward.training.toml");
+        assert!(
+            training
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
     }
 }
 
@@ -693,7 +761,7 @@ where
             Some(total_steps),
         )
         .with_initial_consumed_steps(resume_consumed_steps)
-        .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
+        .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -708,7 +776,7 @@ where
             valid_steps,
             None,
         )
-        .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
+        .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -725,17 +793,65 @@ where
         .verifier_reward
         .enabled
         .then(|| run_dir.join("events").join("ruliad_verifier_policy.jsonl"));
+    let ruliad_structured_recovery_telemetry_path =
+        (training.ruliad_supervision.answer_denoising.enabled
+            && training
+                .ruliad_supervision
+                .answer_denoising
+                .structured_recovery_weight
+                > f32::EPSILON)
+            .then(|| {
+                run_dir
+                    .join("events")
+                    .join("ruliad_structured_recovery.jsonl")
+            });
+    let ruliad_answer_contract_telemetry_path =
+        (training.ruliad_supervision.answer_contract.enabled
+            && training.ruliad_supervision.answer_contract.weight > f32::EPSILON)
+            .then(|| run_dir.join("events").join("ruliad_answer_contract.jsonl"));
+    let ruliad_structured_contrast_telemetry_path = training
+        .ruliad_supervision
+        .verifier_reward
+        .enabled
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_structured_contrast.jsonl")
+        });
+    let ruliad_field_binding_contrast_telemetry_path =
+        (training.ruliad_supervision.verifier_reward.enabled
+            && training
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_weight
+                > f32::EPSILON)
+            .then(|| {
+                run_dir
+                    .join("events")
+                    .join("ruliad_field_binding_contrast.jsonl")
+            });
+    let ruliad_generated_attractor_telemetry_path =
+        (training.ruliad_supervision.verifier_reward.enabled
+            && training
+                .ruliad_supervision
+                .verifier_reward
+                .generated_attractor_replay_capacity
+                > 0)
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_generated_attractor_replay.jsonl")
+        });
     let prepared_model = LanguageTrainModel::new(base_model)
-        .with_training_objective(training.objective.clone())
-        .with_input_corruption(training.input_corruption.clone())
-        .with_logit_entropy_floor(training.logit_entropy_floor.clone())
-        .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
-        .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
-        .with_dynamics_anchor(training.dynamics_anchor.clone())
-        .with_predictive_coding(training.predictive_coding.clone())
-        .with_latent_reasoning(training.latent_reasoning.clone())
-        .with_ruliad_supervision(training.ruliad_supervision)
+        .with_training_objectives(training)
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
+        .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
+        .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
+        .with_ruliad_structured_contrast_telemetry_path(ruliad_structured_contrast_telemetry_path)
+        .with_ruliad_field_binding_contrast_telemetry_path(
+            ruliad_field_binding_contrast_telemetry_path,
+        )
+        .with_ruliad_generated_attractor_telemetry_path(ruliad_generated_attractor_telemetry_path)
         .with_tbptt_chunk_size(training.tbptt_chunk_size);
     let model = Some(prepared_model);
     let eggroll_chunk_autotune = if let Some(model_ref) = model.as_ref() {
@@ -1210,6 +1326,7 @@ where
                     training.seed,
                 )
                 .with_initial_consumed_steps(resume_consumed_steps)
+                .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
                 .with_summary_event_token_ids(summary_event_token_ids.clone()),
             )
         } else {
@@ -1222,7 +1339,7 @@ where
                     Some(total_steps),
                 )
                 .with_initial_consumed_steps(resume_consumed_steps)
-                .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
+                .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
                 .with_summary_event_token_ids(summary_event_token_ids.clone()),
             )
         };
@@ -1241,7 +1358,7 @@ where
                 valid_steps,
                 None,
             )
-            .with_ruliad_policy_batch(training.ruliad_supervision.verifier_reward.enabled)
+            .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
             .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 
@@ -1260,22 +1377,84 @@ where
         .verifier_reward
         .enabled
         .then(|| run_dir.join("events").join("ruliad_verifier_policy.jsonl"));
+    let ruliad_structured_recovery_telemetry_path =
+        (training.ruliad_supervision.answer_denoising.enabled
+            && training
+                .ruliad_supervision
+                .answer_denoising
+                .structured_recovery_weight
+                > f32::EPSILON)
+            .then(|| {
+                run_dir
+                    .join("events")
+                    .join("ruliad_structured_recovery.jsonl")
+            });
+    let ruliad_answer_contract_telemetry_path =
+        (training.ruliad_supervision.answer_contract.enabled
+            && training.ruliad_supervision.answer_contract.weight > f32::EPSILON)
+            .then(|| run_dir.join("events").join("ruliad_answer_contract.jsonl"));
+    let ruliad_structured_contrast_telemetry_path = training
+        .ruliad_supervision
+        .verifier_reward
+        .enabled
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_structured_contrast.jsonl")
+        });
+    let ruliad_field_binding_contrast_telemetry_path =
+        (training.ruliad_supervision.verifier_reward.enabled
+            && training
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_weight
+                > f32::EPSILON)
+            .then(|| {
+                run_dir
+                    .join("events")
+                    .join("ruliad_field_binding_contrast.jsonl")
+            });
+    let ruliad_generated_attractor_telemetry_path =
+        (training.ruliad_supervision.verifier_reward.enabled
+            && training
+                .ruliad_supervision
+                .verifier_reward
+                .generated_attractor_replay_capacity
+                > 0)
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_generated_attractor_replay.jsonl")
+        });
+    let ruliad_verifier_rollout_telemetry_path =
+        (training.ruliad_supervision.verifier_reward.enabled
+            && (training
+                .ruliad_supervision
+                .verifier_reward
+                .rollout_imitation_weight
+                > f32::EPSILON
+                || training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .rollout_recovery_weight
+                    > f32::EPSILON))
+            .then(|| {
+                run_dir
+                    .join("events")
+                    .join("ruliad_verifier_rollout_imitation.jsonl")
+            });
     let prepared_model = LanguageTrainModel::new(base_model)
-        .with_training_objective(training.objective.clone())
-        .with_input_corruption(training.input_corruption.clone())
-        .with_logit_entropy_floor(training.logit_entropy_floor.clone())
-        .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
-        .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
-        .with_dynamics_anchor(training.dynamics_anchor.clone())
-        .with_predictive_coding(training.predictive_coding.clone())
-        .with_latent_reasoning(training.latent_reasoning.clone())
-        .with_ruliad_supervision(training.ruliad_supervision)
+        .with_training_configuration(training, total_steps)
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
-        .with_pipeline_plan(pipeline_plan.clone())
-        .with_tbptt_chunk_size(training.tbptt_chunk_size)
-        .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)
-        .with_continual_backprop(&training.continual_backprop)
-        .with_gradient_scale_schedule(training, total_steps);
+        .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
+        .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
+        .with_ruliad_structured_contrast_telemetry_path(ruliad_structured_contrast_telemetry_path)
+        .with_ruliad_field_binding_contrast_telemetry_path(
+            ruliad_field_binding_contrast_telemetry_path,
+        )
+        .with_ruliad_generated_attractor_telemetry_path(ruliad_generated_attractor_telemetry_path)
+        .with_ruliad_verifier_rollout_telemetry_path(ruliad_verifier_rollout_telemetry_path)
+        .with_pipeline_plan(pipeline_plan.clone());
     let mut model = Some(prepared_model);
     let mut optim = Some(resolve_dragon_language_optimizer::<B>(
         training,

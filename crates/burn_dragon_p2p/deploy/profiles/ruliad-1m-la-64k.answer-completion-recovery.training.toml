@@ -1,0 +1,17 @@
+extends = ["ruliad-1m-la-64k.answer-completion-stable.training.toml"]
+
+[training.events]
+ruliad_contract_probe_enabled = true
+
+[training.ruliad_supervision.answer_denoising]
+enabled = true
+weight = 0.0
+probability = 1.0
+corrupt_offset = 1
+structured_recovery_weight = 0.25
+structured_recovery_every_steps = 4
+structured_recovery_start_after_steps = 0
+structured_recovery_max_completion_tokens = 64
+structured_recovery_negative_count = 2
+structured_recovery_template_negative_count = 2
+structured_recovery_schema_negative_count = 4

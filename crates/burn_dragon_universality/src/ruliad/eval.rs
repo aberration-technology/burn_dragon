@@ -18,15 +18,20 @@ use crate::ruliad::oracles::{
     ruliad_prompt_prefix, sample_text, verify_spec,
 };
 use crate::ruliad::runtime::{OnlineRuliadCorpus, ruliad_serialized_node_count};
-use crate::ruliad::source_selection::{RuliadSourceBucket, ruliad_source_buckets};
+use crate::ruliad::search::RuliadFrontierSampler;
+use crate::ruliad::source_selection::{
+    RuliadSourceBucket, plan_epoch_source_buckets, ruliad_source_buckets,
+};
 use crate::stats::SampleStats;
 
-pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 1;
-pub const RULIAD_EVAL_REPORT_VERSION: u32 = 4;
+pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 2;
+pub const RULIAD_EVAL_REPORT_VERSION: u32 = 6;
 pub const RULIAD_REASONING_SCORE_VERSION: u32 = 2;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
 const SCORE_PPM_DENOMINATOR: usize = 1_000_000;
+const DIAGNOSTIC_TRAIN_SOURCE_TAG: u64 = 0xd1a6_7057_51a6_7a11;
+const DIAGNOSTIC_VALIDATION_SOURCE_TAG: u64 = 0xd1a6_7057_9e57_1a7e;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadCountShare {
@@ -50,6 +55,8 @@ pub struct RuliadDiagnosticThresholds {
     #[serde(default)]
     pub min_task_share: f32,
     #[serde(default)]
+    pub max_answer_contract_share: f32,
+    #[serde(default)]
     pub max_duplicate_oracle_hash_rate: f32,
     #[serde(default = "default_require_all_semantics")]
     pub require_all_semantics: bool,
@@ -59,6 +66,7 @@ impl Default for RuliadDiagnosticThresholds {
     fn default() -> Self {
         Self {
             min_task_share: 0.0,
+            max_answer_contract_share: 0.0,
             max_duplicate_oracle_hash_rate: 0.0,
             require_all_semantics: default_require_all_semantics(),
         }
@@ -76,6 +84,8 @@ pub struct RuliadDiagnosticReport {
     pub split_counts: Vec<RuliadCountShare>,
     pub family_counts: Vec<RuliadCountShare>,
     pub task_counts: Vec<RuliadCountShare>,
+    #[serde(default)]
+    pub answer_contract_counts: Vec<RuliadCountShare>,
     pub math_domain_counts: Vec<RuliadCountShare>,
     pub reasoning_mode_counts: Vec<RuliadCountShare>,
     pub source_bucket_priors: Vec<RuliadSourceBucketDiagnostic>,
@@ -190,6 +200,10 @@ pub struct RuliadEvalGroupScore {
     #[serde(default)]
     pub answer_field_accuracy: f32,
     #[serde(default)]
+    pub answer_field_observed_count: usize,
+    #[serde(default)]
+    pub answer_field_coverage: f32,
+    #[serde(default)]
     pub answer_terminated_count: usize,
     #[serde(default)]
     pub answer_termination_rate: f32,
@@ -199,6 +213,16 @@ pub struct RuliadEvalGroupScore {
     pub expected_answer_distinct_fraction: f32,
     #[serde(default)]
     pub actual_answer_distinct_fraction: f32,
+    #[serde(default)]
+    pub actual_answer_dominant_fraction: f32,
+    #[serde(default)]
+    pub expected_field_value_distinct_fraction: f32,
+    #[serde(default)]
+    pub actual_field_value_distinct_fraction: f32,
+    #[serde(default)]
+    pub field_value_distinct_ratio: f32,
+    #[serde(default)]
+    pub actual_field_value_dominant_fraction: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -238,6 +262,10 @@ pub struct RuliadEvalReport {
     #[serde(default)]
     pub answer_field_accuracy: f32,
     #[serde(default)]
+    pub answer_field_observed_count: usize,
+    #[serde(default)]
+    pub answer_field_coverage: f32,
+    #[serde(default)]
     pub answer_terminated_count: usize,
     #[serde(default)]
     pub answer_termination_rate: f32,
@@ -247,6 +275,16 @@ pub struct RuliadEvalReport {
     pub expected_answer_distinct_fraction: f32,
     #[serde(default)]
     pub actual_answer_distinct_fraction: f32,
+    #[serde(default)]
+    pub actual_answer_dominant_fraction: f32,
+    #[serde(default)]
+    pub expected_field_value_distinct_fraction: f32,
+    #[serde(default)]
+    pub actual_field_value_distinct_fraction: f32,
+    #[serde(default)]
+    pub field_value_distinct_ratio: f32,
+    #[serde(default)]
+    pub actual_field_value_dominant_fraction: f32,
     pub mean_certificate_prefix_coverage: f32,
     pub mean_completion_tokens: f32,
     pub canary_count: usize,
@@ -255,6 +293,8 @@ pub struct RuliadEvalReport {
     pub task_scores: Vec<RuliadEvalGroupScore>,
     #[serde(default)]
     pub difficulty_scores: Vec<RuliadEvalGroupScore>,
+    #[serde(default)]
+    pub answer_contract_scores: Vec<RuliadEvalGroupScore>,
     pub math_domain_scores: Vec<RuliadEvalGroupScore>,
     pub reasoning_mode_scores: Vec<RuliadEvalGroupScore>,
     pub failures: Vec<RuliadEvalFailure>,
@@ -287,6 +327,8 @@ pub struct RuliadReasoningScore {
     pub status: RuliadAnswerStatus,
     pub correct_field_count: usize,
     pub expected_field_count: usize,
+    #[serde(default)]
+    pub observed_field_count: usize,
     pub partial_progress_ppm: usize,
     pub certificate_valid_prefix_steps: usize,
     pub certificate_expected_steps: usize,
@@ -636,12 +678,19 @@ struct EvalAccumulator {
     partial_progress_ppm_sum: usize,
     answer_field_correct_count: usize,
     answer_field_expected_count: usize,
+    answer_field_observed_count: usize,
     answer_terminated_count: usize,
     completion_quality_ppm_sum: usize,
     expected_answer_count: usize,
     expected_answers: BTreeSet<String>,
     actual_answer_count: usize,
     actual_answers: BTreeSet<String>,
+    actual_answer_counts: BTreeMap<String, usize>,
+    expected_field_value_count: usize,
+    expected_field_values: BTreeSet<String>,
+    actual_field_value_count: usize,
+    actual_field_values: BTreeSet<String>,
+    actual_field_value_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -686,11 +735,43 @@ pub fn diagnose_config(
 ) -> Result<RuliadDiagnosticReport> {
     let corpus = OnlineRuliadCorpus::new(config.clone())?;
     let sample_limit_per_split = sample_limit_per_split.max(1);
+    let source_probabilities = if corpus.source_selection_enabled() {
+        let sampler = RuliadFrontierSampler::new(
+            config.source_selection.sampler,
+            corpus.sampler_candidates(),
+        );
+        let probabilities = sampler.probabilities();
+        if probabilities.len() == corpus.source_buckets().len() {
+            Some(probabilities)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut samples = Vec::new();
     for split in [SampleSplit::Train, SampleSplit::Validation] {
         let sample_count = corpus.sample_count(split).min(sample_limit_per_split);
+        let source_plan = source_probabilities.as_ref().map(|probabilities| {
+            plan_epoch_source_buckets(
+                corpus.source_buckets(),
+                probabilities,
+                sample_count,
+                config.seed,
+                diagnostic_source_split_tag(split),
+                0,
+            )
+        });
         for sample_index in 0..sample_count {
-            let document = corpus.generate_document(split, sample_index)?;
+            let document = if let Some(source_plan) = source_plan.as_ref() {
+                let bucket_label =
+                    source_plan.bucket_for_sample(sample_index).ok_or_else(|| {
+                        anyhow!("missing diagnostic source bucket for sample {sample_index}")
+                    })?;
+                corpus.generate_document_for_source_bucket(split, 0, sample_index, bucket_label)?
+            } else {
+                corpus.generate_document(split, sample_index)?
+            };
             samples.push(DiagnosticSample {
                 split,
                 family: document.family,
@@ -723,6 +804,13 @@ pub fn diagnose_config(
         source_bucket_diagnostics(&ruliad_source_buckets(config)),
         thresholds,
     ))
+}
+
+fn diagnostic_source_split_tag(split: SampleSplit) -> u64 {
+    match split {
+        SampleSplit::Train => DIAGNOSTIC_TRAIN_SOURCE_TAG,
+        SampleSplit::Validation => DIAGNOSTIC_VALIDATION_SOURCE_TAG,
+    }
 }
 
 pub fn build_eval_items_from_manifest(
@@ -855,6 +943,7 @@ pub fn evaluate_completions(
     let mut family_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut task_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut difficulty_scores = BTreeMap::<String, EvalAccumulator>::new();
+    let mut answer_contract_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut math_domain_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut reasoning_mode_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut exact_match_count = 0usize;
@@ -870,12 +959,19 @@ pub fn evaluate_completions(
     let mut partial_progress_ppm_sum = 0usize;
     let mut answer_field_correct_count = 0usize;
     let mut answer_field_expected_count = 0usize;
+    let mut answer_field_observed_count = 0usize;
     let mut answer_terminated_count = 0usize;
     let mut completion_quality_ppm_sum = 0usize;
     let mut expected_answer_count = 0usize;
     let mut expected_answers = BTreeSet::new();
     let mut actual_answer_count = 0usize;
     let mut actual_answers = BTreeSet::new();
+    let mut actual_answer_counts = BTreeMap::new();
+    let mut expected_field_value_count = 0usize;
+    let mut expected_field_values = BTreeSet::new();
+    let mut actual_field_value_count = 0usize;
+    let mut actual_field_values = BTreeSet::new();
+    let mut actual_field_value_counts = BTreeMap::new();
     let mut certificate_prefix_ppm_sum = 0usize;
     let mut completion_token_sum = 0usize;
     let mut failures = Vec::new();
@@ -900,6 +996,8 @@ pub fn evaluate_completions(
             answer_field_correct_count.saturating_add(outcome.reasoning_score.correct_field_count);
         answer_field_expected_count = answer_field_expected_count
             .saturating_add(outcome.reasoning_score.expected_field_count);
+        answer_field_observed_count = answer_field_observed_count
+            .saturating_add(outcome.reasoning_score.observed_field_count);
         answer_terminated_count += usize::from(outcome.answer_terminated);
         completion_quality_ppm_sum = completion_quality_ppm_sum
             .saturating_add(outcome.reasoning_score.completion_quality_ppm);
@@ -910,7 +1008,19 @@ pub fn evaluate_completions(
         if let Some(actual_answer) = outcome.actual_answer.as_deref() {
             actual_answer_count = actual_answer_count.saturating_add(1);
             actual_answers.insert(actual_answer.to_string());
+            *actual_answer_counts
+                .entry(actual_answer.to_string())
+                .or_insert(0usize) += 1;
         }
+        add_answer_field_value_diversity(
+            &item.expected_answer,
+            outcome.actual_answer.as_deref(),
+            &mut expected_field_value_count,
+            &mut expected_field_values,
+            &mut actual_field_value_count,
+            &mut actual_field_values,
+            &mut actual_field_value_counts,
+        );
         certificate_prefix_ppm_sum = certificate_prefix_ppm_sum
             .saturating_add(outcome.reasoning_score.certificate_prefix_ppm);
         completion_token_sum =
@@ -921,6 +1031,12 @@ pub fn evaluate_completions(
         }
         add_group_score(&mut family_scores, &item.family, item, &outcome);
         add_group_score(&mut task_scores, &item.task_kind, item, &outcome);
+        add_group_score(
+            &mut answer_contract_scores,
+            &expected_answer_contract(&item.expected_answer),
+            item,
+            &outcome,
+        );
         if let Some(difficulty_level) = item.difficulty_level {
             add_group_score(
                 &mut difficulty_scores,
@@ -975,11 +1091,35 @@ pub fn evaluate_completions(
         answer_field_correct_count,
         answer_field_expected_count,
         answer_field_accuracy: ratio(answer_field_correct_count, answer_field_expected_count),
+        answer_field_observed_count,
+        answer_field_coverage: ratio(answer_field_observed_count, answer_field_expected_count),
         answer_terminated_count,
         answer_termination_rate: ratio(answer_terminated_count, items.len()),
         mean_completion_quality: ratio_ppm(completion_quality_ppm_sum, items.len()),
         expected_answer_distinct_fraction: ratio(expected_answers.len(), expected_answer_count),
         actual_answer_distinct_fraction: ratio(actual_answers.len(), actual_answer_count),
+        actual_answer_dominant_fraction: dominant_fraction(
+            &actual_answer_counts,
+            actual_answer_count,
+        ),
+        expected_field_value_distinct_fraction: ratio(
+            expected_field_values.len(),
+            expected_field_value_count,
+        ),
+        actual_field_value_distinct_fraction: ratio(
+            actual_field_values.len(),
+            actual_field_value_count,
+        ),
+        field_value_distinct_ratio: distinct_fraction_ratio(
+            actual_field_values.len(),
+            actual_field_value_count,
+            expected_field_values.len(),
+            expected_field_value_count,
+        ),
+        actual_field_value_dominant_fraction: dominant_fraction(
+            &actual_field_value_counts,
+            actual_field_value_count,
+        ),
         mean_certificate_prefix_coverage: ratio_ppm(certificate_prefix_ppm_sum, items.len()),
         mean_completion_tokens: ratio_f32(completion_token_sum as f32, items.len()),
         canary_count,
@@ -987,6 +1127,7 @@ pub fn evaluate_completions(
         family_scores: finalize_group_scores(family_scores),
         task_scores: finalize_group_scores(task_scores),
         difficulty_scores: finalize_group_scores(difficulty_scores),
+        answer_contract_scores: finalize_group_scores(answer_contract_scores),
         math_domain_scores: finalize_group_scores(math_domain_scores),
         reasoning_mode_scores: finalize_group_scores(reasoning_mode_scores),
         failures,
@@ -1057,6 +1198,38 @@ fn ruliad_completion_quality_ppm(completion_body: &str) -> usize {
     }
     let normalized_penalty = ((penalty - 0.45) / 0.55).clamp(0.0, 1.0);
     ((1.0 - normalized_penalty) * SCORE_PPM_DENOMINATOR as f64).round() as usize
+}
+
+fn expected_answer_contract(expected_answer: &str) -> String {
+    let keys = expected_answer
+        .split(';')
+        .filter_map(|part| {
+            let (key, _value) = part.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then_some(compact_eval_label(key))
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        "value".to_string()
+    } else {
+        keys.join(",")
+    }
+}
+
+fn compact_eval_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '_' || ch == '-' {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "field".to_string()
+    } else {
+        out
+    }
 }
 
 fn max_char_period_fraction(symbols: &[char], periods: impl IntoIterator<Item = usize>) -> f64 {
@@ -1159,52 +1332,55 @@ fn score_ruliad_completion_parts(
 ) -> RuliadReasoningScore {
     let hash_canary = is_hash_canary_answer(expected_answer, spec);
     let Some(completion) = completion else {
-        return reasoning_score(
-            RuliadAnswerStatus::Missing,
-            0,
-            expected_answer_field_count(expected_answer),
-            0,
-            0,
-            expected_certificate.len(),
-            0,
+        return reasoning_score(ReasoningScoreParts {
+            status: RuliadAnswerStatus::Missing,
+            correct_field_count: 0,
+            expected_field_count: expected_answer_field_count(expected_answer),
+            observed_field_count: 0,
+            partial_progress_ppm: 0,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: expected_certificate.len(),
+            generated_token_count: 0,
             hash_canary,
-            false,
-            0,
-        );
+            answer_terminated: false,
+            completion_quality_ppm: 0,
+        });
     };
     let generated_token_count = completion.generated_token_count;
     let answer_terminated = completion.answer_terminated;
     let completion_quality_ppm = completion.completion_quality_ppm;
     let Some(actual_answer) = completion.answer.as_deref() else {
-        return reasoning_score(
-            RuliadAnswerStatus::Malformed,
-            0,
-            expected_answer_field_count(expected_answer),
-            0,
-            0,
-            expected_certificate.len(),
+        return reasoning_score(ReasoningScoreParts {
+            status: RuliadAnswerStatus::Malformed,
+            correct_field_count: 0,
+            expected_field_count: expected_answer_field_count(expected_answer),
+            observed_field_count: 0,
+            partial_progress_ppm: 0,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: expected_certificate.len(),
             generated_token_count,
             hash_canary,
             answer_terminated,
             completion_quality_ppm,
-        );
+        });
     };
 
     let answer_score = score_answer_fields(expected_answer, actual_answer, hash_canary, spec);
     let (certificate_valid_prefix_steps, certificate_prefix_ppm) =
         score_certificate_prefix(expected_certificate, &completion.certificate_lines);
-    reasoning_score(
-        answer_score.status,
-        answer_score.correct_field_count,
-        answer_score.expected_field_count,
-        answer_score.partial_progress_ppm,
+    reasoning_score(ReasoningScoreParts {
+        status: answer_score.status,
+        correct_field_count: answer_score.correct_field_count,
+        expected_field_count: answer_score.expected_field_count,
+        observed_field_count: answer_score.observed_field_count,
+        partial_progress_ppm: answer_score.partial_progress_ppm,
         certificate_valid_prefix_steps,
-        expected_certificate.len(),
+        certificate_expected_steps: expected_certificate.len(),
         generated_token_count,
         hash_canary,
         answer_terminated,
         completion_quality_ppm,
-    )
+    })
     .with_certificate_prefix_ppm(certificate_prefix_ppm)
 }
 
@@ -1213,6 +1389,7 @@ struct AnswerFieldScore {
     status: RuliadAnswerStatus,
     correct_field_count: usize,
     expected_field_count: usize,
+    observed_field_count: usize,
     partial_progress_ppm: usize,
 }
 
@@ -1233,6 +1410,7 @@ fn score_answer_fields(
             status,
             correct_field_count: expected_field_count,
             expected_field_count,
+            observed_field_count: expected_field_count,
             partial_progress_ppm: SCORE_PPM_DENOMINATOR,
         };
     }
@@ -1250,6 +1428,10 @@ fn score_answer_fields(
                         .get(*key)
                         .is_some_and(|actual| actual == *value)
                 })
+                .count();
+            let observed_field_count = expected_pairs
+                .keys()
+                .filter(|key| actual_pairs.contains_key(*key))
                 .count();
             let partial_progress_ppm = if hash_canary {
                 0
@@ -1270,6 +1452,7 @@ fn score_answer_fields(
                 status,
                 correct_field_count,
                 expected_field_count,
+                observed_field_count,
                 partial_progress_ppm,
             }
         }
@@ -1277,6 +1460,7 @@ fn score_answer_fields(
             status: RuliadAnswerStatus::Malformed,
             correct_field_count: 0,
             expected_field_count: expected_pairs.len().max(1),
+            observed_field_count: 0,
             partial_progress_ppm: 0,
         },
         _ => {
@@ -1297,6 +1481,7 @@ fn score_answer_fields(
                 },
                 correct_field_count: usize::from(partial_progress_ppm > 0),
                 expected_field_count: 1,
+                observed_field_count: usize::from(partial_progress_ppm > 0),
                 partial_progress_ppm,
             }
         }
@@ -1329,10 +1514,11 @@ fn extract_ruliad_proof_lines(document: &str) -> Vec<String> {
         .collect()
 }
 
-fn reasoning_score(
+struct ReasoningScoreParts {
     status: RuliadAnswerStatus,
     correct_field_count: usize,
     expected_field_count: usize,
+    observed_field_count: usize,
     partial_progress_ppm: usize,
     certificate_valid_prefix_steps: usize,
     certificate_expected_steps: usize,
@@ -1340,26 +1526,28 @@ fn reasoning_score(
     hash_canary: bool,
     answer_terminated: bool,
     completion_quality_ppm: usize,
-) -> RuliadReasoningScore {
-    let certificate_prefix_ppm = if certificate_expected_steps == 0 {
-        0
-    } else {
-        certificate_valid_prefix_steps.saturating_mul(SCORE_PPM_DENOMINATOR)
-            / certificate_expected_steps
-    };
+}
+
+fn reasoning_score(parts: ReasoningScoreParts) -> RuliadReasoningScore {
+    let certificate_prefix_ppm = parts
+        .certificate_valid_prefix_steps
+        .saturating_mul(SCORE_PPM_DENOMINATOR)
+        .checked_div(parts.certificate_expected_steps)
+        .unwrap_or(0);
     RuliadReasoningScore {
         version: RULIAD_REASONING_SCORE_VERSION,
-        status,
-        correct_field_count,
-        expected_field_count,
-        partial_progress_ppm,
-        certificate_valid_prefix_steps,
-        certificate_expected_steps,
+        status: parts.status,
+        correct_field_count: parts.correct_field_count,
+        expected_field_count: parts.expected_field_count,
+        observed_field_count: parts.observed_field_count,
+        partial_progress_ppm: parts.partial_progress_ppm,
+        certificate_valid_prefix_steps: parts.certificate_valid_prefix_steps,
+        certificate_expected_steps: parts.certificate_expected_steps,
         certificate_prefix_ppm,
-        generated_token_count,
-        hash_canary,
-        answer_terminated,
-        completion_quality_ppm,
+        generated_token_count: parts.generated_token_count,
+        hash_canary: parts.hash_canary,
+        answer_terminated: parts.answer_terminated,
+        completion_quality_ppm: parts.completion_quality_ppm,
     }
 }
 
@@ -1466,6 +1654,7 @@ fn diagnose_samples(
     let mut split_counts = BTreeMap::<String, usize>::new();
     let mut family_counts = BTreeMap::<String, usize>::new();
     let mut task_counts = BTreeMap::<String, usize>::new();
+    let mut answer_contract_counts = BTreeMap::<String, usize>::new();
     let mut math_domain_counts = BTreeMap::<String, usize>::new();
     let mut reasoning_mode_counts = BTreeMap::<String, usize>::new();
     let mut oracle_hash_counts = BTreeMap::<String, usize>::new();
@@ -1525,6 +1714,11 @@ fn diagnose_samples(
         degenerate_sample_count += usize::from(is_degenerate_spec(spec));
         let expected_answer = ruliad_expected_answer(spec);
         answer_slot_count += usize::from(!expected_answer.trim().is_empty());
+        if !expected_answer.trim().is_empty() {
+            *answer_contract_counts
+                .entry(expected_answer_contract(&expected_answer))
+                .or_insert(0) += 1;
+        }
         let text = sample
             .serialized_preview
             .clone()
@@ -1601,6 +1795,16 @@ fn diagnose_samples(
             }
         }
     }
+    if thresholds.max_answer_contract_share > 0.0 {
+        for contract in count_shares(&answer_contract_counts, answer_slot_count) {
+            if contract.share > thresholds.max_answer_contract_share {
+                gate_failures.push(format!(
+                    "answer_contract_share_above_max {}={:.6}",
+                    contract.label, contract.share
+                ));
+            }
+        }
+    }
 
     RuliadDiagnosticReport {
         version: RULIAD_DIAGNOSTIC_REPORT_VERSION,
@@ -1612,6 +1816,7 @@ fn diagnose_samples(
         split_counts: count_shares(&split_counts, samples.len()),
         family_counts: count_shares(&family_counts, samples.len()),
         task_counts: count_shares(&task_counts, samples.len()),
+        answer_contract_counts: count_shares(&answer_contract_counts, answer_slot_count),
         math_domain_counts: count_shares(&math_domain_counts, samples.len()),
         reasoning_mode_counts: count_shares(&reasoning_mode_counts, samples.len()),
         source_bucket_priors,
@@ -1694,10 +1899,11 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
     };
     let exact_match = ruliad_answers_exact_match(&item.expected_answer, actual);
     let semantic_match = ruliad_answers_semantic_match(&item.expected_answer, actual);
+    let malformed = reasoning_score.status == RuliadAnswerStatus::Malformed;
     EvalOutcome {
         exact_match,
         semantic_match,
-        malformed: false,
+        malformed,
         missing: false,
         answer_terminated,
         actual_answer,
@@ -1730,6 +1936,9 @@ fn add_group_score(
     score.answer_field_expected_count = score
         .answer_field_expected_count
         .saturating_add(outcome.reasoning_score.expected_field_count);
+    score.answer_field_observed_count = score
+        .answer_field_observed_count
+        .saturating_add(outcome.reasoning_score.observed_field_count);
     score.answer_terminated_count += usize::from(outcome.answer_terminated);
     score.completion_quality_ppm_sum = score
         .completion_quality_ppm_sum
@@ -1741,7 +1950,20 @@ fn add_group_score(
     if let Some(actual_answer) = outcome.actual_answer.as_deref() {
         score.actual_answer_count = score.actual_answer_count.saturating_add(1);
         score.actual_answers.insert(actual_answer.to_string());
+        *score
+            .actual_answer_counts
+            .entry(actual_answer.to_string())
+            .or_insert(0usize) += 1;
     }
+    add_answer_field_value_diversity(
+        &item.expected_answer,
+        outcome.actual_answer.as_deref(),
+        &mut score.expected_field_value_count,
+        &mut score.expected_field_values,
+        &mut score.actual_field_value_count,
+        &mut score.actual_field_values,
+        &mut score.actual_field_value_counts,
+    );
 }
 
 fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<RuliadEvalGroupScore> {
@@ -1768,6 +1990,11 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
                 score.answer_field_correct_count,
                 score.answer_field_expected_count,
             ),
+            answer_field_observed_count: score.answer_field_observed_count,
+            answer_field_coverage: ratio(
+                score.answer_field_observed_count,
+                score.answer_field_expected_count,
+            ),
             answer_terminated_count: score.answer_terminated_count,
             answer_termination_rate: ratio(score.answer_terminated_count, score.count),
             mean_completion_quality: ratio_ppm(score.completion_quality_ppm_sum, score.count),
@@ -1778,6 +2005,28 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
             actual_answer_distinct_fraction: ratio(
                 score.actual_answers.len(),
                 score.actual_answer_count,
+            ),
+            actual_answer_dominant_fraction: dominant_fraction(
+                &score.actual_answer_counts,
+                score.actual_answer_count,
+            ),
+            expected_field_value_distinct_fraction: ratio(
+                score.expected_field_values.len(),
+                score.expected_field_value_count,
+            ),
+            actual_field_value_distinct_fraction: ratio(
+                score.actual_field_values.len(),
+                score.actual_field_value_count,
+            ),
+            field_value_distinct_ratio: distinct_fraction_ratio(
+                score.actual_field_values.len(),
+                score.actual_field_value_count,
+                score.expected_field_values.len(),
+                score.expected_field_value_count,
+            ),
+            actual_field_value_dominant_fraction: dominant_fraction(
+                &score.actual_field_value_counts,
+                score.actual_field_value_count,
             ),
         })
         .collect()
@@ -2026,6 +2275,38 @@ fn parse_answer_pair_sequence(value: &str) -> Option<Vec<(String, String)>> {
     (!pairs.is_empty()).then_some(pairs)
 }
 
+fn add_answer_field_value_diversity(
+    expected: &str,
+    actual: Option<&str>,
+    expected_field_value_count: &mut usize,
+    expected_field_values: &mut BTreeSet<String>,
+    actual_field_value_count: &mut usize,
+    actual_field_values: &mut BTreeSet<String>,
+    actual_field_value_counts: &mut BTreeMap<String, usize>,
+) {
+    let Some(expected_fields) = parse_answer_pairs(expected) else {
+        return;
+    };
+    let actual_fields =
+        actual.and_then(|actual| parse_answer_pairs_or_contract_values(expected, actual));
+    for (key, expected_value) in expected_fields {
+        let expected_field_value = format!("{key}={expected_value}");
+        *expected_field_value_count = expected_field_value_count.saturating_add(1);
+        expected_field_values.insert(expected_field_value);
+
+        let actual_value = actual_fields
+            .as_ref()
+            .and_then(|fields| fields.get(&key).map(String::as_str))
+            .unwrap_or("<missing>");
+        let actual_field_value = format!("{key}={actual_value}");
+        *actual_field_value_count = actual_field_value_count.saturating_add(1);
+        actual_field_values.insert(actual_field_value.clone());
+        *actual_field_value_counts
+            .entry(actual_field_value)
+            .or_insert(0usize) += 1;
+    }
+}
+
 fn normalize_pair_key(value: &str) -> &str {
     match value.trim() {
         "accepted" => "acc",
@@ -2043,7 +2324,7 @@ fn normalize_pair_value(value: &str) -> String {
     match value.trim() {
         "1" | "true" | "True" | "TRUE" => "1".to_string(),
         "0" | "false" | "False" | "FALSE" => "0".to_string(),
-        other => other.to_string(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
@@ -2059,6 +2340,24 @@ fn ratio(numerator: usize, denominator: usize) -> f32 {
         0.0
     } else {
         numerator as f32 / denominator as f32
+    }
+}
+
+fn dominant_fraction(counts: &BTreeMap<String, usize>, denominator: usize) -> f32 {
+    ratio(counts.values().copied().max().unwrap_or(0), denominator)
+}
+
+fn distinct_fraction_ratio(
+    actual_distinct_count: usize,
+    actual_count: usize,
+    expected_distinct_count: usize,
+    expected_count: usize,
+) -> f32 {
+    let expected = ratio(expected_distinct_count, expected_count);
+    if expected <= f32::EPSILON {
+        0.0
+    } else {
+        ratio(actual_distinct_count, actual_count) / expected
     }
 }
 
@@ -2154,6 +2453,10 @@ mod tests {
         assert!(ruliad_answers_semantic_match("ok=1;l=1;r=1", "1;1;1"));
         assert!(ruliad_answers_semantic_match("ok=0", "0"));
         assert!(ruliad_answers_semantic_match("acc=0", "accepted=false"));
+        assert!(ruliad_answers_semantic_match(
+            "nflen=3;nfalpha=ABC;nfcounts=0,2,1;nfedge=BB",
+            "nflen=3;nfalpha=abc;nfcounts=0,2,1;nfedge=bb"
+        ));
     }
 
     #[test]
@@ -2293,6 +2596,7 @@ mod tests {
             status: RuliadAnswerStatus::VerifierMatch,
             correct_field_count: 2,
             expected_field_count: 4,
+            observed_field_count: 4,
             partial_progress_ppm: SCORE_PPM_DENOMINATOR / 2,
             certificate_valid_prefix_steps: 1,
             certificate_expected_steps: 4,
@@ -2322,6 +2626,7 @@ mod tests {
             status: RuliadAnswerStatus::SchemaValidWrong,
             correct_field_count: 0,
             expected_field_count: 4,
+            observed_field_count: 4,
             partial_progress_ppm: 0,
             certificate_valid_prefix_steps: 0,
             certificate_expected_steps: 4,
@@ -2410,6 +2715,11 @@ mod tests {
         assert_eq!(report.scored_count, 2);
         assert_eq!(report.expected_answer_distinct_fraction, 1.0);
         assert_eq!(report.actual_answer_distinct_fraction, 0.5);
+        assert_eq!(report.actual_answer_dominant_fraction, 1.0);
+        assert_eq!(report.expected_field_value_distinct_fraction, 5.0 / 6.0);
+        assert_eq!(report.actual_field_value_distinct_fraction, 0.5);
+        assert!((report.field_value_distinct_ratio - 0.6).abs() < 1.0e-6);
+        assert_eq!(report.actual_field_value_dominant_fraction, 1.0 / 3.0);
         assert!(
             report.mean_completion_quality < 0.5,
             "{}",
@@ -2421,10 +2731,250 @@ mod tests {
             1.0
         );
         assert_eq!(report.family_scores[0].actual_answer_distinct_fraction, 0.5);
+        assert_eq!(report.family_scores[0].actual_answer_dominant_fraction, 1.0);
+        assert!((report.family_scores[0].field_value_distinct_ratio - 0.6).abs() < 1.0e-6);
         assert!(
             report.family_scores[0].mean_completion_quality < 0.5,
             "{}",
             report.family_scores[0].mean_completion_quality
+        );
+        let contract = report
+            .answer_contract_scores
+            .iter()
+            .find(|score| score.label == "ok,l,r")
+            .expect("ok/l/r contract group");
+        assert_eq!(contract.count, 2);
+        assert_eq!(contract.expected_answer_distinct_fraction, 1.0);
+        assert_eq!(contract.actual_answer_distinct_fraction, 0.5);
+        assert_eq!(contract.actual_answer_dominant_fraction, 1.0);
+        assert!((contract.field_value_distinct_ratio - 0.6).abs() < 1.0e-6);
+        assert!(
+            contract.mean_completion_quality < 0.5,
+            "{}",
+            contract.mean_completion_quality
+        );
+    }
+
+    #[test]
+    fn eval_report_counts_extracted_but_malformed_answers() {
+        let items = vec![RuliadEvalItem {
+            oracle_hash: "malformed".to_string(),
+            sample_index: 0,
+            split: SampleSplit::Validation,
+            family: "category".to_string(),
+            task_kind: "compose_category_path".to_string(),
+            math_domains: vec!["category_theory".to_string()],
+            reasoning_modes: vec!["compositional_reasoning".to_string()],
+            prompt: "?:cp\nA:ok,l,r\n!:".to_string(),
+            expected_answer: "ok=1;l=14;r=14".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        }];
+        let completions = vec![RuliadCompletionRecord {
+            oracle_hash: "malformed".to_string(),
+            completion: "!:1;l=1;l=1;l=1;l=1\n[/R2]".to_string(),
+        }];
+
+        let report = evaluate_completions("malformed", &items, &completions);
+
+        assert_eq!(report.scored_count, 1);
+        assert_eq!(report.missing_completion_count, 0);
+        assert_eq!(report.malformed_completion_count, 1);
+        assert_eq!(report.schema_valid_wrong_count, 0);
+        assert_eq!(report.partial_credit_count, 0);
+        assert_eq!(report.failures[0].reason, "malformed_completion");
+        assert_eq!(
+            report.family_scores[0].malformed_completion_count, 1,
+            "group metrics should match aggregate malformed accounting"
+        );
+    }
+
+    #[test]
+    fn eval_report_groups_capability_by_answer_contract() {
+        let items = vec![
+            RuliadEvalItem {
+                oracle_hash: "proof-a".to_string(),
+                sample_index: 0,
+                split: SampleSplit::Validation,
+                family: "proof_tree".to_string(),
+                task_kind: "prove_theorem".to_string(),
+                math_domains: vec!["category_theory".to_string()],
+                reasoning_modes: vec!["equational_reasoning".to_string()],
+                prompt: "!:".to_string(),
+                expected_answer: "ok=1;l=2;r=2".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+            RuliadEvalItem {
+                oracle_hash: "proof-b".to_string(),
+                sample_index: 1,
+                split: SampleSplit::Validation,
+                family: "category".to_string(),
+                task_kind: "verify_category_law".to_string(),
+                math_domains: vec!["category_theory".to_string()],
+                reasoning_modes: vec!["equational_reasoning".to_string()],
+                prompt: "!:".to_string(),
+                expected_answer: "ok=1;l=5;r=5".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+            RuliadEvalItem {
+                oracle_hash: "automaton".to_string(),
+                sample_index: 2,
+                split: SampleSplit::Validation,
+                family: "automaton".to_string(),
+                task_kind: "evaluate_automaton".to_string(),
+                math_domains: vec!["automata".to_string()],
+                reasoning_modes: vec!["state_trace".to_string()],
+                prompt: "!:".to_string(),
+                expected_answer: "acc=1".to_string(),
+                difficulty_level: Some(1),
+                spec: None,
+            },
+        ];
+        let completions = vec![
+            RuliadCompletionRecord {
+                oracle_hash: "proof-a".to_string(),
+                completion: "!:ok=1;l=2;r=2\n[/R2]".to_string(),
+            },
+            RuliadCompletionRecord {
+                oracle_hash: "proof-b".to_string(),
+                completion: "!:ok=1;l=2;r=2\n[/R2]".to_string(),
+            },
+            RuliadCompletionRecord {
+                oracle_hash: "automaton".to_string(),
+                completion: "!:acc=1\n[/R2]".to_string(),
+            },
+        ];
+
+        let report = evaluate_completions("contracts", &items, &completions);
+        let by_contract = report
+            .answer_contract_scores
+            .iter()
+            .map(|score| (score.label.as_str(), score))
+            .collect::<BTreeMap<_, _>>();
+        let ok_lr = by_contract.get("ok,l,r").expect("ok/l/r contract");
+        let acc = by_contract.get("acc").expect("acc contract");
+        assert_eq!(ok_lr.count, 2);
+        assert_eq!(ok_lr.semantic_match_count, 1);
+        assert_eq!(ok_lr.actual_answer_distinct_fraction, 0.5);
+        assert_eq!(acc.count, 1);
+        assert_eq!(acc.semantic_match_count, 1);
+        assert_eq!(acc.actual_answer_distinct_fraction, 1.0);
+    }
+
+    #[test]
+    fn diagnose_config_can_gate_dominant_answer_contracts() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.output_dir = dir.path().join("out");
+        config.train_samples = 8;
+        config.validation_samples = 4;
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::ProofTree,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        }];
+
+        let report = diagnose_config(
+            &config,
+            4,
+            RuliadDiagnosticThresholds {
+                max_answer_contract_share: 0.50,
+                max_duplicate_oracle_hash_rate: 1.0,
+                require_all_semantics: false,
+                ..RuliadDiagnosticThresholds::default()
+            },
+        )
+        .expect("diagnose config");
+
+        assert_eq!(report.answer_contract_counts.len(), 1);
+        assert_eq!(report.answer_contract_counts[0].label, "ok,l,r");
+        assert!(
+            report
+                .gate_failures
+                .iter()
+                .any(|failure| failure.starts_with("answer_contract_share_above_max ok,l,r=")),
+            "{:?}",
+            report.gate_failures
+        );
+    }
+
+    #[test]
+    fn diagnose_config_uses_live_source_selection_contract_balance() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.output_dir = dir.path().join("out");
+        config.train_samples = 256;
+        config.validation_samples = 256;
+        config.source_selection.enabled = true;
+        config.source_selection.difficulty_levels = UsizeRangeConfig { min: 1, max: 1 };
+        config.source_selection.sampler.exploration_floor = 0.0;
+        config
+            .source_selection
+            .sampler
+            .max_answer_contract_probability = 0.40;
+        config.families = vec![
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Category,
+                weight: 90,
+                width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::ProofTree,
+                weight: 90,
+                width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Automaton,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Rewrite,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+                steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            },
+            RuliadFamilyConfig {
+                kind: RuliadFamilyKind::Eca,
+                weight: 1,
+                width: Some(UsizeRangeConfig { min: 8, max: 8 }),
+                steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            },
+        ];
+
+        let report = diagnose_config(
+            &config,
+            128,
+            RuliadDiagnosticThresholds {
+                max_answer_contract_share: 0.50,
+                max_duplicate_oracle_hash_rate: 1.0,
+                require_all_semantics: false,
+                ..RuliadDiagnosticThresholds::default()
+            },
+        )
+        .expect("diagnose config");
+        let ok_lr_share = report
+            .answer_contract_counts
+            .iter()
+            .find(|count| count.label == "ok,l,r")
+            .map(|count| count.share)
+            .unwrap_or_default();
+
+        assert!(
+            ok_lr_share <= 0.50,
+            "source selection should cap dominant ok/l/r contract share: {:?}",
+            report.answer_contract_counts
+        );
+        assert!(
+            report.gate_failures.is_empty(),
+            "source-selected diagnostic should pass contract cap gate: {:?}",
+            report.gate_failures
         );
     }
 
@@ -2459,6 +3009,7 @@ mod tests {
             status: RuliadAnswerStatus::VerifierMatch,
             correct_field_count: 4,
             expected_field_count: 4,
+            observed_field_count: 4,
             partial_progress_ppm: SCORE_PPM_DENOMINATOR,
             certificate_valid_prefix_steps: 4,
             certificate_expected_steps: 4,
@@ -2473,6 +3024,7 @@ mod tests {
             status: RuliadAnswerStatus::Partial,
             correct_field_count: 2,
             expected_field_count: 4,
+            observed_field_count: 4,
             partial_progress_ppm: SCORE_PPM_DENOMINATOR / 2,
             certificate_valid_prefix_steps: 1,
             certificate_expected_steps: 4,

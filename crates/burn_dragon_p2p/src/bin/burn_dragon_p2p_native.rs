@@ -2782,7 +2782,7 @@ fn default_mainnet_native_config() -> DragonNativePeerConfig {
                     .collect(),
             )),
         target: Some(DragonNativeTarget::Trainer),
-        identity: Default::default(),
+        identity: burn_p2p::IdentityConfig::Persistent,
         bootstrap_peers: Vec::new(),
         manifest: DragonManifestSeed {
             project_family_id: DEFAULT_MAINNET_PROJECT_FAMILY_ID.into(),

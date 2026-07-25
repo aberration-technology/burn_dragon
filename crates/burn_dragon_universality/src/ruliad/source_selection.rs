@@ -71,6 +71,13 @@ impl RuliadSourceBucket {
             previous_loss_ema: config.target_loss + self.id.difficulty_level as f32 * 0.15,
             gradient_alignment: 0.0,
             is_hash_noise: self.is_hash_noise(),
+            capability_feedback_count: 0,
+            capability_verifier_ema: 0.0,
+            capability_partial_ema: 0.0,
+            capability_completion_health_ema: 0.0,
+            capability_schema_wrong_ema: 0.0,
+            capability_malformed_ema: 0.0,
+            capability_missing_ema: 0.0,
         }
     }
 }
@@ -545,7 +552,10 @@ mod tests {
             .iter()
             .find(|bucket| bucket.id.difficulty_level == 2)
             .expect("hard bucket");
-        assert!(hard.family_config.steps.unwrap().max > easy.family_config.steps.unwrap().max);
+        assert!(
+            hard.family_config.steps.as_ref().expect("hard steps").max
+                > easy.family_config.steps.as_ref().expect("easy steps").max
+        );
         assert!(
             hard.to_sampler_candidate(RuliadSamplerConfig::default())
                 .cost

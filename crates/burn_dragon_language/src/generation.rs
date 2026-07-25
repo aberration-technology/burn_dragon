@@ -109,7 +109,11 @@ pub fn generation_profile_snapshot() -> GenerationProfileSnapshot {
     GenerationProfileSnapshot::default()
 }
 
-fn sample_from_logits_values(mut logits_values: Vec<f32>, top_k: Option<usize>) -> Result<i64> {
+fn sample_from_logits_values_with_rng<R: Rng + ?Sized>(
+    mut logits_values: Vec<f32>,
+    top_k: Option<usize>,
+    rng: &mut R,
+) -> Result<i64> {
     let vocab = logits_values.len();
     if vocab == 0 {
         return Err(anyhow!("logits are empty"));
@@ -150,8 +154,12 @@ fn sample_from_logits_values(mut logits_values: Vec<f32>, top_k: Option<usize>) 
     }
 
     let dist = WeightedIndex::new(&probs).map_err(|err| anyhow!(err.to_string()))?;
+    Ok(dist.sample(rng) as i64)
+}
+
+fn sample_from_logits_values(logits_values: Vec<f32>, top_k: Option<usize>) -> Result<i64> {
     let mut rng = thread_rng();
-    Ok(dist.sample(&mut rng) as i64)
+    sample_from_logits_values_with_rng(logits_values, top_k, &mut rng)
 }
 
 fn sample_argmax_token<B: Backend>(logits_temp: Tensor<B, 1>) -> Result<i64> {
@@ -293,6 +301,18 @@ pub fn sample_next_token<B: Backend>(
     top_k: Option<usize>,
     device: &B::Device,
 ) -> Result<(i64, Tensor<B, 1>)> {
+    sample_next_token_with_rng(model, state, last_logits, temperature, top_k, device, None)
+}
+
+fn sample_next_token_with_rng<B: Backend>(
+    model: &DragonModel<B>,
+    state: &mut ModelState<B>,
+    last_logits: Tensor<B, 1>,
+    temperature: f32,
+    top_k: Option<usize>,
+    device: &B::Device,
+    rng: Option<&mut StdRng>,
+) -> Result<(i64, Tensor<B, 1>)> {
     let prof_enabled = generation_profile_enabled();
     let logits_temp = last_logits.clone().div_scalar(temperature);
     let next = if top_k == Some(1) {
@@ -329,7 +349,11 @@ pub fn sample_next_token<B: Backend>(
             });
         }
         let sample_start = prof_enabled.then(Instant::now);
-        let token = sample_from_logits_values(logits_values, top_k)?;
+        let token = if let Some(rng) = rng {
+            sample_from_logits_values_with_rng(logits_values, top_k, rng)?
+        } else {
+            sample_from_logits_values(logits_values, top_k)?
+        };
         if let Some(start) = sample_start {
             let elapsed = start.elapsed().as_nanos();
             generation_profile_record(|profile| {
@@ -467,6 +491,35 @@ pub fn generate_tokens<B: Backend>(
     settings: GenerationSettings,
     mut on_token: Option<&mut dyn FnMut(i64)>,
 ) -> Result<Vec<i64>> {
+    generate_tokens_with_optional_seed(model, prompt_tokens, device, settings, None, &mut on_token)
+}
+
+pub fn generate_tokens_seeded<B: Backend>(
+    model: &DragonModel<B>,
+    prompt_tokens: Vec<i64>,
+    device: &B::Device,
+    settings: GenerationSettings,
+    seed: u64,
+    mut on_token: Option<&mut dyn FnMut(i64)>,
+) -> Result<Vec<i64>> {
+    generate_tokens_with_optional_seed(
+        model,
+        prompt_tokens,
+        device,
+        settings,
+        Some(seed),
+        &mut on_token,
+    )
+}
+
+fn generate_tokens_with_optional_seed<B: Backend>(
+    model: &DragonModel<B>,
+    prompt_tokens: Vec<i64>,
+    device: &B::Device,
+    settings: GenerationSettings,
+    seed: Option<u64>,
+    on_token: &mut Option<&mut dyn FnMut(i64)>,
+) -> Result<Vec<i64>> {
     let GenerationSettings {
         max_new_tokens,
         temperature,
@@ -478,6 +531,7 @@ pub fn generate_tokens<B: Backend>(
     let mut full_tokens = prompt_tokens;
     let (mut state, mut last_logits) = prefill_state(model, &full_tokens, device)?;
     let mut generated = 0usize;
+    let mut rng = seed.map(StdRng::seed_from_u64);
 
     if let ContextStrategy::Sliding { window } = strategy
         && window > 0
@@ -487,13 +541,20 @@ pub fn generate_tokens<B: Backend>(
     }
 
     while max_new_tokens.is_none_or(|max| generated < max) {
-        let (next, logits) =
-            sample_next_token(model, &mut state, last_logits, temperature, top_k, device)?;
+        let (next, logits) = sample_next_token_with_rng(
+            model,
+            &mut state,
+            last_logits,
+            temperature,
+            top_k,
+            device,
+            rng.as_mut(),
+        )?;
         full_tokens.push(next);
         last_logits = logits;
         generated = generated.saturating_add(1);
 
-        if let Some(callback) = &mut on_token {
+        if let Some(callback) = on_token.as_deref_mut() {
             callback(next);
         }
         if stop_on_token == Some(next) {

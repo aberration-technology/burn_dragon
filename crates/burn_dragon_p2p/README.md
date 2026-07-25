@@ -23,6 +23,8 @@ Deployment assets live in [deploy](deploy):
 - [deploy/README.md](deploy/README.md): GitHub Actions, Terraform, and required repo/environment secrets
 - [deploy/profiles](deploy/profiles): initial Dragon training-profile sources and published network profile payloads
 - [deploy/terraform/aws](deploy/terraform/aws): checked-in AWS bootstrap/edge Terraform root
+- [P2P production readiness](../../docs/p2p-production-readiness.md): trust,
+  native/browser coherence, validation ladder, and remaining release gates
 
 ## Target Matrix
 
@@ -97,10 +99,14 @@ Current default budgets are conservative:
 - native ROCm: `6 GiB`
 - browser WebGPU: `2 GiB`
 
-Fallback policy:
+Preflight fallback policy:
 
 - native peers: `trainer -> validator`
 - browser peers: `browser_trainer_wgpu -> browser_verifier`
+
+After a native trainer has already started, a probable OOM, allocation failure,
+or device loss downgrades the live node to the read-only `viewer` role. The
+current window may drain, but subsequent training windows are rejected.
 
 This is still a heuristic fit model, not a portable exact VRAM probe. The important product behavior is that undersized peers should downgrade before training starts instead of crashing on first optimizer allocation.
 
@@ -112,7 +118,7 @@ Native and browser peers also persist downgrade state for a specific workload fi
 - batch size
 - block size
 
-If a trainer run fails with a probable local fit error like OOM / failed allocation / device loss, the next startup comes back as validator or verifier automatically instead of retrying trainer blindly. Transient control-plane failures such as edge receipt submission 5xx responses are not treated as trainer fit failures, and stale records with those reasons do not bind. The downgrade record stops binding automatically if the configured trainer budget increases above the recorded failed footprint, and native peers can also clear it explicitly.
+If a trainer run fails with a probable local fit error like OOM / failed allocation / device loss, the live native node becomes read-only and the next startup remains observer-only; a browser reconnects as verifier/observer instead of retrying trainer blindly. Transient control-plane failures such as edge receipt submission 5xx responses are not treated as trainer fit failures, and stale records with those reasons do not bind. The downgrade record stops binding automatically if the configured trainer budget increases above the recorded failed footprint, and native peers can also clear it explicitly.
 
 The browser app now renders the local capability decision directly:
 
@@ -121,6 +127,97 @@ The browser app now renders the local capability decision directly:
 - trainer memory budget
 - estimated tokens/sec
 - checkpoint / shard / window budgets
+
+Participation starts from a read-only posture. Capability transitions are
+revisioned and run-scoped through `burn_ecs`, so stale asynchronous probe
+results cannot overwrite a newer role decision. Observer and verifier peers do
+not receive trainer authority merely because their hardware later reports
+WebGPU support.
+
+Native peers also recover in process. The default re-probe policy waits 30
+seconds after downgrade, checks the configured training budget and 125% live
+host-memory headroom, requires two successful probes, and retries with bounded
+exponential backoff. A successful transition acknowledges the handled runtime
+error, restores only the original CPU/GPU trainer role, and clears the
+workload-specific downgrade record. Configure this under
+`capability.native_reprobe`.
+
+## Signed Revision And Genesis
+
+Production peers should require one authority-signed
+`RevisionContractBundle`. It binds:
+
+- Dragon model, checkpoint, tokenizer, dataset, objective, optimizer,
+  scheduler, recurrent-state, aggregation, and validation semantics
+- the update codec used by native and browser contributors
+- one complete, content-addressed model genesis artifact
+
+Backend and local batch size remain capability choices and do not fork the
+semantic revision.
+
+Bootstrap loads contract files from `BURN_P2P_REVISION_CONTRACT_FILES`,
+verifies both domain-separated Ed25519 signatures against the active trust
+bundle, rejects conflicting contracts, and distributes verified bundles in the
+browser-edge snapshot. Native nodes register the same bundle and use
+`require_signed_revision_contracts(true)` for fail-closed startup.
+
+Artifact hashing alone is not treated as model identity. Native peers decode
+the signed genesis and stream a canonical tensor-pack digest without allocating
+a second model-sized flat buffer. Browser peers decode the same record on the
+CPU verification backend before WebGPU training, avoiding unsupported
+synchronous WebGPU readback. Both compare names/layout and float32-normalized
+values against the authority-signed `tensor_digest`.
+
+The local deterministic initialization fallback is for tests and isolated
+development. A public revision must provision and load the exact signed genesis
+artifact; peers must not create private random initial weights.
+
+## Convergence And Distributed State
+
+The three-peer 1M-class release harness separates three questions:
+
+- protocol parity: network candidates and promoted roots must match an
+  independent tensor merge oracle exactly
+- fair convergence: P2P is compared with centralized training over the same
+  examples and the same number of optimizer updates
+- upper-bound convergence: a sequential reference consumes the same examples
+  with three times as many optimizer updates
+
+Protocol parity passes. At seed 1337, full-FedAvg AdamW with nine local steps
+reached validation loss `3.551498`, while the matched-update centralized
+reference reached `2.472019`. That is `66.45%` of centralized loss reduction,
+below the default `90%` promotion threshold. Three-step windows were worse at
+`64.32%` and reduced protocol duty from `45.29%` to `25.05%`.
+
+The artifact-window profile explicitly resets optimizer and scheduler state
+per window. It is mechanically correct but is not the production
+continual-pretraining default until it closes the convergence gate.
+The protocol-aware DiLoCo path closes the bounded local gate: across seeds
+1337-1339, four outer rounds with nine local steps reached 94.69%-98.33% of
+matched synchronized progress. Every network round exactly matched the
+codec-aware protocol oracle and recorded zero hard DiLoCo request failures.
+FP16 and blockwise-int8 retained the seed-1338 trajectory while reducing local
+gradient payloads to 50.0% and 25.6% of FP32, respectively.
+
+Run the release gate with
+`BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1` to make convergence parity a
+hard assertion. Detailed methodology and remaining production gates are in
+[P2P production readiness](../../docs/p2p-production-readiness.md).
+
+## Compact Browser Updates
+
+The browser EGGROLL path publishes a `SeededFitness` compact update: shared
+perturbation identity, contiguous generation numbers, exact batch digests, and
+quantized or FP32 antithetic fitness values. It runs on a plain forward backend,
+without enabling autodiff. Native peers regenerate the low-rank perturbations
+and replay the update against the canonical base model.
+
+Validators now independently recover content-verified microshards from the
+authenticated assignment lease, reproduce the batch digest, replay the
+contract-selected perturbation pairs, and compare fitness under signed
+numerical tolerances. Replay-required updates fail admission unless that
+evidence succeeds. Public arbitrary-peer promotion still requires a separate
+multi-validator quorum and live quarantine/disagreement drill.
 
 ## Browser Data Sources
 
@@ -549,3 +646,81 @@ The wasm/browser smoke specifically covers:
 - generated NCA training
 - HTTP JSON shard training
 - real Chrome + chromedriver execution with WebGPU flags
+
+### Native Convergence Parity
+
+The ignored `ruliad_native_runtime_1m_convergence_matches_federated_oracle`
+integration test is the release-mode learning and communication gate for a
+small native fleet. It runs a 926,210-parameter Dragon model on three local
+trainer peers and verifies:
+
+- one shared training contract, content-bound dataset view, and canonical genesis
+- disjoint, non-empty microshard leases for every peer and round
+- candidate artifact transfer, update visibility, and three-receipt promotion
+- exact candidate replay and exact promoted-tensor parity with an independent
+  weighted-merge/root-EMA oracle
+- validation parity on the materialized promoted artifact
+- a compute-matched sequential comparator, reported separately from protocol
+  parity
+
+Run the full comparator:
+
+```bash
+RUSTC="$(rustup which rustc --toolchain stable)" \
+RUSTFLAGS="-C target-cpu=native" \
+BURN_DRAGON_P2P_PARITY_ROUNDS=2 \
+BURN_DRAGON_P2P_PARITY_REPORT_ROOT=target/test-artifacts/p2p-convergence-parity \
+"$(rustup which cargo --toolchain stable)" test --release \
+  -p burn_dragon_p2p --test native_training \
+  ruliad_native_runtime_1m_convergence_matches_federated_oracle -- \
+  --ignored --exact --nocapture
+```
+
+For a multi-seed protocol matrix, set
+`BURN_DRAGON_P2P_PARITY_REPLAY=false` and
+`BURN_DRAGON_P2P_PARITY_SEQUENTIAL=false`. That mode still performs real
+training, transport, promotion, artifact materialization, and independent
+merge verification; it skips duplicate local candidate replay and sequential
+training. Each seed writes a self-contained JSON report.
+
+This local gate uses the development genesis path and records
+`signed_revision_contract_exercised=false`. It does not replace the clean-store
+staging canary for an authority-signed revision and provisioned genesis
+artifact.
+
+### Native DiLoCo Convergence Parity
+
+The ignored `ruliad_native_runtime_1m_diloco_matches_protocol_oracle` test uses
+the same 926,210-parameter model and data accounting, but executes three local
+inner loops followed by one codec-aware DiLoCo outer update. It checks the
+matched cohort, rotating reducer, contribution commitments, aggregate and
+parameter equality, deterministic peer identities, request-failure telemetry,
+and convergence against synchronized AdamW over the same microbatches.
+
+Run one hard-gated release condition:
+
+```bash
+RUSTC="$(rustup which rustc --toolchain stable)" \
+RUSTFLAGS="-C target-cpu=native" \
+BURN_DRAGON_P2P_PARITY_SEED=1337 \
+BURN_DRAGON_P2P_PARITY_ROUNDS=4 \
+BURN_DRAGON_P2P_PARITY_LOCAL_STEPS=9 \
+BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1 \
+BURN_DRAGON_P2P_DILOCO_CODEC=fp32 \
+BURN_DRAGON_P2P_DILOCO_REPORT_ROOT=target/test-artifacts/p2p-diloco-convergence \
+"$(rustup which cargo --toolchain stable)" test --release \
+  -p burn_dragon_p2p --test native_training \
+  ruliad_native_runtime_1m_diloco_matches_protocol_oracle -- \
+  --ignored --exact --nocapture
+```
+
+Repeat with distinct seeds and `fp16` or `int8` codecs for a promotion matrix.
+The current release matrix passes three FP32 seeds at 94.69% to 98.33% of
+synchronized-reference learning progress. On seed 1338, FP16 and blockwise
+int8/256 retain 94.69% and 94.68% progress while reducing local gradient
+payload to 50.0% and 25.6% of FP32. All conditions use the same release
+executable, enforce the 90% convergence gate, match the codec-aware protocol
+oracle exactly, and record zero hard DiLoCo request failures.
+
+The complete local methodology and current production blockers are tracked in
+[P2P production readiness](../../docs/p2p-production-readiness.md).

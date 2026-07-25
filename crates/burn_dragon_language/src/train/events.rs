@@ -178,6 +178,9 @@ pub(crate) fn source_selection_sample_from_snapshot(
         absolute_step,
         loss,
         entropy_bits: snapshot.sampler_entropy_bits as f64,
+        active_candidate_count: snapshot.active_candidate_count,
+        active_max_entropy_bits: snapshot.active_max_entropy_bits as f64,
+        normalized_entropy: snapshot.normalized_sampler_entropy as f64,
         hash_noise_probability: snapshot.hash_noise_probability as f64,
         mean_loss: snapshot.mean_loss as f64,
         mean_learning_progress: snapshot.mean_learning_progress as f64,
@@ -190,6 +193,13 @@ pub(crate) fn source_selection_sample_from_snapshot(
         normalized_difficulty_score: snapshot.normalized_difficulty_score as f64,
         max_difficulty_probability: snapshot.max_difficulty_probability as f64,
         mastered_probability: snapshot.mastered_probability as f64,
+        capability_feedback_probability: snapshot.capability_feedback_probability as f64,
+        capability_verifier_ema: snapshot.capability_verifier_ema as f64,
+        capability_completion_health_ema: snapshot.capability_completion_health_ema as f64,
+        capability_schema_wrong_ema: snapshot.capability_schema_wrong_ema as f64,
+        capability_malformed_ema: snapshot.capability_malformed_ema as f64,
+        capability_missing_ema: snapshot.capability_missing_ema as f64,
+        capability_lagging_probability: snapshot.capability_lagging_probability as f64,
         frontier_extension_count: snapshot.frontier_extension_count,
         frontier_saturated: snapshot.frontier_saturated,
         unbounded_frontier: snapshot.frontier_unbounded,
@@ -206,6 +216,13 @@ pub(crate) fn source_selection_sample_from_snapshot(
                 previous_loss_ema: bucket.previous_loss_ema as f64,
                 learning_progress: bucket.learning_progress as f64,
                 mastered: bucket.mastered,
+                capability_feedback_count: bucket.capability_feedback_count,
+                capability_verifier_ema: bucket.capability_verifier_ema as f64,
+                capability_completion_health_ema: bucket.capability_completion_health_ema as f64,
+                capability_schema_wrong_ema: bucket.capability_schema_wrong_ema as f64,
+                capability_malformed_ema: bucket.capability_malformed_ema as f64,
+                capability_missing_ema: bucket.capability_missing_ema as f64,
+                capability_lagging: bucket.capability_lagging,
             })
             .collect(),
         difficulty_buckets: snapshot
@@ -220,6 +237,11 @@ pub(crate) fn source_selection_sample_from_snapshot(
             .collect(),
         task_buckets: snapshot
             .task_buckets
+            .iter()
+            .map(source_selection_group_metric)
+            .collect(),
+        contract_buckets: snapshot
+            .contract_buckets
             .iter()
             .map(source_selection_group_metric)
             .collect(),
@@ -238,5 +260,12 @@ fn source_selection_group_metric(
         learning_progress: group.learning_progress as f64,
         mastered_probability: group.mastered_probability as f64,
         mean_difficulty_level: group.mean_difficulty_level as f64,
+        capability_feedback_probability: group.capability_feedback_probability as f64,
+        capability_verifier_ema: group.capability_verifier_ema as f64,
+        capability_completion_health_ema: group.capability_completion_health_ema as f64,
+        capability_schema_wrong_ema: group.capability_schema_wrong_ema as f64,
+        capability_malformed_ema: group.capability_malformed_ema as f64,
+        capability_missing_ema: group.capability_missing_ema as f64,
+        capability_lagging_probability: group.capability_lagging_probability as f64,
     }
 }

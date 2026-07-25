@@ -1,0 +1,32 @@
+extends = ["ruliad-1m-la-16k.field-binding-contrast.training.toml"]
+
+[training.events]
+ruliad_contract_probe_enabled = true
+
+[training.ruliad_supervision.answer_denoising]
+enabled = true
+weight = 0.0
+probability = 1.0
+corrupt_offset = 1
+structured_recovery_weight = 0.25
+structured_recovery_every_steps = 4
+structured_recovery_start_after_steps = 0
+structured_recovery_max_completion_tokens = 64
+structured_recovery_negative_count = 2
+structured_recovery_template_negative_count = 2
+structured_recovery_schema_negative_count = 4
+
+[training.ruliad_supervision.verifier_reward]
+structured_negative_count = 2
+structured_template_negative_count = 2
+structured_schema_negative_count = 8
+structured_contrast_weight = 0.05
+structured_contrast_every_steps = 4
+structured_contrast_start_after_steps = 0
+structured_contrast_margin = 0.25
+rollout_recovery_weight = 0.03
+rollout_imitation_every_steps = 8
+rollout_imitation_start_after_steps = 0
+rollout_imitation_min_partial_progress_ppm = 0
+rollout_imitation_min_completion_quality_ppm = 750000
+rollout_imitation_max_rows_per_step = 8

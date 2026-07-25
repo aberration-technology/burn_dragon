@@ -3,40 +3,23 @@ use crate::train::prelude::*;
 use burn::tensor::activation;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-type StreamingStateStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
-type TeacherModelStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
-
-fn streaming_state_store() -> &'static Mutex<StreamingStateStore> {
-    static STORE: OnceLock<Mutex<StreamingStateStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Default)]
+struct PipelineRuntimeCell {
+    inner: Arc<Mutex<Option<Box<dyn Any + Send>>>>,
 }
 
-fn lock_streaming_state_store() -> std::sync::MutexGuard<'static, StreamingStateStore> {
-    streaming_state_store()
-        .lock()
-        .expect("streaming tbptt runtime lock poisoned")
-}
-
-fn teacher_model_store() -> &'static Mutex<TeacherModelStore> {
-    static STORE: OnceLock<Mutex<TeacherModelStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn lock_teacher_model_store() -> std::sync::MutexGuard<'static, TeacherModelStore> {
-    teacher_model_store()
-        .lock()
-        .expect("teacher model runtime lock poisoned")
-}
-
-fn next_streaming_runtime_key() -> usize {
-    static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
-    NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+impl std::fmt::Debug for PipelineRuntimeCell {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PipelineRuntimeCell")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -746,13 +729,31 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     teacher_model: Option<DragonModel<B>>,
     #[module(skip)]
-    streaming_runtime_key: usize,
+    teacher_runtime: PipelineRuntimeCell,
+    #[module(skip)]
+    streaming_state: PipelineRuntimeCell,
     #[module(skip)]
     gradient_scale_schedule: GradientScaleSchedule,
     #[module(skip)]
     gradient_scale_step: Arc<AtomicUsize>,
     #[module(skip)]
     ruliad_policy_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_structured_recovery_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_answer_contract_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_structured_contrast_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_field_binding_contrast_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_field_binding_replay: Arc<Mutex<VecDeque<RuliadFieldBindingReplaySample>>>,
+    #[module(skip)]
+    ruliad_generated_attractor_replay: Arc<Mutex<RuliadGeneratedAttractorReplay>>,
+    #[module(skip)]
+    ruliad_generated_attractor_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_verifier_rollout_telemetry_path: Option<Arc<PathBuf>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -762,6 +763,11 @@ struct RuliadPolicyRewardTelemetry {
     mode: String,
     sample_groups: usize,
     completion_rows: usize,
+    oracle_sample_groups: usize,
+    oracle_completion_rows: usize,
+    oracle_truncated_completion_rows: usize,
+    structured_negative_completion_rows: usize,
+    generated_attractor_completion_rows: usize,
     gated_sample_groups: usize,
     gated_completion_rows: usize,
     scalarization_count: usize,
@@ -797,12 +803,353 @@ struct RuliadPolicyRewardTelemetry {
     vpo_scalarization_dominant_completion_health: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuliadStructuredNegativeKind {
+    FieldMutation,
+    TemplateCollapse,
+    SchemaCollapse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadStructuredContrastTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    oracle_completion_rows: usize,
+    field_negative_completion_rows: usize,
+    template_negative_completion_rows: usize,
+    schema_negative_completion_rows: usize,
+    generated_attractor_negative_completion_rows: usize,
+    contrast_pairs: usize,
+    contrast_discriminative_tokens: usize,
+    structured_contrast_weight: f32,
+    structured_contrast_margin: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadAnswerContractTelemetry {
+    version: u32,
+    step_index: usize,
+    policy_batch_present: bool,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    prompt_schema_sample_groups: usize,
+    oracle_rows: usize,
+    prompt_schema_rows: usize,
+    contract_tokens: usize,
+    prompt_schema_value_tokens: usize,
+    schema_tokens: usize,
+    schema_start_tokens: usize,
+    value_tokens: usize,
+    other_tokens: usize,
+    premature_close_tokens: usize,
+    answer_contract_weight: f32,
+    premature_close_unlikelihood_weight: f32,
+    max_completion_tokens: usize,
+    max_rows_per_step: usize,
+    prompt_schema_max_rows_per_step: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadFieldBindingContrastTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    prompt_pairs: usize,
+    contrast_pairs: usize,
+    candidate_pairs: usize,
+    contrast_discriminative_tokens: usize,
+    negative_pool_size: usize,
+    replay_pool_size: usize,
+    replay_contrast_pairs: usize,
+    generated_attractor_pool_size: usize,
+    generated_attractor_negative_pool_size: usize,
+    generated_attractor_contrast_pairs: usize,
+    rank_metric_pairs: usize,
+    rank_metric_tokens: usize,
+    logit_margin_mean: Option<f64>,
+    positive_token_fraction: Option<f64>,
+    margin_satisfied_token_fraction: Option<f64>,
+    exact_pair_rank_fraction: Option<f64>,
+    exact_pair_margin_fraction: Option<f64>,
+    field_binding_contrast_weight: f32,
+    field_binding_contrast_margin: f32,
+    field_binding_contrast_pair_weight: f32,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadFieldBindingReplaySample {
+    answer: String,
+    family: String,
+    task_kind: String,
+    contract: String,
+    oracle_completion: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct RuliadGeneratedAttractorKey {
+    family: String,
+    task_kind: String,
+    contract: String,
+    answer: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadGeneratedAttractorEntry {
+    key: RuliadGeneratedAttractorKey,
+    count: usize,
+    last_step_index: usize,
+    status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuliadGeneratedAttractorReplay {
+    entries: HashMap<RuliadGeneratedAttractorKey, RuliadGeneratedAttractorEntry>,
+    order: VecDeque<RuliadGeneratedAttractorKey>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuliadGeneratedAttractorReplaySummary {
+    pool_size: usize,
+    active_count: usize,
+    active_observation_count: usize,
+    dominant_count: usize,
+    distinct_answers: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadGeneratedAttractorReplayTelemetry {
+    version: u32,
+    step_index: usize,
+    source: String,
+    skip_reason: Option<String>,
+    observed_completion_rows: usize,
+    recorded_attractor_rows: usize,
+    selected_candidate_rows: usize,
+    selected_field_binding_pairs: usize,
+    replay_pool_size: usize,
+    active_attractor_count: usize,
+    active_observation_count: usize,
+    distinct_answer_count: usize,
+    dominant_answer_count: usize,
+    dominant_answer_fraction: f64,
+    min_count: usize,
+    max_candidates: usize,
+    min_distinct_answers: usize,
+    max_dominant_fraction: f32,
+}
+
+impl RuliadGeneratedAttractorReplay {
+    fn record(
+        &mut self,
+        key: RuliadGeneratedAttractorKey,
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        step_index: usize,
+        capacity: usize,
+    ) -> bool {
+        if capacity == 0 {
+            return false;
+        }
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.count = entry.count.saturating_add(1);
+            entry.last_step_index = step_index;
+            entry.status = status;
+            return true;
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(
+            key.clone(),
+            RuliadGeneratedAttractorEntry {
+                key,
+                count: 1,
+                last_step_index: step_index,
+                status,
+            },
+        );
+        while self.entries.len() > capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&oldest)
+                .is_some_and(|entry| entry.key == oldest)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    fn candidates_for(
+        &self,
+        family: &str,
+        task_kind: &str,
+        expected_contract: &str,
+        expected_answer: &str,
+        min_count: usize,
+        max_candidates: usize,
+        min_distinct_answers: usize,
+        max_dominant_fraction: f32,
+    ) -> Vec<RuliadGeneratedAttractorEntry> {
+        if max_candidates == 0 {
+            return Vec::new();
+        }
+        if self
+            .summary(min_count)
+            .diversity_skip_reason(min_distinct_answers, max_dominant_fraction)
+            .is_some()
+        {
+            return Vec::new();
+        }
+        let mut candidates = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.count >= min_count
+                    && entry.key.family == family
+                    && entry.key.task_kind == task_kind
+                    && entry.key.answer != expected_answer
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_same_contract = left.key.contract == expected_contract;
+            let right_same_contract = right.key.contract == expected_contract;
+            right_same_contract
+                .cmp(&left_same_contract)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| right.last_step_index.cmp(&left.last_step_index))
+                .then_with(|| left.key.answer.cmp(&right.key.answer))
+        });
+        candidates.truncate(max_candidates);
+        candidates
+    }
+
+    fn summary(&self, min_count: usize) -> RuliadGeneratedAttractorReplaySummary {
+        let mut counts_by_answer = HashMap::<&str, usize>::new();
+        let mut active_count = 0usize;
+        let mut active_observation_count = 0usize;
+        for entry in self.entries.values() {
+            if entry.count < min_count {
+                continue;
+            }
+            active_count = active_count.saturating_add(1);
+            active_observation_count = active_observation_count.saturating_add(entry.count);
+            *counts_by_answer
+                .entry(entry.key.answer.as_str())
+                .or_default() += entry.count;
+        }
+        let dominant_count = counts_by_answer.values().copied().max().unwrap_or(0);
+        RuliadGeneratedAttractorReplaySummary {
+            pool_size: self.entries.len(),
+            active_count,
+            active_observation_count,
+            dominant_count,
+            distinct_answers: counts_by_answer.len(),
+        }
+    }
+}
+
+impl RuliadGeneratedAttractorReplaySummary {
+    fn dominant_fraction(&self) -> f64 {
+        if self.active_observation_count == 0 {
+            0.0
+        } else {
+            self.dominant_count as f64 / self.active_observation_count as f64
+        }
+    }
+
+    fn diversity_skip_reason(
+        &self,
+        min_distinct_answers: usize,
+        max_dominant_fraction: f32,
+    ) -> Option<&'static str> {
+        if self.active_count == 0 {
+            return Some("generated_attractor_no_active_entries");
+        }
+        if self.distinct_answers < min_distinct_answers.max(1) {
+            return Some("generated_attractor_low_answer_diversity");
+        }
+        if self.dominant_fraction() > f64::from(max_dominant_fraction) {
+            return Some("generated_attractor_dominant_answer");
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuliadFieldBindingRankStats {
+    pairs: usize,
+    tokens: usize,
+    logit_margin_mean: Option<f64>,
+    positive_token_fraction: Option<f64>,
+    margin_satisfied_token_fraction: Option<f64>,
+    exact_pair_rank_fraction: Option<f64>,
+    exact_pair_margin_fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadStructuredRecoveryTelemetry {
+    version: u32,
+    step_index: usize,
+    policy_batch_present: bool,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    recovery_rows: usize,
+    field_negative_recovery_rows: usize,
+    template_negative_recovery_rows: usize,
+    schema_negative_recovery_rows: usize,
+    structured_recovery_weight: f32,
+    structured_recovery_max_completion_tokens: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadVerifierRolloutImitationTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    generated_completion_rows: usize,
+    candidate_completion_rows: usize,
+    accepted_completion_rows: usize,
+    accepted_imitation_rows: usize,
+    accepted_recovery_rows: usize,
+    health_gate_passed: bool,
+    verifier_rate_ppm: usize,
+    schema_wrong_rate_ppm: usize,
+    malformed_rate_ppm: usize,
+    verifier_match_rows: usize,
+    semantic_match_rows: usize,
+    partial_rows: usize,
+    schema_wrong_rows: usize,
+    malformed_rows: usize,
+    missing_rows: usize,
+    recovery_partial_rows: usize,
+    recovery_schema_wrong_rows: usize,
+    recovery_malformed_rows: usize,
+    recovery_missing_rows: usize,
+    field_accuracy_mean: f64,
+    partial_progress_mean: f64,
+    completion_quality_mean: f64,
+    rollout_imitation_weight: f32,
+    rollout_recovery_weight: f32,
+    max_completion_tokens: usize,
+}
+
 #[derive(Clone, Debug)]
 struct RuliadPolicyRewardTelemetryAccumulator {
     mode: String,
     step_index: usize,
     sample_groups: usize,
     completion_rows: usize,
+    oracle_sample_groups: usize,
+    oracle_completion_rows: usize,
+    oracle_truncated_completion_rows: usize,
+    structured_negative_completion_rows: usize,
+    generated_attractor_completion_rows: usize,
     gated_sample_groups: usize,
     gated_completion_rows: usize,
     scalarization_count: usize,
@@ -829,6 +1176,11 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             step_index,
             sample_groups: 0,
             completion_rows: 0,
+            oracle_sample_groups: 0,
+            oracle_completion_rows: 0,
+            oracle_truncated_completion_rows: 0,
+            structured_negative_completion_rows: 0,
+            generated_attractor_completion_rows: 0,
             gated_sample_groups: 0,
             gated_completion_rows: 0,
             scalarization_count: 0,
@@ -878,6 +1230,25 @@ impl RuliadPolicyRewardTelemetryAccumulator {
     fn record_gated_group(&mut self, completion_rows: usize) {
         self.gated_sample_groups = self.gated_sample_groups.saturating_add(1);
         self.gated_completion_rows = self.gated_completion_rows.saturating_add(completion_rows);
+    }
+
+    fn record_oracle_candidate(&mut self, truncated: bool) {
+        self.oracle_sample_groups = self.oracle_sample_groups.saturating_add(1);
+        self.oracle_completion_rows = self.oracle_completion_rows.saturating_add(1);
+        if truncated {
+            self.oracle_truncated_completion_rows =
+                self.oracle_truncated_completion_rows.saturating_add(1);
+        }
+    }
+
+    fn record_structured_negative_candidate(&mut self) {
+        self.structured_negative_completion_rows =
+            self.structured_negative_completion_rows.saturating_add(1);
+    }
+
+    fn record_generated_attractor_candidate(&mut self) {
+        self.generated_attractor_completion_rows =
+            self.generated_attractor_completion_rows.saturating_add(1);
     }
 
     fn has_observations(&self) -> bool {
@@ -936,6 +1307,11 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             mode: self.mode,
             sample_groups: self.sample_groups,
             completion_rows: self.completion_rows,
+            oracle_sample_groups: self.oracle_sample_groups,
+            oracle_completion_rows: self.oracle_completion_rows,
+            oracle_truncated_completion_rows: self.oracle_truncated_completion_rows,
+            structured_negative_completion_rows: self.structured_negative_completion_rows,
+            generated_attractor_completion_rows: self.generated_attractor_completion_rows,
             gated_sample_groups: self.gated_sample_groups,
             gated_completion_rows: self.gated_completion_rows,
             scalarization_count: self.scalarization_count,
@@ -1173,10 +1549,21 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             latent_reasoning_capability_gate_open: Arc::new(AtomicBool::new(false)),
             greedy_rollout_recovery_active: Arc::new(AtomicBool::new(false)),
             teacher_model: None,
-            streaming_runtime_key: next_streaming_runtime_key(),
+            teacher_runtime: PipelineRuntimeCell::default(),
+            streaming_state: PipelineRuntimeCell::default(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
             gradient_scale_step: Arc::new(AtomicUsize::new(0)),
             ruliad_policy_telemetry_path: None,
+            ruliad_structured_recovery_telemetry_path: None,
+            ruliad_answer_contract_telemetry_path: None,
+            ruliad_structured_contrast_telemetry_path: None,
+            ruliad_field_binding_contrast_telemetry_path: None,
+            ruliad_field_binding_replay: Arc::new(Mutex::new(VecDeque::new())),
+            ruliad_generated_attractor_replay: Arc::new(Mutex::new(
+                RuliadGeneratedAttractorReplay::default(),
+            )),
+            ruliad_generated_attractor_telemetry_path: None,
+            ruliad_verifier_rollout_telemetry_path: None,
         }
     }
 
@@ -1203,14 +1590,48 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     pub fn with_training_objective(mut self, objective: TrainingObjectiveConfig) -> Self {
         self.teacher_model =
             (!objective.is_next_token()).then(|| detach_teacher_model(&self.model));
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut teachers = lock_teacher_model_store();
-        teachers.remove(&key);
-        if let Some(teacher_model) = self.teacher_model.clone() {
-            teachers.insert(key, Box::new(TeacherModelRuntime::new(teacher_model)));
-        }
+        *self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned") = self
+            .teacher_model
+            .clone()
+            .map(|model| Box::new(TeacherModelRuntime::new(model)) as Box<dyn Any + Send>);
         self.objective = objective;
         self
+    }
+
+    /// Applies the objective and auxiliary-loss portion of a language training contract.
+    ///
+    /// Keep this path shared by local, distributed, and peer-to-peer executors so that
+    /// changing the launch mode cannot silently change what the model is optimizing.
+    pub fn with_training_objectives(self, training: &TrainingHyperparameters) -> Self {
+        self.with_training_objective(training.objective.clone())
+            .with_input_corruption(training.input_corruption.clone())
+            .with_logit_entropy_floor(training.logit_entropy_floor.clone())
+            .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
+            .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
+            .with_dynamics_anchor(training.dynamics_anchor.clone())
+            .with_predictive_coding(training.predictive_coding.clone())
+            .with_latent_reasoning(training.latent_reasoning.clone())
+            .with_ruliad_supervision(training.ruliad_supervision)
+    }
+
+    /// Applies the complete launch-independent language training contract.
+    pub fn with_training_configuration(
+        self,
+        training: &TrainingHyperparameters,
+        total_steps: usize,
+    ) -> Self
+    where
+        B: AutodiffBackend,
+    {
+        self.with_training_objectives(training)
+            .with_tbptt_chunk_size(training.tbptt_chunk_size)
+            .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)
+            .with_continual_backprop(&training.continual_backprop)
+            .with_gradient_scale_schedule(training, total_steps)
     }
 
     pub fn with_input_corruption(mut self, config: CausalInputCorruptionConfig) -> Self {
@@ -1239,17 +1660,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     pub fn with_dynamics_anchor(mut self, config: DynamicsAnchorConfig) -> Self {
         self.dynamics_anchor = config;
         if self.dynamics_anchor.enabled && self.dynamics_anchor.weight > f32::EPSILON {
-            let key = (self.streaming_runtime_key, TypeId::of::<B>());
             let teacher_model = self
                 .teacher_model
                 .clone()
                 .unwrap_or_else(|| detach_teacher_model(&self.model));
             let teacher_model = detach_teacher_model(&teacher_model);
             self.teacher_model = Some(teacher_model.clone());
-            let mut teachers = lock_teacher_model_store();
-            teachers
-                .entry(key)
-                .or_insert_with(|| Box::new(TeacherModelRuntime::new(teacher_model)));
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
         }
         self
     }
@@ -1267,30 +1691,36 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 crate::config::LatentReasoningTargetEncoder::EmaTeacher
             ) || self.latent_reasoning.dragon_state.enabled)
         {
-            let key = (self.streaming_runtime_key, TypeId::of::<B>());
             let teacher_model = self
                 .teacher_model
                 .clone()
                 .unwrap_or_else(|| detach_teacher_model(&self.model));
             let teacher_model = detach_teacher_model(&teacher_model);
             self.teacher_model = Some(teacher_model.clone());
-            let mut teachers = lock_teacher_model_store();
-            teachers
-                .entry(key)
-                .or_insert_with(|| Box::new(TeacherModelRuntime::new(teacher_model)));
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
         }
         self
     }
 
     pub fn with_ruliad_supervision(mut self, config: RuliadSupervisionConfig) -> Self {
         if config.verifier_reward.enabled && config.verifier_reward.kl_weight > f32::EPSILON {
-            let key = (self.streaming_runtime_key, TypeId::of::<B>());
             let teacher_model = detach_teacher_model(&self.model);
             self.teacher_model = Some(teacher_model.clone());
-            let mut teachers = lock_teacher_model_store();
-            teachers
-                .entry(key)
-                .or_insert_with(|| Box::new(TeacherModelRuntime::new(teacher_model)));
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
         }
         self.ruliad_supervision = config;
         self
@@ -1298,6 +1728,39 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     pub fn with_ruliad_policy_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
         self.ruliad_policy_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_structured_recovery_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_structured_recovery_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_answer_contract_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_answer_contract_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_structured_contrast_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_structured_contrast_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_field_binding_contrast_telemetry_path(
+        mut self,
+        path: Option<PathBuf>,
+    ) -> Self {
+        self.ruliad_field_binding_contrast_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_generated_attractor_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_generated_attractor_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_verifier_rollout_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_verifier_rollout_telemetry_path = path.map(Arc::new);
         self
     }
 
@@ -1388,13 +1851,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if !self.tbptt_persist_across_steps {
             return self.model.init_state_ephemeral();
         }
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = lock_streaming_state_store();
+        let mut runtime = self
+            .streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned");
         if reset_stream_state {
-            runtime.remove(&key);
+            *runtime = None;
         }
         runtime
-            .remove(&key)
+            .take()
             .and_then(|state| state.downcast::<ModelState<B>>().ok().map(|state| *state))
             .unwrap_or_else(|| self.model.init_state())
     }
@@ -1404,15 +1870,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return;
         }
         state.detach_in_place();
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = lock_streaming_state_store();
-        runtime.insert(key, Box::new(state));
+        *self
+            .streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned") = Some(Box::new(state));
     }
 
     #[cfg(test)]
     fn peek_step_state_for_test(&self) -> Option<ModelState<B>> {
-        lock_streaming_state_store()
-            .get(&(self.streaming_runtime_key, TypeId::of::<B>()))
+        self.streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned")
+            .as_ref()
             .and_then(|state| state.downcast_ref::<ModelState<B>>().cloned())
     }
 
@@ -1557,10 +2028,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     fn current_teacher_model(&self) -> DragonModel<B> {
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let teachers = lock_teacher_model_store();
-        if let Some(runtime) = teachers
-            .get(&key)
+        let runtime = self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned");
+        if let Some(runtime) = runtime
+            .as_ref()
             .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
         {
             return runtime.model.clone();
@@ -1612,18 +2086,22 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if rate <= f32::EPSILON {
             return;
         };
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut teachers = lock_teacher_model_store();
-        let runtime = teachers.entry(key).or_insert_with(|| {
-            Box::new(TeacherModelRuntime::new(
+        let mut runtime = self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned");
+        if runtime.is_none() {
+            *runtime = Some(Box::new(TeacherModelRuntime::new(
                 self.teacher_model
                     .clone()
                     .unwrap_or_else(|| self.model.clone()),
-            ))
-        });
-        let Some(runtime) = runtime.downcast_mut::<TeacherModelRuntime<B>>() else {
-            return;
-        };
+            )));
+        }
+        let runtime = runtime
+            .as_mut()
+            .and_then(|runtime| runtime.downcast_mut::<TeacherModelRuntime<B>>())
+            .expect("teacher runtime backend type must match learner backend");
         runtime.model = ema_blend_model(&runtime.model, &self.model, rate);
         runtime.update_count = runtime.update_count.saturating_add(1);
     }
@@ -1850,9 +2328,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     #[cfg(test)]
     fn teacher_update_count_for_test(&self) -> Option<usize> {
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        lock_teacher_model_store()
-            .get(&key)
+        self.teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned")
+            .as_ref()
             .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
             .map(|runtime| runtime.update_count)
     }
@@ -2694,6 +3174,24 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
     }
 
+    fn ruliad_structured_answer_recovery_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_denoising;
+        if !config.enabled
+            || config.structured_recovery_weight <= f32::EPSILON
+            || config.structured_recovery_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.structured_recovery_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.structured_recovery_every_steps != 0 {
+            return 0.0;
+        }
+        config.structured_recovery_weight
+    }
+
     fn ruliad_answer_denoising_loss(
         &self,
         clean_inputs: Tensor<B, 2, Int>,
@@ -2747,6 +3245,542 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         inputs.mask_where(mask, replacements)
     }
 
+    fn ruliad_answer_contract_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_contract;
+        if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.every_steps != 0 {
+            return 0.0;
+        }
+        config.weight
+    }
+
+    fn ruliad_answer_contract_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_contract;
+        let weight = self.ruliad_answer_contract_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let max_rows = config.max_rows_per_step.max(1);
+        let prompt_schema_max_rows = if config.prompt_schema_max_rows_per_step == 0 {
+            max_rows
+        } else {
+            config.prompt_schema_max_rows_per_step
+        }
+        .max(1);
+
+        #[derive(Clone)]
+        struct ContractRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            premature_close_mask: Vec<f32>,
+        }
+
+        let mut close_token_ids = tokenizer.encode_payload("\n[/R2]");
+        close_token_ids.extend(tokenizer.encode_payload("[/R2]"));
+        close_token_ids.sort_unstable();
+        close_token_ids.dedup();
+        let close_token_ids = close_token_ids
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let premature_close_weight = config.premature_close_unlikelihood_weight;
+        let mut rows = Vec::<ContractRow>::new();
+        let mut sample_groups = 0usize;
+        let mut prompt_schema_sample_groups = 0usize;
+        let mut contract_tokens = 0usize;
+        let mut prompt_schema_value_tokens = 0usize;
+        let mut prompt_schema_rows = 0usize;
+        let mut schema_tokens = 0usize;
+        let mut schema_start_tokens = 0usize;
+        let mut value_tokens = 0usize;
+        let mut other_tokens = 0usize;
+        let mut premature_close_tokens = 0usize;
+        for sample in policy_batch.samples.iter() {
+            if rows.len() >= max_rows {
+                break;
+            }
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            prompt = Self::ruliad_trim_prompt_for_completion(
+                &prompt,
+                oracle_completion.len(),
+                block_size,
+            );
+            let Some((inputs, targets, _default_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(targets.len());
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let schema_start_mask = Self::ruliad_answer_schema_start_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let mut mask = vec![0.0f32; targets.len()];
+            let mut premature_close_mask = vec![0.0f32; targets.len()];
+            let mut active_tokens = 0usize;
+            for completion_index in 0..oracle_completion.len() {
+                let target_index = completion_start.saturating_add(completion_index);
+                if target_index >= mask.len() {
+                    continue;
+                }
+                let schema_token = schema_mask.get(completion_index).copied().unwrap_or(false);
+                let schema_start_token = schema_start_mask
+                    .get(completion_index)
+                    .copied()
+                    .unwrap_or(false);
+                let token_weight = if schema_token {
+                    schema_tokens = schema_tokens.saturating_add(1);
+                    if schema_start_token {
+                        schema_start_tokens = schema_start_tokens.saturating_add(1);
+                        config
+                            .schema_token_weight
+                            .max(config.schema_start_token_weight)
+                    } else {
+                        config.schema_token_weight
+                    }
+                } else if value_mask.get(completion_index).copied().unwrap_or(false) {
+                    value_tokens = value_tokens.saturating_add(1);
+                    config.value_token_weight
+                } else {
+                    other_tokens = other_tokens.saturating_add(1);
+                    config.other_token_weight
+                };
+                if token_weight > f32::EPSILON {
+                    mask[target_index] = token_weight;
+                    active_tokens = active_tokens.saturating_add(1);
+                }
+            }
+            if premature_close_weight > f32::EPSILON && !close_token_ids.is_empty() {
+                let answer_token_len = tokenizer
+                    .encode_payload(sample.item.expected_answer.trim())
+                    .len()
+                    .min(oracle_completion.len());
+                for completion_index in 0..answer_token_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    if let Some(slot) = premature_close_mask.get_mut(target_index)
+                        && *slot <= f32::EPSILON
+                    {
+                        *slot = 1.0;
+                        premature_close_tokens = premature_close_tokens.saturating_add(1);
+                    }
+                }
+            }
+            if active_tokens == 0 {
+                continue;
+            }
+            contract_tokens = contract_tokens.saturating_add(active_tokens);
+            sample_groups = sample_groups.saturating_add(1);
+            rows.push(ContractRow {
+                inputs,
+                targets,
+                mask,
+                premature_close_mask,
+            });
+        }
+        let oracle_rows = rows.len();
+        if config.prompt_schema_value_weight > f32::EPSILON {
+            for sample in policy_batch.samples.iter() {
+                if prompt_schema_rows >= prompt_schema_max_rows {
+                    break;
+                }
+                let prompt = sample.prompt_tokens.clone();
+                if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+                    continue;
+                }
+                let field_rows = Self::ruliad_prompt_schema_value_completion_rows(
+                    &tokenizer,
+                    &prompt,
+                    &sample.item.expected_answer,
+                    completion_budget,
+                    block_size,
+                    prompt_schema_max_rows.saturating_sub(prompt_schema_rows),
+                );
+                let mut sample_row_count = 0usize;
+                for (inputs, targets, mask, active_tokens) in field_rows {
+                    if active_tokens == 0 {
+                        continue;
+                    }
+                    let mask = mask
+                        .into_iter()
+                        .map(|value| {
+                            if value > f32::EPSILON {
+                                config.prompt_schema_value_weight
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let premature_close_mask = vec![0.0f32; targets.len()];
+                    contract_tokens = contract_tokens.saturating_add(active_tokens);
+                    prompt_schema_value_tokens =
+                        prompt_schema_value_tokens.saturating_add(active_tokens);
+                    prompt_schema_rows = prompt_schema_rows.saturating_add(1);
+                    sample_row_count = sample_row_count.saturating_add(1);
+                    rows.push(ContractRow {
+                        inputs,
+                        targets,
+                        mask,
+                        premature_close_mask,
+                    });
+                }
+                prompt_schema_sample_groups =
+                    prompt_schema_sample_groups.saturating_add(usize::from(sample_row_count > 0));
+            }
+        }
+        let skip_reason = rows
+            .is_empty()
+            .then(|| "no_answer_contract_rows".to_string());
+        self.write_ruliad_answer_contract_telemetry(RuliadAnswerContractTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: true,
+            skip_reason,
+            sample_groups,
+            prompt_schema_sample_groups,
+            oracle_rows,
+            prompt_schema_rows,
+            contract_tokens,
+            prompt_schema_value_tokens,
+            schema_tokens,
+            schema_start_tokens,
+            value_tokens,
+            other_tokens,
+            premature_close_tokens,
+            answer_contract_weight: weight,
+            premature_close_unlikelihood_weight: premature_close_weight,
+            max_completion_tokens: completion_budget,
+            max_rows_per_step: max_rows,
+            prompt_schema_max_rows_per_step: prompt_schema_max_rows,
+        });
+        if rows.is_empty() {
+            return None;
+        }
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0.0f32; row_count * max_len];
+        let mut premature_close_mask_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+            premature_close_mask_values[offset..offset + len]
+                .copy_from_slice(&row.premature_close_mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_values, [row_count, max_len]), device);
+        let logits = self.model.forward(inputs);
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs.clone(), targets);
+        let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+        let mut loss = (token_log_probs * mask)
+            .sum()
+            .reshape([1])
+            .div(active)
+            .mul_scalar(-weight);
+        if premature_close_weight > f32::EPSILON
+            && premature_close_tokens > 0
+            && !close_token_ids.is_empty()
+        {
+            let close_mask = Tensor::<B, 2>::from_data(
+                TensorData::new(premature_close_mask_values, [row_count, max_len]),
+                device,
+            );
+            let close_active = close_mask.clone().sum().reshape([1]).clamp_min(1.0);
+            let mut close_loss: Option<Tensor<B, 1>> = None;
+            let close_token_count = close_token_ids.len().max(1) as f32;
+            for close_token_id in close_token_ids {
+                let close_targets = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(
+                        vec![close_token_id; row_count * max_len],
+                        [row_count, max_len],
+                    ),
+                    device,
+                );
+                let token_loss =
+                    unlikelihood_from_log_probs(log_probs.clone(), close_targets, 1.0e-6);
+                let masked = (token_loss * close_mask.clone())
+                    .sum()
+                    .reshape([1])
+                    .div(close_active.clone());
+                close_loss = Some(match close_loss {
+                    Some(accumulated) => accumulated + masked,
+                    None => masked,
+                });
+            }
+            if let Some(close_loss) = close_loss {
+                loss = loss
+                    + close_loss
+                        .div_scalar(close_token_count)
+                        .mul_scalar(premature_close_weight);
+            }
+        }
+        Some(loss)
+    }
+
+    fn ruliad_answer_contract_auxiliary_loss(
+        &self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let contract_weight = self.ruliad_answer_contract_weight();
+        if contract_weight <= f32::EPSILON {
+            return None;
+        }
+        if let Some(policy_batch) = policy_batch {
+            self.ruliad_answer_contract_loss(policy_batch, device, block_size)
+        } else {
+            self.write_ruliad_answer_contract_skip("missing_policy_batch", contract_weight);
+            None
+        }
+    }
+
+    fn ruliad_structured_answer_recovery_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_denoising;
+        let weight = self.ruliad_structured_answer_recovery_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .structured_recovery_max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+
+        #[derive(Clone)]
+        struct RecoveryRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<i64>,
+        }
+
+        let mut rows = Vec::<RecoveryRow>::new();
+        let mut sample_groups = 0usize;
+        let mut field_negative_recovery_rows = 0usize;
+        let mut template_negative_recovery_rows = 0usize;
+        let mut schema_negative_recovery_rows = 0usize;
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            let Some((oracle_inputs, oracle_targets, oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_inputs.len());
+            let mut sample_rows = 0usize;
+            for (negative, negative_kind) in Self::ruliad_structured_negative_answers_with_schema(
+                &sample.item.expected_answer,
+                config.structured_recovery_negative_count,
+                config.structured_recovery_template_negative_count,
+                config.structured_recovery_schema_negative_count,
+            ) {
+                let Some((negative_completion, _negative_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &negative,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let mut corrupted_inputs = oracle_inputs.clone();
+                for (index, value) in corrupted_inputs
+                    .iter_mut()
+                    .enumerate()
+                    .skip(completion_start)
+                {
+                    let negative_index = index - completion_start;
+                    if let Some(negative_token) = negative_completion.get(negative_index) {
+                        *value = *negative_token;
+                    }
+                }
+                rows.push(RecoveryRow {
+                    inputs: corrupted_inputs,
+                    targets: oracle_targets.clone(),
+                    mask: oracle_mask
+                        .iter()
+                        .map(|value| if *value > 0.0 { 1 } else { 0 })
+                        .collect(),
+                });
+                sample_rows = sample_rows.saturating_add(1);
+                match negative_kind {
+                    RuliadStructuredNegativeKind::FieldMutation => {
+                        field_negative_recovery_rows =
+                            field_negative_recovery_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::TemplateCollapse => {
+                        template_negative_recovery_rows =
+                            template_negative_recovery_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::SchemaCollapse => {
+                        schema_negative_recovery_rows =
+                            schema_negative_recovery_rows.saturating_add(1);
+                    }
+                }
+            }
+            if sample_rows > 0 {
+                sample_groups = sample_groups.saturating_add(1);
+            }
+        }
+        self.write_ruliad_structured_recovery_telemetry(RuliadStructuredRecoveryTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: true,
+            skip_reason: None,
+            sample_groups,
+            recovery_rows: rows.len(),
+            field_negative_recovery_rows,
+            template_negative_recovery_rows,
+            schema_negative_recovery_rows,
+            structured_recovery_weight: weight,
+            structured_recovery_max_completion_tokens: completion_budget,
+        });
+        if rows.is_empty() {
+            return None;
+        }
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values, [row_count, max_len]),
+            device,
+        );
+        let hidden = self.model.forward_hidden(inputs);
+        Some(
+            self.language_loss_from_hidden(hidden, targets, Some(mask))
+                .mul_scalar(weight),
+        )
+    }
+
+    fn ruliad_structured_answer_recovery_auxiliary_loss(
+        &self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let recovery_weight = self.ruliad_structured_answer_recovery_weight();
+        if recovery_weight <= f32::EPSILON {
+            return None;
+        }
+        if let Some(policy_batch) = policy_batch {
+            self.ruliad_structured_answer_recovery_loss(policy_batch, device, block_size)
+        } else {
+            self.write_ruliad_structured_recovery_skip("missing_policy_batch", recovery_weight);
+            None
+        }
+    }
+
+    fn write_ruliad_structured_recovery_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_structured_recovery_telemetry(RuliadStructuredRecoveryTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: false,
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            recovery_rows: 0,
+            field_negative_recovery_rows: 0,
+            template_negative_recovery_rows: 0,
+            schema_negative_recovery_rows: 0,
+            structured_recovery_weight: weight,
+            structured_recovery_max_completion_tokens: self
+                .ruliad_supervision
+                .answer_denoising
+                .structured_recovery_max_completion_tokens,
+        });
+    }
+
     fn ruliad_verifier_reward_weight(&self) -> f32 {
         let config = self.ruliad_supervision.verifier_reward;
         if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
@@ -2760,6 +3794,61 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return 0.0;
         }
         config.weight
+    }
+
+    fn ruliad_structured_contrast_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || config.structured_contrast_weight <= f32::EPSILON
+            || config.structured_contrast_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.structured_contrast_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.structured_contrast_every_steps != 0 {
+            return 0.0;
+        }
+        config.structured_contrast_weight
+    }
+
+    fn ruliad_field_binding_contrast_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || config.field_binding_contrast_weight <= f32::EPSILON
+            || config.field_binding_contrast_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.field_binding_contrast_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.field_binding_contrast_every_steps != 0 {
+            return 0.0;
+        }
+        config.field_binding_contrast_weight
+    }
+
+    fn ruliad_verifier_rollout_feedback_active(&self) -> bool {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || (config.rollout_imitation_weight <= f32::EPSILON
+                && config.rollout_recovery_weight <= f32::EPSILON)
+            || config.rollout_imitation_every_steps == 0
+        {
+            return false;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.rollout_imitation_start_after_steps {
+            return false;
+        }
+        if step_index % config.rollout_imitation_every_steps != 0 {
+            return false;
+        }
+        true
     }
 
     fn mix_ruliad_policy_seed(mut value: u64) -> u64 {
@@ -2812,25 +3901,31 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         config: crate::config::train::RuliadVerifierRewardConfig,
     ) {
         const CORRECTNESS_AXES: &[usize] = &[0, 1, 2, 3, 4];
+        const SCHEMA_QUALITY_AXES: &[usize] = &[6];
         const HEALTH_AXES: &[usize] = &[8, 9];
         const COMPACTNESS_AXIS: usize = 5;
         let original = *weights;
         let correctness_floor = config.vpo_correctness_mass_floor.clamp(0.0, 1.0);
+        let schema_floor = config
+            .vpo_schema_quality_mass_floor
+            .clamp(0.0, 1.0 - correctness_floor);
         let health_floor = config
             .vpo_completion_health_mass_floor
-            .clamp(0.0, 1.0 - correctness_floor);
-        let residual_mass = (1.0 - correctness_floor - health_floor).max(0.0);
+            .clamp(0.0, 1.0 - correctness_floor - schema_floor);
+        let residual_mass = (1.0 - correctness_floor - schema_floor - health_floor).max(0.0);
         for (weight, original_weight) in weights.iter_mut().zip(original) {
             *weight = original_weight * residual_mass;
         }
         Self::add_weighted_group_mass(weights, &original, CORRECTNESS_AXES, correctness_floor);
+        Self::add_weighted_group_mass(weights, &original, SCHEMA_QUALITY_AXES, schema_floor);
         Self::add_weighted_group_mass(weights, &original, HEALTH_AXES, health_floor);
         let compactness_max = config.vpo_compactness_max_weight.clamp(0.0, 1.0);
         if weights[COMPACTNESS_AXIS] > compactness_max {
             let excess = weights[COMPACTNESS_AXIS] - compactness_max;
             weights[COMPACTNESS_AXIS] = compactness_max;
-            Self::add_uniform_mass(weights, CORRECTNESS_AXES, excess * 0.75);
-            Self::add_uniform_mass(weights, HEALTH_AXES, excess * 0.25);
+            Self::add_uniform_mass(weights, CORRECTNESS_AXES, excess * 0.60);
+            Self::add_uniform_mass(weights, SCHEMA_QUALITY_AXES, excess * 0.25);
+            Self::add_uniform_mass(weights, HEALTH_AXES, excess * 0.15);
         }
         Self::renormalize_scalarization(weights);
     }
@@ -2936,6 +4031,26 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             && score.partial_progress_ppm >= min_partial_progress_ppm)
     }
 
+    fn ruliad_score_has_rollout_recovery_signal(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        min_partial_progress_ppm: usize,
+        min_completion_quality_ppm: usize,
+    ) -> bool {
+        if score.completion_quality_ppm < min_completion_quality_ppm {
+            return false;
+        }
+        match score.status {
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                score.partial_progress_ppm >= min_partial_progress_ppm
+            }
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => true,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed
+            | burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => true,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+            | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => false,
+        }
+    }
+
     fn ruliad_score_passes_policy_positive_advantage_gate(
         score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
         config: crate::config::train::RuliadVerifierRewardConfig,
@@ -2996,12 +4111,2406 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
     }
 
-    fn ruliad_verifier_policy_loss(
+    fn write_ruliad_answer_contract_telemetry(&self, telemetry: RuliadAnswerContractTelemetry) {
+        let Some(path) = self.ruliad_answer_contract_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_answer_contract_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_answer_contract_telemetry(RuliadAnswerContractTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: false,
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            prompt_schema_sample_groups: 0,
+            oracle_rows: 0,
+            prompt_schema_rows: 0,
+            contract_tokens: 0,
+            prompt_schema_value_tokens: 0,
+            schema_tokens: 0,
+            schema_start_tokens: 0,
+            value_tokens: 0,
+            other_tokens: 0,
+            premature_close_tokens: 0,
+            answer_contract_weight: weight,
+            premature_close_unlikelihood_weight: self
+                .ruliad_supervision
+                .answer_contract
+                .premature_close_unlikelihood_weight,
+            max_completion_tokens: self
+                .ruliad_supervision
+                .answer_contract
+                .max_completion_tokens,
+            max_rows_per_step: self.ruliad_supervision.answer_contract.max_rows_per_step,
+            prompt_schema_max_rows_per_step: {
+                let contract = self.ruliad_supervision.answer_contract;
+                if contract.prompt_schema_max_rows_per_step == 0 {
+                    contract.max_rows_per_step
+                } else {
+                    contract.prompt_schema_max_rows_per_step
+                }
+            },
+        });
+    }
+
+    fn write_ruliad_structured_contrast_telemetry(
+        &self,
+        telemetry: RuliadStructuredContrastTelemetry,
+    ) {
+        let Some(path) = self.ruliad_structured_contrast_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_structured_contrast_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            oracle_completion_rows: 0,
+            field_negative_completion_rows: 0,
+            template_negative_completion_rows: 0,
+            schema_negative_completion_rows: 0,
+            generated_attractor_negative_completion_rows: 0,
+            contrast_pairs: 0,
+            contrast_discriminative_tokens: 0,
+            structured_contrast_weight: weight,
+            structured_contrast_margin: self
+                .ruliad_supervision
+                .verifier_reward
+                .structured_contrast_margin,
+        });
+    }
+
+    fn write_ruliad_field_binding_contrast_telemetry(
+        &self,
+        telemetry: RuliadFieldBindingContrastTelemetry,
+    ) {
+        let Some(path) = self.ruliad_field_binding_contrast_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_field_binding_contrast_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            prompt_pairs: 0,
+            contrast_pairs: 0,
+            candidate_pairs: 0,
+            contrast_discriminative_tokens: 0,
+            negative_pool_size: 0,
+            replay_pool_size: 0,
+            replay_contrast_pairs: 0,
+            generated_attractor_pool_size: 0,
+            generated_attractor_negative_pool_size: 0,
+            generated_attractor_contrast_pairs: 0,
+            rank_metric_pairs: 0,
+            rank_metric_tokens: 0,
+            logit_margin_mean: None,
+            positive_token_fraction: None,
+            margin_satisfied_token_fraction: None,
+            exact_pair_rank_fraction: None,
+            exact_pair_margin_fraction: None,
+            field_binding_contrast_weight: weight,
+            field_binding_contrast_margin: self
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_margin,
+            field_binding_contrast_pair_weight: self
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_pair_weight,
+        });
+    }
+
+    fn write_ruliad_generated_attractor_telemetry(
+        &self,
+        telemetry: RuliadGeneratedAttractorReplayTelemetry,
+    ) {
+        let Some(path) = self.ruliad_generated_attractor_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn ruliad_generated_attractor_summary(&self) -> RuliadGeneratedAttractorReplaySummary {
+        let config = self.ruliad_supervision.verifier_reward;
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|replay| replay.summary(config.generated_attractor_replay_min_count.max(1)))
+            .unwrap_or_default()
+    }
+
+    fn ruliad_generated_attractor_replay_skip_reason(
+        &self,
+        summary: &RuliadGeneratedAttractorReplaySummary,
+        selected_candidate_rows: usize,
+    ) -> Option<String> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0 || selected_candidate_rows > 0 {
+            return None;
+        }
+        summary
+            .diversity_skip_reason(
+                config
+                    .generated_attractor_replay_min_distinct_answers
+                    .max(1),
+                config.generated_attractor_replay_max_dominant_fraction,
+            )
+            .map(str::to_string)
+    }
+
+    fn write_ruliad_structured_recovery_telemetry(
+        &self,
+        telemetry: RuliadStructuredRecoveryTelemetry,
+    ) {
+        let Some(path) = self.ruliad_structured_recovery_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_verifier_rollout_telemetry(
+        &self,
+        telemetry: RuliadVerifierRolloutImitationTelemetry,
+    ) {
+        let Some(path) = self.ruliad_verifier_rollout_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn ruliad_policy_row_from_completion(
+        prompt: &[i64],
+        completion: &[i64],
+    ) -> Option<(Vec<i64>, Vec<i64>, Vec<f32>)> {
+        if completion.is_empty() {
+            return None;
+        }
+        let mut sequence = prompt.to_vec();
+        sequence.extend_from_slice(completion);
+        if sequence.len() < 2 {
+            return None;
+        }
+        let input_len = sequence.len() - 1;
+        let inputs = sequence[..input_len].to_vec();
+        let targets = sequence[1..].to_vec();
+        let mut mask = vec![0.0f32; input_len];
+        let completion_start = prompt.len().saturating_sub(1).min(input_len);
+        for value in mask.iter_mut().skip(completion_start) {
+            *value = 1.0;
+        }
+        Some((inputs, targets, mask))
+    }
+
+    fn ruliad_trim_prompt_for_completion(
+        prompt: &[i64],
+        completion_len: usize,
+        block_size: usize,
+    ) -> Vec<i64> {
+        if prompt.is_empty() {
+            return Vec::new();
+        }
+        let max_prompt_len = block_size.saturating_sub(completion_len.max(1)).max(1);
+        if prompt.len() > max_prompt_len {
+            prompt[prompt.len() - max_prompt_len..].to_vec()
+        } else {
+            prompt.to_vec()
+        }
+    }
+
+    fn ruliad_oracle_completion_tokens(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        sample: &crate::dataset::RuliadPolicySample,
+        completion_budget: usize,
+    ) -> Option<(Vec<i64>, String, bool)> {
+        let answer = sample.item.expected_answer.trim();
+        if answer.is_empty() || completion_budget == 0 {
+            return None;
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut payload_tokens = tokenizer.encode_payload(&full_completion);
+        let truncated = payload_tokens.len() > completion_budget;
+        payload_tokens.truncate(completion_budget);
+        if payload_tokens.is_empty() {
+            return None;
+        }
+        let completion_text = tokenizer.decode_payload(&payload_tokens, true);
+        let completion = payload_tokens
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        Some((completion, completion_text, truncated))
+    }
+
+    fn record_ruliad_generated_attractor(
+        &self,
+        sample: &crate::dataset::RuliadPolicySample,
+        completion_text: &str,
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        step_index: usize,
+    ) -> bool {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0 {
+            return false;
+        }
+        let extracted =
+            burn_dragon_universality::ruliad::extract_ruliad_completion(completion_text);
+        let Some(answer) = extracted.answer.map(|answer| answer.trim().to_string()) else {
+            return false;
+        };
+        if answer.is_empty() || answer == sample.item.expected_answer.trim() {
+            return false;
+        }
+        let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+            return false;
+        };
+        let key = RuliadGeneratedAttractorKey {
+            family: sample.item.family.clone(),
+            task_kind: sample.item.task_kind.clone(),
+            contract,
+            answer,
+        };
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|mut replay| {
+                replay.record(
+                    key,
+                    score.status,
+                    step_index,
+                    config.generated_attractor_replay_capacity,
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn ruliad_generated_attractor_candidates_for_sample(
+        &self,
+        sample: &crate::dataset::RuliadPolicySample,
+    ) -> Vec<RuliadGeneratedAttractorEntry> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0
+            || config.generated_attractor_replay_max_candidates == 0
+        {
+            return Vec::new();
+        }
+        let Some(expected_contract) = Self::ruliad_answer_contract(&sample.item.expected_answer)
+        else {
+            return Vec::new();
+        };
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|replay| {
+                replay.candidates_for(
+                    &sample.item.family,
+                    &sample.item.task_kind,
+                    &expected_contract,
+                    sample.item.expected_answer.trim(),
+                    config.generated_attractor_replay_min_count.max(1),
+                    config.generated_attractor_replay_max_candidates,
+                    config
+                        .generated_attractor_replay_min_distinct_answers
+                        .max(1),
+                    config.generated_attractor_replay_max_dominant_fraction,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn ruliad_structured_negative_answers(answer: &str, count: usize) -> Vec<String> {
+        Self::ruliad_structured_negative_answers_with_templates(answer, count, 0)
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect()
+    }
+
+    fn ruliad_structured_negative_answers_with_templates(
+        answer: &str,
+        mutation_count: usize,
+        template_count: usize,
+    ) -> Vec<(String, RuliadStructuredNegativeKind)> {
+        let answer = answer.trim();
+        if answer.is_empty() || (mutation_count == 0 && template_count == 0) {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return (0..mutation_count.max(1))
+                .map(|_| {
+                    (
+                        format!("{answer}_wrong"),
+                        RuliadStructuredNegativeKind::FieldMutation,
+                    )
+                })
+                .take(mutation_count.max(template_count))
+                .collect();
+        }
+
+        let mut negatives = Vec::with_capacity(mutation_count + template_count);
+        for template in Self::ruliad_template_collapse_negative_answers(answer, &fields) {
+            if negatives.len() >= template_count {
+                break;
+            }
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                template,
+                RuliadStructuredNegativeKind::TemplateCollapse,
+            );
+        }
+
+        for index in 0..mutation_count {
+            let mutate_index = index % fields.len();
+            let mut candidate = fields.clone();
+            let mutated = Self::mutate_ruliad_answer_value(&candidate[mutate_index].1, index + 1);
+            candidate[mutate_index].1 = mutated;
+            let text = candidate
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                text,
+                RuliadStructuredNegativeKind::FieldMutation,
+            );
+        }
+        negatives
+    }
+
+    fn ruliad_structured_negative_answers_with_schema(
+        answer: &str,
+        mutation_count: usize,
+        template_count: usize,
+        schema_count: usize,
+    ) -> Vec<(String, RuliadStructuredNegativeKind)> {
+        let mut negatives = Self::ruliad_structured_negative_answers_with_templates(
+            answer,
+            mutation_count,
+            template_count,
+        );
+        if schema_count == 0 {
+            return negatives;
+        }
+        negatives.reserve(schema_count);
+        for schema_negative in Self::ruliad_schema_collapse_negative_answers(answer)
+            .into_iter()
+            .take(schema_count)
+        {
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                schema_negative,
+                RuliadStructuredNegativeKind::SchemaCollapse,
+            );
+        }
+        negatives
+    }
+
+    fn push_ruliad_negative_answer(
+        negatives: &mut Vec<(String, RuliadStructuredNegativeKind)>,
+        answer: &str,
+        candidate: String,
+        kind: RuliadStructuredNegativeKind,
+    ) {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate == answer {
+            return;
+        }
+        if negatives
+            .iter()
+            .any(|(existing, _existing_kind)| existing == candidate)
+        {
+            return;
+        }
+        negatives.push((candidate.to_string(), kind));
+    }
+
+    fn ruliad_template_collapse_negative_answers(
+        answer: &str,
+        fields: &[(String, String)],
+    ) -> Vec<String> {
+        let has_key = |key: &str| fields.iter().any(|(candidate, _)| candidate == key);
+        let mut templates = Vec::<String>::new();
+        let mut push = |candidate: &str| {
+            if candidate != answer && !templates.iter().any(|existing| existing == candidate) {
+                templates.push(candidate.to_string());
+            }
+        };
+
+        if has_key("ok") && has_key("l") && has_key("r") {
+            push("ok=1;l=5;r=5");
+            push("ok=1;l=1;r=1");
+            push("ok=0;l=0;r=0");
+            push("ok=1;l=0;r=0");
+        } else if has_key("ok") {
+            push("ok=0");
+            push("ok=1");
+        }
+
+        if has_key("acc") {
+            push("acc=0");
+            push("acc=1");
+        }
+
+        if has_key("xlen") && has_key("xalpha") && has_key("xcounts") && has_key("xedge") {
+            push("xlen=13;xalpha=abc;nfcounts=1,1,0;nfedge=ba");
+            push("xlen=1;xalpha=01;xcounts=1,1;xedge=00");
+            push("xlen=10;xalpha=01;xcounts=10,10;xedge=00");
+            push("xlen=21;xalpha=01;xcounts=10,11;xedge=00");
+            push("xlen=64;xalpha=01;xcounts=32,32;xedge=00");
+        }
+
+        if has_key("nflen") && has_key("nfalpha") && has_key("nfcounts") && has_key("nfedge") {
+            push("nflen=5;nfalpha=abc;nfcounts=1,1,0;nfedge=ba");
+            push("nflen=1;nfalpha=01;nfcounts=1,1;nfedge=00");
+            push("nflen=10;nfalpha=01;nfcounts=10,10;nfedge=00");
+            push("nflen=21;nfalpha=01;nfcounts=10,11;nfedge=00");
+            push("nflen=64;nfalpha=01;nfcounts=32,32;nfedge=00");
+        }
+
+        templates
+    }
+
+    fn ruliad_template_collapse_negative_answers_from_answer(answer: &str) -> Vec<String> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return Vec::new();
+        }
+        Self::ruliad_template_collapse_negative_answers(answer, &fields)
+    }
+
+    fn ruliad_schema_collapse_negative_answers(answer: &str) -> Vec<String> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        let keys = fields
+            .iter()
+            .map(|(key, _value)| key.as_str())
+            .collect::<Vec<_>>();
+        let values = fields
+            .iter()
+            .map(|(_key, value)| value.as_str())
+            .collect::<Vec<_>>();
+        let mut negatives = Vec::<String>::new();
+        let mut push = |candidate: String| {
+            if candidate != answer && !negatives.iter().any(|existing| existing == &candidate) {
+                negatives.push(candidate);
+            }
+        };
+        if fields.len() > 1 {
+            push(
+                fields[..fields.len() - 1]
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            );
+            push(format!("{}={}", fields[0].0, fields[0].1));
+        }
+        if keys == ["xlen", "xalpha", "xcounts", "xedge"] && values.len() == 4 {
+            push(format!(
+                "xlen={};nfalpha={};nfcounts={};xedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+            push(format!(
+                "nflen={};nfalpha={};nfcounts={};nfedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+        } else if keys == ["nflen", "nfalpha", "nfcounts", "nfedge"] && values.len() == 4 {
+            push(format!(
+                "nflen={};xalpha={};xcounts={};nfedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+            push(format!(
+                "xlen={};xalpha={};xcounts={};xedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+        } else if keys == ["ok", "l", "r"] && values.len() == 3 {
+            push(format!("ok={}", values[0]));
+        } else if keys == ["ok"] && values.len() == 1 {
+            push(format!("ok={};l=1;r=1", values[0]));
+        }
+        for prototype in Self::ruliad_cross_contract_prototype_negatives(&keys) {
+            push(prototype);
+        }
+        negatives
+    }
+
+    fn ruliad_cross_contract_prototype_negatives(keys: &[&str]) -> Vec<String> {
+        let contract = keys.join(",");
+        let mut prototypes = match contract.as_str() {
+            "xlen,xalpha,xcounts,xedge" | "nflen,nfalpha,nfcounts,nfedge" => {
+                vec!["ok=1;l=1;r=1", "ok=0;l=0;r=0", "acc=1", "acc=0"]
+            }
+            "ok,l,r" | "ok" => vec![
+                "xlen=1;xalpha=01;xcounts=1,0;xedge=00",
+                "nflen=1;nfalpha=ABC;nfcounts=1,0,0;nfedge=AA",
+                "acc=1",
+                "acc=0",
+            ],
+            "acc" => vec![
+                "ok=1;l=1;r=1",
+                "xlen=1;xalpha=01;xcounts=1,0;xedge=00",
+                "nflen=1;nfalpha=ABC;nfcounts=1,0,0;nfedge=AA",
+            ],
+            _ => Vec::new(),
+        };
+        prototypes.drain(..).map(str::to_string).collect::<Vec<_>>()
+    }
+
+    fn mutate_ruliad_answer_value(value: &str, delta: usize) -> String {
+        let delta = delta.max(1) as u64;
+        if value == "0" {
+            return "1".to_string();
+        }
+        if value == "1" {
+            return "0".to_string();
+        }
+        if value.len() > 1 && value.bytes().all(|byte| byte == b'0' || byte == b'1') {
+            let mut bytes = value.as_bytes().to_vec();
+            let index = delta as usize % bytes.len();
+            bytes[index] = if bytes[index] == b'0' { b'1' } else { b'0' };
+            return String::from_utf8(bytes).unwrap_or_else(|_| value.to_string());
+        }
+
+        let mut output = String::with_capacity(value.len() + 4);
+        let bytes = value.as_bytes();
+        let mut index = 0usize;
+        let mut mutated_any = false;
+        while index < bytes.len() {
+            if bytes[index].is_ascii_digit() {
+                let start = index;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+                let text = &value[start..index];
+                let width = text.len();
+                let modulus = 10u64.saturating_pow(width.min(18) as u32).max(2);
+                let parsed = text.parse::<u64>().unwrap_or(0);
+                let mut next = (parsed + delta) % modulus;
+                if next == parsed {
+                    next = (next + 1) % modulus;
+                }
+                output.push_str(&format!("{next:0width$}"));
+                mutated_any = true;
+            } else {
+                output.push(bytes[index] as char);
+                index += 1;
+            }
+        }
+        if mutated_any {
+            output
+        } else {
+            format!("{value}_wrong")
+        }
+    }
+
+    fn ruliad_completion_tokens_from_answer(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_budget: usize,
+    ) -> Option<(Vec<i64>, String)> {
+        if answer.trim().is_empty() || completion_budget == 0 {
+            return None;
+        }
+        let full_completion = format!("{}\n[/R2]", answer.trim());
+        let mut payload_tokens = tokenizer.encode_payload(&full_completion);
+        payload_tokens.truncate(completion_budget);
+        if payload_tokens.is_empty() {
+            return None;
+        }
+        let completion_text = tokenizer.decode_payload(&payload_tokens, true);
+        let completion = payload_tokens
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        Some((completion, completion_text))
+    }
+
+    fn ruliad_answer_value_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut value_start = field_start + eq_offset + 1;
+                while value_start < field_end
+                    && answer.as_bytes()[value_start].is_ascii_whitespace()
+                {
+                    value_start += 1;
+                }
+                let mut value_end = field_end;
+                while value_end > value_start
+                    && answer.as_bytes()[value_end - 1].is_ascii_whitespace()
+                {
+                    value_end -= 1;
+                }
+                if value_start < value_end {
+                    let prefix_tokens = tokenizer
+                        .encode_payload(&full_completion[..value_start])
+                        .len();
+                    let value_tokens = tokenizer
+                        .encode_payload(&full_completion[value_start..value_end])
+                        .len();
+                    for index in prefix_tokens..prefix_tokens.saturating_add(value_tokens) {
+                        if let Some(slot) = mask.get_mut(index) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_key_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut key_start = field_start;
+                while key_start < field_start + eq_offset
+                    && answer.as_bytes()[key_start].is_ascii_whitespace()
+                {
+                    key_start += 1;
+                }
+                let mut key_end = field_start + eq_offset;
+                while key_end > key_start && answer.as_bytes()[key_end - 1].is_ascii_whitespace() {
+                    key_end -= 1;
+                }
+                if key_start < key_end {
+                    let prefix_tokens = tokenizer
+                        .encode_payload(&full_completion[..key_start])
+                        .len();
+                    let key_tokens = tokenizer
+                        .encode_payload(&full_completion[key_start..key_end])
+                        .len();
+                    for index in prefix_tokens..prefix_tokens.saturating_add(key_tokens) {
+                        if let Some(slot) = mask.get_mut(index) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_schema_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        for (byte_index, byte) in bytes.iter().enumerate() {
+            let active = byte.is_ascii_alphabetic() || *byte == b'=' || *byte == b';';
+            if !active {
+                continue;
+            }
+            let prefix_tokens = tokenizer
+                .encode_payload(&full_completion[..byte_index])
+                .len();
+            let token_count = tokenizer
+                .encode_payload(&full_completion[byte_index..byte_index + 1])
+                .len();
+            for index in prefix_tokens..prefix_tokens.saturating_add(token_count) {
+                if let Some(slot) = mask.get_mut(index) {
+                    *slot = true;
+                }
+            }
+        }
+        mask
+    }
+
+    fn ruliad_answer_schema_start_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut key_start = field_start;
+                while key_start < field_start + eq_offset
+                    && answer.as_bytes()[key_start].is_ascii_whitespace()
+                {
+                    key_start += 1;
+                }
+                if key_start < field_start + eq_offset {
+                    let first = answer.as_bytes()[key_start];
+                    if first.is_ascii_alphabetic() || first == b'_' {
+                        let prefix_tokens = tokenizer
+                            .encode_payload(&full_completion[..key_start])
+                            .len();
+                        let token_count = tokenizer
+                            .encode_payload(&full_completion[key_start..key_start + 1])
+                            .len();
+                        for index in prefix_tokens..prefix_tokens.saturating_add(token_count) {
+                            if let Some(slot) = mask.get_mut(index) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_contract(answer: &str) -> Option<String> {
+        let mut keys = Vec::<String>::new();
+        for part in answer.trim().split(';') {
+            let (key, _value) = part.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            keys.push(key.to_string());
+        }
+        (!keys.is_empty()).then(|| keys.join(";"))
+    }
+
+    fn ruliad_answer_fields(answer: &str) -> Option<Vec<(String, String)>> {
+        let mut fields = Vec::<(String, String)>::new();
+        for part in answer.trim().split(';') {
+            let (key, value) = part.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            fields.push((key.to_string(), value.to_string()));
+        }
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    fn ruliad_prompt_schema_value_completion_rows(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        base_prompt: &[i64],
+        answer: &str,
+        completion_budget: usize,
+        block_size: usize,
+        max_rows: usize,
+    ) -> Vec<(Vec<i64>, Vec<i64>, Vec<f32>, usize)> {
+        if base_prompt.is_empty() || completion_budget == 0 || block_size < 4 || max_rows == 0 {
+            return Vec::new();
+        }
+        let Some(fields) = Self::ruliad_answer_fields(answer) else {
+            return Vec::new();
+        };
+        let row_completion_budget = completion_budget.min(block_size.saturating_sub(2).max(1));
+        let mut rows = Vec::<(Vec<i64>, Vec<i64>, Vec<f32>, usize)>::new();
+        let mut prior = String::new();
+        for (index, (key, value)) in fields.iter().enumerate() {
+            if rows.len() >= max_rows {
+                break;
+            }
+            let schema_prefix = format!("{prior}{key}=");
+            let close = if index + 1 == fields.len() {
+                "\n[/R2]"
+            } else {
+                ";"
+            };
+            let mut completion_tokens = tokenizer.encode_payload(&format!("{value}{close}"));
+            completion_tokens.truncate(row_completion_budget);
+            if completion_tokens.is_empty() {
+                prior.push_str(key);
+                prior.push('=');
+                prior.push_str(value);
+                prior.push(';');
+                continue;
+            }
+            let mut schema_prefix_tokens = tokenizer.encode_payload(&schema_prefix);
+            let prefix_budget = block_size
+                .saturating_sub(completion_tokens.len())
+                .saturating_sub(1);
+            if prefix_budget == 0 {
+                prior.push_str(key);
+                prior.push('=');
+                prior.push_str(value);
+                prior.push(';');
+                continue;
+            }
+            if schema_prefix_tokens.len() > prefix_budget {
+                schema_prefix_tokens =
+                    schema_prefix_tokens[schema_prefix_tokens.len() - prefix_budget..].to_vec();
+            }
+            let prompt_budget = block_size
+                .saturating_sub(schema_prefix_tokens.len())
+                .saturating_sub(completion_tokens.len())
+                .max(1);
+            let mut prompt = if base_prompt.len() > prompt_budget {
+                base_prompt[base_prompt.len() - prompt_budget..].to_vec()
+            } else {
+                base_prompt.to_vec()
+            };
+            prompt.extend(schema_prefix_tokens.into_iter().map(i64::from));
+            let completion = completion_tokens
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            if let Some((inputs, targets, mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &completion)
+            {
+                let active_tokens = mask.iter().filter(|value| **value > f32::EPSILON).count();
+                if active_tokens > 0 {
+                    rows.push((inputs, targets, mask, active_tokens));
+                }
+            }
+            prior.push_str(key);
+            prior.push('=');
+            prior.push_str(value);
+            prior.push(';');
+        }
+        rows
+    }
+
+    fn ruliad_field_binding_rank_stats(
+        logit_margin: Tensor<B, 2>,
+        mask_values: &[i64],
+        row_count: usize,
+        max_len: usize,
+        required_margin: f64,
+    ) -> RuliadFieldBindingRankStats {
+        let Ok(margin_values) = logit_margin.to_data().convert::<f32>().into_vec::<f32>() else {
+            return RuliadFieldBindingRankStats::default();
+        };
+        if margin_values.len() != mask_values.len() || mask_values.len() != row_count * max_len {
+            return RuliadFieldBindingRankStats::default();
+        }
+
+        let mut token_count = 0usize;
+        let mut positive_token_count = 0usize;
+        let mut margin_token_count = 0usize;
+        let mut margin_sum = 0.0f64;
+        let mut pair_count = 0usize;
+        let mut exact_pair_rank_count = 0usize;
+        let mut exact_pair_margin_count = 0usize;
+
+        for row_index in 0..row_count {
+            let row_offset = row_index * max_len;
+            let mut row_tokens = 0usize;
+            let mut row_positive = 0usize;
+            let mut row_margin = 0usize;
+            for column in 0..max_len {
+                let index = row_offset + column;
+                if mask_values[index] == 0 {
+                    continue;
+                }
+                let margin = margin_values[index] as f64;
+                if !margin.is_finite() {
+                    continue;
+                }
+                row_tokens = row_tokens.saturating_add(1);
+                token_count = token_count.saturating_add(1);
+                margin_sum += margin;
+                if margin > 0.0 {
+                    row_positive = row_positive.saturating_add(1);
+                    positive_token_count = positive_token_count.saturating_add(1);
+                }
+                if margin >= required_margin {
+                    row_margin = row_margin.saturating_add(1);
+                    margin_token_count = margin_token_count.saturating_add(1);
+                }
+            }
+            if row_tokens > 0 {
+                pair_count = pair_count.saturating_add(1);
+                if row_positive == row_tokens {
+                    exact_pair_rank_count = exact_pair_rank_count.saturating_add(1);
+                }
+                if row_margin == row_tokens {
+                    exact_pair_margin_count = exact_pair_margin_count.saturating_add(1);
+                }
+            }
+        }
+
+        let token_denominator = token_count as f64;
+        let pair_denominator = pair_count as f64;
+        RuliadFieldBindingRankStats {
+            pairs: pair_count,
+            tokens: token_count,
+            logit_margin_mean: (token_count > 0).then_some(margin_sum / token_denominator),
+            positive_token_fraction: (token_count > 0)
+                .then_some(positive_token_count as f64 / token_denominator),
+            margin_satisfied_token_fraction: (token_count > 0)
+                .then_some(margin_token_count as f64 / token_denominator),
+            exact_pair_rank_fraction: (pair_count > 0)
+                .then_some(exact_pair_rank_count as f64 / pair_denominator),
+            exact_pair_margin_fraction: (pair_count > 0)
+                .then_some(exact_pair_margin_count as f64 / pair_denominator),
+        }
+    }
+
+    fn ruliad_field_binding_contrast_loss(
         &self,
         policy_batch: &crate::dataset::RuliadPolicyBatch,
         device: &B::Device,
         block_size: usize,
     ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_field_binding_contrast_weight();
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+
+        #[derive(Clone)]
+        struct EligibleSample {
+            source_index: usize,
+            prompt: Vec<i64>,
+            answer: String,
+            family: String,
+            task_kind: String,
+            contract: String,
+            oracle_completion: Vec<i64>,
+            value_mask: Vec<bool>,
+            schema_mask: Vec<bool>,
+        }
+
+        #[derive(Clone)]
+        struct NegativeSample {
+            current_source_index: Option<usize>,
+            answer: String,
+            family: String,
+            task_kind: String,
+            contract: String,
+            oracle_completion: Vec<i64>,
+            from_replay: bool,
+            from_generated_attractor: bool,
+            schema_negative: bool,
+        }
+
+        #[derive(Clone)]
+        struct ContrastCandidate {
+            oracle_index: usize,
+            negative_index: usize,
+            negative_source_index: Option<usize>,
+            negative_completion: Vec<i64>,
+            discriminative_tokens: usize,
+            from_replay: bool,
+            from_generated_attractor: bool,
+            schema_negative: bool,
+        }
+
+        #[derive(Clone)]
+        struct ContrastRow {
+            inputs: Vec<i64>,
+            oracle_targets: Vec<i64>,
+            negative_targets: Vec<i64>,
+            mask: Vec<i64>,
+            discriminative_tokens: usize,
+            source_index: usize,
+            negative_source_index: Option<usize>,
+            from_replay: bool,
+            from_generated_attractor: bool,
+        }
+
+        let mut eligible = Vec::<EligibleSample>::new();
+        for (source_index, sample) in policy_batch.samples.iter().enumerate() {
+            let answer = sample.item.expected_answer.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            let Some(contract) = Self::ruliad_answer_contract(answer) else {
+                continue;
+            };
+            let prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                answer,
+                oracle_completion.len(),
+            );
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                answer,
+                oracle_completion.len(),
+            );
+            if !value_mask.iter().any(|active| *active) && !schema_mask.iter().any(|active| *active)
+            {
+                continue;
+            }
+            eligible.push(EligibleSample {
+                source_index,
+                prompt,
+                answer: answer.to_string(),
+                family: sample.item.family.clone(),
+                task_kind: sample.item.task_kind.clone(),
+                contract,
+                oracle_completion,
+                value_mask,
+                schema_mask,
+            });
+        }
+
+        let replay_capacity = config.field_binding_contrast_replay_capacity;
+        let replay_snapshot = if replay_capacity > 0 {
+            self.ruliad_field_binding_replay
+                .lock()
+                .map(|replay| replay.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let replay_pool_size = replay_snapshot.len();
+        let mut negative_pool = eligible
+            .iter()
+            .map(|sample| NegativeSample {
+                current_source_index: Some(sample.source_index),
+                answer: sample.answer.clone(),
+                family: sample.family.clone(),
+                task_kind: sample.task_kind.clone(),
+                contract: sample.contract.clone(),
+                oracle_completion: sample.oracle_completion.clone(),
+                from_replay: false,
+                from_generated_attractor: false,
+                schema_negative: false,
+            })
+            .collect::<Vec<_>>();
+        negative_pool.extend(replay_snapshot.into_iter().map(|sample| NegativeSample {
+            current_source_index: None,
+            answer: sample.answer,
+            family: sample.family,
+            task_kind: sample.task_kind,
+            contract: sample.contract,
+            oracle_completion: sample.oracle_completion,
+            from_replay: true,
+            from_generated_attractor: false,
+            schema_negative: false,
+        }));
+        let generated_attractor_snapshot = eligible
+            .iter()
+            .flat_map(|sample| {
+                self.ruliad_generated_attractor_candidates_for_sample(
+                    &policy_batch.samples[sample.source_index],
+                )
+            })
+            .collect::<Vec<_>>();
+        let generated_attractor_pool_size = generated_attractor_snapshot.len();
+        let mut seen_generated_attractors = HashSet::<(String, String, String, String)>::new();
+        for entry in generated_attractor_snapshot {
+            let key = (
+                entry.key.answer.clone(),
+                entry.key.family.clone(),
+                entry.key.task_kind.clone(),
+                entry.key.contract.clone(),
+            );
+            if !seen_generated_attractors.insert(key) {
+                continue;
+            }
+            let Some((oracle_completion, _completion_text)) =
+                Self::ruliad_completion_tokens_from_answer(
+                    &tokenizer,
+                    &entry.key.answer,
+                    completion_budget,
+                )
+            else {
+                continue;
+            };
+            negative_pool.push(NegativeSample {
+                current_source_index: None,
+                answer: entry.key.answer,
+                family: entry.key.family,
+                task_kind: entry.key.task_kind,
+                contract: entry.key.contract,
+                oracle_completion,
+                from_replay: false,
+                from_generated_attractor: true,
+                schema_negative: false,
+            });
+        }
+        let mut seen_template_negatives = HashSet::<(String, String, String, String)>::new();
+        for sample in eligible.iter() {
+            for answer in
+                Self::ruliad_template_collapse_negative_answers_from_answer(&sample.answer)
+            {
+                if answer == sample.answer {
+                    continue;
+                }
+                let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+                    continue;
+                };
+                if contract != sample.contract {
+                    continue;
+                }
+                let key = (
+                    answer.clone(),
+                    sample.family.clone(),
+                    sample.task_kind.clone(),
+                    contract.clone(),
+                );
+                if !seen_template_negatives.insert(key) {
+                    continue;
+                }
+                let Some((oracle_completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                negative_pool.push(NegativeSample {
+                    current_source_index: None,
+                    answer,
+                    family: sample.family.clone(),
+                    task_kind: sample.task_kind.clone(),
+                    contract,
+                    oracle_completion,
+                    from_replay: false,
+                    from_generated_attractor: false,
+                    schema_negative: false,
+                });
+            }
+            for answer in Self::ruliad_schema_collapse_negative_answers(&sample.answer) {
+                if answer == sample.answer {
+                    continue;
+                }
+                let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+                    continue;
+                };
+                let key = (
+                    answer.clone(),
+                    sample.family.clone(),
+                    sample.task_kind.clone(),
+                    contract.clone(),
+                );
+                if !seen_template_negatives.insert(key) {
+                    continue;
+                }
+                let Some((oracle_completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                negative_pool.push(NegativeSample {
+                    current_source_index: None,
+                    answer,
+                    family: sample.family.clone(),
+                    task_kind: sample.task_kind.clone(),
+                    contract,
+                    oracle_completion,
+                    from_replay: false,
+                    from_generated_attractor: false,
+                    schema_negative: true,
+                });
+            }
+        }
+        let generated_attractor_negative_pool_size = negative_pool
+            .iter()
+            .filter(|negative| negative.from_generated_attractor)
+            .count();
+        let negative_pool_size = negative_pool.len();
+
+        let max_pairs = config.field_binding_contrast_max_pairs.max(1);
+        let mut candidates = Vec::<ContrastCandidate>::new();
+        for (oracle_index, oracle) in eligible.iter().enumerate() {
+            for (negative_index, negative) in negative_pool.iter().enumerate() {
+                if negative.current_source_index == Some(oracle.source_index)
+                    || oracle.answer == negative.answer
+                    || oracle.family != negative.family
+                    || oracle.task_kind != negative.task_kind
+                    || (!negative.schema_negative && oracle.contract != negative.contract)
+                {
+                    continue;
+                }
+                let diff_len = oracle
+                    .oracle_completion
+                    .len()
+                    .min(negative.oracle_completion.len());
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let active = if negative.schema_negative {
+                        oracle
+                            .schema_mask
+                            .get(completion_index)
+                            .copied()
+                            .unwrap_or(false)
+                    } else {
+                        oracle
+                            .value_mask
+                            .get(completion_index)
+                            .copied()
+                            .unwrap_or(false)
+                    };
+                    if active
+                        && oracle.oracle_completion[completion_index]
+                            != negative.oracle_completion[completion_index]
+                    {
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                candidates.push(ContrastCandidate {
+                    oracle_index,
+                    negative_index,
+                    negative_source_index: negative.current_source_index,
+                    negative_completion: negative.oracle_completion.clone(),
+                    discriminative_tokens,
+                    from_replay: negative.from_replay,
+                    from_generated_attractor: negative.from_generated_attractor,
+                    schema_negative: negative.schema_negative,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .discriminative_tokens
+                .cmp(&left.discriminative_tokens)
+                .then_with(|| left.from_replay.cmp(&right.from_replay))
+                .then_with(|| left.oracle_index.cmp(&right.oracle_index))
+                .then_with(|| left.negative_index.cmp(&right.negative_index))
+        });
+        let candidate_pairs = candidates.len();
+        let mut rows = Vec::<ContrastRow>::new();
+        for candidate in candidates.into_iter().take(max_pairs) {
+            let oracle = &eligible[candidate.oracle_index];
+            let prompt = Self::ruliad_trim_prompt_for_completion(
+                &oracle.prompt,
+                oracle
+                    .oracle_completion
+                    .len()
+                    .max(candidate.negative_completion.len()),
+                block_size,
+            );
+            let Some((inputs, oracle_targets, _oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle.oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_targets.len());
+            let diff_len = oracle
+                .oracle_completion
+                .len()
+                .min(candidate.negative_completion.len());
+            let mut negative_targets = oracle_targets.clone();
+            let mut mask = vec![0i64; oracle_targets.len()];
+            let mut discriminative_tokens = 0usize;
+            for completion_index in 0..diff_len {
+                let target_index = completion_start.saturating_add(completion_index);
+                let active = if candidate.schema_negative {
+                    oracle
+                        .schema_mask
+                        .get(completion_index)
+                        .copied()
+                        .unwrap_or(false)
+                } else {
+                    oracle
+                        .value_mask
+                        .get(completion_index)
+                        .copied()
+                        .unwrap_or(false)
+                };
+                if active
+                    && target_index < negative_targets.len()
+                    && oracle.oracle_completion[completion_index]
+                        != candidate.negative_completion[completion_index]
+                {
+                    negative_targets[target_index] =
+                        candidate.negative_completion[completion_index];
+                    mask[target_index] = 1;
+                    discriminative_tokens = discriminative_tokens.saturating_add(1);
+                }
+            }
+            if discriminative_tokens == 0 {
+                continue;
+            }
+            rows.push(ContrastRow {
+                inputs,
+                oracle_targets,
+                negative_targets,
+                mask,
+                discriminative_tokens,
+                source_index: oracle.source_index,
+                negative_source_index: candidate.negative_source_index,
+                from_replay: candidate.from_replay,
+                from_generated_attractor: candidate.from_generated_attractor,
+            });
+        }
+
+        if replay_capacity > 0 && !eligible.is_empty() {
+            if let Ok(mut replay) = self.ruliad_field_binding_replay.lock() {
+                for sample in eligible.iter() {
+                    replay.push_back(RuliadFieldBindingReplaySample {
+                        answer: sample.answer.clone(),
+                        family: sample.family.clone(),
+                        task_kind: sample.task_kind.clone(),
+                        contract: sample.contract.clone(),
+                        oracle_completion: sample.oracle_completion.clone(),
+                    });
+                }
+                while replay.len() > replay_capacity {
+                    replay.pop_front();
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            let replay_summary = self.ruliad_generated_attractor_summary();
+            self.write_ruliad_generated_attractor_telemetry(
+                RuliadGeneratedAttractorReplayTelemetry {
+                    version: 1,
+                    step_index,
+                    source: "field_binding".to_string(),
+                    skip_reason: self
+                        .ruliad_generated_attractor_replay_skip_reason(
+                            &replay_summary,
+                            generated_attractor_negative_pool_size,
+                        )
+                        .or_else(|| Some("no_counterfactual_pairs".to_string())),
+                    observed_completion_rows: 0,
+                    recorded_attractor_rows: 0,
+                    selected_candidate_rows: generated_attractor_negative_pool_size,
+                    selected_field_binding_pairs: 0,
+                    replay_pool_size: replay_summary.pool_size,
+                    active_attractor_count: replay_summary.active_count,
+                    active_observation_count: replay_summary.active_observation_count,
+                    distinct_answer_count: replay_summary.distinct_answers,
+                    dominant_answer_count: replay_summary.dominant_count,
+                    dominant_answer_fraction: replay_summary.dominant_fraction(),
+                    min_count: config.generated_attractor_replay_min_count.max(1),
+                    max_candidates: config.generated_attractor_replay_max_candidates,
+                    min_distinct_answers: config
+                        .generated_attractor_replay_min_distinct_answers
+                        .max(1),
+                    max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+                },
+            );
+            self.write_ruliad_field_binding_contrast_telemetry(
+                RuliadFieldBindingContrastTelemetry {
+                    version: 1,
+                    step_index,
+                    skip_reason: Some("no_counterfactual_pairs".to_string()),
+                    sample_groups: eligible.len(),
+                    prompt_pairs: 0,
+                    contrast_pairs: 0,
+                    candidate_pairs,
+                    contrast_discriminative_tokens: 0,
+                    negative_pool_size,
+                    replay_pool_size,
+                    replay_contrast_pairs: 0,
+                    generated_attractor_pool_size,
+                    generated_attractor_negative_pool_size,
+                    generated_attractor_contrast_pairs: 0,
+                    rank_metric_pairs: 0,
+                    rank_metric_tokens: 0,
+                    logit_margin_mean: None,
+                    positive_token_fraction: None,
+                    margin_satisfied_token_fraction: None,
+                    exact_pair_rank_fraction: None,
+                    exact_pair_margin_fraction: None,
+                    field_binding_contrast_weight: weight,
+                    field_binding_contrast_margin: config.field_binding_contrast_margin,
+                    field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
+                },
+            );
+            return None;
+        }
+
+        let mut participating_samples = HashSet::<usize>::new();
+        for row in rows.iter() {
+            participating_samples.insert(row.source_index);
+            if let Some(negative_source_index) = row.negative_source_index {
+                participating_samples.insert(negative_source_index);
+            }
+        }
+        let replay_contrast_pairs = rows.iter().filter(|row| row.from_replay).count();
+        let generated_attractor_contrast_pairs = rows
+            .iter()
+            .filter(|row| row.from_generated_attractor)
+            .count();
+        let contrast_discriminative_tokens = rows
+            .iter()
+            .map(|row| row.discriminative_tokens)
+            .sum::<usize>();
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut oracle_target_values = vec![0i64; row_count * max_len];
+        let mut negative_target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            oracle_target_values[offset..offset + len].copy_from_slice(&row.oracle_targets[..len]);
+            negative_target_values[offset..offset + len]
+                .copy_from_slice(&row.negative_targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let oracle_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(oracle_target_values, [row_count, max_len]),
+            device,
+        );
+        let negative_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(negative_target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values.clone(), [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let oracle_logits = selected_token_logits(logits.clone(), oracle_targets);
+        let negative_logits = selected_token_logits(logits, negative_targets);
+        let logit_margin = oracle_logits.clone() - negative_logits.clone();
+        let contrast_margin = config.field_binding_contrast_margin.max(0.0);
+        let should_collect_rank_metric = config.field_binding_contrast_rank_metric_every_steps > 0
+            && step_index % config.field_binding_contrast_rank_metric_every_steps == 0;
+        let rank_stats = should_collect_rank_metric.then(|| {
+            Self::ruliad_field_binding_rank_stats(
+                logit_margin.clone(),
+                &mask_values,
+                row_count,
+                max_len,
+                contrast_margin as f64,
+            )
+        });
+        self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
+            version: 1,
+            step_index,
+            skip_reason: None,
+            sample_groups: participating_samples.len(),
+            prompt_pairs: row_count,
+            contrast_pairs: row_count,
+            candidate_pairs,
+            contrast_discriminative_tokens,
+            negative_pool_size,
+            replay_pool_size,
+            replay_contrast_pairs,
+            generated_attractor_pool_size,
+            generated_attractor_negative_pool_size,
+            generated_attractor_contrast_pairs,
+            rank_metric_pairs: rank_stats.as_ref().map(|stats| stats.pairs).unwrap_or(0),
+            rank_metric_tokens: rank_stats.as_ref().map(|stats| stats.tokens).unwrap_or(0),
+            logit_margin_mean: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.logit_margin_mean),
+            positive_token_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.positive_token_fraction),
+            margin_satisfied_token_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.margin_satisfied_token_fraction),
+            exact_pair_rank_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.exact_pair_rank_fraction),
+            exact_pair_margin_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.exact_pair_margin_fraction),
+            field_binding_contrast_weight: weight,
+            field_binding_contrast_margin: config.field_binding_contrast_margin,
+            field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
+        });
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index,
+            source: "field_binding".to_string(),
+            skip_reason: self.ruliad_generated_attractor_replay_skip_reason(
+                &replay_summary,
+                generated_attractor_negative_pool_size,
+            ),
+            observed_completion_rows: 0,
+            recorded_attractor_rows: 0,
+            selected_candidate_rows: generated_attractor_negative_pool_size,
+            selected_field_binding_pairs: generated_attractor_contrast_pairs,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
+        let token_loss = masked_token_mean(
+            activation::softplus(
+                negative_logits.clone() - oracle_logits.clone() + contrast_margin,
+                1.0,
+            ),
+            Some(mask.clone()),
+        );
+        let pair_weight = config.field_binding_contrast_pair_weight.max(0.0);
+        let loss = if pair_weight > f32::EPSILON {
+            let mask = mask.float();
+            let active_per_pair = mask.clone().sum_dim(1).reshape([row_count]).clamp_min(1.0);
+            let pair_logit_gap = ((negative_logits - oracle_logits) * mask)
+                .sum_dim(1)
+                .reshape([row_count])
+                .div(active_per_pair);
+            token_loss
+                + activation::softplus(pair_logit_gap + contrast_margin, 1.0)
+                    .mean()
+                    .reshape([1])
+                    .mul_scalar(pair_weight)
+        } else {
+            token_loss
+        };
+        Some(loss.mul_scalar(weight))
+    }
+
+    fn ruliad_structured_answer_contrast_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_structured_contrast_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+
+        #[derive(Clone)]
+        struct ContrastRow {
+            inputs: Vec<i64>,
+            oracle_targets: Vec<i64>,
+            negative_targets: Vec<i64>,
+            mask: Vec<i64>,
+            discriminative_tokens: usize,
+        }
+
+        let mut rows = Vec::<ContrastRow>::new();
+        let mut oracle_completion_rows = 0usize;
+        let mut field_negative_completion_rows = 0usize;
+        let mut template_negative_completion_rows = 0usize;
+        let mut schema_negative_completion_rows = 0usize;
+        let mut generated_attractor_negative_completion_rows = 0usize;
+        let mut sample_groups = 0usize;
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            prompt = Self::ruliad_trim_prompt_for_completion(
+                &prompt,
+                oracle_completion.len(),
+                block_size,
+            );
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            if !value_mask.iter().any(|active| *active) && !schema_mask.iter().any(|active| *active)
+            {
+                continue;
+            }
+            let Some((inputs, oracle_targets, _oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_targets.len());
+            oracle_completion_rows = oracle_completion_rows.saturating_add(1);
+            let mut sample_pair_count = 0usize;
+
+            for (negative, negative_kind) in Self::ruliad_structured_negative_answers_with_schema(
+                &sample.item.expected_answer,
+                config.structured_negative_count,
+                config.structured_template_negative_count,
+                config.structured_schema_negative_count,
+            ) {
+                let Some((completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &negative,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let diff_len = oracle_completion.len().min(completion.len());
+                let mut negative_targets = oracle_targets.clone();
+                let mut mask = vec![0i64; oracle_targets.len()];
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    let active = match negative_kind {
+                        RuliadStructuredNegativeKind::SchemaCollapse => {
+                            schema_mask.get(completion_index).copied().unwrap_or(false)
+                        }
+                        RuliadStructuredNegativeKind::FieldMutation
+                        | RuliadStructuredNegativeKind::TemplateCollapse => {
+                            value_mask.get(completion_index).copied().unwrap_or(false)
+                        }
+                    };
+                    if active
+                        && target_index < negative_targets.len()
+                        && oracle_completion[completion_index] != completion[completion_index]
+                    {
+                        negative_targets[target_index] = completion[completion_index];
+                        mask[target_index] = 1;
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                rows.push(ContrastRow {
+                    inputs: inputs.clone(),
+                    oracle_targets: oracle_targets.clone(),
+                    negative_targets,
+                    mask,
+                    discriminative_tokens,
+                });
+                sample_pair_count = sample_pair_count.saturating_add(1);
+                match negative_kind {
+                    RuliadStructuredNegativeKind::FieldMutation => {
+                        field_negative_completion_rows =
+                            field_negative_completion_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::TemplateCollapse => {
+                        template_negative_completion_rows =
+                            template_negative_completion_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::SchemaCollapse => {
+                        schema_negative_completion_rows =
+                            schema_negative_completion_rows.saturating_add(1);
+                    }
+                }
+            }
+            let expected_contract = Self::ruliad_answer_contract(&sample.item.expected_answer);
+            for entry in self.ruliad_generated_attractor_candidates_for_sample(sample) {
+                let Some((completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &entry.key.answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let schema_negative = expected_contract
+                    .as_ref()
+                    .is_some_and(|contract| contract != &entry.key.contract);
+                let diff_len = oracle_completion.len().min(completion.len());
+                let mut negative_targets = oracle_targets.clone();
+                let mut mask = vec![0i64; oracle_targets.len()];
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    let active = if schema_negative {
+                        schema_mask.get(completion_index).copied().unwrap_or(false)
+                    } else {
+                        value_mask.get(completion_index).copied().unwrap_or(false)
+                    };
+                    if active
+                        && target_index < negative_targets.len()
+                        && oracle_completion[completion_index] != completion[completion_index]
+                    {
+                        negative_targets[target_index] = completion[completion_index];
+                        mask[target_index] = 1;
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                rows.push(ContrastRow {
+                    inputs: inputs.clone(),
+                    oracle_targets: oracle_targets.clone(),
+                    negative_targets,
+                    mask,
+                    discriminative_tokens,
+                });
+                sample_pair_count = sample_pair_count.saturating_add(1);
+                generated_attractor_negative_completion_rows =
+                    generated_attractor_negative_completion_rows.saturating_add(1);
+            }
+            sample_groups = sample_groups.saturating_add(usize::from(sample_pair_count > 0));
+        }
+        if rows.is_empty() {
+            self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+                version: 1,
+                step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+                skip_reason: Some("no_field_value_pairs".to_string()),
+                sample_groups,
+                oracle_completion_rows,
+                field_negative_completion_rows,
+                template_negative_completion_rows,
+                schema_negative_completion_rows,
+                generated_attractor_negative_completion_rows,
+                contrast_pairs: 0,
+                contrast_discriminative_tokens: 0,
+                structured_contrast_weight: weight,
+                structured_contrast_margin: config.structured_contrast_margin,
+            });
+            return None;
+        }
+        let contrast_discriminative_tokens = rows
+            .iter()
+            .map(|row| row.discriminative_tokens)
+            .sum::<usize>();
+        self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: None,
+            sample_groups,
+            oracle_completion_rows,
+            field_negative_completion_rows,
+            template_negative_completion_rows,
+            schema_negative_completion_rows,
+            generated_attractor_negative_completion_rows,
+            contrast_pairs: rows.len(),
+            contrast_discriminative_tokens,
+            structured_contrast_weight: weight,
+            structured_contrast_margin: config.structured_contrast_margin,
+        });
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut oracle_target_values = vec![0i64; row_count * max_len];
+        let mut negative_target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            oracle_target_values[offset..offset + len].copy_from_slice(&row.oracle_targets[..len]);
+            negative_target_values[offset..offset + len]
+                .copy_from_slice(&row.negative_targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let oracle_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(oracle_target_values, [row_count, max_len]),
+            device,
+        );
+        let negative_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(negative_target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let oracle_logits = selected_token_logits(logits.clone(), oracle_targets);
+        let negative_logits = selected_token_logits(logits, negative_targets);
+        Some(
+            masked_token_mean(
+                activation::softplus(
+                    negative_logits - oracle_logits + config.structured_contrast_margin.max(0.0),
+                    1.0,
+                ),
+                Some(mask),
+            )
+            .mul_scalar(weight),
+        )
+    }
+
+    fn ruliad_verifier_rollout_imitation_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !self.ruliad_verifier_rollout_feedback_active()
+            || policy_batch.samples.is_empty()
+            || self.pipeline_enabled()
+        {
+            return None;
+        }
+        let imitation_weight = config.rollout_imitation_weight.max(0.0);
+        let recovery_weight = config.rollout_recovery_weight.max(0.0);
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+        let max_rows = config.rollout_imitation_max_rows_per_step.max(1);
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum RolloutFeedbackKind {
+            Imitation,
+            Recovery,
+        }
+
+        #[derive(Clone)]
+        struct RolloutFeedbackRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            weight: f32,
+            kind: RolloutFeedbackKind,
+        }
+
+        let mut rows = Vec::<RolloutFeedbackRow>::new();
+        let mut sample_groups = 0usize;
+        let mut generated_completion_rows = 0usize;
+        let mut recorded_attractor_rows = 0usize;
+        let mut verifier_match_rows = 0usize;
+        let mut semantic_match_rows = 0usize;
+        let mut partial_rows = 0usize;
+        let mut schema_wrong_rows = 0usize;
+        let mut malformed_rows = 0usize;
+        let mut missing_rows = 0usize;
+        let mut recovery_partial_rows = 0usize;
+        let mut recovery_schema_wrong_rows = 0usize;
+        let mut recovery_malformed_rows = 0usize;
+        let mut recovery_missing_rows = 0usize;
+        let mut field_accuracy_sum = 0.0f64;
+        let mut partial_progress_sum = 0.0f64;
+        let mut completion_quality_sum = 0.0f64;
+
+        'samples: for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let oracle_row = if recovery_weight > f32::EPSILON {
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+                    .and_then(|(oracle_completion, _oracle_text, _truncated)| {
+                        Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+                    })
+            } else {
+                None
+            };
+            let mut generated_for_sample = 0usize;
+            for group_index in 0..config.group_size.max(1) {
+                if rows.len() >= max_rows {
+                    break 'samples;
+                }
+                let rollout_seed = Self::mix_ruliad_policy_seed(
+                    (step_index as u64).rotate_left(17)
+                        ^ (sample.item.sample_index as u64).rotate_left(7)
+                        ^ group_index as u64,
+                );
+                let generated = crate::generation::generate_tokens_seeded(
+                    &self.model,
+                    prompt.clone(),
+                    device,
+                    crate::generation::GenerationSettings {
+                        max_new_tokens: Some(completion_budget),
+                        temperature: config.temperature,
+                        top_k: Some(config.top_k),
+                        strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: policy_batch.stop_token_id,
+                    },
+                    rollout_seed,
+                    None,
+                )
+                .ok()?;
+                if generated.len() <= prompt.len() {
+                    continue;
+                }
+                let completion = generated[prompt.len()..].to_vec();
+                if completion.is_empty() {
+                    continue;
+                }
+                let completion_tokens = completion
+                    .iter()
+                    .filter_map(|token| u32::try_from(*token).ok())
+                    .collect::<Vec<_>>();
+                let completion_text = tokenizer.decode_payload(&completion_tokens, true);
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                generated_completion_rows = generated_completion_rows.saturating_add(1);
+                recorded_attractor_rows = recorded_attractor_rows.saturating_add(usize::from(
+                    self.record_ruliad_generated_attractor(
+                        sample,
+                        &completion_text,
+                        &score,
+                        step_index,
+                    ),
+                ));
+                generated_for_sample = generated_for_sample.saturating_add(1);
+                match score.status {
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch => {
+                        verifier_match_rows = verifier_match_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => {
+                        semantic_match_rows = semantic_match_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                        partial_rows = partial_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => {
+                        schema_wrong_rows = schema_wrong_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed => {
+                        malformed_rows = malformed_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => {
+                        missing_rows = missing_rows.saturating_add(1)
+                    }
+                }
+                let field_accuracy = if score.expected_field_count == 0 {
+                    0.0
+                } else {
+                    score.correct_field_count as f64 / score.expected_field_count as f64
+                };
+                field_accuracy_sum += field_accuracy;
+                partial_progress_sum += score.partial_progress_ppm as f64 / 1_000_000.0;
+                completion_quality_sum += score.completion_quality_ppm as f64 / 1_000_000.0;
+                let has_imitation_signal = Self::ruliad_score_has_policy_correctness_signal(
+                    &score,
+                    config.rollout_imitation_min_partial_progress_ppm,
+                    config.rollout_imitation_min_completion_quality_ppm,
+                );
+                let has_recovery_signal = Self::ruliad_score_has_rollout_recovery_signal(
+                    &score,
+                    config.rollout_imitation_min_partial_progress_ppm,
+                    config.rollout_imitation_min_completion_quality_ppm,
+                );
+                if !has_imitation_signal && !has_recovery_signal {
+                    continue;
+                }
+                let is_correct = matches!(
+                    score.status,
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                        | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch
+                );
+                if imitation_weight > f32::EPSILON
+                    && let Some((inputs, targets, mask)) =
+                        Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                {
+                    rows.push(RolloutFeedbackRow {
+                        inputs,
+                        targets,
+                        mask,
+                        weight: imitation_weight,
+                        kind: RolloutFeedbackKind::Imitation,
+                    });
+                }
+                if recovery_weight > f32::EPSILON
+                    && !is_correct
+                    && has_recovery_signal
+                    && let Some((oracle_inputs, oracle_targets, oracle_mask)) = oracle_row.as_ref()
+                {
+                    let completion_start = prompt.len().saturating_sub(1).min(oracle_inputs.len());
+                    let mut corrupted_inputs = oracle_inputs.clone();
+                    for (index, value) in corrupted_inputs
+                        .iter_mut()
+                        .enumerate()
+                        .skip(completion_start)
+                    {
+                        let completion_index = index - completion_start;
+                        if let Some(generated_token) = completion.get(completion_index) {
+                            *value = *generated_token;
+                        }
+                    }
+                    rows.push(RolloutFeedbackRow {
+                        inputs: corrupted_inputs,
+                        targets: oracle_targets.clone(),
+                        mask: oracle_mask.clone(),
+                        weight: recovery_weight,
+                        kind: RolloutFeedbackKind::Recovery,
+                    });
+                    match score.status {
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                            recovery_partial_rows = recovery_partial_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => {
+                            recovery_schema_wrong_rows =
+                                recovery_schema_wrong_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed => {
+                            recovery_malformed_rows = recovery_malformed_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => {
+                            recovery_missing_rows = recovery_missing_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                        | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => {}
+                    }
+                }
+            }
+            sample_groups += usize::from(generated_for_sample > 0);
+        }
+
+        let rate_ppm = |count: usize| -> usize {
+            if generated_completion_rows == 0 {
+                0
+            } else {
+                count.saturating_mul(1_000_000) / generated_completion_rows
+            }
+        };
+        let verifier_rate_ppm = rate_ppm(verifier_match_rows.saturating_add(semantic_match_rows));
+        let schema_wrong_rate_ppm = rate_ppm(schema_wrong_rows);
+        let malformed_rate_ppm = rate_ppm(malformed_rows);
+        let candidate_completion_rows = rows.len();
+        let health_gate_passed = generated_completion_rows > 0
+            && verifier_rate_ppm >= config.rollout_imitation_min_verifier_rate_ppm
+            && schema_wrong_rate_ppm <= config.rollout_imitation_max_schema_wrong_rate_ppm
+            && malformed_rate_ppm <= config.rollout_imitation_max_malformed_rate_ppm;
+        if !health_gate_passed {
+            rows.retain(|row| row.kind == RolloutFeedbackKind::Recovery);
+        }
+        let accepted_imitation_rows = rows
+            .iter()
+            .filter(|row| row.kind == RolloutFeedbackKind::Imitation)
+            .count();
+        let accepted_recovery_rows = rows
+            .iter()
+            .filter(|row| row.kind == RolloutFeedbackKind::Recovery)
+            .count();
+        let skip_reason = if generated_completion_rows == 0 {
+            Some("no_generated_completion".to_string())
+        } else if candidate_completion_rows == 0 {
+            Some("no_candidate_completion".to_string())
+        } else if rows.is_empty() && !health_gate_passed {
+            Some("rollout_health_gate".to_string())
+        } else if rows.is_empty() {
+            Some("no_accepted_completion".to_string())
+        } else {
+            None
+        };
+
+        let denominator = generated_completion_rows.max(1) as f64;
+        self.write_ruliad_verifier_rollout_telemetry(RuliadVerifierRolloutImitationTelemetry {
+            version: 1,
+            step_index,
+            skip_reason,
+            sample_groups,
+            generated_completion_rows,
+            candidate_completion_rows,
+            accepted_completion_rows: rows.len(),
+            accepted_imitation_rows,
+            accepted_recovery_rows,
+            health_gate_passed,
+            verifier_rate_ppm,
+            schema_wrong_rate_ppm,
+            malformed_rate_ppm,
+            verifier_match_rows,
+            semantic_match_rows,
+            partial_rows,
+            schema_wrong_rows,
+            malformed_rows,
+            missing_rows,
+            recovery_partial_rows,
+            recovery_schema_wrong_rows,
+            recovery_malformed_rows,
+            recovery_missing_rows,
+            field_accuracy_mean: field_accuracy_sum / denominator,
+            partial_progress_mean: partial_progress_sum / denominator,
+            completion_quality_mean: completion_quality_sum / denominator,
+            rollout_imitation_weight: imitation_weight,
+            rollout_recovery_weight: recovery_weight,
+            max_completion_tokens: completion_budget,
+        });
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index,
+            source: "rollout".to_string(),
+            skip_reason: (generated_completion_rows == 0).then(|| "no_generated_rows".to_string()),
+            observed_completion_rows: generated_completion_rows,
+            recorded_attractor_rows,
+            selected_candidate_rows: 0,
+            selected_field_binding_pairs: 0,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
+
+        if rows.is_empty() {
+            return None;
+        }
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut active_mask_values = vec![0.0f32; row_count * max_len];
+        let mut weighted_mask_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            for (mask_index, value) in row.mask.iter().copied().take(len).enumerate() {
+                active_mask_values[offset + mask_index] = value;
+                weighted_mask_values[offset + mask_index] = value * row.weight;
+            }
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let active_mask = Tensor::<B, 2>::from_data(
+            TensorData::new(active_mask_values, [row_count, max_len]),
+            device,
+        );
+        let weighted_mask = Tensor::<B, 2>::from_data(
+            TensorData::new(weighted_mask_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs, targets);
+        let active = active_mask.sum().reshape([1]).clamp_min(1.0);
+        Some(
+            (token_log_probs * weighted_mask)
+                .sum()
+                .reshape([1])
+                .div(active)
+                .mul_scalar(-1.0),
+        )
+    }
+
+    fn ruliad_verifier_policy_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>>
+    where
+        B: AutodiffBackend,
+    {
         let config = self.ruliad_supervision.verifier_reward;
         let weight = self.ruliad_verifier_reward_weight();
         if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
@@ -3032,6 +6541,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             config.mode,
             self.gradient_scale_step.load(Ordering::Relaxed),
         );
+        let mut observed_generated_rows = 0usize;
+        let mut recorded_attractor_rows = 0usize;
+        let sampling_model = self.model.valid();
         for sample in policy_batch.samples.iter() {
             let mut prompt = sample.prompt_tokens.clone();
             if prompt.is_empty() {
@@ -3040,11 +6552,98 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             if prompt.len() > prompt_budget {
                 prompt = prompt[prompt.len() - prompt_budget..].to_vec();
             }
-            let mut group_rows = Vec::with_capacity(group_size);
-            let mut scores = Vec::with_capacity(group_size);
+            let configured_structured_negatives = if config.include_structured_negative_candidates {
+                config
+                    .structured_negative_count
+                    .saturating_add(config.structured_template_negative_count)
+                    .saturating_add(config.structured_schema_negative_count)
+            } else {
+                0
+            };
+            let generated_attractor_candidates =
+                self.ruliad_generated_attractor_candidates_for_sample(sample);
+            let mut group_rows = Vec::with_capacity(
+                group_size
+                    + usize::from(config.include_oracle_candidate)
+                    + configured_structured_negatives
+                    + generated_attractor_candidates.len(),
+            );
+            let mut scores = Vec::with_capacity(
+                group_size
+                    + usize::from(config.include_oracle_candidate)
+                    + configured_structured_negatives
+                    + generated_attractor_candidates.len(),
+            );
+            if config.include_oracle_candidate
+                && let Some((oracle_completion, oracle_completion_text, oracle_truncated)) =
+                    Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+                && let Some(row) =
+                    Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            {
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&oracle_completion_text),
+                );
+                telemetry.record_oracle_candidate(oracle_truncated);
+                scores.push(score);
+                group_rows.push(row);
+            }
+            if config.include_structured_negative_candidates {
+                for (negative, _negative_kind) in
+                    Self::ruliad_structured_negative_answers_with_schema(
+                        &sample.item.expected_answer,
+                        config.structured_negative_count,
+                        config.structured_template_negative_count,
+                        config.structured_schema_negative_count,
+                    )
+                {
+                    let Some((completion, completion_text)) =
+                        Self::ruliad_completion_tokens_from_answer(
+                            &tokenizer,
+                            &negative,
+                            completion_budget,
+                        )
+                    else {
+                        continue;
+                    };
+                    let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                    else {
+                        continue;
+                    };
+                    let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                        &sample.item,
+                        Some(&completion_text),
+                    );
+                    telemetry.record_structured_negative_candidate();
+                    scores.push(score);
+                    group_rows.push(row);
+                }
+            }
+            for entry in generated_attractor_candidates {
+                let Some((completion, completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &entry.key.answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                else {
+                    continue;
+                };
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                telemetry.record_generated_attractor_candidate();
+                scores.push(score);
+                group_rows.push(row);
+            }
             for _ in 0..group_size {
                 let generated = crate::generation::generate_tokens(
-                    &self.model,
+                    &sampling_model,
                     prompt.clone(),
                     device,
                     crate::generation::GenerationSettings {
@@ -3073,22 +6672,19 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     &sample.item,
                     Some(&completion_text),
                 );
+                observed_generated_rows = observed_generated_rows.saturating_add(1);
+                recorded_attractor_rows = recorded_attractor_rows.saturating_add(usize::from(
+                    self.record_ruliad_generated_attractor(
+                        sample,
+                        &completion_text,
+                        &score,
+                        telemetry.step_index,
+                    ),
+                ));
                 scores.push(score);
-
-                let mut sequence = prompt.clone();
-                sequence.extend_from_slice(&completion);
-                if sequence.len() < 2 {
-                    continue;
+                if let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion) {
+                    group_rows.push(row);
                 }
-                let input_len = sequence.len() - 1;
-                let inputs = sequence[..input_len].to_vec();
-                let targets = sequence[1..].to_vec();
-                let mut mask = vec![0.0f32; input_len];
-                let completion_start = prompt.len().saturating_sub(1).min(input_len);
-                for value in mask.iter_mut().skip(completion_start) {
-                    *value = 1.0;
-                }
-                group_rows.push((inputs, targets, mask));
             }
             if group_rows.is_empty() || scores.len() != group_rows.len() {
                 continue;
@@ -3135,6 +6731,36 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 },
             ));
         }
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index: telemetry.step_index,
+            source: "policy".to_string(),
+            skip_reason: (observed_generated_rows == 0)
+                .then(|| "no_generated_rows".to_string())
+                .or_else(|| {
+                    self.ruliad_generated_attractor_replay_skip_reason(
+                        &replay_summary,
+                        telemetry.generated_attractor_completion_rows,
+                    )
+                }),
+            observed_completion_rows: observed_generated_rows,
+            recorded_attractor_rows,
+            selected_candidate_rows: telemetry.generated_attractor_completion_rows,
+            selected_field_binding_pairs: 0,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
         if rows.is_empty() {
             if telemetry.has_observations() {
                 telemetry.mark_skipped("positive_advantage_gate");
@@ -5405,6 +9031,61 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     predictive_coding_step_report.record();
                 }
 
+                if let Some(contract_loss) = self.ruliad_answer_contract_auxiliary_loss(
+                    ruliad_policy_batch.as_deref(),
+                    &targets.device(),
+                    block_size,
+                ) {
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + contract_loss.clone().detach(),
+                        None => contract_loss.clone().detach(),
+                    });
+                    let contract_grads = contract_loss.backward();
+                    accumulator.accumulate(self, GradientsParams::from_grads(contract_grads, self));
+                }
+
+                if let Some(recovery_loss) = self.ruliad_structured_answer_recovery_auxiliary_loss(
+                    ruliad_policy_batch.as_deref(),
+                    &targets.device(),
+                    block_size,
+                ) {
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + recovery_loss.clone().detach(),
+                        None => recovery_loss.clone().detach(),
+                    });
+                    let recovery_grads = recovery_loss.backward();
+                    accumulator.accumulate(self, GradientsParams::from_grads(recovery_grads, self));
+                }
+
+                let field_binding_weight = self.ruliad_field_binding_contrast_weight();
+                if field_binding_weight > f32::EPSILON {
+                    let field_binding_loss =
+                        if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                            self.ruliad_field_binding_contrast_loss(
+                                policy_batch,
+                                &targets.device(),
+                                block_size,
+                            )
+                        } else {
+                            self.write_ruliad_field_binding_contrast_skip(
+                                "missing_policy_batch",
+                                field_binding_weight,
+                            );
+                            None
+                        };
+                    if let Some(field_binding_loss) = field_binding_loss {
+                        total_loss = Some(match total_loss {
+                            Some(accumulated) => accumulated + field_binding_loss.clone().detach(),
+                            None => field_binding_loss.clone().detach(),
+                        });
+                        let field_binding_grads = field_binding_loss.backward();
+                        accumulator.accumulate(
+                            self,
+                            GradientsParams::from_grads(field_binding_grads, self),
+                        );
+                    }
+                }
+
                 self.store_step_state(step_state);
 
                 let step_memory_after_forward = step_device
@@ -5560,6 +9241,76 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             self.greedy_rollout_unlikelihood_loss(clean_inputs_for_aux)
         {
             loss + rollout_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(contract_loss) = self.ruliad_answer_contract_auxiliary_loss(
+            ruliad_policy_batch.as_deref(),
+            &targets.device(),
+            block_size,
+        ) {
+            loss + contract_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(recovery_loss) = self
+            .ruliad_structured_answer_recovery_auxiliary_loss(
+                ruliad_policy_batch.as_deref(),
+                &targets.device(),
+                block_size,
+            ) {
+            loss + recovery_loss
+        } else {
+            loss
+        };
+        let contrast_weight = self.ruliad_structured_contrast_weight();
+        let loss = if contrast_weight > f32::EPSILON {
+            if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                if let Some(contrast_loss) = self.ruliad_structured_answer_contrast_loss(
+                    policy_batch,
+                    &targets.device(),
+                    block_size,
+                ) {
+                    loss + contrast_loss
+                } else {
+                    loss
+                }
+            } else {
+                self.write_ruliad_structured_contrast_skip("missing_policy_batch", contrast_weight);
+                loss
+            }
+        } else {
+            loss
+        };
+        let field_binding_weight = self.ruliad_field_binding_contrast_weight();
+        let loss = if field_binding_weight > f32::EPSILON {
+            if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                if let Some(field_binding_loss) = self.ruliad_field_binding_contrast_loss(
+                    policy_batch,
+                    &targets.device(),
+                    block_size,
+                ) {
+                    loss + field_binding_loss
+                } else {
+                    loss
+                }
+            } else {
+                self.write_ruliad_field_binding_contrast_skip(
+                    "missing_policy_batch",
+                    field_binding_weight,
+                );
+                loss
+            }
+        } else {
+            loss
+        };
+        let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
+            && let Some(rollout_imitation_loss) = self.ruliad_verifier_rollout_imitation_loss(
+                policy_batch,
+                &targets.device(),
+                block_size,
+            ) {
+            loss + rollout_imitation_loss
         } else {
             loss
         };
@@ -6486,6 +10237,69 @@ mod objective_step_tests {
         }
     }
 
+    #[test]
+    fn streaming_state_is_pipeline_owned_and_clone_shared() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model_a = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_persist_across_steps(true);
+        let model_b = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_persist_across_steps(true);
+        let mut state = model_a.model.init_state();
+        state.position = 17;
+        model_a.store_step_state(state);
+
+        assert_eq!(
+            model_a
+                .peek_step_state_for_test()
+                .expect("model a state")
+                .position,
+            17
+        );
+        assert!(
+            model_b.peek_step_state_for_test().is_none(),
+            "independent pipelines must not share recurrent state"
+        );
+        let cloned = model_a.clone();
+        assert_eq!(
+            cloned
+                .peek_step_state_for_test()
+                .expect("cloned learner state")
+                .position,
+            17,
+            "Burn learner clones must retain the same pipeline runtime cell"
+        );
+        assert_eq!(model_a.load_step_state(true).position, 0);
+        assert!(model_a.peek_step_state_for_test().is_none());
+    }
+
+    fn ruliad_test_score(
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        partial_progress_ppm: usize,
+        completion_quality_ppm: usize,
+    ) -> burn_dragon_universality::ruliad::RuliadReasoningScore {
+        burn_dragon_universality::ruliad::RuliadReasoningScore {
+            version: 1,
+            status,
+            correct_field_count: 0,
+            expected_field_count: 1,
+            observed_field_count: 0,
+            partial_progress_ppm,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: 0,
+            certificate_prefix_ppm: 0,
+            generated_token_count: 8,
+            hash_canary: false,
+            answer_terminated: true,
+            completion_quality_ppm,
+        }
+    }
+
     fn tiny_factorized_model_config() -> DragonConfig {
         let mut config = tiny_model_config();
         config.vocab_size = 32;
@@ -7043,6 +10857,7 @@ mod objective_step_tests {
                     weight: 1.0,
                     probability: 1.0,
                     corrupt_offset: 1,
+                    ..Default::default()
                 },
             )
             .to_data()
@@ -7067,6 +10882,7 @@ mod objective_step_tests {
                 weight: 0.5,
                 probability: 1.0,
                 corrupt_offset: 1,
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -7089,6 +10905,344 @@ mod objective_step_tests {
         );
         assert!(loss.is_finite(), "denoising loss should be finite: {loss}");
         assert!(loss > 0.0, "denoising loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_recovery_loss_trains_oracle_after_wrong_prefix() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 2,
+                    structured_recovery_start_after_steps: 4,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 1,
+                    structured_recovery_template_negative_count: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "trajectory_category".to_string(),
+            task_kind: "eca_summary".to_string(),
+            math_domains: vec!["category".to_string(), "finite_state".to_string()],
+            reasoning_modes: vec!["symbolic_execution".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=44;xalpha=01;xcounts=20,24;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "structured recovery should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "structured recovery should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+            .expect("structured answer recovery loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "recovery loss should be finite: {loss}");
+        assert!(loss > 0.0, "recovery loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_recovery_loss_writes_activity_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 31);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 1,
+                    structured_recovery_start_after_steps: 0,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 2,
+                    structured_recovery_template_negative_count: 2,
+                    structured_recovery_schema_negative_count: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 44,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+            .expect("structured answer recovery loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "recovery loss should be finite: {loss}");
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["sample_groups"].as_u64(), Some(1));
+        assert_eq!(event["field_negative_recovery_rows"].as_u64(), Some(2));
+        assert_eq!(event["template_negative_recovery_rows"].as_u64(), Some(2));
+        let schema_rows = event["schema_negative_recovery_rows"]
+            .as_u64()
+            .expect("schema recovery rows");
+        assert!(
+            schema_rows > 0,
+            "schema-collapse recovery rows should be present: {event}"
+        );
+        assert_eq!(
+            event["recovery_rows"].as_u64(),
+            Some(4 + schema_rows),
+            "recovery rows should include field, template, and schema negatives"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_contract_loss_trains_full_oracle_contract_and_respects_cadence() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 41);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_contract: crate::config::train::RuliadAnswerContractConfig {
+                    enabled: true,
+                    weight: 0.25,
+                    premature_close_unlikelihood_weight: 0.5,
+                    every_steps: 2,
+                    start_after_steps: 4,
+                    max_completion_tokens: 24,
+                    max_rows_per_step: 1,
+                    prompt_schema_max_rows_per_step: 0,
+                    schema_token_weight: 2.0,
+                    schema_start_token_weight: 8.0,
+                    value_token_weight: 1.0,
+                    other_token_weight: 1.0,
+                    prompt_schema_value_weight: 0.0,
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 46,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "answer contract loss should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "answer contract loss should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+            .expect("answer contract loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contract loss should be finite: {loss}");
+        assert!(loss > 0.0, "contract loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_answer_contract_loss_writes_activity_telemetry_and_caps_rows() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 43);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_answer_contract.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_contract: crate::config::train::RuliadAnswerContractConfig {
+                    enabled: true,
+                    weight: 0.25,
+                    premature_close_unlikelihood_weight: 0.5,
+                    every_steps: 1,
+                    start_after_steps: 0,
+                    max_completion_tokens: 24,
+                    max_rows_per_step: 1,
+                    prompt_schema_max_rows_per_step: 1,
+                    schema_token_weight: 2.0,
+                    schema_start_token_weight: 8.0,
+                    value_token_weight: 1.0,
+                    other_token_weight: 1.0,
+                    prompt_schema_value_weight: 2.0,
+                },
+                ..Default::default()
+            })
+            .with_ruliad_answer_contract_telemetry_path(Some(telemetry_path.clone()));
+        let make_item = |sample_index, answer: &str| burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: format!("h{sample_index}"),
+            sample_index,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: answer.to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(47, "ok=1;l=17;r=17"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(48, "nflen=3;nfalpha=ABC;nfcounts=1,1,1;nfedge=AB"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+            .expect("answer contract loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contract loss should be finite: {loss}");
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("contract telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(true));
+        assert_eq!(event["oracle_rows"].as_u64(), Some(1));
+        assert!(
+            event["sample_groups"].as_u64().unwrap_or_default() >= 1,
+            "contract objective should report active sample groups: {event}"
+        );
+        assert!(
+            event["prompt_schema_sample_groups"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "contract objective should report active prompt-schema sample groups: {event}"
+        );
+        assert_eq!(event["prompt_schema_rows"].as_u64(), Some(1));
+        assert_eq!(event["prompt_schema_max_rows_per_step"].as_u64(), Some(1));
+        assert!(
+            event["schema_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should supervise schema tokens: {event}"
+        );
+        assert!(
+            event["schema_start_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should identify schema-start tokens: {event}"
+        );
+        assert!(
+            event["value_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should supervise value tokens: {event}"
+        );
+        assert!(
+            event["prompt_schema_value_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "contract objective should supervise schema-forced value tokens: {event}"
+        );
+        assert!(
+            event["premature_close_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should penalize premature close markers: {event}"
+        );
     }
 
     #[test]
@@ -7231,6 +11385,7 @@ mod objective_step_tests {
             status,
             correct_field_count,
             expected_field_count,
+            observed_field_count: correct_field_count,
             partial_progress_ppm,
             certificate_valid_prefix_steps: 0,
             certificate_expected_steps: 0,
@@ -7241,6 +11396,50 @@ mod objective_step_tests {
                 != burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
             completion_quality_ppm,
         }
+    }
+
+    #[test]
+    fn ruliad_rollout_recovery_signal_accepts_wrong_and_malformed_corruptions() {
+        let partial = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            500_000,
+            1_000_000,
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &partial, 500_000, 750_000,
+            )
+        );
+
+        let mut schema_wrong = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            0,
+            1_000_000,
+        );
+        schema_wrong.observed_field_count = 1;
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &schema_wrong,
+                500_000,
+                750_000,
+            )
+        );
+
+        let malformed = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+            0,
+            1_000_000,
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &malformed, 0, 0,
+            )
+        );
+        assert!(
+            !LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &malformed, 0, 1_000_001,
+            )
+        );
     }
 
     #[test]
@@ -7365,6 +11564,7 @@ mod objective_step_tests {
             enabled: true,
             mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
             vpo_correctness_mass_floor: 0.70,
+            vpo_schema_quality_mass_floor: 0.10,
             vpo_completion_health_mass_floor: 0.10,
             vpo_compactness_max_weight: 0.05,
             ..Default::default()
@@ -7382,10 +11582,15 @@ mod objective_step_tests {
                 "VPO scalarization should sum to one, got {sum}"
             );
             let correctness_mass = scalarization[0..=4].iter().sum::<f32>();
+            let schema_mass = scalarization[6];
             let health_mass = scalarization[8..=9].iter().sum::<f32>();
             assert!(
                 correctness_mass >= 0.70 - 1.0e-5,
                 "correctness mass floor should hold, got {correctness_mass}"
+            );
+            assert!(
+                schema_mass >= 0.10 - 1.0e-5,
+                "schema-quality mass floor should hold, got {schema_mass}"
             );
             assert!(
                 health_mass >= 0.10 - 1.0e-5,
@@ -7427,6 +11632,1966 @@ mod objective_step_tests {
         assert!(
             loss.is_finite(),
             "VPO verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_can_include_oracle_candidate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.1,
+                    group_size: 2,
+                    max_completion_tokens: 16,
+                    every_steps: 1,
+                    top_k: 1,
+                    kl_weight: 0.0,
+                    vpo_scalarizations: 4,
+                    positive_advantage_requires_correctness: true,
+                    positive_advantage_min_partial_progress_ppm: 500_000,
+                    positive_advantage_min_completion_quality_ppm: 750_000,
+                    include_oracle_candidate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 29,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 32)
+            .expect("oracle VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["oracle_sample_groups"], 1);
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["oracle_truncated_completion_rows"], 0);
+        assert_eq!(value["policy_update_applied"], true);
+        assert!(
+            value["vector_semantic_match_mean"]
+                .as_f64()
+                .expect("semantic mean")
+                > 0.0,
+            "oracle candidate should provide a correctness-positive row"
+        );
+    }
+
+    #[test]
+    fn ruliad_rollout_recovery_accepts_malformed_and_missing_corruptions() {
+        use burn_dragon_universality::ruliad::RuliadAnswerStatus;
+
+        let min_partial = 500_000;
+        let min_quality = 750_000;
+        let accepts = |status, partial, quality| {
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &ruliad_test_score(status, partial, quality),
+                min_partial,
+                min_quality,
+            )
+        };
+
+        assert!(accepts(
+            RuliadAnswerStatus::SchemaValidWrong,
+            0,
+            min_quality
+        ));
+        assert!(accepts(RuliadAnswerStatus::Malformed, 0, min_quality));
+        assert!(accepts(RuliadAnswerStatus::Missing, 0, min_quality));
+        assert!(accepts(
+            RuliadAnswerStatus::Partial,
+            min_partial,
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::Partial,
+            min_partial.saturating_sub(1),
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::Malformed,
+            0,
+            min_quality.saturating_sub(1)
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::VerifierMatch,
+            1_000_000,
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::SemanticMatch,
+            1_000_000,
+            min_quality
+        ));
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_mutate_prompt_bound_fields() {
+        let negatives = LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers(
+            "ok=1;l=17;r=17",
+            3,
+        );
+
+        assert_eq!(negatives.len(), 3);
+        assert!(negatives.iter().all(|answer| answer != "ok=1;l=17;r=17"));
+        assert!(
+            negatives.iter().any(|answer| answer.starts_with("ok=0")),
+            "boolean fields should be mutated into plausible wrong answers: {negatives:?}"
+        );
+        assert!(
+            negatives
+                .iter()
+                .any(|answer| answer.contains("l=19") || answer.contains("l=18")),
+            "numeric fields should be mutated without destroying the answer schema: {negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_include_template_collapse_hard_negatives() {
+        let proof_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "ok=1;l=17;r=17",
+                1,
+                2,
+            );
+        let proof_texts = proof_negatives
+            .iter()
+            .map(|(answer, _kind)| answer.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            proof_texts.contains(&"ok=1;l=5;r=5"),
+            "proof hard negatives should target the observed l=5/r=5 attractor: {proof_texts:?}"
+        );
+        assert!(
+            proof_texts.contains(&"ok=1;l=1;r=1"),
+            "proof hard negatives should target the observed l/r collapse: {proof_texts:?}"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|(_answer, kind)| *kind == RuliadStructuredNegativeKind::TemplateCollapse),
+            "template rows should be tracked separately"
+        );
+
+        let automaton_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "acc=1", 0, 2,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert_eq!(automaton_negatives, vec!["acc=0".to_string()]);
+
+        let eca_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "xlen=44;xalpha=01;xcounts=20,24;xedge=01",
+                0,
+                3,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=13;xalpha=abc;nfcounts=1,1,0;nfedge=ba"),
+            "ECA hard negatives should include the observed mixed x/nf lowercase attractor: {eca_negatives:?}"
+        );
+
+        let normal_form_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "nflen=44;nfalpha=01;nfcounts=20,24;nfedge=01",
+                0,
+                3,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert!(
+            normal_form_negatives
+                .iter()
+                .all(|answer| answer.contains("nfedge=") && !answer.contains("xedge=")),
+            "normal-form hard negatives should preserve the nfedge schema: {normal_form_negatives:?}"
+        );
+        assert!(
+            normal_form_negatives
+                .iter()
+                .any(|answer| answer == "nflen=5;nfalpha=abc;nfcounts=1,1,0;nfedge=ba"),
+            "normal-form hard negatives should include the observed lowercase normal-form attractor: {normal_form_negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_with_schema_include_contract_sibling_negatives() {
+        let negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_schema(
+                "xlen=44;xalpha=01;xcounts=20,24;xedge=01",
+                0,
+                0,
+                8,
+            );
+        assert_eq!(negatives.len(), 8);
+        assert!(
+            negatives
+                .iter()
+                .all(|(_answer, kind)| *kind == RuliadStructuredNegativeKind::SchemaCollapse),
+            "schema rows should be tracked separately: {negatives:?}"
+        );
+        let texts = negatives
+            .iter()
+            .map(|(answer, _kind)| answer.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.iter().any(|answer| answer.contains("nfalpha=")),
+            "schema-collapse negatives should expose sibling normal-form keys: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|answer| *answer == "xlen=44;xalpha=01;xcounts=20,24"),
+            "schema-collapse negatives should include missing-tail-field answers: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "xlen=44"),
+            "schema-collapse negatives should include first-field-only answer collapse: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "ok=1;l=1;r=1"),
+            "schema-collapse negatives should include the observed ok/l/r cross-contract prototype: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "acc=1"),
+            "schema-collapse negatives should include compact cross-contract prototypes: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|answer| *answer != "xlen=44;xalpha=01;xcounts=20,24;xedge=01"),
+            "schema-collapse negatives must not duplicate the oracle answer: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_value_completion_mask_marks_only_answer_values() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_value_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "11717");
+    }
+
+    #[test]
+    fn ruliad_answer_key_completion_mask_marks_only_answer_keys() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_key_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "oklr");
+    }
+
+    #[test]
+    fn ruliad_answer_schema_completion_mask_marks_keys_and_field_separators() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_schema_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "ok=;l=;r=");
+    }
+
+    #[test]
+    fn ruliad_answer_schema_start_completion_mask_marks_first_key_bytes() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "xlen=14;xalpha=01;xcounts=8,6;xedge=01";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_schema_start_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "xxxx");
+    }
+
+    #[test]
+    fn ruliad_prompt_schema_value_rows_train_values_under_supplied_keys() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let prompt = tokenizer
+            .encode_payload("?:prove\n!:")
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+
+        let rows = LanguageTrainModel::<TestBackend>::ruliad_prompt_schema_value_completion_rows(
+            &tokenizer,
+            &prompt,
+            "ok=1;l=17;r=17",
+            32,
+            96,
+            8,
+        );
+
+        assert_eq!(rows.len(), 3);
+        let decoded_targets = rows
+            .iter()
+            .map(|(_inputs, targets, mask, active)| {
+                assert_eq!(*active, mask.iter().filter(|value| **value > 0.0).count());
+                let tokens = targets
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(token, active)| (*active > 0.0).then_some(*token as u32))
+                    .collect::<Vec<_>>();
+                tokenizer.decode_payload(&tokens, true)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            decoded_targets,
+            vec!["1;", "17;", "17\n[/R2]"],
+            "schema-forced value rows should target field values and close markers"
+        );
+    }
+
+    #[test]
+    fn ruliad_schema_collapse_negative_answers_cover_sibling_contracts() {
+        let eca_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_schema_collapse_negative_answers(
+                "xlen=14;xalpha=01;xcounts=8,6;xedge=01",
+            );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=14;xalpha=01;xcounts=8,6"),
+            "ECA schema negatives should include tail-field omission: {eca_negatives:?}"
+        );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=14;nfalpha=01;nfcounts=8,6;xedge=01"),
+            "ECA schema negatives should include the observed x/nf mixed-key collapse: {eca_negatives:?}"
+        );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "nflen=14;nfalpha=01;nfcounts=8,6;nfedge=01"),
+            "ECA schema negatives should include the full sibling rewrite contract: {eca_negatives:?}"
+        );
+
+        let proof_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_schema_collapse_negative_answers(
+                "ok=1;l=17;r=17",
+            );
+        assert_eq!(
+            &proof_negatives[..2],
+            ["ok=1;l=17".to_string(), "ok=1".to_string()],
+            "proof-specific truncation negatives should remain first"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|answer| answer.starts_with("xlen=")),
+            "proof negatives should include the ECA sibling contract: {proof_negatives:?}"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|answer| answer.starts_with("nflen=")),
+            "proof negatives should include the normal-form sibling contract: {proof_negatives:?}"
+        );
+        assert!(
+            proof_negatives.iter().any(|answer| answer == "acc=0"),
+            "proof negatives should include the acceptance sibling contract: {proof_negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_trim_prompt_for_completion_preserves_maximum_context() {
+        let prompt = vec![10, 11, 12, 13, 14, 15, 16, 17];
+        let trimmed =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 3, 7);
+        assert_eq!(trimmed, vec![14, 15, 16, 17]);
+
+        let untrimmed =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 2, 16);
+        assert_eq!(untrimmed, prompt);
+
+        let overlong_completion =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 99, 7);
+        assert_eq!(overlong_completion, vec![17]);
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_supports_structured_symbolic_tokenizer() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let mut config = tiny_model_config();
+        config.vocab_size = 512;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 1,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                    vocab_size: 512,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let prompt_tokens = tokenizer
+            .encode_payload("?:ss\n!:")
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens,
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 512,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured symbolic contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contrast loss should be finite: {loss}");
+        assert!(loss > 0.0, "contrast loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_can_include_structured_negative_candidates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.1,
+                    group_size: 2,
+                    max_completion_tokens: 24,
+                    every_steps: 1,
+                    top_k: 1,
+                    kl_weight: 0.0,
+                    vpo_scalarizations: 4,
+                    positive_advantage_requires_correctness: true,
+                    positive_advantage_min_partial_progress_ppm: 500_000,
+                    positive_advantage_min_completion_quality_ppm: 750_000,
+                    include_oracle_candidate: true,
+                    include_structured_negative_candidates: true,
+                    structured_negative_count: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 31,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 48)
+            .expect("structured-negative VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["structured_negative_completion_rows"], 2);
+        assert_eq!(value["policy_update_applied"], true);
+        assert!(
+            value["completion_rows"].as_u64().expect("completion rows") >= 3,
+            "oracle plus structured negatives should contribute trainable policy rows"
+        );
+        assert!(
+            value["vector_schema_quality_mean"]
+                .as_f64()
+                .expect("schema quality")
+                > 0.0,
+            "structured negatives should remain parseable enough to teach field binding"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_rollout_imitation_writes_skip_telemetry_for_wrong_generations() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 20);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_rollout_imitation.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    group_size: 2,
+                    max_completion_tokens: 8,
+                    top_k: 1,
+                    rollout_imitation_weight: 0.05,
+                    rollout_imitation_every_steps: 1,
+                    rollout_imitation_min_partial_progress_ppm: 500_000,
+                    rollout_imitation_min_completion_quality_ppm: 750_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_verifier_rollout_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 33,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        assert!(
+            model
+                .ruliad_verifier_rollout_imitation_loss(&policy_batch, &device, 16)
+                .is_none(),
+            "wrong generated completions should not be reinforced"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        let skip_reason = value["skip_reason"].as_str();
+        assert!(
+            matches!(
+                skip_reason,
+                Some("no_candidate_completion") | Some("rollout_health_gate")
+            ),
+            "unexpected skip reason: {skip_reason:?}"
+        );
+        assert_eq!(value["accepted_completion_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_imitation_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_recovery_rows"].as_u64(), Some(0));
+        let candidate_rows = value["candidate_completion_rows"]
+            .as_u64()
+            .expect("candidate rows");
+        if skip_reason == Some("rollout_health_gate") {
+            assert!(candidate_rows > 0);
+        } else {
+            assert_eq!(candidate_rows, 0);
+        }
+        assert_eq!(value["health_gate_passed"].as_bool(), Some(false));
+        assert!(
+            value["generated_completion_rows"]
+                .as_u64()
+                .expect("generated rows")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_rollout_recovery_accepts_generated_malformed_prefixes() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 23);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_rollout_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    group_size: 1,
+                    max_completion_tokens: 1,
+                    top_k: 1,
+                    rollout_recovery_weight: 0.05,
+                    rollout_imitation_weight: 0.0,
+                    rollout_imitation_every_steps: 1,
+                    rollout_imitation_min_partial_progress_ppm: 0,
+                    rollout_imitation_min_completion_quality_ppm: 0,
+                    rollout_imitation_max_rows_per_step: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_verifier_rollout_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 37,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "rewrite".to_string(),
+            task_kind: "rewrite_normal_form".to_string(),
+            math_domains: vec!["symbolic_rewriting".to_string()],
+            reasoning_modes: vec!["normalization".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "nflen=3;nfalpha=ABC;nfcounts=1,1,1;nfedge=AB".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_verifier_rollout_imitation_loss(&policy_batch, &device, 16)
+            .expect("malformed rollout should create an oracle recovery row");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["accepted_imitation_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_recovery_rows"].as_u64(), Some(1));
+        let malformed = value["recovery_malformed_rows"]
+            .as_u64()
+            .unwrap_or_default();
+        let missing = value["recovery_missing_rows"].as_u64().unwrap_or_default();
+        let schema_wrong = value["recovery_schema_wrong_rows"]
+            .as_u64()
+            .unwrap_or_default();
+        let partial = value["recovery_partial_rows"].as_u64().unwrap_or_default();
+        assert_eq!(malformed + missing + schema_wrong + partial, 1);
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_scores_oracle_against_field_negatives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 21);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 2,
+                    structured_contrast_start_after_steps: 4,
+                    structured_contrast_margin: 0.25,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 2,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 37,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=44;xalpha=01;xcounts=20,24;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "contrast loss should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "contrast loss should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured answer contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contrast loss should be finite: {loss}");
+        assert!(loss > 0.0, "contrast loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_scores_schema_negatives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 35);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 0,
+                    structured_template_negative_count: 0,
+                    structured_schema_negative_count: 4,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 56,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=14;xalpha=01;xcounts=8,6;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("schema-only structured answer contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["field_negative_completion_rows"], 0);
+        assert_eq!(value["template_negative_completion_rows"], 0);
+        assert!(
+            value["schema_negative_completion_rows"]
+                .as_u64()
+                .expect("schema rows")
+                > 0
+        );
+        assert!(
+            value["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("schema discriminative tokens")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_loss_scores_prompt_counterfactuals() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 24);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 2,
+                    field_binding_contrast_start_after_steps: 4,
+                    field_binding_contrast_margin: 0.25,
+                    field_binding_contrast_max_pairs: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 44,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "ok=1;l=19;r=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: item_a,
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: item_b,
+                    prompt_tokens: vec![1, 2, 4],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "field-binding contrast should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "field-binding contrast should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "field-binding contrast loss should be finite: {loss}"
+        );
+        assert!(
+            loss > 0.0,
+            "field-binding contrast loss should be non-zero: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_loss_writes_activity_and_skip_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 25);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 45,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 46,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "ok=1;l=19;r=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: item_a.clone(),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: item_b,
+                    prompt_tokens: vec![1, 2, 4],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+
+        let item_c = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h2".to_string(),
+            sample_index: 47,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "custom".to_string(),
+            task_kind: "field_binding".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:c\n!:".to_string(),
+            expected_answer: "v=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let one_sample_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_c,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&one_sample_batch, &device, 64)
+                .is_none(),
+            "single oracle sample without a template schema should not produce a counterfactual pair"
+        );
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let active: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("active telemetry json");
+        assert_eq!(active["sample_groups"], 2);
+        assert!(
+            active["prompt_pairs"].as_u64().expect("prompt pairs") >= 2,
+            "template hard negatives may add extra field-binding rows"
+        );
+        assert!(
+            active["contrast_pairs"].as_u64().expect("contrast pairs") >= 2,
+            "template hard negatives may add extra contrast pairs"
+        );
+        assert!(
+            active["candidate_pairs"].as_u64().expect("candidate pairs") >= 2,
+            "template hard negatives may add extra candidates"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 2,
+            "template hard negatives should be included in the pool"
+        );
+        assert_eq!(active["replay_pool_size"], 0);
+        assert_eq!(active["replay_contrast_pairs"], 0);
+        assert!(
+            active["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative tokens")
+                > 0
+        );
+        assert!(
+            active["rank_metric_pairs"].as_u64().expect("rank pairs") >= 2,
+            "active field-binding telemetry should rank natural and/or template pairs"
+        );
+        assert!(
+            active["rank_metric_tokens"].as_u64().expect("rank tokens") > 0,
+            "active field-binding telemetry should include rank-token evidence"
+        );
+        let positive_fraction = active["positive_token_fraction"]
+            .as_f64()
+            .expect("positive token fraction");
+        assert!(
+            (0.0..=1.0).contains(&positive_fraction),
+            "positive token fraction should be bounded: {positive_fraction}"
+        );
+        assert!(
+            active["logit_margin_mean"]
+                .as_f64()
+                .expect("margin mean")
+                .is_finite(),
+            "rank telemetry should include a finite margin mean"
+        );
+        let skipped: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("skip telemetry json");
+        assert_eq!(
+            skipped["skip_reason"].as_str(),
+            Some("no_counterfactual_pairs")
+        );
+        assert_eq!(skipped["contrast_pairs"], 0);
+        assert_eq!(skipped["rank_metric_tokens"], 0);
+        assert!(skipped["logit_margin_mean"].is_null());
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_template_negatives_for_single_sample() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 33);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 54,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("template hard negatives should provide a single-sample contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["contrast_pairs"].as_u64().expect("contrast pairs") > 0,
+            "template hard negatives should create contrast rows"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 1,
+            "template hard negatives should augment the natural single-answer pool"
+        );
+        assert_eq!(active["replay_pool_size"], 0);
+        assert_eq!(active["replay_contrast_pairs"], 0);
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_schema_negatives_for_single_sample() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 34);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 55,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=14;xalpha=01;xcounts=8,6;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("schema hard negatives should provide a single-sample contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative key tokens")
+                >= 4,
+            "schema negatives should activate key-token contrast"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 1,
+            "schema hard negatives should augment the natural single-answer pool"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_prefers_most_discriminative_pairs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 32);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 1,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let make_item = |sample_index, answer: &str| burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: format!("h{sample_index}"),
+            sample_index,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: format!("?:sample{sample_index}\n!:"),
+            expected_answer: answer.to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(51, "ok=1;l=17;r=17"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(52, "ok=1;l=19;r=19"),
+                    prompt_tokens: vec![1, 2, 4],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(53, "ok=0;l=00;r=00"),
+                    prompt_tokens: vec![1, 2, 5],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+
+        assert_eq!(active["contrast_pairs"], 1);
+        assert_eq!(
+            active["contrast_discriminative_tokens"], 9,
+            "one-pair field-binding budget should select the strongest value counterfactual"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_replay_for_single_sample_batches() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 26);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 47,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "v=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 48,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "v=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+            vocab_size: 257,
+            eos_id: None,
+        };
+        let first_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_a,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: tokenization.clone(),
+            stop_token_id: None,
+        };
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&first_batch, &device, 64)
+                .is_none(),
+            "first single-sample batch should fill replay but have no contrast pair"
+        );
+
+        let second_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_b,
+                prompt_tokens: vec![1, 2, 4],
+            }],
+            tokenization,
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&second_batch, &device, 64)
+            .expect("replay should provide a counterfactual pair");
+        assert!(tensor_scalar(loss).is_finite());
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let replay_active: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("replay telemetry json");
+        assert_eq!(replay_active["sample_groups"], 1);
+        assert_eq!(replay_active["contrast_pairs"], 1);
+        assert_eq!(replay_active["candidate_pairs"], 1);
+        assert_eq!(replay_active["replay_pool_size"], 1);
+        assert_eq!(replay_active["replay_contrast_pairs"], 1);
+        assert!(
+            replay_active["rank_metric_tokens"]
+                .as_u64()
+                .expect("rank tokens")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_generated_attractor_replay_tracks_repeated_wrong_answers() {
+        let mut replay = RuliadGeneratedAttractorReplay::default();
+        let key = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=5;r=5".to_string(),
+        };
+        assert!(replay.record(
+            key.clone(),
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            1,
+            8,
+        ));
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=17;r=17",
+                    2,
+                    4,
+                    1,
+                    1.0,
+                )
+                .is_empty()
+        );
+        assert!(replay.record(
+            key,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            2,
+            8,
+        ));
+        let candidates = replay.candidates_for(
+            "proof_tree",
+            "prove_theorem",
+            "ok;l;r",
+            "ok=1;l=17;r=17",
+            2,
+            4,
+            1,
+            1.0,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].count, 2);
+        assert_eq!(candidates[0].key.answer, "ok=1;l=5;r=5");
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=5;r=5",
+                    2,
+                    4,
+                    1,
+                    1.0,
+                )
+                .is_empty()
+        );
+        let summary = replay.summary(2);
+        assert_eq!(summary.pool_size, 1);
+        assert_eq!(summary.active_count, 1);
+        assert_eq!(summary.active_observation_count, 2);
+        assert_eq!(summary.dominant_count, 2);
+        assert_eq!(summary.distinct_answers, 1);
+    }
+
+    #[test]
+    fn ruliad_generated_attractor_replay_requires_diverse_answers() {
+        let mut replay = RuliadGeneratedAttractorReplay::default();
+        let key_a = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=5;r=5".to_string(),
+        };
+        let key_b = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=9;r=9".to_string(),
+        };
+        for step_index in 1..=3 {
+            assert!(replay.record(
+                key_a.clone(),
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                step_index,
+                8,
+            ));
+        }
+        assert!(replay.record(
+            key_b.clone(),
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            4,
+            8,
+        ));
+
+        let dominated_summary = replay.summary(1);
+        assert_eq!(
+            dominated_summary.diversity_skip_reason(2, 0.5),
+            Some("generated_attractor_dominant_answer")
+        );
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=17;r=17",
+                    1,
+                    4,
+                    2,
+                    0.5,
+                )
+                .is_empty()
+        );
+
+        for step_index in 5..=6 {
+            assert!(replay.record(
+                key_b.clone(),
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                step_index,
+                8,
+            ));
+        }
+        let balanced_summary = replay.summary(1);
+        assert_eq!(balanced_summary.dominant_fraction(), 0.5);
+        assert_eq!(balanced_summary.diversity_skip_reason(2, 0.5), None);
+        let candidates = replay.candidates_for(
+            "proof_tree",
+            "prove_theorem",
+            "ok;l;r",
+            "ok=1;l=17;r=17",
+            1,
+            4,
+            2,
+            0.5,
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_generated_attractor_replay() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 38);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let attractor_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_generated_attractor_replay.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.01,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 16,
+                    field_binding_contrast_replay_capacity: 0,
+                    generated_attractor_replay_capacity: 8,
+                    generated_attractor_replay_min_count: 1,
+                    generated_attractor_replay_max_candidates: 4,
+                    generated_attractor_replay_min_distinct_answers: 1,
+                    generated_attractor_replay_max_dominant_fraction: 1.0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()))
+            .with_ruliad_generated_attractor_telemetry_path(Some(attractor_telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 61,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let sample = crate::dataset::RuliadPolicySample {
+            item,
+            prompt_tokens: vec![1, 2, 3],
+        };
+        let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+            &sample.item,
+            Some("ok=1;l=5;r=5\n[/R2]"),
+        );
+        assert!(
+            model.record_ruliad_generated_attractor(&sample, "ok=1;l=5;r=5\n[/R2]", &score, 3,)
+        );
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![sample],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("generated attractor should provide a contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("field telemetry");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["generated_attractor_negative_pool_size"]
+                .as_u64()
+                .expect("generated attractor pool")
+                >= 1
+        );
+        assert!(
+            active["generated_attractor_contrast_pairs"]
+                .as_u64()
+                .expect("generated attractor pairs")
+                >= 1
+        );
+        let attractor_content =
+            std::fs::read_to_string(&attractor_telemetry_path).expect("attractor telemetry");
+        let replay_event: serde_json::Value =
+            serde_json::from_str(attractor_content.lines().next().expect("attractor line"))
+                .expect("attractor telemetry json");
+        assert_eq!(replay_event["source"], "field_binding");
+        assert!(
+            replay_event["selected_field_binding_pairs"]
+                .as_u64()
+                .expect("selected field-binding pairs")
+                >= 1
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_uses_generated_attractor_replay_candidates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 39);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let attractor_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_generated_attractor_replay.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.01,
+                    group_size: 2,
+                    every_steps: 1,
+                    include_oracle_candidate: true,
+                    generated_attractor_replay_capacity: 8,
+                    generated_attractor_replay_min_count: 1,
+                    generated_attractor_replay_max_candidates: 4,
+                    generated_attractor_replay_min_distinct_answers: 1,
+                    generated_attractor_replay_max_dominant_fraction: 1.0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()))
+            .with_ruliad_generated_attractor_telemetry_path(Some(attractor_telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 62,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let sample = crate::dataset::RuliadPolicySample {
+            item,
+            prompt_tokens: vec![1, 2, 3],
+        };
+        let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+            &sample.item,
+            Some("ok=1;l=5;r=5\n[/R2]"),
+        );
+        assert!(
+            model.record_ruliad_generated_attractor(&sample, "ok=1;l=5;r=5\n[/R2]", &score, 4,)
+        );
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![sample],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 64)
+            .expect("policy loss should include generated-attractor candidate");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("policy telemetry");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("policy telemetry json");
+        assert!(
+            active["generated_attractor_completion_rows"]
+                .as_u64()
+                .expect("generated attractor candidate rows")
+                >= 1
+        );
+        let attractor_content =
+            std::fs::read_to_string(&attractor_telemetry_path).expect("attractor telemetry");
+        let replay_event: serde_json::Value =
+            serde_json::from_str(attractor_content.lines().next().expect("attractor line"))
+                .expect("attractor telemetry json");
+        assert_eq!(replay_event["source"], "policy");
+        assert!(
+            replay_event["selected_candidate_rows"]
+                .as_u64()
+                .expect("selected candidates")
+                >= 1
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_writes_activity_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 23);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 2,
+                    structured_schema_negative_count: 2,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 41,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured answer contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["sample_groups"], 1);
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["field_negative_completion_rows"], 2);
+        assert_eq!(value["template_negative_completion_rows"], 2);
+        assert_eq!(value["schema_negative_completion_rows"], 2);
+        assert_eq!(value["contrast_pairs"], 6);
+        assert!(
+            value["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative tokens")
+                > 0
         );
     }
 
@@ -8256,6 +14421,215 @@ mod objective_step_tests {
             });
         let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
         assert!(loss.is_finite(), "unexpected latent reasoning loss: {loss}");
+    }
+
+    #[test]
+    fn train_step_writes_recovery_skip_telemetry_without_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_denoising: RuliadAnswerDenoisingConfig {
+                enabled: true,
+                weight: 0.0,
+                structured_recovery_weight: 0.25,
+                structured_recovery_every_steps: 1,
+                structured_recovery_start_after_steps: 0,
+                structured_recovery_max_completion_tokens: 24,
+                structured_recovery_negative_count: 1,
+                structured_recovery_template_negative_count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(false));
+        assert_eq!(event["skip_reason"].as_str(), Some("missing_policy_batch"));
+    }
+
+    #[test]
+    fn train_step_runs_structured_recovery_with_tbptt_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_tbptt_chunk_size(Some(4))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 1,
+                    structured_recovery_start_after_steps: 0,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 1,
+                    structured_recovery_template_negative_count: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 45,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        });
+        let train_batch = SequenceBatch::new(
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(
+                    vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    [2, 8],
+                ),
+                &device,
+            ),
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(
+                    vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                    [2, 8],
+                ),
+                &device,
+            ),
+            None,
+        )
+        .with_ruliad_policy_batch(Some(policy_batch));
+
+        let loss = scalar_loss(TrainStep::step(&model, train_batch));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(true));
+        assert!(
+            event["recovery_rows"].as_u64().unwrap_or_default() > 0,
+            "expected active recovery rows, event={event}"
+        );
+    }
+
+    #[test]
+    fn train_step_runs_field_binding_contrast_with_tbptt_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 37);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_tbptt_chunk_size(Some(8))
+            .with_tbptt_persist_across_steps(true)
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_start_after_steps: 0,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 56,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:fb\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        });
+        let inputs = (0..64)
+            .map(|value| (value % 128) as i64)
+            .collect::<Vec<_>>();
+        let targets = (1..65)
+            .map(|value| (value % 128) as i64)
+            .collect::<Vec<_>>();
+        let train_batch = SequenceBatch::new(
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(inputs, [2, 32]), &device),
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(targets, [2, 32]), &device),
+            None,
+        )
+        .with_ruliad_policy_batch(Some(policy_batch));
+
+        let loss = scalar_loss(TrainStep::step(&model, train_batch));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(event["sample_groups"], 1);
+        assert!(
+            event["contrast_pairs"].as_u64().unwrap_or_default() > 0,
+            "expected active field-binding contrast rows under TBPTT, event={event}"
+        );
+        assert!(
+            event["rank_metric_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected field-binding rank telemetry under TBPTT, event={event}"
+        );
     }
 
     #[test]

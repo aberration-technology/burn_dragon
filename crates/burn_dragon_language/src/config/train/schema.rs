@@ -985,12 +985,20 @@ pub enum RuliadSupervisionMode {
     FullDocument,
     AnswerWindow,
     AnswerCompletion,
+    TraceAndAnswer,
     Mixed,
 }
 
 impl RuliadSupervisionMode {
     pub fn uses_answer_target_mask(self) -> bool {
-        matches!(self, Self::AnswerCompletion | Self::Mixed)
+        matches!(
+            self,
+            Self::AnswerCompletion | Self::TraceAndAnswer | Self::Mixed
+        )
+    }
+
+    pub fn uses_trace_answer_target_mask(self) -> bool {
+        matches!(self, Self::TraceAndAnswer)
     }
 
     pub fn prefer_answer_window(
@@ -1003,6 +1011,7 @@ impl RuliadSupervisionMode {
             Self::FullDocument => false,
             Self::AnswerWindow => true,
             Self::AnswerCompletion => true,
+            Self::TraceAndAnswer => false,
             Self::Mixed => validation || (epoch_index.wrapping_add(absolute_step) & 1) == 0,
         }
     }
@@ -1014,8 +1023,13 @@ pub struct RuliadSupervisionConfig {
     pub mode: RuliadSupervisionMode,
     pub mask_high_entropy_spans: bool,
     pub answer_close_marker_stride: usize,
+    pub answer_close_marker_weight: i64,
+    pub answer_schema_token_weight: i64,
+    pub answer_schema_start_token_weight: i64,
+    pub answer_value_token_weight: i64,
     pub answer_ranking: RuliadAnswerRankingConfig,
     pub answer_denoising: RuliadAnswerDenoisingConfig,
+    pub answer_contract: RuliadAnswerContractConfig,
     pub verifier_reward: RuliadVerifierRewardConfig,
 }
 
@@ -1025,8 +1039,13 @@ impl Default for RuliadSupervisionConfig {
             mode: RuliadSupervisionMode::default(),
             mask_high_entropy_spans: false,
             answer_close_marker_stride: 1,
+            answer_close_marker_weight: 1,
+            answer_schema_token_weight: 1,
+            answer_schema_start_token_weight: 1,
+            answer_value_token_weight: 1,
             answer_ranking: RuliadAnswerRankingConfig::default(),
             answer_denoising: RuliadAnswerDenoisingConfig::default(),
+            answer_contract: RuliadAnswerContractConfig::default(),
             verifier_reward: RuliadVerifierRewardConfig::default(),
         }
     }
@@ -1037,8 +1056,24 @@ impl RuliadSupervisionConfig {
         self.mode.uses_answer_target_mask()
     }
 
+    pub fn uses_trace_answer_target_mask(self) -> bool {
+        self.mode.uses_trace_answer_target_mask()
+    }
+
     pub fn uses_target_loss_mask(self) -> bool {
         self.uses_answer_target_mask() || self.mask_high_entropy_spans
+    }
+
+    pub fn needs_ruliad_policy_batch(self) -> bool {
+        (self.verifier_reward.enabled
+            && (self.verifier_reward.weight > 0.0
+                || self.verifier_reward.structured_contrast_weight > 0.0
+                || self.verifier_reward.field_binding_contrast_weight > 0.0
+                || self.verifier_reward.rollout_imitation_weight > 0.0
+                || self.verifier_reward.rollout_recovery_weight > 0.0))
+            || (self.answer_denoising.enabled
+                && self.answer_denoising.structured_recovery_weight > 0.0)
+            || (self.answer_contract.enabled && self.answer_contract.weight > 0.0)
     }
 
     pub fn prefer_answer_window(
@@ -1074,11 +1109,58 @@ impl Default for RuliadAnswerRankingConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
+pub struct RuliadAnswerContractConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub premature_close_unlikelihood_weight: f32,
+    pub every_steps: usize,
+    pub start_after_steps: usize,
+    pub max_completion_tokens: usize,
+    pub max_rows_per_step: usize,
+    /// Maximum schema-forced value rows per step. A value of 0 reuses
+    /// `max_rows_per_step` for backwards-compatible configs.
+    pub prompt_schema_max_rows_per_step: usize,
+    pub schema_token_weight: f32,
+    pub schema_start_token_weight: f32,
+    pub value_token_weight: f32,
+    pub other_token_weight: f32,
+    pub prompt_schema_value_weight: f32,
+}
+
+impl Default for RuliadAnswerContractConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 0.25,
+            premature_close_unlikelihood_weight: 0.0,
+            every_steps: 1,
+            start_after_steps: 0,
+            max_completion_tokens: 64,
+            max_rows_per_step: 16,
+            prompt_schema_max_rows_per_step: 0,
+            schema_token_weight: 2.0,
+            schema_start_token_weight: 0.0,
+            value_token_weight: 1.0,
+            other_token_weight: 1.0,
+            prompt_schema_value_weight: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
 pub struct RuliadAnswerDenoisingConfig {
     pub enabled: bool,
     pub weight: f32,
     pub probability: f32,
     pub corrupt_offset: i64,
+    pub structured_recovery_weight: f32,
+    pub structured_recovery_every_steps: usize,
+    pub structured_recovery_start_after_steps: usize,
+    pub structured_recovery_max_completion_tokens: usize,
+    pub structured_recovery_negative_count: usize,
+    pub structured_recovery_template_negative_count: usize,
+    pub structured_recovery_schema_negative_count: usize,
 }
 
 impl Default for RuliadAnswerDenoisingConfig {
@@ -1088,6 +1170,13 @@ impl Default for RuliadAnswerDenoisingConfig {
             weight: 0.5,
             probability: 1.0,
             corrupt_offset: 1,
+            structured_recovery_weight: 0.0,
+            structured_recovery_every_steps: 8,
+            structured_recovery_start_after_steps: 0,
+            structured_recovery_max_completion_tokens: 64,
+            structured_recovery_negative_count: 0,
+            structured_recovery_template_negative_count: 0,
+            structured_recovery_schema_negative_count: 0,
         }
     }
 }
@@ -1126,8 +1215,41 @@ pub struct RuliadVerifierRewardConfig {
     pub advantage_epsilon: f32,
     pub vpo_scalarizations: usize,
     pub vpo_correctness_mass_floor: f32,
+    pub vpo_schema_quality_mass_floor: f32,
     pub vpo_completion_health_mass_floor: f32,
     pub vpo_compactness_max_weight: f32,
+    pub include_oracle_candidate: bool,
+    pub include_structured_negative_candidates: bool,
+    pub structured_negative_count: usize,
+    pub structured_template_negative_count: usize,
+    pub structured_schema_negative_count: usize,
+    pub structured_contrast_weight: f32,
+    pub structured_contrast_every_steps: usize,
+    pub structured_contrast_start_after_steps: usize,
+    pub structured_contrast_margin: f32,
+    pub field_binding_contrast_weight: f32,
+    pub field_binding_contrast_every_steps: usize,
+    pub field_binding_contrast_start_after_steps: usize,
+    pub field_binding_contrast_margin: f32,
+    pub field_binding_contrast_pair_weight: f32,
+    pub field_binding_contrast_max_pairs: usize,
+    pub field_binding_contrast_rank_metric_every_steps: usize,
+    pub field_binding_contrast_replay_capacity: usize,
+    pub generated_attractor_replay_capacity: usize,
+    pub generated_attractor_replay_min_count: usize,
+    pub generated_attractor_replay_max_candidates: usize,
+    pub generated_attractor_replay_min_distinct_answers: usize,
+    pub generated_attractor_replay_max_dominant_fraction: f32,
+    pub rollout_imitation_weight: f32,
+    pub rollout_imitation_every_steps: usize,
+    pub rollout_imitation_start_after_steps: usize,
+    pub rollout_imitation_min_partial_progress_ppm: usize,
+    pub rollout_imitation_min_completion_quality_ppm: usize,
+    pub rollout_imitation_min_verifier_rate_ppm: usize,
+    pub rollout_imitation_max_schema_wrong_rate_ppm: usize,
+    pub rollout_imitation_max_malformed_rate_ppm: usize,
+    pub rollout_imitation_max_rows_per_step: usize,
+    pub rollout_recovery_weight: f32,
     pub reward: burn_dragon_universality::RuliadVerifierRewardWeights,
 }
 
@@ -1152,8 +1274,41 @@ impl Default for RuliadVerifierRewardConfig {
             advantage_epsilon: 1.0e-6,
             vpo_scalarizations: 16,
             vpo_correctness_mass_floor: 0.70,
+            vpo_schema_quality_mass_floor: 0.10,
             vpo_completion_health_mass_floor: 0.10,
             vpo_compactness_max_weight: 0.05,
+            include_oracle_candidate: false,
+            include_structured_negative_candidates: false,
+            structured_negative_count: 2,
+            structured_template_negative_count: 0,
+            structured_schema_negative_count: 0,
+            structured_contrast_weight: 0.0,
+            structured_contrast_every_steps: 8,
+            structured_contrast_start_after_steps: 0,
+            structured_contrast_margin: 0.25,
+            field_binding_contrast_weight: 0.0,
+            field_binding_contrast_every_steps: 8,
+            field_binding_contrast_start_after_steps: 0,
+            field_binding_contrast_margin: 0.25,
+            field_binding_contrast_pair_weight: 0.0,
+            field_binding_contrast_max_pairs: 16,
+            field_binding_contrast_rank_metric_every_steps: 8,
+            field_binding_contrast_replay_capacity: 0,
+            generated_attractor_replay_capacity: 0,
+            generated_attractor_replay_min_count: 2,
+            generated_attractor_replay_max_candidates: 4,
+            generated_attractor_replay_min_distinct_answers: 2,
+            generated_attractor_replay_max_dominant_fraction: 0.5,
+            rollout_imitation_weight: 0.0,
+            rollout_imitation_every_steps: 16,
+            rollout_imitation_start_after_steps: 0,
+            rollout_imitation_min_partial_progress_ppm: 500_000,
+            rollout_imitation_min_completion_quality_ppm: 750_000,
+            rollout_imitation_min_verifier_rate_ppm: 100_000,
+            rollout_imitation_max_schema_wrong_rate_ppm: 250_000,
+            rollout_imitation_max_malformed_rate_ppm: 250_000,
+            rollout_imitation_max_rows_per_step: 16,
+            rollout_recovery_weight: 0.0,
             reward: burn_dragon_universality::RuliadVerifierRewardWeights::default(),
         }
     }

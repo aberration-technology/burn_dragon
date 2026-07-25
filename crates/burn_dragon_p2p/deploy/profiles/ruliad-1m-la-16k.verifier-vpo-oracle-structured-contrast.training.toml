@@ -1,0 +1,7 @@
+extends = ["ruliad-1m-la-16k.verifier-vpo-oracle-structured.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+structured_contrast_weight = 0.10
+structured_contrast_every_steps = 8
+structured_contrast_start_after_steps = 0
+structured_contrast_margin = 0.25

@@ -969,6 +969,43 @@ impl TrainingConfig {
                 "training.gates.capability_distinct_2_min_fraction must be finite and in [0, 1]"
             ));
         }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_answer_distinct_min_fraction)
+            || !self
+                .training
+                .gates
+                .capability_answer_distinct_min_fraction
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_answer_distinct_min_fraction must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(
+            &self
+                .training
+                .gates
+                .capability_field_value_distinct_ratio_min,
+        ) || !self
+            .training
+            .gates
+            .capability_field_value_distinct_ratio_min
+            .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_field_value_distinct_ratio_min must be finite and in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.training.gates.capability_field_value_dominance_max)
+            || !self
+                .training
+                .gates
+                .capability_field_value_dominance_max
+                .is_finite()
+        {
+            return Err(anyhow!(
+                "training.gates.capability_field_value_dominance_max must be finite and in [0, 1]"
+            ));
+        }
         if !(0.0..=1.0).contains(&self.training.gates.degeneracy_max_probability_max)
             || !self
                 .training
@@ -1825,6 +1862,98 @@ impl TrainingConfig {
                 ));
             }
         }
+        if !(1..=16).contains(&self.training.ruliad_supervision.answer_value_token_weight) {
+            return Err(anyhow!(
+                "training.ruliad_supervision.answer_value_token_weight must be in [1, 16]"
+            ));
+        }
+        if !(1..=16).contains(&self.training.ruliad_supervision.answer_close_marker_weight) {
+            return Err(anyhow!(
+                "training.ruliad_supervision.answer_close_marker_weight must be in [1, 16]"
+            ));
+        }
+        if !(1..=16).contains(&self.training.ruliad_supervision.answer_schema_token_weight) {
+            return Err(anyhow!(
+                "training.ruliad_supervision.answer_schema_token_weight must be in [1, 16]"
+            ));
+        }
+        if !(1..=16).contains(
+            &self
+                .training
+                .ruliad_supervision
+                .answer_schema_start_token_weight,
+        ) {
+            return Err(anyhow!(
+                "training.ruliad_supervision.answer_schema_start_token_weight must be in [1, 16]"
+            ));
+        }
+        if self.training.ruliad_supervision.answer_contract.enabled {
+            let contract = self.training.ruliad_supervision.answer_contract;
+            if !contract.weight.is_finite() || contract.weight < 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_contract.weight must be finite and non-negative"
+                ));
+            }
+            if contract.weight > 0.0 {
+                if contract.every_steps == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract.every_steps must be positive when weight > 0"
+                    ));
+                }
+                if contract.max_completion_tokens == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract.max_completion_tokens must be positive when weight > 0"
+                    ));
+                }
+                if contract.max_rows_per_step == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract.max_rows_per_step must be positive when weight > 0"
+                    ));
+                }
+                for (name, value) in [
+                    ("schema_token_weight", contract.schema_token_weight),
+                    (
+                        "schema_start_token_weight",
+                        contract.schema_start_token_weight,
+                    ),
+                    ("value_token_weight", contract.value_token_weight),
+                    ("other_token_weight", contract.other_token_weight),
+                    (
+                        "prompt_schema_value_weight",
+                        contract.prompt_schema_value_weight,
+                    ),
+                    (
+                        "premature_close_unlikelihood_weight",
+                        contract.premature_close_unlikelihood_weight,
+                    ),
+                ] {
+                    if !value.is_finite() || value < 0.0 {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.answer_contract.{name} must be finite and non-negative"
+                        ));
+                    }
+                }
+                if contract.schema_token_weight <= f32::EPSILON
+                    && contract.value_token_weight <= f32::EPSILON
+                    && contract.other_token_weight <= f32::EPSILON
+                    && contract.prompt_schema_value_weight <= f32::EPSILON
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract requires at least one positive token weight when weight > 0"
+                    ));
+                }
+                if !self.training.ruliad_supervision.uses_answer_target_mask() {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract.enabled requires training.ruliad_supervision.mode to use answer target masks"
+                    ));
+                }
+                if self.parallel.pipeline.enabled {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_contract.enabled does not yet support parallel.pipeline.enabled"
+                    ));
+                }
+            }
+        }
         if self.training.ruliad_supervision.answer_denoising.enabled {
             let denoising = self.training.ruliad_supervision.answer_denoising;
             if !denoising.weight.is_finite() || denoising.weight < 0.0 {
@@ -1842,6 +1971,33 @@ impl TrainingConfig {
                     "training.ruliad_supervision.answer_denoising.corrupt_offset must be positive"
                 ));
             }
+            if !denoising.structured_recovery_weight.is_finite()
+                || denoising.structured_recovery_weight < 0.0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.answer_denoising.structured_recovery_weight must be finite and non-negative"
+                ));
+            }
+            if denoising.structured_recovery_weight > 0.0 {
+                if denoising.structured_recovery_every_steps == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_denoising.structured_recovery_every_steps must be positive when structured_recovery_weight > 0"
+                    ));
+                }
+                if denoising.structured_recovery_max_completion_tokens == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_denoising.structured_recovery_max_completion_tokens must be positive when structured_recovery_weight > 0"
+                    ));
+                }
+                if denoising.structured_recovery_negative_count == 0
+                    && denoising.structured_recovery_template_negative_count == 0
+                    && denoising.structured_recovery_schema_negative_count == 0
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.answer_denoising.structured_recovery_negative_count, structured_recovery_template_negative_count, or structured_recovery_schema_negative_count must be positive when structured_recovery_weight > 0"
+                    ));
+                }
+            }
             if !self.training.ruliad_supervision.uses_answer_target_mask() {
                 return Err(anyhow!(
                     "training.ruliad_supervision.answer_denoising.enabled requires training.ruliad_supervision.mode to use answer target masks"
@@ -1855,14 +2011,9 @@ impl TrainingConfig {
         }
         if self.training.ruliad_supervision.verifier_reward.enabled {
             let verifier_reward = self.training.ruliad_supervision.verifier_reward;
-            if !verifier_reward.weight.is_finite() || verifier_reward.weight <= 0.0 {
+            if !verifier_reward.weight.is_finite() || verifier_reward.weight < 0.0 {
                 return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.weight must be finite and positive"
-                ));
-            }
-            if verifier_reward.group_size < 2 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.group_size must be at least 2"
+                    "training.ruliad_supervision.verifier_reward.weight must be finite and non-negative"
                 ));
             }
             if verifier_reward.max_completion_tokens == 0 {
@@ -1870,92 +2021,291 @@ impl TrainingConfig {
                     "training.ruliad_supervision.verifier_reward.max_completion_tokens must be positive"
                 ));
             }
-            if verifier_reward.every_steps == 0 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.every_steps must be positive"
-                ));
-            }
-            if !verifier_reward.temperature.is_finite() || verifier_reward.temperature <= 0.0 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.temperature must be finite and positive"
-                ));
-            }
-            if verifier_reward.top_k == 0 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.top_k must be positive"
-                ));
-            }
-            if !verifier_reward.kl_weight.is_finite() || verifier_reward.kl_weight < 0.0 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.kl_weight must be finite and non-negative"
-                ));
-            }
-            if !verifier_reward.clip_range.is_finite() || verifier_reward.clip_range <= 0.0 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.clip_range must be finite and positive"
-                ));
-            }
-            if let Some(max_clip_fraction) = verifier_reward.max_advantage_clip_fraction
-                && (!max_clip_fraction.is_finite() || !(0.0..=1.0).contains(&max_clip_fraction))
+            let policy_reward_enabled = verifier_reward.weight > 0.0;
+            let structured_contrast_enabled = verifier_reward.structured_contrast_weight > 0.0;
+            let field_binding_contrast_enabled =
+                verifier_reward.field_binding_contrast_weight > 0.0;
+            let rollout_imitation_enabled = verifier_reward.rollout_imitation_weight > 0.0
+                || verifier_reward.rollout_recovery_weight > 0.0;
+            let generated_attractor_replay_enabled =
+                verifier_reward.generated_attractor_replay_capacity > 0;
+            if verifier_reward.include_structured_negative_candidates
+                && verifier_reward.structured_negative_count == 0
+                && verifier_reward.structured_template_negative_count == 0
+                && verifier_reward.structured_schema_negative_count == 0
             {
                 return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.max_advantage_clip_fraction must be finite and in [0, 1] when set"
+                    "training.ruliad_supervision.verifier_reward.structured_negative_count, structured_template_negative_count, or structured_schema_negative_count must be positive when include_structured_negative_candidates is true"
                 ));
             }
-            if verifier_reward.positive_advantage_min_partial_progress_ppm > 1_000_000 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.positive_advantage_min_partial_progress_ppm must be <= 1000000"
-                ));
-            }
-            if verifier_reward.positive_advantage_min_completion_quality_ppm > 1_000_000 {
-                return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.positive_advantage_min_completion_quality_ppm must be <= 1000000"
-                ));
-            }
-            if !verifier_reward.advantage_epsilon.is_finite()
-                || verifier_reward.advantage_epsilon <= 0.0
+            if !verifier_reward.structured_contrast_weight.is_finite()
+                || verifier_reward.structured_contrast_weight < 0.0
             {
                 return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.advantage_epsilon must be finite and positive"
+                    "training.ruliad_supervision.verifier_reward.structured_contrast_weight must be finite and non-negative"
                 ));
             }
-            if matches!(
-                verifier_reward.mode,
-                RuliadVerifierRewardMode::VpoIndependent
-            ) {
-                if verifier_reward.vpo_scalarizations == 0 {
+            if verifier_reward.structured_contrast_weight > 0.0 {
+                if verifier_reward.structured_contrast_every_steps == 0 {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.verifier_reward.vpo_scalarizations must be positive when mode=\"vpo_independent\""
+                        "training.ruliad_supervision.verifier_reward.structured_contrast_every_steps must be positive when structured_contrast_weight > 0"
                     ));
                 }
-                if !verifier_reward.vpo_correctness_mass_floor.is_finite()
-                    || !(0.0..=1.0).contains(&verifier_reward.vpo_correctness_mass_floor)
+                if verifier_reward.structured_negative_count == 0
+                    && verifier_reward.structured_template_negative_count == 0
+                    && verifier_reward.structured_schema_negative_count == 0
                 {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.verifier_reward.vpo_correctness_mass_floor must be finite and in [0, 1]"
+                        "training.ruliad_supervision.verifier_reward.structured_negative_count, structured_template_negative_count, or structured_schema_negative_count must be positive when structured_contrast_weight > 0"
                     ));
                 }
-                if !verifier_reward.vpo_completion_health_mass_floor.is_finite()
-                    || !(0.0..=1.0).contains(&verifier_reward.vpo_completion_health_mass_floor)
+                if !verifier_reward.structured_contrast_margin.is_finite()
+                    || verifier_reward.structured_contrast_margin < 0.0
                 {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.verifier_reward.vpo_completion_health_mass_floor must be finite and in [0, 1]"
+                        "training.ruliad_supervision.verifier_reward.structured_contrast_margin must be finite and non-negative"
                     ));
                 }
-                if verifier_reward.vpo_correctness_mass_floor
-                    + verifier_reward.vpo_completion_health_mass_floor
-                    > 1.0 + f32::EPSILON
-                {
+            }
+            if !verifier_reward.field_binding_contrast_weight.is_finite()
+                || verifier_reward.field_binding_contrast_weight < 0.0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.field_binding_contrast_weight must be finite and non-negative"
+                ));
+            }
+            if field_binding_contrast_enabled {
+                if verifier_reward.field_binding_contrast_every_steps == 0 {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.verifier_reward VPO mass floors must sum to <= 1"
+                        "training.ruliad_supervision.verifier_reward.field_binding_contrast_every_steps must be positive when field_binding_contrast_weight > 0"
                     ));
                 }
-                if !verifier_reward.vpo_compactness_max_weight.is_finite()
-                    || !(0.0..=1.0).contains(&verifier_reward.vpo_compactness_max_weight)
+                if !verifier_reward.field_binding_contrast_margin.is_finite()
+                    || verifier_reward.field_binding_contrast_margin < 0.0
                 {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.verifier_reward.vpo_compactness_max_weight must be finite and in [0, 1]"
+                        "training.ruliad_supervision.verifier_reward.field_binding_contrast_margin must be finite and non-negative"
                     ));
+                }
+                if !verifier_reward
+                    .field_binding_contrast_pair_weight
+                    .is_finite()
+                    || verifier_reward.field_binding_contrast_pair_weight < 0.0
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.field_binding_contrast_pair_weight must be finite and non-negative"
+                    ));
+                }
+                if verifier_reward.field_binding_contrast_max_pairs == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.field_binding_contrast_max_pairs must be positive when field_binding_contrast_weight > 0"
+                    ));
+                }
+                if verifier_reward.field_binding_contrast_rank_metric_every_steps == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.field_binding_contrast_rank_metric_every_steps must be positive when field_binding_contrast_weight > 0"
+                    ));
+                }
+            }
+            if generated_attractor_replay_enabled {
+                if !policy_reward_enabled && !rollout_imitation_enabled {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_capacity requires verifier_reward.weight > 0 or rollout_imitation_weight/rollout_recovery_weight > 0 so generated attractors can be observed"
+                    ));
+                }
+                if !structured_contrast_enabled && !field_binding_contrast_enabled {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_capacity requires structured_contrast_weight > 0 or field_binding_contrast_weight > 0 so generated attractors can be replayed as negatives"
+                    ));
+                }
+                if verifier_reward.generated_attractor_replay_min_count == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_min_count must be positive when generated_attractor_replay_capacity > 0"
+                    ));
+                }
+                if verifier_reward.generated_attractor_replay_max_candidates == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_max_candidates must be positive when generated_attractor_replay_capacity > 0"
+                    ));
+                }
+                if verifier_reward.generated_attractor_replay_min_distinct_answers == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_min_distinct_answers must be positive when generated_attractor_replay_capacity > 0"
+                    ));
+                }
+                if !verifier_reward
+                    .generated_attractor_replay_max_dominant_fraction
+                    .is_finite()
+                    || verifier_reward.generated_attractor_replay_max_dominant_fraction <= 0.0
+                    || verifier_reward.generated_attractor_replay_max_dominant_fraction > 1.0
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.generated_attractor_replay_max_dominant_fraction must be finite and in (0, 1] when generated_attractor_replay_capacity > 0"
+                    ));
+                }
+            }
+            if !verifier_reward.rollout_imitation_weight.is_finite()
+                || verifier_reward.rollout_imitation_weight < 0.0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.rollout_imitation_weight must be finite and non-negative"
+                ));
+            }
+            if !verifier_reward.rollout_recovery_weight.is_finite()
+                || verifier_reward.rollout_recovery_weight < 0.0
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.rollout_recovery_weight must be finite and non-negative"
+                ));
+            }
+            if rollout_imitation_enabled {
+                if verifier_reward.rollout_imitation_every_steps == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_every_steps must be positive when rollout_imitation_weight > 0"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_min_partial_progress_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_min_partial_progress_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_min_completion_quality_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_min_completion_quality_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_min_verifier_rate_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_min_verifier_rate_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_max_schema_wrong_rate_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_max_schema_wrong_rate_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_max_malformed_rate_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_max_malformed_rate_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.rollout_imitation_max_rows_per_step == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.rollout_imitation_max_rows_per_step must be positive when rollout_imitation_weight > 0"
+                    ));
+                }
+            }
+            if !policy_reward_enabled
+                && !structured_contrast_enabled
+                && !field_binding_contrast_enabled
+                && !rollout_imitation_enabled
+                && !generated_attractor_replay_enabled
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.enabled requires verifier_reward.weight > 0, structured_contrast_weight > 0, field_binding_contrast_weight > 0, rollout_imitation_weight > 0, rollout_recovery_weight > 0, or generated_attractor_replay_capacity > 0"
+                ));
+            }
+            if policy_reward_enabled {
+                if verifier_reward.group_size < 2 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.group_size must be at least 2"
+                    ));
+                }
+                if verifier_reward.every_steps == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.every_steps must be positive when verifier_reward.weight > 0"
+                    ));
+                }
+                if !verifier_reward.temperature.is_finite() || verifier_reward.temperature <= 0.0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.temperature must be finite and positive"
+                    ));
+                }
+                if verifier_reward.top_k == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.top_k must be positive"
+                    ));
+                }
+                if !verifier_reward.kl_weight.is_finite() || verifier_reward.kl_weight < 0.0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.kl_weight must be finite and non-negative"
+                    ));
+                }
+                if !verifier_reward.clip_range.is_finite() || verifier_reward.clip_range <= 0.0 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.clip_range must be finite and positive"
+                    ));
+                }
+                if let Some(max_clip_fraction) = verifier_reward.max_advantage_clip_fraction
+                    && (!max_clip_fraction.is_finite() || !(0.0..=1.0).contains(&max_clip_fraction))
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.max_advantage_clip_fraction must be finite and in [0, 1] when set"
+                    ));
+                }
+                if verifier_reward.positive_advantage_min_partial_progress_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.positive_advantage_min_partial_progress_ppm must be <= 1000000"
+                    ));
+                }
+                if verifier_reward.positive_advantage_min_completion_quality_ppm > 1_000_000 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.positive_advantage_min_completion_quality_ppm must be <= 1000000"
+                    ));
+                }
+                if !verifier_reward.advantage_epsilon.is_finite()
+                    || verifier_reward.advantage_epsilon <= 0.0
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.verifier_reward.advantage_epsilon must be finite and positive"
+                    ));
+                }
+                if matches!(
+                    verifier_reward.mode,
+                    RuliadVerifierRewardMode::VpoIndependent
+                ) {
+                    if verifier_reward.vpo_scalarizations == 0 {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward.vpo_scalarizations must be positive when mode=\"vpo_independent\""
+                        ));
+                    }
+                    if !verifier_reward.vpo_correctness_mass_floor.is_finite()
+                        || !(0.0..=1.0).contains(&verifier_reward.vpo_correctness_mass_floor)
+                    {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward.vpo_correctness_mass_floor must be finite and in [0, 1]"
+                        ));
+                    }
+                    if !verifier_reward.vpo_completion_health_mass_floor.is_finite()
+                        || !(0.0..=1.0).contains(&verifier_reward.vpo_completion_health_mass_floor)
+                    {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward.vpo_completion_health_mass_floor must be finite and in [0, 1]"
+                        ));
+                    }
+                    if !verifier_reward.vpo_schema_quality_mass_floor.is_finite()
+                        || !(0.0..=1.0).contains(&verifier_reward.vpo_schema_quality_mass_floor)
+                    {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward.vpo_schema_quality_mass_floor must be finite and in [0, 1]"
+                        ));
+                    }
+                    if verifier_reward.vpo_correctness_mass_floor
+                        + verifier_reward.vpo_completion_health_mass_floor
+                        + verifier_reward.vpo_schema_quality_mass_floor
+                        > 1.0 + f32::EPSILON
+                    {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward VPO mass floors must sum to <= 1"
+                        ));
+                    }
+                    if !verifier_reward.vpo_compactness_max_weight.is_finite()
+                        || !(0.0..=1.0).contains(&verifier_reward.vpo_compactness_max_weight)
+                    {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.verifier_reward.vpo_compactness_max_weight must be finite and in [0, 1]"
+                        ));
+                    }
                 }
             }
             let reward_weights = verifier_reward.reward;
@@ -1993,14 +2343,34 @@ impl TrainingConfig {
                     "training.ruliad_supervision.verifier_reward.enabled does not yet support parallel.pipeline.enabled"
                 ));
             }
-            if self.training.tbptt_chunk_size.is_some() {
+            if policy_reward_enabled && self.training.tbptt_chunk_size.is_some() {
                 return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.enabled does not yet support training.tbptt_chunk_size"
+                    "training.ruliad_supervision.verifier_reward.weight > 0 does not yet support training.tbptt_chunk_size"
                 ));
             }
-            if self.training.tbptt_persist_across_steps {
+            if policy_reward_enabled && self.training.tbptt_persist_across_steps {
                 return Err(anyhow!(
-                    "training.ruliad_supervision.verifier_reward.enabled does not yet support training.tbptt_persist_across_steps"
+                    "training.ruliad_supervision.verifier_reward.weight > 0 does not yet support training.tbptt_persist_across_steps"
+                ));
+            }
+            if structured_contrast_enabled && self.training.tbptt_chunk_size.is_some() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.structured_contrast_weight > 0 does not yet support training.tbptt_chunk_size"
+                ));
+            }
+            if structured_contrast_enabled && self.training.tbptt_persist_across_steps {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.structured_contrast_weight > 0 does not yet support training.tbptt_persist_across_steps"
+                ));
+            }
+            if rollout_imitation_enabled && self.training.tbptt_chunk_size.is_some() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.rollout_imitation_weight > 0 does not yet support training.tbptt_chunk_size"
+                ));
+            }
+            if rollout_imitation_enabled && self.training.tbptt_persist_across_steps {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.verifier_reward.rollout_imitation_weight > 0 does not yet support training.tbptt_persist_across_steps"
                 ));
             }
             if !self.training.objective.is_next_token() {
@@ -3281,6 +3651,40 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn ruliad_policy_batch_is_required_only_by_active_auxiliary_consumers() {
+        let mut supervision = crate::RuliadSupervisionConfig::default();
+        assert!(!supervision.needs_ruliad_policy_batch());
+
+        supervision.verifier_reward.enabled = true;
+        supervision.verifier_reward.weight = 0.0;
+        supervision.verifier_reward.structured_contrast_weight = 0.0;
+        supervision.verifier_reward.field_binding_contrast_weight = 0.0;
+        supervision.verifier_reward.rollout_imitation_weight = 0.0;
+        assert!(
+            !supervision.needs_ruliad_policy_batch(),
+            "enabling verifier config alone should not change loader shape"
+        );
+
+        supervision.verifier_reward.field_binding_contrast_weight = 0.01;
+        assert!(supervision.needs_ruliad_policy_batch());
+
+        supervision.verifier_reward.field_binding_contrast_weight = 0.0;
+        supervision.verifier_reward.rollout_imitation_weight = 0.01;
+        assert!(supervision.needs_ruliad_policy_batch());
+
+        supervision.verifier_reward.rollout_imitation_weight = 0.0;
+        supervision.answer_denoising.enabled = true;
+        supervision.answer_denoising.structured_recovery_weight = 0.25;
+        assert!(supervision.needs_ruliad_policy_batch());
+
+        supervision.answer_denoising.enabled = false;
+        supervision.answer_denoising.structured_recovery_weight = 0.0;
+        supervision.answer_contract.enabled = true;
+        supervision.answer_contract.weight = 0.25;
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
     fn ruliad_1m_baseline_profile_validates_and_stays_small() {
         let config = load_profile("ruliad-1m.training.toml");
         config.validate().expect("ruliad-1m profile validates");
@@ -3301,10 +3705,50 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn ruliad_corpus_profiles_warm_start_without_hard_frontier_cap() {
+        for profile in ["ruliad-1m.corpus.toml", "ruliad-r1.corpus.toml"] {
+            let config = burn_dragon_universality::load_ruliad_config(&profile_path(profile))
+                .unwrap_or_else(|err| panic!("load {profile}: {err}"));
+            assert!(config.source_selection.enabled, "{profile}");
+            assert!(
+                config.source_selection.frontier_extension.enabled,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .source_selection
+                    .frontier_extension
+                    .max_materialized_levels,
+                0,
+                "{profile} should keep the live frontier unbounded"
+            );
+            assert!(
+                config.source_selection.cold_start.enabled,
+                "{profile} should warm-start cold models on easy buckets"
+            );
+            assert!(
+                config.source_selection.cold_start.max_difficulty_level
+                    < config.source_selection.difficulty_levels.max,
+                "{profile} cold-start cap should be below the initial materialized frontier"
+            );
+            assert_eq!(
+                config.source_selection.cold_start.max_difficulty_level,
+                config.source_selection.difficulty_levels.min,
+                "{profile} should bootstrap from the easiest difficulty bucket"
+            );
+            assert!(
+                config.source_selection.cold_start.release_requires_mastery,
+                "{profile} should release cold-start difficulty by capability, not time alone"
+            );
+        }
+    }
+
+    #[test]
     fn ruliad_1m_la16k_verifier_proxy_profiles_validate() {
-        for (profile, ranking, denoising) in [
+        for (profile, ranking, denoising, structured_recovery) in [
             (
                 "ruliad-1m-la-16k.answer-completion.self-recovery.training.toml",
+                false,
                 false,
                 false,
             ),
@@ -3312,14 +3756,29 @@ start_policy = "capability_gate"
                 "ruliad-1m-la-16k.answer-completion-ranking.self-recovery.training.toml",
                 true,
                 false,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.answer-completion-recovery-denoising.self-recovery.training.toml",
+                false,
+                true,
+                true,
             ),
             (
                 "ruliad-1m-la-16k.answer-completion-denoising.self-recovery.training.toml",
                 false,
                 true,
+                false,
             ),
             (
                 "ruliad-1m-la-16k.answer-completion-ranking-denoising.self-recovery.training.toml",
+                true,
+                true,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.field-binding-recovery.training.toml",
+                false,
                 true,
                 true,
             ),
@@ -3345,6 +3804,45 @@ start_policy = "capability_gate"
                 config.training.ruliad_supervision.answer_denoising.enabled, denoising,
                 "{profile}"
             );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .answer_denoising
+                    .structured_recovery_weight
+                    > 0.0,
+                structured_recovery,
+                "{profile}"
+            );
+            if structured_recovery {
+                if !profile.contains("field-binding") {
+                    assert!(
+                        config.training.tbptt_chunk_size.is_none(),
+                        "{profile} structured recovery must run in the non-TBPTT train path"
+                    );
+                    assert!(
+                        !config.training.tbptt_persist_across_steps,
+                        "{profile} structured recovery must run in the non-TBPTT train path"
+                    );
+                }
+                assert!(
+                    config
+                        .training
+                        .ruliad_supervision
+                        .answer_denoising
+                        .structured_recovery_schema_negative_count
+                        > 0,
+                    "{profile} should include schema-collapse recovery negatives"
+                );
+            }
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .needs_ruliad_policy_batch(),
+                structured_recovery,
+                "{profile}"
+            );
         }
     }
 
@@ -3356,6 +3854,10 @@ start_policy = "capability_gate"
             .expect("ruliad verifier-reward profile should validate");
         assert!(config.training.ruliad_supervision.verifier_reward.enabled);
         assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        assert_eq!(
             config.training.ruliad_supervision.verifier_reward.mode,
             RuliadVerifierRewardMode::Scalar
         );
@@ -3366,89 +3868,635 @@ start_policy = "capability_gate"
 
     #[test]
     fn ruliad_1m_la16k_verifier_vpo_profile_validates() {
-        let config = load_profile("ruliad-1m-la-16k.verifier-vpo.training.toml");
+        for (
+            profile,
+            include_oracle_candidate,
+            include_structured_negatives,
+            structured_contrast,
+        ) in [
+            (
+                "ruliad-1m-la-16k.verifier-vpo.training.toml",
+                false,
+                false,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.verifier-vpo-oracle.training.toml",
+                true,
+                false,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.verifier-vpo-oracle-structured.training.toml",
+                true,
+                true,
+                false,
+            ),
+            (
+                "ruliad-1m-la-16k.verifier-vpo-oracle-structured-contrast.training.toml",
+                true,
+                true,
+                true,
+            ),
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+            assert!(
+                config.training.ruliad_supervision.verifier_reward.enabled,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.verifier_reward.mode,
+                RuliadVerifierRewardMode::VpoIndependent,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.mode,
+                RuliadSupervisionMode::AnswerCompletion,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .vpo_scalarizations
+                    > 0,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .vpo_correctness_mass_floor
+                    >= 0.70,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .vpo_schema_quality_mass_floor
+                    >= 0.10,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .vpo_compactness_max_weight
+                    <= 0.05,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .positive_advantage_requires_correctness,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .positive_advantage_min_partial_progress_ppm
+                    >= 500_000,
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .positive_advantage_min_completion_quality_ppm
+                    >= 750_000,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .start_after_steps,
+                512,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .max_advantage_clip_fraction,
+                Some(0.95),
+                "{profile}"
+            );
+            assert!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .clip_range
+                    >= 1.0,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .include_oracle_candidate,
+                include_oracle_candidate,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .include_structured_negative_candidates,
+                include_structured_negatives,
+                "{profile}"
+            );
+            if include_structured_negatives {
+                assert!(
+                    config
+                        .training
+                        .ruliad_supervision
+                        .verifier_reward
+                        .structured_negative_count
+                        > 0,
+                    "{profile}"
+                );
+                assert!(
+                    config
+                        .training
+                        .ruliad_supervision
+                        .verifier_reward
+                        .structured_template_negative_count
+                        > 0,
+                    "{profile}"
+                );
+                assert!(
+                    config
+                        .training
+                        .ruliad_supervision
+                        .verifier_reward
+                        .structured_schema_negative_count
+                        > 0,
+                    "{profile}"
+                );
+            }
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_supervision
+                    .verifier_reward
+                    .structured_contrast_weight
+                    > 0.0,
+                structured_contrast,
+                "{profile}"
+            );
+            assert!(config.training.tbptt_chunk_size.is_none(), "{profile}");
+            assert!(!config.training.tbptt_persist_across_steps, "{profile}");
+            assert!(config.training.objective.is_next_token(), "{profile}");
+        }
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_structured_contrast_profile_validates_without_sampled_policy() {
+        let profile = "ruliad-1m-la-16k.structured-contrast.training.toml";
+        let config = load_profile(profile);
         config
             .validate()
-            .expect("ruliad verifier VPO profile should validate");
-        assert!(config.training.ruliad_supervision.verifier_reward.enabled);
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let verifier_reward = config.training.ruliad_supervision.verifier_reward;
+
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.weight, 0.0);
+        assert!(verifier_reward.structured_negative_count > 0);
+        assert_eq!(verifier_reward.structured_template_negative_count, 0);
+        assert!(verifier_reward.structured_schema_negative_count > 0);
+        assert!(verifier_reward.structured_contrast_weight > 0.0);
+        assert_eq!(verifier_reward.structured_contrast_start_after_steps, 0);
         assert_eq!(
-            config.training.ruliad_supervision.verifier_reward.mode,
-            RuliadVerifierRewardMode::VpoIndependent
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .vpo_scalarizations
-                > 0
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .vpo_correctness_mass_floor
-                >= 0.70
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .vpo_compactness_max_weight
-                <= 0.05
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .positive_advantage_requires_correctness
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .positive_advantage_min_partial_progress_ppm
-                >= 500_000
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .positive_advantage_min_completion_quality_ppm
-                >= 750_000
-        );
-        assert_eq!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .start_after_steps,
-            512
-        );
-        assert_eq!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .max_advantage_clip_fraction,
-            Some(0.95)
-        );
-        assert!(
-            config
-                .training
-                .ruliad_supervision
-                .verifier_reward
-                .clip_range
-                >= 1.0
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
         );
         assert!(config.training.tbptt_chunk_size.is_none());
         assert!(!config.training.tbptt_persist_across_steps);
-        assert!(config.training.objective.is_next_token());
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_field_binding_profile_validates_without_tbptt() {
+        let profile =
+            "ruliad-1m-la-16k.verifier-vpo-oracle-structured-contrast-field-binding.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let verifier_reward = config.training.ruliad_supervision.verifier_reward;
+
+        assert!(verifier_reward.enabled);
+        assert!(verifier_reward.field_binding_contrast_weight > 0.0);
+        assert!(verifier_reward.structured_schema_negative_count > 0);
+        assert!(verifier_reward.structured_contrast_weight > 0.0);
+        assert_eq!(verifier_reward.field_binding_contrast_start_after_steps, 0);
+        assert_eq!(verifier_reward.field_binding_contrast_every_steps, 8);
+        assert_eq!(verifier_reward.field_binding_contrast_pair_weight, 0.5);
+        assert_eq!(verifier_reward.field_binding_contrast_max_pairs, 24);
+        assert_eq!(verifier_reward.field_binding_contrast_replay_capacity, 64);
+        assert_eq!(verifier_reward.generated_attractor_replay_capacity, 128);
+        assert_eq!(verifier_reward.generated_attractor_replay_min_count, 2);
+        assert_eq!(verifier_reward.generated_attractor_replay_max_candidates, 4);
+        assert_eq!(
+            verifier_reward.generated_attractor_replay_min_distinct_answers,
+            2
+        );
+        assert_eq!(
+            verifier_reward.generated_attractor_replay_max_dominant_fraction,
+            0.5
+        );
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        assert!(config.training.tbptt_chunk_size.is_none());
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_field_binding_only_profile_validates_without_policy_reward() {
+        let profile = "ruliad-1m-la-16k.field-binding-contrast.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let verifier_reward = config.training.ruliad_supervision.verifier_reward;
+
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.weight, 0.0);
+        assert!(verifier_reward.field_binding_contrast_weight > 0.0);
+        assert_eq!(verifier_reward.field_binding_contrast_every_steps, 4);
+        assert_eq!(verifier_reward.field_binding_contrast_pair_weight, 1.0);
+        assert_eq!(verifier_reward.field_binding_contrast_max_pairs, 16);
+        assert_eq!(verifier_reward.field_binding_contrast_replay_capacity, 128);
+        assert!(config.training.tbptt_chunk_size.is_none());
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_field_binding_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.field-binding-contrast.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let verifier_reward = config.training.ruliad_supervision.verifier_reward;
+
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.weight, 0.0);
+        assert_eq!(verifier_reward.field_binding_contrast_weight, 0.05);
+        assert_eq!(verifier_reward.field_binding_contrast_every_steps, 8);
+        assert_eq!(verifier_reward.field_binding_contrast_pair_weight, 0.5);
+        assert_eq!(verifier_reward.field_binding_contrast_max_pairs, 8);
+        assert_eq!(verifier_reward.field_binding_contrast_replay_capacity, 64);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_structured_recovery_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-completion-recovery.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let denoising = config.training.ruliad_supervision.answer_denoising;
+
+        assert!(denoising.enabled);
+        assert_eq!(denoising.weight, 0.0);
+        assert_eq!(denoising.structured_recovery_weight, 0.25);
+        assert_eq!(denoising.structured_recovery_every_steps, 4);
+        assert_eq!(denoising.structured_recovery_schema_negative_count, 4);
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let contract = config.training.ruliad_supervision.answer_contract;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.premature_close_unlikelihood_weight, 0.5);
+        assert_eq!(contract.every_steps, 1);
+        assert_eq!(contract.max_completion_tokens, 64);
+        assert_eq!(contract.max_rows_per_step, 8);
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(
+            config
+                .model
+                .latent_reasoning
+                .as_ref()
+                .expect("answer-contract profile should configure latent reasoning")
+                .max_steps,
+            2
+        );
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_schema_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-schema.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.premature_close_unlikelihood_weight, 1.0);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.schema_start_token_weight, 0.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(contract.other_token_weight, 0.25);
+        assert_eq!(supervision.answer_close_marker_stride, 4);
+        assert_eq!(supervision.answer_schema_token_weight, 4);
+        assert_eq!(supervision.answer_schema_start_token_weight, 1);
+        assert_eq!(supervision.answer_value_token_weight, 1);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_schema_start_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-schema-start.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.schema_start_token_weight, 16.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(supervision.answer_close_marker_stride, 4);
+        assert_eq!(supervision.answer_schema_token_weight, 4);
+        assert_eq!(supervision.answer_schema_start_token_weight, 12);
+        assert_eq!(supervision.answer_value_token_weight, 1);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_schema_trace_answer_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-schema-trace-answer.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+
+        assert_eq!(supervision.mode, RuliadSupervisionMode::TraceAndAnswer);
+        assert!(supervision.mask_high_entropy_spans);
+        assert!(supervision.uses_answer_target_mask());
+        assert!(supervision.uses_trace_answer_target_mask());
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.schema_start_token_weight, 0.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(supervision.answer_close_marker_stride, 4);
+        assert_eq!(supervision.answer_schema_token_weight, 4);
+        assert_eq!(supervision.answer_schema_start_token_weight, 1);
+        assert_eq!(supervision.answer_value_token_weight, 1);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.uses_target_loss_mask());
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_schema_mixed_trace_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-schema-mixed-trace.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+
+        assert_eq!(supervision.mode, RuliadSupervisionMode::Mixed);
+        assert!(supervision.mask_high_entropy_spans);
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.schema_start_token_weight, 0.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(supervision.answer_close_marker_stride, 4);
+        assert_eq!(supervision.answer_schema_token_weight, 4);
+        assert_eq!(supervision.answer_schema_start_token_weight, 1);
+        assert_eq!(supervision.answer_value_token_weight, 1);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.uses_target_loss_mask());
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_schema_field_binding_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-schema-field-binding.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+        let verifier_reward = supervision.verifier_reward;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.premature_close_unlikelihood_weight, 1.0);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.schema_start_token_weight, 0.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(supervision.answer_close_marker_stride, 4);
+        assert_eq!(supervision.answer_schema_token_weight, 4);
+        assert_eq!(supervision.answer_schema_start_token_weight, 1);
+        assert_eq!(supervision.answer_value_token_weight, 1);
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.weight, 0.0);
+        assert_eq!(verifier_reward.field_binding_contrast_weight, 0.05);
+        assert_eq!(verifier_reward.field_binding_contrast_every_steps, 8);
+        assert_eq!(verifier_reward.field_binding_contrast_pair_weight, 0.5);
+        assert_eq!(verifier_reward.field_binding_contrast_max_pairs, 8);
+        assert_eq!(verifier_reward.field_binding_contrast_replay_capacity, 64);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_value_binding_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-value-binding.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+        let verifier_reward = supervision.verifier_reward;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.25);
+        assert_eq!(contract.schema_token_weight, 4.0);
+        assert_eq!(contract.value_token_weight, 1.0);
+        assert_eq!(contract.prompt_schema_value_weight, 4.0);
+        assert_eq!(contract.prompt_schema_max_rows_per_step, 4);
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.field_binding_contrast_weight, 0.05);
+        assert_eq!(
+            verifier_reward.field_binding_contrast_rank_metric_every_steps,
+            8
+        );
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la64k_answer_contract_values_profile_validates_with_tbptt() {
+        let profile = "ruliad-1m-la-64k.answer-contract-values.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let supervision = config.training.ruliad_supervision;
+        let contract = supervision.answer_contract;
+
+        assert!(contract.enabled);
+        assert_eq!(contract.weight, 0.50);
+        assert_eq!(contract.premature_close_unlikelihood_weight, 0.75);
+        assert_eq!(contract.schema_token_weight, 1.0);
+        assert_eq!(contract.value_token_weight, 8.0);
+        assert_eq!(contract.other_token_weight, 0.25);
+        assert_eq!(supervision.answer_close_marker_stride, 1);
+        assert_eq!(supervision.answer_close_marker_weight, 2);
+        assert_eq!(supervision.answer_schema_token_weight, 1);
+        assert_eq!(supervision.answer_value_token_weight, 6);
+        assert_eq!(config.model.latent_total, Some(65_536));
+        assert_eq!(config.training.tbptt_chunk_size, Some(128));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_1m_la16k_verifier_rollout_imitation_profile_validates_without_tbptt() {
+        let profile = "ruliad-1m-la-16k.verifier-rollout-imitation.training.toml";
+        let config = load_profile(profile);
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{profile} should validate: {err}"));
+        let verifier_reward = config.training.ruliad_supervision.verifier_reward;
+
+        assert!(verifier_reward.enabled);
+        assert_eq!(verifier_reward.weight, 0.0);
+        assert_eq!(verifier_reward.structured_contrast_weight, 0.0);
+        assert!(verifier_reward.rollout_imitation_weight > 0.0);
+        assert_eq!(verifier_reward.rollout_imitation_start_after_steps, 128);
+        assert_eq!(
+            verifier_reward.rollout_imitation_min_verifier_rate_ppm,
+            100_000
+        );
+        assert_eq!(
+            verifier_reward.rollout_imitation_max_schema_wrong_rate_ppm,
+            250_000
+        );
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        assert!(config.training.tbptt_chunk_size.is_none());
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(
+            config
+                .training
+                .ruliad_supervision
+                .needs_ruliad_policy_batch()
+        );
     }
 
     #[test]
@@ -3548,6 +4596,26 @@ start_policy = "capability_gate"
             );
             assert_eq!(
                 config.training.gates.capability_distinct_2_min_fraction, 0.30,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .gates
+                    .capability_answer_distinct_min_fraction,
+                0.20,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .gates
+                    .capability_field_value_distinct_ratio_min,
+                0.35,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.gates.capability_field_value_dominance_max, 0.85,
                 "{profile}"
             );
         }
@@ -4012,6 +5080,47 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn ruliad_generated_attractor_replay_rejects_invalid_diversity_guard() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        let verifier_reward = &mut config.training.ruliad_supervision.verifier_reward;
+        verifier_reward.enabled = true;
+        verifier_reward.generated_attractor_replay_capacity = 8;
+        verifier_reward.field_binding_contrast_weight = 0.01;
+        verifier_reward.field_binding_contrast_pair_weight = 0.5;
+        verifier_reward.generated_attractor_replay_min_distinct_answers = 0;
+        let err = config
+            .validate()
+            .expect_err("zero generated-attractor distinct-answer guard should fail");
+        assert!(
+            err.to_string()
+                .contains("generated_attractor_replay_min_distinct_answers"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        let verifier_reward = &mut config.training.ruliad_supervision.verifier_reward;
+        verifier_reward.enabled = true;
+        verifier_reward.generated_attractor_replay_capacity = 8;
+        verifier_reward.field_binding_contrast_weight = 0.01;
+        verifier_reward.field_binding_contrast_pair_weight = 0.5;
+        verifier_reward.generated_attractor_replay_max_dominant_fraction = 1.25;
+        let err = config
+            .validate()
+            .expect_err("dominant generated-attractor fraction above one should fail");
+        assert!(
+            err.to_string()
+                .contains("generated_attractor_replay_max_dominant_fraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn ruliad_verifier_reward_validates_for_local_ruliad_next_token() {
         let mut config = parse_config("");
         config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
@@ -4042,6 +5151,106 @@ start_policy = "capability_gate"
             .expect_err("zero VPO scalarization count should fail");
         assert!(
             err.to_string().contains("vpo_scalarizations"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_supervision_rejects_invalid_answer_value_weight() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_value_token_weight = 0;
+        let err = config
+            .validate()
+            .expect_err("zero answer value token weight should fail");
+        assert!(
+            err.to_string().contains("answer_value_token_weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_supervision_rejects_invalid_answer_schema_weight() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config
+            .training
+            .ruliad_supervision
+            .answer_schema_token_weight = 0;
+        let err = config
+            .validate()
+            .expect_err("zero answer schema token weight should fail");
+        assert!(
+            err.to_string().contains("answer_schema_token_weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_supervision_rejects_invalid_answer_schema_start_weight() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config
+            .training
+            .ruliad_supervision
+            .answer_schema_start_token_weight = 0;
+        let err = config
+            .validate()
+            .expect_err("zero answer schema start token weight should fail");
+        assert!(
+            err.to_string().contains("answer_schema_start_token_weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_contract_rejects_invalid_prompt_schema_value_weight() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_contract.enabled = true;
+        config.training.ruliad_supervision.answer_contract.weight = 0.25;
+        config
+            .training
+            .ruliad_supervision
+            .answer_contract
+            .prompt_schema_value_weight = -1.0;
+        let err = config
+            .validate()
+            .expect_err("negative prompt-schema value weight should fail");
+        assert!(
+            err.to_string().contains("prompt_schema_value_weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_supervision_rejects_invalid_answer_close_marker_weight() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config
+            .training
+            .ruliad_supervision
+            .answer_close_marker_weight = 0;
+        let err = config
+            .validate()
+            .expect_err("zero answer close marker weight should fail");
+        assert!(
+            err.to_string().contains("answer_close_marker_weight"),
             "unexpected error: {err}"
         );
     }
@@ -4119,7 +5328,7 @@ start_policy = "capability_gate"
             config: "target/test-ruliad.toml".into(),
         };
         config.training.ruliad_supervision.verifier_reward.enabled = true;
-        config.training.tbptt_chunk_size = Some(128);
+        config.training.tbptt_chunk_size = Some(4);
         let err = config
             .validate()
             .expect_err("verifier reward should reject TBPTT chunking");
@@ -4127,6 +5336,161 @@ start_policy = "capability_gate"
             err.to_string().contains("tbptt_chunk_size"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn ruliad_structured_contrast_rejects_tbptt_chunking() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.weight = 0.0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_contrast_weight = 0.01;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_negative_count = 1;
+        config.training.tbptt_chunk_size = Some(4);
+        let err = config
+            .validate()
+            .expect_err("structured contrast should reject TBPTT chunking");
+        assert!(
+            err.to_string().contains("structured_contrast_weight > 0")
+                && err.to_string().contains("tbptt_chunk_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_rollout_imitation_rejects_tbptt_chunking() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.weight = 0.0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .rollout_imitation_weight = 0.01;
+        config.training.tbptt_chunk_size = Some(4);
+        let err = config
+            .validate()
+            .expect_err("rollout imitation should reject TBPTT chunking");
+        assert!(
+            err.to_string().contains("rollout_imitation_weight > 0")
+                && err.to_string().contains("tbptt_chunk_size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_accepts_tbptt_chunking() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.weight = 0.0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .field_binding_contrast_weight = 0.01;
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.tbptt_persist_across_steps = true;
+        config
+            .validate()
+            .expect("field-binding contrast runs as an auxiliary policy-batch forward and should allow TBPTT");
+    }
+
+    #[test]
+    fn ruliad_structured_recovery_accepts_tbptt_chunking() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_denoising.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .answer_denoising
+            .structured_recovery_weight = 0.01;
+        config
+            .training
+            .ruliad_supervision
+            .answer_denoising
+            .structured_recovery_negative_count = 1;
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.tbptt_persist_across_steps = true;
+        config
+            .validate()
+            .expect("structured recovery should run as an auxiliary forward with TBPTT");
+    }
+
+    #[test]
+    fn ruliad_structured_recovery_accepts_schema_negatives_without_field_mutations() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_denoising.enabled = true;
+        config
+            .training
+            .ruliad_supervision
+            .answer_denoising
+            .structured_recovery_weight = 0.01;
+        config
+            .training
+            .ruliad_supervision
+            .answer_denoising
+            .structured_recovery_schema_negative_count = 1;
+        config
+            .validate()
+            .expect("schema-only structured recovery should validate");
+    }
+
+    #[test]
+    fn ruliad_structured_contrast_accepts_schema_negatives_without_field_mutations() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.verifier_reward.enabled = true;
+        config.training.ruliad_supervision.verifier_reward.weight = 0.0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_contrast_weight = 0.01;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_negative_count = 0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_template_negative_count = 0;
+        config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .structured_schema_negative_count = 1;
+        config
+            .validate()
+            .expect("schema-only structured contrast should validate");
     }
 
     #[test]
@@ -4531,6 +5895,51 @@ capability_distinct_2_min_fraction = -0.1
         assert!(
             err.to_string()
                 .contains("capability_distinct_2_min_fraction"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_answer_distinct_min_fraction = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability answer distinct threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_answer_distinct_min_fraction"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_field_value_distinct_ratio_min = 1.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability field-value distinct threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_field_value_distinct_ratio_min"),
+            "unexpected error: {err}"
+        );
+
+        let config = parse_config(
+            r#"
+[training.gates]
+capability_field_value_dominance_max = -0.1
+"#,
+        );
+        let err = config
+            .validate()
+            .expect_err("invalid capability field-value dominance threshold should fail");
+        assert!(
+            err.to_string()
+                .contains("capability_field_value_dominance_max"),
             "unexpected error: {err}"
         );
     }

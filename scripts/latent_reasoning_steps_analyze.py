@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -42,14 +43,31 @@ SUMMARY_COLUMNS = [
     "configured_steps_last",
     "latent_eval_final_ce_delta_last",
     "latent_eval_final_ce_violation_last",
+    "latent_eval_final_entropy_bits_last",
+    "latent_eval_final_delta_rms_last",
     "latent_eval_best_energy_step_last",
     "latent_eval_final_energy_mean_last",
     "latent_eval_final_energy_delta_last",
     "latent_eval_final_energy_violation_last",
+    "latent_extra_eval_max_ce_delta_last",
+    "latent_extra_eval_max_ce_violation_last",
+    "latent_extra_eval_min_entropy_bits_last",
+    "latent_extra_eval_max_delta_rms_last",
     "source_loss_last",
     "source_entropy_bits_last",
+    "source_active_candidate_count_last",
+    "source_active_max_entropy_bits_last",
+    "source_normalized_entropy_last",
     "source_mean_difficulty_last",
+    "source_active_max_difficulty_last",
+    "source_mastered_max_difficulty_last",
+    "source_max_difficulty_level_last",
+    "source_materialized_frontier_edge_last",
+    "source_max_difficulty_probability_last",
+    "source_normalized_difficulty_score_last",
+    "source_target_difficulty_score_last",
     "source_hash_noise_probability_last",
+    "source_capability_lagging_probability_last",
     "ruliad_verifier_last",
     "ruliad_semantic_last",
     "ruliad_partial_last",
@@ -57,6 +75,7 @@ SUMMARY_COLUMNS = [
     "ruliad_malformed_last",
     "ruliad_missing_last",
     "ruliad_answer_field_accuracy_last",
+    "ruliad_answer_field_coverage_last",
     "ruliad_answer_termination_rate_last",
     "ruliad_completion_quality_last",
     "ruliad_expected_answer_distinct_last",
@@ -69,6 +88,19 @@ SUMMARY_COLUMNS = [
     "completion_period_2_to_16_last",
     "completion_period_2_to_64_last",
     "completion_dominant_period_2_to_64_last",
+    "contract_probe_verifier_last",
+    "contract_probe_semantic_last",
+    "contract_probe_partial_last",
+    "contract_probe_schema_wrong_last",
+    "contract_probe_malformed_last",
+    "contract_probe_answer_field_accuracy_last",
+    "contract_probe_answer_field_coverage_last",
+    "contract_probe_completion_health_last",
+    "contract_probe_answer_distinct_last",
+    "contract_probe_verifier_delta",
+    "contract_probe_completion_delta",
+    "contract_probe_answer_field_delta",
+    "contract_probe_answer_distinct_delta",
     "capability_gate_passed_last",
     "capability_gate_failure_count_last",
     "capability_completion_health_metric_last",
@@ -91,12 +123,16 @@ SUMMARY_COLUMNS = [
     "capability_completion_drop_from_best",
     "capability_bucket_mastered_count",
     "capability_bucket_lagging_count",
+    "capability_contract_mastered_count",
+    "capability_contract_lagging_count",
     "dynamics_control_count",
     "stable_control_count",
     "recovery_control_count",
     "recovery_control_fraction",
     "rollback_control_count",
     "hard_recovery_control_count",
+    "source_capability_recovery_control_count",
+    "source_capability_recovery_control_fraction",
     "capability_quality_recovery_count",
     "capability_gate_failed_count",
     "eval_step_sweep",
@@ -109,6 +145,15 @@ SUMMARY_COLUMNS = [
     "best_eval_verifier_delta",
     "best_eval_schema_delta",
     "best_eval_completion_delta",
+    "extra_eval_step_count",
+    "extra_eval_worst_steps",
+    "extra_eval_min_verifier",
+    "extra_eval_min_verifier_delta",
+    "extra_eval_min_completion",
+    "extra_eval_min_completion_delta",
+    "extra_eval_max_schema_delta",
+    "extra_eval_max_malformed_delta",
+    "extra_eval_max_period_2_to_64",
     "output_entropy_bits_last",
     "output_distinct_2_last",
     "output_repetition_last",
@@ -265,6 +310,12 @@ def latent_energy_eval_metrics(events: list[dict[str, Any]], max_steps: Any) -> 
         "latent_eval_final_ce_violation_last": last_metric(
             events, "valid", f"{prefix} Step {step_count} CE Monotonic Violation Rate"
         ),
+        "latent_eval_final_entropy_bits_last": last_metric(
+            events, "valid", f"{prefix} Step {step_count} Entropy Bits"
+        ),
+        "latent_eval_final_delta_rms_last": last_metric(
+            events, "valid", f"{prefix} Step {step_count} Delta RMS"
+        ),
         "latent_eval_best_energy_step_last": last_metric(
             events, "valid", f"{prefix} Best Energy Step"
         ),
@@ -277,6 +328,55 @@ def latent_energy_eval_metrics(events: list[dict[str, Any]], max_steps: Any) -> 
         "latent_eval_final_energy_violation_last": last_metric(
             events, "valid", f"{prefix} Step {step_count} Energy Monotonic Violation Rate"
         ),
+    }
+
+
+def latent_extra_eval_trajectory_metrics(
+    events: list[dict[str, Any]], max_steps: Any
+) -> dict[str, Any]:
+    trained_steps = finite(max_steps)
+    if trained_steps is None:
+        return {}
+    trained_step_count = int(trained_steps)
+    pattern = re.compile(
+        r"^Latent Eval Steps (?P<total>\d+) Step (?P<step>\d+) "
+        r"(?P<metric>CE Delta|CE Monotonic Violation Rate|Entropy Bits|Delta RMS)$"
+    )
+    latest: dict[tuple[int, int, str], float] = {}
+    for event in events:
+        if event.get("split") != "valid":
+            continue
+        name = str(event.get("name") or "")
+        match = pattern.match(name)
+        if match is None:
+            continue
+        total_steps = int(match.group("total"))
+        step = int(match.group("step"))
+        metric = match.group("metric")
+        if total_steps <= trained_step_count or step <= trained_step_count:
+            continue
+        value = finite(event.get("value"))
+        if value is not None:
+            latest[(total_steps, step, metric)] = value
+
+    def values(metric: str) -> list[float]:
+        return [
+            value
+            for key, value in latest.items()
+            if key[2] == metric
+        ]
+
+    ce_deltas = values("CE Delta")
+    ce_violations = values("CE Monotonic Violation Rate")
+    entropies = values("Entropy Bits")
+    delta_rms = values("Delta RMS")
+    return {
+        "latent_extra_eval_max_ce_delta_last": max(ce_deltas) if ce_deltas else None,
+        "latent_extra_eval_max_ce_violation_last": (
+            max(ce_violations) if ce_violations else None
+        ),
+        "latent_extra_eval_min_entropy_bits_last": min(entropies) if entropies else None,
+        "latent_extra_eval_max_delta_rms_last": max(delta_rms) if delta_rms else None,
     }
 
 
@@ -301,13 +401,21 @@ def dynamics_and_gate_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "hard_recovery",
         "hard_collapse",
     }
-    controls = [
-        str(event.get("mode") or "").lower()
-        for event in events
-        if event.get("type") == "dynamics_control"
+    control_events = [
+        event for event in events if event.get("type") == "dynamics_control"
     ]
+    controls = [str(event.get("mode") or "").lower() for event in control_events]
     recovery_count = sum(1 for mode in controls if mode in recovery_modes)
     control_count = len(controls)
+    source_capability_recovery_count = sum(
+        1
+        for event, mode in zip(control_events, controls)
+        if mode == "source_capability_recovery"
+        or (
+            "source-selection capability recovery"
+            in str(event.get("reason") or "").lower()
+        )
+    )
     gate_names = [
         str(event.get("gate") or "")
         for event in events
@@ -323,6 +431,10 @@ def dynamics_and_gate_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "rollback_control_count": sum(1 for mode in controls if mode == "rollback_recovery"),
         "hard_recovery_control_count": sum(
             1 for mode in controls if mode in {"hard_recovery", "hard_collapse"}
+        ),
+        "source_capability_recovery_control_count": source_capability_recovery_count,
+        "source_capability_recovery_control_fraction": (
+            source_capability_recovery_count / control_count if control_count > 0 else 0.0
         ),
         "capability_quality_recovery_count": gate_names.count(
             "continual_learning_capability_quality_recovery"
@@ -342,6 +454,37 @@ def last_source_selection(run_dir: Path) -> dict[str, Any] | None:
     return None
 
 
+def difficulty_level_from_bucket_label(label: Any) -> int | None:
+    text = str(label or "")
+    if not text.startswith("d"):
+        return None
+    try:
+        return int(text[1:])
+    except ValueError:
+        return None
+
+
+def source_difficulty_summary(source: dict[str, Any]) -> dict[str, Any]:
+    active: list[int] = []
+    mastered: list[int] = []
+    for bucket in source.get("difficulty_buckets") or []:
+        if not isinstance(bucket, dict):
+            continue
+        level = difficulty_level_from_bucket_label(bucket.get("label"))
+        if level is None:
+            continue
+        probability = finite(bucket.get("probability")) or 0.0
+        mastered_probability = finite(bucket.get("mastered_probability")) or 0.0
+        if probability > 1e-6:
+            active.append(level)
+        if mastered_probability > 1e-6:
+            mastered.append(level)
+    return {
+        "source_active_max_difficulty_last": max(active) if active else None,
+        "source_mastered_max_difficulty_last": max(mastered) if mastered else None,
+    }
+
+
 def capability_probes(run_dir: Path) -> list[dict[str, Any]]:
     return read_jsonl(run_dir / "events" / "capability_probe.jsonl")
 
@@ -359,7 +502,9 @@ def last_capability_probe(run_dir: Path, probe_name: str = "ruliad_correctness")
     return non_eval[-1] if non_eval else (rows[-1] if rows else None)
 
 
-def eval_step_probe_summary(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
+def eval_step_probe_summary(
+    run_dir: Path, base: dict[str, Any], trained_max_steps: Any
+) -> dict[str, Any]:
     latest_by_step: dict[int, dict[str, Any]] = {}
     for row in capability_probes(run_dir):
         name = str(row.get("probe_name") or "")
@@ -393,7 +538,7 @@ def eval_step_probe_summary(run_dir: Path, base: dict[str, Any]) -> dict[str, An
     best_verifier = finite(best.get("verifier_rate")) or 0.0
     best_schema = finite(best.get("schema_valid_wrong_rate")) or 0.0
     best_completion = finite(best.get("completion_health_rate")) or 0.0
-    return {
+    summary = {
         "best_eval_steps": best_steps,
         "best_eval_verifier": best_verifier,
         "best_eval_semantic": best.get("semantic_rate"),
@@ -403,6 +548,79 @@ def eval_step_probe_summary(run_dir: Path, base: dict[str, Any]) -> dict[str, An
         "best_eval_verifier_delta": best_verifier - base_verifier,
         "best_eval_schema_delta": best_schema - base_schema,
         "best_eval_completion_delta": best_completion - base_completion,
+    }
+    trained_steps = finite(trained_max_steps)
+    if trained_steps is None:
+        return summary
+    extra = {
+        steps: row
+        for steps, row in latest_by_step.items()
+        if steps > int(trained_steps)
+    }
+    if not extra:
+        return summary
+    worst_steps, _worst = min(extra.items(), key=key)
+    base_malformed = finite(base.get("malformed_rate")) or 0.0
+    extra_verifiers = [finite(row.get("verifier_rate")) or 0.0 for row in extra.values()]
+    extra_completions = [
+        finite(row.get("completion_health_rate")) or 0.0 for row in extra.values()
+    ]
+    extra_schema_deltas = [
+        (finite(row.get("schema_valid_wrong_rate")) or 0.0) - base_schema
+        for row in extra.values()
+    ]
+    extra_malformed_deltas = [
+        (finite(row.get("malformed_rate")) or 0.0) - base_malformed
+        for row in extra.values()
+    ]
+    extra_periods = [
+        finite(row.get("completion_max_period_2_to_64_fraction")) or 0.0
+        for row in extra.values()
+    ]
+    min_verifier = min(extra_verifiers)
+    min_completion = min(extra_completions)
+    summary.update(
+        {
+            "extra_eval_step_count": len(extra),
+            "extra_eval_worst_steps": worst_steps,
+            "extra_eval_min_verifier": min_verifier,
+            "extra_eval_min_verifier_delta": min_verifier - base_verifier,
+            "extra_eval_min_completion": min_completion,
+            "extra_eval_min_completion_delta": min_completion - base_completion,
+            "extra_eval_max_schema_delta": max(extra_schema_deltas),
+            "extra_eval_max_malformed_delta": max(extra_malformed_deltas),
+            "extra_eval_max_period_2_to_64": max(extra_periods),
+        }
+    )
+    return summary
+
+
+def contract_probe_summary(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
+    contract = last_capability_probe(run_dir, "ruliad_correctness_contract")
+    if not contract:
+        return {}
+    base_verifier = finite(base.get("verifier_rate")) or 0.0
+    base_completion = finite(base.get("completion_health_rate")) or 0.0
+    base_field = finite(base.get("answer_field_accuracy")) or 0.0
+    base_distinct = finite(base.get("actual_answer_distinct_fraction")) or 0.0
+    contract_verifier = finite(contract.get("verifier_rate")) or 0.0
+    contract_completion = finite(contract.get("completion_health_rate")) or 0.0
+    contract_field = finite(contract.get("answer_field_accuracy")) or 0.0
+    contract_distinct = finite(contract.get("actual_answer_distinct_fraction")) or 0.0
+    return {
+        "contract_probe_verifier_last": contract_verifier,
+        "contract_probe_semantic_last": contract.get("semantic_rate"),
+        "contract_probe_partial_last": contract.get("partial_credit_rate"),
+        "contract_probe_schema_wrong_last": contract.get("schema_valid_wrong_rate"),
+        "contract_probe_malformed_last": contract.get("malformed_rate"),
+        "contract_probe_answer_field_accuracy_last": contract_field,
+        "contract_probe_answer_field_coverage_last": contract.get("answer_field_coverage"),
+        "contract_probe_completion_health_last": contract_completion,
+        "contract_probe_answer_distinct_last": contract_distinct,
+        "contract_probe_verifier_delta": contract_verifier - base_verifier,
+        "contract_probe_completion_delta": contract_completion - base_completion,
+        "contract_probe_answer_field_delta": contract_field - base_field,
+        "contract_probe_answer_distinct_delta": contract_distinct - base_distinct,
     }
 
 
@@ -483,6 +701,8 @@ def capability_probe_summary(run_dir: Path, events: list[dict[str, Any]]) -> dic
     buckets = latest.get("group_buckets") or []
     mastered = 0
     lagging = 0
+    contract_mastered = 0
+    contract_lagging = 0
     for bucket in buckets:
         completion = finite(bucket.get("completion_health_rate"))
         if completion is None:
@@ -494,10 +714,21 @@ def capability_probe_summary(run_dir: Path, events: list[dict[str, Any]]) -> dic
         schema = finite(bucket.get("schema_valid_wrong_rate")) or 0.0
         malformed = finite(bucket.get("malformed_rate")) or 0.0
         missing = finite(bucket.get("missing_rate")) or 0.0
-        if verifier >= 0.50 and completion >= 0.80 and max(schema, malformed, missing) <= 0.10:
+        bucket_mastered = capability_bucket_mastered(
+            verifier, completion, schema, malformed, missing
+        )
+        bucket_lagging = capability_bucket_lagging(
+            verifier, completion, schema, malformed, missing
+        )
+        if bucket_mastered:
             mastered += 1
-        elif completion >= 0.60 and verifier <= 0.05:
+        elif bucket_lagging:
             lagging += 1
+        if str(bucket.get("label") or "").startswith("contract:"):
+            if bucket_mastered:
+                contract_mastered += 1
+            elif bucket_lagging:
+                contract_lagging += 1
     score_auc = sum(score for score, _ in scored) / len(scored)
     return {
         "capability_first_pass_epoch": first_epoch,
@@ -527,7 +758,34 @@ def capability_probe_summary(run_dir: Path, events: list[dict[str, Any]]) -> dic
         ),
         "capability_bucket_mastered_count": mastered,
         "capability_bucket_lagging_count": lagging,
+        "capability_contract_mastered_count": contract_mastered,
+        "capability_contract_lagging_count": contract_lagging,
     }
+
+
+def capability_bucket_mastered(
+    verifier: float,
+    completion: float,
+    schema: float,
+    malformed: float,
+    missing: float,
+) -> bool:
+    return verifier >= 0.50 and completion >= 0.80 and max(schema, malformed, missing) <= 0.10
+
+
+def capability_bucket_lagging(
+    verifier: float,
+    completion: float,
+    schema: float,
+    malformed: float,
+    missing: float,
+) -> bool:
+    if verifier > 0.05:
+        return False
+    structurally_parseable = malformed <= 0.25 and missing <= 0.25
+    schema_valid_wrong = schema >= 0.25 and structurally_parseable
+    answerable_but_unverified = completion >= 0.60 and structurally_parseable
+    return schema_valid_wrong or answerable_but_unverified
 
 
 def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
@@ -555,6 +813,10 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     capability_score_drop = finite(row.get("capability_score_drop_from_best")) or 0.0
     capability_verifier_drop = finite(row.get("capability_verifier_drop_from_best")) or 0.0
     capability_completion_drop = finite(row.get("capability_completion_drop_from_best")) or 0.0
+    capability_lagging_buckets = finite(row.get("capability_bucket_lagging_count")) or 0.0
+    contract_verifier_delta = finite(row.get("contract_probe_verifier_delta")) or 0.0
+    contract_field_delta = finite(row.get("contract_probe_answer_field_delta")) or 0.0
+    contract_completion_delta = finite(row.get("contract_probe_completion_delta")) or 0.0
     recovery_fraction = finite(row.get("recovery_control_fraction")) or 0.0
     quality_recoveries = finite(row.get("capability_quality_recovery_count")) or 0.0
     score += (
@@ -577,6 +839,10 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
     score -= min(3.0, capability_score_drop)
     score -= capability_verifier_drop * 4.0
     score -= capability_completion_drop * 2.0
+    score -= min(3.0, max(0.0, capability_lagging_buckets - 8.0) * 0.10)
+    score += min(1.0, max(0.0, contract_verifier_delta * 2.0))
+    score += min(0.5, max(0.0, contract_field_delta))
+    score += min(0.5, max(0.0, contract_completion_delta))
     score -= min(2.0, recovery_fraction * 2.0)
     score -= min(1.0, quality_recoveries * 0.25)
     entropy = finite(row.get("output_entropy_bits_last"))
@@ -615,6 +881,7 @@ def health_and_score(row: dict[str, Any]) -> tuple[bool, float]:
         and capability_score_drop <= 1.0
         and capability_verifier_drop <= 0.125
         and capability_completion_drop <= 0.30
+        and capability_lagging_buckets <= 8.0
         and recovery_fraction <= 0.50
     )
     return healthy, score
@@ -625,8 +892,10 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
     run_dir = Path(manifest.get("run_dir") or "")
     events = read_jsonl(run_dir / "events" / "training_events.jsonl")
     source = last_source_selection(run_dir) or {}
+    source_difficulty = source_difficulty_summary(source)
     capability = last_capability_probe(run_dir) or {}
-    eval_summary = eval_step_probe_summary(run_dir, capability)
+    eval_summary = eval_step_probe_summary(run_dir, capability, manifest.get("max_steps"))
+    contract_summary = contract_probe_summary(run_dir, capability)
     gpu_log_path = Path(manifest["gpu_log_path"]) if manifest.get("gpu_log_path") else None
     log_path = Path(manifest["log_path"]) if manifest.get("log_path") else None
     gpu_util_mean, gpu_util_p50, gpu_power_mean = gpu_stats(gpu_log_path)
@@ -701,8 +970,20 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         ),
         "source_loss_last": source.get("loss"),
         "source_entropy_bits_last": source.get("entropy_bits"),
+        "source_active_candidate_count_last": source.get("active_candidate_count"),
+        "source_active_max_entropy_bits_last": source.get("active_max_entropy_bits"),
+        "source_normalized_entropy_last": source.get("normalized_entropy"),
         "source_mean_difficulty_last": source.get("mean_difficulty_level"),
+        **source_difficulty,
+        "source_max_difficulty_level_last": source.get("max_difficulty_level"),
+        "source_materialized_frontier_edge_last": source.get("materialized_frontier_edge"),
+        "source_max_difficulty_probability_last": source.get("max_difficulty_probability"),
+        "source_normalized_difficulty_score_last": source.get("normalized_difficulty_score"),
+        "source_target_difficulty_score_last": source.get("target_difficulty_score"),
         "source_hash_noise_probability_last": source.get("hash_noise_probability"),
+        "source_capability_lagging_probability_last": source.get(
+            "capability_lagging_probability"
+        ),
         "ruliad_verifier_last": capability.get("verifier_rate"),
         "ruliad_semantic_last": capability.get("semantic_rate"),
         "ruliad_partial_last": capability.get("partial_credit_rate"),
@@ -710,6 +991,7 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "ruliad_malformed_last": capability.get("malformed_rate"),
         "ruliad_missing_last": capability.get("missing_rate"),
         "ruliad_answer_field_accuracy_last": capability.get("answer_field_accuracy"),
+        "ruliad_answer_field_coverage_last": capability.get("answer_field_coverage"),
         "ruliad_answer_termination_rate_last": capability.get("answer_termination_rate"),
         "ruliad_completion_quality_last": last_metric(
             events, "valid", "Ruliad Mean Completion Quality"
@@ -755,7 +1037,9 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "run_dir": str(run_dir) if str(run_dir) else "",
     }
     row.update(latent_energy_eval_metrics(events, manifest.get("max_steps")))
+    row.update(latent_extra_eval_trajectory_metrics(events, manifest.get("max_steps")))
     row.update(eval_summary)
+    row.update(contract_summary)
     row.update(capability_probe_summary(run_dir, events))
     row.update(dynamics_and_gate_summary(events))
     healthy, score = health_and_score(row)
@@ -785,8 +1069,8 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
     rank_rows = sorted(rows, key=lambda row: finite(row.get("rank_score")) or -1e9, reverse=True)
     with md_path.open("w") as handle:
         handle.write("# Latent Reasoning Max Steps Ablation\n\n")
-        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | verifier | semantic | partial | schema wrong | malformed | field | term | completion | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | cap drop | rec frac | q rec | lag buckets | best eval steps | best eval verifier | energy comps | step comps | out H | out d2 | gpu util | score |\n")
-        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | active d | mastered d | source lag | verifier | semantic | partial | schema wrong | malformed | field | coverage | term | completion | contract verifier | contract field | contract completion | contract dver | contract dfield | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | cap drop | rec frac | src rec | q rec | lag buckets | lag contracts | best eval steps | best eval verifier | extra steps | extra worst | extra dver | extra dcomp | extra dmal | extra lat CE | extra lat viol | extra lat H | extra lat rms | energy comps | step comps | out H | out d2 | gpu util | score |\n")
+        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for row in rank_rows:
             handle.write(
                 "| "
@@ -797,14 +1081,23 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("tokens_per_sec")),
                         fmt(row.get("stage_model_tokens_per_sec")),
                         fmt(row.get("valid_teacher_ce_last")),
+                        fmt(row.get("source_active_max_difficulty_last")),
+                        fmt(row.get("source_mastered_max_difficulty_last")),
+                        fmt(row.get("source_capability_lagging_probability_last")),
                         fmt(row.get("ruliad_verifier_last")),
                         fmt(row.get("ruliad_semantic_last")),
                         fmt(row.get("ruliad_partial_last")),
                         fmt(row.get("ruliad_schema_wrong_last")),
                         fmt(row.get("ruliad_malformed_last")),
                         fmt(row.get("ruliad_answer_field_accuracy_last")),
+                        fmt(row.get("ruliad_answer_field_coverage_last")),
                         fmt(row.get("ruliad_answer_termination_rate_last")),
                         fmt(row.get("completion_health_last")),
+                        fmt(row.get("contract_probe_verifier_last")),
+                        fmt(row.get("contract_probe_answer_field_accuracy_last")),
+                        fmt(row.get("contract_probe_completion_health_last")),
+                        fmt(row.get("contract_probe_verifier_delta")),
+                        fmt(row.get("contract_probe_answer_field_delta")),
                         fmt(row.get("completion_distinct_2_last")),
                         fmt(row.get("completion_period_2_to_64_last")),
                         fmt(row.get("capability_gate_passed_last")),
@@ -813,10 +1106,21 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("capability_score_auc")),
                         fmt(row.get("capability_score_drop_from_best")),
                         fmt(row.get("recovery_control_fraction")),
+                        fmt(row.get("source_capability_recovery_control_count")),
                         fmt(row.get("capability_quality_recovery_count")),
                         fmt(row.get("capability_bucket_lagging_count")),
+                        fmt(row.get("capability_contract_lagging_count")),
                         fmt(row.get("best_eval_steps")),
                         fmt(row.get("best_eval_verifier")),
+                        fmt(row.get("extra_eval_step_count")),
+                        fmt(row.get("extra_eval_worst_steps")),
+                        fmt(row.get("extra_eval_min_verifier_delta")),
+                        fmt(row.get("extra_eval_min_completion_delta")),
+                        fmt(row.get("extra_eval_max_malformed_delta")),
+                        fmt(row.get("latent_extra_eval_max_ce_delta_last")),
+                        fmt(row.get("latent_extra_eval_max_ce_violation_last")),
+                        fmt(row.get("latent_extra_eval_min_entropy_bits_last")),
+                        fmt(row.get("latent_extra_eval_max_delta_rms_last")),
                         fmt(row.get("latent_energy_model_components_last")),
                         fmt(row.get("latent_step_contract_components_last")),
                         fmt(row.get("output_entropy_bits_last")),
@@ -854,9 +1158,10 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
             if completion is None:
                 completion = max(0.0, 1.0 - schema - malformed - missing)
             answer_field = finite(bucket.get("answer_field_accuracy"))
+            answer_coverage = finite(bucket.get("answer_field_coverage"))
             answer_termination = finite(bucket.get("answer_termination_rate"))
-            mastered = verifier >= 0.50 and completion >= 0.80 and max(schema, malformed, missing) <= 0.10
-            lagging = completion >= 0.60 and verifier <= 0.05
+            mastered = capability_bucket_mastered(verifier, completion, schema, malformed, missing)
+            lagging = capability_bucket_lagging(verifier, completion, schema, malformed, missing)
             bucket_rows.append(
                 {
                     "trial_key": row.get("trial_key"),
@@ -869,6 +1174,7 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
                     "partial_credit_rate": partial,
                     "completion_health_rate": completion,
                     "answer_field_accuracy": answer_field,
+                    "answer_field_coverage": answer_coverage,
                     "answer_termination_rate": answer_termination,
                     "schema_valid_wrong_rate": schema,
                     "malformed_rate": malformed,
@@ -893,6 +1199,7 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
         "partial_credit_rate",
         "completion_health_rate",
         "answer_field_accuracy",
+        "answer_field_coverage",
         "answer_termination_rate",
         "schema_valid_wrong_rate",
         "malformed_rate",
@@ -913,8 +1220,8 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
         writer.writerows(bucket_rows)
     with md_path.open("w") as handle:
         handle.write("# Capability Bucket Summary\n\n")
-        handle.write("| trial | bucket | items | verifier | partial | field | terminated | completion | schema wrong | malformed | missing | mastered | lagging |\n")
-        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
+        handle.write("| trial | bucket | items | verifier | partial | field | coverage | terminated | completion | schema wrong | malformed | missing | mastered | lagging |\n")
+        handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
         for item in bucket_rows:
             handle.write(
                 "| "
@@ -926,6 +1233,7 @@ def write_capability_bucket_summary(rows: list[dict[str, Any]], out_dir: Path) -
                         fmt(item.get("verifier_rate")),
                         fmt(item.get("partial_credit_rate")),
                         fmt(item.get("answer_field_accuracy")),
+                        fmt(item.get("answer_field_coverage")),
                         fmt(item.get("answer_termination_rate")),
                         fmt(item.get("completion_health_rate")),
                         fmt(item.get("schema_valid_wrong_rate")),

@@ -32,6 +32,21 @@ extend_when_max_difficulty_probability_at_least = 0.25
 # Zero means no hard materialization limit; the ruliad frontier can keep expanding forever.
 max_materialized_levels = 0
 
+[source_selection.cold_start]
+enabled = true
+# Mainnet-style runs still expose an unbounded frontier, but cold models should not begin at the
+# edge before verifier-backed capability exists.
+max_difficulty_level = 0
+hold_steps = 4096
+ramp_steps = 16384
+release_requires_mastery = true
+mastery_min_feedback_count = 1
+mastery_verifier_min = 0.50
+mastery_completion_health_min = 0.75
+mastery_schema_wrong_max = 0.25
+mastery_malformed_max = 0.05
+mastery_missing_max = 0.05
+
 [source_selection.sampler]
 exploration_floor = 0.005
 mastery_escape_weight = 4.0
@@ -39,6 +54,8 @@ mastery_escape_threshold = 0.70
 mastery_min_normalized_difficulty = 0.90
 mastery_min_max_difficulty_probability = 0.35
 mastery_hash_noise_max_probability = 0.01
+max_answer_contract_probability = 0.35
+min_answer_contract_probability = 0.08
 
 [[families]]
 kind = "eca"

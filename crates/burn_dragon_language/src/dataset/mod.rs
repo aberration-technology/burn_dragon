@@ -76,9 +76,19 @@ impl Dataset {
         &self,
         report: &burn_dragon_universality::RuliadEvalReport,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        self.record_ruliad_capability_feedback_at_step(report, None)
+    }
+
+    pub fn record_ruliad_capability_feedback_at_step(
+        &self,
+        report: &burn_dragon_universality::RuliadEvalReport,
+        absolute_step: Option<usize>,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         match self {
             Dataset::HuggingFace(_) => None,
-            Dataset::Universality(dataset) => dataset.record_ruliad_capability_feedback(report),
+            Dataset::Universality(dataset) => {
+                dataset.record_ruliad_capability_feedback_at_step(report, absolute_step)
+            }
         }
     }
 
@@ -152,6 +162,13 @@ impl Dataset {
             Dataset::Universality(dataset) => {
                 dataset.decode_ruliad_payload_tokens(tokens, stop_at_eos)
             }
+        }
+    }
+
+    pub fn encode_ruliad_payload_tokens(&self, text: &str) -> Option<Vec<u32>> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.encode_ruliad_payload_tokens(text),
         }
     }
 

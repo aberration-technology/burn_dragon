@@ -6,13 +6,18 @@ BACKEND="${BURN_DRAGON_SWEEP_BACKEND:-cuda}"
 FEATURES="${BURN_DRAGON_SWEEP_FEATURES:-train,cuda}"
 MAX_ITERS="${BURN_DRAGON_SWEEP_MAX_ITERS:-4}"
 BATCH_SIZES_CSV="${BURN_DRAGON_SWEEP_BATCH_SIZES:-1}"
+BLOCK_SIZE="${BURN_DRAGON_SWEEP_BLOCK_SIZE:-}"
 TIMEOUT_SECONDS="${BURN_DRAGON_SWEEP_TIMEOUT_SECONDS:-1200}"
 CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_SWEEP_CHECKPOINT_INTERVAL_ITERS:-1000000}"
-MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_SWEEP_MAX_SYSTEM_MEMORY_FRACTION:-0.90}"
-MIN_AVAILABLE_MB="${BURN_DRAGON_SWEEP_MIN_AVAILABLE_MB:-12288}"
+MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_SWEEP_MAX_SYSTEM_MEMORY_FRACTION:-0.70}"
+MIN_AVAILABLE_MB="${BURN_DRAGON_SWEEP_MIN_AVAILABLE_MB:-49152}"
 SAMPLE_INTERVAL_SECONDS="${BURN_DRAGON_SWEEP_SAMPLE_INTERVAL_SECONDS:-1}"
 OUT_DIR="${BURN_DRAGON_SWEEP_OUT_DIR:-$ROOT_DIR/runs/ruliad-neuron-sweep}"
 PROFILES_CSV="${BURN_DRAGON_SWEEP_PROFILES:-crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-16k.jepa.training.toml,crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-32k.jepa.training.toml,crates/burn_dragon_p2p/deploy/profiles/ruliad-1m-la-64k.jepa.training.toml}"
+N_LAYER="${BURN_DRAGON_SWEEP_N_LAYER:-}"
+N_EMBD="${BURN_DRAGON_SWEEP_N_EMBD:-}"
+N_HEAD="${BURN_DRAGON_SWEEP_N_HEAD:-}"
+LATENT_TOTAL="${BURN_DRAGON_SWEEP_LATENT_TOTAL:-}"
 
 usage() {
   cat <<'USAGE'
@@ -24,13 +29,15 @@ Options:
   --features <features>         Cargo features. Default: train,cuda.
   --profiles <csv>              Comma-separated training profile paths.
   --batch-sizes <csv>           Comma-separated batch sizes. Default: 1.
+  --block-size <n>              Override training block size.
   --max-iters <n>               Train iterations per probe. Default: 4.
+  --shape L,E,H,Z               Override n_layer,n_embd,n_head,latent_total.
   --timeout-seconds <n>         Wall-clock timeout per probe. Default: 1200.
   --out-dir <path>              Logs and sweep report directory.
 
 Environment guards:
-  BURN_DRAGON_SWEEP_MAX_SYSTEM_MEMORY_FRACTION  Default: 0.90
-  BURN_DRAGON_SWEEP_MIN_AVAILABLE_MB            Default: 12288
+  BURN_DRAGON_SWEEP_MAX_SYSTEM_MEMORY_FRACTION  Default: 0.70
+  BURN_DRAGON_SWEEP_MIN_AVAILABLE_MB            Default: 49152
 
 The script runs guarded short smokes only. Increase --max-iters after a candidate
 has proven safe at the requested batch size.
@@ -55,8 +62,16 @@ while [[ $# -gt 0 ]]; do
       BATCH_SIZES_CSV="$2"
       shift 2
       ;;
+    --block-size)
+      BLOCK_SIZE="$2"
+      shift 2
+      ;;
     --max-iters)
       MAX_ITERS="$2"
+      shift 2
+      ;;
+    --shape)
+      IFS=',' read -r N_LAYER N_EMBD N_HEAD LATENT_TOTAL <<< "$2"
       shift 2
       ;;
     --timeout-seconds)
@@ -103,6 +118,28 @@ mem_total_kb() {
 
 mem_available_kb() {
   awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+}
+
+preflight_memory_guard() {
+  local total_kb
+  local available_kb
+  local used_kb
+  local max_fraction_bps
+  local min_available_kb
+
+  total_kb="$(mem_total_kb)"
+  available_kb="$(mem_available_kb)"
+  used_kb=$((total_kb - available_kb))
+  max_fraction_bps="$(fraction_to_bps "$MAX_SYSTEM_MEMORY_FRACTION")"
+  min_available_kb=$((MIN_AVAILABLE_MB * 1024))
+  if (( used_kb * 10000 > total_kb * max_fraction_bps )); then
+    echo "preflight RAM guard tripped: used=${used_kb}KiB total=${total_kb}KiB fraction_limit=${MAX_SYSTEM_MEMORY_FRACTION}" >&2
+    return 1
+  fi
+  if (( available_kb < min_available_kb )); then
+    echo "preflight RAM guard tripped: available=${available_kb}KiB floor=${min_available_kb}KiB" >&2
+    return 1
+  fi
 }
 
 fraction_to_bps() {
@@ -193,6 +230,7 @@ run_probe() {
   local profile="$1"
   local batch_size="$2"
   local profile_name
+  local shape_suffix=""
   local log_path
   local status
   local peak_used_mb
@@ -200,19 +238,41 @@ run_probe() {
   local elapsed_seconds
 
   profile_name="$(basename "$profile" .training.toml)"
-  log_path="$OUT_DIR/${profile_name}-bs${batch_size}-iters${MAX_ITERS}.log"
+  if [[ -n "$LATENT_TOTAL" ]]; then
+    shape_suffix="-z${LATENT_TOTAL}"
+  fi
+  log_path="$OUT_DIR/${profile_name}${shape_suffix}-bs${batch_size}-iters${MAX_ITERS}.log"
 
-  echo "==> profile=$profile batch_size=$batch_size max_iters=$MAX_ITERS backend=$BACKEND" | tee "$log_path"
+  echo "==> profile=$profile batch_size=$batch_size block_size=${BLOCK_SIZE:-profile} max_iters=$MAX_ITERS backend=$BACKEND shape=${N_LAYER:-profile},${N_EMBD:-profile},${N_HEAD:-profile},${LATENT_TOTAL:-profile}" | tee "$log_path"
+  if ! preflight_memory_guard 2>&1 | tee -a "$log_path"; then
+    local total_kb
+    local available_kb
+    local used_kb
+    total_kb="$(mem_total_kb)"
+    available_kb="$(mem_available_kb)"
+    used_kb=$((total_kb - available_kb))
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+      "$profile" "$batch_size" "preflight_ram_guard" "$((used_kb / 1024))" "$((available_kb / 1024))" "0" "$log_path" \
+      | tee -a "$REPORT"
+    return 1
+  fi
   (
     cd "$ROOT_DIR"
     export RUSTC="$RUSTUP_RUSTC"
     export CARGO="$RUSTUP_CARGO"
     export BURN_DRAGON_RUN_ROOT="$OUT_DIR/runs"
     export DragonModel_STAGE_PROFILE=1
+    override_args=()
+    if [[ -n "$N_LAYER" ]]; then override_args+=(--n-layer "$N_LAYER"); fi
+    if [[ -n "$N_EMBD" ]]; then override_args+=(--n-embd "$N_EMBD"); fi
+    if [[ -n "$N_HEAD" ]]; then override_args+=(--n-head "$N_HEAD"); fi
+    if [[ -n "$LATENT_TOTAL" ]]; then override_args+=(--latent-total "$LATENT_TOTAL"); fi
+    if [[ -n "$BLOCK_SIZE" ]]; then override_args+=(--block-size "$BLOCK_SIZE"); fi
     exec "$RUSTUP_CARGO" run --release -p burn_dragon_language --example train_language \
       --features "$FEATURES" -- \
       --backend "$BACKEND" \
       --config "$profile" \
+      "${override_args[@]}" \
       --batch-size "$batch_size" \
       --max-iters "$MAX_ITERS" \
       --checkpoint-interval-iters "$CHECKPOINT_INTERVAL_ITERS"

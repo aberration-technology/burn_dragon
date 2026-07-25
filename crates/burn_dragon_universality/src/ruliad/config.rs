@@ -499,6 +499,20 @@ pub struct RuliadSourceSelectionColdStartConfig {
     pub hold_steps: usize,
     #[serde(default = "default_cold_start_ramp_steps")]
     pub ramp_steps: usize,
+    #[serde(default)]
+    pub release_requires_mastery: bool,
+    #[serde(default = "default_cold_start_mastery_min_feedback_count")]
+    pub mastery_min_feedback_count: usize,
+    #[serde(default = "default_cold_start_mastery_verifier_min")]
+    pub mastery_verifier_min: f32,
+    #[serde(default = "default_cold_start_mastery_completion_health_min")]
+    pub mastery_completion_health_min: f32,
+    #[serde(default = "default_cold_start_mastery_schema_wrong_max")]
+    pub mastery_schema_wrong_max: f32,
+    #[serde(default = "default_cold_start_mastery_malformed_max")]
+    pub mastery_malformed_max: f32,
+    #[serde(default = "default_cold_start_mastery_missing_max")]
+    pub mastery_missing_max: f32,
 }
 
 impl Default for RuliadSourceSelectionColdStartConfig {
@@ -508,6 +522,13 @@ impl Default for RuliadSourceSelectionColdStartConfig {
             max_difficulty_level: default_cold_start_max_difficulty_level(),
             hold_steps: default_cold_start_hold_steps(),
             ramp_steps: default_cold_start_ramp_steps(),
+            release_requires_mastery: false,
+            mastery_min_feedback_count: default_cold_start_mastery_min_feedback_count(),
+            mastery_verifier_min: default_cold_start_mastery_verifier_min(),
+            mastery_completion_health_min: default_cold_start_mastery_completion_health_min(),
+            mastery_schema_wrong_max: default_cold_start_mastery_schema_wrong_max(),
+            mastery_malformed_max: default_cold_start_mastery_malformed_max(),
+            mastery_missing_max: default_cold_start_mastery_missing_max(),
         }
     }
 }
@@ -574,6 +595,70 @@ impl RuliadCorpusConfig {
             if self.source_selection.cold_start.ramp_steps == 0 {
                 return Err(anyhow!(
                     "source_selection.cold_start.ramp_steps must be > 0 when cold_start is enabled"
+                ));
+            }
+            if self.source_selection.cold_start.mastery_min_feedback_count == 0 {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_min_feedback_count must be > 0 when cold_start is enabled"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.source_selection.cold_start.mastery_verifier_min)
+                || !self
+                    .source_selection
+                    .cold_start
+                    .mastery_verifier_min
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_verifier_min must be finite in [0, 1]"
+                ));
+            }
+            if !(0.0..=1.0).contains(
+                &self
+                    .source_selection
+                    .cold_start
+                    .mastery_completion_health_min,
+            ) || !self
+                .source_selection
+                .cold_start
+                .mastery_completion_health_min
+                .is_finite()
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_completion_health_min must be finite in [0, 1]"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.source_selection.cold_start.mastery_schema_wrong_max)
+                || !self
+                    .source_selection
+                    .cold_start
+                    .mastery_schema_wrong_max
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_schema_wrong_max must be finite in [0, 1]"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.source_selection.cold_start.mastery_malformed_max)
+                || !self
+                    .source_selection
+                    .cold_start
+                    .mastery_malformed_max
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_malformed_max must be finite in [0, 1]"
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.source_selection.cold_start.mastery_missing_max)
+                || !self
+                    .source_selection
+                    .cold_start
+                    .mastery_missing_max
+                    .is_finite()
+            {
+                return Err(anyhow!(
+                    "source_selection.cold_start.mastery_missing_max must be finite in [0, 1]"
                 ));
             }
         }
@@ -821,6 +906,30 @@ fn default_cold_start_ramp_steps() -> usize {
     8192
 }
 
+fn default_cold_start_mastery_min_feedback_count() -> usize {
+    1
+}
+
+fn default_cold_start_mastery_verifier_min() -> f32 {
+    0.50
+}
+
+fn default_cold_start_mastery_completion_health_min() -> f32 {
+    0.75
+}
+
+fn default_cold_start_mastery_schema_wrong_max() -> f32 {
+    0.25
+}
+
+fn default_cold_start_mastery_malformed_max() -> f32 {
+    0.05
+}
+
+fn default_cold_start_mastery_missing_max() -> f32 {
+    0.05
+}
+
 fn default_frontier_levels_per_extension() -> usize {
     8
 }
@@ -927,5 +1036,51 @@ mod tests {
                 assert!(steps.max <= 8);
             }
         }
+    }
+
+    #[test]
+    fn cold_start_mastery_gate_config_validates_thresholds() {
+        let mut config = RuliadCorpusConfig {
+            output_dir: "target/test-ruliad-cold-start".into(),
+            seed: 1,
+            name: "cold-start".to_string(),
+            train_samples: 8,
+            validation_samples: 2,
+            chunk_token_capacity: 1024,
+            serialization: RuliadSerializationConfig::default(),
+            tokenization: RuliadTokenizationConfig::default(),
+            source_selection: RuliadSourceSelectionConfig {
+                enabled: true,
+                difficulty_levels: UsizeRangeConfig { min: 0, max: 4 },
+                cold_start: RuliadSourceSelectionColdStartConfig {
+                    enabled: true,
+                    max_difficulty_level: 0,
+                    release_requires_mastery: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            families: compact_ruliad_families(),
+            proof_tasks: None,
+            lean_task_limit: None,
+        };
+        config.validate().expect("valid mastery-gated cold start");
+
+        config
+            .source_selection
+            .cold_start
+            .mastery_min_feedback_count = 0;
+        let err = config.validate().expect_err("zero feedback count rejected");
+        assert!(err.to_string().contains("mastery_min_feedback_count"));
+
+        config
+            .source_selection
+            .cold_start
+            .mastery_min_feedback_count = 1;
+        config.source_selection.cold_start.mastery_verifier_min = 1.5;
+        let err = config
+            .validate()
+            .expect_err("invalid verifier threshold rejected");
+        assert!(err.to_string().contains("mastery_verifier_min"));
     }
 }

@@ -58,6 +58,8 @@ enum Command {
         #[arg(long, default_value_t = 0.0)]
         min_task_share: f32,
         #[arg(long, default_value_t = 0.0)]
+        max_answer_contract_share: f32,
+        #[arg(long, default_value_t = 0.0)]
         max_duplicate_oracle_hash_rate: f32,
         #[arg(long)]
         relaxed_semantics: bool,
@@ -168,12 +170,14 @@ pub fn main() -> Result<()> {
             samples,
             out,
             min_task_share,
+            max_answer_contract_share,
             max_duplicate_oracle_hash_rate,
             relaxed_semantics,
             fail_on_gates,
         } => {
             let thresholds = RuliadDiagnosticThresholds {
                 min_task_share,
+                max_answer_contract_share,
                 max_duplicate_oracle_hash_rate,
                 require_all_semantics: !relaxed_semantics,
             };
@@ -268,6 +272,13 @@ pub fn main() -> Result<()> {
                     previous_loss_ema: 2.0 + (index % 7) as f32 * 0.5,
                     gradient_alignment: 0.0,
                     is_hash_noise: index % 11 == 0,
+                    capability_feedback_count: 0,
+                    capability_verifier_ema: 0.0,
+                    capability_partial_ema: 0.0,
+                    capability_completion_health_ema: 0.0,
+                    capability_schema_wrong_ema: 0.0,
+                    capability_malformed_ema: 0.0,
+                    capability_missing_ema: 0.0,
                 })
                 .collect::<Vec<_>>();
             let sampler = RuliadFrontierSampler::new(RuliadSamplerConfig::default(), candidates);

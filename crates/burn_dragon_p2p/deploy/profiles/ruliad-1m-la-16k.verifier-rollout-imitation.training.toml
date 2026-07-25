@@ -1,0 +1,18 @@
+extends = ["ruliad-1m-la-16k.verifier-reward.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+enabled = true
+weight = 0.0
+group_size = 4
+max_completion_tokens = 64
+temperature = 0.8
+top_k = 64
+rollout_imitation_weight = 0.02
+rollout_imitation_every_steps = 16
+rollout_imitation_start_after_steps = 128
+rollout_imitation_min_partial_progress_ppm = 500000
+rollout_imitation_min_completion_quality_ppm = 750000
+rollout_imitation_min_verifier_rate_ppm = 100000
+rollout_imitation_max_schema_wrong_rate_ppm = 250000
+rollout_imitation_max_malformed_rate_ppm = 250000
+rollout_imitation_max_rows_per_step = 16

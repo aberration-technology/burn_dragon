@@ -175,8 +175,11 @@ mod tests {
                 ..burn_dragon_core::DragonConfig::default()
             },
             training_objective: crate::config::DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Wgpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,

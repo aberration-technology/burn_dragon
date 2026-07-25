@@ -493,8 +493,9 @@ impl Tokenizer {
 
         // Prepare a true Python iterator object
         let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
-            pyo3::Py::from_owned_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
-        };
+            pyo3::Bound::from_owned_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
+        }
+        .unbind();
 
         // Global chunk counts
         let mut counts: AHashMap<CompactString, i32> = AHashMap::new();

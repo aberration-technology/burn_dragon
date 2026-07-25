@@ -170,7 +170,7 @@ jobs:
       - name: bootstrap locked sibling stack
         uses: ./.github/actions/bootstrap-stack
         with:
-          token: ${{ secrets.BURN_STACK_TOKEN || github.token }}
+          token: ${{ secrets.BURN_STACK_TOKEN }}
 
       - name: resolve deployment settings
         shell: bash

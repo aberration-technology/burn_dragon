@@ -229,6 +229,8 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
     for snippet in [
         "inputs:",
         "token:",
+        "require cross-repository read token",
+        "BURN_STACK_TOKEN must have read access",
         "GIT_CONFIG_COUNT: 1",
         "GIT_CONFIG_KEY_0: url.https://x-access-token:${{ inputs.token }}@github.com/.insteadOf",
         "GIT_CONFIG_VALUE_0: https://github.com/",
@@ -253,8 +255,13 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
             )?;
             require_contains(
                 &text,
-                "token: ${{ secrets.BURN_STACK_TOKEN || github.token }}",
+                "token: ${{ secrets.BURN_STACK_TOKEN }}",
                 &format!("{path} supplies cross-repository read credentials"),
+            )?;
+            require_absent(
+                &text,
+                "secrets.BURN_STACK_TOKEN || github.token",
+                &format!("{path} does not use a repository-scoped token for sibling clones"),
             )?;
         }
         require_absent(

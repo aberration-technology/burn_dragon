@@ -9,6 +9,15 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: require cross-repository read token
+      shell: bash
+      env:
+        BURN_STACK_TOKEN: ${{ inputs.token }}
+      run: |
+        if [[ -z "${BURN_STACK_TOKEN}" ]]; then
+          echo "::error::BURN_STACK_TOKEN must have read access to burn_ecs, burn_p2p, burn_eggroll, and burn_pc"
+          exit 1
+        fi
     - name: bootstrap locked sibling repositories
       shell: bash
       env:

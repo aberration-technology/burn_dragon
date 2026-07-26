@@ -115,18 +115,25 @@ pub fn browser_trainer_transport_policy() -> BrowserTransportPolicy {
 }
 
 #[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+pub struct DragonBrowserBootstrapMaterial {
+    pub snapshot: Option<BrowserEdgeSnapshot>,
+    pub signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+}
+
+#[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
 pub fn build_browser_app_connect_config(
     edge_base_url: String,
     capability: BrowserCapabilityReport,
     target: BrowserAppTarget,
     seed_node_urls: Vec<String>,
     selection: Option<(String, Option<String>)>,
-    bootstrap_snapshot: Option<BrowserEdgeSnapshot>,
-    signed_seed_advertisement: Option<SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
+    sync_active_head_artifact: bool,
+    bootstrap: DragonBrowserBootstrapMaterial,
 ) -> BrowserAppConnectConfig {
     let mut connect = BrowserAppConnectConfig::new(edge_base_url, capability, target)
         .with_seed_node_urls(seed_node_urls)
-        .with_bootstrap_material(bootstrap_snapshot, signed_seed_advertisement);
+        .with_active_head_artifact_sync(sync_active_head_artifact)
+        .with_bootstrap_material(bootstrap.snapshot, bootstrap.signed_seed_advertisement);
     if let Some((experiment_id, revision_id)) = selection {
         connect = connect.with_selection(experiment_id, revision_id);
     }

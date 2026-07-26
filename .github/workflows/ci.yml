@@ -69,6 +69,7 @@ jobs:
       - run: target/debug/xtask deployment-script-checks
       - run: "python3 - <<'PY'\nimport yaml\nfor path in [\n  '.github/workflows/ci.yml',\n  '.github/workflows/deploy-burn-dragon-p2p-aws.yml',\n  '.github/workflows/restore-burn-dragon-p2p-aws.yml',\n  '.github/workflows/inspect-burn-dragon-p2p-aws.yml',\n  '.github/workflows/cleanup-burn-dragon-p2p-aws.yml',\n  '.github/workflows/deploy-pages.yml',\n  '.github/workflows/live-browser-canary.yml',\n  '.github/workflows/live-native-training-canary.yml',\n  '.github/workflows/p2p-validation.yml',\n  '.github/workflows/publish-crates.yml',\n  '.github/workflows/publish-readiness.yml',\n]:\n    yaml.safe_load(open(path))\nprint('workflow-yaml-ok')\nPY"
       - run: node --check xtask/assets/live-browser-canary.mjs
+      - run: node --test xtask/assets/browser-site-override.test.mjs
       - run: cargo fmt --manifest-path Cargo.toml --all --check
       - run: cargo clippy --manifest-path Cargo.toml -p xtask --no-deps -- -D warnings
       - run: cargo clippy --manifest-path Cargo.toml -p burn_dragon_tokenizer -p burn_dragon_universality -p burn_dragon_time -p burn_dragon_checkpoint --all-targets --no-deps -- -D warnings

@@ -375,9 +375,23 @@ fn browser_canary_contracts() -> Result<()> {
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
         "path.join(SITE_OVERRIDE_DIR, \"browser-app-config.json\")",
-        "report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);\n    assertBrowserE2eContract(report);",
+        "resolveOverrideFilePath(SITE_OVERRIDE_DIR, requestUrl, SITE_BASE_URL)",
+        "site_override_missing_assets",
+        "missing browser site artifact:",
+        "report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);\n    assertSiteOverrideAssetClosure(report);\n    assertBrowserE2eContract(report);",
     ] {
         require_contains(&script, snippet, "live browser canary script")?;
+    }
+    let override_router = read("xtask/assets/browser-site-override.mjs")?;
+    for snippet in [
+        "fs.statSync(assetPath).isDirectory()",
+        "return path.join(assetPath, \"index.html\");",
+    ] {
+        require_contains(
+            &override_router,
+            snippet,
+            "browser site override resolves directory index documents",
+        )?;
     }
     for forbidden in [
         "consumeCallbackToken",

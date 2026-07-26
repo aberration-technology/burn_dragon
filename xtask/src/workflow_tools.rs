@@ -189,7 +189,13 @@ pub fn run_pages_predeploy_canary() -> Result<()> {
     let site_dir = std::env::var("BURN_DRAGON_PAGES_PREDEPLOY_SITE_DIR")
         .unwrap_or_else(|_| "target/browser-site".to_owned());
     for path in [
+        Path::new(&site_dir).join("index.html"),
+        Path::new(&site_dir).join("callback/github/index.html"),
+        Path::new(&site_dir).join("callback/oidc/index.html"),
+        Path::new(&site_dir).join("callback/oauth/index.html"),
         Path::new(&site_dir).join("browser-app-config.json"),
+        Path::new(&site_dir).join("browser-app-loader.js"),
+        Path::new(&site_dir).join("burn_dragon_p2p_browser.js"),
         Path::new(&site_dir).join("burn_dragon_p2p_browser_bg.wasm"),
     ] {
         ensure!(

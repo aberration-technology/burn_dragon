@@ -106,7 +106,10 @@ jobs:
         timeout-minutes: 5
       - run: cargo test --manifest-path Cargo.toml -p burn_dragon_train --all-targets -- --test-threads=1
         timeout-minutes: 15
-      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets -- --test-threads=1
+      - name: test universality and compile benchmarks
+        run: |
+          cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets --no-run
+          cargo test --manifest-path Cargo.toml -p burn_dragon_universality --lib -- --test-threads=1
         timeout-minutes: 15
       - name: ruliad diagnostic and eval smoke
         shell: bash

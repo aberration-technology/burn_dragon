@@ -374,6 +374,8 @@ fn browser_canary_contracts() -> Result<()> {
         "\"browser_session_enrolled_for_training\"",
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
+        "applyBrowserCanaryProfile(transportFilteredBrowserConfig, {",
+        "expectCheckpointSync: EXPECT_CHECKPOINT_SYNC",
         "path.join(SITE_OVERRIDE_DIR, \"browser-app-config.json\")",
         "resolveOverrideFilePath(SITE_OVERRIDE_DIR, requestUrl, SITE_BASE_URL)",
         "site_override_missing_assets",
@@ -391,6 +393,21 @@ fn browser_canary_contracts() -> Result<()> {
             &override_router,
             snippet,
             "browser site override resolves directory index documents",
+        )?;
+    }
+    let canary_profile = read("xtask/assets/live-browser-canary-profile.mjs")?;
+    for snippet in [
+        "if (expectTraining && expectCheckpointSync)",
+        "if (expectCheckpointSync)",
+        "if (!expectTraining)",
+        "training.live_participant.load_active_head_artifact = false;",
+        "if (useProductionTrainingProfile)",
+        "training.live_participant.publish_canonical_update = false;",
+    ] {
+        require_contains(
+            &canary_profile,
+            snippet,
+            "live browser canary lane profile contract",
         )?;
     }
     for forbidden in [
@@ -435,6 +452,12 @@ fn browser_canary_contracts() -> Result<()> {
         &workflow,
         concat!("bash ", "scripts", "/run_live_browser_canary.sh"),
         "browser canary workflow has no legacy script runner",
+    )?;
+    let ci_workflow = read(".github/workflows/ci.yml")?;
+    require_contains(
+        &ci_workflow,
+        "node --test xtask/assets/live-browser-canary-profile.test.mjs",
+        "live browser canary profile tests run in CI",
     )?;
     Ok(())
 }

@@ -11,6 +11,10 @@ import {
   contentTypeForPath,
   resolveOverrideFilePath,
 } from "./browser-site-override.mjs";
+import {
+  applyBrowserCanaryProfile,
+  browserConfigTrainingConfig,
+} from "./live-browser-canary-profile.mjs";
 
 const SITE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL");
 const EDGE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL");
@@ -1037,17 +1041,6 @@ function browserConfigSeedNodeUrls(browserConfig) {
   return [];
 }
 
-function browserConfigTrainingConfig(browserConfig) {
-  if (!browserConfig || typeof browserConfig !== "object") {
-    return null;
-  }
-  const nested = browserConfig.config?.training;
-  if (nested && typeof nested === "object") {
-    return nested;
-  }
-  return null;
-}
-
 function summarizeBrowserTrainingProfile(browserConfig) {
   const training = browserConfigTrainingConfig(browserConfig);
   if (!training) {
@@ -1064,58 +1057,6 @@ function summarizeBrowserTrainingProfile(browserConfig) {
     model_n_layer: training.model_config?.n_layer ?? null,
     model_language_head: training.model_config?.language_head?.type ?? null,
   };
-}
-
-function applyBrowserTrainingCanaryProfile(browserConfig) {
-  if (!EXPECT_TRAINING || !browserConfig || typeof browserConfig !== "object") {
-    return browserConfig;
-  }
-  const profiled = JSON.parse(JSON.stringify(browserConfig));
-  const training = browserConfigTrainingConfig(profiled);
-  if (!training || typeof training !== "object") {
-    return profiled;
-  }
-  if (USE_PRODUCTION_TRAINING_PROFILE) {
-    training.max_train_batches = Math.min(Number(training.max_train_batches ?? 1) || 1, 1);
-    training.max_eval_batches = 0;
-    if (training.live_participant && typeof training.live_participant === "object") {
-      training.live_participant.publish_canonical_update = false;
-    }
-    return profiled;
-  }
-  training.block_size = Math.min(Number(training.block_size ?? 32) || 32, 32);
-  training.max_train_batches = 1;
-  training.max_eval_batches = 0;
-  if (training.model_config && typeof training.model_config === "object") {
-    training.model_config.n_embd = 16;
-    training.model_config.n_head = 1;
-    training.model_config.n_layer = 1;
-    training.model_config.n_expert = 1;
-    training.model_config.mlp_internal_dim_multiplier = 2;
-    if (training.model_config.mhc && typeof training.model_config.mhc === "object") {
-      training.model_config.mhc.enabled = false;
-    }
-    if (
-      training.model_config.attention_residual &&
-      typeof training.model_config.attention_residual === "object"
-    ) {
-      training.model_config.attention_residual.enabled = false;
-    }
-    if (
-      training.model_config.block_attention_residual &&
-      typeof training.model_config.block_attention_residual === "object"
-    ) {
-      training.model_config.block_attention_residual.enabled = false;
-    }
-    if (training.model_config.fused_kernels && typeof training.model_config.fused_kernels === "object") {
-      training.model_config.fused_kernels.enabled = false;
-    }
-  }
-  if (training.live_participant && typeof training.live_participant === "object") {
-    training.live_participant.publish_canonical_update = false;
-    training.live_participant.load_active_head_artifact = false;
-  }
-  return profiled;
 }
 
 function snapshotAllowsBrowserTraining(snapshot, experimentId) {
@@ -1410,7 +1351,11 @@ async function runCanary() {
   const productionBrowserTrainingConfig = browserConfigTrainingConfig(
     transportFilteredBrowserConfig,
   );
-  const filteredBrowserConfig = applyBrowserTrainingCanaryProfile(transportFilteredBrowserConfig);
+  const filteredBrowserConfig = applyBrowserCanaryProfile(transportFilteredBrowserConfig, {
+    expectTraining: EXPECT_TRAINING,
+    expectCheckpointSync: EXPECT_CHECKPOINT_SYNC,
+    useProductionTrainingProfile: USE_PRODUCTION_TRAINING_PROFILE,
+  });
   const expectedTransport = expectedConnectedTransport(
     TRANSPORT_MODE,
     filteredSignedSeedsEnvelope,

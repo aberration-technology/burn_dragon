@@ -43,7 +43,8 @@ use crate::capability_state::apply_browser_downgrade_state;
 use crate::capability_state::clear_browser_downgrade;
 use crate::config::{DragonBrowserAppConfig, DragonPeerNetworkConfig};
 use crate::p2p_adapter::{
-    DragonBrowserAppHandle, browser_runtime_role_label, build_browser_app_connect_config,
+    DragonBrowserAppHandle, DragonBrowserBootstrapMaterial, browser_runtime_role_label,
+    build_browser_app_connect_config,
 };
 #[cfg(feature = "wasm-peer")]
 use crate::profile::{
@@ -193,7 +194,7 @@ fn dragon_browser_training_requires_active_head_artifact(config: &DragonBrowserA
             .training
             .as_ref()
             .and_then(|training| training.live_participant.as_ref())
-            .is_none_or(|live| live.load_active_head_artifact)
+            .is_none_or(|live| live.load_active_head_artifact || live.publish_canonical_update)
     }
     #[cfg(not(feature = "wasm-peer"))]
     {
@@ -579,8 +580,11 @@ fn connect_config(
         capability_decision.connect_target,
         seed_node_urls,
         config.selected_experiment(),
-        bootstrap_snapshot,
-        signed_seed_advertisement,
+        dragon_browser_training_requires_active_head_artifact(&config),
+        DragonBrowserBootstrapMaterial {
+            snapshot: bootstrap_snapshot,
+            signed_seed_advertisement,
+        },
     ))
 }
 

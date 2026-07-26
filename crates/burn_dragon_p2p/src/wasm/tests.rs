@@ -1159,6 +1159,45 @@ fn dragon_connect_config_reuses_embedded_bootstrap_when_network_matches() {
         connect.bootstrap_signed_seed_advertisement,
         Some(expected_signed_seed_advertisement)
     );
+    assert!(connect.sync_active_head_artifact);
+}
+
+#[wasm_bindgen_test]
+fn dragon_connect_config_disables_artifact_sync_when_training_profile_skips_checkpoint_load() {
+    let mut config = sample_browser_app_config();
+    config.training = Some(
+        serde_json::from_value(serde_json::json!({
+            "experiment_kind": "nca_prepretraining",
+            "model_config": burn_dragon_core::DragonConfig::default(),
+            "train_source": {
+                "type": "inline",
+                "records": []
+            },
+            "live_participant": {
+                "study_id": "study-browser",
+                "experiment_id": "nca-prepretraining",
+                "revision_id": "rev-browser",
+                "workload_id": "workload-browser",
+                "publish_canonical_update": false,
+                "load_active_head_artifact": false
+            }
+        }))
+        .expect("browser training config"),
+    );
+
+    let connect = connect_config(&config, &config, None, None).expect("connect config");
+
+    assert!(!connect.sync_active_head_artifact);
+
+    config
+        .training
+        .as_mut()
+        .and_then(|training| training.live_participant.as_mut())
+        .expect("live participant")
+        .publish_canonical_update = true;
+    let publishing_connect =
+        connect_config(&config, &config, None, None).expect("publishing connect config");
+    assert!(publishing_connect.sync_active_head_artifact);
 }
 
 #[wasm_bindgen_test]

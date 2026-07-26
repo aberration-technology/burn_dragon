@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow, bail};
+use burn::backend::NdArray;
 use burn::module::Module;
 use burn::record::{
     BinBytesRecorder, FullPrecisionSettings, HalfPrecisionSettings, NamedMpkBytesRecorder, Recorder,
 };
 use burn::tensor::backend::Backend;
-use burn_dragon_core::DragonModel;
-use burn_p2p::{ArtifactDescriptor, Precision};
+use burn_dragon_core::{DragonConfig, DragonModel};
+use burn_p2p::{ArtifactDescriptor, ContentId, Precision};
 use log::info;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +159,111 @@ where
     }
 }
 
+pub(crate) fn verify_browser_genesis_tensor_digest(
+    model_config: &DragonConfig,
+    descriptor: &ArtifactDescriptor,
+    bytes: &[u8],
+    expected: &ContentId,
+) -> Result<()> {
+    let format = browser_record_bytes_format(&descriptor.record_format)?;
+    let precision = browser_record_precision(&descriptor.precision)?;
+    match (format, precision) {
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Full) => {
+            verify_browser_record_tensor_digest::<BinBytesRecorder<FullPrecisionSettings>>(
+                model_config,
+                descriptor,
+                bytes,
+                expected,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::Bin, BrowserBurnRecordPrecision::Half) => {
+            verify_browser_record_tensor_digest::<BinBytesRecorder<HalfPrecisionSettings>>(
+                model_config,
+                descriptor,
+                bytes,
+                expected,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Full) => {
+            verify_browser_record_tensor_digest::<NamedMpkBytesRecorder<FullPrecisionSettings>>(
+                model_config,
+                descriptor,
+                bytes,
+                expected,
+            )
+        }
+        (BrowserBurnRecordBytesFormat::NamedMpk, BrowserBurnRecordPrecision::Half) => {
+            verify_browser_record_tensor_digest::<NamedMpkBytesRecorder<HalfPrecisionSettings>>(
+                model_config,
+                descriptor,
+                bytes,
+                expected,
+            )
+        }
+    }
+}
+
+fn verify_browser_record_tensor_digest<R>(
+    model_config: &DragonConfig,
+    descriptor: &ArtifactDescriptor,
+    bytes: &[u8],
+    expected: &ContentId,
+) -> Result<()>
+where
+    R: Recorder<NdArray<f32>, RecordArgs = (), RecordOutput = Vec<u8>, LoadArgs = Vec<u8>>,
+{
+    type DigestBackend = NdArray<f32>;
+
+    let device = burn::tensor::Device::<DigestBackend>::default();
+    let wrapped = BrowserNativeTrainModelArtifact {
+        model: DragonModel::<DigestBackend>::new(model_config.clone(), &device),
+    };
+    let wrapped_result = R::default()
+        .load(bytes.to_vec(), &device)
+        .map(|record| wrapped.load_record(record))
+        .map_err(|error| error.to_string())
+        .and_then(|model| {
+            burn_p2p::tensor_identity::module_tensor_digest::<DigestBackend, _>(
+                &model,
+                descriptor.model_schema_hash.clone(),
+            )
+            .map_err(|error| error.to_string())
+        });
+    if wrapped_result.as_ref() == Ok(expected) {
+        return Ok(());
+    }
+
+    let direct = DragonModel::<DigestBackend>::new(model_config.clone(), &device);
+    let direct_result = R::default()
+        .load(bytes.to_vec(), &device)
+        .map(|record| direct.load_record(record))
+        .map_err(|error| error.to_string())
+        .and_then(|model| {
+            burn_p2p::tensor_identity::module_tensor_digest::<DigestBackend, _>(
+                &model,
+                descriptor.model_schema_hash.clone(),
+            )
+            .map_err(|error| error.to_string())
+        });
+    if direct_result.as_ref() == Ok(expected) {
+        return Ok(());
+    }
+
+    bail!(
+        "decoded browser genesis tensors do not match authority-signed digest {}: native-wrapper={}; direct={}",
+        expected.as_str(),
+        digest_result_label(&wrapped_result),
+        digest_result_label(&direct_result),
+    )
+}
+
+fn digest_result_label(result: &std::result::Result<ContentId, String>) -> String {
+    match result {
+        Ok(digest) => digest.as_str().to_owned(),
+        Err(error) => format!("decode-error:{error}"),
+    }
+}
+
 #[cfg(all(
     test,
     not(target_arch = "wasm32"),
@@ -192,6 +298,39 @@ mod tests {
 
         load_browser_active_head_model(target, &descriptor, bytes, &device)
             .expect("browser should load native learner-wrapper head artifacts");
+    }
+
+    #[test]
+    fn browser_genesis_verifier_matches_native_training_wrapper_tensors() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model_config = tiny_factorized_nca_model_config();
+        let source = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &device,
+        ));
+        let semantic_schema = ContentId::new("semantic-schema");
+        let expected = burn_p2p::burn::module_tensor_digest::<TestBackend, _>(
+            &source,
+            semantic_schema.clone(),
+        )
+        .expect("native tensor digest");
+        let format = BrowserBurnRecordBytesFormat::NamedMpk;
+        let precision = BrowserBurnRecordPrecision::Full;
+        let bytes = encode_browser_record_bytes::<TestBackend, _>(source, format, precision)
+            .expect("native training wrapper record should encode");
+        let mut descriptor = descriptor_for_bytes(&bytes, format, precision);
+        descriptor.model_schema_hash = semantic_schema;
+
+        verify_browser_genesis_tensor_digest(&model_config, &descriptor, &bytes, &expected)
+            .expect("browser verifier should reproduce native digest");
+        let error = verify_browser_genesis_tensor_digest(
+            &model_config,
+            &descriptor,
+            &bytes,
+            &ContentId::new("wrong"),
+        )
+        .expect_err("wrong signed digest must fail");
+        assert!(error.to_string().contains("do not match authority-signed"));
     }
 
     #[test]

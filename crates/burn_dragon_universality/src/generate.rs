@@ -277,6 +277,15 @@ fn generate_sample_record(
         preview_path,
         serialized_char_count: serialized.len(),
         stats,
+        ruliad_spec: None,
+        ruliad_categorical_view: None,
+        oracle_hash: None,
+        task_kind: None,
+        verifier_version: None,
+        ruliad_document_mode: None,
+        ruliad_node_count: None,
+        math_domains: Vec::new(),
+        reasoning_modes: Vec::new(),
     })
 }
 

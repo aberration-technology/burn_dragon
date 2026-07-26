@@ -5,17 +5,12 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, ValueEnum};
 
-use crate::{browser_site, workflow_tools};
+use crate::{browser_site, stack_lock, workflow_tools};
 
 const LOCAL_BROWSER_E2E_ARTIFACT_ROOT: &str = "target/test-artifacts/browser-peer-e2e";
 const LOCAL_BROWSER_E2E_SITE_DIR: &str = "target/browser-site";
 const LOCAL_BROWSER_E2E_SYNTHETIC_SITE_BASE_URL: &str = "http://127.0.0.1:17777";
-const CI_BURN_P2P_REF: &str = "900a8fbc988edd7db503b1fb1ee2eed29dcc99bc";
 const DEFAULT_CI_TARGET_DIR: &str = "target/local-browser-e2e-ci-sibling";
-const DEFAULT_CARGO: &str =
-    "/home/mosure/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo";
-const DEFAULT_RUSTC: &str =
-    "/home/mosure/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc";
 
 #[derive(Clone, Debug, Args)]
 pub struct LocalBrowserE2eArgs {
@@ -51,8 +46,8 @@ pub struct LocalBrowserE2eCiSiblingArgs {
     e2e: LocalBrowserE2eArgs,
     #[arg(long, default_value = "../burn_p2p")]
     burn_p2p_repo: PathBuf,
-    #[arg(long, default_value = CI_BURN_P2P_REF)]
-    burn_p2p_ref: String,
+    #[arg(long)]
+    burn_p2p_ref: Option<String>,
     #[arg(long, default_value = DEFAULT_CI_TARGET_DIR)]
     target_dir: PathBuf,
 }
@@ -117,6 +112,12 @@ pub fn run(
 pub fn run_ci_sibling(args: &LocalBrowserE2eCiSiblingArgs) -> Result<()> {
     let dragon_root = workspace_root();
     let burn_p2p_repo = absolute_under_workspace(&dragon_root, &args.burn_p2p_repo);
+    let burn_p2p_ref = args.burn_p2p_ref.clone().unwrap_or(
+        stack_lock::workspace_stack_lock()?
+            .repository("burn_p2p")?
+            .revision
+            .clone(),
+    );
     ensure!(
         burn_p2p_repo.join(".git").exists(),
         "burn_p2p repository not found at {}; pass --burn-p2p-repo",
@@ -147,7 +148,7 @@ pub fn run_ci_sibling(args: &LocalBrowserE2eCiSiblingArgs) -> Result<()> {
     apply_current_dragon_diff(&dragon_root, &dragon_worktree_path)?;
     copy_untracked_dragon_files(&dragon_root, &dragon_worktree_path)?;
 
-    let burn_p2p_worktree = if git_commit_exists(&burn_p2p_repo, &args.burn_p2p_ref)? {
+    let burn_p2p_worktree = if git_commit_exists(&burn_p2p_repo, &burn_p2p_ref)? {
         let burn_p2p_worktree_arg = path_arg(&burn_p2p_worktree_path)?;
         run_git(
             &burn_p2p_repo,
@@ -156,7 +157,7 @@ pub fn run_ci_sibling(args: &LocalBrowserE2eCiSiblingArgs) -> Result<()> {
                 "add",
                 "--detach",
                 burn_p2p_worktree_arg.as_str(),
-                args.burn_p2p_ref.as_str(),
+                burn_p2p_ref.as_str(),
             ],
         )?;
         Some(GitWorktreeGuard::new(
@@ -176,13 +177,13 @@ pub fn run_ci_sibling(args: &LocalBrowserE2eCiSiblingArgs) -> Result<()> {
         )?;
         run_git(
             &burn_p2p_worktree_path,
-            &["checkout", args.burn_p2p_ref.as_str()],
+            &["checkout", burn_p2p_ref.as_str()],
         )?;
         None
     };
 
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| DEFAULT_CARGO.to_owned());
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| DEFAULT_RUSTC.to_owned());
+    let cargo = resolve_rust_tool("CARGO", "cargo");
+    let rustc = resolve_rust_tool("RUSTC", "rustc");
     let target_dir = absolute_under_workspace(&dragon_root, &args.target_dir);
     let e2e_args = args.e2e.to_xtask_args(Some(&dragon_root));
     let mut command = Command::new(&cargo);
@@ -213,6 +214,23 @@ pub fn run_ci_sibling(args: &LocalBrowserE2eCiSiblingArgs) -> Result<()> {
         bail!("local-browser-e2e-ci-sibling failed");
     }
     Ok(())
+}
+
+fn resolve_rust_tool(env_var: &str, tool: &str) -> String {
+    if let Ok(explicit) = std::env::var(env_var)
+        && !explicit.trim().is_empty()
+    {
+        return explicit;
+    }
+    Command::new("rustup")
+        .args(["which", tool])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| tool.to_owned())
 }
 
 impl LocalBrowserE2eArgs {

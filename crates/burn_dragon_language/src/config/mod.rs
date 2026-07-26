@@ -10,8 +10,19 @@ pub use core::{
 };
 #[cfg(feature = "train")]
 pub use train::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
+    AutoBatchSizeConfig, CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
+    DragonStateConsistencyConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
+    GreedyRolloutUnlikelihoodConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
+    LatentEnergyModelConfig, LatentReasoningAuxiliaryStartPolicy,
+    LatentReasoningConstraintBalancerConfig, LatentReasoningNegativeSource,
+    LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
+    LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LatentStepContractConfig,
+    LogitEntropyFloorConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
+    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
+    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadSupervisionConfig,
+    RuliadSupervisionMode, RuliadVerifierRewardConfig, RuliadVerifierRewardMode,
+    SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
 };

@@ -1,0 +1,12 @@
+extends = ["ruliad-1m-la-16k.verifier-reward.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+weight = 0.0
+field_binding_contrast_weight = 0.25
+field_binding_contrast_every_steps = 4
+field_binding_contrast_start_after_steps = 0
+field_binding_contrast_margin = 0.50
+field_binding_contrast_pair_weight = 1.00
+field_binding_contrast_max_pairs = 16
+field_binding_contrast_rank_metric_every_steps = 8
+field_binding_contrast_replay_capacity = 128

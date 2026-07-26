@@ -149,14 +149,27 @@ fn load_config(config_paths: &[PathBuf], overrides: &TrainingOverrides) -> Resul
 fn train_cpu(args: &RunArgs) -> Result<()> {
     let config = load_config(&args.config_paths, &args.overrides)?;
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
-    train::train_backend::<Autodiff<NdArray<f32>>, _>(&config, dataset, "cpu", |_| {})
+    if train::optimizer_uses_forward_only_eggroll(&config) {
+        train::train_backend_forward_eggroll::<NdArray<f32>, _>(&config, dataset, "cpu", |_| {})
+    } else {
+        train::train_backend::<Autodiff<NdArray<f32>>, _>(&config, dataset, "cpu", |_| {})
+    }
 }
 
 #[cfg(all(feature = "train", feature = "cuda"))]
 fn train_cuda(args: &RunArgs) -> Result<()> {
     let config = load_config(&args.config_paths, &args.overrides)?;
     let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
-    train::train_backend::<Autodiff<burn_cuda::Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
+    if train::optimizer_uses_forward_only_eggroll(&config) {
+        train::train_backend_forward_eggroll::<burn_cuda::Cuda<f32>, _>(
+            &config,
+            dataset,
+            "cuda",
+            |_| {},
+        )
+    } else {
+        train::train_backend::<Autodiff<burn_cuda::Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
+    }
 }
 
 #[cfg(all(feature = "train", not(feature = "cuda")))]

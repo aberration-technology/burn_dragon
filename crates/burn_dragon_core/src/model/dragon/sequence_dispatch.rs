@@ -335,7 +335,7 @@ impl<B: Backend> DragonModel<B> {
                         self.gated_deltanet2_config.chunk_size,
                     ) {
                         write_gated_deltanet2_state(layer_state, output.state);
-                        return output.context;
+                        return params.apply_output_scale(output.context);
                     }
                     static GDN2_CHUNK_WY_FALLBACK_WARN: Once = Once::new();
                     GDN2_CHUNK_WY_FALLBACK_WARN.call_once(|| {
@@ -356,7 +356,7 @@ impl<B: Backend> DragonModel<B> {
                     self.gated_deltanet2_config.state_epsilon,
                 );
                 write_gated_deltanet2_state(layer_state, next_state);
-                context
+                params.apply_output_scale(context)
             }
             (family, executor) => panic!(
                 "sequence kernel family {:?} with executor {:?} is not implemented in DragonModel yet",

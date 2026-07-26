@@ -1,0 +1,41 @@
+extends = "ruliad-1m-la-16k.answer-completion.self-recovery.training.toml"
+
+[model]
+latent_total = 65536
+
+[model.latent_reasoning]
+enabled = true
+max_steps = 2
+min_steps = 2
+adaptive_halting = false
+halt_threshold = 0.55
+refiner_hidden_multiplier = 1
+normalize_steps = true
+residual_refinement_gate = true
+residual_refinement_gate_init = 0.05
+energy_head = false
+step_conditioned_decoder = false
+step_conditioned_decoder_scale = 1.0
+stop_bias_init = -2.0
+energy_margin = 1.0
+
+[training]
+batch_size = 1
+
+[training.latent_reasoning]
+eval_step_sweep = [1, 2, 4, 8]
+jepa_every_steps = 8
+jepa_start_after_steps = 0
+
+[training.latent_reasoning.next_latent]
+every_steps = 16
+start_after_steps = 128
+
+[training.latent_reasoning.step_contract]
+enabled = true
+start_after_steps = 0
+every_steps = 4
+ce_weight = 0.25
+monotonic_ce_weight = 1.0
+contractive_weight = 0.05
+ce_tolerance = 0.01

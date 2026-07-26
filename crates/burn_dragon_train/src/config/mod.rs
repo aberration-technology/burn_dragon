@@ -2,6 +2,7 @@
 pub mod artifacts;
 pub mod continual_backprop;
 pub mod core;
+pub mod events;
 pub mod optimizer;
 pub mod run_layout;
 
@@ -22,7 +23,12 @@ pub use core::{
     VisionTeacherVariant, WgpuBackend, WgpuGenerationExecutor, WgpuInferenceConfig,
     WgpuMemoryConfig, WgpuRuntimeConfig, WgpuStartupAutotuneConfig, WgpuTrainingConfig,
 };
+pub use events::{TrainingEventsConfig, TrainingGatesConfig};
 pub use optimizer::{
+    EggrollAutoPopulationConfig, EggrollChunkAutotuneConfig, EggrollPerturbationScope,
+    EggrollPopulationExecutionBackend, EggrollPopulationExecutionConfig,
     LearningRateScheduleConfig, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
+    PredictiveCodingOptimizerConfig, PredictiveCodingOptimizerTransform,
+    ResolvedEggrollAutoPopulation,
 };
 pub use run_layout::RunLayoutConfig;

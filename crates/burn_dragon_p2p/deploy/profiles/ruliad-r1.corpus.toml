@@ -1,0 +1,107 @@
+output_dir = "./generated/ruliad-r1"
+seed = 1337
+name = "burn-dragon-mainnet-ruliad-r1"
+train_samples = 256
+validation_samples = 64
+chunk_token_capacity = 4096
+proof_tasks = "crates/burn_dragon_universality/data/ruliad_seed/proof_tasks.jsonl"
+lean_task_limit = 128
+
+[serialization]
+document_tokens = 1024
+preview_samples = 4
+document_mode = "multi_chunk_proof_tree"
+document_chunks = { min = 4, max = 8 }
+
+[tokenization]
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
+
+[source_selection]
+enabled = true
+# Initial finite frontier only. Frontier extension is unbounded below, so this is not a global
+# difficulty cap.
+difficulty_levels = { min = 0, max = 24 }
+
+[source_selection.frontier_extension]
+enabled = true
+levels_per_extension = 8
+extend_when_normalized_difficulty_at_least = 0.88
+extend_when_max_difficulty_probability_at_least = 0.25
+# Zero means no hard materialization limit; the ruliad frontier can keep expanding forever.
+max_materialized_levels = 0
+
+[source_selection.cold_start]
+enabled = true
+# Mainnet-style runs still expose an unbounded frontier, but cold models should not begin at the
+# edge before verifier-backed capability exists.
+max_difficulty_level = 0
+hold_steps = 4096
+ramp_steps = 16384
+release_requires_mastery = true
+mastery_min_feedback_count = 1
+mastery_verifier_min = 0.50
+mastery_completion_health_min = 0.75
+mastery_schema_wrong_max = 0.25
+mastery_malformed_max = 0.05
+mastery_missing_max = 0.05
+
+[source_selection.sampler]
+exploration_floor = 0.005
+mastery_escape_weight = 4.0
+mastery_escape_threshold = 0.70
+mastery_min_normalized_difficulty = 0.90
+mastery_min_max_difficulty_probability = 0.35
+mastery_hash_noise_max_probability = 0.01
+max_answer_contract_probability = 0.35
+min_answer_contract_probability = 0.08
+
+[[families]]
+kind = "eca"
+weight = 4
+width = { min = 16, max = 32 }
+steps = { min = 4, max = 10 }
+
+[[families]]
+kind = "simulation"
+weight = 2
+width = { min = 16, max = 32 }
+steps = { min = 4, max = 8 }
+
+[[families]]
+kind = "automaton"
+weight = 2
+width = { min = 3, max = 8 }
+steps = { min = 6, max = 20 }
+
+[[families]]
+kind = "rewrite"
+weight = 2
+width = { min = 8, max = 20 }
+steps = { min = 4, max = 12 }
+
+[[families]]
+kind = "algebra"
+weight = 2
+width = { min = 2, max = 6 }
+
+[[families]]
+kind = "category"
+weight = 1
+width = { min = 3, max = 7 }
+steps = { min = 3, max = 6 }
+
+[[families]]
+kind = "proof_tree"
+weight = 3
+width = { min = 5, max = 17 }
+steps = { min = 4, max = 12 }
+
+[[families]]
+kind = "lean_task"
+weight = 1
+
+[[families]]
+kind = "hash_noise"
+weight = 1

@@ -451,6 +451,130 @@ impl ModuleDisplayDefault for SummaryMemoryConfig {
 
 impl ModuleDisplay for SummaryMemoryConfig {}
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HierarchicalDragonSharing {
+    #[default]
+    Shared,
+    Split,
+}
+
+fn default_hierarchical_dragon_fast_cycles() -> usize {
+    3
+}
+
+fn default_hierarchical_dragon_slow_cycles() -> usize {
+    2
+}
+
+fn default_hierarchical_dragon_slow_to_fast_scale() -> f32 {
+    0.25
+}
+
+fn default_hierarchical_dragon_fast_to_slow_scale() -> f32 {
+    0.25
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HierarchicalDragonConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_layers: Option<usize>,
+    #[serde(default = "default_hierarchical_dragon_fast_cycles")]
+    pub fast_cycles: usize,
+    #[serde(default = "default_hierarchical_dragon_slow_cycles")]
+    pub slow_cycles: usize,
+    #[serde(default)]
+    pub rho_sharing: HierarchicalDragonSharing,
+    #[serde(default)]
+    pub weight_sharing: HierarchicalDragonSharing,
+    #[serde(default = "default_hierarchical_dragon_slow_to_fast_scale")]
+    pub slow_to_fast_scale: f32,
+    #[serde(default = "default_hierarchical_dragon_fast_to_slow_scale")]
+    pub fast_to_slow_scale: f32,
+}
+
+impl Default for HierarchicalDragonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            last_layers: None,
+            fast_cycles: default_hierarchical_dragon_fast_cycles(),
+            slow_cycles: default_hierarchical_dragon_slow_cycles(),
+            rho_sharing: HierarchicalDragonSharing::default(),
+            weight_sharing: HierarchicalDragonSharing::default(),
+            slow_to_fast_scale: default_hierarchical_dragon_slow_to_fast_scale(),
+            fast_to_slow_scale: default_hierarchical_dragon_fast_to_slow_scale(),
+        }
+    }
+}
+
+impl<B: Backend> Module<B> for HierarchicalDragonConfig {
+    type Record = ();
+
+    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
+        devices
+    }
+
+    fn fork(self, _device: &B::Device) -> Self {
+        self
+    }
+
+    fn to_device(self, _device: &B::Device) -> Self {
+        self
+    }
+
+    fn visit<Visitor: ModuleVisitor<B>>(&self, _visitor: &mut Visitor) {}
+
+    fn map<Mapper: ModuleMapper<B>>(self, _mapper: &mut Mapper) -> Self {
+        self
+    }
+
+    fn load_record(self, _record: Self::Record) -> Self {
+        self
+    }
+
+    fn into_record(self) -> Self::Record {}
+}
+
+impl<B: AutodiffBackend> AutodiffModule<B> for HierarchicalDragonConfig {
+    type InnerModule = HierarchicalDragonConfig;
+
+    fn valid(&self) -> Self::InnerModule {
+        self.clone()
+    }
+
+    fn from_inner(module: Self::InnerModule) -> Self {
+        module
+    }
+}
+
+impl ModuleDisplayDefault for HierarchicalDragonConfig {
+    fn content(&self, content: Content) -> Option<Content> {
+        let summary = format!(
+            "enabled={}, last_layers={}, fast_cycles={}, slow_cycles={}, rho_sharing={:?}, weight_sharing={:?}, slow_to_fast_scale={}, fast_to_slow_scale={}",
+            self.enabled,
+            self.last_layers
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "all".to_string()),
+            self.fast_cycles,
+            self.slow_cycles,
+            self.rho_sharing,
+            self.weight_sharing,
+            self.slow_to_fast_scale,
+            self.fast_to_slow_scale,
+        );
+
+        content
+            .set_top_level_type("HierarchicalDragonConfig")
+            .add_formatted(&summary)
+            .optional()
+    }
+}
+
+impl ModuleDisplay for HierarchicalDragonConfig {}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LatentFanoutScheduleConfig {
@@ -612,6 +736,141 @@ impl LanguageHeadConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LatentReasoningConfig {
+    pub enabled: bool,
+    pub max_steps: usize,
+    pub min_steps: usize,
+    pub adaptive_halting: bool,
+    pub halt_threshold: f32,
+    pub refiner_hidden_multiplier: usize,
+    pub normalize_steps: bool,
+    pub residual_refinement_gate: bool,
+    pub residual_refinement_gate_init: f32,
+    pub energy_head: bool,
+    pub step_conditioned_decoder: bool,
+    pub step_conditioned_decoder_scale: f32,
+    pub stop_bias_init: f32,
+    pub energy_margin: f32,
+}
+
+impl Default for LatentReasoningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_steps: 1,
+            min_steps: 1,
+            adaptive_halting: false,
+            halt_threshold: 0.55,
+            refiner_hidden_multiplier: 1,
+            normalize_steps: false,
+            residual_refinement_gate: false,
+            residual_refinement_gate_init: 0.25,
+            energy_head: false,
+            step_conditioned_decoder: false,
+            step_conditioned_decoder_scale: 1.0,
+            stop_bias_init: -2.0,
+            energy_margin: 1.0,
+        }
+    }
+}
+
+impl LatentReasoningConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_steps == 0 {
+            return Err("model.latent_reasoning.max_steps must be > 0 when enabled".to_string());
+        }
+        if self.min_steps == 0 {
+            return Err("model.latent_reasoning.min_steps must be > 0 when enabled".to_string());
+        }
+        if self.min_steps > self.max_steps {
+            return Err(format!(
+                "model.latent_reasoning.min_steps must be <= max_steps (got {} > {})",
+                self.min_steps, self.max_steps
+            ));
+        }
+        if self.adaptive_halting
+            && (!self.halt_threshold.is_finite() || !(0.0..=1.0).contains(&self.halt_threshold))
+        {
+            return Err(format!(
+                "model.latent_reasoning.halt_threshold must be finite and in [0, 1] (got {})",
+                self.halt_threshold
+            ));
+        }
+        if self.refiner_hidden_multiplier == 0 {
+            return Err("model.latent_reasoning.refiner_hidden_multiplier must be > 0".to_string());
+        }
+        if !self.residual_refinement_gate_init.is_finite()
+            || !(0.0..1.0).contains(&self.residual_refinement_gate_init)
+        {
+            return Err(format!(
+                "model.latent_reasoning.residual_refinement_gate_init must be finite and in (0, 1) (got {})",
+                self.residual_refinement_gate_init
+            ));
+        }
+        if self.adaptive_halting && !self.stop_bias_init.is_finite() {
+            return Err(format!(
+                "model.latent_reasoning.stop_bias_init must be finite (got {})",
+                self.stop_bias_init
+            ));
+        }
+        if !self.step_conditioned_decoder_scale.is_finite()
+            || self.step_conditioned_decoder_scale < 0.0
+        {
+            return Err(format!(
+                "model.latent_reasoning.step_conditioned_decoder_scale must be finite and >= 0 (got {})",
+                self.step_conditioned_decoder_scale
+            ));
+        }
+        if !self.energy_margin.is_finite() || self.energy_margin < 0.0 {
+            return Err(format!(
+                "model.latent_reasoning.energy_margin must be finite and >= 0 (got {})",
+                self.energy_margin
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NextLatentTransitionConfig {
+    pub enabled: bool,
+    pub hidden_multiplier: usize,
+    pub normalize_input: bool,
+    pub zero_init_output: bool,
+}
+
+impl Default for NextLatentTransitionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hidden_multiplier: 2,
+            normalize_input: true,
+            zero_init_output: true,
+        }
+    }
+}
+
+impl NextLatentTransitionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.hidden_multiplier == 0 {
+            return Err(
+                "model.next_latent_transition.hidden_multiplier must be > 0 when enabled"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DragonConfig {
     pub n_layer: usize,
     pub n_embd: usize,
@@ -632,6 +891,8 @@ pub struct DragonConfig {
     pub vocab_size: usize,
     #[serde(default)]
     pub language_head: LanguageHeadConfig,
+    #[serde(default)]
+    pub tie_input_output_embeddings: bool,
     /// Number of fast internal recurrent updates to run before each slow token emission.
     /// Valid values: 1, 2, 4, 8, 16.
     pub rollout_fast_steps_per_slow_step: usize,
@@ -647,6 +908,12 @@ pub struct DragonConfig {
     pub y_neuron_recurrence: YNeuronRecurrenceConfig,
     pub clocked_slow_memory: ClockedSlowMemoryConfig,
     pub summary_memory: SummaryMemoryConfig,
+    #[serde(default)]
+    pub hierarchical_dragon: HierarchicalDragonConfig,
+    #[serde(default)]
+    pub latent_reasoning: LatentReasoningConfig,
+    #[serde(default)]
+    pub next_latent_transition: NextLatentTransitionConfig,
 }
 
 impl Default for DragonConfig {
@@ -665,6 +932,7 @@ impl Default for DragonConfig {
             n_expert: 1,
             vocab_size: 256,
             language_head: LanguageHeadConfig::default(),
+            tie_input_output_embeddings: false,
             rollout_fast_steps_per_slow_step: 1,
             fused_kernels: FusedKernelConfig::default(),
             normalization: DragonNormConfig::default(),
@@ -675,6 +943,9 @@ impl Default for DragonConfig {
             y_neuron_recurrence: YNeuronRecurrenceConfig::default(),
             clocked_slow_memory: ClockedSlowMemoryConfig::default(),
             summary_memory: SummaryMemoryConfig::default(),
+            hierarchical_dragon: HierarchicalDragonConfig::default(),
+            latent_reasoning: LatentReasoningConfig::default(),
+            next_latent_transition: NextLatentTransitionConfig::default(),
         }
     }
 }

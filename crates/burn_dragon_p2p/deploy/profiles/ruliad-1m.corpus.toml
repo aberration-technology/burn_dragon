@@ -1,0 +1,93 @@
+output_dir = "./generated/ruliad-1m"
+seed = 1337
+name = "burn-dragon-ruliad-1m-baseline"
+train_samples = 512
+validation_samples = 128
+chunk_token_capacity = 2048
+proof_tasks = "crates/burn_dragon_universality/data/ruliad_seed/proof_tasks.jsonl"
+lean_task_limit = 0
+
+[serialization]
+document_tokens = 512
+preview_samples = 6
+document_mode = "single_sample"
+document_chunks = { min = 1, max = 1 }
+
+[tokenization]
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
+
+[source_selection]
+enabled = true
+# Initial finite frontier only. Frontier extension is unbounded below, so this is not a global
+# difficulty cap.
+difficulty_levels = { min = 0, max = 12 }
+
+[source_selection.frontier_extension]
+enabled = true
+levels_per_extension = 8
+extend_when_normalized_difficulty_at_least = 0.88
+extend_when_max_difficulty_probability_at_least = 0.25
+# Zero means no hard materialization limit; the ruliad frontier can keep expanding forever.
+max_materialized_levels = 0
+
+[source_selection.cold_start]
+enabled = true
+# Initial training should learn the answer contract on easy buckets before the live frontier opens.
+# This is a warm-start curriculum cap, not a global difficulty ceiling.
+max_difficulty_level = 0
+hold_steps = 1024
+ramp_steps = 8192
+release_requires_mastery = true
+mastery_min_feedback_count = 1
+mastery_verifier_min = 0.50
+mastery_completion_health_min = 0.75
+mastery_schema_wrong_max = 0.25
+mastery_malformed_max = 0.05
+mastery_missing_max = 0.05
+
+[source_selection.sampler]
+exploration_floor = 0.02
+mastery_escape_weight = 1.0
+mastery_escape_threshold = 0.80
+mastery_min_normalized_difficulty = 0.85
+mastery_min_max_difficulty_probability = 0.40
+mastery_hash_noise_max_probability = 0.0
+max_answer_contract_probability = 0.35
+min_answer_contract_probability = 0.10
+
+[[families]]
+kind = "eca"
+weight = 3
+width = { min = 12, max = 24 }
+steps = { min = 3, max = 8 }
+
+[[families]]
+kind = "automaton"
+weight = 2
+width = { min = 3, max = 6 }
+steps = { min = 4, max = 12 }
+
+[[families]]
+kind = "rewrite"
+weight = 2
+width = { min = 6, max = 14 }
+steps = { min = 3, max = 8 }
+
+[[families]]
+kind = "algebra"
+weight = 2
+width = { min = 2, max = 5 }
+
+[[families]]
+kind = "category"
+weight = 2
+width = { min = 3, max = 6 }
+steps = { min = 2, max = 5 }
+
+[[families]]
+kind = "proof_tree"
+weight = 3
+width = { min = 4, max = 10 }
+steps = { min = 3, max = 8 }

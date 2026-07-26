@@ -1,0 +1,5 @@
+extends = "ruliad-1m-la-16k.training.toml"
+
+[model]
+latent_total = 32768
+

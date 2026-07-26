@@ -101,6 +101,56 @@ fn fused_relu_lowrank_matches_reference_head_aligned() {
 }
 
 #[test]
+fn fused_relu_lowrank_matches_reference_grouped_single_stream() {
+    let device = burn::tensor::Device::<Backend>::default();
+    if let Err(reason) = init_runtime(&device) {
+        eprintln!("skipping WGPU test: {reason}");
+        return;
+    }
+
+    let input = Tensor::<Backend, 4>::random([6, 1, 5, 24], Distribution::Default, &device);
+    let weight = Tensor::<Backend, 4>::random([3, 4, 24, 12], Distribution::Default, &device);
+    let mask = Tensor::<Backend, 1>::from_floats([1.0; 12], &device).reshape([1, 1, 1, 12]);
+    let actual =
+        try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.05, Some(&mask)).expect("fused");
+    let expected = lowrank_projection_reference_forward(input, weight, 0.05, Some(mask));
+    assert_close(actual, expected, 1.0e-4, 1.0e-4);
+}
+
+#[test]
+fn fused_relu_lowrank_matches_reference_grouped_head_aligned() {
+    let device = burn::tensor::Device::<Backend>::default();
+    if let Err(reason) = init_runtime(&device) {
+        eprintln!("skipping WGPU test: {reason}");
+        return;
+    }
+
+    let input = Tensor::<Backend, 4>::random([6, 4, 5, 24], Distribution::Default, &device);
+    let weight = Tensor::<Backend, 4>::random([3, 4, 24, 12], Distribution::Default, &device);
+    let actual =
+        try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.05, None).expect("fused");
+    let expected = lowrank_projection_reference_forward(input, weight, 0.05, None);
+    assert_close(actual, expected, 1.0e-4, 1.0e-4);
+}
+
+#[test]
+fn fused_relu_lowrank_grouped_autodiff_falls_back() {
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
+    if let Err(reason) = init_runtime(&device) {
+        eprintln!("skipping WGPU test: {reason}");
+        return;
+    }
+
+    let input =
+        Tensor::<AutodiffBackendImpl, 4>::random([6, 1, 5, 24], Distribution::Default, &device)
+            .require_grad();
+    let weight =
+        Tensor::<AutodiffBackendImpl, 4>::random([3, 4, 24, 12], Distribution::Default, &device)
+            .require_grad();
+    assert!(try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.05, None).is_none());
+}
+
+#[test]
 fn fused_relu_lowrank_matches_reference_single_stream_query_weight_gradients_on_wgpu_autodiff() {
     let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
     if let Err(reason) = init_runtime(&device) {
@@ -373,6 +423,42 @@ fn fused_relu_lowrank_supports_cuda_backend_types() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn fused_relu_lowrank_grouped_cuda_uses_distinct_weight_groups() {
+    let device = burn::tensor::Device::<CudaBackend>::default();
+    let input = Tensor::<CudaBackend, 4>::from_data(
+        TensorData::new(vec![1.0; 4 * 2], [4, 1, 1, 2]),
+        &device,
+    );
+    let weight = Tensor::<CudaBackend, 4>::from_data(
+        TensorData::new(
+            vec![
+                1.0, 2.0, 3.0, 4.0, // group 0
+                10.0, 20.0, 30.0, 40.0, // group 1
+            ],
+            [2, 1, 2, 2],
+        ),
+        &device,
+    );
+
+    let actual =
+        try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.0, None).expect("cuda fused");
+    let expected = Tensor::<CudaBackend, 4>::from_data(
+        TensorData::new(
+            vec![
+                4.0, 6.0, // batch 0, group 0
+                4.0, 6.0, // batch 1, group 0
+                40.0, 60.0, // batch 2, group 1
+                40.0, 60.0, // batch 3, group 1
+            ],
+            [4, 1, 1, 2],
+        ),
+        &device,
+    );
+    assert_close(actual, expected, 1.0e-5, 1.0e-5);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn fused_relu_lowrank_matches_reference_single_stream_on_cuda() {
     let device = burn::tensor::Device::<CudaBackend>::default();
     let input = Tensor::<CudaBackend, 4>::random([2, 1, 7, 32], Distribution::Default, &device);
@@ -382,6 +468,33 @@ fn fused_relu_lowrank_matches_reference_single_stream_on_cuda() {
     let actual = try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.1, Some(&mask))
         .expect("cuda fused");
     let expected = lowrank_projection_reference_forward(input, weight, 0.1, Some(mask));
+    assert_close(actual, expected, 2.0e-3, 2.0e-3);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn fused_relu_lowrank_grouped_single_stream_matches_reference_on_cuda() {
+    let device = burn::tensor::Device::<CudaBackend>::default();
+    let input = Tensor::<CudaBackend, 4>::random([6, 1, 5, 24], Distribution::Default, &device);
+    let weight = Tensor::<CudaBackend, 4>::random([3, 4, 24, 12], Distribution::Default, &device);
+    let mask = Tensor::<CudaBackend, 1>::from_floats([1.0; 12], &device).reshape([1, 1, 1, 12]);
+
+    let actual = try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.05, Some(&mask))
+        .expect("cuda grouped fused");
+    let expected = lowrank_projection_reference_forward(input, weight, 0.05, Some(mask));
+    assert_close(actual, expected, 2.0e-3, 2.0e-3);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn fused_relu_lowrank_grouped_head_aligned_matches_reference_on_cuda() {
+    let device = burn::tensor::Device::<CudaBackend>::default();
+    let input = Tensor::<CudaBackend, 4>::random([6, 4, 5, 24], Distribution::Default, &device);
+    let weight = Tensor::<CudaBackend, 4>::random([3, 4, 24, 12], Distribution::Default, &device);
+
+    let actual = try_fused_relu_lowrank_projection_wgpu(&input, &weight, 0.05, None)
+        .expect("cuda grouped head-aligned fused");
+    let expected = lowrank_projection_reference_forward(input, weight, 0.05, None);
     assert_close(actual, expected, 2.0e-3, 2.0e-3);
 }
 

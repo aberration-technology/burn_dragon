@@ -1,20 +1,19 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 use crate::bootstrap_runtime::{
     RuntimeCommandEnv, preserve_current_heads, render_bootstrap_runtime_sync_commands,
 };
-
-const BURN_P2P_SIBLING_REF: &str = "900a8fbc988edd7db503b1fb1ee2eed29dcc99bc";
+use crate::stack_lock;
 
 pub fn run() -> Result<()> {
-    repository_has_no_scripts_tree()?;
+    workflows_do_not_invoke_repository_scripts()?;
     runtime_sync_contract()?;
     bootstrap_head_preservation_contract()?;
-    workflow_sibling_checkout_contract()?;
+    workflow_stack_bootstrap_contract()?;
     deployment_workflow_contracts()?;
     browser_auth_contracts()?;
     browser_canary_contracts()?;
@@ -28,23 +27,17 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn repository_has_no_scripts_tree() -> Result<()> {
-    for path in walk(".")? {
-        if path
-            .components()
-            .any(|component| component.as_os_str() == ".git")
-            || path
-                .components()
-                .any(|component| component.as_os_str() == "target")
-            || path
-                .components()
-                .any(|component| component.as_os_str() == "burn_p2p-sibling")
-        {
+fn workflows_do_not_invoke_repository_scripts() -> Result<()> {
+    for path in walk(".github/workflows")? {
+        if !path.is_file() {
             continue;
         }
-        if path.file_name().and_then(|value| value.to_str()) == Some("scripts") {
-            bail!("legacy scripts directory remains: {}", path.display());
-        }
+        let source = read(&path)?;
+        ensure!(
+            !source.contains("scripts/") && !source.contains("./scripts/"),
+            "workflow {} invokes a repository script; deployment orchestration belongs in xtask",
+            path.display(),
+        );
     }
     Ok(())
 }
@@ -218,32 +211,56 @@ fn bootstrap_head_preservation_contract() -> Result<()> {
     Ok(())
 }
 
-fn workflow_sibling_checkout_contract() -> Result<()> {
+fn workflow_stack_bootstrap_contract() -> Result<()> {
+    let lock = stack_lock::workspace_stack_lock()?;
+    for name in ["burn_ecs", "burn_p2p", "burn_eggroll", "burn_pc"] {
+        let repository = lock.repository(name)?;
+        ensure!(
+            repository.path == Path::new("..").join(name),
+            "{name} lock path must match the Cargo sibling path"
+        );
+    }
+    let action = read(".github/actions/bootstrap-stack/action.yml")?;
+    require_contains(
+        &action,
+        "scripts/bootstrap_stack.py",
+        "stack bootstrap action invokes the pre-Cargo bootstrap",
+    )?;
+    for snippet in [
+        "BURN_STACK_TOKEN",
+        "x-access-token",
+        ".insteadOf",
+        "${{ inputs.token }}",
+    ] {
+        require_absent(
+            &action,
+            snippet,
+            "public stack bootstrap action does not require credentials",
+        )?;
+    }
+
     for path in workflow_paths()? {
         let text = read(&path)?;
-        if text.contains("repository: aberration-technology/burn_p2p") {
-            let ref_snippet = format!("ref: {BURN_P2P_SIBLING_REF}");
+        if text.contains("cargo ")
+            || text.contains("target/debug/xtask")
+            || text.contains("target/release/xtask")
+        {
             require_contains(
                 &text,
-                &ref_snippet,
-                &format!("{path} pins the burn_p2p sibling revision"),
-            )?;
-            require_contains(
-                &text,
-                "path: burn_p2p-sibling",
-                &format!("{path} checks burn_p2p out inside workspace"),
-            )?;
-            require_contains(
-                &text,
-                "ln -s \"${GITHUB_WORKSPACE}/burn_p2p-sibling\" \"$target\"",
-                &format!("{path} links burn_p2p path dependency"),
+                "uses: ./.github/actions/bootstrap-stack",
+                &format!("{path} materializes the locked sibling stack before Cargo"),
             )?;
             require_absent(
                 &text,
-                "path: ../burn_p2p",
-                &format!("{path} does not checkout outside workspace"),
+                "BURN_STACK_TOKEN",
+                &format!("{path} does not require credentials for public sibling clones"),
             )?;
         }
+        require_absent(
+            &text,
+            "repository: aberration-technology/burn_p2p",
+            &format!("{path} does not duplicate a burn_p2p revision"),
+        )?;
     }
     Ok(())
 }
@@ -455,7 +472,7 @@ fn browser_auth_contracts() -> Result<()> {
 fn native_canary_contracts() -> Result<()> {
     let workflow = read(".github/workflows/live-native-training-canary.yml")?;
     for snippet in [
-        "repository: aberration-technology/burn_p2p",
+        "uses: ./.github/actions/bootstrap-stack",
         "cargo build --locked -p burn_dragon_p2p --bin burn_dragon_p2p_native",
         "cargo build --locked -p xtask",
         "target/debug/xtask run-live-native-training-canary",
@@ -547,6 +564,16 @@ fn browser_and_native_transport_contracts() -> Result<()> {
         &trainer,
         "\"/ip4/$${PUBLIC_IPV4}/udp/${trainer_webrtc_port}/webrtc-direct\"",
         "trainer WebRTC external addr",
+    )?;
+    require_contains(
+        &trainer,
+        "run-trainer-daemon",
+        "managed trainer executes the protocol-aware training loop",
+    )?;
+    require_contains(
+        &trainer,
+        "--initialize-head-on-start false",
+        "managed trainer requires the signed canonical genesis",
     )?;
     require_contains(
         &validator,

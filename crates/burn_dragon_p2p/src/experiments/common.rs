@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use burn::data::dataloader::batcher::Batcher;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
@@ -29,13 +29,13 @@ use burn_dragon_train::train::metrics::{
 };
 use burn_dragon_train::train::pipeline::ResolvedLrScheduler;
 use burn_p2p::burn::{
-    BurnLearnerDataPipeline, BurnLearnerProject, BurnTrainLoader, BurnValidationLoader,
-    BurnWorkloadAdapter, connect, from_learner, from_loaders,
+    BurnLearnerDataPipeline, BurnLearnerProject, BurnLearnerProjectBuilder, BurnTrainLoader,
+    BurnValidationLoader, BurnWorkloadAdapter, connect, from_learner, from_loaders,
 };
 use burn_p2p::{
     DatasetViewId, EvalSplit, GeneratedWorkloadInputProvider, LeaseDataPipeline,
     LeaseDataPipelineDescriptor, LeaseDataPipelineKind, MetricReport, MetricValue, NodeBuilder,
-    SelectedWorkloadProject, SingleWorkloadProjectFamily,
+    PeerRole, PeerRoleSet, SelectedWorkloadProject, SingleWorkloadProjectFamily,
 };
 use burn_train::InferenceStep;
 use burn_train::metric::{Adaptor, ItemLazy};
@@ -47,7 +47,7 @@ use crate::capability::{
 };
 use crate::capability_state::{
     NativeDowngradeObservation, NativeDowngradeScope, apply_native_downgrade_state,
-    clear_native_downgrade, persist_native_downgrade,
+    clear_native_downgrade, load_matching_native_downgrade, persist_native_downgrade,
 };
 use crate::config::{
     DragonExistingShardDatasetConfig, DragonExperimentKind, DragonManifestBundle,
@@ -59,11 +59,98 @@ use crate::profile::resolve_native_training_profile;
 pub type DragonLearningComponents<B> =
     LearningComponentsMarker<B, ResolvedLrScheduler, LanguageTrainModel<B>, LanguageOptimizer<B>>;
 
+type DragonLearnerProjectBuilder<B> = BurnLearnerProjectBuilder<DragonLearningComponents<B>>;
+
 pub type DragonProjectFamily<B> = SingleWorkloadProjectFamily<
     BurnWorkloadAdapter<BurnLearnerProject<DragonLearningComponents<B>>>,
 >;
 
 pub type DragonNodeBuilder<B> = NodeBuilder<SelectedWorkloadProject<DragonProjectFamily<B>>>;
+
+fn attach_dragon_workload_update_applier<B>(
+    builder: DragonLearnerProjectBuilder<B>,
+    config: &TrainingConfig,
+) -> DragonLearnerProjectBuilder<B>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    if config.optimizer.name != burn_dragon_train::OptimizerKind::Eggroll {
+        return builder;
+    }
+    let eggroll = config.optimizer.effective_eggroll_config();
+    let apply_eggroll = eggroll.clone();
+    let builder = builder.with_workload_update_applier(
+        move |mut base_model, descriptor, envelope, contract, store, _device| {
+            let bytes = store.materialize_artifact_bytes(descriptor)?;
+            let update = burn_p2p_workload::decode_compact_update(
+                &bytes,
+                &envelope.training_contract_id,
+                contract,
+            )?;
+            base_model.model = crate::seeded_fitness::replay_dragon_seeded_fitness_update(
+                base_model.model.clone(),
+                &apply_eggroll,
+                &contract.optimizer_hash,
+                &update,
+            )?;
+            Ok(base_model)
+        },
+    );
+    let tbptt_chunk_size = config.training.tbptt_chunk_size;
+    let persist_across_steps = config.training.tbptt_persist_across_steps;
+    builder.with_workload_update_validator(move |mut base_model, context| {
+        let burn_p2p::WorkloadUpdateValidationContext {
+            descriptor,
+            update: envelope,
+            contract,
+            store,
+            device,
+            replay,
+        } = context;
+        let burn_p2p::UpdateCodec::SeededFitness {
+            replay: replay_policy,
+            ..
+        } = &contract.update_codec
+        else {
+            anyhow::bail!("Dragon seeded-fitness validator received a different update codec");
+        };
+        let bytes = store.materialize_artifact_bytes(descriptor)?;
+        let update = burn_p2p_workload::decode_compact_update(
+            &bytes,
+            &envelope.training_contract_id,
+            contract,
+        )?;
+        let records =
+            crate::seeded_fitness::load_replay_token_window_records(replay.cached_microshards)?;
+        let (model, replay_stats) =
+            crate::seeded_fitness::validate_and_replay_dragon_seeded_fitness_update(
+                base_model.model.clone(),
+                &eggroll,
+                &contract.optimizer_hash,
+                &update,
+                records,
+                replay_policy,
+                tbptt_chunk_size,
+                persist_across_steps,
+                device,
+            )?;
+        base_model.model = model;
+        Ok(burn_p2p::ValidatedWorkloadUpdate {
+            model: base_model,
+            evidence: burn_p2p::ValidatedUpdateEvidence {
+                update_envelope_id: burn_p2p::ContentId::derive(envelope)?,
+                norm_stats: None,
+                feature_sketch: None,
+                reconstruction_verified: true,
+                replay_verified: true,
+                replay_stats: Some(replay_stats),
+                validator_peer_id: replay.validator_peer_id.clone(),
+                validated_at: chrono::Utc::now(),
+            },
+        })
+    })
+}
 pub type DragonBurnProject<B> = BurnLearnerProject<DragonLearningComponents<B>>;
 
 #[derive(Clone)]
@@ -81,6 +168,7 @@ where
     pub model_config: DragonConfig,
     pub footprint: DragonTrainingFootprint,
     pub target_decision: DragonNativeTargetDecision,
+    pub capability_reprobe_policy: crate::config::DragonNativeCapabilityReprobePolicy,
 }
 
 impl<B> PreparedNativePeer<B>
@@ -92,7 +180,7 @@ where
             crate::config::DragonNativeTarget::Reducer => "reducer",
             crate::config::DragonNativeTarget::Validator => "validator",
             crate::config::DragonNativeTarget::Auto
-            | crate::config::DragonNativeTarget::Trainer => "trainer",
+            | crate::config::DragonNativeTarget::Trainer => "observer",
         }
     }
 
@@ -132,6 +220,15 @@ where
 
     pub fn clear_runtime_downgrade(&self) -> Result<()> {
         clear_native_downgrade(self.downgrade_scope())
+    }
+
+    pub fn runtime_downgrade_failure_count(&self) -> Result<u32> {
+        Ok(load_matching_native_downgrade(
+            self.downgrade_scope(),
+            self.target_decision.trainer_memory_budget_bytes,
+        )?
+        .map(|record| record.failure_count)
+        .unwrap_or_default())
     }
 }
 
@@ -212,6 +309,19 @@ fn dragon_sharded_input_descriptor(
             };
             descriptor.with_generated_input_source(&provider)
         }
+        burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { config } => {
+            let provider = DragonGeneratedInputDescriptor {
+                provider: "burn_dragon_universality_ruliad",
+                metadata: BTreeMap::from([
+                    ("config_path".into(), config.display().to_string()),
+                    (
+                        "experiment_kind".into(),
+                        experiment_kind.workload_slug().into(),
+                    ),
+                ]),
+            };
+            descriptor.with_generated_input_source(&provider)
+        }
         burn_dragon_language::DatasetSourceConfig::UniversalityManifest { manifest } => descriptor
             .with_custom_input_source(
                 "universality-manifest",
@@ -247,6 +357,7 @@ fn dragon_sharded_data_pipeline<B>(
     dataset: burn_p2p::burn::BurnShardedDataset<TokenWindowRecord>,
     batcher: TokenWindowBatcher,
     batch_size: usize,
+    max_train_batches: usize,
 ) -> BurnLearnerDataPipeline<DragonLearningComponents<B>>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -258,14 +369,26 @@ where
         descriptor,
         move || Ok(registration.clone()),
         move |_registration| Ok(microshard_plan.clone()),
-        move |_lease, cached_microshards, device| {
-            dataset.load_batches(cached_microshards, batcher.clone(), batch_size, device)
+        move |lease, cached_microshards, device| {
+            let records = dataset.load_records(cached_microshards)?;
+            batcher.stream_aligned_batches::<B>(
+                records,
+                batch_size,
+                Some(max_train_batches),
+                Some(lease.window_id.0),
+                device,
+            )
         },
     )
 }
 
-impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindowBatcher {
-    fn batch(&self, items: Vec<TokenWindowRecord>, device: &B::Device) -> SequenceBatch<B> {
+impl TokenWindowBatcher {
+    fn batch_items<B: Backend>(
+        &self,
+        items: Vec<TokenWindowRecord>,
+        reset_stream_state: bool,
+        device: &B::Device,
+    ) -> SequenceBatch<B> {
         let batch_size = items.len().max(1);
         let block_size = items
             .first()
@@ -274,9 +397,17 @@ impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindow
             .max(1);
         let mut inputs = Vec::with_capacity(batch_size * block_size);
         let mut targets = Vec::with_capacity(batch_size * block_size);
-        let mut reset_stream_state = false;
         for item in items {
-            reset_stream_state |= item.reset_stream_state;
+            assert_eq!(
+                item.inputs.len(),
+                block_size,
+                "token-window input lengths must match within one stream batch"
+            );
+            assert_eq!(
+                item.targets.len(),
+                block_size,
+                "token-window target lengths must match within one stream batch"
+            );
             inputs.extend(item.inputs);
             targets.extend(item.targets);
         }
@@ -296,31 +427,60 @@ impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindow
                 TensorData::new(targets, [batch_size, block_size]),
                 device,
             ),
+            loss_mask: None,
             summary_event_mask,
+            ruliad_policy_batch: None,
             reset_stream_state,
         }
     }
+
+    fn stream_aligned_batches<B: Backend>(
+        &self,
+        records: Vec<TokenWindowRecord>,
+        batch_size: usize,
+        max_batches: Option<usize>,
+        window_id: Option<u64>,
+        device: &B::Device,
+    ) -> Result<Vec<SequenceBatch<B>>> {
+        let plan = crate::stream_batch::plan_windowed_stream_batches(
+            &records,
+            batch_size,
+            max_batches,
+            window_id,
+        )?;
+        let mut batches = Vec::with_capacity(plan.len());
+        for planned in plan {
+            let items = planned
+                .record_indices
+                .iter()
+                .map(|index| records[*index].clone())
+                .collect();
+            batches.push(self.batch_items::<B>(items, planned.reset_stream_state, device));
+        }
+        Ok(batches)
+    }
 }
 
-fn dataset_view_id_for_dataset(
-    dataset: &Dataset,
-    shard_export: Option<&DragonShardExportConfig>,
-) -> Result<DatasetViewId> {
-    if let Some(shard_export) = shard_export {
-        let dataset_name = shard_export
-            .dataset_name
-            .as_deref()
-            .unwrap_or("burn-dragon-p2p-dataset");
-        return DatasetViewId::derive(&(
-            "burn-dragon-p2p-dataset-view",
-            dataset_name,
-            dataset.block_size(),
-            dataset.batch_size(),
-            dataset.token_count(),
-        ))
-        .map_err(Into::into);
+impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindowBatcher {
+    fn batch(&self, items: Vec<TokenWindowRecord>, device: &B::Device) -> SequenceBatch<B> {
+        let reset_stream_state = items
+            .first()
+            .map(|first| {
+                if items
+                    .iter()
+                    .all(|item| item.reset_stream_state == first.reset_stream_state)
+                {
+                    first.reset_stream_state
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(true);
+        self.batch_items::<B>(items, reset_stream_state, device)
     }
+}
 
+fn inline_dataset_view_id(dataset: &Dataset) -> Result<DatasetViewId> {
     DatasetViewId::derive(&(
         "burn-dragon-p2p-inline-dataset-view",
         dataset.block_size(),
@@ -461,6 +621,10 @@ fn ensure_supported_training_mode(
             DragonExperimentKind::NcaPrepretraining,
         )
         | (
+            burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { .. },
+            DragonExperimentKind::NcaPrepretraining,
+        )
+        | (
             burn_dragon_language::DatasetSourceConfig::NemotronClimbMix { .. },
             DragonExperimentKind::ClimbMixPretraining,
         ) => {}
@@ -501,6 +665,121 @@ fn mean_loss_from_output_ref<B: Backend>(output: &LanguageModelOutput<B>) -> f64
 
 fn mean_loss_from_train_output_ref<B: AutodiffBackend>(output: &LanguageModelTrainItem<B>) -> f64 {
     mean_loss_from_output_ref(&output.clone().sync())
+}
+
+fn insert_train_loss_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    step_index: usize,
+    loss: f64,
+) {
+    let previous_mean = match metrics.get("train_loss_mean") {
+        Some(MetricValue::Float(value)) => *value,
+        Some(MetricValue::Integer(value)) => *value as f64,
+        _ => 0.0,
+    };
+    let count = (step_index + 1) as f64;
+    let mean = previous_mean + (loss - previous_mean) / count;
+    metrics.insert("train_loss".into(), MetricValue::Float(mean));
+    metrics.insert("train_loss_mean".into(), MetricValue::Float(mean));
+    metrics.insert("train_loss_last".into(), MetricValue::Float(loss));
+}
+
+fn insert_ruliad_source_selection_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
+) {
+    metrics.insert(
+        "ruliad_source_selection_entropy_bits".into(),
+        MetricValue::Float(snapshot.sampler_entropy_bits as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_active_candidate_count".into(),
+        MetricValue::Integer(snapshot.active_candidate_count as i64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_active_max_entropy_bits".into(),
+        MetricValue::Float(snapshot.active_max_entropy_bits as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_normalized_entropy".into(),
+        MetricValue::Float(snapshot.normalized_sampler_entropy as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_hash_noise_probability".into(),
+        MetricValue::Float(snapshot.hash_noise_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mean_loss".into(),
+        MetricValue::Float(snapshot.mean_loss as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mean_learning_progress".into(),
+        MetricValue::Float(snapshot.mean_learning_progress as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_frontier_loss".into(),
+        MetricValue::Float(snapshot.frontier_loss as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_target_loss".into(),
+        MetricValue::Float(snapshot.target_loss as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_target_difficulty_score".into(),
+        MetricValue::Float(snapshot.target_difficulty_score as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_max_difficulty_level".into(),
+        MetricValue::Integer(snapshot.max_difficulty_level as i64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mean_difficulty_level".into(),
+        MetricValue::Float(snapshot.mean_difficulty_level as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_normalized_difficulty_score".into(),
+        MetricValue::Float(snapshot.normalized_difficulty_score as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_max_difficulty_probability".into(),
+        MetricValue::Float(snapshot.max_difficulty_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_mastered_probability".into(),
+        MetricValue::Float(snapshot.mastered_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_feedback_probability".into(),
+        MetricValue::Float(snapshot.capability_feedback_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_verifier_ema".into(),
+        MetricValue::Float(snapshot.capability_verifier_ema as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_completion_health_ema".into(),
+        MetricValue::Float(snapshot.capability_completion_health_ema as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_schema_wrong_ema".into(),
+        MetricValue::Float(snapshot.capability_schema_wrong_ema as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_malformed_ema".into(),
+        MetricValue::Float(snapshot.capability_malformed_ema as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_missing_ema".into(),
+        MetricValue::Float(snapshot.capability_missing_ema as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_capability_lagging_probability".into(),
+        MetricValue::Float(snapshot.capability_lagging_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_verifier_failures".into(),
+        MetricValue::Integer(snapshot.verifier_failures as i64),
+    );
 }
 
 fn language_evaluate<B>(
@@ -629,37 +908,62 @@ fn window_records_from_dataset(
     dataset: &Dataset,
     split: DatasetSplit,
     max_records: Option<usize>,
+    batch_size: usize,
 ) -> Vec<TokenWindowRecord> {
     let (offset, span) = dataset.split_offset_and_span(split);
     let block_size = dataset.block_size();
     if block_size == 0 || span <= block_size {
         return Vec::new();
     }
-    let logical_document_tokens = dataset.preferred_logical_document_tokens(split);
-    let document_span = logical_document_tokens.map(|tokens| tokens.saturating_add(1));
+    let logical_document_tokens = dataset
+        .preferred_logical_document_tokens(split)
+        .unwrap_or_else(|| span.saturating_sub(1).max(block_size));
+    let document_span = logical_document_tokens.saturating_add(1);
+    let num_documents = (span / document_span).max(1);
+    let chunks_per_document = logical_document_tokens.div_ceil(block_size).max(1);
+    let batch_size = batch_size.max(1);
     let mut records = Vec::new();
-    let max_start = span.saturating_sub(block_size + 1);
-    let mut local_start = 0usize;
-    while local_start <= max_start {
-        let start = offset + local_start;
-        let mut sample = vec![0_u32; block_size + 1];
-        dataset.copy_token_range(start, &mut sample);
-        let reset_stream_state =
-            document_span.is_some_and(|document_span| local_start.is_multiple_of(document_span));
-        records.push(TokenWindowRecord {
-            inputs: sample[..block_size]
-                .iter()
-                .map(|token| *token as i64)
-                .collect(),
-            targets: sample[1..].iter().map(|token| *token as i64).collect(),
-            reset_stream_state,
-        });
-        if max_records.is_some_and(|limit| records.len() >= limit) {
-            break;
+    for (group_id, document_group_start) in (0..num_documents).step_by(batch_size).enumerate() {
+        let group_rows = (num_documents - document_group_start).min(batch_size);
+        for chunk_index in 0..chunks_per_document {
+            for stream_row in 0..group_rows {
+                let document_index = document_group_start + stream_row;
+                let start = offset
+                    + document_index.saturating_mul(document_span)
+                    + chunk_index.saturating_mul(block_size);
+                let mut sample = vec![0_u32; block_size + 1];
+                dataset.copy_token_range(start, &mut sample);
+                records.push(TokenWindowRecord {
+                    inputs: sample[..block_size]
+                        .iter()
+                        .map(|token| *token as i64)
+                        .collect(),
+                    targets: sample[1..].iter().map(|token| *token as i64).collect(),
+                    reset_stream_state: chunk_index == 0,
+                    stream_group_id: Some(group_id as u64),
+                    stream_row: Some(stream_row),
+                    chunk_index: Some(chunk_index),
+                });
+                if max_records.is_some_and(|limit| records.len() >= limit) {
+                    return records;
+                }
+            }
         }
-        local_start = local_start.saturating_add(block_size);
     }
     records
+}
+
+fn stream_segment_partition_key(
+    record_index: usize,
+    record: &TokenWindowRecord,
+    max_segment_chunks: usize,
+) -> (u8, u64, usize) {
+    match (record.stream_group_id, record.chunk_index) {
+        (Some(group_id), Some(chunk_index)) => {
+            (0, group_id, chunk_index / max_segment_chunks.max(1))
+        }
+        _ => (1, record_index as u64, 0),
+    }
 }
 
 fn attach_sharded_dataset<B>(
@@ -669,7 +973,11 @@ fn attach_sharded_dataset<B>(
     datasets: &burn_dragon_language::train::utils::PreparedDatasets,
     shard_export: &DragonShardExportConfig,
     summary_event_token_ids: Option<Vec<u32>>,
-) -> Result<burn_p2p::burn::BurnLearnerProjectBuilder<DragonLearningComponents<B>>>
+    max_train_batches: usize,
+) -> Result<(
+    burn_p2p::burn::BurnLearnerProjectBuilder<DragonLearningComponents<B>>,
+    DatasetViewId,
+)>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
@@ -678,6 +986,7 @@ where
         &datasets.train,
         DatasetSplit::Train,
         shard_export.max_records,
+        datasets.train.batch_size(),
     );
     if records.is_empty() {
         bail!(
@@ -695,8 +1004,15 @@ where
     if let Some(count) = shard_export.microshards {
         config = config.with_microshards(count);
     }
-    let sharded =
-        burn_p2p::burn::BurnShardedDataset::write_local(&shard_export.root, &records, config)?;
+    let sharded = burn_p2p::burn::BurnShardedDataset::write_local_grouped_by(
+        &shard_export.root,
+        &records,
+        config,
+        "dragon-bounded-stream-segment-balanced-v2",
+        |record_index, record| {
+            stream_segment_partition_key(record_index, record, max_train_batches)
+        },
+    )?;
     let sharded = if let Some(base_url) = &shard_export.http_upstream {
         sharded.with_http_upstream(base_url.clone())
     } else {
@@ -709,14 +1025,17 @@ where
         sharded.microshard_plan().microshards.len(),
         shard_export.http_upstream.as_deref(),
     );
-    Ok(
+    let dataset_view_id = sharded.registration().view.dataset_view_id.clone();
+    Ok((
         builder.with_data_pipeline(dragon_sharded_data_pipeline::<B>(
             descriptor,
             sharded,
             TokenWindowBatcher::new(summary_event_token_ids),
             datasets.train.batch_size(),
+            max_train_batches,
         )),
-    )
+        dataset_view_id,
+    ))
 }
 
 fn attach_existing_sharded_dataset<B>(
@@ -725,6 +1044,7 @@ fn attach_existing_sharded_dataset<B>(
     dataset_source: &burn_dragon_language::DatasetSourceConfig,
     shard_dataset: &DragonExistingShardDatasetConfig,
     batch_size: usize,
+    max_train_batches: usize,
     summary_event_token_ids: Option<Vec<u32>>,
 ) -> Result<burn_p2p::burn::BurnLearnerProjectBuilder<DragonLearningComponents<B>>>
 where
@@ -751,6 +1071,7 @@ where
             sharded,
             TokenWindowBatcher::new(summary_event_token_ids),
             batch_size,
+            max_train_batches,
         )),
     )
 }
@@ -767,6 +1088,7 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    B::seed(device, config.training.seed);
     let mut base_model = DragonModel::<B>::new(model_config.clone(), device);
     let fresh_model = base_model.clone();
     if let Some(checkpoint_path) = &config.training.init_checkpoint_path {
@@ -782,11 +1104,8 @@ where
     validate_dragon_continual_backprop(&config.training, &base_model, 1)?;
 
     let model = LanguageTrainModel::new(base_model)
-        .with_pipeline_plan(None)
-        .with_tbptt_chunk_size(config.training.tbptt_chunk_size)
-        .with_tbptt_persist_across_steps(config.training.tbptt_persist_across_steps)
-        .with_continual_backprop(&config.training.continual_backprop)
-        .with_gradient_scale_schedule(&config.training, total_steps);
+        .with_training_configuration(&config.training, total_steps)
+        .with_pipeline_plan(None);
     let optimizer = resolve_dragon_language_optimizer::<B>(
         &config.training,
         &config.optimizer,
@@ -867,10 +1186,17 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    let Some(validation_cfg) = &config.dataset.validation else {
-        return Ok(None);
+    let effective_cfg = match &config.dataset.validation {
+        Some(validation_cfg) => validation_dataset_config_for(&config.dataset, validation_cfg),
+        None => match &config.dataset.source {
+            burn_dragon_language::DatasetSourceConfig::UniversalityNca { .. }
+            | burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { .. }
+            | burn_dragon_language::DatasetSourceConfig::UniversalityManifest { .. } => {
+                config.dataset.clone()
+            }
+            burn_dragon_language::DatasetSourceConfig::NemotronClimbMix { .. } => return Ok(None),
+        },
     };
-    let effective_cfg = validation_dataset_config_for(&config.dataset, validation_cfg);
     let prepared = prepare_datasets(&effective_cfg, &config.training)?;
     ensure_tokenizer_compatible(
         base_tokenizer,
@@ -895,6 +1221,7 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    native.capability_policy.native_reprobe.validate()?;
     let resolved = resolve_native_training_profile(native, experiment_kind, true)?;
     let config = resolved.config;
     if native
@@ -959,7 +1286,7 @@ where
                 burn_p2p::CapabilityEstimate {
                     preferred_backends: vec![backend_label_owned.clone()],
                     work_units_per_second: estimated_tokens_per_second
-                        .max((inventory.parameter_count.max(1) as f64).sqrt()),
+                        .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
                     target_window_seconds: 30,
                 }
             })
@@ -968,9 +1295,10 @@ where
                     "train_steps".into(),
                     MetricValue::Integer((step_index + 1) as i64),
                 );
-                metrics.insert(
-                    "train_loss".into(),
-                    MetricValue::Float(mean_loss_from_train_output_ref(output)),
+                insert_train_loss_metrics(
+                    metrics,
+                    step_index,
+                    mean_loss_from_train_output_ref(output),
                 );
                 Ok(())
             });
@@ -999,8 +1327,10 @@ where
             &config.dataset.source,
             existing_shards,
             config.training.batch_size,
+            config.training.max_iters,
             summary_event_token_ids,
         )?;
+        builder = attach_dragon_workload_update_applier(builder, &config);
         (
             builder.build()?,
             sharded.registration().view.dataset_view_id.clone(),
@@ -1043,44 +1373,57 @@ where
         let max_eval_batches = native.training_overrides.max_eval_batches;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
+        let source_selection_dataset = Arc::clone(&datasets.train);
         let mut builder = from_loaders(learner, device.clone(), train_loader, validation_loader)
             .with_benchmark(move |model, _device| {
                 let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
                 burn_p2p::CapabilityEstimate {
                     preferred_backends: vec![backend_label_owned.clone()],
                     work_units_per_second: estimated_tokens_per_second
-                        .max((inventory.parameter_count.max(1) as f64).sqrt()),
+                        .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
                     target_window_seconds: 30,
                 }
             })
             .with_evaluate(move |model, split| {
                 language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
             })
-            .with_step_metrics(|step_index, output, metrics| {
+            .with_step_metrics(move |step_index, output, metrics| {
+                let train_loss = mean_loss_from_train_output_ref(output);
                 metrics.insert(
                     "train_steps".into(),
                     MetricValue::Integer((step_index + 1) as i64),
                 );
-                metrics.insert(
-                    "train_loss".into(),
-                    MetricValue::Float(mean_loss_from_train_output_ref(output)),
-                );
+                insert_train_loss_metrics(metrics, step_index, train_loss);
+                if let Some(snapshot) = source_selection_dataset
+                    .record_source_selection_loss(step_index, train_loss as f32)
+                {
+                    insert_ruliad_source_selection_metrics(metrics, &snapshot);
+                }
                 Ok(())
             });
 
-        if let Some(shard_export) = &native.shard_export {
-            builder = attach_sharded_dataset::<B>(
+        let exported_dataset_view_id = if let Some(shard_export) = &native.shard_export {
+            let (next_builder, dataset_view_id) = attach_sharded_dataset::<B>(
                 builder,
                 experiment_kind,
                 &config.dataset.source,
                 &datasets,
                 shard_export,
                 summary_event_token_ids.clone(),
+                config.training.max_iters,
             )?;
-        }
+            builder = next_builder;
+            Some(dataset_view_id)
+        } else {
+            None
+        };
+        builder = attach_dragon_workload_update_applier(builder, &config);
         (
             builder.build()?,
-            dataset_view_id_for_dataset(&datasets.train, native.shard_export.as_ref())?,
+            match exported_dataset_view_id {
+                Some(dataset_view_id) => dataset_view_id,
+                None => inline_dataset_view_id(&datasets.train)?,
+            },
         )
     };
 
@@ -1099,6 +1442,7 @@ where
         experiment_kind,
         backend_label,
         &model_config,
+        Some(&config),
         &resolved.profile,
         dataset_view_id,
         &footprint,
@@ -1151,6 +1495,71 @@ where
         &manifests.experiment_directory,
     );
     node_builder = node_builder.with_auth(auth_config);
+    if matches!(
+        target_decision.requested_target,
+        crate::config::DragonNativeTarget::Auto | crate::config::DragonNativeTarget::Trainer
+    ) {
+        let gpu = !backend_label.eq_ignore_ascii_case("cpu")
+            && !backend_label.eq_ignore_ascii_case("ndarray");
+        let mut roles = target_decision
+            .requested_target
+            .roles(gpu)
+            .roles
+            .into_iter()
+            .collect::<Vec<_>>();
+        roles.extend(target_decision.effective_target.roles(gpu).roles);
+        roles.push(PeerRole::Viewer);
+        node_builder = node_builder.with_role_capabilities(PeerRoleSet::new(roles));
+    }
+    if let Some(path) = native.manifest.revision_contract_path.as_ref() {
+        for authority_public_key_hex in &native.manifest.authority_public_keys {
+            let public_key_bytes = hex::decode(authority_public_key_hex)
+                .with_context(|| "decode revision authority public key as protobuf hex")?;
+            let public_key = libp2p_identity::PublicKey::try_decode_protobuf(&public_key_bytes)
+                .with_context(|| "decode revision authority protobuf public key")?;
+            let issuer_peer_id = burn_p2p::PeerId::new(
+                libp2p_identity::PeerId::from_public_key(&public_key).to_string(),
+            );
+            node_builder =
+                node_builder.with_revision_contract_trusted_issuer(burn_p2p::TrustedIssuer {
+                    issuer_peer_id,
+                    issuer_public_key_hex: authority_public_key_hex.clone(),
+                })?;
+        }
+        let bytes = std::fs::read(path).with_context(|| {
+            format!(
+                "read signed revision contract bundle from {}",
+                path.display()
+            )
+        })?;
+        let contract: burn_p2p::RevisionContractBundle = serde_json::from_slice(&bytes)
+            .with_context(|| {
+                format!(
+                    "decode signed revision contract bundle from {}",
+                    path.display()
+                )
+            })?;
+        contract
+            .validate()
+            .context("validate signed Dragon revision contract bundle")?;
+        ensure!(
+            contract.revision.experiment_id.as_str() == manifest_seed.experiment_id
+                && contract.revision.revision_id.as_str() == manifest_seed.revision_id,
+            "signed revision contract does not match selected Dragon experiment/revision"
+        );
+        ensure!(
+            contract.training_contract_id == manifests.training_contract_id
+                && contract.training == manifests.training_contract,
+            "signed revision contract semantic training identity does not match local Dragon configuration"
+        );
+        node_builder = node_builder.with_revision_contract(contract)?;
+    } else if native.manifest.require_signed_revision_contracts {
+        bail!(
+            "signed revision contracts are required, but manifest.revision_contract_path is unset"
+        );
+    }
+    node_builder = node_builder
+        .require_signed_revision_contracts(native.manifest.require_signed_revision_contracts);
     if let Some(upstream) = dataset_upstream {
         node_builder = node_builder.with_dataset(upstream);
     }
@@ -1166,5 +1575,122 @@ where
         model_config,
         footprint,
         target_decision,
+        capability_reprobe_policy: native.capability_policy.native_reprobe.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::NdArray;
+
+    use super::*;
+
+    fn record(
+        group: Option<u64>,
+        row: Option<usize>,
+        chunk: Option<usize>,
+        token: i64,
+        reset: bool,
+    ) -> TokenWindowRecord {
+        TokenWindowRecord {
+            inputs: vec![token, token + 1],
+            targets: vec![token + 1, token + 2],
+            reset_stream_state: reset,
+            stream_group_id: group,
+            stream_row: row,
+            chunk_index: chunk,
+        }
+    }
+
+    #[test]
+    fn sharded_batches_restore_stream_group_and_row_order() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let batcher = TokenWindowBatcher::new(None);
+        let batches = batcher
+            .stream_aligned_batches::<NdArray<f32>>(
+                vec![
+                    record(Some(7), Some(1), Some(1), 31, false),
+                    record(Some(8), Some(0), Some(5), 50, false),
+                    record(Some(7), Some(0), Some(0), 10, true),
+                    record(Some(7), Some(0), Some(1), 30, false),
+                    record(Some(7), Some(1), Some(0), 11, true),
+                ],
+                2,
+                None,
+                None,
+                &device,
+            )
+            .expect("aligned batches");
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches[0].reset_stream_state);
+        assert!(!batches[1].reset_stream_state);
+        assert!(batches[2].reset_stream_state);
+        assert_eq!(
+            batches[1]
+                .inputs
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .expect("tokens"),
+            vec![30, 31, 31, 32]
+        );
+    }
+
+    #[test]
+    fn legacy_shards_reset_each_batch_instead_of_cross_wiring_streams() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let batcher = TokenWindowBatcher::new(None);
+        let batches = batcher
+            .stream_aligned_batches::<NdArray<f32>>(
+                vec![
+                    record(None, None, None, 1, true),
+                    record(None, None, None, 2, false),
+                    record(None, None, None, 3, false),
+                ],
+                2,
+                None,
+                None,
+                &device,
+            )
+            .expect("legacy batches");
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| batch.reset_stream_state));
+    }
+
+    #[test]
+    fn shard_partition_preserves_bounded_contiguous_stream_segments() {
+        let key = |index, group, chunk| {
+            stream_segment_partition_key(
+                index,
+                &record(group, Some(0), chunk, index as i64, chunk == Some(0)),
+                3,
+            )
+        };
+
+        assert_eq!(key(0, Some(7), Some(0)), key(1, Some(7), Some(2)));
+        assert_ne!(key(0, Some(7), Some(2)), key(1, Some(7), Some(3)));
+        assert_ne!(key(0, Some(7), Some(0)), key(1, Some(8), Some(0)));
+        assert_ne!(key(0, None, None), key(1, None, None));
+    }
+
+    #[test]
+    fn train_loss_metrics_keep_mean_and_last_batch_distinct() {
+        let mut metrics = BTreeMap::new();
+        for (step_index, loss) in [3.0, 1.0, 4.0].into_iter().enumerate() {
+            insert_train_loss_metrics(&mut metrics, step_index, loss);
+        }
+        assert_eq!(
+            metrics.get("train_loss"),
+            Some(&MetricValue::Float(8.0 / 3.0))
+        );
+        assert_eq!(
+            metrics.get("train_loss_mean"),
+            Some(&MetricValue::Float(8.0 / 3.0))
+        );
+        assert_eq!(
+            metrics.get("train_loss_last"),
+            Some(&MetricValue::Float(4.0))
+        );
+    }
 }

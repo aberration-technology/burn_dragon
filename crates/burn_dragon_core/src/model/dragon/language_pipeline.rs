@@ -23,7 +23,12 @@ impl<B: Backend> DragonModel<B> {
             position_mode,
             summary_event_mask,
         );
-        let logits = self.project_hidden_to_logits(hidden.clone());
+        let output = self.reason_hidden(hidden);
+        let logits = self.project_hidden_to_logits_for_latent_step(
+            output.final_hidden.clone(),
+            output.steps_used,
+        );
+        let hidden = output.final_hidden;
         (hidden, logits)
     }
 
@@ -146,6 +151,48 @@ impl<B: Backend> DragonModel<B> {
                 continue;
             }
             layer_state.clocked_slow_hidden = None;
+
+            if self.hierarchical_dragon_applies_to_layer(layer_idx) {
+                layer_state.y_neuron_state = None;
+                let [branch_batch, branch_views, branch_time, branch_dim] =
+                    branch_input.shape().dims::<4>();
+                let branch_flat =
+                    branch_input.reshape([branch_batch * branch_views, 1, branch_time, branch_dim]);
+                let branch_out = self
+                    .forward_hierarchical_branch_layer(
+                        branch_flat,
+                        layer_state,
+                        layer_idx,
+                        start_pos,
+                        position_mode,
+                    )
+                    .reshape([branch_batch, branch_views, branch_time, branch_dim]);
+                let next = self.merge_language_residuals_for_layer(
+                    branch_out,
+                    merge_bindings,
+                    &connector,
+                    mhc_coefficients,
+                );
+                pipeline_state.current =
+                    if self.residual_connector_needs_post_merge_norm(&connector) {
+                        self.norm.forward(next)
+                    } else {
+                        next
+                    };
+                self.update_language_residual_history(
+                    &mut pipeline_state.residual_history,
+                    current_before,
+                    &pipeline_state.current,
+                );
+                continue;
+            }
+            layer_state.hierarchical_slow_hidden = None;
+            layer_state.slow_rho = None;
+            layer_state.slow_rho_norm = None;
+            layer_state.slow_sequence_aux = None;
+            layer_state.slow_mamba_angle_state = None;
+            layer_state.slow_mamba_k_state = None;
+            layer_state.slow_mamba_v_state = None;
 
             let [branch_batch, branch_views, branch_time, branch_dim] =
                 branch_input.shape().dims::<4>();

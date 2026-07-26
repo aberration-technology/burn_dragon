@@ -1,0 +1,58 @@
+extends = ["ruliad-r1.training.toml"]
+
+[model.latent_reasoning]
+enabled = true
+max_steps = 1
+min_steps = 1
+adaptive_halting = false
+halt_threshold = 0.55
+refiner_hidden_multiplier = 1
+normalize_steps = false
+energy_head = false
+stop_bias_init = -2.0
+energy_margin = 1.0
+
+[training]
+max_iters = 8
+checkpoint_interval_iters = 8
+log_frequency = 1
+batch_size = 8
+
+[training.latent_reasoning]
+enabled = true
+every_steps = 8
+jepa_future_offsets = [1]
+target_encoder = "detached_student"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"
+
+[training.latent_reasoning.sigreg]
+enabled = false
+mode = "weak_covariance"
+target_variance = 1.0
+min_variance = 0.2
+mean_tolerance = 0.05
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.01
+warmup_steps = 512
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5
+
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 4
+max_batch_size = 16
+max_probe_batch_size = 8
+probe_steps = 1
+target_device_memory_mb = 60000
+binary_search = true
+recompute_on_neuron_scale = false
+max_system_memory_fraction = 0.9
+probe_safety_margin = 1.15
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0

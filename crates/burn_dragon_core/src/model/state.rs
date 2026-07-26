@@ -1,3 +1,5 @@
+use std::mem;
+
 use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 
@@ -10,7 +12,14 @@ pub struct LayerState<B: Backend> {
     pub mamba_angle_state: Option<Tensor<B, 3>>,
     pub mamba_k_state: Option<Tensor<B, 3>>,
     pub mamba_v_state: Option<Tensor<B, 3>>,
+    pub slow_rho: Option<Tensor<B, 4>>,
+    pub slow_rho_norm: Option<Tensor<B, 3>>,
+    pub slow_sequence_aux: Option<Tensor<B, 4>>,
+    pub slow_mamba_angle_state: Option<Tensor<B, 3>>,
+    pub slow_mamba_k_state: Option<Tensor<B, 3>>,
+    pub slow_mamba_v_state: Option<Tensor<B, 3>>,
     pub y_neuron_state: Option<Tensor<B, 3>>,
+    pub hierarchical_slow_hidden: Option<Tensor<B, 4>>,
     pub clocked_slow_hidden: Option<Tensor<B, 4>>,
     pub summary_memory_hidden: Option<Tensor<B, 4>>,
     #[cfg(any(feature = "viz", feature = "probe"))]
@@ -52,7 +61,14 @@ impl<B: Backend> ModelState<B> {
                     mamba_angle_state: None,
                     mamba_k_state: None,
                     mamba_v_state: None,
+                    slow_rho: None,
+                    slow_rho_norm: None,
+                    slow_sequence_aux: None,
+                    slow_mamba_angle_state: None,
+                    slow_mamba_k_state: None,
+                    slow_mamba_v_state: None,
                     y_neuron_state: None,
+                    hierarchical_slow_hidden: None,
                     clocked_slow_hidden: None,
                     summary_memory_hidden: None,
                     #[cfg(any(feature = "viz", feature = "probe"))]
@@ -71,7 +87,14 @@ impl<B: Backend> ModelState<B> {
             layer.mamba_angle_state = None;
             layer.mamba_k_state = None;
             layer.mamba_v_state = None;
+            layer.slow_rho = None;
+            layer.slow_rho_norm = None;
+            layer.slow_sequence_aux = None;
+            layer.slow_mamba_angle_state = None;
+            layer.slow_mamba_k_state = None;
+            layer.slow_mamba_v_state = None;
             layer.y_neuron_state = None;
+            layer.hierarchical_slow_hidden = None;
             layer.clocked_slow_hidden = None;
             layer.summary_memory_hidden = None;
         }
@@ -98,7 +121,26 @@ impl<B: Backend> ModelState<B> {
             layer.mamba_angle_state = layer.mamba_angle_state.take().map(|tensor| tensor.detach());
             layer.mamba_k_state = layer.mamba_k_state.take().map(|tensor| tensor.detach());
             layer.mamba_v_state = layer.mamba_v_state.take().map(|tensor| tensor.detach());
+            layer.slow_rho = layer.slow_rho.take().map(|tensor| tensor.detach());
+            layer.slow_rho_norm = layer.slow_rho_norm.take().map(|tensor| tensor.detach());
+            layer.slow_sequence_aux = layer.slow_sequence_aux.take().map(|tensor| tensor.detach());
+            layer.slow_mamba_angle_state = layer
+                .slow_mamba_angle_state
+                .take()
+                .map(|tensor| tensor.detach());
+            layer.slow_mamba_k_state = layer
+                .slow_mamba_k_state
+                .take()
+                .map(|tensor| tensor.detach());
+            layer.slow_mamba_v_state = layer
+                .slow_mamba_v_state
+                .take()
+                .map(|tensor| tensor.detach());
             layer.y_neuron_state = layer.y_neuron_state.take().map(|tensor| tensor.detach());
+            layer.hierarchical_slow_hidden = layer
+                .hierarchical_slow_hidden
+                .take()
+                .map(|tensor| tensor.detach());
             layer.clocked_slow_hidden = layer
                 .clocked_slow_hidden
                 .take()
@@ -146,7 +188,17 @@ impl<B: AutodiffBackend> ModelState<B> {
                     mamba_angle_state: layer.mamba_angle_state.clone().map(Tensor::inner),
                     mamba_k_state: layer.mamba_k_state.clone().map(Tensor::inner),
                     mamba_v_state: layer.mamba_v_state.clone().map(Tensor::inner),
+                    slow_rho: layer.slow_rho.clone().map(Tensor::inner),
+                    slow_rho_norm: layer.slow_rho_norm.clone().map(Tensor::inner),
+                    slow_sequence_aux: layer.slow_sequence_aux.clone().map(Tensor::inner),
+                    slow_mamba_angle_state: layer.slow_mamba_angle_state.clone().map(Tensor::inner),
+                    slow_mamba_k_state: layer.slow_mamba_k_state.clone().map(Tensor::inner),
+                    slow_mamba_v_state: layer.slow_mamba_v_state.clone().map(Tensor::inner),
                     y_neuron_state: layer.y_neuron_state.clone().map(Tensor::inner),
+                    hierarchical_slow_hidden: layer
+                        .hierarchical_slow_hidden
+                        .clone()
+                        .map(Tensor::inner),
                     clocked_slow_hidden: layer.clocked_slow_hidden.clone().map(Tensor::inner),
                     summary_memory_hidden: layer.summary_memory_hidden.clone().map(Tensor::inner),
                     #[cfg(any(feature = "viz", feature = "probe"))]
@@ -175,7 +227,16 @@ impl<B: AutodiffBackend> ModelState<B> {
                     mamba_angle_state: layer.mamba_angle_state.map(Tensor::from_inner),
                     mamba_k_state: layer.mamba_k_state.map(Tensor::from_inner),
                     mamba_v_state: layer.mamba_v_state.map(Tensor::from_inner),
+                    slow_rho: layer.slow_rho.map(Tensor::from_inner),
+                    slow_rho_norm: layer.slow_rho_norm.map(Tensor::from_inner),
+                    slow_sequence_aux: layer.slow_sequence_aux.map(Tensor::from_inner),
+                    slow_mamba_angle_state: layer.slow_mamba_angle_state.map(Tensor::from_inner),
+                    slow_mamba_k_state: layer.slow_mamba_k_state.map(Tensor::from_inner),
+                    slow_mamba_v_state: layer.slow_mamba_v_state.map(Tensor::from_inner),
                     y_neuron_state: layer.y_neuron_state.map(Tensor::from_inner),
+                    hierarchical_slow_hidden: layer
+                        .hierarchical_slow_hidden
+                        .map(Tensor::from_inner),
                     clocked_slow_hidden: layer.clocked_slow_hidden.map(Tensor::from_inner),
                     summary_memory_hidden: layer.summary_memory_hidden.map(Tensor::from_inner),
                     #[cfg(any(feature = "viz", feature = "probe"))]
@@ -189,6 +250,20 @@ impl<B: AutodiffBackend> ModelState<B> {
                 .collect(),
             position: state.position,
         }
+    }
+}
+
+impl<B: Backend> LayerState<B> {
+    pub fn swap_fast_slow_sequence_state(&mut self) {
+        mem::swap(&mut self.rho, &mut self.slow_rho);
+        mem::swap(&mut self.rho_norm, &mut self.slow_rho_norm);
+        mem::swap(&mut self.sequence_aux, &mut self.slow_sequence_aux);
+        mem::swap(
+            &mut self.mamba_angle_state,
+            &mut self.slow_mamba_angle_state,
+        );
+        mem::swap(&mut self.mamba_k_state, &mut self.slow_mamba_k_state);
+        mem::swap(&mut self.mamba_v_state, &mut self.slow_mamba_v_state);
     }
 }
 

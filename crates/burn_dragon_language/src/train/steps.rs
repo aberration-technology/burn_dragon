@@ -1,39 +1,25 @@
+use crate::config::train::NeuronScalingStabilizationConfig;
 use crate::train::prelude::*;
+use burn::tensor::activation;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-type StreamingStateStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
-type TeacherModelStore = HashMap<(usize, TypeId), Box<dyn Any + Send>>;
-
-fn streaming_state_store() -> &'static Mutex<StreamingStateStore> {
-    static STORE: OnceLock<Mutex<StreamingStateStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Default)]
+struct PipelineRuntimeCell {
+    inner: Arc<Mutex<Option<Box<dyn Any + Send>>>>,
 }
 
-fn lock_streaming_state_store() -> std::sync::MutexGuard<'static, StreamingStateStore> {
-    streaming_state_store()
-        .lock()
-        .expect("streaming tbptt runtime lock poisoned")
-}
-
-fn teacher_model_store() -> &'static Mutex<TeacherModelStore> {
-    static STORE: OnceLock<Mutex<TeacherModelStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn lock_teacher_model_store() -> std::sync::MutexGuard<'static, TeacherModelStore> {
-    teacher_model_store()
-        .lock()
-        .expect("teacher model runtime lock poisoned")
-}
-
-fn next_streaming_runtime_key() -> usize {
-    static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
-    NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+impl std::fmt::Debug for PipelineRuntimeCell {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PipelineRuntimeCell")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,6 +29,7 @@ struct GradientScaleSchedule {
     backbone_grad_scale: Option<f32>,
     backbone_grad_scale_steps: usize,
     backbone_param_ids: Arc<HashSet<burn::module::ParamId>>,
+    neuron_scale_stabilization: Option<NeuronScaleGradientStabilization>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +88,48 @@ impl ParamScaleScheduleRule {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NeuronScaleGradientStabilization {
+    start_step_index: usize,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    freeze_base_steps: usize,
+    unfreeze_ramp_steps: usize,
+    new_slice_lr_scale: f32,
+    base_lr_scale_after_ramp: f32,
+    base_param_ids: Arc<HashSet<burn::module::ParamId>>,
+    shared_encoder: burn::module::ParamId,
+    shared_encoder_v: burn::module::ParamId,
+    shared_decoder: burn::module::ParamId,
+}
+
+impl NeuronScaleGradientStabilization {
+    fn base_scale_for_step_index(&self, step_index: usize) -> f32 {
+        let elapsed = step_index.saturating_sub(self.start_step_index);
+        if elapsed < self.freeze_base_steps {
+            return 0.0;
+        }
+        if self.unfreeze_ramp_steps == 0 {
+            return self.base_lr_scale_after_ramp;
+        }
+        let ramp_elapsed = elapsed.saturating_sub(self.freeze_base_steps);
+        if ramp_elapsed >= self.unfreeze_ramp_steps {
+            return self.base_lr_scale_after_ramp;
+        }
+        self.base_lr_scale_after_ramp * (ramp_elapsed as f32 / self.unfreeze_ramp_steps as f32)
+    }
+
+    fn is_active_for_step_index(&self, step_index: usize) -> bool {
+        let elapsed = step_index.saturating_sub(self.start_step_index);
+        elapsed
+            < self
+                .freeze_base_steps
+                .saturating_add(self.unfreeze_ramp_steps)
+            || (self.base_lr_scale_after_ramp - 1.0).abs() > f32::EPSILON
+            || (self.new_slice_lr_scale - 1.0).abs() > f32::EPSILON
+    }
+}
+
 impl GradientScaleSchedule {
     fn from_training<B: BackendTrait>(
         model: &DragonModel<B>,
@@ -149,6 +178,7 @@ impl GradientScaleSchedule {
             backbone_grad_scale: Some(backbone_grad_scale),
             backbone_grad_scale_steps,
             backbone_param_ids: Arc::new(backbone_param_ids),
+            neuron_scale_stabilization: None,
         }
     }
 
@@ -201,6 +231,51 @@ impl GradientScaleSchedule {
             step_index,
         )
     }
+
+    fn with_neuron_scale_stabilization<B: BackendTrait>(
+        mut self,
+        model: &DragonModel<B>,
+        old_latent_total: usize,
+        new_latent_total: usize,
+        start_step_index: usize,
+        config: &NeuronScalingStabilizationConfig,
+    ) -> Self {
+        if new_latent_total <= old_latent_total {
+            return self;
+        }
+        let new_latent_per_head = model.latent_per_head_capacity();
+        if new_latent_per_head == 0 {
+            return self;
+        }
+        let n_head = new_latent_total / new_latent_per_head;
+        if n_head == 0 {
+            return self;
+        }
+        let old_latent_per_head = old_latent_total / n_head;
+        if old_latent_per_head >= new_latent_per_head {
+            return self;
+        }
+        let shared = model.shared_lowrank_param_ids();
+        let shared_ids = HashSet::from([shared.encoder, shared.encoder_v, shared.decoder]);
+        let mut base_param_ids = collect_model_param_ids(model);
+        for param_id in &shared_ids {
+            base_param_ids.remove(param_id);
+        }
+        self.neuron_scale_stabilization = Some(NeuronScaleGradientStabilization {
+            start_step_index,
+            old_latent_per_head,
+            new_latent_per_head,
+            freeze_base_steps: config.freeze_base_steps,
+            unfreeze_ramp_steps: config.unfreeze_ramp_steps,
+            new_slice_lr_scale: config.new_slice_lr_scale,
+            base_lr_scale_after_ramp: config.base_lr_scale_after_ramp,
+            base_param_ids: Arc::new(base_param_ids),
+            shared_encoder: shared.encoder,
+            shared_encoder_v: shared.encoder_v,
+            shared_decoder: shared.decoder,
+        });
+        self
+    }
 }
 
 fn scale_gradients_by_schedule<B, M>(
@@ -210,6 +285,7 @@ fn scale_gradients_by_schedule<B, M>(
     step_index: usize,
     extra_param_ids: &HashSet<burn::module::ParamId>,
     extra_scale: Option<f32>,
+    neuron_scale_stabilization: Option<&NeuronScaleGradientStabilization>,
 ) where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
@@ -219,7 +295,9 @@ fn scale_gradients_by_schedule<B, M>(
         .any(|rule| (rule.scale_for_step_index(step_index) - 1.0).abs() > f32::EPSILON);
     let has_extra_scale = extra_scale
         .is_some_and(|scale| (scale - 1.0).abs() > f32::EPSILON && !extra_param_ids.is_empty());
-    if !has_static_scales && !has_extra_scale {
+    let has_neuron_scale_stabilization = neuron_scale_stabilization
+        .is_some_and(|schedule| schedule.is_active_for_step_index(step_index));
+    if !has_static_scales && !has_extra_scale && !has_neuron_scale_stabilization {
         return;
     }
 
@@ -229,6 +307,7 @@ fn scale_gradients_by_schedule<B, M>(
         step_index: usize,
         extra_param_ids: &'a HashSet<burn::module::ParamId>,
         extra_scale: Option<f32>,
+        neuron_scale_stabilization: Option<&'a NeuronScaleGradientStabilization>,
         _marker: std::marker::PhantomData<B>,
     }
 
@@ -245,6 +324,11 @@ fn scale_gradients_by_schedule<B, M>(
             {
                 scale *= extra_scale;
             }
+            if let Some(schedule) = self.neuron_scale_stabilization
+                && schedule.base_param_ids.contains(&param.id)
+            {
+                scale *= schedule.base_scale_for_step_index(self.step_index);
+            }
             if (scale - 1.0).abs() <= f32::EPSILON {
                 return;
             }
@@ -260,9 +344,170 @@ fn scale_gradients_by_schedule<B, M>(
         step_index,
         extra_param_ids,
         extra_scale,
+        neuron_scale_stabilization,
         _marker: std::marker::PhantomData,
     };
     module.visit(&mut visitor);
+    if let Some(schedule) = neuron_scale_stabilization {
+        scale_shared_lowrank_gradients::<B, M>(module, grads, schedule, step_index);
+    }
+}
+
+#[derive(Default)]
+struct ParamIdCollector {
+    ids: HashSet<burn::module::ParamId>,
+}
+
+impl<B: BackendTrait> burn::module::ModuleVisitor<B> for ParamIdCollector {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.ids.insert(param.id);
+    }
+}
+
+fn collect_model_param_ids<B: BackendTrait>(
+    model: &DragonModel<B>,
+) -> HashSet<burn::module::ParamId> {
+    let mut collector = ParamIdCollector::default();
+    model.visit(&mut collector);
+    collector.ids
+}
+
+fn scale_shared_lowrank_gradients<B, M>(
+    module: &M,
+    grads: &mut GradientsParams,
+    schedule: &NeuronScaleGradientStabilization,
+    step_index: usize,
+) where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let base_scale = schedule.base_scale_for_step_index(step_index);
+    let tail_scale = schedule.new_slice_lr_scale;
+    if (base_scale - 1.0).abs() <= f32::EPSILON && (tail_scale - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+
+    struct SharedLowrankGradientVisitor<'a, B: AutodiffBackend> {
+        grads: &'a mut GradientsParams,
+        schedule: &'a NeuronScaleGradientStabilization,
+        base_scale: f32,
+        tail_scale: f32,
+        _marker: std::marker::PhantomData<B>,
+    }
+
+    impl<B: AutodiffBackend> burn::module::ModuleVisitor<B> for SharedLowrankGradientVisitor<'_, B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if param.id == self.schedule.shared_encoder
+                || param.id == self.schedule.shared_encoder_v
+            {
+                if let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id) {
+                    let scaled = scale_3d_latent_tail(
+                        grad,
+                        self.schedule.old_latent_per_head,
+                        self.schedule.new_latent_per_head,
+                        self.base_scale,
+                        self.tail_scale,
+                    );
+                    self.grads.register(param.id, scaled);
+                }
+            } else if param.id == self.schedule.shared_decoder
+                && let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id)
+            {
+                let scaled = scale_2d_headed_latent_rows(
+                    grad,
+                    self.schedule.old_latent_per_head,
+                    self.schedule.new_latent_per_head,
+                    self.base_scale,
+                    self.tail_scale,
+                );
+                self.grads.register(param.id, scaled);
+            }
+        }
+    }
+
+    let mut visitor = SharedLowrankGradientVisitor::<B> {
+        grads,
+        schedule,
+        base_scale,
+        tail_scale,
+        _marker: std::marker::PhantomData,
+    };
+    module.visit(&mut visitor);
+}
+
+fn scale_3d_latent_tail<B: BackendTrait, const D: usize>(
+    tensor: Tensor<B, D>,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+) -> Tensor<B, D> {
+    if D != 3 || old_latent_per_head >= new_latent_per_head {
+        return tensor.mul_scalar(base_scale);
+    }
+    let dims: [usize; D] = tensor.shape().dims();
+    let device = tensor.device();
+    let heads = dims[0];
+    let embd = dims[1];
+    let latent = dims[2];
+    if latent != new_latent_per_head {
+        return tensor;
+    }
+    let scale =
+        latent_tail_scale_vector::<B>(latent, old_latent_per_head, base_scale, tail_scale, &device)
+            .reshape([1, 1, latent])
+            .repeat_dim(0, heads)
+            .repeat_dim(1, embd);
+    (tensor.reshape([heads, embd, latent]) * scale).reshape(dims)
+}
+
+fn scale_2d_headed_latent_rows<B: BackendTrait, const D: usize>(
+    tensor: Tensor<B, D>,
+    old_latent_per_head: usize,
+    new_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+) -> Tensor<B, D> {
+    if D != 2 || old_latent_per_head >= new_latent_per_head {
+        return tensor.mul_scalar(base_scale);
+    }
+    let dims: [usize; D] = tensor.shape().dims();
+    let device = tensor.device();
+    let rows = dims[0];
+    let cols = dims[1];
+    if rows % new_latent_per_head != 0 {
+        return tensor;
+    }
+    let heads = rows / new_latent_per_head;
+    let scale = latent_tail_scale_vector::<B>(
+        new_latent_per_head,
+        old_latent_per_head,
+        base_scale,
+        tail_scale,
+        &device,
+    )
+    .reshape([1, new_latent_per_head, 1])
+    .repeat_dim(0, heads)
+    .repeat_dim(2, cols);
+    (tensor.reshape([heads, new_latent_per_head, cols]) * scale).reshape(dims)
+}
+
+fn latent_tail_scale_vector<B: BackendTrait>(
+    latent: usize,
+    old_latent_per_head: usize,
+    base_scale: f32,
+    tail_scale: f32,
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    let base_mask = Tensor::<B, 1, Int>::arange(0..latent as i64, device)
+        .float()
+        .lower_elem(old_latent_per_head.min(latent) as f32)
+        .float();
+    base_mask.clone().mul_scalar(base_scale)
+        + base_mask
+            .mul_scalar(-1.0)
+            .add_scalar(1.0)
+            .mul_scalar(tail_scale)
 }
 
 #[derive(Debug)]
@@ -274,10 +519,27 @@ struct TeacherModelRuntime<B: BackendTrait> {
 impl<B: BackendTrait> TeacherModelRuntime<B> {
     fn new(model: DragonModel<B>) -> Self {
         Self {
-            model,
+            model: detach_teacher_model(&model),
             update_count: 0,
         }
     }
+}
+
+fn detach_teacher_model<B: BackendTrait>(model: &DragonModel<B>) -> DragonModel<B> {
+    struct DetachParamMapper<B: BackendTrait> {
+        _marker: std::marker::PhantomData<B>,
+    }
+
+    impl<B: BackendTrait> burn::module::ModuleMapper<B> for DetachParamMapper<B> {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            Param::from_mapped_value(id, tensor.detach().set_require_grad(false), mapper)
+        }
+    }
+
+    model.clone().map(&mut DetachParamMapper::<B> {
+        _marker: std::marker::PhantomData,
+    })
 }
 
 fn ema_blend_model<B: BackendTrait>(
@@ -290,7 +552,7 @@ fn ema_blend_model<B: BackendTrait>(
         return teacher.clone();
     }
     if (rate - 1.0).abs() <= f32::EPSILON {
-        return online.clone();
+        return detach_teacher_model(online);
     }
 
     struct OnlineParamCollector<B: BackendTrait> {
@@ -319,13 +581,10 @@ fn ema_blend_model<B: BackendTrait>(
                 .downcast::<Tensor<B, D>>()
                 .unwrap_or_else(|_| panic!("teacher EMA source parameter shape mismatch"));
             let (id, tensor, mapper) = param.consume();
-            let require_grad = tensor.is_require_grad();
-            let mut blended = (tensor.detach().mul_scalar(1.0 - self.rate)
+            let blended = (tensor.detach().mul_scalar(1.0 - self.rate)
                 + online.detach().mul_scalar(self.rate))
-            .detach();
-            if require_grad {
-                blended = blended.require_grad();
-            }
+            .detach()
+            .set_require_grad(false);
             Param::from_mapped_value(id, blended, mapper)
         }
     }
@@ -348,6 +607,93 @@ fn ema_blend_model<B: BackendTrait>(
     blended
 }
 
+fn attach_predictive_coding_tensor<B: BackendTrait, const D: usize>(
+    slot: &mut Option<Tensor<B, D>>,
+) -> bool {
+    let Some(tensor) = slot.take() else {
+        return false;
+    };
+    *slot = Some(tensor.detach().require_grad());
+    true
+}
+
+fn update_predictive_coding_tensor<B: AutodiffBackend, const D: usize>(
+    slot: &mut Option<Tensor<B, D>>,
+    grads: &B::Gradients,
+    config: &burn_pc::PcInferenceConfig,
+    sync_diagnostics: bool,
+    stats: &mut PredictiveCodingTensorUpdateStats,
+) {
+    let Some(tensor) = slot.take() else {
+        return;
+    };
+    let grad = tensor.grad(grads);
+    let base = tensor.detach().inner();
+    let Some(grad) = grad else {
+        *slot = Some(Tensor::from_inner(base).detach());
+        return;
+    };
+    if sync_diagnostics {
+        let update = burn_pc::pc_sgd_update_with_metrics(base, grad, config);
+        stats.record_synced(update.grad_norm, update.delta_rms);
+        *slot = Some(Tensor::from_inner(update.tensor).detach());
+    } else {
+        let updated = burn_pc::pc_sgd_update(base, grad, config);
+        stats.record_unsynced();
+        *slot = Some(Tensor::from_inner(updated).detach());
+    }
+}
+
+fn scalar_tensor_to_f64<B: BackendTrait>(tensor: Tensor<B, 1>) -> f64 {
+    let values = tensor
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("scalar tensor");
+    values.first().copied().unwrap_or(0.0) as f64
+}
+
+fn latent_energy_contrastive_margin_loss<B: BackendTrait>(
+    positive_energy: Tensor<B, 3>,
+    negative_energy: Tensor<B, 3>,
+    margin: f32,
+) -> Tensor<B, 1> {
+    activation::softplus(positive_energy - negative_energy + margin.max(0.0), 1.0)
+        .mean()
+        .reshape([1])
+}
+
+fn latent_energy_monotonic_penalty<B: BackendTrait>(
+    previous_energy: Tensor<B, 3>,
+    current_energy: Tensor<B, 3>,
+    tolerance: f32,
+) -> Tensor<B, 1> {
+    (current_energy - previous_energy.detach())
+        .add_scalar(-tolerance.max(0.0))
+        .clamp_min(0.0)
+        .mean()
+        .reshape([1])
+}
+
+fn latent_energy_contractivity_penalty<B: BackendTrait>(
+    state: Tensor<B, 3>,
+    target: Tensor<B, 3>,
+    trust_radius: f32,
+) -> Tensor<B, 1> {
+    let target_scale = target
+        .clone()
+        .powf_scalar(2.0)
+        .mean()
+        .sqrt()
+        .reshape([1])
+        .detach()
+        .clamp_min(1.0e-6);
+    let delta_rms = (state - target).powf_scalar(2.0).mean().sqrt().reshape([1]);
+    (delta_rms / target_scale)
+        .add_scalar(-trust_radius.max(0.0))
+        .clamp_min(0.0)
+}
+
 #[derive(Module, Debug)]
 pub struct LanguageTrainModel<B: BackendTrait> {
     pub model: DragonModel<B>,
@@ -359,13 +705,809 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     pub objective: TrainingObjectiveConfig,
     #[module(skip)]
+    input_corruption: CausalInputCorruptionConfig,
+    #[module(skip)]
+    logit_entropy_floor: LogitEntropyFloorConfig,
+    #[module(skip)]
+    repeat_unlikelihood: RepeatUnlikelihoodConfig,
+    #[module(skip)]
+    greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig,
+    #[module(skip)]
+    dynamics_anchor: DynamicsAnchorConfig,
+    #[module(skip)]
+    predictive_coding: PredictiveCodingConfig,
+    #[module(skip)]
+    latent_reasoning: LatentReasoningTrainingConfig,
+    #[module(skip)]
+    ruliad_supervision: RuliadSupervisionConfig,
+    #[module(skip)]
+    latent_reasoning_capability_gate_open: Arc<AtomicBool>,
+    #[module(skip)]
+    greedy_rollout_recovery_active: Arc<AtomicBool>,
+    #[module(skip)]
+    input_vocab_size: usize,
+    #[module(skip)]
     teacher_model: Option<DragonModel<B>>,
     #[module(skip)]
-    streaming_runtime_key: usize,
+    teacher_runtime: PipelineRuntimeCell,
+    #[module(skip)]
+    streaming_state: PipelineRuntimeCell,
     #[module(skip)]
     gradient_scale_schedule: GradientScaleSchedule,
     #[module(skip)]
     gradient_scale_step: Arc<AtomicUsize>,
+    #[module(skip)]
+    ruliad_policy_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_structured_recovery_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_answer_contract_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_structured_contrast_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_field_binding_contrast_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_field_binding_replay: Arc<Mutex<VecDeque<RuliadFieldBindingReplaySample>>>,
+    #[module(skip)]
+    ruliad_generated_attractor_replay: Arc<Mutex<RuliadGeneratedAttractorReplay>>,
+    #[module(skip)]
+    ruliad_generated_attractor_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_verifier_rollout_telemetry_path: Option<Arc<PathBuf>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadPolicyRewardTelemetry {
+    version: u32,
+    step_index: usize,
+    mode: String,
+    sample_groups: usize,
+    completion_rows: usize,
+    oracle_sample_groups: usize,
+    oracle_completion_rows: usize,
+    oracle_truncated_completion_rows: usize,
+    structured_negative_completion_rows: usize,
+    generated_attractor_completion_rows: usize,
+    gated_sample_groups: usize,
+    gated_completion_rows: usize,
+    scalarization_count: usize,
+    reward_mean: f64,
+    reward_std: f64,
+    reward_min: f64,
+    reward_max: f64,
+    advantage_mean: f64,
+    advantage_std: f64,
+    advantage_clip_fraction: f64,
+    policy_update_applied: bool,
+    policy_skip_reason: Option<String>,
+    vector_sample_count: usize,
+    vector_verifier_match_mean: f64,
+    vector_semantic_match_mean: f64,
+    vector_partial_progress_mean: f64,
+    vector_field_accuracy_mean: f64,
+    vector_certificate_prefix_mean: f64,
+    vector_compactness_mean: f64,
+    vector_schema_quality_mean: f64,
+    vector_hash_safety_mean: f64,
+    vector_answer_termination_mean: f64,
+    vector_completion_health_mean: f64,
+    vpo_scalarization_dominant_verifier_match: usize,
+    vpo_scalarization_dominant_semantic_match: usize,
+    vpo_scalarization_dominant_partial_progress: usize,
+    vpo_scalarization_dominant_field_accuracy: usize,
+    vpo_scalarization_dominant_certificate_prefix: usize,
+    vpo_scalarization_dominant_compactness: usize,
+    vpo_scalarization_dominant_schema_quality: usize,
+    vpo_scalarization_dominant_hash_safety: usize,
+    vpo_scalarization_dominant_answer_termination: usize,
+    vpo_scalarization_dominant_completion_health: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuliadStructuredNegativeKind {
+    FieldMutation,
+    TemplateCollapse,
+    SchemaCollapse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadStructuredContrastTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    oracle_completion_rows: usize,
+    field_negative_completion_rows: usize,
+    template_negative_completion_rows: usize,
+    schema_negative_completion_rows: usize,
+    generated_attractor_negative_completion_rows: usize,
+    contrast_pairs: usize,
+    contrast_discriminative_tokens: usize,
+    structured_contrast_weight: f32,
+    structured_contrast_margin: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadAnswerContractTelemetry {
+    version: u32,
+    step_index: usize,
+    policy_batch_present: bool,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    prompt_schema_sample_groups: usize,
+    oracle_rows: usize,
+    prompt_schema_rows: usize,
+    contract_tokens: usize,
+    prompt_schema_value_tokens: usize,
+    schema_tokens: usize,
+    schema_start_tokens: usize,
+    value_tokens: usize,
+    other_tokens: usize,
+    premature_close_tokens: usize,
+    answer_contract_weight: f32,
+    premature_close_unlikelihood_weight: f32,
+    max_completion_tokens: usize,
+    max_rows_per_step: usize,
+    prompt_schema_max_rows_per_step: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadFieldBindingContrastTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    prompt_pairs: usize,
+    contrast_pairs: usize,
+    candidate_pairs: usize,
+    contrast_discriminative_tokens: usize,
+    negative_pool_size: usize,
+    replay_pool_size: usize,
+    replay_contrast_pairs: usize,
+    generated_attractor_pool_size: usize,
+    generated_attractor_negative_pool_size: usize,
+    generated_attractor_contrast_pairs: usize,
+    rank_metric_pairs: usize,
+    rank_metric_tokens: usize,
+    logit_margin_mean: Option<f64>,
+    positive_token_fraction: Option<f64>,
+    margin_satisfied_token_fraction: Option<f64>,
+    exact_pair_rank_fraction: Option<f64>,
+    exact_pair_margin_fraction: Option<f64>,
+    field_binding_contrast_weight: f32,
+    field_binding_contrast_margin: f32,
+    field_binding_contrast_pair_weight: f32,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadFieldBindingReplaySample {
+    answer: String,
+    family: String,
+    task_kind: String,
+    contract: String,
+    oracle_completion: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct RuliadGeneratedAttractorKey {
+    family: String,
+    task_kind: String,
+    contract: String,
+    answer: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadGeneratedAttractorEntry {
+    key: RuliadGeneratedAttractorKey,
+    count: usize,
+    last_step_index: usize,
+    status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuliadGeneratedAttractorReplay {
+    entries: HashMap<RuliadGeneratedAttractorKey, RuliadGeneratedAttractorEntry>,
+    order: VecDeque<RuliadGeneratedAttractorKey>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuliadGeneratedAttractorReplaySummary {
+    pool_size: usize,
+    active_count: usize,
+    active_observation_count: usize,
+    dominant_count: usize,
+    distinct_answers: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadGeneratedAttractorReplayTelemetry {
+    version: u32,
+    step_index: usize,
+    source: String,
+    skip_reason: Option<String>,
+    observed_completion_rows: usize,
+    recorded_attractor_rows: usize,
+    selected_candidate_rows: usize,
+    selected_field_binding_pairs: usize,
+    replay_pool_size: usize,
+    active_attractor_count: usize,
+    active_observation_count: usize,
+    distinct_answer_count: usize,
+    dominant_answer_count: usize,
+    dominant_answer_fraction: f64,
+    min_count: usize,
+    max_candidates: usize,
+    min_distinct_answers: usize,
+    max_dominant_fraction: f32,
+}
+
+impl RuliadGeneratedAttractorReplay {
+    fn record(
+        &mut self,
+        key: RuliadGeneratedAttractorKey,
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        step_index: usize,
+        capacity: usize,
+    ) -> bool {
+        if capacity == 0 {
+            return false;
+        }
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.count = entry.count.saturating_add(1);
+            entry.last_step_index = step_index;
+            entry.status = status;
+            return true;
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(
+            key.clone(),
+            RuliadGeneratedAttractorEntry {
+                key,
+                count: 1,
+                last_step_index: step_index,
+                status,
+            },
+        );
+        while self.entries.len() > capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&oldest)
+                .is_some_and(|entry| entry.key == oldest)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    fn candidates_for(
+        &self,
+        family: &str,
+        task_kind: &str,
+        expected_contract: &str,
+        expected_answer: &str,
+        min_count: usize,
+        max_candidates: usize,
+        min_distinct_answers: usize,
+        max_dominant_fraction: f32,
+    ) -> Vec<RuliadGeneratedAttractorEntry> {
+        if max_candidates == 0 {
+            return Vec::new();
+        }
+        if self
+            .summary(min_count)
+            .diversity_skip_reason(min_distinct_answers, max_dominant_fraction)
+            .is_some()
+        {
+            return Vec::new();
+        }
+        let mut candidates = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.count >= min_count
+                    && entry.key.family == family
+                    && entry.key.task_kind == task_kind
+                    && entry.key.answer != expected_answer
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_same_contract = left.key.contract == expected_contract;
+            let right_same_contract = right.key.contract == expected_contract;
+            right_same_contract
+                .cmp(&left_same_contract)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| right.last_step_index.cmp(&left.last_step_index))
+                .then_with(|| left.key.answer.cmp(&right.key.answer))
+        });
+        candidates.truncate(max_candidates);
+        candidates
+    }
+
+    fn summary(&self, min_count: usize) -> RuliadGeneratedAttractorReplaySummary {
+        let mut counts_by_answer = HashMap::<&str, usize>::new();
+        let mut active_count = 0usize;
+        let mut active_observation_count = 0usize;
+        for entry in self.entries.values() {
+            if entry.count < min_count {
+                continue;
+            }
+            active_count = active_count.saturating_add(1);
+            active_observation_count = active_observation_count.saturating_add(entry.count);
+            *counts_by_answer
+                .entry(entry.key.answer.as_str())
+                .or_default() += entry.count;
+        }
+        let dominant_count = counts_by_answer.values().copied().max().unwrap_or(0);
+        RuliadGeneratedAttractorReplaySummary {
+            pool_size: self.entries.len(),
+            active_count,
+            active_observation_count,
+            dominant_count,
+            distinct_answers: counts_by_answer.len(),
+        }
+    }
+}
+
+impl RuliadGeneratedAttractorReplaySummary {
+    fn dominant_fraction(&self) -> f64 {
+        if self.active_observation_count == 0 {
+            0.0
+        } else {
+            self.dominant_count as f64 / self.active_observation_count as f64
+        }
+    }
+
+    fn diversity_skip_reason(
+        &self,
+        min_distinct_answers: usize,
+        max_dominant_fraction: f32,
+    ) -> Option<&'static str> {
+        if self.active_count == 0 {
+            return Some("generated_attractor_no_active_entries");
+        }
+        if self.distinct_answers < min_distinct_answers.max(1) {
+            return Some("generated_attractor_low_answer_diversity");
+        }
+        if self.dominant_fraction() > f64::from(max_dominant_fraction) {
+            return Some("generated_attractor_dominant_answer");
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuliadFieldBindingRankStats {
+    pairs: usize,
+    tokens: usize,
+    logit_margin_mean: Option<f64>,
+    positive_token_fraction: Option<f64>,
+    margin_satisfied_token_fraction: Option<f64>,
+    exact_pair_rank_fraction: Option<f64>,
+    exact_pair_margin_fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadStructuredRecoveryTelemetry {
+    version: u32,
+    step_index: usize,
+    policy_batch_present: bool,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    recovery_rows: usize,
+    field_negative_recovery_rows: usize,
+    template_negative_recovery_rows: usize,
+    schema_negative_recovery_rows: usize,
+    structured_recovery_weight: f32,
+    structured_recovery_max_completion_tokens: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadVerifierRolloutImitationTelemetry {
+    version: u32,
+    step_index: usize,
+    skip_reason: Option<String>,
+    sample_groups: usize,
+    generated_completion_rows: usize,
+    candidate_completion_rows: usize,
+    accepted_completion_rows: usize,
+    accepted_imitation_rows: usize,
+    accepted_recovery_rows: usize,
+    health_gate_passed: bool,
+    verifier_rate_ppm: usize,
+    schema_wrong_rate_ppm: usize,
+    malformed_rate_ppm: usize,
+    verifier_match_rows: usize,
+    semantic_match_rows: usize,
+    partial_rows: usize,
+    schema_wrong_rows: usize,
+    malformed_rows: usize,
+    missing_rows: usize,
+    recovery_partial_rows: usize,
+    recovery_schema_wrong_rows: usize,
+    recovery_malformed_rows: usize,
+    recovery_missing_rows: usize,
+    field_accuracy_mean: f64,
+    partial_progress_mean: f64,
+    completion_quality_mean: f64,
+    rollout_imitation_weight: f32,
+    rollout_recovery_weight: f32,
+    max_completion_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RuliadPolicyRewardTelemetryAccumulator {
+    mode: String,
+    step_index: usize,
+    sample_groups: usize,
+    completion_rows: usize,
+    oracle_sample_groups: usize,
+    oracle_completion_rows: usize,
+    oracle_truncated_completion_rows: usize,
+    structured_negative_completion_rows: usize,
+    generated_attractor_completion_rows: usize,
+    gated_sample_groups: usize,
+    gated_completion_rows: usize,
+    scalarization_count: usize,
+    rewards: Vec<f32>,
+    advantages: Vec<f32>,
+    clipped_advantage_count: usize,
+    policy_update_applied: bool,
+    policy_skip_reason: Option<String>,
+    vector_sums: [f64; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    vector_sample_count: usize,
+    vpo_scalarization_dominant_axis_counts:
+        [usize; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+}
+
+impl RuliadPolicyRewardTelemetryAccumulator {
+    fn new(mode: crate::config::train::RuliadVerifierRewardMode, step_index: usize) -> Self {
+        Self {
+            mode: match mode {
+                crate::config::train::RuliadVerifierRewardMode::Scalar => "scalar".to_string(),
+                crate::config::train::RuliadVerifierRewardMode::VpoIndependent => {
+                    "vpo_independent".to_string()
+                }
+            },
+            step_index,
+            sample_groups: 0,
+            completion_rows: 0,
+            oracle_sample_groups: 0,
+            oracle_completion_rows: 0,
+            oracle_truncated_completion_rows: 0,
+            structured_negative_completion_rows: 0,
+            generated_attractor_completion_rows: 0,
+            gated_sample_groups: 0,
+            gated_completion_rows: 0,
+            scalarization_count: 0,
+            rewards: Vec::new(),
+            advantages: Vec::new(),
+            clipped_advantage_count: 0,
+            policy_update_applied: true,
+            policy_skip_reason: None,
+            vector_sums: [0.0; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+            vector_sample_count: 0,
+            vpo_scalarization_dominant_axis_counts: [0;
+                burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        }
+    }
+
+    fn record_vectors(
+        &mut self,
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+    ) {
+        for score in scores {
+            let vector = burn_dragon_universality::ruliad::ruliad_verifier_reward_vector(score);
+            for (index, component) in vector.components().into_iter().enumerate() {
+                self.vector_sums[index] += f64::from(component);
+            }
+            self.vector_sample_count = self.vector_sample_count.saturating_add(1);
+        }
+    }
+
+    fn record_rewards_and_advantages(
+        &mut self,
+        rewards: &[f32],
+        advantages: &[f32],
+        clip_range: f32,
+    ) {
+        self.sample_groups = self.sample_groups.saturating_add(1);
+        self.completion_rows = self.completion_rows.saturating_add(rewards.len());
+        self.rewards.extend_from_slice(rewards);
+        self.advantages.extend_from_slice(advantages);
+        self.clipped_advantage_count = self.clipped_advantage_count.saturating_add(
+            advantages
+                .iter()
+                .filter(|advantage| advantage.abs() > clip_range)
+                .count(),
+        );
+    }
+
+    fn record_gated_group(&mut self, completion_rows: usize) {
+        self.gated_sample_groups = self.gated_sample_groups.saturating_add(1);
+        self.gated_completion_rows = self.gated_completion_rows.saturating_add(completion_rows);
+    }
+
+    fn record_oracle_candidate(&mut self, truncated: bool) {
+        self.oracle_sample_groups = self.oracle_sample_groups.saturating_add(1);
+        self.oracle_completion_rows = self.oracle_completion_rows.saturating_add(1);
+        if truncated {
+            self.oracle_truncated_completion_rows =
+                self.oracle_truncated_completion_rows.saturating_add(1);
+        }
+    }
+
+    fn record_structured_negative_candidate(&mut self) {
+        self.structured_negative_completion_rows =
+            self.structured_negative_completion_rows.saturating_add(1);
+    }
+
+    fn record_generated_attractor_candidate(&mut self) {
+        self.generated_attractor_completion_rows =
+            self.generated_attractor_completion_rows.saturating_add(1);
+    }
+
+    fn has_observations(&self) -> bool {
+        self.completion_rows > 0 || self.gated_completion_rows > 0 || self.vector_sample_count > 0
+    }
+
+    fn record_vpo_scalarization(
+        &mut self,
+        weights: &[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    ) {
+        self.scalarization_count = self.scalarization_count.saturating_add(1);
+        let axis = weights
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        if let Some(count) = self.vpo_scalarization_dominant_axis_counts.get_mut(axis) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn advantage_clip_fraction(&self) -> f64 {
+        if self.advantages.is_empty() {
+            0.0
+        } else {
+            self.clipped_advantage_count as f64 / self.advantages.len() as f64
+        }
+    }
+
+    fn mark_skipped(&mut self, reason: impl Into<String>) {
+        self.policy_update_applied = false;
+        self.policy_skip_reason = Some(reason.into());
+    }
+
+    fn finish(self) -> Option<RuliadPolicyRewardTelemetry> {
+        if !self.has_observations() {
+            return None;
+        }
+        let (reward_mean, reward_std, reward_min, reward_max) = stats_f64(&self.rewards);
+        let (advantage_mean, advantage_std, _, _) = stats_f64(&self.advantages);
+        let advantage_clip_fraction = self.advantage_clip_fraction();
+        let vector_mean = |index: usize| {
+            if self.vector_sample_count == 0 {
+                0.0
+            } else {
+                self.vector_sums[index] / self.vector_sample_count as f64
+            }
+        };
+        Some(RuliadPolicyRewardTelemetry {
+            version: 1,
+            step_index: self.step_index,
+            mode: self.mode,
+            sample_groups: self.sample_groups,
+            completion_rows: self.completion_rows,
+            oracle_sample_groups: self.oracle_sample_groups,
+            oracle_completion_rows: self.oracle_completion_rows,
+            oracle_truncated_completion_rows: self.oracle_truncated_completion_rows,
+            structured_negative_completion_rows: self.structured_negative_completion_rows,
+            generated_attractor_completion_rows: self.generated_attractor_completion_rows,
+            gated_sample_groups: self.gated_sample_groups,
+            gated_completion_rows: self.gated_completion_rows,
+            scalarization_count: self.scalarization_count,
+            reward_mean,
+            reward_std,
+            reward_min,
+            reward_max,
+            advantage_mean,
+            advantage_std,
+            advantage_clip_fraction,
+            policy_update_applied: self.policy_update_applied,
+            policy_skip_reason: self.policy_skip_reason,
+            vector_sample_count: self.vector_sample_count,
+            vector_verifier_match_mean: vector_mean(0),
+            vector_semantic_match_mean: vector_mean(1),
+            vector_partial_progress_mean: vector_mean(2),
+            vector_field_accuracy_mean: vector_mean(3),
+            vector_certificate_prefix_mean: vector_mean(4),
+            vector_compactness_mean: vector_mean(5),
+            vector_schema_quality_mean: vector_mean(6),
+            vector_hash_safety_mean: vector_mean(7),
+            vector_answer_termination_mean: vector_mean(8),
+            vector_completion_health_mean: vector_mean(9),
+            vpo_scalarization_dominant_verifier_match: self.vpo_scalarization_dominant_axis_counts
+                [0],
+            vpo_scalarization_dominant_semantic_match: self.vpo_scalarization_dominant_axis_counts
+                [1],
+            vpo_scalarization_dominant_partial_progress: self
+                .vpo_scalarization_dominant_axis_counts[2],
+            vpo_scalarization_dominant_field_accuracy: self.vpo_scalarization_dominant_axis_counts
+                [3],
+            vpo_scalarization_dominant_certificate_prefix: self
+                .vpo_scalarization_dominant_axis_counts[4],
+            vpo_scalarization_dominant_compactness: self.vpo_scalarization_dominant_axis_counts[5],
+            vpo_scalarization_dominant_schema_quality: self.vpo_scalarization_dominant_axis_counts
+                [6],
+            vpo_scalarization_dominant_hash_safety: self.vpo_scalarization_dominant_axis_counts[7],
+            vpo_scalarization_dominant_answer_termination: self
+                .vpo_scalarization_dominant_axis_counts[8],
+            vpo_scalarization_dominant_completion_health: self
+                .vpo_scalarization_dominant_axis_counts[9],
+        })
+    }
+}
+
+fn stats_f64(values: &[f32]) -> (f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    for value in values.iter().copied().map(f64::from) {
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+    }
+    let mean = sum / values.len() as f64;
+    let variance = values
+        .iter()
+        .copied()
+        .map(f64::from)
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    (mean, variance.sqrt(), min, max)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputDegeneracyStats {
+    pub token_count: usize,
+    pub entropy_bits: f64,
+    pub mean_max_probability: f64,
+    pub argmax_unique_fraction: f64,
+    pub eos_fraction: f64,
+    pub repetition_fraction: f64,
+    pub distinct_1_fraction: f64,
+    pub distinct_2_fraction: f64,
+    pub period_2_fraction: f64,
+    pub period_3_fraction: f64,
+    pub max_period_2_to_16_fraction: f64,
+    pub max_period_2_to_64_fraction: f64,
+    pub dominant_period_2_to_64: usize,
+    pub prompt_max_period_2_to_64_fraction: f64,
+    pub prompt_dominant_period_2_to_64: usize,
+    pub prompt_tokens: Vec<i64>,
+    pub generated_tokens: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LatentReasoningStepDiagnostics {
+    pub raw_loss: f64,
+    pub final_loss: f64,
+    pub raw_entropy_bits: f64,
+    pub final_entropy_bits: f64,
+    pub final_delta_rms: f64,
+    pub final_raw_cosine: f64,
+    pub step_loss: Vec<f64>,
+    pub step_ce_delta: Vec<f64>,
+    pub step_ce_monotonic_violation_rate: Vec<f64>,
+    pub step_entropy_bits: Vec<f64>,
+    pub step_delta_rms: Vec<f64>,
+    pub step_raw_cosine: Vec<f64>,
+    pub step_energy_mean: Vec<f64>,
+    pub step_energy_delta: Vec<f64>,
+    pub step_energy_monotonic_violation_rate: Vec<f64>,
+    pub best_energy_step: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PredictiveCodingChunkReport {
+    chunks_seen: usize,
+    chunks_corrected: usize,
+    inference_steps: usize,
+    skipped_empty_state: usize,
+    energy_before: Option<f64>,
+    energy_after: Option<f64>,
+    grad_norm_mean: Option<f64>,
+    grad_norm_max: Option<f64>,
+    delta_rms_mean: Option<f64>,
+    elapsed_ns: u128,
+}
+
+impl PredictiveCodingChunkReport {
+    fn has_activity(self) -> bool {
+        self.chunks_seen > 0 || self.inference_steps > 0 || self.elapsed_ns > 0
+    }
+
+    fn accumulate_unsynced(&mut self, report: Self) {
+        self.chunks_seen = self.chunks_seen.saturating_add(report.chunks_seen);
+        self.chunks_corrected = self
+            .chunks_corrected
+            .saturating_add(report.chunks_corrected);
+        self.inference_steps = self.inference_steps.saturating_add(report.inference_steps);
+        self.skipped_empty_state = self
+            .skipped_empty_state
+            .saturating_add(report.skipped_empty_state);
+        self.elapsed_ns = self.elapsed_ns.saturating_add(report.elapsed_ns);
+    }
+
+    fn record(self) {
+        crate::train::profile::record_predictive_coding(
+            self.chunks_seen,
+            self.chunks_corrected,
+            self.inference_steps,
+            self.skipped_empty_state,
+            self.energy_before,
+            self.energy_after,
+            self.grad_norm_mean,
+            self.grad_norm_max,
+            self.delta_rms_mean,
+            self.elapsed_ns,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PredictiveCodingTensorUpdateStats {
+    tensor_count: usize,
+    diagnostic_count: usize,
+    grad_norm_sum: f64,
+    grad_norm_max: f64,
+    delta_rms_sum: f64,
+}
+
+impl PredictiveCodingTensorUpdateStats {
+    fn record_unsynced(&mut self) {
+        self.tensor_count = self.tensor_count.saturating_add(1);
+    }
+
+    fn record_synced<B: BackendTrait>(&mut self, grad_norm: Tensor<B, 1>, delta_rms: Tensor<B, 1>) {
+        let grad_norm = scalar_tensor_to_f64(grad_norm);
+        let delta_rms = scalar_tensor_to_f64(delta_rms);
+        if grad_norm.is_finite() && delta_rms.is_finite() {
+            self.tensor_count = self.tensor_count.saturating_add(1);
+            self.diagnostic_count = self.diagnostic_count.saturating_add(1);
+            self.grad_norm_sum += grad_norm;
+            self.grad_norm_max = self.grad_norm_max.max(grad_norm);
+            self.delta_rms_sum += delta_rms;
+        }
+    }
+
+    fn grad_norm_mean(self) -> Option<f64> {
+        (self.diagnostic_count > 0).then(|| self.grad_norm_sum / self.diagnostic_count as f64)
+    }
+
+    fn grad_norm_max(self) -> Option<f64> {
+        (self.diagnostic_count > 0).then_some(self.grad_norm_max)
+    }
+
+    fn delta_rms_mean(self) -> Option<f64> {
+        (self.diagnostic_count > 0).then(|| self.delta_rms_sum / self.diagnostic_count as f64)
+    }
 }
 
 struct ObjectiveScoreBatch<B: BackendTrait> {
@@ -390,20 +1532,48 @@ struct RolloutScoreConfig {
 impl<B: BackendTrait> LanguageTrainModel<B> {
     pub fn new(model: DragonModel<B>) -> Self {
         Self {
+            input_vocab_size: model.vocab_size(),
             model,
             tbptt_chunk_size: None,
             pipeline_plan: None,
             tbptt_persist_across_steps: false,
             objective: TrainingObjectiveConfig::NextToken,
+            input_corruption: CausalInputCorruptionConfig::default(),
+            logit_entropy_floor: LogitEntropyFloorConfig::default(),
+            repeat_unlikelihood: RepeatUnlikelihoodConfig::default(),
+            greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig::default(),
+            dynamics_anchor: DynamicsAnchorConfig::default(),
+            predictive_coding: PredictiveCodingConfig::default(),
+            latent_reasoning: LatentReasoningTrainingConfig::default(),
+            ruliad_supervision: RuliadSupervisionConfig::default(),
+            latent_reasoning_capability_gate_open: Arc::new(AtomicBool::new(false)),
+            greedy_rollout_recovery_active: Arc::new(AtomicBool::new(false)),
             teacher_model: None,
-            streaming_runtime_key: next_streaming_runtime_key(),
+            teacher_runtime: PipelineRuntimeCell::default(),
+            streaming_state: PipelineRuntimeCell::default(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
             gradient_scale_step: Arc::new(AtomicUsize::new(0)),
+            ruliad_policy_telemetry_path: None,
+            ruliad_structured_recovery_telemetry_path: None,
+            ruliad_answer_contract_telemetry_path: None,
+            ruliad_structured_contrast_telemetry_path: None,
+            ruliad_field_binding_contrast_telemetry_path: None,
+            ruliad_field_binding_replay: Arc::new(Mutex::new(VecDeque::new())),
+            ruliad_generated_attractor_replay: Arc::new(Mutex::new(
+                RuliadGeneratedAttractorReplay::default(),
+            )),
+            ruliad_generated_attractor_telemetry_path: None,
+            ruliad_verifier_rollout_telemetry_path: None,
         }
     }
 
     pub fn with_tbptt_chunk_size(mut self, tbptt_chunk_size: Option<usize>) -> Self {
         self.tbptt_chunk_size = tbptt_chunk_size;
+        self
+    }
+
+    pub(crate) fn map_model(mut self, f: impl FnOnce(DragonModel<B>) -> DragonModel<B>) -> Self {
+        self.model = f(self.model);
         self
     }
 
@@ -418,15 +1588,190 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     pub fn with_training_objective(mut self, objective: TrainingObjectiveConfig) -> Self {
-        self.teacher_model = (!objective.is_next_token()).then(|| self.model.clone());
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut teachers = lock_teacher_model_store();
-        teachers.remove(&key);
-        if let Some(teacher_model) = self.teacher_model.clone() {
-            teachers.insert(key, Box::new(TeacherModelRuntime::new(teacher_model)));
-        }
+        self.teacher_model =
+            (!objective.is_next_token()).then(|| detach_teacher_model(&self.model));
+        *self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned") = self
+            .teacher_model
+            .clone()
+            .map(|model| Box::new(TeacherModelRuntime::new(model)) as Box<dyn Any + Send>);
         self.objective = objective;
         self
+    }
+
+    /// Applies the objective and auxiliary-loss portion of a language training contract.
+    ///
+    /// Keep this path shared by local, distributed, and peer-to-peer executors so that
+    /// changing the launch mode cannot silently change what the model is optimizing.
+    pub fn with_training_objectives(self, training: &TrainingHyperparameters) -> Self {
+        self.with_training_objective(training.objective.clone())
+            .with_input_corruption(training.input_corruption.clone())
+            .with_logit_entropy_floor(training.logit_entropy_floor.clone())
+            .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
+            .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
+            .with_dynamics_anchor(training.dynamics_anchor.clone())
+            .with_predictive_coding(training.predictive_coding.clone())
+            .with_latent_reasoning(training.latent_reasoning.clone())
+            .with_ruliad_supervision(training.ruliad_supervision)
+    }
+
+    /// Applies the complete launch-independent language training contract.
+    pub fn with_training_configuration(
+        self,
+        training: &TrainingHyperparameters,
+        total_steps: usize,
+    ) -> Self
+    where
+        B: AutodiffBackend,
+    {
+        self.with_training_objectives(training)
+            .with_tbptt_chunk_size(training.tbptt_chunk_size)
+            .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)
+            .with_continual_backprop(&training.continual_backprop)
+            .with_gradient_scale_schedule(training, total_steps)
+    }
+
+    pub fn with_input_corruption(mut self, config: CausalInputCorruptionConfig) -> Self {
+        self.input_corruption = config;
+        self
+    }
+
+    pub fn with_logit_entropy_floor(mut self, config: LogitEntropyFloorConfig) -> Self {
+        self.logit_entropy_floor = config;
+        self
+    }
+
+    pub fn with_repeat_unlikelihood(mut self, config: RepeatUnlikelihoodConfig) -> Self {
+        self.repeat_unlikelihood = config;
+        self
+    }
+
+    pub fn with_greedy_rollout_unlikelihood(
+        mut self,
+        config: GreedyRolloutUnlikelihoodConfig,
+    ) -> Self {
+        self.greedy_rollout_unlikelihood = config;
+        self
+    }
+
+    pub fn with_dynamics_anchor(mut self, config: DynamicsAnchorConfig) -> Self {
+        self.dynamics_anchor = config;
+        if self.dynamics_anchor.enabled && self.dynamics_anchor.weight > f32::EPSILON {
+            let teacher_model = self
+                .teacher_model
+                .clone()
+                .unwrap_or_else(|| detach_teacher_model(&self.model));
+            let teacher_model = detach_teacher_model(&teacher_model);
+            self.teacher_model = Some(teacher_model.clone());
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
+        }
+        self
+    }
+
+    pub fn with_predictive_coding(mut self, config: PredictiveCodingConfig) -> Self {
+        self.predictive_coding = config;
+        self
+    }
+
+    pub fn with_latent_reasoning(mut self, config: LatentReasoningTrainingConfig) -> Self {
+        self.latent_reasoning = config;
+        if self.latent_reasoning.enabled
+            && (matches!(
+                self.latent_reasoning.target_encoder,
+                crate::config::LatentReasoningTargetEncoder::EmaTeacher
+            ) || self.latent_reasoning.dragon_state.enabled)
+        {
+            let teacher_model = self
+                .teacher_model
+                .clone()
+                .unwrap_or_else(|| detach_teacher_model(&self.model));
+            let teacher_model = detach_teacher_model(&teacher_model);
+            self.teacher_model = Some(teacher_model.clone());
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
+        }
+        self
+    }
+
+    pub fn with_ruliad_supervision(mut self, config: RuliadSupervisionConfig) -> Self {
+        if config.verifier_reward.enabled && config.verifier_reward.kl_weight > f32::EPSILON {
+            let teacher_model = detach_teacher_model(&self.model);
+            self.teacher_model = Some(teacher_model.clone());
+            let mut runtime = self
+                .teacher_runtime
+                .inner
+                .lock()
+                .expect("teacher model runtime lock poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(TeacherModelRuntime::new(teacher_model)));
+            }
+        }
+        self.ruliad_supervision = config;
+        self
+    }
+
+    pub fn with_ruliad_policy_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_policy_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_structured_recovery_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_structured_recovery_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_answer_contract_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_answer_contract_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_structured_contrast_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_structured_contrast_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_field_binding_contrast_telemetry_path(
+        mut self,
+        path: Option<PathBuf>,
+    ) -> Self {
+        self.ruliad_field_binding_contrast_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_generated_attractor_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_generated_attractor_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_verifier_rollout_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_verifier_rollout_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn set_recovery_auxiliary_active(&self, active: bool) {
+        self.greedy_rollout_recovery_active
+            .store(active, Ordering::Relaxed);
+    }
+
+    pub fn set_latent_reasoning_capability_gate_open(&self, open: bool) {
+        self.latent_reasoning_capability_gate_open
+            .store(open, Ordering::Relaxed);
     }
 
     pub fn with_gradient_scale_schedule(
@@ -436,6 +1781,31 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     ) -> Self {
         self.gradient_scale_schedule =
             GradientScaleSchedule::from_training(&self.model, training, total_steps);
+        self
+    }
+
+    pub fn gradient_scale_step_index(&self) -> usize {
+        self.gradient_scale_step
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+
+    pub fn with_neuron_scale_stabilization(
+        mut self,
+        old_latent_total: usize,
+        new_latent_total: usize,
+        config: &NeuronScalingStabilizationConfig,
+    ) -> Self {
+        let start_step_index = self.gradient_scale_step_index().saturating_add(1);
+        self.gradient_scale_schedule = self
+            .gradient_scale_schedule
+            .with_neuron_scale_stabilization(
+                &self.model,
+                old_latent_total,
+                new_latent_total,
+                start_step_index,
+                config,
+            );
         self
     }
 
@@ -465,6 +1835,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             step_index,
             self.gradient_scale_schedule.backbone_param_ids.as_ref(),
             extra_scale,
+            self.gradient_scale_schedule
+                .neuron_scale_stabilization
+                .as_ref(),
         );
         grads
     }
@@ -478,13 +1851,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if !self.tbptt_persist_across_steps {
             return self.model.init_state_ephemeral();
         }
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = lock_streaming_state_store();
+        let mut runtime = self
+            .streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned");
         if reset_stream_state {
-            runtime.remove(&key);
+            *runtime = None;
         }
         runtime
-            .remove(&key)
+            .take()
             .and_then(|state| state.downcast::<ModelState<B>>().ok().map(|state| *state))
             .unwrap_or_else(|| self.model.init_state())
     }
@@ -494,15 +1870,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             return;
         }
         state.detach_in_place();
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut runtime = lock_streaming_state_store();
-        runtime.insert(key, Box::new(state));
+        *self
+            .streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned") = Some(Box::new(state));
     }
 
     #[cfg(test)]
     fn peek_step_state_for_test(&self) -> Option<ModelState<B>> {
-        lock_streaming_state_store()
-            .get(&(self.streaming_runtime_key, TypeId::of::<B>()))
+        self.streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned")
+            .as_ref()
             .and_then(|state| state.downcast_ref::<ModelState<B>>().cloned())
     }
 
@@ -532,15 +1913,47 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         &self,
         hidden: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 1> {
-        self.model.language_loss_from_hidden(hidden, targets)
+        self.language_loss_from_hidden_for_latent_step(
+            hidden,
+            targets,
+            loss_mask,
+            self.model.latent_reasoning_config().max_steps,
+        )
+    }
+
+    fn language_loss_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        step: usize,
+    ) -> Tensor<B, 1> {
+        if let Some(mask) = loss_mask {
+            return masked_token_mean(
+                self.model
+                    .language_token_losses_from_hidden_for_latent_step(hidden, targets, step),
+                Some(mask),
+            );
+        }
+        self.model
+            .language_loss_from_hidden_for_latent_step(hidden, targets, step)
     }
 
     fn language_loss_from_logits(
         &self,
         logits: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 1> {
+        if let Some(mask) = loss_mask {
+            return masked_token_mean(
+                self.model
+                    .language_token_losses_from_logits(logits, targets),
+                Some(mask),
+            );
+        }
         self.model.language_loss_from_logits(logits, targets)
     }
 
@@ -615,10 +2028,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     fn current_teacher_model(&self) -> DragonModel<B> {
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let teachers = lock_teacher_model_store();
-        if let Some(runtime) = teachers
-            .get(&key)
+        let runtime = self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned");
+        if let Some(runtime) = runtime
+            .as_ref()
             .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
         {
             return runtime.model.clone();
@@ -629,7 +2045,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     fn objective_teacher_update_rate(&self) -> f32 {
-        match &self.objective {
+        let objective_rate = match &self.objective {
             TrainingObjectiveConfig::NextToken => 0.0,
             TrainingObjectiveConfig::Sdft(config) => config.teacher_update_rate,
             TrainingObjectiveConfig::Sdpo(config) => config.teacher_update_rate,
@@ -645,7 +2061,24 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         / weight_sum
                 }
             }
-        }
+        };
+        let anchor_rate =
+            if self.dynamics_anchor.enabled && self.dynamics_anchor.weight > f32::EPSILON {
+                self.dynamics_anchor.teacher_update_rate.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        let latent_rate = if self.latent_reasoning.enabled
+            && (matches!(
+                self.latent_reasoning.target_encoder,
+                crate::config::LatentReasoningTargetEncoder::EmaTeacher
+            ) || self.latent_reasoning.dragon_state.enabled)
+        {
+            self.latent_reasoning.teacher_update_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        objective_rate.max(anchor_rate).max(latent_rate)
     }
 
     fn update_teacher_runtime(&self) {
@@ -653,27 +2086,253 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if rate <= f32::EPSILON {
             return;
         };
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        let mut teachers = lock_teacher_model_store();
-        let runtime = teachers.entry(key).or_insert_with(|| {
-            Box::new(TeacherModelRuntime::new(
+        let mut runtime = self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned");
+        if runtime.is_none() {
+            *runtime = Some(Box::new(TeacherModelRuntime::new(
                 self.teacher_model
                     .clone()
                     .unwrap_or_else(|| self.model.clone()),
-            ))
-        });
-        let Some(runtime) = runtime.downcast_mut::<TeacherModelRuntime<B>>() else {
-            return;
-        };
+            )));
+        }
+        let runtime = runtime
+            .as_mut()
+            .and_then(|runtime| runtime.downcast_mut::<TeacherModelRuntime<B>>())
+            .expect("teacher runtime backend type must match learner backend");
         runtime.model = ema_blend_model(&runtime.model, &self.model, rate);
         runtime.update_count = runtime.update_count.saturating_add(1);
     }
 
+    pub(crate) fn validation_loss_and_output_degeneracy(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+    ) -> (Tensor<B, 1>, Option<OutputDegeneracyStats>) {
+        let output = <Self as ValidStep>::step(self, batch.clone());
+        let loss_value: LossValue<B> = output.adapt();
+        let stats = self.output_degeneracy_for_batch(batch, probe_tokens, eos_id);
+        (loss_value.value(), stats)
+    }
+
+    pub(crate) fn latent_reasoning_step_diagnostics(
+        &self,
+        batch: SequenceBatch<B>,
+    ) -> Option<LatentReasoningStepDiagnostics> {
+        if !self.model.latent_reasoning_enabled()
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+        {
+            return None;
+        }
+        let raw = self.model.forward_hidden_raw(batch.inputs);
+        let output = self.model.reason_hidden(raw.clone());
+        if output.step_hiddens.is_empty() {
+            return None;
+        }
+        let raw_loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+            raw.clone(),
+            batch.targets.clone(),
+            batch.loss_mask.clone(),
+            0,
+        ));
+        let raw_entropy_bits = self.hidden_entropy_bits_for_latent_step(raw.clone(), 0);
+        let final_loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+            output.final_hidden.clone(),
+            batch.targets.clone(),
+            batch.loss_mask.clone(),
+            output.steps_used,
+        ));
+        let final_entropy_bits = self
+            .hidden_entropy_bits_for_latent_step(output.final_hidden.clone(), output.steps_used);
+        let final_delta_rms = Self::tensor_delta_rms(raw.clone(), output.final_hidden.clone());
+        let final_raw_cosine = Self::tensor_cosine(raw.clone(), output.final_hidden.clone());
+        let mut previous = raw.clone();
+        let mut previous_ce = raw_loss;
+        let mut step_loss = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_ce_delta = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_ce_monotonic_violation_rate = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_entropy_bits = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_delta_rms = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_raw_cosine = Vec::with_capacity(output.step_hiddens.len());
+        let mut step_energy_mean = Vec::with_capacity(output.energies.len());
+        let mut step_energy_delta = Vec::with_capacity(output.energies.len());
+        let mut step_energy_monotonic_violation_rate = Vec::with_capacity(output.energies.len());
+        let mut previous_energy = self.model.latent_energy_from_hidden(raw.clone());
+        for (index, hidden) in output.step_hiddens.into_iter().enumerate() {
+            let step = index.saturating_add(1);
+            let loss = scalar_tensor_to_f64(self.language_loss_from_hidden_for_latent_step(
+                hidden.clone(),
+                batch.targets.clone(),
+                batch.loss_mask.clone(),
+                step,
+            ));
+            let ce_delta = loss - previous_ce;
+            step_loss.push(loss);
+            step_ce_delta.push(ce_delta);
+            step_ce_monotonic_violation_rate.push(f64::from(ce_delta > 1.0e-6));
+            previous_ce = loss;
+            step_entropy_bits.push(self.hidden_entropy_bits_for_latent_step(hidden.clone(), step));
+            step_delta_rms.push(Self::tensor_delta_rms(previous.clone(), hidden.clone()));
+            step_raw_cosine.push(Self::tensor_cosine(raw.clone(), hidden.clone()));
+            previous = hidden;
+            if let Some(energy) = output.energies.get(index) {
+                step_energy_mean.push(scalar_tensor_to_f64(energy.clone().mean().reshape([1])));
+                if let Some(prev_energy) = previous_energy.as_ref() {
+                    let energy_delta = energy.clone() - prev_energy.clone();
+                    step_energy_delta.push(scalar_tensor_to_f64(
+                        energy_delta.clone().mean().reshape([1]),
+                    ));
+                    let violations = energy_delta.greater_elem(0.0).float().mean().reshape([1]);
+                    step_energy_monotonic_violation_rate.push(scalar_tensor_to_f64(violations));
+                }
+                previous_energy = Some(energy.clone());
+            }
+        }
+        let best_energy_step = step_energy_mean
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| value.is_finite())
+            .min_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+            .map(|(index, _)| index.saturating_add(1));
+        Some(LatentReasoningStepDiagnostics {
+            raw_loss,
+            final_loss,
+            raw_entropy_bits,
+            final_entropy_bits,
+            final_delta_rms,
+            final_raw_cosine,
+            step_loss,
+            step_ce_delta,
+            step_ce_monotonic_violation_rate,
+            step_entropy_bits,
+            step_delta_rms,
+            step_raw_cosine,
+            step_energy_mean,
+            step_energy_delta,
+            step_energy_monotonic_violation_rate,
+            best_energy_step,
+        })
+    }
+
+    fn hidden_entropy_bits(&self, hidden: Tensor<B, 3>) -> f64 {
+        self.hidden_entropy_bits_for_latent_step(
+            hidden,
+            self.model.latent_reasoning_config().max_steps,
+        )
+    }
+
+    fn hidden_entropy_bits_for_latent_step(&self, hidden: Tensor<B, 3>, step: usize) -> f64 {
+        let logits = self.model.logits_from_hidden_for_latent_step(hidden, step);
+        let [batch, time, vocab] = logits.shape().dims::<3>();
+        if batch == 0 || time == 0 || vocab == 0 {
+            return 0.0;
+        }
+        let log_probs = activation::log_softmax(logits.reshape([batch * time, vocab]), 1);
+        let entropy = (log_probs.clone().exp() * log_probs)
+            .sum_dim(1)
+            .mean()
+            .mul_scalar(-1.0 / std::f32::consts::LN_2);
+        scalar_tensor_to_f64(entropy.reshape([1]))
+    }
+
+    fn tensor_delta_rms(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>) -> f64 {
+        scalar_tensor_to_f64((rhs - lhs).powf_scalar(2.0).mean().sqrt().reshape([1]))
+    }
+
+    fn tensor_cosine(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>) -> f64 {
+        let dot = scalar_tensor_to_f64((lhs.clone() * rhs.clone()).mean().reshape([1]));
+        let lhs_rms = scalar_tensor_to_f64(lhs.powf_scalar(2.0).mean().sqrt().reshape([1]));
+        let rhs_rms = scalar_tensor_to_f64(rhs.powf_scalar(2.0).mean().sqrt().reshape([1]));
+        let denom = (lhs_rms * rhs_rms).max(1.0e-12);
+        dot / denom
+    }
+
+    fn output_degeneracy_for_batch(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+    ) -> Option<OutputDegeneracyStats> {
+        if probe_tokens == 0
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+        {
+            return None;
+        }
+        let [batch_size, block_size] = batch.inputs.shape().dims::<2>();
+        if batch_size == 0 || block_size == 0 {
+            return None;
+        }
+        let probe_batch = batch_size.min(4);
+        let generated_tokens = probe_tokens.max(1);
+        let prompt_time = block_size.min(probe_tokens.clamp(1, 32));
+        let prompt_available = block_size.saturating_sub(prompt_time);
+        let device = batch.inputs.device();
+        let mut accumulator = OutputDegeneracyAccumulator::new(eos_id);
+        for prompt_index in 0..probe_batch {
+            let prompt_start =
+                validation_degeneracy_prompt_start(prompt_index, probe_batch, prompt_available);
+            let inputs = batch.inputs.clone().slice([
+                prompt_index..prompt_index + 1,
+                prompt_start..(prompt_start + prompt_time),
+            ]);
+            let prompt_tokens = inputs
+                .clone()
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("validation degeneracy prompt tokens");
+            accumulator.record_prompt_tokens(prompt_tokens);
+            let summary_event_mask = batch.summary_event_mask.clone().map(|mask| {
+                mask.slice([
+                    prompt_index..prompt_index + 1,
+                    prompt_start..(prompt_start + prompt_time),
+                ])
+            });
+            let mut state = self.model.init_state();
+            let logits = if let Some(mask) = summary_event_mask {
+                self.model
+                    .forward_with_state_and_summary_event_mask(inputs, mask, &mut state)
+            } else {
+                self.model.forward_with_state(inputs, &mut state)
+            };
+            let [_, time, vocab] = logits.shape().dims::<3>();
+            if time == 0 || vocab == 0 {
+                continue;
+            }
+            let mut last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+            for _ in 0..generated_tokens {
+                let Some(step) = output_degeneracy_step_from_logits(last_logits.clone()) else {
+                    continue;
+                };
+                accumulator.record(step);
+                let next = step.argmax as i64;
+                accumulator.record_generated_token(next);
+                let next_tensor =
+                    Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
+                let logits = self.model.forward_with_state(next_tensor, &mut state);
+                let [_, time, vocab] = logits.shape().dims::<3>();
+                if time == 0 || vocab == 0 {
+                    break;
+                }
+                last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+            }
+        }
+        Some(accumulator.finish()).filter(|stats| stats.token_count > 0)
+    }
+
     #[cfg(test)]
     fn teacher_update_count_for_test(&self) -> Option<usize> {
-        let key = (self.streaming_runtime_key, TypeId::of::<B>());
-        lock_teacher_model_store()
-            .get(&key)
+        self.teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned")
+            .as_ref()
             .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>())
             .map(|runtime| runtime.update_count)
     }
@@ -683,6 +2342,5980 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             &self.objective,
             self.model.uses_factorized_language_head(),
         );
+    }
+
+    fn causal_input_corruption_probability(&self) -> f32 {
+        if !self.input_corruption.enabled {
+            return 0.0;
+        }
+        let probability = self.input_corruption.probability.clamp(0.0, 1.0);
+        if probability <= f32::EPSILON {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < self.input_corruption.warmup_steps {
+            return 0.0;
+        }
+        if self.input_corruption.ramp_steps == 0 {
+            return probability;
+        }
+        let ramp_step = step_index
+            .saturating_sub(self.input_corruption.warmup_steps)
+            .saturating_add(1);
+        let ramp = (ramp_step as f32 / self.input_corruption.ramp_steps as f32).clamp(0.0, 1.0);
+        probability * ramp
+    }
+
+    fn scheduled_weight(
+        enabled: bool,
+        weight: f32,
+        warmup_steps: usize,
+        ramp_steps: usize,
+        step_index: usize,
+    ) -> f32 {
+        if !enabled || weight <= f32::EPSILON {
+            return 0.0;
+        }
+        if step_index < warmup_steps {
+            return 0.0;
+        }
+        if ramp_steps == 0 {
+            return weight;
+        }
+        let ramp_step = step_index.saturating_sub(warmup_steps).saturating_add(1);
+        let ramp = (ramp_step as f32 / ramp_steps as f32).clamp(0.0, 1.0);
+        weight * ramp
+    }
+
+    fn scheduled_weight_on_cadence(
+        enabled: bool,
+        weight: f32,
+        warmup_steps: usize,
+        ramp_steps: usize,
+        every_steps: usize,
+        step_index: usize,
+    ) -> f32 {
+        if every_steps > 1 && !step_index.is_multiple_of(every_steps) {
+            return 0.0;
+        }
+        Self::scheduled_weight(enabled, weight, warmup_steps, ramp_steps, step_index)
+    }
+
+    fn repeat_unlikelihood_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn repeat_cycle_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.cycle_weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn repeat_cycle_margin_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.repeat_unlikelihood.enabled,
+            self.repeat_unlikelihood.cycle_margin_weight,
+            self.repeat_unlikelihood.warmup_steps,
+            self.repeat_unlikelihood.ramp_steps,
+            self.repeat_unlikelihood.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_marginal_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.marginal_weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn logit_target_coverage_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.logit_entropy_floor.enabled,
+            self.logit_entropy_floor.target_coverage_weight,
+            self.logit_entropy_floor.warmup_steps,
+            self.logit_entropy_floor.ramp_steps,
+            self.logit_entropy_floor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn dynamics_anchor_weight(&self) -> f32 {
+        Self::scheduled_weight_on_cadence(
+            self.dynamics_anchor.enabled,
+            self.dynamics_anchor.weight,
+            self.dynamics_anchor.warmup_steps,
+            self.dynamics_anchor.ramp_steps,
+            self.dynamics_anchor.every_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn dynamics_anchor_teacher_model(&self) -> Option<DragonModel<B>> {
+        if self.dynamics_anchor_weight() <= f32::EPSILON
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+        {
+            return None;
+        }
+        Some(self.current_teacher_model())
+    }
+
+    fn latent_dragon_state_consistency_active(&self) -> bool {
+        self.latent_reasoning.enabled
+            && self.latent_reasoning.dragon_state.enabled
+            && !self.pipeline_enabled()
+    }
+
+    fn recurrent_teacher_model(&self) -> Option<(DragonModel<B>, bool)> {
+        if let Some(teacher) = self.dynamics_anchor_teacher_model() {
+            return Some((teacher, true));
+        }
+        self.latent_dragon_state_consistency_active()
+            .then(|| (self.current_teacher_model(), false))
+    }
+
+    fn dynamics_anchor_mask(
+        &self,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 2, Int>> {
+        match self.dynamics_anchor.mask {
+            DynamicsAnchorMask::AllTokens => None,
+            DynamicsAnchorMask::TargetTokens => loss_mask,
+            DynamicsAnchorMask::ContextTokens => loss_mask.map(|mask| mask.equal_elem(0).int()),
+        }
+    }
+
+    fn dynamics_anchor_loss_from_log_probs(
+        &self,
+        student_log_probs: Tensor<B, 3>,
+        teacher_logits: Tensor<B, 3>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let weight = self.dynamics_anchor_weight();
+        if weight <= f32::EPSILON {
+            return None;
+        }
+        let teacher_log_probs = log_probs_from_logits(teacher_logits.detach());
+        let per_token = self_distillation_per_token_from_log_probs(
+            student_log_probs,
+            teacher_log_probs,
+            self.dynamics_anchor.kl,
+        );
+        Some(masked_token_mean(per_token, self.dynamics_anchor_mask(loss_mask)).mul_scalar(weight))
+    }
+
+    fn teacher_logits_with_state(
+        teacher: &DragonModel<B>,
+        inputs: Tensor<B, 2, Int>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+        state: &mut ModelState<B>,
+    ) -> Tensor<B, 3> {
+        if let Some(mask) = summary_event_mask {
+            teacher.forward_with_state_and_summary_event_mask(inputs, mask, state)
+        } else {
+            teacher.forward_with_state(inputs, state)
+        }
+        .detach()
+    }
+
+    fn teacher_forward_with_state(
+        teacher: &DragonModel<B>,
+        emit_logits: bool,
+        inputs: Tensor<B, 2, Int>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+        state: &mut ModelState<B>,
+    ) -> Option<Tensor<B, 3>> {
+        if emit_logits {
+            return Some(Self::teacher_logits_with_state(
+                teacher,
+                inputs,
+                summary_event_mask,
+                state,
+            ));
+        }
+        if let Some(mask) = summary_event_mask {
+            teacher.forward_hidden_with_state_and_summary_event_mask(inputs, mask, state);
+        } else {
+            teacher.forward_hidden_with_state(inputs, state);
+        }
+        None
+    }
+
+    fn predictive_coding_active_for_chunk(&self, step_index: usize, chunk_index: usize) -> bool {
+        self.predictive_coding.enabled
+            && step_index >= self.predictive_coding.warmup_steps
+            && chunk_index.is_multiple_of(self.predictive_coding.apply_every_chunks.max(1))
+    }
+
+    fn predictive_coding_inference_config(&self) -> burn_pc::PcInferenceConfig {
+        burn_pc::PcInferenceConfig {
+            steps: self.predictive_coding.steps,
+            step_size: self.predictive_coding.step_size,
+            latent_decay: self.predictive_coding.latent_decay,
+            max_grad_norm: self.predictive_coding.max_grad_norm,
+            eps: self.predictive_coding.eps,
+        }
+    }
+
+    fn predictive_coding_state_has_latents(
+        state: &ModelState<B>,
+        scope: PredictiveCodingStateScope,
+    ) -> bool {
+        state.layers.iter().any(|layer| {
+            let core = layer.rho.is_some() || layer.y_neuron_state.is_some();
+            core || (matches!(scope, PredictiveCodingStateScope::All)
+                && (layer.sequence_aux.is_some()
+                    || layer.mamba_angle_state.is_some()
+                    || layer.mamba_k_state.is_some()
+                    || layer.mamba_v_state.is_some()
+                    || layer.clocked_slow_hidden.is_some()
+                    || layer.summary_memory_hidden.is_some()))
+        })
+    }
+
+    fn attach_predictive_coding_state_latents(
+        state: &mut ModelState<B>,
+        scope: PredictiveCodingStateScope,
+    ) -> bool {
+        let mut attached = false;
+        for layer in &mut state.layers {
+            layer.rho_norm = None;
+            attached |= attach_predictive_coding_tensor(&mut layer.rho);
+            attached |= attach_predictive_coding_tensor(&mut layer.y_neuron_state);
+            if matches!(scope, PredictiveCodingStateScope::All) {
+                attached |= attach_predictive_coding_tensor(&mut layer.sequence_aux);
+                attached |= attach_predictive_coding_tensor(&mut layer.mamba_angle_state);
+                attached |= attach_predictive_coding_tensor(&mut layer.mamba_k_state);
+                attached |= attach_predictive_coding_tensor(&mut layer.mamba_v_state);
+                attached |= attach_predictive_coding_tensor(&mut layer.clocked_slow_hidden);
+                attached |= attach_predictive_coding_tensor(&mut layer.summary_memory_hidden);
+            }
+        }
+        attached
+    }
+
+    fn update_predictive_coding_state_latents(
+        state: &mut ModelState<B>,
+        grads: &B::Gradients,
+        config: &burn_pc::PcInferenceConfig,
+        sync_diagnostics: bool,
+        scope: PredictiveCodingStateScope,
+    ) -> PredictiveCodingTensorUpdateStats
+    where
+        B: AutodiffBackend,
+    {
+        let mut stats = PredictiveCodingTensorUpdateStats::default();
+        for layer in &mut state.layers {
+            layer.rho_norm = None;
+            update_predictive_coding_tensor(
+                &mut layer.rho,
+                grads,
+                config,
+                sync_diagnostics,
+                &mut stats,
+            );
+            update_predictive_coding_tensor(
+                &mut layer.y_neuron_state,
+                grads,
+                config,
+                sync_diagnostics,
+                &mut stats,
+            );
+            if matches!(scope, PredictiveCodingStateScope::All) {
+                update_predictive_coding_tensor(
+                    &mut layer.sequence_aux,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+                update_predictive_coding_tensor(
+                    &mut layer.mamba_angle_state,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+                update_predictive_coding_tensor(
+                    &mut layer.mamba_k_state,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+                update_predictive_coding_tensor(
+                    &mut layer.mamba_v_state,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+                update_predictive_coding_tensor(
+                    &mut layer.clocked_slow_hidden,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+                update_predictive_coding_tensor(
+                    &mut layer.summary_memory_hidden,
+                    grads,
+                    config,
+                    sync_diagnostics,
+                    &mut stats,
+                );
+            }
+        }
+        stats
+    }
+
+    fn predictive_coding_energy_with_state(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+        state: &mut ModelState<B>,
+    ) -> Tensor<B, 1> {
+        let hidden = if let Some(mask) = summary_event_mask {
+            self.model
+                .forward_hidden_with_state_and_summary_event_mask(inputs, mask, state)
+        } else {
+            self.model.forward_hidden_with_state(inputs, state)
+        };
+        self.language_loss_from_hidden(hidden, targets, loss_mask)
+    }
+
+    fn correct_state_with_predictive_coding(
+        &self,
+        state: ModelState<B>,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (ModelState<B>, PredictiveCodingChunkReport)
+    where
+        B: AutodiffBackend,
+    {
+        let start = Instant::now();
+        let mut report = PredictiveCodingChunkReport {
+            chunks_seen: 1,
+            ..PredictiveCodingChunkReport::default()
+        };
+        let state_scope = self.predictive_coding.state_scope;
+        if !Self::predictive_coding_state_has_latents(&state, state_scope) {
+            report.skipped_empty_state = 1;
+            report.elapsed_ns = start.elapsed().as_nanos();
+            return (state.detached_clone(), report);
+        }
+
+        let config = self.predictive_coding_inference_config();
+        let sync_diagnostics = self.predictive_coding.sync_diagnostics;
+        let mut corrected = state.detached_clone();
+        let mut update_stats = PredictiveCodingTensorUpdateStats::default();
+        for step in 0..config.steps {
+            if !Self::attach_predictive_coding_state_latents(&mut corrected, state_scope) {
+                report.skipped_empty_state = report.skipped_empty_state.saturating_add(1);
+                break;
+            }
+            let mut inference_state = corrected.clone();
+            let energy = self.predictive_coding_energy_with_state(
+                inputs.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                summary_event_mask.clone(),
+                &mut inference_state,
+            );
+            if sync_diagnostics && step == 0 {
+                report.energy_before = Some(scalar_tensor_to_f64(energy.clone().detach().inner()));
+            }
+            let grads = energy.backward();
+            let step_stats = Self::update_predictive_coding_state_latents(
+                &mut corrected,
+                &grads,
+                &config,
+                sync_diagnostics,
+                state_scope,
+            );
+            if step_stats.tensor_count == 0 {
+                report.skipped_empty_state = report.skipped_empty_state.saturating_add(1);
+                corrected.detach_in_place();
+                break;
+            }
+            update_stats.tensor_count = update_stats
+                .tensor_count
+                .saturating_add(step_stats.tensor_count);
+            update_stats.diagnostic_count = update_stats
+                .diagnostic_count
+                .saturating_add(step_stats.diagnostic_count);
+            update_stats.grad_norm_sum += step_stats.grad_norm_sum;
+            update_stats.grad_norm_max = update_stats.grad_norm_max.max(step_stats.grad_norm_max);
+            update_stats.delta_rms_sum += step_stats.delta_rms_sum;
+            report.inference_steps = report.inference_steps.saturating_add(1);
+            corrected.detach_in_place();
+        }
+
+        if report.inference_steps > 0 {
+            if sync_diagnostics {
+                let mut post_state = corrected.clone();
+                let post_energy = self.predictive_coding_energy_with_state(
+                    inputs,
+                    targets,
+                    loss_mask,
+                    summary_event_mask,
+                    &mut post_state,
+                );
+                report.energy_after = Some(scalar_tensor_to_f64(post_energy.detach().inner()));
+            }
+            report.chunks_corrected = 1;
+            report.grad_norm_mean = update_stats.grad_norm_mean();
+            report.grad_norm_max = update_stats.grad_norm_max();
+            report.delta_rms_mean = update_stats.delta_rms_mean();
+        }
+        report.elapsed_ns = start.elapsed().as_nanos();
+        (corrected, report)
+    }
+
+    fn greedy_rollout_unlikelihood_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_unlikelihood_margin_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.margin_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_cycle_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.cycle_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_cycle_margin_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.cycle_margin_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn next_token_loss_from_logits(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        dynamics_teacher_logits: Option<Tensor<B, 3>>,
+    ) -> Tensor<B, 1> {
+        let [batch_size, time, vocab] = logits.shape().dims();
+        let log_probs = log_probs_from_logits(logits.clone());
+        let mut loss =
+            next_token_loss_from_log_probs(log_probs.clone(), targets.clone(), loss_mask.clone());
+        if let Some(answer_ranking_loss) = self.ruliad_answer_ranking_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            loss_mask.clone(),
+        ) {
+            loss = loss + answer_ranking_loss;
+        }
+        let weight = self.repeat_unlikelihood_weight();
+        let cycle_weight = self.repeat_cycle_weight();
+        let cycle_margin_weight = self.repeat_cycle_margin_weight();
+        let needs_lagged_aux = weight > f32::EPSILON
+            || cycle_weight > f32::EPSILON
+            || cycle_margin_weight > f32::EPSILON;
+        if needs_lagged_aux {
+            if weight > f32::EPSILON {
+                let mut total_loss: Option<Tensor<B, 1>> = None;
+                let mut total_hits: Option<Tensor<B, 1>> = None;
+                for lag in self.repeat_unlikelihood_lags(time) {
+                    let Some((lag_log_probs, lag_targets, history_tokens)) =
+                        lagged_prediction_tensors(
+                            log_probs.clone(),
+                            targets.clone(),
+                            clean_inputs.clone(),
+                            lag,
+                            batch_size,
+                            time,
+                            vocab,
+                        )
+                    else {
+                        continue;
+                    };
+                    let repeat_weight = history_tokens.clone().not_equal(lag_targets).int().float();
+                    let unlikelihood = unlikelihood_from_log_probs(
+                        lag_log_probs,
+                        history_tokens,
+                        self.repeat_unlikelihood.epsilon,
+                    );
+                    let lag_loss = (unlikelihood * repeat_weight.clone()).sum().reshape([1]);
+                    let lag_hits = repeat_weight.sum().reshape([1]);
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + lag_loss,
+                        None => lag_loss,
+                    });
+                    total_hits = Some(match total_hits {
+                        Some(accumulated) => accumulated + lag_hits,
+                        None => lag_hits,
+                    });
+                }
+                if let Some(total_loss) = total_loss {
+                    loss = loss
+                        + total_loss
+                            .div(
+                                total_hits
+                                    .expect("repeat unlikelihood hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(weight);
+                }
+            }
+            if cycle_weight > f32::EPSILON || cycle_margin_weight > f32::EPSILON {
+                let mut total_cycle: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_hits: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_margin: Option<Tensor<B, 1>> = None;
+                let mut total_cycle_margin_hits: Option<Tensor<B, 1>> = None;
+                let mean_logits_by_position = (cycle_margin_weight > f32::EPSILON)
+                    .then(|| logits.clone().mean_dim(2).reshape([batch_size, time]));
+                for lag in self.repeat_cycle_lags(time) {
+                    let Some((lag_log_probs, lag_targets, history_tokens)) =
+                        lagged_prediction_tensors(
+                            log_probs.clone(),
+                            targets.clone(),
+                            clean_inputs.clone(),
+                            lag,
+                            batch_size,
+                            time,
+                            vocab,
+                        )
+                    else {
+                        continue;
+                    };
+                    let cycle_weight_tensor =
+                        history_tokens.clone().not_equal(lag_targets).int().float();
+                    if cycle_weight > f32::EPSILON {
+                        let unlikelihood = unlikelihood_from_log_probs(
+                            lag_log_probs,
+                            history_tokens.clone(),
+                            self.repeat_unlikelihood.epsilon,
+                        );
+                        let lag_loss = (unlikelihood * cycle_weight_tensor.clone())
+                            .sum()
+                            .reshape([1]);
+                        let lag_hits = cycle_weight_tensor.clone().sum().reshape([1]);
+                        total_cycle = Some(match total_cycle {
+                            Some(accumulated) => accumulated + lag_loss,
+                            None => lag_loss,
+                        });
+                        total_cycle_hits = Some(match total_cycle_hits {
+                            Some(accumulated) => accumulated + lag_hits,
+                            None => lag_hits,
+                        });
+                    }
+                    if cycle_margin_weight > f32::EPSILON {
+                        let start = lag.saturating_sub(1);
+                        let lag_logits =
+                            logits.clone().slice([0..batch_size, start..time, 0..vocab]);
+                        let history_logits =
+                            selected_token_logits(lag_logits.clone(), history_tokens);
+                        let mean_logits = mean_logits_by_position
+                            .as_ref()
+                            .expect("cycle margin mean logits")
+                            .clone()
+                            .slice([0..batch_size, start..time]);
+                        let margin_penalty = activation::softplus(
+                            history_logits - mean_logits + self.repeat_unlikelihood.cycle_margin,
+                            1.0,
+                        );
+                        let lag_margin = (margin_penalty * cycle_weight_tensor.clone())
+                            .sum()
+                            .reshape([1]);
+                        let lag_hits = cycle_weight_tensor.sum().reshape([1]);
+                        total_cycle_margin = Some(match total_cycle_margin {
+                            Some(accumulated) => accumulated + lag_margin,
+                            None => lag_margin,
+                        });
+                        total_cycle_margin_hits = Some(match total_cycle_margin_hits {
+                            Some(accumulated) => accumulated + lag_hits,
+                            None => lag_hits,
+                        });
+                    }
+                }
+                if let Some(total_cycle) = total_cycle {
+                    loss = loss
+                        + total_cycle
+                            .div(
+                                total_cycle_hits
+                                    .expect("repeat cycle hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(cycle_weight);
+                }
+                if let Some(total_cycle_margin) = total_cycle_margin {
+                    loss = loss
+                        + total_cycle_margin
+                            .div(
+                                total_cycle_margin_hits
+                                    .expect("repeat cycle margin hit accumulator")
+                                    .clamp_min(1.0),
+                            )
+                            .mul_scalar(cycle_margin_weight);
+                }
+            }
+        }
+        if let Some(entropy_floor_loss) =
+            self.logit_entropy_floor_loss(log_probs.clone(), targets.clone())
+        {
+            loss = loss + entropy_floor_loss;
+        }
+        if let Some(teacher_logits) = dynamics_teacher_logits
+            && let Some(anchor_loss) =
+                self.dynamics_anchor_loss_from_log_probs(log_probs, teacher_logits, loss_mask)
+        {
+            loss = loss + anchor_loss;
+        }
+        loss
+    }
+
+    fn repeat_unlikelihood_lags(&self, time: usize) -> Vec<usize> {
+        if time == 0 {
+            return Vec::new();
+        }
+        let mut lags = Vec::with_capacity(self.repeat_unlikelihood.history_lags.len() + 1);
+        lags.push(1);
+        lags.extend(self.repeat_unlikelihood.history_lags.iter().copied());
+        lags.retain(|lag| (1..=time).contains(lag));
+        lags.sort_unstable();
+        lags.dedup();
+        lags
+    }
+
+    fn repeat_cycle_lags(&self, time: usize) -> Vec<usize> {
+        if time == 0
+            || self.repeat_unlikelihood.cycle_min_lag == 0
+            || self.repeat_unlikelihood.cycle_max_lag < self.repeat_unlikelihood.cycle_min_lag
+        {
+            return Vec::new();
+        }
+        let min_lag = self.repeat_unlikelihood.cycle_min_lag.min(time);
+        let max_lag = self.repeat_unlikelihood.cycle_max_lag.min(time);
+        if max_lag < min_lag {
+            return Vec::new();
+        }
+        let available = max_lag - min_lag + 1;
+        let budget = self
+            .repeat_unlikelihood
+            .cycle_lags_per_step
+            .max(1)
+            .min(available);
+        if budget == available {
+            return (min_lag..=max_lag).collect();
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let mut lags = Vec::with_capacity(budget);
+        let stride = (available / budget).max(1);
+        let offset = step_index % available;
+        for index in 0..budget {
+            let relative = (offset + index * stride) % available;
+            lags.push(min_lag + relative);
+        }
+        lags.sort_unstable();
+        lags.dedup();
+        lags
+    }
+
+    fn next_token_loss_from_hidden(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        dynamics_teacher_logits: Option<Tensor<B, 3>>,
+    ) -> Tensor<B, 1> {
+        if (self.repeat_unlikelihood_weight() <= f32::EPSILON
+            && self.repeat_cycle_weight() <= f32::EPSILON
+            && self.repeat_cycle_margin_weight() <= f32::EPSILON
+            && self.logit_entropy_floor_weight() <= f32::EPSILON
+            && self.logit_marginal_entropy_floor_weight() <= f32::EPSILON
+            && self.logit_target_coverage_weight() <= f32::EPSILON
+            && self.ruliad_answer_ranking_weight() <= f32::EPSILON
+            && self.ruliad_answer_denoising_weight() <= f32::EPSILON
+            && dynamics_teacher_logits.is_none())
+            || self.model.uses_factorized_language_head()
+        {
+            let mut loss =
+                self.language_loss_from_hidden(hidden.clone(), targets.clone(), loss_mask.clone());
+            if let Some(aux) = self.latent_reasoning_auxiliary_loss(
+                hidden,
+                clean_inputs.clone(),
+                Some(targets.clone()),
+                loss_mask.clone(),
+            ) {
+                loss = loss + aux;
+            }
+            if let Some(denoising) =
+                self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
+            {
+                loss = loss + denoising;
+            }
+            return loss;
+        }
+        let logits = self.model.logits_from_hidden(hidden.clone());
+        let mut loss = self.next_token_loss_from_logits(
+            logits,
+            targets.clone(),
+            clean_inputs.clone(),
+            loss_mask.clone(),
+            dynamics_teacher_logits,
+        );
+        if let Some(aux) = self.latent_reasoning_auxiliary_loss(
+            hidden,
+            clean_inputs.clone(),
+            Some(targets.clone()),
+            loss_mask.clone(),
+        ) {
+            loss = loss + aux;
+        }
+        if let Some(denoising) = self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
+        {
+            loss = loss + denoising;
+        }
+        loss
+    }
+
+    fn ruliad_answer_ranking_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_ranking;
+        if config.enabled {
+            config.weight.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn ruliad_answer_ranking_loss_from_logits(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_ranking;
+        let weight = self.ruliad_answer_ranking_weight();
+        if weight <= f32::EPSILON {
+            return None;
+        }
+        let mask = loss_mask?;
+        let [batch, time, vocab] = logits.shape().dims();
+        if batch == 0 || time == 0 || vocab <= 1 {
+            return None;
+        }
+        let offset = (config.corrupt_offset % vocab as i64).max(1);
+        let corrupt_targets = targets
+            .clone()
+            .add_scalar(offset)
+            .remainder_scalar(vocab as i64);
+        let oracle_logits = selected_token_logits(logits.clone(), targets);
+        let corrupt_logits = selected_token_logits(logits, corrupt_targets);
+        let penalty =
+            activation::softplus(corrupt_logits - oracle_logits + config.margin.max(0.0), 1.0);
+        Some(masked_token_mean(penalty, Some(mask)).mul_scalar(weight))
+    }
+
+    fn ruliad_answer_denoising_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_denoising;
+        if config.enabled {
+            config.weight.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn ruliad_structured_answer_recovery_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_denoising;
+        if !config.enabled
+            || config.structured_recovery_weight <= f32::EPSILON
+            || config.structured_recovery_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.structured_recovery_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.structured_recovery_every_steps != 0 {
+            return 0.0;
+        }
+        config.structured_recovery_weight
+    }
+
+    fn ruliad_answer_denoising_loss(
+        &self,
+        clean_inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_denoising;
+        let weight = self.ruliad_answer_denoising_weight();
+        if weight <= f32::EPSILON || self.pipeline_enabled() {
+            return None;
+        }
+        let mask = loss_mask?;
+        let prefix_mask = answer_prefix_input_mask(mask.clone());
+        let corrupted_inputs =
+            self.corrupt_ruliad_answer_prefix_inputs(clean_inputs, prefix_mask, config);
+        let hidden = self.model.forward_hidden(corrupted_inputs);
+        Some(
+            self.language_loss_from_hidden(hidden, targets, Some(mask))
+                .mul_scalar(weight),
+        )
+    }
+
+    fn corrupt_ruliad_answer_prefix_inputs(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        prefix_mask: Tensor<B, 2, Int>,
+        config: RuliadAnswerDenoisingConfig,
+    ) -> Tensor<B, 2, Int> {
+        let probability = config.probability.clamp(0.0, 1.0);
+        if probability <= f32::EPSILON {
+            return inputs;
+        }
+        let [batch, time] = inputs.shape().dims();
+        if batch == 0 || time == 0 || self.input_vocab_size <= 1 {
+            return inputs;
+        }
+        let vocab = self.input_vocab_size as i64;
+        let offset = (config.corrupt_offset % vocab).max(1);
+        let mut mask = prefix_mask.equal_elem(1);
+        if probability < 1.0 {
+            let device = inputs.device();
+            let keep = Tensor::<B, 2>::random(
+                [batch, time],
+                TensorDistribution::Uniform(0.0, 1.0),
+                &device,
+            )
+            .lower_elem(probability);
+            mask = mask.bool_and(keep);
+        }
+        let replacements = inputs.clone().add_scalar(offset).remainder_scalar(vocab);
+        inputs.mask_where(mask, replacements)
+    }
+
+    fn ruliad_answer_contract_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.answer_contract;
+        if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.every_steps != 0 {
+            return 0.0;
+        }
+        config.weight
+    }
+
+    fn ruliad_answer_contract_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_contract;
+        let weight = self.ruliad_answer_contract_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let max_rows = config.max_rows_per_step.max(1);
+        let prompt_schema_max_rows = if config.prompt_schema_max_rows_per_step == 0 {
+            max_rows
+        } else {
+            config.prompt_schema_max_rows_per_step
+        }
+        .max(1);
+
+        #[derive(Clone)]
+        struct ContractRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            premature_close_mask: Vec<f32>,
+        }
+
+        let mut close_token_ids = tokenizer.encode_payload("\n[/R2]");
+        close_token_ids.extend(tokenizer.encode_payload("[/R2]"));
+        close_token_ids.sort_unstable();
+        close_token_ids.dedup();
+        let close_token_ids = close_token_ids
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let premature_close_weight = config.premature_close_unlikelihood_weight;
+        let mut rows = Vec::<ContractRow>::new();
+        let mut sample_groups = 0usize;
+        let mut prompt_schema_sample_groups = 0usize;
+        let mut contract_tokens = 0usize;
+        let mut prompt_schema_value_tokens = 0usize;
+        let mut prompt_schema_rows = 0usize;
+        let mut schema_tokens = 0usize;
+        let mut schema_start_tokens = 0usize;
+        let mut value_tokens = 0usize;
+        let mut other_tokens = 0usize;
+        let mut premature_close_tokens = 0usize;
+        for sample in policy_batch.samples.iter() {
+            if rows.len() >= max_rows {
+                break;
+            }
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            prompt = Self::ruliad_trim_prompt_for_completion(
+                &prompt,
+                oracle_completion.len(),
+                block_size,
+            );
+            let Some((inputs, targets, _default_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(targets.len());
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let schema_start_mask = Self::ruliad_answer_schema_start_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let mut mask = vec![0.0f32; targets.len()];
+            let mut premature_close_mask = vec![0.0f32; targets.len()];
+            let mut active_tokens = 0usize;
+            for completion_index in 0..oracle_completion.len() {
+                let target_index = completion_start.saturating_add(completion_index);
+                if target_index >= mask.len() {
+                    continue;
+                }
+                let schema_token = schema_mask.get(completion_index).copied().unwrap_or(false);
+                let schema_start_token = schema_start_mask
+                    .get(completion_index)
+                    .copied()
+                    .unwrap_or(false);
+                let token_weight = if schema_token {
+                    schema_tokens = schema_tokens.saturating_add(1);
+                    if schema_start_token {
+                        schema_start_tokens = schema_start_tokens.saturating_add(1);
+                        config
+                            .schema_token_weight
+                            .max(config.schema_start_token_weight)
+                    } else {
+                        config.schema_token_weight
+                    }
+                } else if value_mask.get(completion_index).copied().unwrap_or(false) {
+                    value_tokens = value_tokens.saturating_add(1);
+                    config.value_token_weight
+                } else {
+                    other_tokens = other_tokens.saturating_add(1);
+                    config.other_token_weight
+                };
+                if token_weight > f32::EPSILON {
+                    mask[target_index] = token_weight;
+                    active_tokens = active_tokens.saturating_add(1);
+                }
+            }
+            if premature_close_weight > f32::EPSILON && !close_token_ids.is_empty() {
+                let answer_token_len = tokenizer
+                    .encode_payload(sample.item.expected_answer.trim())
+                    .len()
+                    .min(oracle_completion.len());
+                for completion_index in 0..answer_token_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    if let Some(slot) = premature_close_mask.get_mut(target_index)
+                        && *slot <= f32::EPSILON
+                    {
+                        *slot = 1.0;
+                        premature_close_tokens = premature_close_tokens.saturating_add(1);
+                    }
+                }
+            }
+            if active_tokens == 0 {
+                continue;
+            }
+            contract_tokens = contract_tokens.saturating_add(active_tokens);
+            sample_groups = sample_groups.saturating_add(1);
+            rows.push(ContractRow {
+                inputs,
+                targets,
+                mask,
+                premature_close_mask,
+            });
+        }
+        let oracle_rows = rows.len();
+        if config.prompt_schema_value_weight > f32::EPSILON {
+            for sample in policy_batch.samples.iter() {
+                if prompt_schema_rows >= prompt_schema_max_rows {
+                    break;
+                }
+                let prompt = sample.prompt_tokens.clone();
+                if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+                    continue;
+                }
+                let field_rows = Self::ruliad_prompt_schema_value_completion_rows(
+                    &tokenizer,
+                    &prompt,
+                    &sample.item.expected_answer,
+                    completion_budget,
+                    block_size,
+                    prompt_schema_max_rows.saturating_sub(prompt_schema_rows),
+                );
+                let mut sample_row_count = 0usize;
+                for (inputs, targets, mask, active_tokens) in field_rows {
+                    if active_tokens == 0 {
+                        continue;
+                    }
+                    let mask = mask
+                        .into_iter()
+                        .map(|value| {
+                            if value > f32::EPSILON {
+                                config.prompt_schema_value_weight
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let premature_close_mask = vec![0.0f32; targets.len()];
+                    contract_tokens = contract_tokens.saturating_add(active_tokens);
+                    prompt_schema_value_tokens =
+                        prompt_schema_value_tokens.saturating_add(active_tokens);
+                    prompt_schema_rows = prompt_schema_rows.saturating_add(1);
+                    sample_row_count = sample_row_count.saturating_add(1);
+                    rows.push(ContractRow {
+                        inputs,
+                        targets,
+                        mask,
+                        premature_close_mask,
+                    });
+                }
+                prompt_schema_sample_groups =
+                    prompt_schema_sample_groups.saturating_add(usize::from(sample_row_count > 0));
+            }
+        }
+        let skip_reason = rows
+            .is_empty()
+            .then(|| "no_answer_contract_rows".to_string());
+        self.write_ruliad_answer_contract_telemetry(RuliadAnswerContractTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: true,
+            skip_reason,
+            sample_groups,
+            prompt_schema_sample_groups,
+            oracle_rows,
+            prompt_schema_rows,
+            contract_tokens,
+            prompt_schema_value_tokens,
+            schema_tokens,
+            schema_start_tokens,
+            value_tokens,
+            other_tokens,
+            premature_close_tokens,
+            answer_contract_weight: weight,
+            premature_close_unlikelihood_weight: premature_close_weight,
+            max_completion_tokens: completion_budget,
+            max_rows_per_step: max_rows,
+            prompt_schema_max_rows_per_step: prompt_schema_max_rows,
+        });
+        if rows.is_empty() {
+            return None;
+        }
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0.0f32; row_count * max_len];
+        let mut premature_close_mask_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+            premature_close_mask_values[offset..offset + len]
+                .copy_from_slice(&row.premature_close_mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_values, [row_count, max_len]), device);
+        let logits = self.model.forward(inputs);
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs.clone(), targets);
+        let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+        let mut loss = (token_log_probs * mask)
+            .sum()
+            .reshape([1])
+            .div(active)
+            .mul_scalar(-weight);
+        if premature_close_weight > f32::EPSILON
+            && premature_close_tokens > 0
+            && !close_token_ids.is_empty()
+        {
+            let close_mask = Tensor::<B, 2>::from_data(
+                TensorData::new(premature_close_mask_values, [row_count, max_len]),
+                device,
+            );
+            let close_active = close_mask.clone().sum().reshape([1]).clamp_min(1.0);
+            let mut close_loss: Option<Tensor<B, 1>> = None;
+            let close_token_count = close_token_ids.len().max(1) as f32;
+            for close_token_id in close_token_ids {
+                let close_targets = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(
+                        vec![close_token_id; row_count * max_len],
+                        [row_count, max_len],
+                    ),
+                    device,
+                );
+                let token_loss =
+                    unlikelihood_from_log_probs(log_probs.clone(), close_targets, 1.0e-6);
+                let masked = (token_loss * close_mask.clone())
+                    .sum()
+                    .reshape([1])
+                    .div(close_active.clone());
+                close_loss = Some(match close_loss {
+                    Some(accumulated) => accumulated + masked,
+                    None => masked,
+                });
+            }
+            if let Some(close_loss) = close_loss {
+                loss = loss
+                    + close_loss
+                        .div_scalar(close_token_count)
+                        .mul_scalar(premature_close_weight);
+            }
+        }
+        Some(loss)
+    }
+
+    fn ruliad_answer_contract_auxiliary_loss(
+        &self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let contract_weight = self.ruliad_answer_contract_weight();
+        if contract_weight <= f32::EPSILON {
+            return None;
+        }
+        if let Some(policy_batch) = policy_batch {
+            self.ruliad_answer_contract_loss(policy_batch, device, block_size)
+        } else {
+            self.write_ruliad_answer_contract_skip("missing_policy_batch", contract_weight);
+            None
+        }
+    }
+
+    fn ruliad_structured_answer_recovery_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.answer_denoising;
+        let weight = self.ruliad_structured_answer_recovery_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .structured_recovery_max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+
+        #[derive(Clone)]
+        struct RecoveryRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<i64>,
+        }
+
+        let mut rows = Vec::<RecoveryRow>::new();
+        let mut sample_groups = 0usize;
+        let mut field_negative_recovery_rows = 0usize;
+        let mut template_negative_recovery_rows = 0usize;
+        let mut schema_negative_recovery_rows = 0usize;
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            let Some((oracle_inputs, oracle_targets, oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_inputs.len());
+            let mut sample_rows = 0usize;
+            for (negative, negative_kind) in Self::ruliad_structured_negative_answers_with_schema(
+                &sample.item.expected_answer,
+                config.structured_recovery_negative_count,
+                config.structured_recovery_template_negative_count,
+                config.structured_recovery_schema_negative_count,
+            ) {
+                let Some((negative_completion, _negative_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &negative,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let mut corrupted_inputs = oracle_inputs.clone();
+                for (index, value) in corrupted_inputs
+                    .iter_mut()
+                    .enumerate()
+                    .skip(completion_start)
+                {
+                    let negative_index = index - completion_start;
+                    if let Some(negative_token) = negative_completion.get(negative_index) {
+                        *value = *negative_token;
+                    }
+                }
+                rows.push(RecoveryRow {
+                    inputs: corrupted_inputs,
+                    targets: oracle_targets.clone(),
+                    mask: oracle_mask
+                        .iter()
+                        .map(|value| if *value > 0.0 { 1 } else { 0 })
+                        .collect(),
+                });
+                sample_rows = sample_rows.saturating_add(1);
+                match negative_kind {
+                    RuliadStructuredNegativeKind::FieldMutation => {
+                        field_negative_recovery_rows =
+                            field_negative_recovery_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::TemplateCollapse => {
+                        template_negative_recovery_rows =
+                            template_negative_recovery_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::SchemaCollapse => {
+                        schema_negative_recovery_rows =
+                            schema_negative_recovery_rows.saturating_add(1);
+                    }
+                }
+            }
+            if sample_rows > 0 {
+                sample_groups = sample_groups.saturating_add(1);
+            }
+        }
+        self.write_ruliad_structured_recovery_telemetry(RuliadStructuredRecoveryTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: true,
+            skip_reason: None,
+            sample_groups,
+            recovery_rows: rows.len(),
+            field_negative_recovery_rows,
+            template_negative_recovery_rows,
+            schema_negative_recovery_rows,
+            structured_recovery_weight: weight,
+            structured_recovery_max_completion_tokens: completion_budget,
+        });
+        if rows.is_empty() {
+            return None;
+        }
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values, [row_count, max_len]),
+            device,
+        );
+        let hidden = self.model.forward_hidden(inputs);
+        Some(
+            self.language_loss_from_hidden(hidden, targets, Some(mask))
+                .mul_scalar(weight),
+        )
+    }
+
+    fn ruliad_structured_answer_recovery_auxiliary_loss(
+        &self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let recovery_weight = self.ruliad_structured_answer_recovery_weight();
+        if recovery_weight <= f32::EPSILON {
+            return None;
+        }
+        if let Some(policy_batch) = policy_batch {
+            self.ruliad_structured_answer_recovery_loss(policy_batch, device, block_size)
+        } else {
+            self.write_ruliad_structured_recovery_skip("missing_policy_batch", recovery_weight);
+            None
+        }
+    }
+
+    fn write_ruliad_structured_recovery_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_structured_recovery_telemetry(RuliadStructuredRecoveryTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: false,
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            recovery_rows: 0,
+            field_negative_recovery_rows: 0,
+            template_negative_recovery_rows: 0,
+            schema_negative_recovery_rows: 0,
+            structured_recovery_weight: weight,
+            structured_recovery_max_completion_tokens: self
+                .ruliad_supervision
+                .answer_denoising
+                .structured_recovery_max_completion_tokens,
+        });
+    }
+
+    fn ruliad_verifier_reward_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.every_steps != 0 {
+            return 0.0;
+        }
+        config.weight
+    }
+
+    fn ruliad_structured_contrast_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || config.structured_contrast_weight <= f32::EPSILON
+            || config.structured_contrast_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.structured_contrast_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.structured_contrast_every_steps != 0 {
+            return 0.0;
+        }
+        config.structured_contrast_weight
+    }
+
+    fn ruliad_field_binding_contrast_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || config.field_binding_contrast_weight <= f32::EPSILON
+            || config.field_binding_contrast_every_steps == 0
+        {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.field_binding_contrast_start_after_steps {
+            return 0.0;
+        }
+        if step_index % config.field_binding_contrast_every_steps != 0 {
+            return 0.0;
+        }
+        config.field_binding_contrast_weight
+    }
+
+    fn ruliad_verifier_rollout_feedback_active(&self) -> bool {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !config.enabled
+            || (config.rollout_imitation_weight <= f32::EPSILON
+                && config.rollout_recovery_weight <= f32::EPSILON)
+            || config.rollout_imitation_every_steps == 0
+        {
+            return false;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.rollout_imitation_start_after_steps {
+            return false;
+        }
+        if step_index % config.rollout_imitation_every_steps != 0 {
+            return false;
+        }
+        true
+    }
+
+    fn mix_ruliad_policy_seed(mut value: u64) -> u64 {
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn ruliad_vpo_scalarizations(
+        &self,
+        sample_index: usize,
+        count: usize,
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) -> Vec<[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM]> {
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed) as u64;
+        let seed = Self::mix_ruliad_policy_seed(
+            step_index
+                ^ (sample_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (count as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
+        );
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scalarizations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut weights =
+                [0.0f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM];
+            let mut sum = 0.0f32;
+            for weight in weights.iter_mut() {
+                let draw = -rng.gen_range(f32::MIN_POSITIVE..1.0).ln();
+                *weight = draw;
+                sum += draw;
+            }
+            if !sum.is_finite() || sum <= f32::EPSILON {
+                let uniform = 1.0 / weights.len() as f32;
+                weights.fill(uniform);
+            } else {
+                for weight in weights.iter_mut() {
+                    *weight /= sum;
+                }
+            }
+            Self::constrain_ruliad_vpo_scalarization(&mut weights, config);
+            scalarizations.push(weights);
+        }
+        scalarizations
+    }
+
+    fn constrain_ruliad_vpo_scalarization(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) {
+        const CORRECTNESS_AXES: &[usize] = &[0, 1, 2, 3, 4];
+        const SCHEMA_QUALITY_AXES: &[usize] = &[6];
+        const HEALTH_AXES: &[usize] = &[8, 9];
+        const COMPACTNESS_AXIS: usize = 5;
+        let original = *weights;
+        let correctness_floor = config.vpo_correctness_mass_floor.clamp(0.0, 1.0);
+        let schema_floor = config
+            .vpo_schema_quality_mass_floor
+            .clamp(0.0, 1.0 - correctness_floor);
+        let health_floor = config
+            .vpo_completion_health_mass_floor
+            .clamp(0.0, 1.0 - correctness_floor - schema_floor);
+        let residual_mass = (1.0 - correctness_floor - schema_floor - health_floor).max(0.0);
+        for (weight, original_weight) in weights.iter_mut().zip(original) {
+            *weight = original_weight * residual_mass;
+        }
+        Self::add_weighted_group_mass(weights, &original, CORRECTNESS_AXES, correctness_floor);
+        Self::add_weighted_group_mass(weights, &original, SCHEMA_QUALITY_AXES, schema_floor);
+        Self::add_weighted_group_mass(weights, &original, HEALTH_AXES, health_floor);
+        let compactness_max = config.vpo_compactness_max_weight.clamp(0.0, 1.0);
+        if weights[COMPACTNESS_AXIS] > compactness_max {
+            let excess = weights[COMPACTNESS_AXIS] - compactness_max;
+            weights[COMPACTNESS_AXIS] = compactness_max;
+            Self::add_uniform_mass(weights, CORRECTNESS_AXES, excess * 0.60);
+            Self::add_uniform_mass(weights, SCHEMA_QUALITY_AXES, excess * 0.25);
+            Self::add_uniform_mass(weights, HEALTH_AXES, excess * 0.15);
+        }
+        Self::renormalize_scalarization(weights);
+    }
+
+    fn add_weighted_group_mass(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        original: &[f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        axes: &[usize],
+        mass: f32,
+    ) {
+        if axes.is_empty() || mass <= f32::EPSILON {
+            return;
+        }
+        let group_mass = axes.iter().map(|axis| original[*axis]).sum::<f32>();
+        if group_mass <= f32::EPSILON {
+            Self::add_uniform_mass(weights, axes, mass);
+            return;
+        }
+        for axis in axes {
+            weights[*axis] += mass * original[*axis] / group_mass;
+        }
+    }
+
+    fn add_uniform_mass(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+        axes: &[usize],
+        mass: f32,
+    ) {
+        if axes.is_empty() || mass <= f32::EPSILON {
+            return;
+        }
+        let share = mass / axes.len() as f32;
+        for axis in axes {
+            weights[*axis] += share;
+        }
+    }
+
+    fn renormalize_scalarization(
+        weights: &mut [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM],
+    ) {
+        let sum = weights.iter().copied().sum::<f32>();
+        if sum <= f32::EPSILON || !sum.is_finite() {
+            let uniform = 1.0 / weights.len() as f32;
+            weights.fill(uniform);
+            return;
+        }
+        for weight in weights.iter_mut() {
+            *weight = (*weight / sum).max(0.0);
+        }
+    }
+
+    fn ruliad_vpo_independent_utilities_with_telemetry(
+        &self,
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+        scalarizations: &[
+            [f32; burn_dragon_universality::ruliad::RULIAD_VERIFIER_REWARD_VECTOR_DIM]
+        ],
+        telemetry: &mut RuliadPolicyRewardTelemetryAccumulator,
+    ) -> Vec<f32> {
+        let mut utilities = vec![0.0f32; scores.len()];
+        if scores.is_empty() || scalarizations.is_empty() {
+            return utilities;
+        }
+        let vectors = scores
+            .iter()
+            .map(burn_dragon_universality::ruliad::ruliad_verifier_reward_vector)
+            .collect::<Vec<_>>();
+        for weights in scalarizations {
+            telemetry.record_vpo_scalarization(weights);
+            let mut best_index = 0usize;
+            let mut best_value = f32::NEG_INFINITY;
+            for (index, vector) in vectors.iter().copied().enumerate() {
+                let value = vector.scalarize(weights);
+                if value > best_value {
+                    best_index = index;
+                    best_value = value;
+                }
+            }
+            if best_value.is_finite() {
+                utilities[best_index] += best_value;
+            }
+        }
+        let scale = scalarizations.len() as f32;
+        for utility in utilities.iter_mut() {
+            *utility /= scale;
+        }
+        utilities
+    }
+
+    fn ruliad_score_has_policy_correctness_signal(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        min_partial_progress_ppm: usize,
+        min_completion_quality_ppm: usize,
+    ) -> bool {
+        if score.completion_quality_ppm < min_completion_quality_ppm {
+            return false;
+        }
+        matches!(
+            score.status,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch
+        ) || (score.status == burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial
+            && score.partial_progress_ppm >= min_partial_progress_ppm)
+    }
+
+    fn ruliad_score_has_rollout_recovery_signal(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        min_partial_progress_ppm: usize,
+        min_completion_quality_ppm: usize,
+    ) -> bool {
+        if score.completion_quality_ppm < min_completion_quality_ppm {
+            return false;
+        }
+        match score.status {
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                score.partial_progress_ppm >= min_partial_progress_ppm
+            }
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => true,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed
+            | burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => true,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+            | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => false,
+        }
+    }
+
+    fn ruliad_score_passes_policy_positive_advantage_gate(
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) -> bool {
+        Self::ruliad_score_has_policy_correctness_signal(
+            score,
+            config.positive_advantage_min_partial_progress_ppm,
+            config.positive_advantage_min_completion_quality_ppm,
+        )
+    }
+
+    fn constrain_ruliad_policy_advantages(
+        scores: &[burn_dragon_universality::ruliad::RuliadReasoningScore],
+        advantages: &mut [f32],
+        config: crate::config::train::RuliadVerifierRewardConfig,
+    ) -> bool {
+        if !config.positive_advantage_requires_correctness {
+            return true;
+        }
+        let mut has_correctness_candidate = false;
+        for score in scores {
+            if Self::ruliad_score_passes_policy_positive_advantage_gate(score, config) {
+                has_correctness_candidate = true;
+                break;
+            }
+        }
+        if !has_correctness_candidate {
+            return false;
+        }
+        for (score, advantage) in scores.iter().zip(advantages.iter_mut()) {
+            if *advantage > 0.0
+                && !Self::ruliad_score_passes_policy_positive_advantage_gate(score, config)
+            {
+                *advantage = 0.0;
+            }
+        }
+        advantages
+            .iter()
+            .any(|advantage| advantage.abs() > f32::EPSILON)
+    }
+
+    fn write_ruliad_policy_telemetry(&self, telemetry: RuliadPolicyRewardTelemetry) {
+        let Some(path) = self.ruliad_policy_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_answer_contract_telemetry(&self, telemetry: RuliadAnswerContractTelemetry) {
+        let Some(path) = self.ruliad_answer_contract_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_answer_contract_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_answer_contract_telemetry(RuliadAnswerContractTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            policy_batch_present: false,
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            prompt_schema_sample_groups: 0,
+            oracle_rows: 0,
+            prompt_schema_rows: 0,
+            contract_tokens: 0,
+            prompt_schema_value_tokens: 0,
+            schema_tokens: 0,
+            schema_start_tokens: 0,
+            value_tokens: 0,
+            other_tokens: 0,
+            premature_close_tokens: 0,
+            answer_contract_weight: weight,
+            premature_close_unlikelihood_weight: self
+                .ruliad_supervision
+                .answer_contract
+                .premature_close_unlikelihood_weight,
+            max_completion_tokens: self
+                .ruliad_supervision
+                .answer_contract
+                .max_completion_tokens,
+            max_rows_per_step: self.ruliad_supervision.answer_contract.max_rows_per_step,
+            prompt_schema_max_rows_per_step: {
+                let contract = self.ruliad_supervision.answer_contract;
+                if contract.prompt_schema_max_rows_per_step == 0 {
+                    contract.max_rows_per_step
+                } else {
+                    contract.prompt_schema_max_rows_per_step
+                }
+            },
+        });
+    }
+
+    fn write_ruliad_structured_contrast_telemetry(
+        &self,
+        telemetry: RuliadStructuredContrastTelemetry,
+    ) {
+        let Some(path) = self.ruliad_structured_contrast_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_structured_contrast_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            oracle_completion_rows: 0,
+            field_negative_completion_rows: 0,
+            template_negative_completion_rows: 0,
+            schema_negative_completion_rows: 0,
+            generated_attractor_negative_completion_rows: 0,
+            contrast_pairs: 0,
+            contrast_discriminative_tokens: 0,
+            structured_contrast_weight: weight,
+            structured_contrast_margin: self
+                .ruliad_supervision
+                .verifier_reward
+                .structured_contrast_margin,
+        });
+    }
+
+    fn write_ruliad_field_binding_contrast_telemetry(
+        &self,
+        telemetry: RuliadFieldBindingContrastTelemetry,
+    ) {
+        let Some(path) = self.ruliad_field_binding_contrast_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_field_binding_contrast_skip(&self, reason: &str, weight: f32) {
+        self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: Some(reason.to_string()),
+            sample_groups: 0,
+            prompt_pairs: 0,
+            contrast_pairs: 0,
+            candidate_pairs: 0,
+            contrast_discriminative_tokens: 0,
+            negative_pool_size: 0,
+            replay_pool_size: 0,
+            replay_contrast_pairs: 0,
+            generated_attractor_pool_size: 0,
+            generated_attractor_negative_pool_size: 0,
+            generated_attractor_contrast_pairs: 0,
+            rank_metric_pairs: 0,
+            rank_metric_tokens: 0,
+            logit_margin_mean: None,
+            positive_token_fraction: None,
+            margin_satisfied_token_fraction: None,
+            exact_pair_rank_fraction: None,
+            exact_pair_margin_fraction: None,
+            field_binding_contrast_weight: weight,
+            field_binding_contrast_margin: self
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_margin,
+            field_binding_contrast_pair_weight: self
+                .ruliad_supervision
+                .verifier_reward
+                .field_binding_contrast_pair_weight,
+        });
+    }
+
+    fn write_ruliad_generated_attractor_telemetry(
+        &self,
+        telemetry: RuliadGeneratedAttractorReplayTelemetry,
+    ) {
+        let Some(path) = self.ruliad_generated_attractor_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn ruliad_generated_attractor_summary(&self) -> RuliadGeneratedAttractorReplaySummary {
+        let config = self.ruliad_supervision.verifier_reward;
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|replay| replay.summary(config.generated_attractor_replay_min_count.max(1)))
+            .unwrap_or_default()
+    }
+
+    fn ruliad_generated_attractor_replay_skip_reason(
+        &self,
+        summary: &RuliadGeneratedAttractorReplaySummary,
+        selected_candidate_rows: usize,
+    ) -> Option<String> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0 || selected_candidate_rows > 0 {
+            return None;
+        }
+        summary
+            .diversity_skip_reason(
+                config
+                    .generated_attractor_replay_min_distinct_answers
+                    .max(1),
+                config.generated_attractor_replay_max_dominant_fraction,
+            )
+            .map(str::to_string)
+    }
+
+    fn write_ruliad_structured_recovery_telemetry(
+        &self,
+        telemetry: RuliadStructuredRecoveryTelemetry,
+    ) {
+        let Some(path) = self.ruliad_structured_recovery_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_ruliad_verifier_rollout_telemetry(
+        &self,
+        telemetry: RuliadVerifierRolloutImitationTelemetry,
+    ) {
+        let Some(path) = self.ruliad_verifier_rollout_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn ruliad_policy_row_from_completion(
+        prompt: &[i64],
+        completion: &[i64],
+    ) -> Option<(Vec<i64>, Vec<i64>, Vec<f32>)> {
+        if completion.is_empty() {
+            return None;
+        }
+        let mut sequence = prompt.to_vec();
+        sequence.extend_from_slice(completion);
+        if sequence.len() < 2 {
+            return None;
+        }
+        let input_len = sequence.len() - 1;
+        let inputs = sequence[..input_len].to_vec();
+        let targets = sequence[1..].to_vec();
+        let mut mask = vec![0.0f32; input_len];
+        let completion_start = prompt.len().saturating_sub(1).min(input_len);
+        for value in mask.iter_mut().skip(completion_start) {
+            *value = 1.0;
+        }
+        Some((inputs, targets, mask))
+    }
+
+    fn ruliad_trim_prompt_for_completion(
+        prompt: &[i64],
+        completion_len: usize,
+        block_size: usize,
+    ) -> Vec<i64> {
+        if prompt.is_empty() {
+            return Vec::new();
+        }
+        let max_prompt_len = block_size.saturating_sub(completion_len.max(1)).max(1);
+        if prompt.len() > max_prompt_len {
+            prompt[prompt.len() - max_prompt_len..].to_vec()
+        } else {
+            prompt.to_vec()
+        }
+    }
+
+    fn ruliad_oracle_completion_tokens(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        sample: &crate::dataset::RuliadPolicySample,
+        completion_budget: usize,
+    ) -> Option<(Vec<i64>, String, bool)> {
+        let answer = sample.item.expected_answer.trim();
+        if answer.is_empty() || completion_budget == 0 {
+            return None;
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut payload_tokens = tokenizer.encode_payload(&full_completion);
+        let truncated = payload_tokens.len() > completion_budget;
+        payload_tokens.truncate(completion_budget);
+        if payload_tokens.is_empty() {
+            return None;
+        }
+        let completion_text = tokenizer.decode_payload(&payload_tokens, true);
+        let completion = payload_tokens
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        Some((completion, completion_text, truncated))
+    }
+
+    fn record_ruliad_generated_attractor(
+        &self,
+        sample: &crate::dataset::RuliadPolicySample,
+        completion_text: &str,
+        score: &burn_dragon_universality::ruliad::RuliadReasoningScore,
+        step_index: usize,
+    ) -> bool {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0 {
+            return false;
+        }
+        let extracted =
+            burn_dragon_universality::ruliad::extract_ruliad_completion(completion_text);
+        let Some(answer) = extracted.answer.map(|answer| answer.trim().to_string()) else {
+            return false;
+        };
+        if answer.is_empty() || answer == sample.item.expected_answer.trim() {
+            return false;
+        }
+        let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+            return false;
+        };
+        let key = RuliadGeneratedAttractorKey {
+            family: sample.item.family.clone(),
+            task_kind: sample.item.task_kind.clone(),
+            contract,
+            answer,
+        };
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|mut replay| {
+                replay.record(
+                    key,
+                    score.status,
+                    step_index,
+                    config.generated_attractor_replay_capacity,
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn ruliad_generated_attractor_candidates_for_sample(
+        &self,
+        sample: &crate::dataset::RuliadPolicySample,
+    ) -> Vec<RuliadGeneratedAttractorEntry> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if config.generated_attractor_replay_capacity == 0
+            || config.generated_attractor_replay_max_candidates == 0
+        {
+            return Vec::new();
+        }
+        let Some(expected_contract) = Self::ruliad_answer_contract(&sample.item.expected_answer)
+        else {
+            return Vec::new();
+        };
+        self.ruliad_generated_attractor_replay
+            .lock()
+            .map(|replay| {
+                replay.candidates_for(
+                    &sample.item.family,
+                    &sample.item.task_kind,
+                    &expected_contract,
+                    sample.item.expected_answer.trim(),
+                    config.generated_attractor_replay_min_count.max(1),
+                    config.generated_attractor_replay_max_candidates,
+                    config
+                        .generated_attractor_replay_min_distinct_answers
+                        .max(1),
+                    config.generated_attractor_replay_max_dominant_fraction,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn ruliad_structured_negative_answers(answer: &str, count: usize) -> Vec<String> {
+        Self::ruliad_structured_negative_answers_with_templates(answer, count, 0)
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect()
+    }
+
+    fn ruliad_structured_negative_answers_with_templates(
+        answer: &str,
+        mutation_count: usize,
+        template_count: usize,
+    ) -> Vec<(String, RuliadStructuredNegativeKind)> {
+        let answer = answer.trim();
+        if answer.is_empty() || (mutation_count == 0 && template_count == 0) {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return (0..mutation_count.max(1))
+                .map(|_| {
+                    (
+                        format!("{answer}_wrong"),
+                        RuliadStructuredNegativeKind::FieldMutation,
+                    )
+                })
+                .take(mutation_count.max(template_count))
+                .collect();
+        }
+
+        let mut negatives = Vec::with_capacity(mutation_count + template_count);
+        for template in Self::ruliad_template_collapse_negative_answers(answer, &fields) {
+            if negatives.len() >= template_count {
+                break;
+            }
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                template,
+                RuliadStructuredNegativeKind::TemplateCollapse,
+            );
+        }
+
+        for index in 0..mutation_count {
+            let mutate_index = index % fields.len();
+            let mut candidate = fields.clone();
+            let mutated = Self::mutate_ruliad_answer_value(&candidate[mutate_index].1, index + 1);
+            candidate[mutate_index].1 = mutated;
+            let text = candidate
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                text,
+                RuliadStructuredNegativeKind::FieldMutation,
+            );
+        }
+        negatives
+    }
+
+    fn ruliad_structured_negative_answers_with_schema(
+        answer: &str,
+        mutation_count: usize,
+        template_count: usize,
+        schema_count: usize,
+    ) -> Vec<(String, RuliadStructuredNegativeKind)> {
+        let mut negatives = Self::ruliad_structured_negative_answers_with_templates(
+            answer,
+            mutation_count,
+            template_count,
+        );
+        if schema_count == 0 {
+            return negatives;
+        }
+        negatives.reserve(schema_count);
+        for schema_negative in Self::ruliad_schema_collapse_negative_answers(answer)
+            .into_iter()
+            .take(schema_count)
+        {
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                schema_negative,
+                RuliadStructuredNegativeKind::SchemaCollapse,
+            );
+        }
+        negatives
+    }
+
+    fn push_ruliad_negative_answer(
+        negatives: &mut Vec<(String, RuliadStructuredNegativeKind)>,
+        answer: &str,
+        candidate: String,
+        kind: RuliadStructuredNegativeKind,
+    ) {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate == answer {
+            return;
+        }
+        if negatives
+            .iter()
+            .any(|(existing, _existing_kind)| existing == candidate)
+        {
+            return;
+        }
+        negatives.push((candidate.to_string(), kind));
+    }
+
+    fn ruliad_template_collapse_negative_answers(
+        answer: &str,
+        fields: &[(String, String)],
+    ) -> Vec<String> {
+        let has_key = |key: &str| fields.iter().any(|(candidate, _)| candidate == key);
+        let mut templates = Vec::<String>::new();
+        let mut push = |candidate: &str| {
+            if candidate != answer && !templates.iter().any(|existing| existing == candidate) {
+                templates.push(candidate.to_string());
+            }
+        };
+
+        if has_key("ok") && has_key("l") && has_key("r") {
+            push("ok=1;l=5;r=5");
+            push("ok=1;l=1;r=1");
+            push("ok=0;l=0;r=0");
+            push("ok=1;l=0;r=0");
+        } else if has_key("ok") {
+            push("ok=0");
+            push("ok=1");
+        }
+
+        if has_key("acc") {
+            push("acc=0");
+            push("acc=1");
+        }
+
+        if has_key("xlen") && has_key("xalpha") && has_key("xcounts") && has_key("xedge") {
+            push("xlen=13;xalpha=abc;nfcounts=1,1,0;nfedge=ba");
+            push("xlen=1;xalpha=01;xcounts=1,1;xedge=00");
+            push("xlen=10;xalpha=01;xcounts=10,10;xedge=00");
+            push("xlen=21;xalpha=01;xcounts=10,11;xedge=00");
+            push("xlen=64;xalpha=01;xcounts=32,32;xedge=00");
+        }
+
+        if has_key("nflen") && has_key("nfalpha") && has_key("nfcounts") && has_key("nfedge") {
+            push("nflen=5;nfalpha=abc;nfcounts=1,1,0;nfedge=ba");
+            push("nflen=1;nfalpha=01;nfcounts=1,1;nfedge=00");
+            push("nflen=10;nfalpha=01;nfcounts=10,10;nfedge=00");
+            push("nflen=21;nfalpha=01;nfcounts=10,11;nfedge=00");
+            push("nflen=64;nfalpha=01;nfcounts=32,32;nfedge=00");
+        }
+
+        templates
+    }
+
+    fn ruliad_template_collapse_negative_answers_from_answer(answer: &str) -> Vec<String> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return Vec::new();
+        }
+        Self::ruliad_template_collapse_negative_answers(answer, &fields)
+    }
+
+    fn ruliad_schema_collapse_negative_answers(answer: &str) -> Vec<String> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Vec::new();
+        }
+        let fields = answer
+            .split(';')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                Some((key.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        let keys = fields
+            .iter()
+            .map(|(key, _value)| key.as_str())
+            .collect::<Vec<_>>();
+        let values = fields
+            .iter()
+            .map(|(_key, value)| value.as_str())
+            .collect::<Vec<_>>();
+        let mut negatives = Vec::<String>::new();
+        let mut push = |candidate: String| {
+            if candidate != answer && !negatives.iter().any(|existing| existing == &candidate) {
+                negatives.push(candidate);
+            }
+        };
+        if fields.len() > 1 {
+            push(
+                fields[..fields.len() - 1]
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            );
+            push(format!("{}={}", fields[0].0, fields[0].1));
+        }
+        if keys == ["xlen", "xalpha", "xcounts", "xedge"] && values.len() == 4 {
+            push(format!(
+                "xlen={};nfalpha={};nfcounts={};xedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+            push(format!(
+                "nflen={};nfalpha={};nfcounts={};nfedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+        } else if keys == ["nflen", "nfalpha", "nfcounts", "nfedge"] && values.len() == 4 {
+            push(format!(
+                "nflen={};xalpha={};xcounts={};nfedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+            push(format!(
+                "xlen={};xalpha={};xcounts={};xedge={}",
+                values[0], values[1], values[2], values[3]
+            ));
+        } else if keys == ["ok", "l", "r"] && values.len() == 3 {
+            push(format!("ok={}", values[0]));
+        } else if keys == ["ok"] && values.len() == 1 {
+            push(format!("ok={};l=1;r=1", values[0]));
+        }
+        for prototype in Self::ruliad_cross_contract_prototype_negatives(&keys) {
+            push(prototype);
+        }
+        negatives
+    }
+
+    fn ruliad_cross_contract_prototype_negatives(keys: &[&str]) -> Vec<String> {
+        let contract = keys.join(",");
+        let mut prototypes = match contract.as_str() {
+            "xlen,xalpha,xcounts,xedge" | "nflen,nfalpha,nfcounts,nfedge" => {
+                vec!["ok=1;l=1;r=1", "ok=0;l=0;r=0", "acc=1", "acc=0"]
+            }
+            "ok,l,r" | "ok" => vec![
+                "xlen=1;xalpha=01;xcounts=1,0;xedge=00",
+                "nflen=1;nfalpha=ABC;nfcounts=1,0,0;nfedge=AA",
+                "acc=1",
+                "acc=0",
+            ],
+            "acc" => vec![
+                "ok=1;l=1;r=1",
+                "xlen=1;xalpha=01;xcounts=1,0;xedge=00",
+                "nflen=1;nfalpha=ABC;nfcounts=1,0,0;nfedge=AA",
+            ],
+            _ => Vec::new(),
+        };
+        prototypes.drain(..).map(str::to_string).collect::<Vec<_>>()
+    }
+
+    fn mutate_ruliad_answer_value(value: &str, delta: usize) -> String {
+        let delta = delta.max(1) as u64;
+        if value == "0" {
+            return "1".to_string();
+        }
+        if value == "1" {
+            return "0".to_string();
+        }
+        if value.len() > 1 && value.bytes().all(|byte| byte == b'0' || byte == b'1') {
+            let mut bytes = value.as_bytes().to_vec();
+            let index = delta as usize % bytes.len();
+            bytes[index] = if bytes[index] == b'0' { b'1' } else { b'0' };
+            return String::from_utf8(bytes).unwrap_or_else(|_| value.to_string());
+        }
+
+        let mut output = String::with_capacity(value.len() + 4);
+        let bytes = value.as_bytes();
+        let mut index = 0usize;
+        let mut mutated_any = false;
+        while index < bytes.len() {
+            if bytes[index].is_ascii_digit() {
+                let start = index;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+                let text = &value[start..index];
+                let width = text.len();
+                let modulus = 10u64.saturating_pow(width.min(18) as u32).max(2);
+                let parsed = text.parse::<u64>().unwrap_or(0);
+                let mut next = (parsed + delta) % modulus;
+                if next == parsed {
+                    next = (next + 1) % modulus;
+                }
+                output.push_str(&format!("{next:0width$}"));
+                mutated_any = true;
+            } else {
+                output.push(bytes[index] as char);
+                index += 1;
+            }
+        }
+        if mutated_any {
+            output
+        } else {
+            format!("{value}_wrong")
+        }
+    }
+
+    fn ruliad_completion_tokens_from_answer(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_budget: usize,
+    ) -> Option<(Vec<i64>, String)> {
+        if answer.trim().is_empty() || completion_budget == 0 {
+            return None;
+        }
+        let full_completion = format!("{}\n[/R2]", answer.trim());
+        let mut payload_tokens = tokenizer.encode_payload(&full_completion);
+        payload_tokens.truncate(completion_budget);
+        if payload_tokens.is_empty() {
+            return None;
+        }
+        let completion_text = tokenizer.decode_payload(&payload_tokens, true);
+        let completion = payload_tokens
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        Some((completion, completion_text))
+    }
+
+    fn ruliad_answer_value_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut value_start = field_start + eq_offset + 1;
+                while value_start < field_end
+                    && answer.as_bytes()[value_start].is_ascii_whitespace()
+                {
+                    value_start += 1;
+                }
+                let mut value_end = field_end;
+                while value_end > value_start
+                    && answer.as_bytes()[value_end - 1].is_ascii_whitespace()
+                {
+                    value_end -= 1;
+                }
+                if value_start < value_end {
+                    let prefix_tokens = tokenizer
+                        .encode_payload(&full_completion[..value_start])
+                        .len();
+                    let value_tokens = tokenizer
+                        .encode_payload(&full_completion[value_start..value_end])
+                        .len();
+                    for index in prefix_tokens..prefix_tokens.saturating_add(value_tokens) {
+                        if let Some(slot) = mask.get_mut(index) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_key_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut key_start = field_start;
+                while key_start < field_start + eq_offset
+                    && answer.as_bytes()[key_start].is_ascii_whitespace()
+                {
+                    key_start += 1;
+                }
+                let mut key_end = field_start + eq_offset;
+                while key_end > key_start && answer.as_bytes()[key_end - 1].is_ascii_whitespace() {
+                    key_end -= 1;
+                }
+                if key_start < key_end {
+                    let prefix_tokens = tokenizer
+                        .encode_payload(&full_completion[..key_start])
+                        .len();
+                    let key_tokens = tokenizer
+                        .encode_payload(&full_completion[key_start..key_end])
+                        .len();
+                    for index in prefix_tokens..prefix_tokens.saturating_add(key_tokens) {
+                        if let Some(slot) = mask.get_mut(index) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_schema_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        for (byte_index, byte) in bytes.iter().enumerate() {
+            let active = byte.is_ascii_alphabetic() || *byte == b'=' || *byte == b';';
+            if !active {
+                continue;
+            }
+            let prefix_tokens = tokenizer
+                .encode_payload(&full_completion[..byte_index])
+                .len();
+            let token_count = tokenizer
+                .encode_payload(&full_completion[byte_index..byte_index + 1])
+                .len();
+            for index in prefix_tokens..prefix_tokens.saturating_add(token_count) {
+                if let Some(slot) = mask.get_mut(index) {
+                    *slot = true;
+                }
+            }
+        }
+        mask
+    }
+
+    fn ruliad_answer_schema_start_completion_mask(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        answer: &str,
+        completion_len: usize,
+    ) -> Vec<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || completion_len == 0 {
+            return vec![false; completion_len];
+        }
+        let full_completion = format!("{answer}\n[/R2]");
+        let mut mask = vec![false; completion_len];
+        let bytes = answer.as_bytes();
+        let mut field_start = 0usize;
+        while field_start < answer.len() {
+            let field_end = bytes[field_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| field_start + offset)
+                .unwrap_or(answer.len());
+            let field = &answer[field_start..field_end];
+            if let Some(eq_offset) = field.find('=') {
+                let mut key_start = field_start;
+                while key_start < field_start + eq_offset
+                    && answer.as_bytes()[key_start].is_ascii_whitespace()
+                {
+                    key_start += 1;
+                }
+                if key_start < field_start + eq_offset {
+                    let first = answer.as_bytes()[key_start];
+                    if first.is_ascii_alphabetic() || first == b'_' {
+                        let prefix_tokens = tokenizer
+                            .encode_payload(&full_completion[..key_start])
+                            .len();
+                        let token_count = tokenizer
+                            .encode_payload(&full_completion[key_start..key_start + 1])
+                            .len();
+                        for index in prefix_tokens..prefix_tokens.saturating_add(token_count) {
+                            if let Some(slot) = mask.get_mut(index) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+            }
+            field_start = field_end.saturating_add(1);
+        }
+        mask
+    }
+
+    fn ruliad_answer_contract(answer: &str) -> Option<String> {
+        let mut keys = Vec::<String>::new();
+        for part in answer.trim().split(';') {
+            let (key, _value) = part.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            keys.push(key.to_string());
+        }
+        (!keys.is_empty()).then(|| keys.join(";"))
+    }
+
+    fn ruliad_answer_fields(answer: &str) -> Option<Vec<(String, String)>> {
+        let mut fields = Vec::<(String, String)>::new();
+        for part in answer.trim().split(';') {
+            let (key, value) = part.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            fields.push((key.to_string(), value.to_string()));
+        }
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    fn ruliad_prompt_schema_value_completion_rows(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        base_prompt: &[i64],
+        answer: &str,
+        completion_budget: usize,
+        block_size: usize,
+        max_rows: usize,
+    ) -> Vec<(Vec<i64>, Vec<i64>, Vec<f32>, usize)> {
+        if base_prompt.is_empty() || completion_budget == 0 || block_size < 4 || max_rows == 0 {
+            return Vec::new();
+        }
+        let Some(fields) = Self::ruliad_answer_fields(answer) else {
+            return Vec::new();
+        };
+        let row_completion_budget = completion_budget.min(block_size.saturating_sub(2).max(1));
+        let mut rows = Vec::<(Vec<i64>, Vec<i64>, Vec<f32>, usize)>::new();
+        let mut prior = String::new();
+        for (index, (key, value)) in fields.iter().enumerate() {
+            if rows.len() >= max_rows {
+                break;
+            }
+            let schema_prefix = format!("{prior}{key}=");
+            let close = if index + 1 == fields.len() {
+                "\n[/R2]"
+            } else {
+                ";"
+            };
+            let mut completion_tokens = tokenizer.encode_payload(&format!("{value}{close}"));
+            completion_tokens.truncate(row_completion_budget);
+            if completion_tokens.is_empty() {
+                prior.push_str(key);
+                prior.push('=');
+                prior.push_str(value);
+                prior.push(';');
+                continue;
+            }
+            let mut schema_prefix_tokens = tokenizer.encode_payload(&schema_prefix);
+            let prefix_budget = block_size
+                .saturating_sub(completion_tokens.len())
+                .saturating_sub(1);
+            if prefix_budget == 0 {
+                prior.push_str(key);
+                prior.push('=');
+                prior.push_str(value);
+                prior.push(';');
+                continue;
+            }
+            if schema_prefix_tokens.len() > prefix_budget {
+                schema_prefix_tokens =
+                    schema_prefix_tokens[schema_prefix_tokens.len() - prefix_budget..].to_vec();
+            }
+            let prompt_budget = block_size
+                .saturating_sub(schema_prefix_tokens.len())
+                .saturating_sub(completion_tokens.len())
+                .max(1);
+            let mut prompt = if base_prompt.len() > prompt_budget {
+                base_prompt[base_prompt.len() - prompt_budget..].to_vec()
+            } else {
+                base_prompt.to_vec()
+            };
+            prompt.extend(schema_prefix_tokens.into_iter().map(i64::from));
+            let completion = completion_tokens
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            if let Some((inputs, targets, mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &completion)
+            {
+                let active_tokens = mask.iter().filter(|value| **value > f32::EPSILON).count();
+                if active_tokens > 0 {
+                    rows.push((inputs, targets, mask, active_tokens));
+                }
+            }
+            prior.push_str(key);
+            prior.push('=');
+            prior.push_str(value);
+            prior.push(';');
+        }
+        rows
+    }
+
+    fn ruliad_field_binding_rank_stats(
+        logit_margin: Tensor<B, 2>,
+        mask_values: &[i64],
+        row_count: usize,
+        max_len: usize,
+        required_margin: f64,
+    ) -> RuliadFieldBindingRankStats {
+        let Ok(margin_values) = logit_margin.to_data().convert::<f32>().into_vec::<f32>() else {
+            return RuliadFieldBindingRankStats::default();
+        };
+        if margin_values.len() != mask_values.len() || mask_values.len() != row_count * max_len {
+            return RuliadFieldBindingRankStats::default();
+        }
+
+        let mut token_count = 0usize;
+        let mut positive_token_count = 0usize;
+        let mut margin_token_count = 0usize;
+        let mut margin_sum = 0.0f64;
+        let mut pair_count = 0usize;
+        let mut exact_pair_rank_count = 0usize;
+        let mut exact_pair_margin_count = 0usize;
+
+        for row_index in 0..row_count {
+            let row_offset = row_index * max_len;
+            let mut row_tokens = 0usize;
+            let mut row_positive = 0usize;
+            let mut row_margin = 0usize;
+            for column in 0..max_len {
+                let index = row_offset + column;
+                if mask_values[index] == 0 {
+                    continue;
+                }
+                let margin = margin_values[index] as f64;
+                if !margin.is_finite() {
+                    continue;
+                }
+                row_tokens = row_tokens.saturating_add(1);
+                token_count = token_count.saturating_add(1);
+                margin_sum += margin;
+                if margin > 0.0 {
+                    row_positive = row_positive.saturating_add(1);
+                    positive_token_count = positive_token_count.saturating_add(1);
+                }
+                if margin >= required_margin {
+                    row_margin = row_margin.saturating_add(1);
+                    margin_token_count = margin_token_count.saturating_add(1);
+                }
+            }
+            if row_tokens > 0 {
+                pair_count = pair_count.saturating_add(1);
+                if row_positive == row_tokens {
+                    exact_pair_rank_count = exact_pair_rank_count.saturating_add(1);
+                }
+                if row_margin == row_tokens {
+                    exact_pair_margin_count = exact_pair_margin_count.saturating_add(1);
+                }
+            }
+        }
+
+        let token_denominator = token_count as f64;
+        let pair_denominator = pair_count as f64;
+        RuliadFieldBindingRankStats {
+            pairs: pair_count,
+            tokens: token_count,
+            logit_margin_mean: (token_count > 0).then_some(margin_sum / token_denominator),
+            positive_token_fraction: (token_count > 0)
+                .then_some(positive_token_count as f64 / token_denominator),
+            margin_satisfied_token_fraction: (token_count > 0)
+                .then_some(margin_token_count as f64 / token_denominator),
+            exact_pair_rank_fraction: (pair_count > 0)
+                .then_some(exact_pair_rank_count as f64 / pair_denominator),
+            exact_pair_margin_fraction: (pair_count > 0)
+                .then_some(exact_pair_margin_count as f64 / pair_denominator),
+        }
+    }
+
+    fn ruliad_field_binding_contrast_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_field_binding_contrast_weight();
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+
+        #[derive(Clone)]
+        struct EligibleSample {
+            source_index: usize,
+            prompt: Vec<i64>,
+            answer: String,
+            family: String,
+            task_kind: String,
+            contract: String,
+            oracle_completion: Vec<i64>,
+            value_mask: Vec<bool>,
+            schema_mask: Vec<bool>,
+        }
+
+        #[derive(Clone)]
+        struct NegativeSample {
+            current_source_index: Option<usize>,
+            answer: String,
+            family: String,
+            task_kind: String,
+            contract: String,
+            oracle_completion: Vec<i64>,
+            from_replay: bool,
+            from_generated_attractor: bool,
+            schema_negative: bool,
+        }
+
+        #[derive(Clone)]
+        struct ContrastCandidate {
+            oracle_index: usize,
+            negative_index: usize,
+            negative_source_index: Option<usize>,
+            negative_completion: Vec<i64>,
+            discriminative_tokens: usize,
+            from_replay: bool,
+            from_generated_attractor: bool,
+            schema_negative: bool,
+        }
+
+        #[derive(Clone)]
+        struct ContrastRow {
+            inputs: Vec<i64>,
+            oracle_targets: Vec<i64>,
+            negative_targets: Vec<i64>,
+            mask: Vec<i64>,
+            discriminative_tokens: usize,
+            source_index: usize,
+            negative_source_index: Option<usize>,
+            from_replay: bool,
+            from_generated_attractor: bool,
+        }
+
+        let mut eligible = Vec::<EligibleSample>::new();
+        for (source_index, sample) in policy_batch.samples.iter().enumerate() {
+            let answer = sample.item.expected_answer.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            let Some(contract) = Self::ruliad_answer_contract(answer) else {
+                continue;
+            };
+            let prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                answer,
+                oracle_completion.len(),
+            );
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                answer,
+                oracle_completion.len(),
+            );
+            if !value_mask.iter().any(|active| *active) && !schema_mask.iter().any(|active| *active)
+            {
+                continue;
+            }
+            eligible.push(EligibleSample {
+                source_index,
+                prompt,
+                answer: answer.to_string(),
+                family: sample.item.family.clone(),
+                task_kind: sample.item.task_kind.clone(),
+                contract,
+                oracle_completion,
+                value_mask,
+                schema_mask,
+            });
+        }
+
+        let replay_capacity = config.field_binding_contrast_replay_capacity;
+        let replay_snapshot = if replay_capacity > 0 {
+            self.ruliad_field_binding_replay
+                .lock()
+                .map(|replay| replay.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let replay_pool_size = replay_snapshot.len();
+        let mut negative_pool = eligible
+            .iter()
+            .map(|sample| NegativeSample {
+                current_source_index: Some(sample.source_index),
+                answer: sample.answer.clone(),
+                family: sample.family.clone(),
+                task_kind: sample.task_kind.clone(),
+                contract: sample.contract.clone(),
+                oracle_completion: sample.oracle_completion.clone(),
+                from_replay: false,
+                from_generated_attractor: false,
+                schema_negative: false,
+            })
+            .collect::<Vec<_>>();
+        negative_pool.extend(replay_snapshot.into_iter().map(|sample| NegativeSample {
+            current_source_index: None,
+            answer: sample.answer,
+            family: sample.family,
+            task_kind: sample.task_kind,
+            contract: sample.contract,
+            oracle_completion: sample.oracle_completion,
+            from_replay: true,
+            from_generated_attractor: false,
+            schema_negative: false,
+        }));
+        let generated_attractor_snapshot = eligible
+            .iter()
+            .flat_map(|sample| {
+                self.ruliad_generated_attractor_candidates_for_sample(
+                    &policy_batch.samples[sample.source_index],
+                )
+            })
+            .collect::<Vec<_>>();
+        let generated_attractor_pool_size = generated_attractor_snapshot.len();
+        let mut seen_generated_attractors = HashSet::<(String, String, String, String)>::new();
+        for entry in generated_attractor_snapshot {
+            let key = (
+                entry.key.answer.clone(),
+                entry.key.family.clone(),
+                entry.key.task_kind.clone(),
+                entry.key.contract.clone(),
+            );
+            if !seen_generated_attractors.insert(key) {
+                continue;
+            }
+            let Some((oracle_completion, _completion_text)) =
+                Self::ruliad_completion_tokens_from_answer(
+                    &tokenizer,
+                    &entry.key.answer,
+                    completion_budget,
+                )
+            else {
+                continue;
+            };
+            negative_pool.push(NegativeSample {
+                current_source_index: None,
+                answer: entry.key.answer,
+                family: entry.key.family,
+                task_kind: entry.key.task_kind,
+                contract: entry.key.contract,
+                oracle_completion,
+                from_replay: false,
+                from_generated_attractor: true,
+                schema_negative: false,
+            });
+        }
+        let mut seen_template_negatives = HashSet::<(String, String, String, String)>::new();
+        for sample in eligible.iter() {
+            for answer in
+                Self::ruliad_template_collapse_negative_answers_from_answer(&sample.answer)
+            {
+                if answer == sample.answer {
+                    continue;
+                }
+                let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+                    continue;
+                };
+                if contract != sample.contract {
+                    continue;
+                }
+                let key = (
+                    answer.clone(),
+                    sample.family.clone(),
+                    sample.task_kind.clone(),
+                    contract.clone(),
+                );
+                if !seen_template_negatives.insert(key) {
+                    continue;
+                }
+                let Some((oracle_completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                negative_pool.push(NegativeSample {
+                    current_source_index: None,
+                    answer,
+                    family: sample.family.clone(),
+                    task_kind: sample.task_kind.clone(),
+                    contract,
+                    oracle_completion,
+                    from_replay: false,
+                    from_generated_attractor: false,
+                    schema_negative: false,
+                });
+            }
+            for answer in Self::ruliad_schema_collapse_negative_answers(&sample.answer) {
+                if answer == sample.answer {
+                    continue;
+                }
+                let Some(contract) = Self::ruliad_answer_contract(&answer) else {
+                    continue;
+                };
+                let key = (
+                    answer.clone(),
+                    sample.family.clone(),
+                    sample.task_kind.clone(),
+                    contract.clone(),
+                );
+                if !seen_template_negatives.insert(key) {
+                    continue;
+                }
+                let Some((oracle_completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                negative_pool.push(NegativeSample {
+                    current_source_index: None,
+                    answer,
+                    family: sample.family.clone(),
+                    task_kind: sample.task_kind.clone(),
+                    contract,
+                    oracle_completion,
+                    from_replay: false,
+                    from_generated_attractor: false,
+                    schema_negative: true,
+                });
+            }
+        }
+        let generated_attractor_negative_pool_size = negative_pool
+            .iter()
+            .filter(|negative| negative.from_generated_attractor)
+            .count();
+        let negative_pool_size = negative_pool.len();
+
+        let max_pairs = config.field_binding_contrast_max_pairs.max(1);
+        let mut candidates = Vec::<ContrastCandidate>::new();
+        for (oracle_index, oracle) in eligible.iter().enumerate() {
+            for (negative_index, negative) in negative_pool.iter().enumerate() {
+                if negative.current_source_index == Some(oracle.source_index)
+                    || oracle.answer == negative.answer
+                    || oracle.family != negative.family
+                    || oracle.task_kind != negative.task_kind
+                    || (!negative.schema_negative && oracle.contract != negative.contract)
+                {
+                    continue;
+                }
+                let diff_len = oracle
+                    .oracle_completion
+                    .len()
+                    .min(negative.oracle_completion.len());
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let active = if negative.schema_negative {
+                        oracle
+                            .schema_mask
+                            .get(completion_index)
+                            .copied()
+                            .unwrap_or(false)
+                    } else {
+                        oracle
+                            .value_mask
+                            .get(completion_index)
+                            .copied()
+                            .unwrap_or(false)
+                    };
+                    if active
+                        && oracle.oracle_completion[completion_index]
+                            != negative.oracle_completion[completion_index]
+                    {
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                candidates.push(ContrastCandidate {
+                    oracle_index,
+                    negative_index,
+                    negative_source_index: negative.current_source_index,
+                    negative_completion: negative.oracle_completion.clone(),
+                    discriminative_tokens,
+                    from_replay: negative.from_replay,
+                    from_generated_attractor: negative.from_generated_attractor,
+                    schema_negative: negative.schema_negative,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .discriminative_tokens
+                .cmp(&left.discriminative_tokens)
+                .then_with(|| left.from_replay.cmp(&right.from_replay))
+                .then_with(|| left.oracle_index.cmp(&right.oracle_index))
+                .then_with(|| left.negative_index.cmp(&right.negative_index))
+        });
+        let candidate_pairs = candidates.len();
+        let mut rows = Vec::<ContrastRow>::new();
+        for candidate in candidates.into_iter().take(max_pairs) {
+            let oracle = &eligible[candidate.oracle_index];
+            let prompt = Self::ruliad_trim_prompt_for_completion(
+                &oracle.prompt,
+                oracle
+                    .oracle_completion
+                    .len()
+                    .max(candidate.negative_completion.len()),
+                block_size,
+            );
+            let Some((inputs, oracle_targets, _oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle.oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_targets.len());
+            let diff_len = oracle
+                .oracle_completion
+                .len()
+                .min(candidate.negative_completion.len());
+            let mut negative_targets = oracle_targets.clone();
+            let mut mask = vec![0i64; oracle_targets.len()];
+            let mut discriminative_tokens = 0usize;
+            for completion_index in 0..diff_len {
+                let target_index = completion_start.saturating_add(completion_index);
+                let active = if candidate.schema_negative {
+                    oracle
+                        .schema_mask
+                        .get(completion_index)
+                        .copied()
+                        .unwrap_or(false)
+                } else {
+                    oracle
+                        .value_mask
+                        .get(completion_index)
+                        .copied()
+                        .unwrap_or(false)
+                };
+                if active
+                    && target_index < negative_targets.len()
+                    && oracle.oracle_completion[completion_index]
+                        != candidate.negative_completion[completion_index]
+                {
+                    negative_targets[target_index] =
+                        candidate.negative_completion[completion_index];
+                    mask[target_index] = 1;
+                    discriminative_tokens = discriminative_tokens.saturating_add(1);
+                }
+            }
+            if discriminative_tokens == 0 {
+                continue;
+            }
+            rows.push(ContrastRow {
+                inputs,
+                oracle_targets,
+                negative_targets,
+                mask,
+                discriminative_tokens,
+                source_index: oracle.source_index,
+                negative_source_index: candidate.negative_source_index,
+                from_replay: candidate.from_replay,
+                from_generated_attractor: candidate.from_generated_attractor,
+            });
+        }
+
+        if replay_capacity > 0 && !eligible.is_empty() {
+            if let Ok(mut replay) = self.ruliad_field_binding_replay.lock() {
+                for sample in eligible.iter() {
+                    replay.push_back(RuliadFieldBindingReplaySample {
+                        answer: sample.answer.clone(),
+                        family: sample.family.clone(),
+                        task_kind: sample.task_kind.clone(),
+                        contract: sample.contract.clone(),
+                        oracle_completion: sample.oracle_completion.clone(),
+                    });
+                }
+                while replay.len() > replay_capacity {
+                    replay.pop_front();
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            let replay_summary = self.ruliad_generated_attractor_summary();
+            self.write_ruliad_generated_attractor_telemetry(
+                RuliadGeneratedAttractorReplayTelemetry {
+                    version: 1,
+                    step_index,
+                    source: "field_binding".to_string(),
+                    skip_reason: self
+                        .ruliad_generated_attractor_replay_skip_reason(
+                            &replay_summary,
+                            generated_attractor_negative_pool_size,
+                        )
+                        .or_else(|| Some("no_counterfactual_pairs".to_string())),
+                    observed_completion_rows: 0,
+                    recorded_attractor_rows: 0,
+                    selected_candidate_rows: generated_attractor_negative_pool_size,
+                    selected_field_binding_pairs: 0,
+                    replay_pool_size: replay_summary.pool_size,
+                    active_attractor_count: replay_summary.active_count,
+                    active_observation_count: replay_summary.active_observation_count,
+                    distinct_answer_count: replay_summary.distinct_answers,
+                    dominant_answer_count: replay_summary.dominant_count,
+                    dominant_answer_fraction: replay_summary.dominant_fraction(),
+                    min_count: config.generated_attractor_replay_min_count.max(1),
+                    max_candidates: config.generated_attractor_replay_max_candidates,
+                    min_distinct_answers: config
+                        .generated_attractor_replay_min_distinct_answers
+                        .max(1),
+                    max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+                },
+            );
+            self.write_ruliad_field_binding_contrast_telemetry(
+                RuliadFieldBindingContrastTelemetry {
+                    version: 1,
+                    step_index,
+                    skip_reason: Some("no_counterfactual_pairs".to_string()),
+                    sample_groups: eligible.len(),
+                    prompt_pairs: 0,
+                    contrast_pairs: 0,
+                    candidate_pairs,
+                    contrast_discriminative_tokens: 0,
+                    negative_pool_size,
+                    replay_pool_size,
+                    replay_contrast_pairs: 0,
+                    generated_attractor_pool_size,
+                    generated_attractor_negative_pool_size,
+                    generated_attractor_contrast_pairs: 0,
+                    rank_metric_pairs: 0,
+                    rank_metric_tokens: 0,
+                    logit_margin_mean: None,
+                    positive_token_fraction: None,
+                    margin_satisfied_token_fraction: None,
+                    exact_pair_rank_fraction: None,
+                    exact_pair_margin_fraction: None,
+                    field_binding_contrast_weight: weight,
+                    field_binding_contrast_margin: config.field_binding_contrast_margin,
+                    field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
+                },
+            );
+            return None;
+        }
+
+        let mut participating_samples = HashSet::<usize>::new();
+        for row in rows.iter() {
+            participating_samples.insert(row.source_index);
+            if let Some(negative_source_index) = row.negative_source_index {
+                participating_samples.insert(negative_source_index);
+            }
+        }
+        let replay_contrast_pairs = rows.iter().filter(|row| row.from_replay).count();
+        let generated_attractor_contrast_pairs = rows
+            .iter()
+            .filter(|row| row.from_generated_attractor)
+            .count();
+        let contrast_discriminative_tokens = rows
+            .iter()
+            .map(|row| row.discriminative_tokens)
+            .sum::<usize>();
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut oracle_target_values = vec![0i64; row_count * max_len];
+        let mut negative_target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            oracle_target_values[offset..offset + len].copy_from_slice(&row.oracle_targets[..len]);
+            negative_target_values[offset..offset + len]
+                .copy_from_slice(&row.negative_targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let oracle_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(oracle_target_values, [row_count, max_len]),
+            device,
+        );
+        let negative_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(negative_target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values.clone(), [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let oracle_logits = selected_token_logits(logits.clone(), oracle_targets);
+        let negative_logits = selected_token_logits(logits, negative_targets);
+        let logit_margin = oracle_logits.clone() - negative_logits.clone();
+        let contrast_margin = config.field_binding_contrast_margin.max(0.0);
+        let should_collect_rank_metric = config.field_binding_contrast_rank_metric_every_steps > 0
+            && step_index % config.field_binding_contrast_rank_metric_every_steps == 0;
+        let rank_stats = should_collect_rank_metric.then(|| {
+            Self::ruliad_field_binding_rank_stats(
+                logit_margin.clone(),
+                &mask_values,
+                row_count,
+                max_len,
+                contrast_margin as f64,
+            )
+        });
+        self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
+            version: 1,
+            step_index,
+            skip_reason: None,
+            sample_groups: participating_samples.len(),
+            prompt_pairs: row_count,
+            contrast_pairs: row_count,
+            candidate_pairs,
+            contrast_discriminative_tokens,
+            negative_pool_size,
+            replay_pool_size,
+            replay_contrast_pairs,
+            generated_attractor_pool_size,
+            generated_attractor_negative_pool_size,
+            generated_attractor_contrast_pairs,
+            rank_metric_pairs: rank_stats.as_ref().map(|stats| stats.pairs).unwrap_or(0),
+            rank_metric_tokens: rank_stats.as_ref().map(|stats| stats.tokens).unwrap_or(0),
+            logit_margin_mean: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.logit_margin_mean),
+            positive_token_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.positive_token_fraction),
+            margin_satisfied_token_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.margin_satisfied_token_fraction),
+            exact_pair_rank_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.exact_pair_rank_fraction),
+            exact_pair_margin_fraction: rank_stats
+                .as_ref()
+                .and_then(|stats| stats.exact_pair_margin_fraction),
+            field_binding_contrast_weight: weight,
+            field_binding_contrast_margin: config.field_binding_contrast_margin,
+            field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
+        });
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index,
+            source: "field_binding".to_string(),
+            skip_reason: self.ruliad_generated_attractor_replay_skip_reason(
+                &replay_summary,
+                generated_attractor_negative_pool_size,
+            ),
+            observed_completion_rows: 0,
+            recorded_attractor_rows: 0,
+            selected_candidate_rows: generated_attractor_negative_pool_size,
+            selected_field_binding_pairs: generated_attractor_contrast_pairs,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
+        let token_loss = masked_token_mean(
+            activation::softplus(
+                negative_logits.clone() - oracle_logits.clone() + contrast_margin,
+                1.0,
+            ),
+            Some(mask.clone()),
+        );
+        let pair_weight = config.field_binding_contrast_pair_weight.max(0.0);
+        let loss = if pair_weight > f32::EPSILON {
+            let mask = mask.float();
+            let active_per_pair = mask.clone().sum_dim(1).reshape([row_count]).clamp_min(1.0);
+            let pair_logit_gap = ((negative_logits - oracle_logits) * mask)
+                .sum_dim(1)
+                .reshape([row_count])
+                .div(active_per_pair);
+            token_loss
+                + activation::softplus(pair_logit_gap + contrast_margin, 1.0)
+                    .mean()
+                    .reshape([1])
+                    .mul_scalar(pair_weight)
+        } else {
+            token_loss
+        };
+        Some(loss.mul_scalar(weight))
+    }
+
+    fn ruliad_structured_answer_contrast_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_structured_contrast_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+
+        #[derive(Clone)]
+        struct ContrastRow {
+            inputs: Vec<i64>,
+            oracle_targets: Vec<i64>,
+            negative_targets: Vec<i64>,
+            mask: Vec<i64>,
+            discriminative_tokens: usize,
+        }
+
+        let mut rows = Vec::<ContrastRow>::new();
+        let mut oracle_completion_rows = 0usize;
+        let mut field_negative_completion_rows = 0usize;
+        let mut template_negative_completion_rows = 0usize;
+        let mut schema_negative_completion_rows = 0usize;
+        let mut generated_attractor_negative_completion_rows = 0usize;
+        let mut sample_groups = 0usize;
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            let Some((oracle_completion, _oracle_text, _truncated)) =
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+            else {
+                continue;
+            };
+            prompt = Self::ruliad_trim_prompt_for_completion(
+                &prompt,
+                oracle_completion.len(),
+                block_size,
+            );
+            let value_mask = Self::ruliad_answer_value_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            let schema_mask = Self::ruliad_answer_schema_completion_mask(
+                &tokenizer,
+                &sample.item.expected_answer,
+                oracle_completion.len(),
+            );
+            if !value_mask.iter().any(|active| *active) && !schema_mask.iter().any(|active| *active)
+            {
+                continue;
+            }
+            let Some((inputs, oracle_targets, _oracle_mask)) =
+                Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            else {
+                continue;
+            };
+            let completion_start = prompt.len().saturating_sub(1).min(oracle_targets.len());
+            oracle_completion_rows = oracle_completion_rows.saturating_add(1);
+            let mut sample_pair_count = 0usize;
+
+            for (negative, negative_kind) in Self::ruliad_structured_negative_answers_with_schema(
+                &sample.item.expected_answer,
+                config.structured_negative_count,
+                config.structured_template_negative_count,
+                config.structured_schema_negative_count,
+            ) {
+                let Some((completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &negative,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let diff_len = oracle_completion.len().min(completion.len());
+                let mut negative_targets = oracle_targets.clone();
+                let mut mask = vec![0i64; oracle_targets.len()];
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    let active = match negative_kind {
+                        RuliadStructuredNegativeKind::SchemaCollapse => {
+                            schema_mask.get(completion_index).copied().unwrap_or(false)
+                        }
+                        RuliadStructuredNegativeKind::FieldMutation
+                        | RuliadStructuredNegativeKind::TemplateCollapse => {
+                            value_mask.get(completion_index).copied().unwrap_or(false)
+                        }
+                    };
+                    if active
+                        && target_index < negative_targets.len()
+                        && oracle_completion[completion_index] != completion[completion_index]
+                    {
+                        negative_targets[target_index] = completion[completion_index];
+                        mask[target_index] = 1;
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                rows.push(ContrastRow {
+                    inputs: inputs.clone(),
+                    oracle_targets: oracle_targets.clone(),
+                    negative_targets,
+                    mask,
+                    discriminative_tokens,
+                });
+                sample_pair_count = sample_pair_count.saturating_add(1);
+                match negative_kind {
+                    RuliadStructuredNegativeKind::FieldMutation => {
+                        field_negative_completion_rows =
+                            field_negative_completion_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::TemplateCollapse => {
+                        template_negative_completion_rows =
+                            template_negative_completion_rows.saturating_add(1);
+                    }
+                    RuliadStructuredNegativeKind::SchemaCollapse => {
+                        schema_negative_completion_rows =
+                            schema_negative_completion_rows.saturating_add(1);
+                    }
+                }
+            }
+            let expected_contract = Self::ruliad_answer_contract(&sample.item.expected_answer);
+            for entry in self.ruliad_generated_attractor_candidates_for_sample(sample) {
+                let Some((completion, _completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &entry.key.answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let schema_negative = expected_contract
+                    .as_ref()
+                    .is_some_and(|contract| contract != &entry.key.contract);
+                let diff_len = oracle_completion.len().min(completion.len());
+                let mut negative_targets = oracle_targets.clone();
+                let mut mask = vec![0i64; oracle_targets.len()];
+                let mut discriminative_tokens = 0usize;
+                for completion_index in 0..diff_len {
+                    let target_index = completion_start.saturating_add(completion_index);
+                    let active = if schema_negative {
+                        schema_mask.get(completion_index).copied().unwrap_or(false)
+                    } else {
+                        value_mask.get(completion_index).copied().unwrap_or(false)
+                    };
+                    if active
+                        && target_index < negative_targets.len()
+                        && oracle_completion[completion_index] != completion[completion_index]
+                    {
+                        negative_targets[target_index] = completion[completion_index];
+                        mask[target_index] = 1;
+                        discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    }
+                }
+                if discriminative_tokens == 0 {
+                    continue;
+                }
+                rows.push(ContrastRow {
+                    inputs: inputs.clone(),
+                    oracle_targets: oracle_targets.clone(),
+                    negative_targets,
+                    mask,
+                    discriminative_tokens,
+                });
+                sample_pair_count = sample_pair_count.saturating_add(1);
+                generated_attractor_negative_completion_rows =
+                    generated_attractor_negative_completion_rows.saturating_add(1);
+            }
+            sample_groups = sample_groups.saturating_add(usize::from(sample_pair_count > 0));
+        }
+        if rows.is_empty() {
+            self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+                version: 1,
+                step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+                skip_reason: Some("no_field_value_pairs".to_string()),
+                sample_groups,
+                oracle_completion_rows,
+                field_negative_completion_rows,
+                template_negative_completion_rows,
+                schema_negative_completion_rows,
+                generated_attractor_negative_completion_rows,
+                contrast_pairs: 0,
+                contrast_discriminative_tokens: 0,
+                structured_contrast_weight: weight,
+                structured_contrast_margin: config.structured_contrast_margin,
+            });
+            return None;
+        }
+        let contrast_discriminative_tokens = rows
+            .iter()
+            .map(|row| row.discriminative_tokens)
+            .sum::<usize>();
+        self.write_ruliad_structured_contrast_telemetry(RuliadStructuredContrastTelemetry {
+            version: 1,
+            step_index: self.gradient_scale_step.load(Ordering::Relaxed),
+            skip_reason: None,
+            sample_groups,
+            oracle_completion_rows,
+            field_negative_completion_rows,
+            template_negative_completion_rows,
+            schema_negative_completion_rows,
+            generated_attractor_negative_completion_rows,
+            contrast_pairs: rows.len(),
+            contrast_discriminative_tokens,
+            structured_contrast_weight: weight,
+            structured_contrast_margin: config.structured_contrast_margin,
+        });
+
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut oracle_target_values = vec![0i64; row_count * max_len];
+        let mut negative_target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0i64; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            oracle_target_values[offset..offset + len].copy_from_slice(&row.oracle_targets[..len]);
+            negative_target_values[offset..offset + len]
+                .copy_from_slice(&row.negative_targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let oracle_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(oracle_target_values, [row_count, max_len]),
+            device,
+        );
+        let negative_targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(negative_target_values, [row_count, max_len]),
+            device,
+        );
+        let mask = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(mask_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let oracle_logits = selected_token_logits(logits.clone(), oracle_targets);
+        let negative_logits = selected_token_logits(logits, negative_targets);
+        Some(
+            masked_token_mean(
+                activation::softplus(
+                    negative_logits - oracle_logits + config.structured_contrast_margin.max(0.0),
+                    1.0,
+                ),
+                Some(mask),
+            )
+            .mul_scalar(weight),
+        )
+    }
+
+    fn ruliad_verifier_rollout_imitation_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>> {
+        let config = self.ruliad_supervision.verifier_reward;
+        if !self.ruliad_verifier_rollout_feedback_active()
+            || policy_batch.samples.is_empty()
+            || self.pipeline_enabled()
+        {
+            return None;
+        }
+        let imitation_weight = config.rollout_imitation_weight.max(0.0);
+        let recovery_weight = config.rollout_recovery_weight.max(0.0);
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+        let max_rows = config.rollout_imitation_max_rows_per_step.max(1);
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum RolloutFeedbackKind {
+            Imitation,
+            Recovery,
+        }
+
+        #[derive(Clone)]
+        struct RolloutFeedbackRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            weight: f32,
+            kind: RolloutFeedbackKind,
+        }
+
+        let mut rows = Vec::<RolloutFeedbackRow>::new();
+        let mut sample_groups = 0usize;
+        let mut generated_completion_rows = 0usize;
+        let mut recorded_attractor_rows = 0usize;
+        let mut verifier_match_rows = 0usize;
+        let mut semantic_match_rows = 0usize;
+        let mut partial_rows = 0usize;
+        let mut schema_wrong_rows = 0usize;
+        let mut malformed_rows = 0usize;
+        let mut missing_rows = 0usize;
+        let mut recovery_partial_rows = 0usize;
+        let mut recovery_schema_wrong_rows = 0usize;
+        let mut recovery_malformed_rows = 0usize;
+        let mut recovery_missing_rows = 0usize;
+        let mut field_accuracy_sum = 0.0f64;
+        let mut partial_progress_sum = 0.0f64;
+        let mut completion_quality_sum = 0.0f64;
+
+        'samples: for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let oracle_row = if recovery_weight > f32::EPSILON {
+                Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+                    .and_then(|(oracle_completion, _oracle_text, _truncated)| {
+                        Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+                    })
+            } else {
+                None
+            };
+            let mut generated_for_sample = 0usize;
+            for group_index in 0..config.group_size.max(1) {
+                if rows.len() >= max_rows {
+                    break 'samples;
+                }
+                let rollout_seed = Self::mix_ruliad_policy_seed(
+                    (step_index as u64).rotate_left(17)
+                        ^ (sample.item.sample_index as u64).rotate_left(7)
+                        ^ group_index as u64,
+                );
+                let generated = crate::generation::generate_tokens_seeded(
+                    &self.model,
+                    prompt.clone(),
+                    device,
+                    crate::generation::GenerationSettings {
+                        max_new_tokens: Some(completion_budget),
+                        temperature: config.temperature,
+                        top_k: Some(config.top_k),
+                        strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: policy_batch.stop_token_id,
+                    },
+                    rollout_seed,
+                    None,
+                )
+                .ok()?;
+                if generated.len() <= prompt.len() {
+                    continue;
+                }
+                let completion = generated[prompt.len()..].to_vec();
+                if completion.is_empty() {
+                    continue;
+                }
+                let completion_tokens = completion
+                    .iter()
+                    .filter_map(|token| u32::try_from(*token).ok())
+                    .collect::<Vec<_>>();
+                let completion_text = tokenizer.decode_payload(&completion_tokens, true);
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                generated_completion_rows = generated_completion_rows.saturating_add(1);
+                recorded_attractor_rows = recorded_attractor_rows.saturating_add(usize::from(
+                    self.record_ruliad_generated_attractor(
+                        sample,
+                        &completion_text,
+                        &score,
+                        step_index,
+                    ),
+                ));
+                generated_for_sample = generated_for_sample.saturating_add(1);
+                match score.status {
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch => {
+                        verifier_match_rows = verifier_match_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => {
+                        semantic_match_rows = semantic_match_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                        partial_rows = partial_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => {
+                        schema_wrong_rows = schema_wrong_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed => {
+                        malformed_rows = malformed_rows.saturating_add(1)
+                    }
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => {
+                        missing_rows = missing_rows.saturating_add(1)
+                    }
+                }
+                let field_accuracy = if score.expected_field_count == 0 {
+                    0.0
+                } else {
+                    score.correct_field_count as f64 / score.expected_field_count as f64
+                };
+                field_accuracy_sum += field_accuracy;
+                partial_progress_sum += score.partial_progress_ppm as f64 / 1_000_000.0;
+                completion_quality_sum += score.completion_quality_ppm as f64 / 1_000_000.0;
+                let has_imitation_signal = Self::ruliad_score_has_policy_correctness_signal(
+                    &score,
+                    config.rollout_imitation_min_partial_progress_ppm,
+                    config.rollout_imitation_min_completion_quality_ppm,
+                );
+                let has_recovery_signal = Self::ruliad_score_has_rollout_recovery_signal(
+                    &score,
+                    config.rollout_imitation_min_partial_progress_ppm,
+                    config.rollout_imitation_min_completion_quality_ppm,
+                );
+                if !has_imitation_signal && !has_recovery_signal {
+                    continue;
+                }
+                let is_correct = matches!(
+                    score.status,
+                    burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                        | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch
+                );
+                if imitation_weight > f32::EPSILON
+                    && let Some((inputs, targets, mask)) =
+                        Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                {
+                    rows.push(RolloutFeedbackRow {
+                        inputs,
+                        targets,
+                        mask,
+                        weight: imitation_weight,
+                        kind: RolloutFeedbackKind::Imitation,
+                    });
+                }
+                if recovery_weight > f32::EPSILON
+                    && !is_correct
+                    && has_recovery_signal
+                    && let Some((oracle_inputs, oracle_targets, oracle_mask)) = oracle_row.as_ref()
+                {
+                    let completion_start = prompt.len().saturating_sub(1).min(oracle_inputs.len());
+                    let mut corrupted_inputs = oracle_inputs.clone();
+                    for (index, value) in corrupted_inputs
+                        .iter_mut()
+                        .enumerate()
+                        .skip(completion_start)
+                    {
+                        let completion_index = index - completion_start;
+                        if let Some(generated_token) = completion.get(completion_index) {
+                            *value = *generated_token;
+                        }
+                    }
+                    rows.push(RolloutFeedbackRow {
+                        inputs: corrupted_inputs,
+                        targets: oracle_targets.clone(),
+                        mask: oracle_mask.clone(),
+                        weight: recovery_weight,
+                        kind: RolloutFeedbackKind::Recovery,
+                    });
+                    match score.status {
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial => {
+                            recovery_partial_rows = recovery_partial_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong => {
+                            recovery_schema_wrong_rows =
+                                recovery_schema_wrong_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed => {
+                            recovery_malformed_rows = recovery_malformed_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::Missing => {
+                            recovery_missing_rows = recovery_missing_rows.saturating_add(1)
+                        }
+                        burn_dragon_universality::ruliad::RuliadAnswerStatus::VerifierMatch
+                        | burn_dragon_universality::ruliad::RuliadAnswerStatus::SemanticMatch => {}
+                    }
+                }
+            }
+            sample_groups += usize::from(generated_for_sample > 0);
+        }
+
+        let rate_ppm = |count: usize| -> usize {
+            if generated_completion_rows == 0 {
+                0
+            } else {
+                count.saturating_mul(1_000_000) / generated_completion_rows
+            }
+        };
+        let verifier_rate_ppm = rate_ppm(verifier_match_rows.saturating_add(semantic_match_rows));
+        let schema_wrong_rate_ppm = rate_ppm(schema_wrong_rows);
+        let malformed_rate_ppm = rate_ppm(malformed_rows);
+        let candidate_completion_rows = rows.len();
+        let health_gate_passed = generated_completion_rows > 0
+            && verifier_rate_ppm >= config.rollout_imitation_min_verifier_rate_ppm
+            && schema_wrong_rate_ppm <= config.rollout_imitation_max_schema_wrong_rate_ppm
+            && malformed_rate_ppm <= config.rollout_imitation_max_malformed_rate_ppm;
+        if !health_gate_passed {
+            rows.retain(|row| row.kind == RolloutFeedbackKind::Recovery);
+        }
+        let accepted_imitation_rows = rows
+            .iter()
+            .filter(|row| row.kind == RolloutFeedbackKind::Imitation)
+            .count();
+        let accepted_recovery_rows = rows
+            .iter()
+            .filter(|row| row.kind == RolloutFeedbackKind::Recovery)
+            .count();
+        let skip_reason = if generated_completion_rows == 0 {
+            Some("no_generated_completion".to_string())
+        } else if candidate_completion_rows == 0 {
+            Some("no_candidate_completion".to_string())
+        } else if rows.is_empty() && !health_gate_passed {
+            Some("rollout_health_gate".to_string())
+        } else if rows.is_empty() {
+            Some("no_accepted_completion".to_string())
+        } else {
+            None
+        };
+
+        let denominator = generated_completion_rows.max(1) as f64;
+        self.write_ruliad_verifier_rollout_telemetry(RuliadVerifierRolloutImitationTelemetry {
+            version: 1,
+            step_index,
+            skip_reason,
+            sample_groups,
+            generated_completion_rows,
+            candidate_completion_rows,
+            accepted_completion_rows: rows.len(),
+            accepted_imitation_rows,
+            accepted_recovery_rows,
+            health_gate_passed,
+            verifier_rate_ppm,
+            schema_wrong_rate_ppm,
+            malformed_rate_ppm,
+            verifier_match_rows,
+            semantic_match_rows,
+            partial_rows,
+            schema_wrong_rows,
+            malformed_rows,
+            missing_rows,
+            recovery_partial_rows,
+            recovery_schema_wrong_rows,
+            recovery_malformed_rows,
+            recovery_missing_rows,
+            field_accuracy_mean: field_accuracy_sum / denominator,
+            partial_progress_mean: partial_progress_sum / denominator,
+            completion_quality_mean: completion_quality_sum / denominator,
+            rollout_imitation_weight: imitation_weight,
+            rollout_recovery_weight: recovery_weight,
+            max_completion_tokens: completion_budget,
+        });
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index,
+            source: "rollout".to_string(),
+            skip_reason: (generated_completion_rows == 0).then(|| "no_generated_rows".to_string()),
+            observed_completion_rows: generated_completion_rows,
+            recorded_attractor_rows,
+            selected_candidate_rows: 0,
+            selected_field_binding_pairs: 0,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
+
+        if rows.is_empty() {
+            return None;
+        }
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut active_mask_values = vec![0.0f32; row_count * max_len];
+        let mut weighted_mask_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            for (mask_index, value) in row.mask.iter().copied().take(len).enumerate() {
+                active_mask_values[offset + mask_index] = value;
+                weighted_mask_values[offset + mask_index] = value * row.weight;
+            }
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let active_mask = Tensor::<B, 2>::from_data(
+            TensorData::new(active_mask_values, [row_count, max_len]),
+            device,
+        );
+        let weighted_mask = Tensor::<B, 2>::from_data(
+            TensorData::new(weighted_mask_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs);
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs, targets);
+        let active = active_mask.sum().reshape([1]).clamp_min(1.0);
+        Some(
+            (token_log_probs * weighted_mask)
+                .sum()
+                .reshape([1])
+                .div(active)
+                .mul_scalar(-1.0),
+        )
+    }
+
+    fn ruliad_verifier_policy_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>>
+    where
+        B: AutodiffBackend,
+    {
+        let config = self.ruliad_supervision.verifier_reward;
+        let weight = self.ruliad_verifier_reward_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let prompt_budget = block_size.saturating_sub(completion_budget).max(1);
+        let group_size = config.group_size.max(2);
+
+        #[derive(Clone)]
+        struct PolicyRow {
+            inputs: Vec<i64>,
+            targets: Vec<i64>,
+            mask: Vec<f32>,
+            advantage: f32,
+        }
+
+        let mut rows = Vec::new();
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            config.mode,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        );
+        let mut observed_generated_rows = 0usize;
+        let mut recorded_attractor_rows = 0usize;
+        let sampling_model = self.model.valid();
+        for sample in policy_batch.samples.iter() {
+            let mut prompt = sample.prompt_tokens.clone();
+            if prompt.is_empty() {
+                continue;
+            }
+            if prompt.len() > prompt_budget {
+                prompt = prompt[prompt.len() - prompt_budget..].to_vec();
+            }
+            let configured_structured_negatives = if config.include_structured_negative_candidates {
+                config
+                    .structured_negative_count
+                    .saturating_add(config.structured_template_negative_count)
+                    .saturating_add(config.structured_schema_negative_count)
+            } else {
+                0
+            };
+            let generated_attractor_candidates =
+                self.ruliad_generated_attractor_candidates_for_sample(sample);
+            let mut group_rows = Vec::with_capacity(
+                group_size
+                    + usize::from(config.include_oracle_candidate)
+                    + configured_structured_negatives
+                    + generated_attractor_candidates.len(),
+            );
+            let mut scores = Vec::with_capacity(
+                group_size
+                    + usize::from(config.include_oracle_candidate)
+                    + configured_structured_negatives
+                    + generated_attractor_candidates.len(),
+            );
+            if config.include_oracle_candidate
+                && let Some((oracle_completion, oracle_completion_text, oracle_truncated)) =
+                    Self::ruliad_oracle_completion_tokens(&tokenizer, sample, completion_budget)
+                && let Some(row) =
+                    Self::ruliad_policy_row_from_completion(&prompt, &oracle_completion)
+            {
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&oracle_completion_text),
+                );
+                telemetry.record_oracle_candidate(oracle_truncated);
+                scores.push(score);
+                group_rows.push(row);
+            }
+            if config.include_structured_negative_candidates {
+                for (negative, _negative_kind) in
+                    Self::ruliad_structured_negative_answers_with_schema(
+                        &sample.item.expected_answer,
+                        config.structured_negative_count,
+                        config.structured_template_negative_count,
+                        config.structured_schema_negative_count,
+                    )
+                {
+                    let Some((completion, completion_text)) =
+                        Self::ruliad_completion_tokens_from_answer(
+                            &tokenizer,
+                            &negative,
+                            completion_budget,
+                        )
+                    else {
+                        continue;
+                    };
+                    let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                    else {
+                        continue;
+                    };
+                    let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                        &sample.item,
+                        Some(&completion_text),
+                    );
+                    telemetry.record_structured_negative_candidate();
+                    scores.push(score);
+                    group_rows.push(row);
+                }
+            }
+            for entry in generated_attractor_candidates {
+                let Some((completion, completion_text)) =
+                    Self::ruliad_completion_tokens_from_answer(
+                        &tokenizer,
+                        &entry.key.answer,
+                        completion_budget,
+                    )
+                else {
+                    continue;
+                };
+                let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion)
+                else {
+                    continue;
+                };
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                telemetry.record_generated_attractor_candidate();
+                scores.push(score);
+                group_rows.push(row);
+            }
+            for _ in 0..group_size {
+                let generated = crate::generation::generate_tokens(
+                    &sampling_model,
+                    prompt.clone(),
+                    device,
+                    crate::generation::GenerationSettings {
+                        max_new_tokens: Some(completion_budget),
+                        temperature: config.temperature,
+                        top_k: Some(config.top_k),
+                        strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: policy_batch.stop_token_id,
+                    },
+                    None,
+                )
+                .ok()?;
+                if generated.len() <= prompt.len() {
+                    continue;
+                }
+                let completion = generated[prompt.len()..].to_vec();
+                if completion.is_empty() {
+                    continue;
+                }
+                let completion_tokens = completion
+                    .iter()
+                    .filter_map(|token| u32::try_from(*token).ok())
+                    .collect::<Vec<_>>();
+                let completion_text = tokenizer.decode_payload(&completion_tokens, true);
+                let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+                    &sample.item,
+                    Some(&completion_text),
+                );
+                observed_generated_rows = observed_generated_rows.saturating_add(1);
+                recorded_attractor_rows = recorded_attractor_rows.saturating_add(usize::from(
+                    self.record_ruliad_generated_attractor(
+                        sample,
+                        &completion_text,
+                        &score,
+                        telemetry.step_index,
+                    ),
+                ));
+                scores.push(score);
+                if let Some(row) = Self::ruliad_policy_row_from_completion(&prompt, &completion) {
+                    group_rows.push(row);
+                }
+            }
+            if group_rows.is_empty() || scores.len() != group_rows.len() {
+                continue;
+            }
+            telemetry.record_vectors(&scores);
+            let rewards = match config.mode {
+                crate::config::train::RuliadVerifierRewardMode::Scalar => scores
+                    .iter()
+                    .map(|score| {
+                        burn_dragon_universality::ruliad::ruliad_verifier_reward(
+                            score,
+                            config.reward,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                crate::config::train::RuliadVerifierRewardMode::VpoIndependent => {
+                    let scalarizations = self.ruliad_vpo_scalarizations(
+                        sample.item.sample_index,
+                        config.vpo_scalarizations.max(1),
+                        config,
+                    );
+                    self.ruliad_vpo_independent_utilities_with_telemetry(
+                        &scores,
+                        &scalarizations,
+                        &mut telemetry,
+                    )
+                }
+            };
+            let mut advantages = burn_dragon_universality::ruliad::normalized_advantages(
+                &rewards,
+                config.advantage_epsilon,
+            );
+            if !Self::constrain_ruliad_policy_advantages(&scores, &mut advantages, config) {
+                telemetry.record_gated_group(rewards.len());
+                continue;
+            }
+            telemetry.record_rewards_and_advantages(&rewards, &advantages, config.clip_range);
+            rows.extend(group_rows.into_iter().zip(advantages).map(
+                |((inputs, targets, mask), advantage)| PolicyRow {
+                    inputs,
+                    targets,
+                    mask,
+                    advantage: advantage.clamp(-config.clip_range, config.clip_range),
+                },
+            ));
+        }
+        let replay_summary = self.ruliad_generated_attractor_summary();
+        self.write_ruliad_generated_attractor_telemetry(RuliadGeneratedAttractorReplayTelemetry {
+            version: 1,
+            step_index: telemetry.step_index,
+            source: "policy".to_string(),
+            skip_reason: (observed_generated_rows == 0)
+                .then(|| "no_generated_rows".to_string())
+                .or_else(|| {
+                    self.ruliad_generated_attractor_replay_skip_reason(
+                        &replay_summary,
+                        telemetry.generated_attractor_completion_rows,
+                    )
+                }),
+            observed_completion_rows: observed_generated_rows,
+            recorded_attractor_rows,
+            selected_candidate_rows: telemetry.generated_attractor_completion_rows,
+            selected_field_binding_pairs: 0,
+            replay_pool_size: replay_summary.pool_size,
+            active_attractor_count: replay_summary.active_count,
+            active_observation_count: replay_summary.active_observation_count,
+            distinct_answer_count: replay_summary.distinct_answers,
+            dominant_answer_count: replay_summary.dominant_count,
+            dominant_answer_fraction: replay_summary.dominant_fraction(),
+            min_count: config.generated_attractor_replay_min_count.max(1),
+            max_candidates: config.generated_attractor_replay_max_candidates,
+            min_distinct_answers: config
+                .generated_attractor_replay_min_distinct_answers
+                .max(1),
+            max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+        });
+        if rows.is_empty() {
+            if telemetry.has_observations() {
+                telemetry.mark_skipped("positive_advantage_gate");
+                if let Some(telemetry) = telemetry.finish() {
+                    self.write_ruliad_policy_telemetry(telemetry);
+                }
+            }
+            return None;
+        }
+        if let Some(max_clip_fraction) = config.max_advantage_clip_fraction {
+            let clip_fraction = telemetry.advantage_clip_fraction();
+            if clip_fraction > f64::from(max_clip_fraction) {
+                telemetry.mark_skipped(format!("advantage_clip_fraction>{max_clip_fraction:.6}"));
+                if let Some(telemetry) = telemetry.finish() {
+                    self.write_ruliad_policy_telemetry(telemetry);
+                }
+                return None;
+            }
+        }
+        if let Some(telemetry) = telemetry.finish() {
+            self.write_ruliad_policy_telemetry(telemetry);
+        }
+        let max_len = rows.iter().map(|row| row.inputs.len()).max()?.max(1);
+        let row_count = rows.len();
+        let mut input_values = vec![0i64; row_count * max_len];
+        let mut target_values = vec![0i64; row_count * max_len];
+        let mut mask_values = vec![0.0f32; row_count * max_len];
+        let mut advantage_values = vec![0.0f32; row_count * max_len];
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let offset = row_index * max_len;
+            let len = row.inputs.len().min(max_len);
+            input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
+            target_values[offset..offset + len].copy_from_slice(&row.targets[..len]);
+            mask_values[offset..offset + len].copy_from_slice(&row.mask[..len]);
+            for value in advantage_values[offset..offset + len].iter_mut() {
+                *value = row.advantage;
+            }
+        }
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(input_values, [row_count, max_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(target_values, [row_count, max_len]),
+            device,
+        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_values, [row_count, max_len]), device);
+        let advantages = Tensor::<B, 2>::from_data(
+            TensorData::new(advantage_values, [row_count, max_len]),
+            device,
+        );
+        let logits = self.model.forward(inputs.clone());
+        let log_probs = log_probs_from_logits(logits);
+        let token_log_probs = selected_token_log_probs(log_probs.clone(), targets);
+        let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+        let mut loss = (token_log_probs * advantages * mask.clone())
+            .sum()
+            .reshape([1])
+            .div(active)
+            .mul_scalar(-weight);
+        if config.kl_weight > f32::EPSILON && self.teacher_model.is_some() {
+            let teacher_log_probs =
+                log_probs_from_logits(self.current_teacher_model().forward(inputs).detach());
+            let [rows, time, _vocab] = log_probs.shape().dims();
+            let per_token_kl = (log_probs.clone().exp() * (log_probs - teacher_log_probs))
+                .sum_dim(2)
+                .reshape([rows, time]);
+            let active = mask.clone().sum().reshape([1]).clamp_min(1.0);
+            let kl_loss = (per_token_kl * mask)
+                .sum()
+                .reshape([1])
+                .div(active)
+                .mul_scalar(config.kl_weight);
+            loss = loss + kl_loss;
+        }
+        Some(loss)
+    }
+
+    fn latent_reasoning_target_hidden(
+        &self,
+        hidden: Tensor<B, 3>,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 3> {
+        if !self.latent_reasoning.enabled
+            || self.pipeline_enabled()
+            || !matches!(
+                self.latent_reasoning.target_encoder,
+                crate::config::LatentReasoningTargetEncoder::EmaTeacher
+            )
+        {
+            return hidden.detach();
+        }
+        self.current_teacher_model()
+            .forward_hidden(clean_inputs)
+            .detach()
+    }
+
+    fn shifted_latent_negative(target: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, time, dim] = target.shape().dims();
+        if batch > 1 {
+            let head = target.clone().slice([0..1, 0..time, 0..dim]);
+            let tail = target.slice([1..batch, 0..time, 0..dim]);
+            Tensor::cat(vec![tail, head], 0)
+        } else if time > 1 {
+            let head = target.clone().slice([0..batch, 0..1, 0..dim]);
+            let tail = target.slice([0..batch, 1..time, 0..dim]);
+            Tensor::cat(vec![tail, head], 1)
+        } else {
+            target
+        }
+    }
+
+    fn sigreg_loss_from_hidden(&self, hidden: Tensor<B, 3>) -> Option<Tensor<B, 1>> {
+        if !self.latent_reasoning.sigreg.enabled
+            || !matches!(
+                self.latent_reasoning.sigreg.target,
+                crate::config::LatentReasoningSigRegTarget::Hidden
+                    | crate::config::LatentReasoningSigRegTarget::HiddenAndRhoMemorySlots
+            )
+        {
+            return None;
+        }
+        let [batch, time, dim] = hidden.shape().dims();
+        if batch == 0 || time == 0 || dim == 0 {
+            return None;
+        }
+        let mean = hidden.clone().mean_dim(0).mean_dim(1);
+        let centered = hidden - mean.clone().repeat_dim(0, batch).repeat_dim(1, time);
+        let variance = centered.powf_scalar(2.0).mean_dim(0).mean_dim(1);
+        let variance_floor = self.latent_reasoning.sigreg.min_variance.max(0.0);
+        let variance_loss = variance
+            .mul_scalar(-1.0)
+            .add_scalar(variance_floor)
+            .clamp_min(0.0)
+            .powf_scalar(2.0)
+            .mean();
+        let mean_tolerance = self.latent_reasoning.sigreg.mean_tolerance.max(0.0);
+        let mean_loss = mean
+            .abs()
+            .add_scalar(-mean_tolerance)
+            .clamp_min(0.0)
+            .powf_scalar(2.0)
+            .mean();
+        Some((variance_loss + mean_loss).reshape([1]))
+    }
+
+    fn sigreg_loss_from_rho_memory_state(&self, state: &ModelState<B>) -> Option<Tensor<B, 1>> {
+        if !self.latent_reasoning.sigreg.enabled
+            || !matches!(
+                self.latent_reasoning.sigreg.target,
+                crate::config::LatentReasoningSigRegTarget::RhoMemorySlots
+                    | crate::config::LatentReasoningSigRegTarget::HiddenAndRhoMemorySlots
+            )
+        {
+            return None;
+        }
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        for rho in state.layers.iter().filter_map(|layer| layer.rho.as_ref()) {
+            let [batch, heads, original_slots, dim] = rho.shape().dims::<4>();
+            if batch == 0 || heads == 0 || original_slots < 2 || dim == 0 {
+                continue;
+            }
+            let rho = self.sigreg_sample_rho_slots(rho.clone(), original_slots);
+            let [batch, heads, slots, dim] = rho.shape().dims::<4>();
+            let groups = batch * heads;
+            let rows = rho.reshape([groups, slots, dim]);
+            let row_mean = rows.clone().mean_dim(2);
+            let centered = rows - row_mean.repeat_dim(2, dim);
+            let row_energy = centered
+                .clone()
+                .powf_scalar(2.0)
+                .sum_dim(2)
+                .clamp_min(1.0e-8);
+            let normalized = centered / row_energy.clone().sqrt().repeat_dim(2, dim);
+            let gram = normalized
+                .clone()
+                .matmul(normalized.clone().swap_dims(1, 2));
+            let total_sq = gram.powf_scalar(2.0).sum().reshape([1]);
+            let diag_sq = normalized
+                .powf_scalar(2.0)
+                .sum_dim(2)
+                .powf_scalar(2.0)
+                .sum()
+                .reshape([1]);
+            let denom = (groups * slots * slots.saturating_sub(1)).max(1) as f32;
+            let loss = (total_sq - diag_sq).clamp_min(0.0).div_scalar(denom);
+            total = Some(match total {
+                Some(accumulated) => accumulated + loss,
+                None => loss,
+            });
+            components = components.saturating_add(1);
+        }
+        total.map(|loss| loss.div_scalar(components.max(1) as f32))
+    }
+
+    fn sigreg_sample_rho_slots(&self, rho: Tensor<B, 4>, slots: usize) -> Tensor<B, 4> {
+        Self::sample_rho_slots_with_limit(rho, slots, self.latent_reasoning.sigreg.max_rho_slots)
+    }
+
+    fn sample_rho_slots_with_limit(
+        rho: Tensor<B, 4>,
+        slots: usize,
+        max_slots: usize,
+    ) -> Tensor<B, 4> {
+        let max_slots = max_slots.max(2);
+        if slots <= max_slots {
+            return rho;
+        }
+        let sample_slots = max_slots.min(slots);
+        let denominator = sample_slots.saturating_sub(1).max(1);
+        let source_span = slots.saturating_sub(1);
+        let indices = (0..sample_slots)
+            .map(|idx| ((idx * source_span + denominator / 2) / denominator) as i64)
+            .collect::<Vec<_>>();
+        let device = rho.device();
+        let indices =
+            Tensor::<B, 1, Int>::from_data(TensorData::new(indices, [sample_slots]), &device);
+        rho.select(2, indices)
+    }
+
+    fn normalized_rho_rows(rho: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let [_batch, _heads, _slots, dim] = rho.shape().dims::<4>();
+        let energy = rho
+            .clone()
+            .powf_scalar(2.0)
+            .mean_dim(3)
+            .clamp_min(1.0e-8)
+            .sqrt();
+        let normalized = rho / energy.clone().repeat_dim(3, dim);
+        (normalized, energy)
+    }
+
+    fn dragon_state_consistency_loss(
+        &self,
+        student_state: &ModelState<B>,
+        teacher_state: &ModelState<B>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.dragon_state;
+        if !config.enabled {
+            return (None, 0);
+        }
+        let rho_weight = config.rho_weight.max(0.0);
+        let rho_energy_weight = config.rho_energy_weight.max(0.0);
+        if rho_weight <= f32::EPSILON && rho_energy_weight <= f32::EPSILON {
+            return (None, 0);
+        }
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        for (student_layer, teacher_layer) in student_state.layers.iter().zip(&teacher_state.layers)
+        {
+            let (Some(student_rho), Some(teacher_rho)) =
+                (student_layer.rho.as_ref(), teacher_layer.rho.as_ref())
+            else {
+                continue;
+            };
+            let student_dims = student_rho.shape().dims::<4>();
+            if student_dims != teacher_rho.shape().dims::<4>() {
+                continue;
+            }
+            let [_batch, _heads, slots, _dim] = student_dims;
+            if slots < 2 {
+                continue;
+            }
+            let student_rho =
+                Self::sample_rho_slots_with_limit(student_rho.clone(), slots, config.max_rho_slots);
+            let teacher_rho =
+                Self::sample_rho_slots_with_limit(teacher_rho.clone(), slots, config.max_rho_slots)
+                    .detach();
+            let (student_rows, student_energy) = Self::normalized_rho_rows(student_rho);
+            let (teacher_rows, teacher_energy) = Self::normalized_rho_rows(teacher_rho);
+            if rho_weight > f32::EPSILON {
+                let row_loss = crate::train::next_latent::smooth_l1_mean(
+                    student_rows,
+                    teacher_rows.detach(),
+                    config.smooth_l1_beta,
+                )
+                .mul_scalar(rho_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + row_loss,
+                    None => row_loss,
+                });
+                components = components.saturating_add(1);
+            }
+            if rho_energy_weight > f32::EPSILON {
+                let energy_loss = crate::train::next_latent::smooth_l1_mean(
+                    student_energy,
+                    teacher_energy.detach(),
+                    config.smooth_l1_beta,
+                )
+                .mul_scalar(rho_energy_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + energy_loss,
+                    None => energy_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
+    fn next_latent_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        target_hidden: Tensor<B, 3>,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.next_latent;
+        if !config.enabled || !self.model.next_latent_transition_enabled() {
+            return (None, 0);
+        }
+        let regression_weight = config.regression_weight.max(0.0);
+        let token_kl_weight = config.token_kl_weight.max(0.0);
+        if regression_weight <= f32::EPSILON && token_kl_weight <= f32::EPSILON {
+            return (None, 0);
+        }
+        let [batch, time, dim] = hidden.shape().dims();
+        if batch == 0 || time < 2 || dim == 0 {
+            return (None, 0);
+        }
+        let max_horizon = config.horizon.min(time.saturating_sub(1));
+        let mut rollout_state = hidden;
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut loss_components = 0usize;
+        let mut transition_components = 0usize;
+        for horizon_index in 0..max_horizon {
+            let rollout_time = time.saturating_sub(horizon_index + 1);
+            if rollout_time == 0 {
+                break;
+            }
+            let current = rollout_state.slice([0..batch, 0..rollout_time, 0..dim]);
+            let action_tokens = clean_inputs
+                .clone()
+                .slice([0..batch, horizon_index + 1..time]);
+            let mut action_embedding = self.model.embed_tokens(action_tokens);
+            if config.detach_action_embedding {
+                action_embedding = action_embedding.detach();
+            }
+            let Some(prediction) = self
+                .model
+                .next_latent_prediction_from_hidden_action(current, action_embedding)
+            else {
+                break;
+            };
+            let target = target_hidden
+                .clone()
+                .slice([0..batch, horizon_index + 1..time, 0..dim])
+                .detach();
+            if regression_weight > f32::EPSILON {
+                let regression = crate::train::next_latent::smooth_l1_mean(
+                    prediction.clone(),
+                    target.clone(),
+                    config.smooth_l1_beta,
+                )
+                .mul_scalar(regression_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + regression,
+                    None => regression,
+                });
+                loss_components = loss_components.saturating_add(1);
+            }
+            if token_kl_weight > f32::EPSILON && !self.model.uses_factorized_language_head() {
+                let student_logits = self.model.logits_from_hidden(prediction.clone());
+                let teacher_logits = self.model.logits_from_hidden(target).detach();
+                let token_kl = crate::train::next_latent::token_kl_mean_from_logits(
+                    student_logits,
+                    teacher_logits,
+                )
+                .mul_scalar(token_kl_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + token_kl,
+                    None => token_kl,
+                });
+                loss_components = loss_components.saturating_add(1);
+            }
+            rollout_state = prediction;
+            transition_components = transition_components.saturating_add(1);
+        }
+        (
+            total.map(|loss| loss.div_scalar(loss_components.max(1) as f32)),
+            transition_components,
+        )
+    }
+
+    fn latent_energy_model_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        target_hidden: Tensor<B, 3>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.energy_model;
+        if !config.enabled || !self.model.latent_reasoning_enabled() {
+            return (None, 0);
+        }
+        let contrastive_weight = config.contrastive_weight.max(0.0);
+        let monotonic_weight = config.monotonic_weight.max(0.0);
+        let contractive_weight = config.contractive_weight.max(0.0);
+        if contrastive_weight <= f32::EPSILON
+            && monotonic_weight <= f32::EPSILON
+            && contractive_weight <= f32::EPSILON
+        {
+            return (None, 0);
+        }
+        let Some(mut previous_energy) = self.model.latent_energy_from_hidden(hidden.clone()) else {
+            return (None, 0);
+        };
+        let output = self.model.reason_hidden(hidden);
+        if output.step_hiddens.is_empty() || output.energies.is_empty() {
+            return (None, 0);
+        }
+        let target = target_hidden.detach();
+        let negative = match self.latent_reasoning.negative_source {
+            crate::config::LatentReasoningNegativeSource::InBatchAndCorruptAnswer
+            | crate::config::LatentReasoningNegativeSource::TemporalShift => {
+                Self::shifted_latent_negative(target.clone()).detach()
+            }
+        };
+        let negative_energy = self.model.latent_energy_from_hidden(negative);
+        let step_limit = config
+            .max_rollout_steps_for_loss
+            .min(output.step_hiddens.len())
+            .min(output.energies.len());
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        for step_index in 0..step_limit {
+            let state = output
+                .step_hiddens
+                .get(step_index)
+                .expect("step hidden")
+                .clone();
+            let energy = output
+                .energies
+                .get(step_index)
+                .expect("step energy")
+                .clone();
+            if contrastive_weight > f32::EPSILON
+                && let Some(negative_energy) = negative_energy.as_ref()
+            {
+                let contrastive = latent_energy_contrastive_margin_loss(
+                    energy.clone(),
+                    negative_energy.clone(),
+                    config.margin,
+                )
+                .mul_scalar(contrastive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contrastive,
+                    None => contrastive,
+                });
+                components = components.saturating_add(1);
+            }
+            if monotonic_weight > f32::EPSILON {
+                let monotonic = latent_energy_monotonic_penalty(
+                    previous_energy.clone(),
+                    energy.clone(),
+                    config.monotonic_tolerance,
+                )
+                .mul_scalar(monotonic_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + monotonic,
+                    None => monotonic,
+                });
+                components = components.saturating_add(1);
+            }
+            if contractive_weight > f32::EPSILON {
+                let contractive =
+                    latent_energy_contractivity_penalty(state, target.clone(), config.trust_radius)
+                        .mul_scalar(contractive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contractive,
+                    None => contractive,
+                });
+                components = components.saturating_add(1);
+            }
+            previous_energy = energy;
+        }
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
+    fn latent_step_contract_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Option<Tensor<B, 2, Int>>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let config = &self.latent_reasoning.step_contract;
+        if !config.enabled || !self.model.latent_reasoning_enabled() {
+            return (None, 0);
+        }
+        let ce_weight = config.ce_weight.max(0.0);
+        let token_kl_weight = config.token_kl_weight.max(0.0);
+        let monotonic_ce_weight = config.monotonic_ce_weight.max(0.0);
+        let contractive_weight = config.contractive_weight.max(0.0);
+        if ce_weight <= f32::EPSILON
+            && token_kl_weight <= f32::EPSILON
+            && monotonic_ce_weight <= f32::EPSILON
+            && contractive_weight <= f32::EPSILON
+        {
+            return (None, 0);
+        }
+
+        let output = self.model.reason_hidden(hidden.clone());
+        if output.step_hiddens.is_empty() {
+            return (None, 0);
+        }
+
+        let step_limit = config
+            .max_rollout_steps_for_loss
+            .max(1)
+            .min(output.step_hiddens.len());
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        let mut previous_hidden = hidden.clone().detach();
+        let mut previous_ce = targets.as_ref().map(|targets| {
+            self.language_loss_from_hidden_for_latent_step(
+                hidden.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                0,
+            )
+            .detach()
+        });
+        let reference_logits = (token_kl_weight > f32::EPSILON
+            && !self.model.uses_factorized_language_head())
+        .then(|| {
+            self.model
+                .logits_from_hidden_for_latent_step(output.final_hidden, output.steps_used)
+                .detach()
+        });
+
+        for (index, state) in output.step_hiddens.into_iter().take(step_limit).enumerate() {
+            let step = index.saturating_add(1);
+            let step_ce = targets.as_ref().map(|targets| {
+                self.language_loss_from_hidden_for_latent_step(
+                    state.clone(),
+                    targets.clone(),
+                    loss_mask.clone(),
+                    step,
+                )
+            });
+            if ce_weight > f32::EPSILON
+                && let Some(step_ce) = step_ce.as_ref()
+            {
+                let component = step_ce.clone().mul_scalar(ce_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + component,
+                    None => component,
+                });
+                components = components.saturating_add(1);
+            }
+            if monotonic_ce_weight > f32::EPSILON
+                && let (Some(step_ce), Some(previous_ce_value)) =
+                    (step_ce.as_ref(), previous_ce.as_ref())
+            {
+                let penalty = (step_ce.clone()
+                    - previous_ce_value
+                        .clone()
+                        .add_scalar(config.ce_tolerance.max(0.0)))
+                .clamp_min(0.0)
+                .mul_scalar(monotonic_ce_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + penalty,
+                    None => penalty,
+                });
+                components = components.saturating_add(1);
+            }
+            if token_kl_weight > f32::EPSILON
+                && let Some(reference_logits) = reference_logits.as_ref()
+            {
+                let step_logits = self
+                    .model
+                    .logits_from_hidden_for_latent_step(state.clone(), step);
+                let token_kl = crate::train::next_latent::token_kl_mean_from_logits(
+                    step_logits,
+                    reference_logits.clone(),
+                )
+                .mul_scalar(token_kl_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + token_kl,
+                    None => token_kl,
+                });
+                components = components.saturating_add(1);
+            }
+            if contractive_weight > f32::EPSILON {
+                let contractive = latent_energy_contractivity_penalty(
+                    state.clone(),
+                    previous_hidden.clone(),
+                    config.trust_radius,
+                )
+                .mul_scalar(contractive_weight);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + contractive,
+                    None => contractive,
+                });
+                components = components.saturating_add(1);
+            }
+            previous_hidden = state.detach();
+            if let Some(step_ce) = step_ce {
+                previous_ce = Some(step_ce.detach());
+            }
+        }
+
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
+    fn latent_reasoning_fallback_every_steps(&self) -> usize {
+        self.latent_reasoning.every_steps.max(1)
+    }
+
+    fn latent_reasoning_fallback_start_after_steps(&self) -> usize {
+        self.latent_reasoning.constraint_balancer.start_after_steps
+    }
+
+    fn latent_reasoning_jepa_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .jepa_every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_jepa_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .jepa_start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_default_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        if self.latent_reasoning.start_after_capability_gate_passed {
+            LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        } else {
+            LatentReasoningAuxiliaryStartPolicy::FixedStep
+        }
+    }
+
+    fn latent_reasoning_jepa_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .jepa_start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_next_latent_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .next_latent
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_next_latent_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .next_latent
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_next_latent_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .next_latent
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_dragon_state_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .dragon_state
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_dragon_state_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .dragon_state
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_dragon_state_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .dragon_state
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_energy_model_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .energy_model
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_energy_model_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .energy_model
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_energy_model_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .energy_model
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_step_contract_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .step_contract
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_step_contract_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .step_contract
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_step_contract_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .step_contract
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_sigreg_every_steps(&self) -> usize {
+        self.latent_reasoning
+            .sigreg
+            .every_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_every_steps())
+            .max(1)
+    }
+
+    fn latent_reasoning_sigreg_start_after_steps(&self) -> usize {
+        self.latent_reasoning
+            .sigreg
+            .start_after_steps
+            .unwrap_or_else(|| self.latent_reasoning_fallback_start_after_steps())
+    }
+
+    fn latent_reasoning_sigreg_start_policy(&self) -> LatentReasoningAuxiliaryStartPolicy {
+        self.latent_reasoning
+            .sigreg
+            .start_policy
+            .unwrap_or_else(|| self.latent_reasoning_default_start_policy())
+    }
+
+    fn latent_reasoning_auxiliary_scale(&self) -> Option<f32> {
+        self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_fallback_every_steps(),
+            self.latent_reasoning_fallback_start_after_steps(),
+            self.latent_reasoning_default_start_policy(),
+        )
+    }
+
+    fn latent_reasoning_auxiliary_scale_for_every_steps(&self, every_steps: usize) -> Option<f32> {
+        self.latent_reasoning_auxiliary_scale_for_schedule(
+            every_steps,
+            self.latent_reasoning_fallback_start_after_steps(),
+            self.latent_reasoning_default_start_policy(),
+        )
+    }
+
+    fn latent_reasoning_auxiliary_scale_for_schedule(
+        &self,
+        every_steps: usize,
+        start_after_steps: usize,
+        start_policy: LatentReasoningAuxiliaryStartPolicy,
+    ) -> Option<f32> {
+        if !self.latent_reasoning.enabled {
+            return None;
+        }
+        let requires_capability = matches!(
+            start_policy,
+            LatentReasoningAuxiliaryStartPolicy::CapabilityGate
+                | LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        let requires_fixed_step = matches!(
+            start_policy,
+            LatentReasoningAuxiliaryStartPolicy::FixedStep
+                | LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        if requires_capability
+            && !self
+                .latent_reasoning_capability_gate_open
+                .load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let step = self.gradient_scale_step.load(Ordering::Relaxed);
+        let current_step = step.saturating_add(1);
+        if requires_fixed_step && start_after_steps > 0 && current_step <= start_after_steps {
+            return None;
+        }
+        let every_steps = every_steps.max(1);
+        if every_steps > 1 && !current_step.is_multiple_of(every_steps) {
+            return None;
+        }
+        let mut aux_scale = self
+            .latent_reasoning
+            .constraint_balancer
+            .normalized_aux_scale
+            .max(0.0);
+        let warmup_steps = self.latent_reasoning.constraint_balancer.warmup_steps;
+        if warmup_steps > 0 {
+            let warmup_start = if requires_fixed_step {
+                start_after_steps
+            } else {
+                0
+            };
+            let active_step = current_step.saturating_sub(warmup_start).max(1);
+            let progress = (active_step as f32 / warmup_steps as f32).min(1.0);
+            aux_scale *= progress;
+        }
+        (aux_scale > f32::EPSILON).then_some(aux_scale)
+    }
+
+    fn latent_rho_memory_auxiliary_loss(&self, state: &ModelState<B>) -> Option<Tensor<B, 1>> {
+        let aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_sigreg_every_steps(),
+            self.latent_reasoning_sigreg_start_after_steps(),
+            self.latent_reasoning_sigreg_start_policy(),
+        )?;
+        let loss = self.sigreg_loss_from_rho_memory_state(state)?;
+        crate::train::profile::record_latent_reasoning(
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            self.model.latent_reasoning_config().max_steps,
+        );
+        Some(loss.mul_scalar(aux_scale))
+    }
+
+    fn add_latent_rho_memory_auxiliary_loss(
+        &self,
+        loss: Tensor<B, 1>,
+        state: &ModelState<B>,
+    ) -> Tensor<B, 1> {
+        self.latent_rho_memory_auxiliary_loss(state)
+            .map(|aux| loss.clone() + aux)
+            .unwrap_or(loss)
+    }
+
+    fn latent_dragon_state_auxiliary_loss(
+        &self,
+        student_state: &ModelState<B>,
+        teacher_state: Option<&ModelState<B>>,
+    ) -> Option<Tensor<B, 1>> {
+        let aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_dragon_state_every_steps(),
+            self.latent_reasoning_dragon_state_start_after_steps(),
+            self.latent_reasoning_dragon_state_start_policy(),
+        )?;
+        let teacher_state = teacher_state?;
+        let (loss, components) = self.dragon_state_consistency_loss(student_state, teacher_state);
+        if components > 0 {
+            crate::train::profile::record_latent_reasoning(
+                0,
+                components,
+                0,
+                0,
+                0,
+                0,
+                self.model.latent_reasoning_config().max_steps,
+            );
+        }
+        loss.map(|loss| loss.mul_scalar(aux_scale))
+    }
+
+    fn add_latent_dragon_state_auxiliary_loss(
+        &self,
+        loss: Tensor<B, 1>,
+        student_state: &ModelState<B>,
+        teacher_state: Option<&ModelState<B>>,
+    ) -> Tensor<B, 1> {
+        self.latent_dragon_state_auxiliary_loss(student_state, teacher_state)
+            .map(|aux| loss.clone() + aux)
+            .unwrap_or(loss)
+    }
+
+    fn latent_reasoning_auxiliary_loss(
+        &self,
+        hidden: Tensor<B, 3>,
+        clean_inputs: Tensor<B, 2, Int>,
+        targets: Option<Tensor<B, 2, Int>>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+    ) -> Option<Tensor<B, 1>> {
+        let next_latent_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_next_latent_every_steps(),
+            self.latent_reasoning_next_latent_start_after_steps(),
+            self.latent_reasoning_next_latent_start_policy(),
+        );
+        let jepa_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_jepa_every_steps(),
+            self.latent_reasoning_jepa_start_after_steps(),
+            self.latent_reasoning_jepa_start_policy(),
+        );
+        let energy_model_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_energy_model_every_steps(),
+            self.latent_reasoning_energy_model_start_after_steps(),
+            self.latent_reasoning_energy_model_start_policy(),
+        );
+        let step_contract_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_step_contract_every_steps(),
+            self.latent_reasoning_step_contract_start_after_steps(),
+            self.latent_reasoning_step_contract_start_policy(),
+        );
+        let sigreg_aux_scale = self.latent_reasoning_auxiliary_scale_for_schedule(
+            self.latent_reasoning_sigreg_every_steps(),
+            self.latent_reasoning_sigreg_start_after_steps(),
+            self.latent_reasoning_sigreg_start_policy(),
+        );
+        if next_latent_aux_scale.is_none()
+            && jepa_aux_scale.is_none()
+            && energy_model_aux_scale.is_none()
+            && step_contract_aux_scale.is_none()
+            && sigreg_aux_scale.is_none()
+        {
+            return None;
+        }
+        let [batch, time, dim] = hidden.shape().dims();
+        if batch == 0 || time == 0 || dim == 0 {
+            let aux_scale = sigreg_aux_scale?;
+            let loss = self.sigreg_loss_from_hidden(hidden);
+            if loss.is_some() {
+                crate::train::profile::record_latent_reasoning(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    self.model.latent_reasoning_config().max_steps,
+                );
+            }
+            return loss.map(|loss| loss.mul_scalar(aux_scale));
+        }
+
+        let target_hidden =
+            self.latent_reasoning_target_hidden(hidden.clone(), clean_inputs.clone());
+        let mut total: Option<Tensor<B, 1>> = None;
+        let mut components = 0usize;
+        let mut next_latent_components = 0usize;
+        if let Some(next_latent_aux_scale) = next_latent_aux_scale {
+            let (next_latent_loss, active_components) = self.next_latent_auxiliary_loss(
+                hidden.clone(),
+                target_hidden.clone(),
+                clean_inputs.clone(),
+            );
+            next_latent_components = active_components;
+            if let Some(next_latent_loss) = next_latent_loss {
+                let next_latent_loss = next_latent_loss.mul_scalar(next_latent_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + next_latent_loss,
+                    None => next_latent_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
+        let mut jepa_components = 0usize;
+        if let Some(jepa_aux_scale) = jepa_aux_scale {
+            for offset in self
+                .latent_reasoning
+                .jepa_future_offsets
+                .iter()
+                .copied()
+                .filter(|offset| *offset > 0 && *offset < time)
+            {
+                let context = hidden.clone().slice([0..batch, 0..time - offset, 0..dim]);
+                let target = target_hidden
+                    .clone()
+                    .slice([0..batch, offset..time, 0..dim])
+                    .detach();
+                let prediction = self.model.latent_jepa_prediction_from_hidden(context);
+                let positive_energy = (prediction.clone() - target.clone())
+                    .powf_scalar(2.0)
+                    .mean()
+                    .reshape([1]);
+                let negative = Self::shifted_latent_negative(target).detach();
+                let negative_energy = (prediction - negative).powf_scalar(2.0).mean().reshape([1]);
+                let margin = self.model.latent_reasoning_config().energy_margin;
+                let margin_loss =
+                    activation::softplus(positive_energy.clone() - negative_energy + margin, 1.0);
+                let component = (positive_energy + margin_loss).mul_scalar(jepa_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + component,
+                    None => component,
+                });
+                components = components.saturating_add(1);
+                jepa_components = jepa_components.saturating_add(1);
+            }
+        }
+        let mut energy_model_components = 0usize;
+        if let Some(energy_model_aux_scale) = energy_model_aux_scale {
+            let (energy_model_loss, active_components) =
+                self.latent_energy_model_auxiliary_loss(hidden.clone(), target_hidden.clone());
+            energy_model_components = active_components;
+            if let Some(energy_model_loss) = energy_model_loss {
+                let energy_model_loss = energy_model_loss.mul_scalar(energy_model_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + energy_model_loss,
+                    None => energy_model_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
+        let mut step_contract_components = 0usize;
+        if let Some(step_contract_aux_scale) = step_contract_aux_scale {
+            let (step_contract_loss, active_components) =
+                self.latent_step_contract_auxiliary_loss(hidden.clone(), targets, loss_mask);
+            step_contract_components = active_components;
+            if let Some(step_contract_loss) = step_contract_loss {
+                let step_contract_loss = step_contract_loss.mul_scalar(step_contract_aux_scale);
+                total = Some(match total {
+                    Some(accumulated) => accumulated + step_contract_loss,
+                    None => step_contract_loss,
+                });
+                components = components.saturating_add(1);
+            }
+        }
+        let mut sigreg_components = 0usize;
+        if let Some(sigreg_aux_scale) = sigreg_aux_scale
+            && let Some(sigreg) = self.sigreg_loss_from_hidden(hidden)
+        {
+            let sigreg = sigreg.mul_scalar(sigreg_aux_scale);
+            total = Some(match total {
+                Some(accumulated) => accumulated + sigreg,
+                None => sigreg,
+            });
+            components = components.saturating_add(1);
+            sigreg_components = sigreg_components.saturating_add(1);
+        }
+        if components > 0 {
+            crate::train::profile::record_latent_reasoning(
+                next_latent_components,
+                0,
+                jepa_components,
+                energy_model_components,
+                step_contract_components,
+                sigreg_components,
+                self.model.latent_reasoning_config().max_steps,
+            );
+        }
+        total.map(|loss| loss.div_scalar(components.max(1) as f32))
+    }
+
+    fn logit_entropy_floor_loss(
+        &self,
+        log_probs: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+    ) -> Option<Tensor<B, 1>> {
+        let [batch, time, vocab] = log_probs.shape().dims();
+        if batch == 0 || time == 0 || vocab == 0 {
+            return None;
+        }
+        let token_count = batch * time;
+        let flat_log_probs = log_probs.reshape([token_count, vocab]);
+        let flat_probs = flat_log_probs.clone().exp();
+        let weight = self.logit_entropy_floor_weight();
+        let target_entropy_bits = self.logit_entropy_floor.target_entropy_bits;
+        let marginal_weight = self.logit_marginal_entropy_floor_weight();
+        let target_marginal_entropy_bits = self.logit_entropy_floor.target_marginal_entropy_bits;
+        let target_coverage_weight = self.logit_target_coverage_weight();
+        let mut total = if weight > f32::EPSILON && target_entropy_bits > f32::EPSILON {
+            entropy_floor_loss_from_flat_log_probs(
+                flat_log_probs.clone(),
+                flat_probs.clone(),
+                target_entropy_bits,
+            )
+            .map(|loss| loss.mul_scalar(weight))
+        } else {
+            None
+        };
+        let marginal_probs = (marginal_weight > f32::EPSILON
+            || target_coverage_weight > f32::EPSILON)
+            .then(|| flat_probs.mean_dim(0));
+        if marginal_weight > f32::EPSILON && target_marginal_entropy_bits > f32::EPSILON {
+            if let Some(loss) = marginal_entropy_floor_loss_from_marginal(
+                marginal_probs
+                    .as_ref()
+                    .expect("marginal probabilities")
+                    .clone(),
+                target_marginal_entropy_bits,
+            )
+            .map(|loss| loss.mul_scalar(marginal_weight))
+            {
+                total = Some(match total {
+                    Some(accumulated) => accumulated + loss,
+                    None => loss,
+                });
+            }
+        }
+        if target_coverage_weight > f32::EPSILON
+            && let Some(loss) = target_marginal_coverage_loss_from_marginal(
+                marginal_probs.expect("marginal probabilities"),
+                targets,
+                self.logit_entropy_floor.target_coverage_epsilon,
+            )
+            .map(|loss| loss.mul_scalar(target_coverage_weight))
+        {
+            total = Some(match total {
+                Some(accumulated) => accumulated + loss,
+                None => loss,
+            });
+        }
+        total
+    }
+
+    fn greedy_rollout_entropy_floor_weight(&self) -> f32 {
+        Self::scheduled_weight(
+            self.greedy_rollout_unlikelihood.enabled,
+            self.greedy_rollout_unlikelihood.entropy_floor_weight,
+            self.greedy_rollout_unlikelihood.warmup_steps,
+            self.greedy_rollout_unlikelihood.ramp_steps,
+            self.gradient_scale_step.load(Ordering::Relaxed),
+        )
+    }
+
+    fn greedy_rollout_entropy_floor_loss(&self, log_probs: Tensor<B, 3>) -> Option<Tensor<B, 1>> {
+        let weight = self.greedy_rollout_entropy_floor_weight();
+        let target_entropy_bits = self.greedy_rollout_unlikelihood.target_entropy_bits;
+        if weight <= f32::EPSILON || target_entropy_bits <= f32::EPSILON {
+            return None;
+        }
+        entropy_floor_loss_from_log_probs(log_probs, target_entropy_bits)
+            .map(|loss| loss.mul_scalar(weight))
+    }
+
+    fn greedy_rollout_unlikelihood_loss(
+        &self,
+        clean_inputs: Tensor<B, 2, Int>,
+    ) -> Option<Tensor<B, 1>> {
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let config = &self.greedy_rollout_unlikelihood;
+        if config.recovery_only && !self.greedy_rollout_recovery_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let weight = self.greedy_rollout_unlikelihood_weight();
+        let margin_weight = self.greedy_rollout_unlikelihood_margin_weight();
+        let cycle_weight = self.greedy_rollout_cycle_weight();
+        let cycle_margin_weight = self.greedy_rollout_cycle_margin_weight();
+        let entropy_floor_weight = self.greedy_rollout_entropy_floor_weight();
+        let recovery_weight = Self::scheduled_weight(
+            config.enabled,
+            config.recovery_weight,
+            config.warmup_steps,
+            config.ramp_steps,
+            step_index,
+        );
+        let sequence_recovery_weight = Self::scheduled_weight(
+            config.enabled,
+            config.sequence_recovery_weight,
+            config.warmup_steps,
+            config.ramp_steps,
+            step_index,
+        );
+        if (weight <= f32::EPSILON
+            && margin_weight <= f32::EPSILON
+            && cycle_weight <= f32::EPSILON
+            && cycle_margin_weight <= f32::EPSILON
+            && recovery_weight <= f32::EPSILON
+            && sequence_recovery_weight <= f32::EPSILON
+            && entropy_floor_weight <= f32::EPSILON)
+            || self.pipeline_enabled()
+            || self.model.uses_factorized_language_head()
+            || !step_index.is_multiple_of(config.every_steps)
+        {
+            return None;
+        }
+        let [batch_size, block_size] = clean_inputs.shape().dims();
+        let prompt_batch = batch_size.min(config.batch_prompts.max(1));
+        let prompt_tokens = block_size.min(config.prompt_tokens.max(1));
+        if prompt_batch == 0 || prompt_tokens == 0 {
+            return None;
+        }
+        let prompt_start =
+            rollout_prompt_start(step_index, config.every_steps, block_size, prompt_tokens);
+        let prompt = clean_inputs.clone().slice([
+            0..prompt_batch,
+            prompt_start..(prompt_start + prompt_tokens),
+        ]);
+        let mut state = self.model.init_state();
+        let logits = self.model.forward_with_state(prompt.clone(), &mut state);
+        let [_, time, vocab] = logits.shape().dims::<3>();
+        if time == 0 || vocab == 0 {
+            return None;
+        }
+        let needs_step_log_probs = weight > f32::EPSILON
+            || cycle_weight > f32::EPSILON
+            || recovery_weight > f32::EPSILON
+            || entropy_floor_weight > f32::EPSILON;
+        let needs_step_logits = needs_step_log_probs
+            || margin_weight > f32::EPSILON
+            || cycle_margin_weight > f32::EPSILON;
+        let mut last_logits = logits
+            .slice_dim(1, (time - 1)..time)
+            .reshape([prompt_batch, vocab]);
+        if !needs_step_logits {
+            last_logits = last_logits.detach();
+            state.detach_in_place();
+        }
+        let history_tokens = config.history_tokens.max(1);
+        let mut history = Vec::with_capacity(history_tokens);
+        for offset in 0..prompt_tokens.min(history_tokens) {
+            let start = prompt_tokens - 1 - offset;
+            history.push(prompt.clone().slice([0..prompt_batch, start..(start + 1)]));
+        }
+        let mut total_loss: Option<Tensor<B, 1>> = None;
+        let mut total_hits: Option<Tensor<B, 1>> = None;
+        let mut total_margin: Option<Tensor<B, 1>> = None;
+        let mut total_margin_hits: Option<Tensor<B, 1>> = None;
+        let mut total_cycle: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_hits: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_margin: Option<Tensor<B, 1>> = None;
+        let mut total_cycle_margin_hits: Option<Tensor<B, 1>> = None;
+        let mut total_recovery: Option<Tensor<B, 1>> = None;
+        let mut recovery_steps = 0usize;
+        let mut generated_tokens = Vec::with_capacity(config.rollout_tokens);
+        let mut total_entropy_floor: Option<Tensor<B, 1>> = None;
+        let mut entropy_floor_steps = 0usize;
+        for rollout_index in 0..config.rollout_tokens {
+            let step_logits =
+                needs_step_logits.then(|| last_logits.clone().reshape([prompt_batch, 1, vocab]));
+            let step_log_probs = needs_step_log_probs.then(|| {
+                log_probs_from_logits(
+                    step_logits
+                        .as_ref()
+                        .expect("step logits are required for rollout log-probs")
+                        .clone(),
+                )
+            });
+            if let Some(entropy_loss) = step_log_probs
+                .as_ref()
+                .and_then(|log_probs| self.greedy_rollout_entropy_floor_loss(log_probs.clone()))
+            {
+                total_entropy_floor = Some(match total_entropy_floor {
+                    Some(accumulated) => accumulated + entropy_loss,
+                    None => entropy_loss,
+                });
+                entropy_floor_steps = entropy_floor_steps.saturating_add(1);
+            }
+            let next = last_logits.clone().argmax(1).reshape([prompt_batch, 1]);
+            let mut repeat_mask = next.clone().equal(
+                history
+                    .first()
+                    .expect("greedy rollout history should not be empty")
+                    .clone(),
+            );
+            for previous in history.iter().skip(1) {
+                repeat_mask = repeat_mask.bool_or(next.clone().equal(previous.clone()));
+            }
+            let repeat_mask = repeat_mask.int();
+            let cycle_mask =
+                cycle_repeat_mask(&next, &history, config.cycle_min_lag, config.cycle_max_lag);
+            if weight > f32::EPSILON {
+                let next_log_probs = selected_token_log_probs(
+                    step_log_probs
+                        .as_ref()
+                        .expect("step log-probs are required for rollout unlikelihood")
+                        .clone(),
+                    next.clone(),
+                );
+                let next_prob = next_log_probs
+                    .exp()
+                    .clamp_min(0.0)
+                    .clamp_max(1.0 - config.epsilon);
+                let unlikelihood = next_prob
+                    .mul_scalar(-1.0)
+                    .add_scalar(1.0)
+                    .clamp_min(config.epsilon)
+                    .log()
+                    .mul_scalar(-1.0);
+                let repeat_weight = repeat_mask.clone().float();
+                let step_loss = (unlikelihood * repeat_weight.clone()).sum().reshape([1]);
+                let step_hits = repeat_weight.sum().reshape([1]);
+                total_loss = Some(match total_loss {
+                    Some(accumulated) => accumulated + step_loss,
+                    None => step_loss,
+                });
+                total_hits = Some(match total_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if cycle_weight > f32::EPSILON
+                && let Some(cycle_mask) = cycle_mask.clone()
+            {
+                let next_log_probs = selected_token_log_probs(
+                    step_log_probs
+                        .as_ref()
+                        .expect("step log-probs are required for rollout cycle unlikelihood")
+                        .clone(),
+                    next.clone(),
+                );
+                let next_prob = next_log_probs
+                    .exp()
+                    .clamp_min(0.0)
+                    .clamp_max(1.0 - config.epsilon);
+                let unlikelihood = next_prob
+                    .mul_scalar(-1.0)
+                    .add_scalar(1.0)
+                    .clamp_min(config.epsilon)
+                    .log()
+                    .mul_scalar(-1.0);
+                let cycle_weight_tensor = cycle_mask.float();
+                let step_cycle = (unlikelihood * cycle_weight_tensor.clone())
+                    .sum()
+                    .reshape([1]);
+                let step_hits = cycle_weight_tensor.sum().reshape([1]);
+                total_cycle = Some(match total_cycle {
+                    Some(accumulated) => accumulated + step_cycle,
+                    None => step_cycle,
+                });
+                total_cycle_hits = Some(match total_cycle_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if margin_weight > f32::EPSILON {
+                let repeat_weight = repeat_mask.float();
+                let step_logits = step_logits
+                    .as_ref()
+                    .expect("step logits are required for rollout margin");
+                let next_logits = selected_token_logits(step_logits.clone(), next.clone());
+                let mean_logits = step_logits.clone().mean_dim(2).reshape([prompt_batch, 1]);
+                let margin_penalty =
+                    activation::softplus(next_logits - mean_logits + config.margin, 1.0);
+                let step_margin = (margin_penalty * repeat_weight.clone()).sum().reshape([1]);
+                let step_hits = repeat_weight.sum().reshape([1]);
+                total_margin = Some(match total_margin {
+                    Some(accumulated) => accumulated + step_margin,
+                    None => step_margin,
+                });
+                total_margin_hits = Some(match total_margin_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            if cycle_margin_weight > f32::EPSILON
+                && let Some(cycle_mask) = cycle_mask
+            {
+                let cycle_weight_tensor = cycle_mask.float();
+                let step_logits = step_logits
+                    .as_ref()
+                    .expect("step logits are required for rollout cycle margin");
+                let next_logits = selected_token_logits(step_logits.clone(), next.clone());
+                let mean_logits = step_logits.clone().mean_dim(2).reshape([prompt_batch, 1]);
+                let margin_penalty =
+                    activation::softplus(next_logits - mean_logits + config.margin, 1.0);
+                let step_margin = (margin_penalty * cycle_weight_tensor.clone())
+                    .sum()
+                    .reshape([1]);
+                let step_hits = cycle_weight_tensor.sum().reshape([1]);
+                total_cycle_margin = Some(match total_cycle_margin {
+                    Some(accumulated) => accumulated + step_margin,
+                    None => step_margin,
+                });
+                total_cycle_margin_hits = Some(match total_cycle_margin_hits {
+                    Some(accumulated) => accumulated + step_hits,
+                    None => step_hits,
+                });
+            }
+            let target_pos = prompt_start + prompt_tokens + rollout_index;
+            if recovery_weight > f32::EPSILON && target_pos < block_size {
+                let recovery_target = clean_inputs
+                    .clone()
+                    .slice([0..prompt_batch, target_pos..(target_pos + 1)]);
+                let recovery_loss = selected_token_log_probs(
+                    step_log_probs
+                        .as_ref()
+                        .expect("step log-probs are required for rollout recovery")
+                        .clone(),
+                    recovery_target,
+                )
+                .mul_scalar(-1.0)
+                .mean()
+                .reshape([1]);
+                total_recovery = Some(match total_recovery {
+                    Some(accumulated) => accumulated + recovery_loss,
+                    None => recovery_loss,
+                });
+                recovery_steps = recovery_steps.saturating_add(1);
+            }
+            generated_tokens.push(next.clone());
+            let logits = self.model.forward_with_state(next.clone(), &mut state);
+            let [_, time, vocab] = logits.shape().dims::<3>();
+            if time == 0 || vocab == 0 {
+                break;
+            }
+            last_logits = logits
+                .slice_dim(1, (time - 1)..time)
+                .reshape([prompt_batch, vocab]);
+            if !needs_step_logits {
+                last_logits = last_logits.detach();
+                state.detach_in_place();
+            }
+            history.insert(0, next);
+            if history.len() > history_tokens {
+                history.pop();
+            }
+        }
+        let mut loss = total_loss.map(|loss| {
+            loss.div(
+                total_hits
+                    .expect("greedy rollout hit accumulator should exist")
+                    .clamp_min(1.0),
+            )
+            .mul_scalar(weight)
+        });
+        if let Some(margin) = total_margin {
+            let margin = margin
+                .div(
+                    total_margin_hits
+                        .expect("greedy rollout margin hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(margin_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + margin,
+                None => margin,
+            });
+        }
+        if let Some(cycle) = total_cycle {
+            let cycle = cycle
+                .div(
+                    total_cycle_hits
+                        .expect("greedy rollout cycle hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(cycle_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + cycle,
+                None => cycle,
+            });
+        }
+        if let Some(cycle_margin) = total_cycle_margin {
+            let cycle_margin = cycle_margin
+                .div(
+                    total_cycle_margin_hits
+                        .expect("greedy rollout cycle margin hit accumulator should exist")
+                        .clamp_min(1.0),
+                )
+                .mul_scalar(cycle_margin_weight);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + cycle_margin,
+                None => cycle_margin,
+            });
+        }
+        if recovery_steps > 0
+            && let Some(recovery) = total_recovery
+        {
+            let recovery = recovery.mul_scalar(recovery_weight / recovery_steps as f32);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + recovery,
+                None => recovery,
+            });
+        }
+        if sequence_recovery_weight > f32::EPSILON
+            && !generated_tokens.is_empty()
+            && prompt_start + prompt_tokens < block_size
+        {
+            let available_targets = generated_tokens
+                .len()
+                .min(block_size - prompt_start - prompt_tokens);
+            if available_targets > 0 {
+                let generated = Tensor::cat(
+                    generated_tokens
+                        .into_iter()
+                        .take(available_targets)
+                        .collect(),
+                    1,
+                );
+                let recovery_inputs = Tensor::cat(vec![prompt.clone(), generated], 1);
+                let recovery_logits = self.model.forward(recovery_inputs);
+                let [_, recovery_time, recovery_vocab] = recovery_logits.shape().dims::<3>();
+                let logit_start = prompt_tokens.saturating_sub(1);
+                let logit_end = (logit_start + available_targets).min(recovery_time);
+                let used_targets = logit_end.saturating_sub(logit_start);
+                if used_targets > 0 && recovery_vocab > 0 {
+                    let recovery_targets = clean_inputs.clone().slice([
+                        0..prompt_batch,
+                        (prompt_start + prompt_tokens)
+                            ..(prompt_start + prompt_tokens + used_targets),
+                    ]);
+                    let recovery_log_probs = log_probs_from_logits(recovery_logits.slice([
+                        0..prompt_batch,
+                        logit_start..logit_end,
+                        0..recovery_vocab,
+                    ]));
+                    let sequence_recovery =
+                        selected_token_log_probs(recovery_log_probs, recovery_targets)
+                            .mul_scalar(-1.0)
+                            .mean()
+                            .reshape([1])
+                            .mul_scalar(sequence_recovery_weight);
+                    loss = Some(match loss {
+                        Some(accumulated) => accumulated + sequence_recovery,
+                        None => sequence_recovery,
+                    });
+                }
+            }
+        }
+        if entropy_floor_steps > 0
+            && let Some(entropy_floor) = total_entropy_floor
+        {
+            let entropy_floor = entropy_floor.mul_scalar(1.0 / entropy_floor_steps as f32);
+            loss = Some(match loss {
+                Some(accumulated) => accumulated + entropy_floor,
+                None => entropy_floor,
+            });
+        }
+        loss
+    }
+
+    fn corrupt_causal_inputs(&self, inputs: Tensor<B, 2, Int>) -> Tensor<B, 2, Int> {
+        let probability = self.causal_input_corruption_probability();
+        if probability <= f32::EPSILON {
+            return inputs;
+        }
+        let shape = inputs.shape();
+        let device = inputs.device();
+        let mask = Tensor::<B, 2>::random(
+            shape.clone(),
+            TensorDistribution::Uniform(0.0, 1.0),
+            &device,
+        )
+        .lower_elem(probability);
+        let replacements = if let Some(token_id) = self.input_corruption.replacement_token_id {
+            Tensor::<B, 2, Int>::full(shape, i64::from(token_id), &device)
+        } else {
+            let vocab_size = self.input_vocab_size.max(1);
+            Tensor::<B, 2>::random(
+                shape,
+                TensorDistribution::Uniform(0.0, vocab_size as f64),
+                &device,
+            )
+            .clamp_min(0.0)
+            .clamp_max(vocab_size.saturating_sub(1) as f32)
+            .int()
+        };
+        inputs.mask_where(mask, replacements)
     }
 
     fn truncate_reprompt_tokens(
@@ -761,6 +8394,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         temperature: config.temperature,
                         top_k: config.top_k,
                         strategy: crate::generation::ContextStrategy::Infinite,
+                        stop_on_token: None,
                     },
                     None,
                 )
@@ -946,6 +8580,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         &self,
         inputs: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
         summary_event_mask: Option<Tensor<B, 2, Int>>,
     ) -> (Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>) {
         let plan = self
@@ -971,6 +8606,14 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let chunk_targets = ranges
             .iter()
             .map(|range| Self::slice_batch(targets.clone(), range.start, range.end))
+            .collect::<Vec<_>>();
+        let chunk_loss_masks = ranges
+            .iter()
+            .map(|range| {
+                loss_mask
+                    .clone()
+                    .map(|mask| Self::slice_batch(mask, range.start, range.end))
+            })
             .collect::<Vec<_>>();
         let chunk_masks = ranges
             .iter()
@@ -1026,7 +8669,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             );
             let weight = ranges[microbatch_id].len() as f32 / batch_size as f32;
             let chunk_loss = self
-                .language_loss_from_hidden(hidden.clone(), chunk_targets[microbatch_id].clone())
+                .language_loss_from_hidden(
+                    hidden.clone(),
+                    chunk_targets[microbatch_id].clone(),
+                    chunk_loss_masks[microbatch_id].clone(),
+                )
                 .mul_scalar(weight);
             total_loss = Some(match total_loss {
                 Some(accumulated) => accumulated + chunk_loss,
@@ -1107,20 +8754,28 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
 
     fn step(&self, batch: SequenceBatch<B>) -> TrainOutput<LanguageModelTrainItem<B>> {
         let prof_enabled = crate::train::profile::enabled();
-        let detail_prof_enabled = crate::train::profile::detail_enabled();
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let detail_prof_enabled = prof_enabled && crate::train::profile::detail_due(step_index);
         let memory_prof_enabled = prof_enabled && crate::train::profile::memory_enabled();
         let forward_start = prof_enabled.then(Instant::now);
-        let inputs = batch.inputs;
+        let clean_inputs = batch.inputs;
         let targets = batch.targets;
+        let loss_mask = batch.loss_mask;
+        let ruliad_policy_batch = batch.ruliad_policy_batch;
         if !self.objective.is_next_token() {
             self.update_teacher_runtime();
-            let loss = self.objective_loss(inputs, targets);
+            let loss = self.objective_loss(clean_inputs, targets);
             let grads = loss.backward();
             return TrainOutput {
                 grads: self.apply_gradient_scale_schedule(GradientsParams::from_grads(grads, self)),
                 item: LanguageModelTrainItem::new(loss),
             };
         }
+        if self.latent_reasoning.enabled {
+            self.update_teacher_runtime();
+        }
+        let inputs = self.corrupt_causal_inputs(clean_inputs.clone());
+        let clean_inputs_for_aux = clean_inputs.clone();
         let summary_event_mask = batch.summary_event_mask;
         let reset_stream_state = batch.reset_stream_state;
         let step_device = memory_prof_enabled.then(|| inputs.device());
@@ -1130,6 +8785,14 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let [_batch_size, block_size] = inputs.shape().dims();
         let tbptt_chunk_size = self.effective_tbptt_chunk_size(block_size);
         let factorized_head = self.model.uses_factorized_language_head();
+        let recurrent_teacher = self.recurrent_teacher_model();
+        let (recurrent_teacher, recurrent_teacher_emits_logits) = match recurrent_teacher {
+            Some((teacher, emit_logits)) => (Some(teacher), emit_logits),
+            None => (None, false),
+        };
+        let mut recurrent_teacher_state = recurrent_teacher
+            .as_ref()
+            .map(|teacher| teacher.init_state());
         let probe_inputs = detail_prof_enabled.then(|| inputs.clone());
         let probe_summary_event_mask = detail_prof_enabled
             .then(|| summary_event_mask.clone())
@@ -1137,8 +8800,12 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let mut step_state = self.load_step_state(reset_stream_state);
         let (loss, probe_hidden, probe_logits, forward_ns) = if self.pipeline_enabled() {
             let forward_start = Instant::now();
-            let (loss, hidden, logits) =
-                self.forward_loss_with_pipeline(inputs, targets.clone(), summary_event_mask);
+            let (loss, hidden, logits) = self.forward_loss_with_pipeline(
+                inputs,
+                targets.clone(),
+                loss_mask.clone(),
+                summary_event_mask,
+            );
             step_state = self.model.init_state();
             (
                 loss,
@@ -1147,19 +8814,62 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 forward_start.elapsed().as_nanos(),
             )
         } else if let Some(chunk_size) = tbptt_chunk_size {
-            if detail_prof_enabled {
+            let use_tbptt_block_backward = if self.predictive_coding.enabled {
+                matches!(
+                    self.predictive_coding.backward_mode,
+                    PredictiveCodingBackwardMode::Block
+                )
+            } else {
+                detail_prof_enabled
+            };
+            if use_tbptt_block_backward {
                 let [batch_size, block_size] = inputs.shape().dims();
                 let mut hidden_chunks = Vec::new();
                 let mut logits_chunks = Vec::new();
+                let mut teacher_logits_chunks = Vec::new();
                 let mut total_forward_ns = 0u128;
-                for start in (0..block_size).step_by(chunk_size) {
+                let mut predictive_coding_step_report = PredictiveCodingChunkReport::default();
+                for (chunk_index, start) in (0..block_size).step_by(chunk_size).enumerate() {
                     let end = (start + chunk_size).min(block_size);
                     let chunk_inputs = Self::slice_tokens(inputs.clone(), batch_size, start, end);
                     let chunk_summary_event_mask = summary_event_mask
                         .clone()
                         .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                    if self.predictive_coding_active_for_chunk(step_index, chunk_index) {
+                        let chunk_targets =
+                            Self::slice_tokens(targets.clone(), batch_size, start, end);
+                        let chunk_loss_mask = loss_mask
+                            .clone()
+                            .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                        let (corrected_state, report) = self.correct_state_with_predictive_coding(
+                            step_state,
+                            chunk_inputs.clone(),
+                            chunk_targets,
+                            chunk_loss_mask,
+                            chunk_summary_event_mask.clone(),
+                        );
+                        step_state = corrected_state;
+                        if self.predictive_coding.sync_diagnostics {
+                            report.record();
+                        } else {
+                            predictive_coding_step_report.accumulate_unsynced(report);
+                        }
+                    }
+                    let chunk_teacher_logits = if let (Some(teacher), Some(teacher_state)) =
+                        (recurrent_teacher.as_ref(), recurrent_teacher_state.as_mut())
+                    {
+                        Self::teacher_forward_with_state(
+                            teacher,
+                            recurrent_teacher_emits_logits,
+                            chunk_inputs.clone(),
+                            chunk_summary_event_mask.clone(),
+                            teacher_state,
+                        )
+                    } else {
+                        None
+                    };
                     let chunk_forward_start = Instant::now();
-                    let hidden = if let Some(mask) = chunk_summary_event_mask {
+                    let hidden = if let Some(mask) = chunk_summary_event_mask.clone() {
                         self.model.forward_hidden_with_state_and_summary_event_mask(
                             chunk_inputs,
                             mask,
@@ -1171,34 +8881,97 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     };
                     total_forward_ns += chunk_forward_start.elapsed().as_nanos();
                     hidden_chunks.push(hidden);
-                    if !factorized_head {
+                    if detail_prof_enabled && !factorized_head {
                         logits_chunks.push(
                             self.model
                                 .logits_from_hidden(hidden_chunks.last().expect("hidden").clone()),
                         );
                     }
+                    if let Some(logits) = chunk_teacher_logits {
+                        teacher_logits_chunks.push(logits);
+                    }
                     if end < block_size {
                         step_state.detach_in_place();
+                        if let Some(teacher_state) = recurrent_teacher_state.as_mut() {
+                            teacher_state.detach_in_place();
+                        }
                     }
                 }
+                if predictive_coding_step_report.has_activity() {
+                    predictive_coding_step_report.record();
+                }
                 let hidden = Tensor::cat(hidden_chunks, 1);
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
-                let logits = (!factorized_head).then(|| Tensor::cat(logits_chunks, 1));
-                (loss, Some(hidden), logits, total_forward_ns)
+                let teacher_logits = (!teacher_logits_chunks.is_empty())
+                    .then(|| Tensor::cat(teacher_logits_chunks, 1));
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                    loss_mask.clone(),
+                    teacher_logits,
+                );
+                let loss = self.add_latent_rho_memory_auxiliary_loss(loss, &step_state);
+                let loss = self.add_latent_dragon_state_auxiliary_loss(
+                    loss,
+                    &step_state,
+                    recurrent_teacher_state.as_ref(),
+                );
+                let logits = (!factorized_head && !logits_chunks.is_empty())
+                    .then(|| Tensor::cat(logits_chunks, 1));
+                (
+                    loss,
+                    detail_prof_enabled.then_some(hidden),
+                    logits,
+                    total_forward_ns,
+                )
             } else {
                 let [batch_size, block_size] = inputs.shape().dims();
                 let mut total_forward_ns = 0u128;
                 let mut total_backward_ns = 0u128;
                 let mut total_loss: Option<Tensor<B, 1>> = None;
                 let mut accumulator = GradientsAccumulator::new();
+                let mut predictive_coding_step_report = PredictiveCodingChunkReport::default();
 
-                for start in (0..block_size).step_by(chunk_size) {
+                for (chunk_index, start) in (0..block_size).step_by(chunk_size).enumerate() {
                     let end = (start + chunk_size).min(block_size);
                     let chunk_inputs = Self::slice_tokens(inputs.clone(), batch_size, start, end);
+                    let chunk_clean_inputs =
+                        Self::slice_tokens(clean_inputs.clone(), batch_size, start, end);
                     let chunk_targets = Self::slice_tokens(targets.clone(), batch_size, start, end);
+                    let chunk_loss_mask = loss_mask
+                        .clone()
+                        .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
                     let chunk_summary_event_mask = summary_event_mask
                         .clone()
                         .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                    if self.predictive_coding_active_for_chunk(step_index, chunk_index) {
+                        let (corrected_state, report) = self.correct_state_with_predictive_coding(
+                            step_state,
+                            chunk_inputs.clone(),
+                            chunk_targets.clone(),
+                            chunk_loss_mask.clone(),
+                            chunk_summary_event_mask.clone(),
+                        );
+                        step_state = corrected_state;
+                        if self.predictive_coding.sync_diagnostics {
+                            report.record();
+                        } else {
+                            predictive_coding_step_report.accumulate_unsynced(report);
+                        }
+                    }
+                    let chunk_teacher_logits = if let (Some(teacher), Some(teacher_state)) =
+                        (recurrent_teacher.as_ref(), recurrent_teacher_state.as_mut())
+                    {
+                        Self::teacher_forward_with_state(
+                            teacher,
+                            recurrent_teacher_emits_logits,
+                            chunk_inputs.clone(),
+                            chunk_summary_event_mask.clone(),
+                            teacher_state,
+                        )
+                    } else {
+                        None
+                    };
 
                     let chunk_forward_start = Instant::now();
                     let chunk_loss = if let Some(mask) = chunk_summary_event_mask {
@@ -1207,13 +8980,32 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                             mask,
                             &mut step_state,
                         );
-                        self.language_loss_from_hidden(hidden, chunk_targets.clone())
+                        self.next_token_loss_from_hidden(
+                            hidden,
+                            chunk_targets.clone(),
+                            chunk_clean_inputs.clone(),
+                            chunk_loss_mask.clone(),
+                            chunk_teacher_logits,
+                        )
                     } else {
                         let hidden = self
                             .model
                             .forward_hidden_with_state(chunk_inputs, &mut step_state);
-                        self.language_loss_from_hidden(hidden, chunk_targets.clone())
+                        self.next_token_loss_from_hidden(
+                            hidden,
+                            chunk_targets.clone(),
+                            chunk_clean_inputs.clone(),
+                            chunk_loss_mask.clone(),
+                            chunk_teacher_logits,
+                        )
                     };
+                    let chunk_loss =
+                        self.add_latent_rho_memory_auxiliary_loss(chunk_loss, &step_state);
+                    let chunk_loss = self.add_latent_dragon_state_auxiliary_loss(
+                        chunk_loss,
+                        &step_state,
+                        recurrent_teacher_state.as_ref(),
+                    );
                     total_forward_ns += chunk_forward_start.elapsed().as_nanos();
 
                     let chunk_weight = (end - start) as f32 / block_size as f32;
@@ -1230,6 +9022,67 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
 
                     if end < block_size {
                         step_state.detach_in_place();
+                        if let Some(teacher_state) = recurrent_teacher_state.as_mut() {
+                            teacher_state.detach_in_place();
+                        }
+                    }
+                }
+                if predictive_coding_step_report.has_activity() {
+                    predictive_coding_step_report.record();
+                }
+
+                if let Some(contract_loss) = self.ruliad_answer_contract_auxiliary_loss(
+                    ruliad_policy_batch.as_deref(),
+                    &targets.device(),
+                    block_size,
+                ) {
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + contract_loss.clone().detach(),
+                        None => contract_loss.clone().detach(),
+                    });
+                    let contract_grads = contract_loss.backward();
+                    accumulator.accumulate(self, GradientsParams::from_grads(contract_grads, self));
+                }
+
+                if let Some(recovery_loss) = self.ruliad_structured_answer_recovery_auxiliary_loss(
+                    ruliad_policy_batch.as_deref(),
+                    &targets.device(),
+                    block_size,
+                ) {
+                    total_loss = Some(match total_loss {
+                        Some(accumulated) => accumulated + recovery_loss.clone().detach(),
+                        None => recovery_loss.clone().detach(),
+                    });
+                    let recovery_grads = recovery_loss.backward();
+                    accumulator.accumulate(self, GradientsParams::from_grads(recovery_grads, self));
+                }
+
+                let field_binding_weight = self.ruliad_field_binding_contrast_weight();
+                if field_binding_weight > f32::EPSILON {
+                    let field_binding_loss =
+                        if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                            self.ruliad_field_binding_contrast_loss(
+                                policy_batch,
+                                &targets.device(),
+                                block_size,
+                            )
+                        } else {
+                            self.write_ruliad_field_binding_contrast_skip(
+                                "missing_policy_batch",
+                                field_binding_weight,
+                            );
+                            None
+                        };
+                    if let Some(field_binding_loss) = field_binding_loss {
+                        total_loss = Some(match total_loss {
+                            Some(accumulated) => accumulated + field_binding_loss.clone().detach(),
+                            None => field_binding_loss.clone().detach(),
+                        });
+                        let field_binding_grads = field_binding_loss.backward();
+                        accumulator.accumulate(
+                            self,
+                            GradientsParams::from_grads(field_binding_grads, self),
+                        );
                     }
                 }
 
@@ -1268,6 +9121,19 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             }
         } else if detail_prof_enabled {
             if let Some(summary_event_mask) = summary_event_mask {
+                let teacher_logits = if let (Some(teacher), Some(teacher_state)) =
+                    (recurrent_teacher.as_ref(), recurrent_teacher_state.as_mut())
+                {
+                    Self::teacher_forward_with_state(
+                        teacher,
+                        recurrent_teacher_emits_logits,
+                        inputs.clone(),
+                        Some(summary_event_mask.clone()),
+                        teacher_state,
+                    )
+                } else {
+                    None
+                };
                 let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
                     inputs,
                     summary_event_mask,
@@ -1276,23 +9142,73 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let forward_ns = forward_start
                     .map(|start| start.elapsed().as_nanos())
                     .unwrap_or_default();
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                    loss_mask.clone(),
+                    teacher_logits,
+                );
+                let loss = self.add_latent_rho_memory_auxiliary_loss(loss, &step_state);
+                let loss = self.add_latent_dragon_state_auxiliary_loss(
+                    loss,
+                    &step_state,
+                    recurrent_teacher_state.as_ref(),
+                );
                 let logits =
                     (!factorized_head).then(|| self.model.logits_from_hidden(hidden.clone()));
                 (loss, Some(hidden), logits, forward_ns)
             } else {
+                let teacher_logits = if let (Some(teacher), Some(teacher_state)) =
+                    (recurrent_teacher.as_ref(), recurrent_teacher_state.as_mut())
+                {
+                    Self::teacher_forward_with_state(
+                        teacher,
+                        recurrent_teacher_emits_logits,
+                        inputs.clone(),
+                        None,
+                        teacher_state,
+                    )
+                } else {
+                    None
+                };
                 let hidden = self
                     .model
                     .forward_hidden_with_state(inputs, &mut step_state);
                 let forward_ns = forward_start
                     .map(|start| start.elapsed().as_nanos())
                     .unwrap_or_default();
-                let loss = self.language_loss_from_hidden(hidden.clone(), targets.clone());
+                let loss = self.next_token_loss_from_hidden(
+                    hidden.clone(),
+                    targets.clone(),
+                    clean_inputs.clone(),
+                    loss_mask.clone(),
+                    teacher_logits,
+                );
+                let loss = self.add_latent_rho_memory_auxiliary_loss(loss, &step_state);
+                let loss = self.add_latent_dragon_state_auxiliary_loss(
+                    loss,
+                    &step_state,
+                    recurrent_teacher_state.as_ref(),
+                );
                 let logits =
                     (!factorized_head).then(|| self.model.logits_from_hidden(hidden.clone()));
                 (loss, Some(hidden), logits, forward_ns)
             }
         } else {
+            let teacher_logits = if let (Some(teacher), Some(teacher_state)) =
+                (recurrent_teacher.as_ref(), recurrent_teacher_state.as_mut())
+            {
+                Self::teacher_forward_with_state(
+                    teacher,
+                    recurrent_teacher_emits_logits,
+                    inputs.clone(),
+                    summary_event_mask.clone(),
+                    teacher_state,
+                )
+            } else {
+                None
+            };
             let hidden = if let Some(summary_event_mask) = summary_event_mask {
                 self.model.forward_hidden_with_state_and_summary_event_mask(
                     inputs,
@@ -1306,8 +9222,105 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             let forward_ns = forward_start
                 .map(|start| start.elapsed().as_nanos())
                 .unwrap_or_default();
-            let loss = self.language_loss_from_hidden(hidden, targets.clone());
+            let loss = self.next_token_loss_from_hidden(
+                hidden,
+                targets.clone(),
+                clean_inputs.clone(),
+                loss_mask.clone(),
+                teacher_logits,
+            );
+            let loss = self.add_latent_rho_memory_auxiliary_loss(loss, &step_state);
+            let loss = self.add_latent_dragon_state_auxiliary_loss(
+                loss,
+                &step_state,
+                recurrent_teacher_state.as_ref(),
+            );
             (loss, None, None, forward_ns)
+        };
+        let loss = if let Some(rollout_loss) =
+            self.greedy_rollout_unlikelihood_loss(clean_inputs_for_aux)
+        {
+            loss + rollout_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(contract_loss) = self.ruliad_answer_contract_auxiliary_loss(
+            ruliad_policy_batch.as_deref(),
+            &targets.device(),
+            block_size,
+        ) {
+            loss + contract_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(recovery_loss) = self
+            .ruliad_structured_answer_recovery_auxiliary_loss(
+                ruliad_policy_batch.as_deref(),
+                &targets.device(),
+                block_size,
+            ) {
+            loss + recovery_loss
+        } else {
+            loss
+        };
+        let contrast_weight = self.ruliad_structured_contrast_weight();
+        let loss = if contrast_weight > f32::EPSILON {
+            if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                if let Some(contrast_loss) = self.ruliad_structured_answer_contrast_loss(
+                    policy_batch,
+                    &targets.device(),
+                    block_size,
+                ) {
+                    loss + contrast_loss
+                } else {
+                    loss
+                }
+            } else {
+                self.write_ruliad_structured_contrast_skip("missing_policy_batch", contrast_weight);
+                loss
+            }
+        } else {
+            loss
+        };
+        let field_binding_weight = self.ruliad_field_binding_contrast_weight();
+        let loss = if field_binding_weight > f32::EPSILON {
+            if let Some(policy_batch) = ruliad_policy_batch.as_deref() {
+                if let Some(field_binding_loss) = self.ruliad_field_binding_contrast_loss(
+                    policy_batch,
+                    &targets.device(),
+                    block_size,
+                ) {
+                    loss + field_binding_loss
+                } else {
+                    loss
+                }
+            } else {
+                self.write_ruliad_field_binding_contrast_skip(
+                    "missing_policy_batch",
+                    field_binding_weight,
+                );
+                loss
+            }
+        } else {
+            loss
+        };
+        let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
+            && let Some(rollout_imitation_loss) = self.ruliad_verifier_rollout_imitation_loss(
+                policy_batch,
+                &targets.device(),
+                block_size,
+            ) {
+            loss + rollout_imitation_loss
+        } else {
+            loss
+        };
+        let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
+            && let Some(policy_loss) =
+                self.ruliad_verifier_policy_loss(policy_batch, &targets.device(), block_size)
+        {
+            loss + policy_loss
+        } else {
+            loss
         };
         self.store_step_state(step_state);
         let step_memory_after_forward = step_device
@@ -1486,10 +9499,12 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
     type Output = LanguageModelOutput<B>;
 
     fn step(&self, batch: SequenceBatch<B>) -> LanguageModelOutput<B> {
+        let loss_mask = batch.loss_mask;
         if self.pipeline_enabled() {
             let (loss, _hidden, _logits) = self.forward_loss_with_pipeline(
                 batch.inputs,
                 batch.targets,
+                loss_mask,
                 batch.summary_event_mask,
             );
             return LanguageModelOutput::new(loss);
@@ -1507,6 +9522,9 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                         Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
                     let chunk_targets =
                         Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+                    let chunk_loss_mask = loss_mask
+                        .clone()
+                        .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
                     let chunk_mask =
                         Self::slice_tokens(summary_event_mask.clone(), batch_size, start, end);
                     let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
@@ -1516,7 +9534,7 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                     );
                     let chunk_weight = (end - start) as f32 / block_size as f32;
                     let chunk_loss = self
-                        .language_loss_from_hidden(hidden, chunk_targets)
+                        .language_loss_from_hidden(hidden, chunk_targets, chunk_loss_mask)
                         .mul_scalar(chunk_weight);
                     loss = Some(match loss {
                         Some(accumulated) => accumulated + chunk_loss,
@@ -1533,7 +9551,7 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                     summary_event_mask,
                     &mut state,
                 );
-                let loss = self.language_loss_from_hidden(hidden, batch.targets);
+                let loss = self.language_loss_from_hidden(hidden, batch.targets, loss_mask);
                 LanguageModelOutput::new(loss)
             }
         } else if let Some(chunk_size) =
@@ -1547,12 +9565,15 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
                 let chunk_inputs = Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
                 let chunk_targets =
                     Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+                let chunk_loss_mask = loss_mask
+                    .clone()
+                    .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
                 let hidden = self
                     .model
                     .forward_hidden_with_state(chunk_inputs, &mut state);
                 let chunk_weight = (end - start) as f32 / block_size as f32;
                 let chunk_loss = self
-                    .language_loss_from_hidden(hidden, chunk_targets)
+                    .language_loss_from_hidden(hidden, chunk_targets, chunk_loss_mask)
                     .mul_scalar(chunk_weight);
                 loss = Some(match loss {
                     Some(accumulated) => accumulated + chunk_loss,
@@ -1564,10 +9585,627 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
             )
         } else {
             let hidden = self.model.forward_hidden(batch.inputs);
-            let loss = self.language_loss_from_hidden(hidden, batch.targets);
+            let loss = self.language_loss_from_hidden(hidden, batch.targets, loss_mask);
             LanguageModelOutput::new(loss)
         }
     }
+}
+
+impl<B: BackendTrait> LanguageTrainModel<B> {
+    pub(crate) fn step_with_stream_state(
+        &self,
+        batch: SequenceBatch<B>,
+        state: &mut ModelState<B>,
+    ) -> LanguageModelOutput<B> {
+        if batch.reset_stream_state {
+            *state = self.model.init_state();
+        }
+        if self.pipeline_enabled() {
+            return <Self as ValidStep>::step(self, batch);
+        }
+        let loss_mask = batch.loss_mask;
+        if let Some(summary_event_mask) = batch.summary_event_mask {
+            if let Some(chunk_size) =
+                self.effective_tbptt_chunk_size(batch.inputs.shape().dims::<2>()[1])
+            {
+                let [batch_size, block_size] = batch.inputs.shape().dims();
+                let mut loss: Option<Tensor<B, 1>> = None;
+                for start in (0..block_size).step_by(chunk_size) {
+                    let end = (start + chunk_size).min(block_size);
+                    let chunk_inputs =
+                        Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
+                    let chunk_targets =
+                        Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+                    let chunk_loss_mask = loss_mask
+                        .clone()
+                        .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                    let chunk_mask =
+                        Self::slice_tokens(summary_event_mask.clone(), batch_size, start, end);
+                    let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
+                        chunk_inputs,
+                        chunk_mask,
+                        state,
+                    );
+                    let chunk_weight = (end - start) as f32 / block_size as f32;
+                    let chunk_loss = self
+                        .language_loss_from_hidden(hidden, chunk_targets, chunk_loss_mask)
+                        .mul_scalar(chunk_weight);
+                    loss = Some(match loss {
+                        Some(accumulated) => accumulated + chunk_loss,
+                        None => chunk_loss,
+                    });
+                }
+                return LanguageModelOutput::new(
+                    loss.expect("streaming valid step should produce at least one loss chunk"),
+                );
+            }
+            let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
+                batch.inputs,
+                summary_event_mask,
+                state,
+            );
+            let loss = self.language_loss_from_hidden(hidden, batch.targets, loss_mask);
+            return LanguageModelOutput::new(loss);
+        }
+        if let Some(chunk_size) =
+            self.effective_tbptt_chunk_size(batch.inputs.shape().dims::<2>()[1])
+        {
+            let [batch_size, block_size] = batch.inputs.shape().dims();
+            let mut loss: Option<Tensor<B, 1>> = None;
+            for start in (0..block_size).step_by(chunk_size) {
+                let end = (start + chunk_size).min(block_size);
+                let chunk_inputs = Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
+                let chunk_targets =
+                    Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+                let chunk_loss_mask = loss_mask
+                    .clone()
+                    .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                let hidden = self.model.forward_hidden_with_state(chunk_inputs, state);
+                let chunk_weight = (end - start) as f32 / block_size as f32;
+                let chunk_loss = self
+                    .language_loss_from_hidden(hidden, chunk_targets, chunk_loss_mask)
+                    .mul_scalar(chunk_weight);
+                loss = Some(match loss {
+                    Some(accumulated) => accumulated + chunk_loss,
+                    None => chunk_loss,
+                });
+            }
+            return LanguageModelOutput::new(
+                loss.expect("streaming valid step should produce at least one loss chunk"),
+            );
+        }
+        let hidden = self.model.forward_hidden_with_state(batch.inputs, state);
+        let loss = self.language_loss_from_hidden(hidden, batch.targets, loss_mask);
+        LanguageModelOutput::new(loss)
+    }
+}
+
+fn output_degeneracy_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    eos_id: Option<i64>,
+) -> OutputDegeneracyStats {
+    let [batch, time, vocab] = logits.shape().dims::<3>();
+    if batch == 0 || time == 0 || vocab == 0 {
+        return OutputDegeneracyStats::default();
+    }
+    let values = logits
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("validation degeneracy logits vec");
+    let mut accumulator = OutputDegeneracyAccumulator::new(eos_id);
+
+    for b in 0..batch {
+        for t in 0..time {
+            let start = (b * time + t) * vocab;
+            if let Some(step) = output_degeneracy_step_from_row(&values[start..start + vocab]) {
+                accumulator.record(step);
+            }
+        }
+    }
+
+    accumulator.finish()
+}
+
+fn validation_degeneracy_prompt_start(
+    prompt_index: usize,
+    prompt_count: usize,
+    available: usize,
+) -> usize {
+    if available == 0 || prompt_index == 0 || prompt_count <= 1 {
+        return 0;
+    }
+    let min_start = available.min(64);
+    let interior = available.saturating_sub(min_start);
+    let interior_index = prompt_index.saturating_sub(1);
+    let interior_count = prompt_count.saturating_sub(1).max(1);
+    min_start + (interior_index.saturating_mul(interior + 1) / interior_count).min(interior)
+}
+
+fn rollout_prompt_start(
+    step_index: usize,
+    every_steps: usize,
+    block_size: usize,
+    prompt_tokens: usize,
+) -> usize {
+    let available = block_size.saturating_sub(prompt_tokens);
+    if available == 0 {
+        return 0;
+    }
+    let min_start = available.min(prompt_tokens.max(1));
+    let span = available.saturating_sub(min_start);
+    if span == 0 {
+        return min_start;
+    }
+    let rollout_index = step_index / every_steps.max(1);
+    min_start + (rollout_index.saturating_mul(prompt_tokens.max(1)) % (span + 1))
+}
+
+fn lagged_prediction_tensors<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    clean_inputs: Tensor<B, 2, Int>,
+    lag: usize,
+    batch_size: usize,
+    time: usize,
+    vocab: usize,
+) -> Option<(Tensor<B, 3>, Tensor<B, 2, Int>, Tensor<B, 2, Int>)> {
+    if lag == 0 || time == 0 || lag > time {
+        return None;
+    }
+    let start = lag.saturating_sub(1);
+    let valid_time = time.saturating_sub(start);
+    if valid_time == 0 {
+        return None;
+    }
+    Some((
+        log_probs.slice([0..batch_size, start..time, 0..vocab]),
+        targets.slice([0..batch_size, start..time]),
+        clean_inputs.slice([0..batch_size, 0..valid_time]),
+    ))
+}
+
+fn unlikelihood_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    tokens: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Tensor<B, 2> {
+    selected_token_log_probs(log_probs, tokens)
+        .exp()
+        .clamp_min(0.0)
+        .clamp_max(1.0 - epsilon)
+        .mul_scalar(-1.0)
+        .add_scalar(1.0)
+        .clamp_min(epsilon)
+        .log()
+        .mul_scalar(-1.0)
+}
+
+fn cycle_repeat_mask<B: BackendTrait>(
+    next: &Tensor<B, 2, Int>,
+    history: &[Tensor<B, 2, Int>],
+    min_lag: usize,
+    max_lag: usize,
+) -> Option<Tensor<B, 2, burn::tensor::Bool>> {
+    if history.is_empty() || min_lag == 0 || max_lag < min_lag {
+        return None;
+    }
+    let mut mask: Option<Tensor<B, 2, burn::tensor::Bool>> = None;
+    for lag in min_lag..=max_lag {
+        let Some(previous) = history.get(lag.saturating_sub(1)) else {
+            continue;
+        };
+        let lag_mask = next.clone().equal(previous.clone());
+        mask = Some(match mask {
+            Some(accumulated) => accumulated.bool_or(lag_mask),
+            None => lag_mask,
+        });
+    }
+    mask
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputDegeneracyStep {
+    argmax: usize,
+    entropy_bits: f64,
+    max_probability: f64,
+}
+
+#[derive(Debug)]
+struct OutputDegeneracyAccumulator {
+    eos_id: Option<i64>,
+    token_count: usize,
+    entropy_sum: f64,
+    max_probability_sum: f64,
+    eos_count: usize,
+    repetition_count: usize,
+    repetition_denominator: usize,
+    previous: Option<usize>,
+    unique: HashSet<usize>,
+    steps: Vec<OutputDegeneracyStep>,
+    prompt_tokens: Vec<i64>,
+    generated_tokens: Vec<i64>,
+}
+
+struct OutputDegeneracySummary {
+    entropy_bits: f64,
+    mean_max_probability: f64,
+    argmax_unique_fraction: f64,
+    repetition_fraction: f64,
+}
+
+impl OutputDegeneracyAccumulator {
+    const MIN_PAYLOAD_TOKENS_BEFORE_EOS_PADDING: usize = 16;
+
+    fn new(eos_id: Option<i64>) -> Self {
+        Self {
+            eos_id,
+            token_count: 0,
+            entropy_sum: 0.0,
+            max_probability_sum: 0.0,
+            eos_count: 0,
+            repetition_count: 0,
+            repetition_denominator: 0,
+            previous: None,
+            unique: HashSet::new(),
+            steps: Vec::new(),
+            prompt_tokens: Vec::new(),
+            generated_tokens: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, step: OutputDegeneracyStep) {
+        self.entropy_sum += step.entropy_bits;
+        self.max_probability_sum += step.max_probability;
+        if self
+            .eos_id
+            .is_some_and(|id| id >= 0 && step.argmax == id as usize)
+        {
+            self.eos_count = self.eos_count.saturating_add(1);
+        }
+        if let Some(previous) = self.previous {
+            self.repetition_denominator = self.repetition_denominator.saturating_add(1);
+            if previous == step.argmax {
+                self.repetition_count = self.repetition_count.saturating_add(1);
+            }
+        }
+        self.previous = Some(step.argmax);
+        self.unique.insert(step.argmax);
+        self.steps.push(step);
+        self.token_count = self.token_count.saturating_add(1);
+    }
+
+    fn record_generated_token(&mut self, token: i64) {
+        self.generated_tokens.push(token);
+    }
+
+    fn record_prompt_tokens(&mut self, tokens: impl IntoIterator<Item = i64>) {
+        self.prompt_tokens.extend(tokens);
+    }
+
+    fn finish(self) -> OutputDegeneracyStats {
+        if self.token_count == 0 {
+            return OutputDegeneracyStats::default();
+        }
+        let first_eos_index = self.eos_id.and_then(|eos_id| {
+            self.generated_tokens
+                .iter()
+                .position(|token| *token == eos_id)
+        });
+        let scored_len = first_eos_index
+            .filter(|index| *index >= Self::MIN_PAYLOAD_TOKENS_BEFORE_EOS_PADDING)
+            .unwrap_or(self.generated_tokens.len())
+            .min(self.steps.len());
+        let scored_steps = &self.steps[..scored_len];
+        let scored_generated_tokens = &self.generated_tokens[..scored_len];
+        let scored = Self::summarize_steps(scored_steps).unwrap_or_else(|| {
+            Self::summarize_steps(&self.steps).expect("non-empty output degeneracy accumulator")
+        });
+        let eos_fraction = if scored_len < self.generated_tokens.len() {
+            0.0
+        } else {
+            self.eos_count as f64 / self.token_count as f64
+        };
+        let distinct_1_fraction = distinct_n_fraction(scored_generated_tokens, 1);
+        let distinct_2_fraction = distinct_n_fraction(scored_generated_tokens, 2);
+        let period_2_fraction = period_fraction(scored_generated_tokens, 2);
+        let period_3_fraction = period_fraction(scored_generated_tokens, 3);
+        let max_period_2_to_16_fraction = max_period_fraction(scored_generated_tokens, 2..=16);
+        let (dominant_period_2_to_64, max_period_2_to_64_fraction) =
+            dominant_period_fraction(scored_generated_tokens, 2..=64);
+        let (prompt_dominant_period_2_to_64, prompt_max_period_2_to_64_fraction) =
+            dominant_period_fraction(&self.prompt_tokens, 2..=64);
+        OutputDegeneracyStats {
+            token_count: self.token_count,
+            entropy_bits: scored.entropy_bits,
+            mean_max_probability: scored.mean_max_probability,
+            argmax_unique_fraction: scored.argmax_unique_fraction,
+            eos_fraction,
+            repetition_fraction: scored.repetition_fraction,
+            distinct_1_fraction,
+            distinct_2_fraction,
+            period_2_fraction,
+            period_3_fraction,
+            max_period_2_to_16_fraction,
+            max_period_2_to_64_fraction,
+            dominant_period_2_to_64,
+            prompt_max_period_2_to_64_fraction,
+            prompt_dominant_period_2_to_64,
+            prompt_tokens: self.prompt_tokens,
+            generated_tokens: self.generated_tokens,
+        }
+    }
+
+    fn summarize_steps(steps: &[OutputDegeneracyStep]) -> Option<OutputDegeneracySummary> {
+        if steps.is_empty() {
+            return None;
+        }
+        let mut entropy_sum = 0.0;
+        let mut max_probability_sum = 0.0;
+        let mut unique = HashSet::new();
+        let mut previous = None;
+        let mut repetition_count = 0usize;
+        let mut repetition_denominator = 0usize;
+        for step in steps {
+            entropy_sum += step.entropy_bits;
+            max_probability_sum += step.max_probability;
+            unique.insert(step.argmax);
+            if let Some(previous) = previous {
+                repetition_denominator = repetition_denominator.saturating_add(1);
+                if previous == step.argmax {
+                    repetition_count = repetition_count.saturating_add(1);
+                }
+            }
+            previous = Some(step.argmax);
+        }
+        Some(OutputDegeneracySummary {
+            entropy_bits: entropy_sum / steps.len() as f64,
+            mean_max_probability: max_probability_sum / steps.len() as f64,
+            argmax_unique_fraction: unique.len() as f64 / steps.len() as f64,
+            repetition_fraction: if repetition_denominator == 0 {
+                0.0
+            } else {
+                repetition_count as f64 / repetition_denominator as f64
+            },
+        })
+    }
+}
+
+fn distinct_n_fraction(tokens: &[i64], n: usize) -> f64 {
+    if n == 0 || tokens.len() < n {
+        return 0.0;
+    }
+    let total = tokens.len() + 1 - n;
+    let distinct = tokens
+        .windows(n)
+        .map(|window| window.to_vec())
+        .collect::<HashSet<_>>()
+        .len();
+    distinct as f64 / total as f64
+}
+
+fn period_fraction(tokens: &[i64], period: usize) -> f64 {
+    if period == 0 || tokens.len() < period.saturating_mul(2) {
+        return 0.0;
+    }
+    let matches = (period..tokens.len())
+        .filter(|idx| tokens[*idx] == tokens[*idx - period])
+        .count();
+    matches as f64 / (tokens.len() - period) as f64
+}
+
+fn max_period_fraction(tokens: &[i64], periods: impl IntoIterator<Item = usize>) -> f64 {
+    dominant_period_fraction(tokens, periods).1
+}
+
+fn dominant_period_fraction(
+    tokens: &[i64],
+    periods: impl IntoIterator<Item = usize>,
+) -> (usize, f64) {
+    periods
+        .into_iter()
+        .map(|period| (period, period_fraction(tokens, period)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or((0, 0.0))
+}
+
+fn selected_token_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+) -> Tensor<B, 2> {
+    let [batch, time, _vocab] = logits.shape().dims();
+    logits
+        .gather(2, targets.reshape([batch, time, 1]))
+        .reshape([batch, time])
+}
+
+fn answer_prefix_input_mask<B: BackendTrait>(loss_mask: Tensor<B, 2, Int>) -> Tensor<B, 2, Int> {
+    let [batch, time] = loss_mask.shape().dims();
+    let device = loss_mask.device();
+    if time == 0 {
+        return Tensor::<B, 2, Int>::zeros([batch, 0], &device);
+    }
+    let head = Tensor::<B, 2, Int>::zeros([batch, 1], &device);
+    if time == 1 {
+        return head;
+    }
+    let previous_targets = loss_mask.slice([0..batch, 0..(time - 1)]);
+    Tensor::cat(vec![head, previous_targets], 1)
+}
+
+fn next_token_loss_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+) -> Tensor<B, 1> {
+    masked_token_mean(
+        selected_token_log_probs(log_probs, targets).mul_scalar(-1.0),
+        loss_mask,
+    )
+}
+
+fn entropy_floor_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    entropy_floor_loss_from_log_probs(log_probs_from_logits(logits), target_entropy_bits)
+}
+
+fn entropy_floor_loss_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    let [batch, time, vocab] = log_probs.shape().dims();
+    if batch == 0 || time == 0 || vocab == 0 || target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let flat_log_probs = log_probs.reshape([batch * time, vocab]);
+    let flat_probs = flat_log_probs.clone().exp();
+    entropy_floor_loss_from_flat_log_probs(flat_log_probs, flat_probs, target_entropy_bits)
+}
+
+fn entropy_floor_loss_from_flat_log_probs<B: BackendTrait>(
+    flat_log_probs: Tensor<B, 2>,
+    flat_probs: Tensor<B, 2>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    let [token_count, vocab] = flat_log_probs.shape().dims();
+    if token_count == 0 || vocab == 0 || target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let entropy = (flat_probs * flat_log_probs)
+        .sum_dim(1)
+        .mul_scalar(-1.0)
+        .mean()
+        .reshape([1]);
+    let target_nats = target_entropy_bits * std::f32::consts::LN_2;
+    Some(
+        entropy
+            .mul_scalar(-1.0)
+            .add_scalar(target_nats)
+            .clamp_min(0.0),
+    )
+}
+
+fn predicted_marginal_from_logits<B: BackendTrait>(logits: Tensor<B, 3>) -> Option<Tensor<B, 2>> {
+    predicted_marginal_from_log_probs(log_probs_from_logits(logits))
+}
+
+fn predicted_marginal_from_log_probs<B: BackendTrait>(
+    log_probs: Tensor<B, 3>,
+) -> Option<Tensor<B, 2>> {
+    let [batch, time, vocab] = log_probs.shape().dims();
+    if batch == 0 || time == 0 || vocab == 0 {
+        return None;
+    }
+    Some(log_probs.reshape([batch * time, vocab]).exp().mean_dim(0))
+}
+
+fn marginal_entropy_floor_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    marginal_entropy_floor_loss_from_marginal(
+        predicted_marginal_from_logits(logits)?,
+        target_entropy_bits,
+    )
+}
+
+fn marginal_entropy_floor_loss_from_marginal<B: BackendTrait>(
+    marginal: Tensor<B, 2>,
+    target_entropy_bits: f32,
+) -> Option<Tensor<B, 1>> {
+    if target_entropy_bits <= f32::EPSILON {
+        return None;
+    }
+    let entropy = (marginal.clone() * marginal.clamp_min(1.0e-12).log())
+        .sum_dim(1)
+        .mul_scalar(-1.0)
+        .reshape([1]);
+    let target_nats = target_entropy_bits * std::f32::consts::LN_2;
+    Some(
+        entropy
+            .mul_scalar(-1.0)
+            .add_scalar(target_nats)
+            .clamp_min(0.0),
+    )
+}
+
+fn target_marginal_coverage_loss_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Option<Tensor<B, 1>> {
+    target_marginal_coverage_loss_from_marginal(
+        predicted_marginal_from_logits(logits)?,
+        targets,
+        epsilon,
+    )
+}
+
+fn target_marginal_coverage_loss_from_marginal<B: BackendTrait>(
+    marginal: Tensor<B, 2>,
+    targets: Tensor<B, 2, Int>,
+    epsilon: f32,
+) -> Option<Tensor<B, 1>> {
+    let [_marginal_batch, vocab] = marginal.shape().dims();
+    if vocab == 0 || epsilon <= 0.0 || epsilon >= 1.0 {
+        return None;
+    }
+    let [batch, time] = targets.shape().dims();
+    let token_count = batch * time;
+    if token_count == 0 {
+        return None;
+    }
+    let log_marginal = marginal.clamp_min(epsilon).log().repeat_dim(0, token_count);
+    Some(
+        log_marginal
+            .gather(1, targets.reshape([token_count, 1]))
+            .mean()
+            .reshape([1])
+            .mul_scalar(-1.0),
+    )
+}
+
+fn output_degeneracy_step_from_logits<B: BackendTrait>(
+    logits: Tensor<B, 1>,
+) -> Option<OutputDegeneracyStep> {
+    let values = logits
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("validation free-running degeneracy logits vec");
+    output_degeneracy_step_from_row(&values)
+}
+
+fn output_degeneracy_step_from_row(row: &[f32]) -> Option<OutputDegeneracyStep> {
+    let (argmax, max_logit) = row
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    let mut exp_sum = 0.0f64;
+    let mut weighted_logit_sum = 0.0f64;
+    for value in row.iter().copied().filter(|value| value.is_finite()) {
+        let weight = (value as f64 - max_logit as f64).exp();
+        exp_sum += weight;
+        weighted_logit_sum += weight * value as f64;
+    }
+    if exp_sum <= 0.0 || !exp_sum.is_finite() {
+        return None;
+    }
+    let logsumexp = max_logit as f64 + exp_sum.ln();
+    let entropy_nats = logsumexp - weighted_logit_sum / exp_sum;
+    Some(OutputDegeneracyStep {
+        argmax,
+        entropy_bits: entropy_nats.max(0.0) / std::f64::consts::LN_2,
+        max_probability: 1.0 / exp_sum,
+    })
 }
 
 #[cfg(test)]
@@ -1579,6 +10217,14 @@ mod objective_step_tests {
     type TestBackend = Autodiff<NdArray<f32>>;
     type TestInnerBackend = NdArray<f32>;
 
+    fn tensor_scalar(tensor: Tensor<TestBackend, 1>) -> f32 {
+        tensor
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scalar tensor")[0]
+    }
+
     fn tiny_model_config() -> DragonConfig {
         DragonConfig {
             n_layer: 1,
@@ -1588,6 +10234,69 @@ mod objective_step_tests {
             dropout: 0.0,
             vocab_size: 16,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn streaming_state_is_pipeline_owned_and_clone_shared() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model_a = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_persist_across_steps(true);
+        let model_b = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_persist_across_steps(true);
+        let mut state = model_a.model.init_state();
+        state.position = 17;
+        model_a.store_step_state(state);
+
+        assert_eq!(
+            model_a
+                .peek_step_state_for_test()
+                .expect("model a state")
+                .position,
+            17
+        );
+        assert!(
+            model_b.peek_step_state_for_test().is_none(),
+            "independent pipelines must not share recurrent state"
+        );
+        let cloned = model_a.clone();
+        assert_eq!(
+            cloned
+                .peek_step_state_for_test()
+                .expect("cloned learner state")
+                .position,
+            17,
+            "Burn learner clones must retain the same pipeline runtime cell"
+        );
+        assert_eq!(model_a.load_step_state(true).position, 0);
+        assert!(model_a.peek_step_state_for_test().is_none());
+    }
+
+    fn ruliad_test_score(
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        partial_progress_ppm: usize,
+        completion_quality_ppm: usize,
+    ) -> burn_dragon_universality::ruliad::RuliadReasoningScore {
+        burn_dragon_universality::ruliad::RuliadReasoningScore {
+            version: 1,
+            status,
+            correct_field_count: 0,
+            expected_field_count: 1,
+            observed_field_count: 0,
+            partial_progress_ppm,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: 0,
+            certificate_prefix_ppm: 0,
+            generated_token_count: 8,
+            hash_canary: false,
+            answer_terminated: true,
+            completion_quality_ppm,
         }
     }
 
@@ -1643,6 +10352,4043 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn predictive_coding_corrects_tbptt_state_directly() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 11);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_chunk_size(Some(2))
+        .with_predictive_coding(PredictiveCodingConfig {
+            enabled: true,
+            steps: 1,
+            step_size: 0.01,
+            sync_diagnostics: true,
+            ..Default::default()
+        });
+        let batch = batch(&device);
+        let [batch_size, _block_size] = batch.inputs.shape().dims();
+        let mut state = model.model.init_state_ephemeral();
+        let first_inputs =
+            LanguageTrainModel::<TestBackend>::slice_tokens(batch.inputs.clone(), batch_size, 0, 2);
+        let _ = model
+            .model
+            .forward_hidden_with_state(first_inputs, &mut state);
+        state.detach_in_place();
+
+        let second_inputs =
+            LanguageTrainModel::<TestBackend>::slice_tokens(batch.inputs, batch_size, 2, 4);
+        let second_targets =
+            LanguageTrainModel::<TestBackend>::slice_tokens(batch.targets, batch_size, 2, 4);
+        let (_corrected_state, report) = model.correct_state_with_predictive_coding(
+            state,
+            second_inputs,
+            second_targets,
+            None,
+            None,
+        );
+
+        assert!(
+            report.chunks_seen > 0,
+            "PC should observe at least one TBPTT state handoff, report={report:?}"
+        );
+        assert!(
+            report.chunks_corrected > 0,
+            "PC should correct at least one recurrent state, report={report:?}"
+        );
+        assert!(
+            report.chunks_corrected <= report.chunks_seen,
+            "corrected chunks should be bounded by observed chunks, report={report:?}"
+        );
+        assert!(
+            report
+                .energy_before
+                .zip(report.energy_after)
+                .is_some_and(|(before, after)| before.is_finite() && after.is_finite()),
+            "PC should record finite before/after energy, report={report:?}"
+        );
+    }
+
+    fn require_grad_param_count<B: BackendTrait>(model: &DragonModel<B>) -> usize {
+        #[derive(Default)]
+        struct RequireGradCounter {
+            count: usize,
+        }
+
+        impl<B: BackendTrait> burn::module::ModuleVisitor<B> for RequireGradCounter {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                self.count += usize::from(param.val().is_require_grad());
+            }
+        }
+
+        let mut counter = RequireGradCounter::default();
+        model.visit(&mut counter);
+        counter.count
+    }
+
+    #[test]
+    fn teacher_runtime_detaches_trainable_parameters() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = DragonModel::<TestBackend>::new(tiny_model_config(), &device);
+        assert!(
+            require_grad_param_count(&model) > 0,
+            "training model should own trainable autodiff parameters"
+        );
+
+        let teacher = TeacherModelRuntime::new(model);
+        assert_eq!(
+            require_grad_param_count(&teacher.model),
+            0,
+            "teacher snapshots must not build parameter-gradient graphs"
+        );
+    }
+
+    #[test]
+    fn neuron_scale_3d_gradient_scaling_preserves_headed_tail_semantics() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tensor = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 1, 4]),
+            &device,
+        );
+        let scaled = scale_3d_latent_tail(tensor, 2, 4, 0.5, 2.0)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scaled 3d gradient");
+        assert_eq!(scaled, vec![0.5, 1.0, 6.0, 8.0, 2.5, 3.0, 14.0, 16.0]);
+    }
+
+    #[test]
+    fn neuron_scale_2d_gradient_scaling_preserves_headed_tail_semantics() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tensor = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                (1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                [8, 2],
+            ),
+            &device,
+        );
+        let scaled = scale_2d_headed_latent_rows(tensor, 2, 4, 0.5, 2.0)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("scaled 2d gradient");
+        assert_eq!(
+            scaled,
+            vec![
+                0.5, 1.0, 1.5, 2.0, 10.0, 12.0, 14.0, 16.0, 4.5, 5.0, 5.5, 6.0, 26.0, 28.0, 30.0,
+                32.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn output_degeneracy_step_reports_overconfident_argmax() {
+        let step =
+            output_degeneracy_step_from_row(&[12.0, -8.0, -9.0, -10.0]).expect("finite step");
+        assert_eq!(step.argmax, 0);
+        assert!(
+            step.entropy_bits < 0.001,
+            "unexpected entropy: {}",
+            step.entropy_bits
+        );
+        assert!(
+            step.max_probability > 0.999,
+            "unexpected max probability: {}",
+            step.max_probability
+        );
+    }
+
+    #[test]
+    fn output_degeneracy_accumulator_tracks_repetition_and_eos() {
+        let mut accumulator = OutputDegeneracyAccumulator::new(Some(2));
+        for argmax in [2, 2, 3, 3] {
+            accumulator.record(OutputDegeneracyStep {
+                argmax,
+                entropy_bits: 0.25,
+                max_probability: 0.9,
+            });
+            accumulator.record_generated_token(argmax as i64);
+        }
+        let stats = accumulator.finish();
+        assert_eq!(stats.token_count, 4);
+        assert_eq!(stats.argmax_unique_fraction, 0.5);
+        assert_eq!(stats.eos_fraction, 0.5);
+        assert!((stats.repetition_fraction - (2.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(stats.distinct_1_fraction, 0.5);
+        assert_eq!(stats.distinct_2_fraction, 1.0);
+        assert_eq!(stats.period_2_fraction, 0.0);
+    }
+
+    #[test]
+    fn output_degeneracy_accumulator_ignores_eos_padding_after_payload() {
+        let eos_id = 99usize;
+        let mut accumulator = OutputDegeneracyAccumulator::new(Some(eos_id as i64));
+        for argmax in (0usize..24).chain(std::iter::repeat(eos_id).take(40)) {
+            accumulator.record(OutputDegeneracyStep {
+                argmax,
+                entropy_bits: if argmax == eos_id { 0.01 } else { 2.0 },
+                max_probability: if argmax == eos_id { 0.99 } else { 0.3 },
+            });
+            accumulator.record_generated_token(argmax as i64);
+        }
+        let stats = accumulator.finish();
+        assert_eq!(stats.token_count, 64);
+        assert_eq!(
+            stats.eos_fraction, 0.0,
+            "EOS padding after a payload should not trip EOS collapse"
+        );
+        assert!(
+            stats.repetition_fraction < 0.01,
+            "payload repetition should be scored before EOS padding: {}",
+            stats.repetition_fraction
+        );
+        assert!(
+            stats.entropy_bits > 1.9,
+            "payload entropy should be scored before EOS padding: {}",
+            stats.entropy_bits
+        );
+        assert_eq!(stats.distinct_1_fraction, 1.0);
+    }
+
+    #[test]
+    fn output_degeneracy_accumulator_tracks_long_period_cycles() {
+        let mut accumulator = OutputDegeneracyAccumulator::new(None);
+        for index in 0..128 {
+            let argmax = index % 37;
+            accumulator.record(OutputDegeneracyStep {
+                argmax,
+                entropy_bits: 4.0,
+                max_probability: 0.25,
+            });
+            accumulator.record_generated_token(argmax as i64);
+        }
+        let stats = accumulator.finish();
+        assert!(
+            stats.max_period_2_to_16_fraction < 0.05,
+            "period-2..16 should not catch a period-37 loop: {}",
+            stats.max_period_2_to_16_fraction
+        );
+        assert_eq!(stats.dominant_period_2_to_64, 37);
+        assert!(
+            stats.max_period_2_to_64_fraction > 0.95,
+            "expected high extended long-cycle fraction, got {}",
+            stats.max_period_2_to_64_fraction
+        );
+        assert!(
+            stats.period_2_fraction < 0.01 && stats.period_3_fraction < 0.01,
+            "period-2/3 should not catch a period-37 loop"
+        );
+    }
+
+    #[test]
+    fn output_degeneracy_ignores_single_comparison_long_period_aliases() {
+        let mut tokens: Vec<i64> = (0..32).collect();
+        tokens[31] = tokens[0];
+
+        assert_eq!(period_fraction(&tokens, 31), 0.0);
+        let (dominant_period, max_fraction) = dominant_period_fraction(&tokens, 2..=64);
+
+        assert_ne!(
+            dominant_period, 31,
+            "period-31 only has one comparison over a 32-token probe"
+        );
+        assert!(
+            max_fraction < 1.0,
+            "single-comparison alias should not produce a perfect period score"
+        );
+    }
+
+    #[test]
+    fn validation_degeneracy_probe_rolls_out_generated_tokens() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let (_loss, stats) = model.validation_loss_and_output_degeneracy(batch(&device), 3, None);
+        let stats = stats.expect("free-running degeneracy stats");
+        assert_eq!(stats.token_count, 6);
+        assert!(stats.entropy_bits.is_finite());
+        assert!(stats.mean_max_probability.is_finite());
+        assert!((0.0..=1.0).contains(&stats.argmax_unique_fraction));
+        assert!((0.0..=1.0).contains(&stats.repetition_fraction));
+        assert_eq!(stats.generated_tokens.len(), 6);
+        assert!((0.0..=1.0).contains(&stats.distinct_1_fraction));
+        assert!((0.0..=1.0).contains(&stats.distinct_2_fraction));
+        assert!((0.0..=1.0).contains(&stats.period_2_fraction));
+        assert!((0.0..=1.0).contains(&stats.period_3_fraction));
+    }
+
+    #[test]
+    fn validation_degeneracy_prompts_cover_header_and_interior_windows() {
+        let starts = (0..4)
+            .map(|index| validation_degeneracy_prompt_start(index, 4, 224))
+            .collect::<Vec<_>>();
+        assert_eq!(starts[0], 0);
+        assert!(starts[1] >= 64, "{starts:?}");
+        assert!(starts[3] <= 224, "{starts:?}");
+        assert!(starts.windows(2).all(|window| window[0] <= window[1]));
+    }
+
+    #[test]
+    fn rollout_unlikelihood_prompt_rotates_away_from_header() {
+        let first = rollout_prompt_start(0, 1, 256, 32);
+        let later = rollout_prompt_start(1, 1, 256, 32);
+        assert_eq!(first, 32);
+        assert_ne!(first, later);
+        assert!(later > 0);
+    }
+
+    #[test]
+    fn selected_token_logits_gathers_raw_logits_not_log_probs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 9.0, -1.0, 4.0, 3.0, 7.0, 8.0], [1, 2, 4]),
+            &device,
+        );
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![2, 0], [1, 2]), &device);
+        let selected = selected_token_logits(logits, targets)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("selected logits");
+        assert_eq!(selected, vec![9.0, 4.0]);
+    }
+
+    #[test]
+    fn causal_input_corruption_replaces_inputs_with_fixed_token() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_input_corruption(CausalInputCorruptionConfig {
+            enabled: true,
+            probability: 1.0,
+            replacement_token_id: Some(3),
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let corrupted = model.corrupt_causal_inputs(inputs);
+        let values = corrupted
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(values, vec![3; 6]);
+    }
+
+    #[test]
+    fn causal_input_corruption_respects_warmup() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_input_corruption(CausalInputCorruptionConfig {
+            enabled: true,
+            probability: 1.0,
+            warmup_steps: 10,
+            replacement_token_id: Some(3),
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 4, 5, 6], [2, 3]),
+            &device,
+        );
+        let corrupted = model.corrupt_causal_inputs(inputs);
+        let values = corrupted
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(values, vec![0, 1, 2, 4, 5, 6]);
+    }
+
+    #[test]
+    fn next_token_loss_honors_optional_target_mask() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 0.0, 8.0], [1, 2, 2]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 0], [1, 2]), &device);
+        let first_only_mask =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 0], [1, 2]), &device);
+
+        let unmasked = tensor_scalar(model.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        let masked = tensor_scalar(model.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            Some(first_only_mask),
+            None,
+        ));
+
+        assert!(unmasked > masked + 3.0);
+        assert!(
+            masked < 1.0e-3,
+            "masked loss should keep only the confident first token"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_ranking_penalizes_corrupt_answer_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_ranking: RuliadAnswerRankingConfig {
+                enabled: true,
+                weight: 1.0,
+                margin: 0.5,
+                corrupt_offset: 1,
+            },
+            ..Default::default()
+        });
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let mask =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 1], [1, 2]), &device);
+        let preferred = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 5.0, -2.0, 0.0, //
+                    0.0, 0.0, 5.0, -2.0,
+                ],
+                [1, 2, 4],
+            ),
+            &device,
+        );
+        let inverted = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, -2.0, 5.0, 0.0, //
+                    0.0, 0.0, -2.0, 5.0,
+                ],
+                [1, 2, 4],
+            ),
+            &device,
+        );
+
+        let preferred_loss = tensor_scalar(
+            model
+                .ruliad_answer_ranking_loss_from_logits(
+                    preferred,
+                    targets.clone(),
+                    Some(mask.clone()),
+                )
+                .expect("preferred ranking loss"),
+        );
+        let inverted_loss = tensor_scalar(
+            model
+                .ruliad_answer_ranking_loss_from_logits(inverted, targets, Some(mask))
+                .expect("inverted ranking loss"),
+        );
+
+        assert!(
+            inverted_loss > preferred_loss + 5.0,
+            "ranking loss should reward oracle answer logits over corrupt answer logits: preferred={preferred_loss} inverted={inverted_loss}"
+        );
+    }
+
+    #[test]
+    fn answer_prefix_input_mask_shifts_target_answer_mask_right() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 0, 1], [1, 5]),
+            &device,
+        );
+        let shifted = answer_prefix_input_mask(mask)
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("shifted mask");
+        assert_eq!(shifted, vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_corrupts_only_answer_prefix_inputs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![10, 11, 12, 13, 14], [1, 5]),
+            &device,
+        );
+        let target_mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 0, 1], [1, 5]),
+            &device,
+        );
+        let prefix_mask = answer_prefix_input_mask(target_mask);
+        let corrupted = model
+            .corrupt_ruliad_answer_prefix_inputs(
+                inputs,
+                prefix_mask,
+                RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 1.0,
+                    probability: 1.0,
+                    corrupt_offset: 1,
+                    ..Default::default()
+                },
+            )
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("corrupted inputs");
+        assert_eq!(corrupted, vec![10, 11, 13, 14, 14]);
+    }
+
+    #[test]
+    fn ruliad_answer_denoising_loss_is_finite_for_masked_answer_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_denoising: RuliadAnswerDenoisingConfig {
+                enabled: true,
+                weight: 0.5,
+                probability: 1.0,
+                corrupt_offset: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3, 4, 5], [1, 6]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3, 4, 5, 6], [1, 6]),
+            &device,
+        );
+        let mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 1, 1, 0, 0], [1, 6]),
+            &device,
+        );
+        let loss = tensor_scalar(
+            model
+                .ruliad_answer_denoising_loss(inputs, targets, Some(mask))
+                .expect("denoising loss"),
+        );
+        assert!(loss.is_finite(), "denoising loss should be finite: {loss}");
+        assert!(loss > 0.0, "denoising loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_recovery_loss_trains_oracle_after_wrong_prefix() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 2,
+                    structured_recovery_start_after_steps: 4,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 1,
+                    structured_recovery_template_negative_count: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "trajectory_category".to_string(),
+            task_kind: "eca_summary".to_string(),
+            math_domains: vec!["category".to_string(), "finite_state".to_string()],
+            reasoning_modes: vec!["symbolic_execution".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=44;xalpha=01;xcounts=20,24;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "structured recovery should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "structured recovery should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+            .expect("structured answer recovery loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "recovery loss should be finite: {loss}");
+        assert!(loss > 0.0, "recovery loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_recovery_loss_writes_activity_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 31);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 1,
+                    structured_recovery_start_after_steps: 0,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 2,
+                    structured_recovery_template_negative_count: 2,
+                    structured_recovery_schema_negative_count: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 44,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_recovery_loss(&policy_batch, &device, 64)
+            .expect("structured answer recovery loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "recovery loss should be finite: {loss}");
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["sample_groups"].as_u64(), Some(1));
+        assert_eq!(event["field_negative_recovery_rows"].as_u64(), Some(2));
+        assert_eq!(event["template_negative_recovery_rows"].as_u64(), Some(2));
+        let schema_rows = event["schema_negative_recovery_rows"]
+            .as_u64()
+            .expect("schema recovery rows");
+        assert!(
+            schema_rows > 0,
+            "schema-collapse recovery rows should be present: {event}"
+        );
+        assert_eq!(
+            event["recovery_rows"].as_u64(),
+            Some(4 + schema_rows),
+            "recovery rows should include field, template, and schema negatives"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_contract_loss_trains_full_oracle_contract_and_respects_cadence() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 41);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_contract: crate::config::train::RuliadAnswerContractConfig {
+                    enabled: true,
+                    weight: 0.25,
+                    premature_close_unlikelihood_weight: 0.5,
+                    every_steps: 2,
+                    start_after_steps: 4,
+                    max_completion_tokens: 24,
+                    max_rows_per_step: 1,
+                    prompt_schema_max_rows_per_step: 0,
+                    schema_token_weight: 2.0,
+                    schema_start_token_weight: 8.0,
+                    value_token_weight: 1.0,
+                    other_token_weight: 1.0,
+                    prompt_schema_value_weight: 0.0,
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 46,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "answer contract loss should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "answer contract loss should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+            .expect("answer contract loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contract loss should be finite: {loss}");
+        assert!(loss > 0.0, "contract loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_answer_contract_loss_writes_activity_telemetry_and_caps_rows() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 43);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_answer_contract.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_contract: crate::config::train::RuliadAnswerContractConfig {
+                    enabled: true,
+                    weight: 0.25,
+                    premature_close_unlikelihood_weight: 0.5,
+                    every_steps: 1,
+                    start_after_steps: 0,
+                    max_completion_tokens: 24,
+                    max_rows_per_step: 1,
+                    prompt_schema_max_rows_per_step: 1,
+                    schema_token_weight: 2.0,
+                    schema_start_token_weight: 8.0,
+                    value_token_weight: 1.0,
+                    other_token_weight: 1.0,
+                    prompt_schema_value_weight: 2.0,
+                },
+                ..Default::default()
+            })
+            .with_ruliad_answer_contract_telemetry_path(Some(telemetry_path.clone()));
+        let make_item = |sample_index, answer: &str| burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: format!("h{sample_index}"),
+            sample_index,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: answer.to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(47, "ok=1;l=17;r=17"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(48, "nflen=3;nfalpha=ABC;nfcounts=1,1,1;nfedge=AB"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_answer_contract_loss(&policy_batch, &device, 64)
+            .expect("answer contract loss");
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contract loss should be finite: {loss}");
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("contract telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(true));
+        assert_eq!(event["oracle_rows"].as_u64(), Some(1));
+        assert!(
+            event["sample_groups"].as_u64().unwrap_or_default() >= 1,
+            "contract objective should report active sample groups: {event}"
+        );
+        assert!(
+            event["prompt_schema_sample_groups"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "contract objective should report active prompt-schema sample groups: {event}"
+        );
+        assert_eq!(event["prompt_schema_rows"].as_u64(), Some(1));
+        assert_eq!(event["prompt_schema_max_rows_per_step"].as_u64(), Some(1));
+        assert!(
+            event["schema_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should supervise schema tokens: {event}"
+        );
+        assert!(
+            event["schema_start_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should identify schema-start tokens: {event}"
+        );
+        assert!(
+            event["value_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should supervise value tokens: {event}"
+        );
+        assert!(
+            event["prompt_schema_value_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "contract objective should supervise schema-forced value tokens: {event}"
+        );
+        assert!(
+            event["premature_close_tokens"].as_u64().unwrap_or_default() > 0,
+            "contract objective should penalize premature close markers: {event}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_builds_from_policy_metadata() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 0,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("verifier policy loss");
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_respects_start_after_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                weight: 0.1,
+                every_steps: 1,
+                start_after_steps: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert_eq!(model.ruliad_verifier_reward_weight(), 0.0);
+        model.gradient_scale_step.store(4, Ordering::Relaxed);
+        assert_eq!(model.ruliad_verifier_reward_weight(), 0.1);
+    }
+
+    #[test]
+    fn ruliad_policy_telemetry_marks_saturated_updates_as_skipped() {
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            64,
+        );
+        telemetry.record_rewards_and_advantages(&[0.0, 1.0, -1.0], &[0.0, 1.0, -1.0], 0.2);
+        assert!(
+            telemetry.advantage_clip_fraction() > 0.5,
+            "test should exercise a saturated policy update"
+        );
+        telemetry.mark_skipped("advantage_clip_fraction>0.500000");
+        let telemetry = telemetry.finish().expect("telemetry");
+        assert!(!telemetry.policy_update_applied);
+        assert_eq!(
+            telemetry.policy_skip_reason.as_deref(),
+            Some("advantage_clip_fraction>0.500000")
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_telemetry_reports_gated_groups_without_rows() {
+        let mut telemetry = RuliadPolicyRewardTelemetryAccumulator::new(
+            crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            64,
+        );
+        telemetry.record_gated_group(4);
+        telemetry.mark_skipped("positive_advantage_gate");
+        let telemetry = telemetry.finish().expect("telemetry");
+        assert_eq!(telemetry.completion_rows, 0);
+        assert_eq!(telemetry.gated_sample_groups, 1);
+        assert_eq!(telemetry.gated_completion_rows, 4);
+        assert!(!telemetry.policy_update_applied);
+        assert_eq!(
+            telemetry.policy_skip_reason.as_deref(),
+            Some("positive_advantage_gate")
+        );
+    }
+
+    fn strict_policy_advantage_gate_config() -> crate::config::train::RuliadVerifierRewardConfig {
+        crate::config::train::RuliadVerifierRewardConfig {
+            positive_advantage_requires_correctness: true,
+            positive_advantage_min_partial_progress_ppm: 500_000,
+            positive_advantage_min_completion_quality_ppm: 750_000,
+            ..Default::default()
+        }
+    }
+
+    fn policy_score(
+        status: burn_dragon_universality::ruliad::RuliadAnswerStatus,
+        partial_progress_ppm: usize,
+        completion_quality_ppm: usize,
+    ) -> burn_dragon_universality::ruliad::RuliadReasoningScore {
+        let expected_field_count = 4;
+        let correct_field_count = partial_progress_ppm
+            .saturating_mul(expected_field_count)
+            .div_ceil(1_000_000)
+            .min(expected_field_count);
+        burn_dragon_universality::ruliad::RuliadReasoningScore {
+            version: burn_dragon_universality::ruliad::RULIAD_REASONING_SCORE_VERSION,
+            status,
+            correct_field_count,
+            expected_field_count,
+            observed_field_count: correct_field_count,
+            partial_progress_ppm,
+            certificate_valid_prefix_steps: 0,
+            certificate_expected_steps: 0,
+            certificate_prefix_ppm: 0,
+            generated_token_count: if partial_progress_ppm > 0 { 8 } else { 1 },
+            hash_canary: false,
+            answer_terminated: status
+                != burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+            completion_quality_ppm,
+        }
+    }
+
+    #[test]
+    fn ruliad_rollout_recovery_signal_accepts_wrong_and_malformed_corruptions() {
+        let partial = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            500_000,
+            1_000_000,
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &partial, 500_000, 750_000,
+            )
+        );
+
+        let mut schema_wrong = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            0,
+            1_000_000,
+        );
+        schema_wrong.observed_field_count = 1;
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &schema_wrong,
+                500_000,
+                750_000,
+            )
+        );
+
+        let malformed = policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+            0,
+            1_000_000,
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &malformed, 0, 0,
+            )
+        );
+        assert!(
+            !LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &malformed, 0, 1_000_001,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_blocks_positive_wrong_schema() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                500_000,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [-0.4, 0.9];
+        assert!(
+            LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+        assert_eq!(advantages[0], -0.4);
+        assert_eq!(advantages[1], 0.0);
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_all_wrong_groups() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Malformed,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [0.9, -0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_weak_partial_groups() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                250_000,
+                1_000_000,
+            ),
+            policy_score(
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                0,
+                1_000_000,
+            ),
+        ];
+        let mut advantages = [0.9, -0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_policy_advantage_guard_skips_low_quality_partials() {
+        let config = strict_policy_advantage_gate_config();
+        let scores = vec![policy_score(
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            500_000,
+            250_000,
+        )];
+        let mut advantages = [0.9];
+        assert!(
+            !LanguageTrainModel::<TestBackend>::constrain_ruliad_policy_advantages(
+                &scores,
+                &mut advantages,
+                config,
+            )
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_supports_vpo_mode() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 11);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                kl_weight: 0.0,
+                vpo_scalarizations: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let vpo_config = crate::config::train::RuliadVerifierRewardConfig {
+            enabled: true,
+            mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+            vpo_correctness_mass_floor: 0.70,
+            vpo_schema_quality_mass_floor: 0.10,
+            vpo_completion_health_mass_floor: 0.10,
+            vpo_compactness_max_weight: 0.05,
+            ..Default::default()
+        };
+        let scalarizations = model.ruliad_vpo_scalarizations(17, 4, vpo_config);
+        assert_eq!(scalarizations.len(), 4);
+        for scalarization in scalarizations {
+            assert!(
+                scalarization.iter().all(|weight| *weight >= 0.0),
+                "VPO scalarization weights should be non-negative"
+            );
+            let sum = scalarization.iter().sum::<f32>();
+            assert!(
+                (sum - 1.0).abs() < 1.0e-5,
+                "VPO scalarization should sum to one, got {sum}"
+            );
+            let correctness_mass = scalarization[0..=4].iter().sum::<f32>();
+            let schema_mass = scalarization[6];
+            let health_mass = scalarization[8..=9].iter().sum::<f32>();
+            assert!(
+                correctness_mass >= 0.70 - 1.0e-5,
+                "correctness mass floor should hold, got {correctness_mass}"
+            );
+            assert!(
+                schema_mass >= 0.10 - 1.0e-5,
+                "schema-quality mass floor should hold, got {schema_mass}"
+            );
+            assert!(
+                health_mass >= 0.10 - 1.0e-5,
+                "health mass floor should hold, got {health_mass}"
+            );
+            assert!(
+                scalarization[5] <= 0.05 + 1.0e-5,
+                "compactness weight should be capped"
+            );
+        }
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 17,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("VPO verifier policy loss");
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "VPO verifier policy loss should be finite: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_can_include_oracle_candidate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.1,
+                    group_size: 2,
+                    max_completion_tokens: 16,
+                    every_steps: 1,
+                    top_k: 1,
+                    kl_weight: 0.0,
+                    vpo_scalarizations: 4,
+                    positive_advantage_requires_correctness: true,
+                    positive_advantage_min_partial_progress_ppm: 500_000,
+                    positive_advantage_min_completion_quality_ppm: 750_000,
+                    include_oracle_candidate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 29,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 32)
+            .expect("oracle VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["oracle_sample_groups"], 1);
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["oracle_truncated_completion_rows"], 0);
+        assert_eq!(value["policy_update_applied"], true);
+        assert!(
+            value["vector_semantic_match_mean"]
+                .as_f64()
+                .expect("semantic mean")
+                > 0.0,
+            "oracle candidate should provide a correctness-positive row"
+        );
+    }
+
+    #[test]
+    fn ruliad_rollout_recovery_accepts_malformed_and_missing_corruptions() {
+        use burn_dragon_universality::ruliad::RuliadAnswerStatus;
+
+        let min_partial = 500_000;
+        let min_quality = 750_000;
+        let accepts = |status, partial, quality| {
+            LanguageTrainModel::<TestBackend>::ruliad_score_has_rollout_recovery_signal(
+                &ruliad_test_score(status, partial, quality),
+                min_partial,
+                min_quality,
+            )
+        };
+
+        assert!(accepts(
+            RuliadAnswerStatus::SchemaValidWrong,
+            0,
+            min_quality
+        ));
+        assert!(accepts(RuliadAnswerStatus::Malformed, 0, min_quality));
+        assert!(accepts(RuliadAnswerStatus::Missing, 0, min_quality));
+        assert!(accepts(
+            RuliadAnswerStatus::Partial,
+            min_partial,
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::Partial,
+            min_partial.saturating_sub(1),
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::Malformed,
+            0,
+            min_quality.saturating_sub(1)
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::VerifierMatch,
+            1_000_000,
+            min_quality
+        ));
+        assert!(!accepts(
+            RuliadAnswerStatus::SemanticMatch,
+            1_000_000,
+            min_quality
+        ));
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_mutate_prompt_bound_fields() {
+        let negatives = LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers(
+            "ok=1;l=17;r=17",
+            3,
+        );
+
+        assert_eq!(negatives.len(), 3);
+        assert!(negatives.iter().all(|answer| answer != "ok=1;l=17;r=17"));
+        assert!(
+            negatives.iter().any(|answer| answer.starts_with("ok=0")),
+            "boolean fields should be mutated into plausible wrong answers: {negatives:?}"
+        );
+        assert!(
+            negatives
+                .iter()
+                .any(|answer| answer.contains("l=19") || answer.contains("l=18")),
+            "numeric fields should be mutated without destroying the answer schema: {negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_include_template_collapse_hard_negatives() {
+        let proof_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "ok=1;l=17;r=17",
+                1,
+                2,
+            );
+        let proof_texts = proof_negatives
+            .iter()
+            .map(|(answer, _kind)| answer.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            proof_texts.contains(&"ok=1;l=5;r=5"),
+            "proof hard negatives should target the observed l=5/r=5 attractor: {proof_texts:?}"
+        );
+        assert!(
+            proof_texts.contains(&"ok=1;l=1;r=1"),
+            "proof hard negatives should target the observed l/r collapse: {proof_texts:?}"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|(_answer, kind)| *kind == RuliadStructuredNegativeKind::TemplateCollapse),
+            "template rows should be tracked separately"
+        );
+
+        let automaton_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "acc=1", 0, 2,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert_eq!(automaton_negatives, vec!["acc=0".to_string()]);
+
+        let eca_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "xlen=44;xalpha=01;xcounts=20,24;xedge=01",
+                0,
+                3,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=13;xalpha=abc;nfcounts=1,1,0;nfedge=ba"),
+            "ECA hard negatives should include the observed mixed x/nf lowercase attractor: {eca_negatives:?}"
+        );
+
+        let normal_form_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                "nflen=44;nfalpha=01;nfcounts=20,24;nfedge=01",
+                0,
+                3,
+            )
+            .into_iter()
+            .map(|(answer, _kind)| answer)
+            .collect::<Vec<_>>();
+        assert!(
+            normal_form_negatives
+                .iter()
+                .all(|answer| answer.contains("nfedge=") && !answer.contains("xedge=")),
+            "normal-form hard negatives should preserve the nfedge schema: {normal_form_negatives:?}"
+        );
+        assert!(
+            normal_form_negatives
+                .iter()
+                .any(|answer| answer == "nflen=5;nfalpha=abc;nfcounts=1,1,0;nfedge=ba"),
+            "normal-form hard negatives should include the observed lowercase normal-form attractor: {normal_form_negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_negative_answers_with_schema_include_contract_sibling_negatives() {
+        let negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_schema(
+                "xlen=44;xalpha=01;xcounts=20,24;xedge=01",
+                0,
+                0,
+                8,
+            );
+        assert_eq!(negatives.len(), 8);
+        assert!(
+            negatives
+                .iter()
+                .all(|(_answer, kind)| *kind == RuliadStructuredNegativeKind::SchemaCollapse),
+            "schema rows should be tracked separately: {negatives:?}"
+        );
+        let texts = negatives
+            .iter()
+            .map(|(answer, _kind)| answer.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.iter().any(|answer| answer.contains("nfalpha=")),
+            "schema-collapse negatives should expose sibling normal-form keys: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|answer| *answer == "xlen=44;xalpha=01;xcounts=20,24"),
+            "schema-collapse negatives should include missing-tail-field answers: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "xlen=44"),
+            "schema-collapse negatives should include first-field-only answer collapse: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "ok=1;l=1;r=1"),
+            "schema-collapse negatives should include the observed ok/l/r cross-contract prototype: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|answer| *answer == "acc=1"),
+            "schema-collapse negatives should include compact cross-contract prototypes: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|answer| *answer != "xlen=44;xalpha=01;xcounts=20,24;xedge=01"),
+            "schema-collapse negatives must not duplicate the oracle answer: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_answer_value_completion_mask_marks_only_answer_values() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_value_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "11717");
+    }
+
+    #[test]
+    fn ruliad_answer_key_completion_mask_marks_only_answer_keys() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_key_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "oklr");
+    }
+
+    #[test]
+    fn ruliad_answer_schema_completion_mask_marks_keys_and_field_separators() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "ok=1;l=17;r=17";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_schema_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "ok=;l=;r=");
+    }
+
+    #[test]
+    fn ruliad_answer_schema_start_completion_mask_marks_first_key_bytes() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let answer = "xlen=14;xalpha=01;xcounts=8,6;xedge=01";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R2]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_schema_start_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .collect::<String>();
+
+        assert_eq!(marked, "xxxx");
+    }
+
+    #[test]
+    fn ruliad_prompt_schema_value_rows_train_values_under_supplied_keys() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let prompt = tokenizer
+            .encode_payload("?:prove\n!:")
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+
+        let rows = LanguageTrainModel::<TestBackend>::ruliad_prompt_schema_value_completion_rows(
+            &tokenizer,
+            &prompt,
+            "ok=1;l=17;r=17",
+            32,
+            96,
+            8,
+        );
+
+        assert_eq!(rows.len(), 3);
+        let decoded_targets = rows
+            .iter()
+            .map(|(_inputs, targets, mask, active)| {
+                assert_eq!(*active, mask.iter().filter(|value| **value > 0.0).count());
+                let tokens = targets
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(token, active)| (*active > 0.0).then_some(*token as u32))
+                    .collect::<Vec<_>>();
+                tokenizer.decode_payload(&tokens, true)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            decoded_targets,
+            vec!["1;", "17;", "17\n[/R2]"],
+            "schema-forced value rows should target field values and close markers"
+        );
+    }
+
+    #[test]
+    fn ruliad_schema_collapse_negative_answers_cover_sibling_contracts() {
+        let eca_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_schema_collapse_negative_answers(
+                "xlen=14;xalpha=01;xcounts=8,6;xedge=01",
+            );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=14;xalpha=01;xcounts=8,6"),
+            "ECA schema negatives should include tail-field omission: {eca_negatives:?}"
+        );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "xlen=14;nfalpha=01;nfcounts=8,6;xedge=01"),
+            "ECA schema negatives should include the observed x/nf mixed-key collapse: {eca_negatives:?}"
+        );
+        assert!(
+            eca_negatives
+                .iter()
+                .any(|answer| answer == "nflen=14;nfalpha=01;nfcounts=8,6;nfedge=01"),
+            "ECA schema negatives should include the full sibling rewrite contract: {eca_negatives:?}"
+        );
+
+        let proof_negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_schema_collapse_negative_answers(
+                "ok=1;l=17;r=17",
+            );
+        assert_eq!(
+            &proof_negatives[..2],
+            ["ok=1;l=17".to_string(), "ok=1".to_string()],
+            "proof-specific truncation negatives should remain first"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|answer| answer.starts_with("xlen=")),
+            "proof negatives should include the ECA sibling contract: {proof_negatives:?}"
+        );
+        assert!(
+            proof_negatives
+                .iter()
+                .any(|answer| answer.starts_with("nflen=")),
+            "proof negatives should include the normal-form sibling contract: {proof_negatives:?}"
+        );
+        assert!(
+            proof_negatives.iter().any(|answer| answer == "acc=0"),
+            "proof negatives should include the acceptance sibling contract: {proof_negatives:?}"
+        );
+    }
+
+    #[test]
+    fn ruliad_trim_prompt_for_completion_preserves_maximum_context() {
+        let prompt = vec![10, 11, 12, 13, 14, 15, 16, 17];
+        let trimmed =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 3, 7);
+        assert_eq!(trimmed, vec![14, 15, 16, 17]);
+
+        let untrimmed =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 2, 16);
+        assert_eq!(untrimmed, prompt);
+
+        let overlong_completion =
+            LanguageTrainModel::<TestBackend>::ruliad_trim_prompt_for_completion(&prompt, 99, 7);
+        assert_eq!(overlong_completion, vec![17]);
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_supports_structured_symbolic_tokenizer() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let mut config = tiny_model_config();
+        config.vocab_size = 512;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 1,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                    vocab_size: 512,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let prompt_tokens = tokenizer
+            .encode_payload("?:ss\n!:")
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens,
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 512,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured symbolic contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contrast loss should be finite: {loss}");
+        assert!(loss > 0.0, "contrast loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_can_include_structured_negative_candidates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.1,
+                    group_size: 2,
+                    max_completion_tokens: 24,
+                    every_steps: 1,
+                    top_k: 1,
+                    kl_weight: 0.0,
+                    vpo_scalarizations: 4,
+                    positive_advantage_requires_correctness: true,
+                    positive_advantage_min_partial_progress_ppm: 500_000,
+                    positive_advantage_min_completion_quality_ppm: 750_000,
+                    include_oracle_candidate: true,
+                    include_structured_negative_candidates: true,
+                    structured_negative_count: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 31,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 48)
+            .expect("structured-negative VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["structured_negative_completion_rows"], 2);
+        assert_eq!(value["policy_update_applied"], true);
+        assert!(
+            value["completion_rows"].as_u64().expect("completion rows") >= 3,
+            "oracle plus structured negatives should contribute trainable policy rows"
+        );
+        assert!(
+            value["vector_schema_quality_mean"]
+                .as_f64()
+                .expect("schema quality")
+                > 0.0,
+            "structured negatives should remain parseable enough to teach field binding"
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_rollout_imitation_writes_skip_telemetry_for_wrong_generations() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 20);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_rollout_imitation.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    group_size: 2,
+                    max_completion_tokens: 8,
+                    top_k: 1,
+                    rollout_imitation_weight: 0.05,
+                    rollout_imitation_every_steps: 1,
+                    rollout_imitation_min_partial_progress_ppm: 500_000,
+                    rollout_imitation_min_completion_quality_ppm: 750_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_verifier_rollout_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 33,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        assert!(
+            model
+                .ruliad_verifier_rollout_imitation_loss(&policy_batch, &device, 16)
+                .is_none(),
+            "wrong generated completions should not be reinforced"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        let skip_reason = value["skip_reason"].as_str();
+        assert!(
+            matches!(
+                skip_reason,
+                Some("no_candidate_completion") | Some("rollout_health_gate")
+            ),
+            "unexpected skip reason: {skip_reason:?}"
+        );
+        assert_eq!(value["accepted_completion_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_imitation_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_recovery_rows"].as_u64(), Some(0));
+        let candidate_rows = value["candidate_completion_rows"]
+            .as_u64()
+            .expect("candidate rows");
+        if skip_reason == Some("rollout_health_gate") {
+            assert!(candidate_rows > 0);
+        } else {
+            assert_eq!(candidate_rows, 0);
+        }
+        assert_eq!(value["health_gate_passed"].as_bool(), Some(false));
+        assert!(
+            value["generated_completion_rows"]
+                .as_u64()
+                .expect("generated rows")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_rollout_recovery_accepts_generated_malformed_prefixes() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 23);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_rollout_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    group_size: 1,
+                    max_completion_tokens: 1,
+                    top_k: 1,
+                    rollout_recovery_weight: 0.05,
+                    rollout_imitation_weight: 0.0,
+                    rollout_imitation_every_steps: 1,
+                    rollout_imitation_min_partial_progress_ppm: 0,
+                    rollout_imitation_min_completion_quality_ppm: 0,
+                    rollout_imitation_max_rows_per_step: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_verifier_rollout_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 37,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "rewrite".to_string(),
+            task_kind: "rewrite_normal_form".to_string(),
+            math_domains: vec!["symbolic_rewriting".to_string()],
+            reasoning_modes: vec!["normalization".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "nflen=3;nfalpha=ABC;nfcounts=1,1,1;nfedge=AB".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_verifier_rollout_imitation_loss(&policy_batch, &device, 16)
+            .expect("malformed rollout should create an oracle recovery row");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["accepted_imitation_rows"].as_u64(), Some(0));
+        assert_eq!(value["accepted_recovery_rows"].as_u64(), Some(1));
+        let malformed = value["recovery_malformed_rows"]
+            .as_u64()
+            .unwrap_or_default();
+        let missing = value["recovery_missing_rows"].as_u64().unwrap_or_default();
+        let schema_wrong = value["recovery_schema_wrong_rows"]
+            .as_u64()
+            .unwrap_or_default();
+        let partial = value["recovery_partial_rows"].as_u64().unwrap_or_default();
+        assert_eq!(malformed + missing + schema_wrong + partial, 1);
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_scores_oracle_against_field_negatives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 21);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 2,
+                    structured_contrast_start_after_steps: 4,
+                    structured_contrast_margin: 0.25,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 2,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 37,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=44;xalpha=01;xcounts=20,24;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "contrast loss should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "contrast loss should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured answer contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(loss.is_finite(), "contrast loss should be finite: {loss}");
+        assert!(loss > 0.0, "contrast loss should be non-zero: {loss}");
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_scores_schema_negatives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 35);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 0,
+                    structured_template_negative_count: 0,
+                    structured_schema_negative_count: 4,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 56,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=14;xalpha=01;xcounts=8,6;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("schema-only structured answer contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["field_negative_completion_rows"], 0);
+        assert_eq!(value["template_negative_completion_rows"], 0);
+        assert!(
+            value["schema_negative_completion_rows"]
+                .as_u64()
+                .expect("schema rows")
+                > 0
+        );
+        assert!(
+            value["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("schema discriminative tokens")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_loss_scores_prompt_counterfactuals() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 24);
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 2,
+                    field_binding_contrast_start_after_steps: 4,
+                    field_binding_contrast_margin: 0.25,
+                    field_binding_contrast_max_pairs: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 43,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 44,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "ok=1;l=19;r=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: item_a,
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: item_b,
+                    prompt_tokens: vec![1, 2, 4],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        model.gradient_scale_step.store(3, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "field-binding contrast should respect start_after_steps"
+        );
+        model.gradient_scale_step.store(5, Ordering::Relaxed);
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+                .is_none(),
+            "field-binding contrast should respect every_steps cadence"
+        );
+        model.gradient_scale_step.store(6, Ordering::Relaxed);
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+
+        let loss = tensor_scalar(loss);
+        assert!(
+            loss.is_finite(),
+            "field-binding contrast loss should be finite: {loss}"
+        );
+        assert!(
+            loss > 0.0,
+            "field-binding contrast loss should be non-zero: {loss}"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_loss_writes_activity_and_skip_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 25);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 45,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 46,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "ok=1;l=19;r=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: item_a.clone(),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: item_b,
+                    prompt_tokens: vec![1, 2, 4],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+
+        let item_c = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h2".to_string(),
+            sample_index: 47,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "custom".to_string(),
+            task_kind: "field_binding".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:c\n!:".to_string(),
+            expected_answer: "v=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let one_sample_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_c,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&one_sample_batch, &device, 64)
+                .is_none(),
+            "single oracle sample without a template schema should not produce a counterfactual pair"
+        );
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let active: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("active telemetry json");
+        assert_eq!(active["sample_groups"], 2);
+        assert!(
+            active["prompt_pairs"].as_u64().expect("prompt pairs") >= 2,
+            "template hard negatives may add extra field-binding rows"
+        );
+        assert!(
+            active["contrast_pairs"].as_u64().expect("contrast pairs") >= 2,
+            "template hard negatives may add extra contrast pairs"
+        );
+        assert!(
+            active["candidate_pairs"].as_u64().expect("candidate pairs") >= 2,
+            "template hard negatives may add extra candidates"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 2,
+            "template hard negatives should be included in the pool"
+        );
+        assert_eq!(active["replay_pool_size"], 0);
+        assert_eq!(active["replay_contrast_pairs"], 0);
+        assert!(
+            active["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative tokens")
+                > 0
+        );
+        assert!(
+            active["rank_metric_pairs"].as_u64().expect("rank pairs") >= 2,
+            "active field-binding telemetry should rank natural and/or template pairs"
+        );
+        assert!(
+            active["rank_metric_tokens"].as_u64().expect("rank tokens") > 0,
+            "active field-binding telemetry should include rank-token evidence"
+        );
+        let positive_fraction = active["positive_token_fraction"]
+            .as_f64()
+            .expect("positive token fraction");
+        assert!(
+            (0.0..=1.0).contains(&positive_fraction),
+            "positive token fraction should be bounded: {positive_fraction}"
+        );
+        assert!(
+            active["logit_margin_mean"]
+                .as_f64()
+                .expect("margin mean")
+                .is_finite(),
+            "rank telemetry should include a finite margin mean"
+        );
+        let skipped: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("skip telemetry json");
+        assert_eq!(
+            skipped["skip_reason"].as_str(),
+            Some("no_counterfactual_pairs")
+        );
+        assert_eq!(skipped["contrast_pairs"], 0);
+        assert_eq!(skipped["rank_metric_tokens"], 0);
+        assert!(skipped["logit_margin_mean"].is_null());
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_template_negatives_for_single_sample() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 33);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 54,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("template hard negatives should provide a single-sample contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["contrast_pairs"].as_u64().expect("contrast pairs") > 0,
+            "template hard negatives should create contrast rows"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 1,
+            "template hard negatives should augment the natural single-answer pool"
+        );
+        assert_eq!(active["replay_pool_size"], 0);
+        assert_eq!(active["replay_contrast_pairs"], 0);
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_schema_negatives_for_single_sample() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 34);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 55,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "eca".to_string(),
+            task_kind: "multi_step_state".to_string(),
+            math_domains: vec!["computation".to_string()],
+            reasoning_modes: vec!["iterated".to_string()],
+            prompt: "?:eca\n!:".to_string(),
+            expected_answer: "xlen=14;xalpha=01;xcounts=8,6;xedge=01".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("schema hard negatives should provide a single-sample contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative key tokens")
+                >= 4,
+            "schema negatives should activate key-token contrast"
+        );
+        assert!(
+            active["negative_pool_size"]
+                .as_u64()
+                .expect("negative pool size")
+                > 1,
+            "schema hard negatives should augment the natural single-answer pool"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_prefers_most_discriminative_pairs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 32);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 1,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let make_item = |sample_index, answer: &str| burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: format!("h{sample_index}"),
+            sample_index,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: format!("?:sample{sample_index}\n!:"),
+            expected_answer: answer.to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(51, "ok=1;l=17;r=17"),
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(52, "ok=1;l=19;r=19"),
+                    prompt_tokens: vec![1, 2, 4],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: make_item(53, "ok=0;l=00;r=00"),
+                    prompt_tokens: vec![1, 2, 5],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("field-binding contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+
+        assert_eq!(active["contrast_pairs"], 1);
+        assert_eq!(
+            active["contrast_discriminative_tokens"], 9,
+            "one-pair field-binding budget should select the strongest value counterfactual"
+        );
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_replay_for_single_sample_batches() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 26);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 4,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item_a = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 47,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:a\n!:".to_string(),
+            expected_answer: "v=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let item_b = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h1".to_string(),
+            sample_index: 48,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:b\n!:".to_string(),
+            expected_answer: "v=19".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+            vocab_size: 257,
+            eos_id: None,
+        };
+        let first_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_a,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: tokenization.clone(),
+            stop_token_id: None,
+        };
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&first_batch, &device, 64)
+                .is_none(),
+            "first single-sample batch should fill replay but have no contrast pair"
+        );
+
+        let second_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item: item_b,
+                prompt_tokens: vec![1, 2, 4],
+            }],
+            tokenization,
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&second_batch, &device, 64)
+            .expect("replay should provide a counterfactual pair");
+        assert!(tensor_scalar(loss).is_finite());
+
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let replay_active: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("replay telemetry json");
+        assert_eq!(replay_active["sample_groups"], 1);
+        assert_eq!(replay_active["contrast_pairs"], 1);
+        assert_eq!(replay_active["candidate_pairs"], 1);
+        assert_eq!(replay_active["replay_pool_size"], 1);
+        assert_eq!(replay_active["replay_contrast_pairs"], 1);
+        assert!(
+            replay_active["rank_metric_tokens"]
+                .as_u64()
+                .expect("rank tokens")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_generated_attractor_replay_tracks_repeated_wrong_answers() {
+        let mut replay = RuliadGeneratedAttractorReplay::default();
+        let key = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=5;r=5".to_string(),
+        };
+        assert!(replay.record(
+            key.clone(),
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            1,
+            8,
+        ));
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=17;r=17",
+                    2,
+                    4,
+                    1,
+                    1.0,
+                )
+                .is_empty()
+        );
+        assert!(replay.record(
+            key,
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+            2,
+            8,
+        ));
+        let candidates = replay.candidates_for(
+            "proof_tree",
+            "prove_theorem",
+            "ok;l;r",
+            "ok=1;l=17;r=17",
+            2,
+            4,
+            1,
+            1.0,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].count, 2);
+        assert_eq!(candidates[0].key.answer, "ok=1;l=5;r=5");
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=5;r=5",
+                    2,
+                    4,
+                    1,
+                    1.0,
+                )
+                .is_empty()
+        );
+        let summary = replay.summary(2);
+        assert_eq!(summary.pool_size, 1);
+        assert_eq!(summary.active_count, 1);
+        assert_eq!(summary.active_observation_count, 2);
+        assert_eq!(summary.dominant_count, 2);
+        assert_eq!(summary.distinct_answers, 1);
+    }
+
+    #[test]
+    fn ruliad_generated_attractor_replay_requires_diverse_answers() {
+        let mut replay = RuliadGeneratedAttractorReplay::default();
+        let key_a = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=5;r=5".to_string(),
+        };
+        let key_b = RuliadGeneratedAttractorKey {
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            contract: "ok;l;r".to_string(),
+            answer: "ok=1;l=9;r=9".to_string(),
+        };
+        for step_index in 1..=3 {
+            assert!(replay.record(
+                key_a.clone(),
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+                step_index,
+                8,
+            ));
+        }
+        assert!(replay.record(
+            key_b.clone(),
+            burn_dragon_universality::ruliad::RuliadAnswerStatus::SchemaValidWrong,
+            4,
+            8,
+        ));
+
+        let dominated_summary = replay.summary(1);
+        assert_eq!(
+            dominated_summary.diversity_skip_reason(2, 0.5),
+            Some("generated_attractor_dominant_answer")
+        );
+        assert!(
+            replay
+                .candidates_for(
+                    "proof_tree",
+                    "prove_theorem",
+                    "ok;l;r",
+                    "ok=1;l=17;r=17",
+                    1,
+                    4,
+                    2,
+                    0.5,
+                )
+                .is_empty()
+        );
+
+        for step_index in 5..=6 {
+            assert!(replay.record(
+                key_b.clone(),
+                burn_dragon_universality::ruliad::RuliadAnswerStatus::Partial,
+                step_index,
+                8,
+            ));
+        }
+        let balanced_summary = replay.summary(1);
+        assert_eq!(balanced_summary.dominant_fraction(), 0.5);
+        assert_eq!(balanced_summary.diversity_skip_reason(2, 0.5), None);
+        let candidates = replay.candidates_for(
+            "proof_tree",
+            "prove_theorem",
+            "ok;l;r",
+            "ok=1;l=17;r=17",
+            1,
+            4,
+            2,
+            0.5,
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_uses_generated_attractor_replay() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 38);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let attractor_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_generated_attractor_replay.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.01,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 16,
+                    field_binding_contrast_replay_capacity: 0,
+                    generated_attractor_replay_capacity: 8,
+                    generated_attractor_replay_min_count: 1,
+                    generated_attractor_replay_max_candidates: 4,
+                    generated_attractor_replay_min_distinct_answers: 1,
+                    generated_attractor_replay_max_dominant_fraction: 1.0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()))
+            .with_ruliad_generated_attractor_telemetry_path(Some(attractor_telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 61,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let sample = crate::dataset::RuliadPolicySample {
+            item,
+            prompt_tokens: vec![1, 2, 3],
+        };
+        let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+            &sample.item,
+            Some("ok=1;l=5;r=5\n[/R2]"),
+        );
+        assert!(
+            model.record_ruliad_generated_attractor(&sample, "ok=1;l=5;r=5\n[/R2]", &score, 3,)
+        );
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![sample],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
+            .expect("generated attractor should provide a contrast pair");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("field telemetry");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(active["sample_groups"], 1);
+        assert!(
+            active["generated_attractor_negative_pool_size"]
+                .as_u64()
+                .expect("generated attractor pool")
+                >= 1
+        );
+        assert!(
+            active["generated_attractor_contrast_pairs"]
+                .as_u64()
+                .expect("generated attractor pairs")
+                >= 1
+        );
+        let attractor_content =
+            std::fs::read_to_string(&attractor_telemetry_path).expect("attractor telemetry");
+        let replay_event: serde_json::Value =
+            serde_json::from_str(attractor_content.lines().next().expect("attractor line"))
+                .expect("attractor telemetry json");
+        assert_eq!(replay_event["source"], "field_binding");
+        assert!(
+            replay_event["selected_field_binding_pairs"]
+                .as_u64()
+                .expect("selected field-binding pairs")
+                >= 1
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_uses_generated_attractor_replay_candidates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 39);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let attractor_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_generated_attractor_replay.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                    weight: 0.01,
+                    group_size: 2,
+                    every_steps: 1,
+                    include_oracle_candidate: true,
+                    generated_attractor_replay_capacity: 8,
+                    generated_attractor_replay_min_count: 1,
+                    generated_attractor_replay_max_candidates: 4,
+                    generated_attractor_replay_min_distinct_answers: 1,
+                    generated_attractor_replay_max_dominant_fraction: 1.0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()))
+            .with_ruliad_generated_attractor_telemetry_path(Some(attractor_telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 62,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:single\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let sample = crate::dataset::RuliadPolicySample {
+            item,
+            prompt_tokens: vec![1, 2, 3],
+        };
+        let score = burn_dragon_universality::ruliad::score_ruliad_item_completion(
+            &sample.item,
+            Some("ok=1;l=5;r=5\n[/R2]"),
+        );
+        assert!(
+            model.record_ruliad_generated_attractor(&sample, "ok=1;l=5;r=5\n[/R2]", &score, 4,)
+        );
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![sample],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 64)
+            .expect("policy loss should include generated-attractor candidate");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("policy telemetry");
+        let active: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("policy telemetry json");
+        assert!(
+            active["generated_attractor_completion_rows"]
+                .as_u64()
+                .expect("generated attractor candidate rows")
+                >= 1
+        );
+        let attractor_content =
+            std::fs::read_to_string(&attractor_telemetry_path).expect("attractor telemetry");
+        let replay_event: serde_json::Value =
+            serde_json::from_str(attractor_content.lines().next().expect("attractor line"))
+                .expect("attractor telemetry json");
+        assert_eq!(replay_event["source"], "policy");
+        assert!(
+            replay_event["selected_candidate_rows"]
+                .as_u64()
+                .expect("selected candidates")
+                >= 1
+        );
+    }
+
+    #[test]
+    fn ruliad_structured_answer_contrast_loss_writes_activity_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 23);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    structured_contrast_weight: 0.25,
+                    structured_contrast_every_steps: 1,
+                    structured_negative_count: 2,
+                    structured_template_negative_count: 2,
+                    structured_schema_negative_count: 2,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 41,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        let loss = model
+            .ruliad_structured_answer_contrast_loss(&policy_batch, &device, 64)
+            .expect("structured answer contrast loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["sample_groups"], 1);
+        assert_eq!(value["oracle_completion_rows"], 1);
+        assert_eq!(value["field_negative_completion_rows"], 2);
+        assert_eq!(value["template_negative_completion_rows"], 2);
+        assert_eq!(value["schema_negative_completion_rows"], 2);
+        assert_eq!(value["contrast_pairs"], 6);
+        assert!(
+            value["contrast_discriminative_tokens"]
+                .as_u64()
+                .expect("discriminative tokens")
+                > 0
+        );
+    }
+
+    #[test]
+    fn ruliad_verifier_policy_loss_writes_reward_telemetry() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 13);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_verifier_policy.jsonl");
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                enabled: true,
+                mode: crate::config::train::RuliadVerifierRewardMode::VpoIndependent,
+                weight: 0.1,
+                group_size: 2,
+                max_completion_tokens: 2,
+                every_steps: 1,
+                top_k: 1,
+                kl_weight: 0.0,
+                vpo_scalarizations: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_ruliad_policy_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 23,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "law".to_string(),
+            task_kind: "category_law".to_string(),
+            math_domains: vec!["category".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:q\n!:".to_string(),
+            expected_answer: "ok=1".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+        let loss = model
+            .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
+            .expect("VPO verifier policy loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let line = content.lines().next().expect("telemetry line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("telemetry json");
+        assert_eq!(value["mode"], "vpo_independent");
+        assert_eq!(value["scalarization_count"], 4);
+        assert_eq!(value["completion_rows"], 2);
+        assert!(
+            value["reward_mean"]
+                .as_f64()
+                .expect("reward mean")
+                .is_finite(),
+            "reward mean should be finite"
+        );
+    }
+
+    #[test]
+    fn dynamics_anchor_penalizes_teacher_distribution_drift() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let anchored = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_dynamics_anchor(DynamicsAnchorConfig {
+            enabled: true,
+            weight: 1.0,
+            teacher_update_rate: 0.0,
+            kl: SelfDistillationKlKind::Forward,
+            ..Default::default()
+        });
+        let student_logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 8.0, 0.0], [1, 2, 2]),
+            &device,
+        );
+        let teacher_logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 8.0, 0.0, 8.0], [1, 2, 2]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 0], [1, 2]), &device);
+
+        let ce = tensor_scalar(plain.next_token_loss_from_logits(
+            student_logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        let anchored_loss = tensor_scalar(anchored.next_token_loss_from_logits(
+            student_logits,
+            targets,
+            clean_inputs,
+            None,
+            Some(teacher_logits),
+        ));
+
+        assert!(
+            anchored_loss > ce + 6.0,
+            "anchor should add KL pressure when student diverges from teacher: ce={ce} anchored={anchored_loss}"
+        );
+    }
+
+    #[test]
+    fn dynamics_anchor_context_mask_uses_unsupervised_tokens() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_dynamics_anchor(DynamicsAnchorConfig {
+            enabled: true,
+            weight: 1.0,
+            mask: DynamicsAnchorMask::ContextTokens,
+            ..Default::default()
+        });
+        let target_mask = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 0, 1], [1, 3]),
+            &device,
+        );
+        let context_mask = model
+            .dynamics_anchor_mask(Some(target_mask))
+            .expect("context mask")
+            .to_data()
+            .convert::<i64>()
+            .into_vec::<i64>()
+            .expect("mask values");
+
+        assert_eq!(context_mask, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn repeat_unlikelihood_penalizes_wrong_copy_predictions() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let repeat_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![5.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let penalized =
+            repeat_penalized.next_token_loss_from_logits(logits, targets, clean_inputs, None, None);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "repeat unlikelihood should increase loss for wrong-copy logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_penalizes_overconfident_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let entropy_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 2.0,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let penalized = entropy_penalized.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            None,
+            None,
+        );
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "entropy floor should increase loss for overconfident logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_respects_every_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let throttled = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 2.0,
+            every_steps: 4,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = tensor_scalar(plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        throttled
+            .gradient_scale_step
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let off_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        throttled
+            .gradient_scale_step
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        let on_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            None,
+            None,
+        ));
+        assert!(
+            (off_cadence - ce).abs() < 1.0e-5,
+            "off-cadence entropy loss should match CE: ce={ce} off={off_cadence}"
+        );
+        assert!(
+            on_cadence > ce,
+            "on-cadence entropy loss should add penalty: ce={ce} on={on_cadence}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_does_not_penalize_logits_above_floor() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let entropy_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            weight: 0.5,
+            target_entropy_bits: 1.0,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::zeros([1, 2, 4], &device);
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let penalized = entropy_penalized.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            None,
+            None,
+        );
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            (penalized_value - ce_value).abs() < 1.0e-5,
+            "entropy floor should not penalize logits already above the floor: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn marginal_entropy_floor_penalizes_collapsed_batch_distribution() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let collapsed = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0, //
+                    8.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let diverse = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    8.0, 0.0, 0.0, 0.0, //
+                    0.0, 8.0, 0.0, 0.0, //
+                    0.0, 0.0, 8.0, 0.0, //
+                    0.0, 0.0, 0.0, 8.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let collapsed_loss =
+            tensor_scalar(marginal_entropy_floor_loss_from_logits(collapsed, 2.0).expect("loss"));
+        let diverse_loss =
+            tensor_scalar(marginal_entropy_floor_loss_from_logits(diverse, 2.0).expect("loss"));
+        assert!(
+            collapsed_loss > diverse_loss + 1.0,
+            "marginal entropy should penalize collapsed predicted support: collapsed={collapsed_loss} diverse={diverse_loss}"
+        );
+    }
+
+    #[test]
+    fn target_marginal_coverage_penalizes_missing_batch_targets() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let collapsed = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let covered = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    0.0, 6.0, 0.0, 0.0, //
+                    0.0, 0.0, 6.0, 0.0, //
+                    0.0, 0.0, 0.0, 6.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let collapsed_loss = tensor_scalar(
+            target_marginal_coverage_loss_from_logits(collapsed, targets.clone(), 1.0e-8)
+                .expect("collapsed loss"),
+        );
+        let covered_loss = tensor_scalar(
+            target_marginal_coverage_loss_from_logits(covered, targets, 1.0e-8)
+                .expect("covered loss"),
+        );
+        assert!(
+            collapsed_loss > covered_loss + 2.0,
+            "target marginal coverage should penalize missing target support: collapsed={collapsed_loss} covered={covered_loss}"
+        );
+    }
+
+    #[test]
+    fn logit_entropy_floor_target_coverage_increases_training_loss() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let coverage_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_logit_entropy_floor(LogitEntropyFloorConfig {
+            enabled: true,
+            target_coverage_weight: 0.5,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0, //
+                    6.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 4, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let penalized = coverage_penalized.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            None,
+            None,
+        );
+        let ce_value = tensor_scalar(ce);
+        let penalized_value = tensor_scalar(penalized);
+        assert!(
+            penalized_value > ce_value,
+            "target coverage should increase loss for collapsed marginal support: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn repeat_unlikelihood_penalizes_configured_history_lags() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let immediate_only = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            ..Default::default()
+        });
+        let lagged = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            history_lags: vec![2],
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, //
+                    5.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 3, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2], [1, 3]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3], [1, 3]),
+            &device,
+        );
+        let immediate = immediate_only.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let lagged = lagged.next_token_loss_from_logits(logits, targets, clean_inputs, None, None);
+        let immediate_value = immediate
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("immediate")[0];
+        let lagged_value = lagged
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lagged")[0];
+        assert!(
+            lagged_value > immediate_value,
+            "configured history lag should add unlikelihood loss: immediate={immediate_value} lagged={lagged_value}"
+        );
+    }
+
+    #[test]
+    fn repeat_cycle_lags_respect_budget_and_rotate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            cycle_weight: 0.5,
+            cycle_min_lag: 2,
+            cycle_max_lag: 16,
+            cycle_lags_per_step: 4,
+            ..Default::default()
+        });
+        let first = model.repeat_cycle_lags(16);
+        assert_eq!(first.len(), 4);
+        assert!(first.iter().all(|lag| (2..=16).contains(lag)));
+        model
+            .gradient_scale_step
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let second = model.repeat_cycle_lags(16);
+        assert_eq!(second.len(), 4);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn repeat_unlikelihood_respects_every_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let throttled = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            weight: 0.5,
+            every_steps: 4,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![5.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0], [1, 2, 4]),
+            &device,
+        );
+        let clean_inputs =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![0, 1], [1, 2]), &device);
+        let targets =
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(vec![1, 2], [1, 2]), &device);
+        let ce = tensor_scalar(plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        throttled
+            .gradient_scale_step
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let off_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        ));
+        throttled
+            .gradient_scale_step
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        let on_cadence = tensor_scalar(throttled.next_token_loss_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            None,
+            None,
+        ));
+        assert!(
+            (off_cadence - ce).abs() < 1.0e-5,
+            "off-cadence repeat loss should match CE: ce={ce} off={off_cadence}"
+        );
+        assert!(
+            on_cadence > ce,
+            "on-cadence repeat loss should add penalty: ce={ce} on={on_cadence}"
+        );
+    }
+
+    #[test]
+    fn repeat_cycle_unlikelihood_penalizes_wrong_cycle_predictions() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let plain = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ));
+        let cycle_penalized = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_repeat_unlikelihood(RepeatUnlikelihoodConfig {
+            enabled: true,
+            cycle_weight: 0.5,
+            cycle_margin_weight: 0.5,
+            cycle_margin: 0.05,
+            cycle_min_lag: 2,
+            cycle_max_lag: 2,
+            cycle_lags_per_step: 1,
+            ..Default::default()
+        });
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, //
+                    5.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ],
+                [1, 3, 4],
+            ),
+            &device,
+        );
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2], [1, 3]),
+            &device,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3], [1, 3]),
+            &device,
+        );
+        let ce = plain.next_token_loss_from_logits(
+            logits.clone(),
+            targets.clone(),
+            clean_inputs.clone(),
+            None,
+            None,
+        );
+        let penalized =
+            cycle_penalized.next_token_loss_from_logits(logits, targets, clean_inputs, None, None);
+        let ce_value = ce.to_data().convert::<f32>().into_vec::<f32>().expect("ce")[0];
+        let penalized_value = penalized
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("penalized")[0];
+        assert!(
+            penalized_value > ce_value,
+            "cycle unlikelihood should increase loss for wrong-cycle logits: ce={ce_value} penalized={penalized_value}"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_recovery_only_skips_stable_hot_path() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_greedy_rollout_unlikelihood(GreedyRolloutUnlikelihoodConfig {
+            enabled: true,
+            recovery_only: true,
+            weight: 0.5,
+            prompt_tokens: 1,
+            rollout_tokens: 1,
+            history_tokens: 1,
+            batch_prompts: 1,
+            every_steps: 1,
+            ..Default::default()
+        });
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [1, 4]),
+            &device,
+        );
+
+        assert!(
+            model
+                .greedy_rollout_unlikelihood_loss(clean_inputs.clone())
+                .is_none(),
+            "recovery-only rollout must not run during stable training"
+        );
+        model.set_recovery_auxiliary_active(true);
+        assert!(
+            model
+                .greedy_rollout_unlikelihood_loss(clean_inputs)
+                .is_some(),
+            "recovery-only rollout should run when dynamics enters recovery"
+        );
+    }
+
+    #[test]
+    fn greedy_rollout_sequence_recovery_runs_without_step_penalties() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_greedy_rollout_unlikelihood(GreedyRolloutUnlikelihoodConfig {
+            enabled: true,
+            sequence_recovery_weight: 0.5,
+            prompt_tokens: 2,
+            rollout_tokens: 2,
+            history_tokens: 2,
+            batch_prompts: 1,
+            every_steps: 1,
+            ..Default::default()
+        });
+        let clean_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3, 4], [1, 5]),
+            &device,
+        );
+
+        let loss = model
+            .greedy_rollout_unlikelihood_loss(clean_inputs)
+            .expect("sequence recovery should produce a rollout loss");
+        let loss = scalar_tensor_to_f64(loss.inner());
+        assert!(
+            loss.is_finite(),
+            "unexpected sequence recovery loss: {loss}"
+        );
+    }
+
+    #[test]
     fn sdft_train_step_runs_rollout_objective() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 7);
@@ -1657,6 +14403,995 @@ mod objective_step_tests {
         }));
         let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
         assert!(loss.is_finite(), "unexpected SDFT loss: {loss}");
+    }
+
+    #[test]
+    fn latent_reasoning_train_step_runs_next_token_objective() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 1;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![1],
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected latent reasoning loss: {loss}");
+    }
+
+    #[test]
+    fn train_step_writes_recovery_skip_telemetry_without_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            answer_denoising: RuliadAnswerDenoisingConfig {
+                enabled: true,
+                weight: 0.0,
+                structured_recovery_weight: 0.25,
+                structured_recovery_every_steps: 1,
+                structured_recovery_start_after_steps: 0,
+                structured_recovery_max_completion_tokens: 24,
+                structured_recovery_negative_count: 1,
+                structured_recovery_template_negative_count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(false));
+        assert_eq!(event["skip_reason"].as_str(), Some("missing_policy_batch"));
+    }
+
+    #[test]
+    fn train_step_runs_structured_recovery_with_tbptt_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_structured_recovery.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_tbptt_chunk_size(Some(4))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                answer_denoising: RuliadAnswerDenoisingConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    structured_recovery_weight: 0.25,
+                    structured_recovery_every_steps: 1,
+                    structured_recovery_start_after_steps: 0,
+                    structured_recovery_max_completion_tokens: 24,
+                    structured_recovery_negative_count: 1,
+                    structured_recovery_template_negative_count: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_structured_recovery_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 45,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:ss\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        });
+        let train_batch = SequenceBatch::new(
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(
+                    vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    [2, 8],
+                ),
+                &device,
+            ),
+            Tensor::<TestBackend, 2, Int>::from_data(
+                TensorData::new(
+                    vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                    [2, 8],
+                ),
+                &device,
+            ),
+            None,
+        )
+        .with_ruliad_policy_batch(Some(policy_batch));
+
+        let loss = scalar_loss(TrainStep::step(&model, train_batch));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(event["policy_batch_present"].as_bool(), Some(true));
+        assert!(
+            event["recovery_rows"].as_u64().unwrap_or_default() > 0,
+            "expected active recovery rows, event={event}"
+        );
+    }
+
+    #[test]
+    fn train_step_runs_field_binding_contrast_with_tbptt_policy_batch() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 37);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut config = tiny_model_config();
+        config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_tbptt_chunk_size(Some(8))
+            .with_tbptt_persist_across_steps(true)
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                mode: RuliadSupervisionMode::AnswerCompletion,
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_start_after_steps: 0,
+                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_replay_capacity: 0,
+                    max_completion_tokens: 24,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "h0".to_string(),
+            sample_index: 56,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "proof_tree".to_string(),
+            task_kind: "prove_theorem".to_string(),
+            math_domains: vec!["category".to_string(), "formal_proof".to_string()],
+            reasoning_modes: vec!["equational".to_string()],
+            prompt: "?:fb\n!:".to_string(),
+            expected_answer: "ok=1;l=17;r=17".to_string(),
+            difficulty_level: Some(0),
+            spec: None,
+        };
+        let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        });
+        let inputs = (0..64)
+            .map(|value| (value % 128) as i64)
+            .collect::<Vec<_>>();
+        let targets = (1..65)
+            .map(|value| (value % 128) as i64)
+            .collect::<Vec<_>>();
+        let train_batch = SequenceBatch::new(
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(inputs, [2, 32]), &device),
+            Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(targets, [2, 32]), &device),
+            None,
+        )
+        .with_ruliad_policy_batch(Some(policy_batch));
+
+        let loss = scalar_loss(TrainStep::step(&model, train_batch));
+        assert!(loss.is_finite(), "unexpected train loss: {loss}");
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let event: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("field-binding telemetry json");
+        assert_eq!(event["sample_groups"], 1);
+        assert!(
+            event["contrast_pairs"].as_u64().unwrap_or_default() > 0,
+            "expected active field-binding contrast rows under TBPTT, event={event}"
+        );
+        assert!(
+            event["rank_metric_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected field-binding rank telemetry under TBPTT, event={event}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_margin_loss_prefers_lower_positive_energy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let low_positive = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.1], [1, 2, 1]),
+            &device,
+        );
+        let high_negative = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, 2.5], [1, 2, 1]),
+            &device,
+        );
+        let high_positive = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, 2.5], [1, 2, 1]),
+            &device,
+        );
+        let low_negative = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.1], [1, 2, 1]),
+            &device,
+        );
+
+        let preferred = tensor_scalar(latent_energy_contrastive_margin_loss(
+            low_positive,
+            high_negative,
+            1.0,
+        ));
+        let inverted = tensor_scalar(latent_energy_contrastive_margin_loss(
+            high_positive,
+            low_negative,
+            1.0,
+        ));
+        assert!(
+            inverted > preferred + 2.0,
+            "contrastive energy should prefer low positives: preferred={preferred} inverted={inverted}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_monotonic_penalty_catches_ascending_energy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let previous = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0], [1, 2, 1]),
+            &device,
+        );
+        let descending = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.75, 0.5], [1, 2, 1]),
+            &device,
+        );
+        let ascending = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.25, 1.5], [1, 2, 1]),
+            &device,
+        );
+
+        let descending = tensor_scalar(latent_energy_monotonic_penalty(
+            previous.clone(),
+            descending,
+            0.0,
+        ));
+        let ascending = tensor_scalar(latent_energy_monotonic_penalty(previous, ascending, 0.0));
+        assert!(
+            descending <= 1.0e-6,
+            "descending energy should have no monotonic penalty: {descending}"
+        );
+        assert!(
+            ascending > 0.25,
+            "ascending energy should be penalized: {ascending}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_contractivity_penalty_catches_large_hidden_drift() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let target = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, -1.0], [1, 1, 2]),
+            &device,
+        );
+        let close = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.05, -0.95], [1, 1, 2]),
+            &device,
+        );
+        let far = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![3.0, -3.0], [1, 1, 2]),
+            &device,
+        );
+
+        let close = tensor_scalar(latent_energy_contractivity_penalty(
+            close,
+            target.clone(),
+            0.5,
+        ));
+        let far = tensor_scalar(latent_energy_contractivity_penalty(far, target, 0.5));
+        assert!(
+            close <= 1.0e-6,
+            "nearby hidden states should fit within the trust radius: {close}"
+        );
+        assert!(
+            far > close + 1.0,
+            "large hidden drift should be penalized: close={close} far={far}"
+        );
+    }
+
+    #[test]
+    fn latent_energy_model_train_step_runs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 2;
+        config.latent_reasoning.energy_head = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                energy_model: crate::config::LatentEnergyModelConfig {
+                    enabled: true,
+                    max_rollout_steps_for_loss: 2,
+                    ..Default::default()
+                },
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected latent EBM loss: {loss}");
+    }
+
+    #[test]
+    fn latent_step_contract_train_step_runs_and_records_components() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        crate::train::profile::reset();
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        config.latent_reasoning.min_steps = 2;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                step_contract: LatentStepContractConfig {
+                    enabled: true,
+                    max_rollout_steps_for_loss: 2,
+                    ce_weight: 0.1,
+                    monotonic_ce_weight: 0.5,
+                    contractive_weight: 0.05,
+                    ..Default::default()
+                },
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(
+            loss.is_finite(),
+            "unexpected latent step contract loss: {loss}"
+        );
+        let snapshot = crate::train::profile::take_latent_reasoning();
+        assert!(
+            snapshot.step_contract_components > 0,
+            "step contract should record active components: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_step_diagnostics_are_finite() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 3;
+        config.latent_reasoning.min_steps = 3;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device));
+
+        let diagnostics = model
+            .latent_reasoning_step_diagnostics(batch(&device))
+            .expect("latent diagnostics");
+        assert_eq!(diagnostics.step_loss.len(), 3);
+        assert_eq!(diagnostics.step_ce_delta.len(), 3);
+        assert_eq!(diagnostics.step_ce_monotonic_violation_rate.len(), 3);
+        assert_eq!(diagnostics.step_entropy_bits.len(), 3);
+        assert_eq!(diagnostics.step_delta_rms.len(), 3);
+        assert_eq!(diagnostics.step_raw_cosine.len(), 3);
+        for value in [
+            diagnostics.raw_loss,
+            diagnostics.final_loss,
+            diagnostics.raw_entropy_bits,
+            diagnostics.final_entropy_bits,
+            diagnostics.final_delta_rms,
+            diagnostics.final_raw_cosine,
+        ]
+        .into_iter()
+        .chain(diagnostics.step_loss)
+        .chain(diagnostics.step_ce_delta)
+        .chain(diagnostics.step_ce_monotonic_violation_rate)
+        .chain(diagnostics.step_entropy_bits)
+        .chain(diagnostics.step_delta_rms)
+        .chain(diagnostics.step_raw_cosine)
+        {
+            assert!(
+                value.is_finite(),
+                "diagnostic value was not finite: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn latent_reasoning_step_diagnostics_include_energy_when_head_enabled() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 3;
+        config.latent_reasoning.min_steps = 3;
+        config.latent_reasoning.energy_head = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device));
+
+        let diagnostics = model
+            .latent_reasoning_step_diagnostics(batch(&device))
+            .expect("latent diagnostics");
+        assert_eq!(diagnostics.step_energy_mean.len(), 3);
+        assert_eq!(diagnostics.step_energy_delta.len(), 3);
+        assert_eq!(diagnostics.step_energy_monotonic_violation_rate.len(), 3);
+        assert!(diagnostics.best_energy_step.is_some());
+        for value in diagnostics
+            .step_energy_mean
+            .into_iter()
+            .chain(diagnostics.step_energy_delta)
+            .chain(diagnostics.step_energy_monotonic_violation_rate)
+        {
+            assert!(
+                value.is_finite(),
+                "energy diagnostic value was not finite: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn latent_reasoning_auxiliary_scale_respects_start_after_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                jepa_future_offsets: vec![1],
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    start_after_steps: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(0, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.gradient_scale_step.store(1, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.gradient_scale_step.store(2, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
+    }
+
+    #[test]
+    fn latent_reasoning_auxiliary_scale_can_wait_for_capability_gate() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                start_after_capability_gate_passed: true,
+                jepa_future_offsets: vec![1],
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(32, Ordering::Relaxed);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
+    }
+
+    #[test]
+    fn latent_reasoning_auxiliary_scale_respects_per_objective_every_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 8,
+                jepa_every_steps: Some(8),
+                jepa_future_offsets: vec![1],
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    every_steps: Some(16),
+                    start_after_steps: Some(8),
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(7, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_every_steps(
+                model.latent_reasoning_jepa_every_steps()
+            ),
+            Some(0.25)
+        );
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            None
+        );
+        model.gradient_scale_step.store(15, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_start_policy_can_gate_specific_objectives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                jepa_start_policy: Some(LatentReasoningAuxiliaryStartPolicy::FixedStep),
+                jepa_future_offsets: vec![1],
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    start_policy: Some(
+                        LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate,
+                    ),
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    start_after_steps: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(4, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_jepa_every_steps(),
+                model.latent_reasoning_jepa_start_after_steps(),
+                model.latent_reasoning_jepa_start_policy()
+            ),
+            Some(0.25)
+        );
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            None
+        );
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_capability_gate_policy_can_ignore_fixed_step_start() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    start_after_steps: Some(512),
+                    start_policy: Some(LatentReasoningAuxiliaryStartPolicy::CapabilityGate),
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(0, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            None
+        );
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(
+            model.latent_reasoning_auxiliary_scale_for_schedule(
+                model.latent_reasoning_next_latent_every_steps(),
+                model.latent_reasoning_next_latent_start_after_steps(),
+                model.latent_reasoning_next_latent_start_policy()
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_global_capability_gate_remains_compatibility_default() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                every_steps: 1,
+                start_after_capability_gate_passed: true,
+                jepa_future_offsets: vec![1],
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.25,
+                    start_after_steps: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        model.gradient_scale_step.store(2, Ordering::Relaxed);
+        assert_eq!(
+            model.latent_reasoning_jepa_start_policy(),
+            LatentReasoningAuxiliaryStartPolicy::FixedStepAndCapabilityGate
+        );
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), None);
+        model.set_latent_reasoning_capability_gate_open(true);
+        assert_eq!(model.latent_reasoning_auxiliary_scale(), Some(0.25));
+    }
+
+    #[test]
+    fn next_latent_train_step_runs_without_inference_latent_reasoning() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.next_latent_transition.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                next_latent: NextLatentPredictionConfig {
+                    enabled: true,
+                    horizon: 2,
+                    regression_weight: 1.0,
+                    token_kl_weight: 0.01,
+                    smooth_l1_beta: 1.0,
+                    detach_action_embedding: true,
+                    ..Default::default()
+                },
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        assert!(!model.model.latent_reasoning_enabled());
+        assert!(model.model.next_latent_transition_enabled());
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(loss.is_finite(), "unexpected NextLat loss: {loss}");
+    }
+
+    #[test]
+    fn dragon_state_consistency_train_step_runs_without_latent_reasoning_architecture() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = false;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                dragon_state: DragonStateConsistencyConfig {
+                    enabled: true,
+                    rho_weight: 1.0,
+                    rho_energy_weight: 0.25,
+                    smooth_l1_beta: 1.0,
+                    max_rho_slots: 4,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        assert!(!model.model.latent_reasoning_enabled());
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(
+            loss.is_finite(),
+            "unexpected Dragon state consistency loss: {loss}"
+        );
+    }
+
+    #[test]
+    fn latent_reasoning_rho_memory_sigreg_train_step_runs() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = true;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: true,
+                    target: crate::config::LatentReasoningSigRegTarget::RhoMemorySlots,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(
+            loss.is_finite(),
+            "unexpected rho-memory latent reasoning loss: {loss}"
+        );
+    }
+
+    #[test]
+    fn rho_memory_sigreg_train_step_runs_without_latent_reasoning_architecture() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7);
+        let mut config = tiny_model_config();
+        config.latent_reasoning.enabled = false;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_latent_reasoning(LatentReasoningTrainingConfig {
+                enabled: true,
+                jepa_future_offsets: vec![usize::MAX],
+                sigreg: LatentReasoningSigRegConfig {
+                    enabled: true,
+                    target: LatentReasoningSigRegTarget::RhoMemorySlots,
+                    ..Default::default()
+                },
+                constraint_balancer: LatentReasoningConstraintBalancerConfig {
+                    normalized_aux_scale: 0.01,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        assert!(
+            loss.is_finite(),
+            "unexpected rho-memory regularized base Dragon loss: {loss}"
+        );
+    }
+
+    #[test]
+    fn rho_memory_sigreg_penalizes_redundant_slots() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_latent_reasoning(LatentReasoningTrainingConfig {
+            enabled: true,
+            sigreg: LatentReasoningSigRegConfig {
+                enabled: true,
+                target: LatentReasoningSigRegTarget::RhoMemorySlots,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut duplicate_state = model.model.init_state_ephemeral();
+        duplicate_state.layers[0].rho = Some(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0, -1.0, 0.0, 1.0, -1.0, 0.0], [1, 1, 2, 3]),
+            &device,
+        ));
+        let mut orthogonal_state = model.model.init_state_ephemeral();
+        orthogonal_state.layers[0].rho = Some(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0, -1.0, 0.0, 1.0, 1.0, -2.0], [1, 1, 2, 3]),
+            &device,
+        ));
+
+        let duplicate = tensor_scalar(
+            model
+                .sigreg_loss_from_rho_memory_state(&duplicate_state)
+                .expect("duplicate rho loss"),
+        );
+        let orthogonal = tensor_scalar(
+            model
+                .sigreg_loss_from_rho_memory_state(&orthogonal_state)
+                .expect("orthogonal rho loss"),
+        );
+
+        assert!(
+            duplicate > orthogonal + 0.5,
+            "duplicate slots should be penalized more strongly: duplicate={duplicate} orthogonal={orthogonal}"
+        );
+        assert!(
+            orthogonal < 1.0e-5,
+            "centered orthogonal slots should have near-zero redundancy penalty: {orthogonal}"
+        );
+    }
+
+    #[test]
+    fn rho_memory_sigreg_samples_slots_deterministically() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_latent_reasoning(LatentReasoningTrainingConfig {
+            enabled: true,
+            sigreg: LatentReasoningSigRegConfig {
+                enabled: true,
+                target: LatentReasoningSigRegTarget::RhoMemorySlots,
+                max_rho_slots: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let rho = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![0.0, 1.0, 2.0, 3.0, 4.0], [1, 1, 5, 1]),
+            &device,
+        );
+
+        let sampled = model.sigreg_sample_rho_slots(rho, 5);
+        assert_eq!(sampled.shape().dims::<4>(), [1, 1, 3, 1]);
+        let values = sampled
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("sampled rho");
+        assert_eq!(values, vec![0.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn dragon_state_consistency_is_zero_for_matching_rho_and_positive_for_drift() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_latent_reasoning(LatentReasoningTrainingConfig {
+            enabled: true,
+            dragon_state: DragonStateConsistencyConfig {
+                enabled: true,
+                rho_weight: 1.0,
+                rho_energy_weight: 1.0,
+                smooth_l1_beta: 1.0,
+                max_rho_slots: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut student_state = model.model.init_state_ephemeral();
+        student_state.layers[0].rho = Some(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [1, 1, 2, 3]),
+            &device,
+        ));
+        let teacher_state = student_state.clone();
+
+        let (matching_loss, matching_components) =
+            model.dragon_state_consistency_loss(&student_state, &teacher_state);
+        assert_eq!(matching_components, 2);
+        let matching_loss = tensor_scalar(matching_loss.expect("matching rho loss"));
+        assert!(
+            matching_loss.abs() < 1.0e-6,
+            "matching rho state should have zero consistency loss: {matching_loss}"
+        );
+
+        let mut drifted_teacher_state = model.model.init_state_ephemeral();
+        drifted_teacher_state.layers[0].rho = Some(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.0], [1, 1, 2, 3]),
+            &device,
+        ));
+        let (drift_loss, drift_components) =
+            model.dragon_state_consistency_loss(&student_state, &drifted_teacher_state);
+        assert_eq!(drift_components, 2);
+        let drift_loss = tensor_scalar(drift_loss.expect("drift rho loss"));
+        assert!(
+            drift_loss > matching_loss + 0.1,
+            "drifted rho rows should be penalized: matching={matching_loss} drift={drift_loss}"
+        );
+    }
+
+    #[test]
+    fn sigreg_combined_target_enables_hidden_and_rho_losses() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_latent_reasoning(LatentReasoningTrainingConfig {
+            enabled: true,
+            sigreg: LatentReasoningSigRegConfig {
+                enabled: true,
+                target: LatentReasoningSigRegTarget::HiddenAndRhoMemorySlots,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let hidden = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.1, 0.2, 0.3], [1, 2, 2]),
+            &device,
+        );
+        let mut state = model.model.init_state_ephemeral();
+        state.layers[0].rho = Some(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0, -1.0, 0.0, 1.0, -1.0, 0.0], [1, 1, 2, 3]),
+            &device,
+        ));
+
+        assert!(model.sigreg_loss_from_hidden(hidden).is_some());
+        assert!(model.sigreg_loss_from_rho_memory_state(&state).is_some());
     }
 
     #[test]

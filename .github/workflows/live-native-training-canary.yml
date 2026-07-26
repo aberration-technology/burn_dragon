@@ -152,19 +152,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: checkout burn_p2p sibling
-        uses: actions/checkout@v4
-        with:
-          repository: aberration-technology/burn_p2p
-          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
-          path: burn_p2p-sibling
-      - name: link burn_p2p path dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${GITHUB_WORKSPACE}/../burn_p2p"
-          rm -rf "$target"
-          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
+      - name: bootstrap locked sibling stack
+        uses: ./.github/actions/bootstrap-stack
 
       - name: setup rust toolchain
         uses: dtolnay/rust-toolchain@stable

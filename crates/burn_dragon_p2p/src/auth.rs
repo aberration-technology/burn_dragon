@@ -1841,6 +1841,7 @@ mod tests {
                 entries: Vec::new(),
             },
             heads: Vec::new(),
+            revision_contracts: Vec::new(),
             leaderboard: BrowserLeaderboardSnapshot {
                 network_id: burn_p2p::NetworkId::new("burn-dragon-mainnet"),
                 score_version: "v1".into(),

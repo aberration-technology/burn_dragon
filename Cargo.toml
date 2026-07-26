@@ -5,6 +5,7 @@ members = [
   "crates/burn_dragon_time",
   "crates/burn_dragon_checkpoint",
   "crates/burn_dragon_core",
+  "crates/burn_dragon_eggroll",
   "crates/burn_dragon_kernel",
   "crates/burn_dragon_language",
   "crates/burn_dragon_p2p",
@@ -26,6 +27,9 @@ readme = "README.md"
 [workspace.dependencies]
 anyhow = "1.0"
 burn = { version = "0.21.0", default-features = false }
+burn_ecs = { version = "=0.21.8", path = "../burn_ecs", default-features = false }
+burn_eggroll = { version = "=0.21.8", path = "../burn_eggroll", default-features = false }
+burn_pc = { version = "=0.21.8", path = "../burn_pc", default-features = false }
 burn-autodiff = { version = "0.21.0", default-features = false }
 burn-collective = "0.21.0"
 burn-communication = "0.21.0"
@@ -40,9 +44,12 @@ burn-store = { version = "0.21.0", default-features = false }
 burn-train = { version = "0.21.0", default-features = false }
 burn-wgpu = { version = "0.21.0", default-features = false }
 burn_gdn = { version = "0.21.0", default-features = false }
+bevy_app = { version = "0.18.1", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.18.1", default-features = false, features = ["std"] }
 
 burn_dragon_checkpoint = { version = "=0.21.8", path = "crates/burn_dragon_checkpoint", default-features = false }
 burn_dragon_core = { version = "=0.21.8", path = "crates/burn_dragon_core", default-features = false }
+burn_dragon_eggroll = { version = "=0.21.8", path = "crates/burn_dragon_eggroll", default-features = false }
 burn_dragon_kernel = { version = "=0.21.8", path = "crates/burn_dragon_kernel", default-features = false }
 burn_dragon_language = { version = "=0.21.8", path = "crates/burn_dragon_language", default-features = false }
 burn_dragon_p2p = { version = "=0.21.8", path = "crates/burn_dragon_p2p", default-features = false }

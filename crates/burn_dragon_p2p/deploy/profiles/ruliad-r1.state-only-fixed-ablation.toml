@@ -1,0 +1,30 @@
+extends = ["ruliad-r1.adamw-fixed-ablation.toml"]
+
+[training.latent_reasoning]
+enabled = true
+every_steps = 8
+jepa_future_offsets = [9999]
+target_encoder = "ema_teacher"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"
+
+[training.latent_reasoning.dragon_state]
+enabled = true
+rho_weight = 0.5
+rho_energy_weight = 0.125
+smooth_l1_beta = 1.0
+max_rho_slots = 64
+
+[training.latent_reasoning.sigreg]
+enabled = false
+mode = "weak_covariance"
+target_variance = 1.0
+min_variance = 0.2
+mean_tolerance = 0.05
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.01
+warmup_steps = 512
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5

@@ -44,7 +44,9 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+            PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
+            PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
+            SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
             SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
             TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
         };
@@ -101,10 +103,13 @@ pub use config::{
 };
 #[cfg(feature = "train")]
 pub use config::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
-    TrainingObjectiveKind, load_training_config,
+    DatasetConfig, DatasetSourceConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
+    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
+    PredictiveCodingStateScope, RepromptTruncation, RuliadAnswerDenoisingConfig,
+    RuliadAnswerRankingConfig, RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig,
+    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings, generate_text, generate_tokens,
@@ -120,8 +125,9 @@ pub use loss::language_model_loss;
 pub use stages::{
     BUNDLE_STATE_FILE_NAME, ExperimentBackend, ExperimentBundleConfig, ExperimentBundleState,
     ExperimentStageArtifact, ExperimentStageConfig, ExperimentStageKind, ExperimentStageState,
-    ExperimentStageStatus, RESOLVED_CONFIG_FILE_NAME, STAGE_STATE_FILE_NAME, build_bundle_state,
-    bundle_state_path, load_experiment_bundle_config, load_stage_state,
+    ExperimentStageStatus, GeneratedUniversalityCorpusReport, PreparedUniversalityCorpusConfig,
+    RESOLVED_CONFIG_FILE_NAME, STAGE_STATE_FILE_NAME, build_bundle_state, bundle_state_path,
+    generate_prepared_universality_stage_corpus, load_experiment_bundle_config, load_stage_state,
     prepare_language_stage_config, prepare_universality_stage_config, resolve_bundle_root,
     resolve_stage_dependency_artifacts, resolve_stage_dir, resolve_training_stage_artifact,
     resolved_stage_config_path, stage_state_path, unix_timestamp_now, write_bundle_state,

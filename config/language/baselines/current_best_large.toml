@@ -1,0 +1,16 @@
+name = "current_best_large_48h"
+output_dir = "runs/current_best_large"
+resume_from_last_completed_stage = true
+
+[[stages]]
+name = "nca_prepretrain"
+type = "universality_generate"
+config = "crates/burn_dragon_p2p/deploy/profiles/nca-r1.corpus.toml"
+
+[[stages]]
+name = "climbmix_pretrain"
+depends_on = ["nca_prepretrain"]
+type = "language_train"
+config = "crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.training.toml"
+backend = "wgpu"
+dataset_manifest_from_stage = "nca_prepretrain"

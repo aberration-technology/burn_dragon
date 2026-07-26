@@ -1,0 +1,16 @@
+extends = ["ruliad-1m-la-64k.answer-completion-stable.training.toml"]
+
+[training.events]
+ruliad_contract_probe_enabled = true
+
+[training.ruliad_supervision.answer_contract]
+enabled = true
+weight = 0.25
+premature_close_unlikelihood_weight = 0.5
+every_steps = 1
+start_after_steps = 0
+max_completion_tokens = 64
+max_rows_per_step = 8
+schema_token_weight = 2.0
+value_token_weight = 1.0
+other_token_weight = 1.0

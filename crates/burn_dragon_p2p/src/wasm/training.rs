@@ -3,23 +3,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use burn::backend::NdArray;
 use burn::module::{AutodiffModule, Module};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-use burn_dragon_core::{DragonModel, objective::window_self_distillation_smoke_loss};
+use burn_dragon_core::{DragonModel, ModelState};
+use burn_dragon_eggroll::{
+    AntitheticFitness, EggrollModuleOptimizerState, apply_antithetic_update_with_allowed_param_ids,
+    perturb_module_with_allowed_param_ids,
+};
 use burn_dragon_time::Instant;
 use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
-    ArtifactId, ArtifactKind, ChunkingScheme, ContentId, ExperimentId, ExperimentScope, HeadId,
-    RevisionId, StudyId, WorkloadId, WorkloadTrainingArtifact, WorkloadTrainingArtifactChunk,
-    WorkloadTrainingContribution, WorkloadTrainingLease,
+    ArtifactId, ArtifactKind, COMPACT_UPDATE_PAYLOAD_VERSION, ChunkingScheme,
+    CompactScalarEncoding, CompactScalarVector, CompactUpdateBody, CompactUpdatePayload, ContentId,
+    ExperimentId, ExperimentScope, HeadDescriptor, HeadId, Precision, RevisionId,
+    SeededFitnessGeneration, StudyId, TrainingProtocol, WorkloadId, WorkloadTrainingArtifact,
+    WorkloadTrainingArtifactChunk, WorkloadTrainingContribution, WorkloadTrainingLease,
+    WorkloadUpdateEnvelope,
 };
 use burn_p2p_browser::{
-    BrowserCapabilityReport, BrowserRuntimeRole, BrowserSessionRuntimeConfig,
+    BrowserBootstrapHead, BrowserCapabilityReport, BrowserRuntimeRole, BrowserSessionRuntimeConfig,
     BrowserSessionRuntimeError, BrowserSessionRuntimeHandle, BrowserSessionState,
     BrowserTrainingBudget, BrowserTrainingPlan,
 };
@@ -41,7 +49,7 @@ use crate::browser_data::deterministic_sample_indices;
 use crate::browser_record::{
     BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_record_format_name,
     browser_record_precision_descriptor, encode_browser_record_bytes,
-    load_browser_active_head_model,
+    load_browser_active_head_model, verify_browser_genesis_tensor_digest,
 };
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 #[cfg(target_arch = "wasm32")]
@@ -51,10 +59,14 @@ use crate::capability_state::{
 };
 use crate::config::{
     DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserLiveParticipantConfig,
-    DragonBrowserShardSelectionPolicy, DragonBrowserTokenSource, DragonBrowserTrainingConfig,
-    TokenWindowRecord,
+    DragonBrowserOptimizerConfig, DragonBrowserShardSelectionPolicy, DragonBrowserTokenSource,
+    DragonBrowserTrainingConfig, TokenWindowRecord, dragon_model_schema_hash,
 };
 use crate::p2p_adapter::{browser_runtime_role_label, browser_trainer_transport_policy};
+use crate::profile::{
+    DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION, browser_runtime_execution_contract_hash,
+};
+use crate::seeded_fitness::dragon_seeded_fitness_catalog;
 
 type BrowserCpuEvalBackend = NdArray<f32>;
 type BrowserCpuTrainBackend = Autodiff<BrowserCpuEvalBackend>;
@@ -123,6 +135,249 @@ struct TokenWindowBatch<B: Backend> {
     inputs: Tensor<B, 2, Int>,
     targets: Tensor<B, 2, Int>,
     token_count: usize,
+    batch_digest: ContentId,
+    record_digests: Vec<ContentId>,
+    reset_stream_state: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserCompactUpdateTrace {
+    parameter_catalog_hash: ContentId,
+    parameter_count: u64,
+    perturbation_generator_hash: ContentId,
+    optimizer_update_hash: ContentId,
+    generations: Vec<SeededFitnessGeneration>,
+}
+
+struct BrowserKernelStep<B: Backend> {
+    model: DragonModel<B>,
+    losses: Vec<f64>,
+}
+
+trait BrowserTrainingKernel<B: Backend> {
+    async fn step(
+        &mut self,
+        model: DragonModel<B>,
+        batch: &TokenWindowBatch<B>,
+        generation: u64,
+    ) -> Result<BrowserKernelStep<B>>;
+
+    fn compact_trace(&self) -> Option<&BrowserCompactUpdateTrace> {
+        None
+    }
+
+    fn observes_loss(&self) -> bool {
+        true
+    }
+}
+
+struct BrowserAdamwKernel<B: AutodiffBackend>
+where
+    DragonModel<B>: AutodiffModule<B>,
+{
+    learning_rate: f64,
+    observe_loss: bool,
+    tbptt_chunk_size: Option<usize>,
+    persist_across_steps: bool,
+    state: Option<ModelState<B>>,
+    optimizer: OptimizerAdaptor<AdamW, DragonModel<B>, B>,
+}
+
+impl<B: AutodiffBackend> BrowserAdamwKernel<B>
+where
+    DragonModel<B>: AutodiffModule<B>,
+{
+    fn new(
+        learning_rate: f64,
+        weight_decay: f32,
+        observe_loss: bool,
+        tbptt_chunk_size: Option<usize>,
+        persist_across_steps: bool,
+    ) -> Self {
+        Self {
+            learning_rate,
+            observe_loss,
+            tbptt_chunk_size,
+            persist_across_steps,
+            state: None,
+            optimizer: AdamWConfig::new().with_weight_decay(weight_decay).init(),
+        }
+    }
+}
+
+impl<B: AutodiffBackend> BrowserTrainingKernel<B> for BrowserAdamwKernel<B>
+where
+    DragonModel<B>: AutodiffModule<B>,
+{
+    async fn step(
+        &mut self,
+        model: DragonModel<B>,
+        batch: &TokenWindowBatch<B>,
+        _generation: u64,
+    ) -> Result<BrowserKernelStep<B>> {
+        let mut state = take_browser_step_state(
+            &model,
+            &mut self.state,
+            batch.reset_stream_state,
+            self.persist_across_steps,
+        );
+        let mut accumulator = GradientsAccumulator::new();
+        let mut observed_losses = Vec::new();
+        visit_browser_next_token_chunks(&model, batch, &mut state, self.tbptt_chunk_size, |loss| {
+            if self.observe_loss {
+                observed_losses.push(loss.clone().detach());
+            }
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            accumulator.accumulate(&model, grads);
+        });
+        let losses = if observed_losses.is_empty() {
+            Vec::new()
+        } else {
+            vec![scalar_from_loss_async(sum_scalar_losses(observed_losses)).await?]
+        };
+        let grads = accumulator.grads();
+        let model = self.optimizer.step(self.learning_rate, model, grads);
+        store_browser_step_state(&mut self.state, state, self.persist_across_steps);
+        Ok(BrowserKernelStep { model, losses })
+    }
+
+    fn observes_loss(&self) -> bool {
+        self.observe_loss
+    }
+}
+
+struct BrowserSeededFitnessKernel<B: Backend> {
+    config: burn_eggroll::EggrollConfig,
+    scalar_encoding: CompactScalarEncoding,
+    allowed_param_ids: BTreeSet<u64>,
+    optimizer_state: EggrollModuleOptimizerState<B>,
+    trace: BrowserCompactUpdateTrace,
+    tbptt_chunk_size: Option<usize>,
+    persist_across_steps: bool,
+    state: Option<ModelState<B>>,
+}
+
+impl<B: Backend> BrowserSeededFitnessKernel<B> {
+    fn new(
+        model: &DragonModel<B>,
+        config: burn_eggroll::EggrollConfig,
+        scalar_encoding: CompactScalarEncoding,
+        optimizer_update_hash: ContentId,
+        tbptt_chunk_size: Option<usize>,
+        persist_across_steps: bool,
+    ) -> Result<Self> {
+        config.validate()?;
+        let catalog = dragon_seeded_fitness_catalog(model, &config)?;
+        Ok(Self {
+            config,
+            scalar_encoding,
+            allowed_param_ids: catalog.allowed_param_ids,
+            optimizer_state: EggrollModuleOptimizerState::new(),
+            trace: BrowserCompactUpdateTrace {
+                parameter_catalog_hash: catalog.parameter_catalog_hash,
+                parameter_count: catalog.parameter_count,
+                perturbation_generator_hash: catalog.perturbation_generator_hash,
+                optimizer_update_hash,
+                generations: Vec::new(),
+            },
+            tbptt_chunk_size,
+            persist_across_steps,
+            state: None,
+        })
+    }
+}
+
+impl<B: Backend> BrowserTrainingKernel<B> for BrowserSeededFitnessKernel<B> {
+    async fn step(
+        &mut self,
+        model: DragonModel<B>,
+        batch: &TokenWindowBatch<B>,
+        generation: u64,
+    ) -> Result<BrowserKernelStep<B>> {
+        let base_state = take_browser_step_state(
+            &model,
+            &mut self.state,
+            batch.reset_stream_state,
+            self.persist_across_steps,
+        );
+        let pair_count = self.config.population.population_size / 2;
+        let chunk_pairs = (self.config.population.population_chunk_size / 2)
+            .max(1)
+            .min(pair_count);
+        let mut losses = Vec::with_capacity(pair_count * 2);
+        let mut fitness = Vec::with_capacity(pair_count);
+        for pair_start in (0..pair_count).step_by(chunk_pairs) {
+            let pair_end = (pair_start + chunk_pairs).min(pair_count);
+            let mut loss_tensors = Vec::with_capacity((pair_end - pair_start) * 2);
+            for pair_index in pair_start..pair_end {
+                for sign in [
+                    burn_eggroll::AntitheticSign::Plus,
+                    burn_eggroll::AntitheticSign::Minus,
+                ] {
+                    let candidate = perturb_module_with_allowed_param_ids(
+                        model.clone(),
+                        &self.config,
+                        generation,
+                        pair_index as u64,
+                        sign,
+                        Some(&self.allowed_param_ids),
+                    );
+                    let mut candidate_state = base_state.detached_clone();
+                    let mut candidate_losses = Vec::new();
+                    visit_browser_next_token_chunks(
+                        &candidate,
+                        batch,
+                        &mut candidate_state,
+                        self.tbptt_chunk_size,
+                        |loss| candidate_losses.push(loss),
+                    );
+                    loss_tensors.push(sum_scalar_losses(candidate_losses));
+                }
+            }
+            losses.extend(scalar_values_from_loss_tensors_async(loss_tensors).await?);
+        }
+        for (pair_index, pair_losses) in losses.chunks_exact(2).enumerate() {
+            fitness.push(AntitheticFitness {
+                pair_index: pair_index as u64,
+                plus: -(pair_losses[0] as f32),
+                minus: -(pair_losses[1] as f32),
+            });
+        }
+        let transmitted_fitness = fitness
+            .iter()
+            .flat_map(|item| [item.plus, item.minus])
+            .collect::<Vec<_>>();
+        self.trace.generations.push(SeededFitnessGeneration {
+            generation,
+            batch_digest: batch.batch_digest.clone(),
+            record_digests: batch.record_digests.clone(),
+            reset_stream_state: batch.reset_stream_state,
+            fitness: CompactScalarVector::encode(&transmitted_fitness, self.scalar_encoding)
+                .map_err(anyhow::Error::msg)?,
+        });
+        let (model, _) = apply_antithetic_update_with_allowed_param_ids(
+            model,
+            &self.config,
+            generation,
+            &fitness,
+            &mut self.optimizer_state,
+            Some(&self.allowed_param_ids),
+        )?;
+        let mut next_state = base_state;
+        visit_browser_next_token_chunks(
+            &model,
+            batch,
+            &mut next_state,
+            self.tbptt_chunk_size,
+            drop,
+        );
+        store_browser_step_state(&mut self.state, next_state, self.persist_across_steps);
+        Ok(BrowserKernelStep { model, losses })
+    }
+
+    fn compact_trace(&self) -> Option<&BrowserCompactUpdateTrace> {
+        Some(&self.trace)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -156,6 +411,7 @@ struct TokenRecordLoadPolicy {
 struct LiveBrowserParticipantHandle {
     session_runtime: BrowserSessionRuntimeHandle,
     training_budget: BrowserTrainingBudget,
+    revision_contract: Option<burn_p2p::RevisionContractBundle>,
 }
 
 #[derive(Default)]
@@ -336,10 +592,12 @@ impl<'a> BrowserTrainingRunContext<'a> {
 fn browser_canonical_artifact_publication_decision(
     requested: bool,
     backend_kind: BrowserTrainingBackendKind,
+    compact_update: bool,
 ) -> BrowserCanonicalArtifactPublicationDecision {
     browser_canonical_artifact_publication_decision_for_platform(
         requested,
         backend_kind,
+        compact_update,
         cfg!(target_arch = "wasm32"),
     )
 }
@@ -347,12 +605,23 @@ fn browser_canonical_artifact_publication_decision(
 fn browser_canonical_artifact_publication_decision_for_platform(
     requested: bool,
     backend_kind: BrowserTrainingBackendKind,
+    compact_update: bool,
     target_arch_wasm32: bool,
 ) -> BrowserCanonicalArtifactPublicationDecision {
+    #[cfg(not(feature = "wgpu"))]
+    let _ = target_arch_wasm32;
+
     if !requested {
         return BrowserCanonicalArtifactPublicationDecision {
             requested,
             should_publish: false,
+            disabled_reason: None,
+        };
+    }
+    if compact_update {
+        return BrowserCanonicalArtifactPublicationDecision {
+            requested,
+            should_publish: true,
             disabled_reason: None,
         };
     }
@@ -451,48 +720,157 @@ pub(crate) async fn run_browser_training_with_session(
     let live_session_principal_id = session.live_session_principal_id().map(str::to_owned);
     let result = match backend_kind {
         BrowserTrainingBackendKind::Cpu => {
-            let train_device = burn::tensor::Device::<BrowserCpuTrainBackend>::default();
-            let eval_device = burn::tensor::Device::<BrowserCpuEvalBackend>::default();
             let setup_started_at = Instant::now();
-            BrowserCpuEvalBackend::seed(&eval_device, 1337);
-            let setup_time_ms = elapsed_ms(setup_started_at);
-            run_browser_training_inner::<BrowserCpuTrainBackend, BrowserCpuEvalBackend>(
-                BrowserTrainingRunContext {
-                    edge_base_url,
-                    config,
-                    backend_label: "burn-ndarray-wasm",
-                    backend_kind,
-                    setup_time_ms,
-                    live_session_principal_id,
-                },
-                &train_device,
-                &eval_device,
-                session.live_participant.as_mut(),
-            )
-            .await
+            match &config.optimizer {
+                DragonBrowserOptimizerConfig::Adamw => {
+                    let device = burn::tensor::Device::<BrowserCpuTrainBackend>::default();
+                    BrowserCpuTrainBackend::seed(&device, 1337);
+                    let setup_time_ms = elapsed_ms(setup_started_at);
+                    run_browser_training_inner::<
+                        BrowserCpuTrainBackend,
+                        BrowserAdamwKernel<BrowserCpuTrainBackend>,
+                        _,
+                    >(
+                        BrowserTrainingRunContext {
+                            edge_base_url,
+                            config,
+                            backend_label: "burn-ndarray-wasm",
+                            backend_kind,
+                            setup_time_ms,
+                            live_session_principal_id,
+                        },
+                        &device,
+                        session.live_participant.as_mut(),
+                        |_model, _contract| {
+                            Ok(BrowserAdamwKernel::<BrowserCpuTrainBackend>::new(
+                                config.learning_rate,
+                                config.weight_decay,
+                                browser_loss_scalar_readback_enabled(backend_kind),
+                                config.tbptt_chunk_size,
+                                config.tbptt_persist_across_steps,
+                            ))
+                        },
+                    )
+                    .await
+                }
+                DragonBrowserOptimizerConfig::SeededFitness {
+                    eggroll,
+                    scalar_encoding,
+                } => {
+                    let device = burn::tensor::Device::<BrowserCpuEvalBackend>::default();
+                    BrowserCpuEvalBackend::seed(&device, 1337);
+                    let setup_time_ms = elapsed_ms(setup_started_at);
+                    run_browser_training_inner::<
+                        BrowserCpuEvalBackend,
+                        BrowserSeededFitnessKernel<BrowserCpuEvalBackend>,
+                        _,
+                    >(
+                        BrowserTrainingRunContext {
+                            edge_base_url,
+                            config,
+                            backend_label: "burn-ndarray-wasm-forward",
+                            backend_kind,
+                            setup_time_ms,
+                            live_session_principal_id,
+                        },
+                        &device,
+                        session.live_participant.as_mut(),
+                        |model, contract| {
+                            let optimizer_hash = contract
+                                .map(|contract| contract.training.optimizer_hash.clone())
+                                .map(Ok)
+                                .unwrap_or_else(|| ContentId::derive(eggroll))?;
+                            BrowserSeededFitnessKernel::new(
+                                model,
+                                eggroll.clone(),
+                                *scalar_encoding,
+                                optimizer_hash,
+                                config.tbptt_chunk_size,
+                                config.tbptt_persist_across_steps,
+                            )
+                        },
+                    )
+                    .await
+                }
+            }
         }
         #[cfg(feature = "wgpu")]
         BrowserTrainingBackendKind::Wgpu => {
-            let train_device = BrowserWgpuTrainDevice::default();
-            let eval_device = burn::tensor::Device::<BrowserWgpuEvalBackend>::default();
             let setup_started_at = Instant::now();
-            ensure_webgpu_runtime_ready(&train_device).await;
-            BrowserWgpuEvalBackend::seed(&eval_device, 1337);
-            let setup_time_ms = elapsed_ms(setup_started_at);
-            run_browser_training_inner::<BrowserWgpuTrainBackend, BrowserWgpuEvalBackend>(
-                BrowserTrainingRunContext {
-                    edge_base_url,
-                    config,
-                    backend_label: "burn-webgpu-wasm",
-                    backend_kind,
-                    setup_time_ms,
-                    live_session_principal_id,
-                },
-                &train_device,
-                &eval_device,
-                session.live_participant.as_mut(),
-            )
-            .await
+            match &config.optimizer {
+                DragonBrowserOptimizerConfig::Adamw => {
+                    let device = BrowserWgpuTrainDevice::default();
+                    ensure_webgpu_runtime_ready(&device).await;
+                    BrowserWgpuTrainBackend::seed(&device, 1337);
+                    let setup_time_ms = elapsed_ms(setup_started_at);
+                    run_browser_training_inner::<
+                        BrowserWgpuTrainBackend,
+                        BrowserAdamwKernel<BrowserWgpuTrainBackend>,
+                        _,
+                    >(
+                        BrowserTrainingRunContext {
+                            edge_base_url,
+                            config,
+                            backend_label: "burn-webgpu-wasm",
+                            backend_kind,
+                            setup_time_ms,
+                            live_session_principal_id,
+                        },
+                        &device,
+                        session.live_participant.as_mut(),
+                        |_model, _contract| {
+                            Ok(BrowserAdamwKernel::<BrowserWgpuTrainBackend>::new(
+                                config.learning_rate,
+                                config.weight_decay,
+                                browser_loss_scalar_readback_enabled(backend_kind),
+                                config.tbptt_chunk_size,
+                                config.tbptt_persist_across_steps,
+                            ))
+                        },
+                    )
+                    .await
+                }
+                DragonBrowserOptimizerConfig::SeededFitness {
+                    eggroll,
+                    scalar_encoding,
+                } => {
+                    let device = burn::tensor::Device::<BrowserWgpuEvalBackend>::default();
+                    ensure_webgpu_runtime_ready(&device).await;
+                    BrowserWgpuEvalBackend::seed(&device, 1337);
+                    let setup_time_ms = elapsed_ms(setup_started_at);
+                    run_browser_training_inner::<
+                        BrowserWgpuEvalBackend,
+                        BrowserSeededFitnessKernel<BrowserWgpuEvalBackend>,
+                        _,
+                    >(
+                        BrowserTrainingRunContext {
+                            edge_base_url,
+                            config,
+                            backend_label: "burn-webgpu-wasm-forward",
+                            backend_kind,
+                            setup_time_ms,
+                            live_session_principal_id,
+                        },
+                        &device,
+                        session.live_participant.as_mut(),
+                        |model, contract| {
+                            let optimizer_hash = contract
+                                .map(|contract| contract.training.optimizer_hash.clone())
+                                .map(Ok)
+                                .unwrap_or_else(|| ContentId::derive(eggroll))?;
+                            BrowserSeededFitnessKernel::new(
+                                model,
+                                eggroll.clone(),
+                                *scalar_encoding,
+                                optimizer_hash,
+                                config.tbptt_chunk_size,
+                                config.tbptt_persist_across_steps,
+                            )
+                        },
+                    )
+                    .await
+                }
+            }
         }
     };
 
@@ -557,29 +935,39 @@ fn resolve_browser_training_backend(
     }
 }
 
-async fn run_browser_training_inner<TrainB, EvalB>(
+async fn run_browser_training_inner<B, K, F>(
     context: BrowserTrainingRunContext<'_>,
-    train_device: &TrainB::Device,
-    eval_device: &EvalB::Device,
+    device: &B::Device,
     mut live_participant: Option<&mut LiveBrowserParticipantHandle>,
+    kernel_factory: F,
 ) -> Result<DragonBrowserTrainingResult>
 where
-    TrainB: AutodiffBackend<InnerBackend = EvalB> + Clone,
-    EvalB: Backend + Clone,
-    DragonModel<TrainB>: Module<TrainB>,
+    B: Backend + Clone,
+    DragonModel<B>: Module<B>,
+    K: BrowserTrainingKernel<B>,
+    F: FnOnce(&DragonModel<B>, Option<&burn_p2p::RevisionContractBundle>) -> Result<K>,
 {
     validate_browser_training_config(context.config)?;
     validate_live_training_backend(context.config, context.backend_kind)?;
 
     let total_started_at = Instant::now();
 
+    let train_record_limit = if context.config.training_lease.is_some()
+        && matches!(
+            &context.config.train_source,
+            DragonBrowserTokenSource::ShardManifestHttp { .. }
+        ) {
+        None
+    } else {
+        max_record_limit(context.config.batch_size, context.config.max_train_batches)
+    };
     let train_records = load_token_records(
         context.edge_base_url,
         &context.config.train_source,
         context.config.block_size,
         context.token_record_load_policy(
             "train",
-            max_record_limit(context.config.batch_size, context.config.max_train_batches),
+            train_record_limit,
             context.config.training_lease.clone(),
         ),
     )
@@ -609,17 +997,25 @@ where
         eval_records.len(),
     );
 
-    let train_batches = build_batches::<TrainB>(
+    let train_batches = build_batches::<B>(
         &train_records,
         context.config.batch_size,
         context.config.block_size,
-        train_device,
+        context.config.max_train_batches,
+        context
+            .config
+            .training_lease
+            .as_ref()
+            .map(|lease| lease.window_id.0),
+        device,
     )?;
-    let eval_batches = build_batches::<EvalB>(
+    let eval_batches = build_batches::<B>(
         &eval_records,
         context.config.batch_size,
         context.config.block_size,
-        eval_device,
+        context.config.max_eval_batches,
+        None,
+        device,
     )?;
     let train_batches_len = train_batches.len();
     let eval_batches_len = eval_batches.len();
@@ -645,6 +1041,7 @@ where
     let artifact_publication_decision = browser_canonical_artifact_publication_decision(
         requested_canonical_update,
         context.backend_kind,
+        context.config.optimizer.is_forward_only(),
     );
     if artifact_publication_decision.should_publish && !load_active_head {
         bail!("browser canonical artifact publication requires loading the active head artifact");
@@ -682,8 +1079,11 @@ where
     let training_started_at = Instant::now();
     info!("browser training loop starting");
     info!("browser model initialization starting");
-    let mut model = DragonModel::<TrainB>::new(context.config.model_config.clone(), train_device);
+    let mut model = DragonModel::<B>::new(context.config.model_config.clone(), device);
     info!("browser model initialization complete");
+    let revision_contract = live_participant
+        .as_ref()
+        .and_then(|handle| handle.revision_contract.as_ref());
     let mut active_model_schema_hash = None;
     if let Some((head_id, descriptor, bytes)) = active_head_artifact {
         info!(
@@ -692,8 +1092,25 @@ where
             descriptor.artifact_id.as_str(),
             bytes.len(),
         );
+        validate_browser_active_head_descriptor(
+            context.config,
+            revision_contract,
+            &head_id,
+            &descriptor,
+        )?;
+        if let Some(contract) = revision_contract
+            && descriptor == contract.genesis.payload.payload.artifact
+        {
+            verify_browser_genesis_tensor_digest(
+                &context.config.model_config,
+                &descriptor,
+                &bytes,
+                &contract.genesis.payload.payload.tensor_digest,
+            )
+            .context("verify decoded browser genesis tensors")?;
+        }
         active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
-        model = load_browser_active_head_model(model, &descriptor, bytes, train_device)?;
+        model = load_browser_active_head_model(model, &descriptor, bytes, device)?;
         info!(
             "browser training loaded active head artifact: head_id={} artifact_id={}",
             head_id.as_str(),
@@ -705,11 +1122,8 @@ where
         .training_objective
         .ensure_browser_supported()
         .map_err(anyhow::Error::msg)?;
-    let teacher_model = (!context.config.training_objective.is_next_token()).then(|| model.clone());
-    let mut optimizer = AdamWConfig::new()
-        .with_weight_decay(context.config.weight_decay)
-        .init();
-    let collect_loss_scalars = browser_loss_scalar_readback_enabled(context.backend_kind);
+    let mut kernel = kernel_factory(&model, revision_contract)?;
+    let collect_loss_scalars = kernel.observes_loss();
     if !collect_loss_scalars {
         info!(
             "browser training loss scalar readback disabled for backend={}; avoiding wasm WebGPU buffer maps during live training",
@@ -721,6 +1135,12 @@ where
     let mut train_batch_count = 0usize;
     let mut train_example_count = 0usize;
     let mut train_token_count = 0usize;
+    let generation_base = context
+        .config
+        .training_lease
+        .as_ref()
+        .map(|lease| lease.window_id.0.checked_shl(32).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
         if train_batch_count > 0
             && training_window_budget_ms.is_some_and(|budget_ms| {
@@ -746,14 +1166,13 @@ where
                 batch.token_count, context.config.block_size, context.config.batch_size,
             );
         }
-        let loss = browser_training_objective_loss(
-            &model,
-            teacher_model.as_ref(),
-            &batch,
-            &context.config.training_objective,
-        );
-        if collect_loss_scalars {
-            train_loss_sum += scalar_from_loss_async(loss.clone()).await?;
+        let generation = generation_base
+            .checked_add(batch_index as u64)
+            .ok_or_else(|| anyhow!("browser optimizer generation overflowed"))?;
+        let step = kernel.step(model, &batch, generation).await?;
+        model = step.model;
+        for loss in step.losses {
+            train_loss_sum += loss;
             train_loss_count = train_loss_count.saturating_add(1);
         }
         train_example_count = train_example_count.saturating_add(
@@ -763,14 +1182,15 @@ where
         );
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
-        model = optimizer.step(context.config.learning_rate, model, grads);
         if batch_index == 0 {
             info!("browser training first batch complete");
         }
     }
+    if train_batch_count == 0 {
+        bail!("browser training window completed zero batches");
+    }
+    let compact_trace = kernel.compact_trace().cloned();
     let training_time_ms = elapsed_ms(training_started_at);
-    let train_batch_count = train_batch_count.max(1);
     let train_loss_mean = if train_loss_count > 0 {
         train_loss_sum / train_loss_count as f64
     } else {
@@ -788,9 +1208,9 @@ where
     let eval_loss = if eval_batches.is_empty() || !collect_loss_scalars {
         None
     } else {
-        let eval_model = model.valid();
         let mut total = 0.0;
         let mut count = 0usize;
+        let mut eval_state = None;
         for (batch_index, batch) in eval_batches.into_iter().enumerate() {
             if context
                 .config
@@ -799,9 +1219,26 @@ where
             {
                 break;
             }
-            let hidden = eval_model.forward_hidden(batch.inputs);
-            let loss = eval_model.language_loss_from_hidden(hidden, batch.targets);
-            total += scalar_from_loss_async(loss).await?;
+            let mut step_state = take_browser_step_state(
+                &model,
+                &mut eval_state,
+                batch.reset_stream_state,
+                context.config.tbptt_persist_across_steps,
+            );
+            let mut losses = Vec::new();
+            visit_browser_next_token_chunks(
+                &model,
+                &batch,
+                &mut step_state,
+                context.config.tbptt_chunk_size,
+                |loss| losses.push(loss),
+            );
+            total += scalar_from_loss_async(sum_scalar_losses(losses)).await?;
+            store_browser_step_state(
+                &mut eval_state,
+                step_state,
+                context.config.tbptt_persist_across_steps,
+            );
             count = count.saturating_add(1);
         }
         (count > 0).then_some(total / count as f64)
@@ -813,7 +1250,7 @@ where
     );
 
     let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
-    let published_artifact = if let Some(live) = live_participant.as_ref() {
+    let published_update = if let Some(live) = live_participant.as_ref() {
         if !artifact_publication_decision.should_publish {
             if artifact_publication_decision.requested {
                 info!(
@@ -834,16 +1271,22 @@ where
                 active_model_schema_hash.is_some(),
                 context.backend_label,
             );
-            let model_schema_hash = active_model_schema_hash.unwrap_or_else(|| {
-                ContentId::derive(&context.config.model_config)
-                    .unwrap_or_else(|_| ContentId::new("dragon-browser-model-schema"))
-            });
-            Some(browser_training_head_artifact(
-                &context,
-                live,
-                model,
-                model_schema_hash,
-            )?)
+            let model_schema_hash = active_model_schema_hash
+                .unwrap_or_else(|| dragon_model_schema_hash(&context.config.model_config));
+            Some(match compact_trace.as_ref() {
+                Some(trace) => {
+                    browser_training_compact_update(&context, live, trace, model_schema_hash)?
+                }
+                None => BrowserPublishedUpdate {
+                    artifact: browser_training_head_artifact(
+                        &context,
+                        live,
+                        model,
+                        model_schema_hash,
+                    )?,
+                    workload_update: None,
+                },
+            })
         }
     } else {
         None
@@ -862,7 +1305,7 @@ where
             eval_time_ms,
             total_time_ms,
         },
-        published_artifact,
+        published_update,
     );
     let live_participant = finish_live_browser_participant(
         context.edge_base_url,
@@ -940,6 +1383,20 @@ fn validate_browser_training_config(config: &DragonBrowserTrainingConfig) -> Res
     }
     if config.batch_size == 0 {
         bail!("browser training batch_size must be > 0");
+    }
+    if let Some(chunk_size) = config.tbptt_chunk_size {
+        if chunk_size == 0 {
+            bail!("browser training tbptt_chunk_size must be > 0 when set");
+        }
+        if chunk_size > config.block_size {
+            bail!(
+                "browser training tbptt_chunk_size must be <= block_size (got {chunk_size} > {})",
+                config.block_size
+            );
+        }
+    }
+    if config.tbptt_persist_across_steps && config.tbptt_chunk_size.is_none() {
+        bail!("browser training tbptt_persist_across_steps requires tbptt_chunk_size");
     }
     if config.model_config.vocab_size == 0 {
         bail!("browser training model_config.vocab_size must be > 0");
@@ -1300,6 +1757,7 @@ fn token_windows_from_tokens(tokens: &[u32], block_size: usize) -> Vec<TokenWind
                 .collect(),
             targets: window[1..].iter().map(|token| i64::from(*token)).collect(),
             reset_stream_state: start == 0,
+            ..TokenWindowRecord::default()
         });
         if start >= max_start {
             break;
@@ -1333,32 +1791,132 @@ fn build_batches<B: Backend>(
     records: &[TokenWindowRecord],
     batch_size: usize,
     block_size: usize,
+    max_batches: Option<usize>,
+    window_id: Option<u64>,
     device: &B::Device,
 ) -> Result<Vec<TokenWindowBatch<B>>> {
     if records.is_empty() {
         return Ok(Vec::new());
     }
-    let mut batches = Vec::new();
-    for chunk in records.chunks(batch_size.max(1)) {
-        let mut inputs = Vec::with_capacity(chunk.len() * block_size);
-        let mut targets = Vec::with_capacity(chunk.len() * block_size);
-        for record in chunk {
-            inputs.extend(record.inputs.iter().copied());
-            targets.extend(record.targets.iter().copied());
-        }
-        batches.push(TokenWindowBatch {
-            inputs: Tensor::<B, 2, Int>::from_data(
-                TensorData::new(inputs, [chunk.len(), block_size]),
-                device,
-            ),
-            targets: Tensor::<B, 2, Int>::from_data(
-                TensorData::new(targets, [chunk.len(), block_size]),
-                device,
-            ),
-            token_count: chunk.len() * block_size,
-        });
+    let plan = crate::stream_batch::plan_windowed_stream_batches(
+        records,
+        batch_size,
+        max_batches,
+        window_id,
+    )?;
+    let mut batches = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let items = planned
+            .record_indices
+            .iter()
+            .map(|index| &records[*index])
+            .collect::<Vec<_>>();
+        batches.push(build_batch_from_records::<B>(
+            &items,
+            planned.reset_stream_state,
+            block_size,
+            device,
+        )?);
     }
     Ok(batches)
+}
+
+fn build_batch_from_records<B: Backend>(
+    records: &[&TokenWindowRecord],
+    reset_stream_state: bool,
+    block_size: usize,
+    device: &B::Device,
+) -> Result<TokenWindowBatch<B>> {
+    let mut inputs = Vec::with_capacity(records.len() * block_size);
+    let mut targets = Vec::with_capacity(records.len() * block_size);
+    for record in records {
+        inputs.extend(record.inputs.iter().copied());
+        targets.extend(record.targets.iter().copied());
+    }
+    let batch_digest = ContentId::derive(&(
+        "dragon-token-window-batch-v2",
+        records,
+        block_size,
+        reset_stream_state,
+    ))?;
+    let record_digests = records
+        .iter()
+        .map(|record| ContentId::derive(*record))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(TokenWindowBatch {
+        inputs: Tensor::<B, 2, Int>::from_data(
+            TensorData::new(inputs, [records.len(), block_size]),
+            device,
+        ),
+        targets: Tensor::<B, 2, Int>::from_data(
+            TensorData::new(targets, [records.len(), block_size]),
+            device,
+        ),
+        token_count: records.len() * block_size,
+        batch_digest,
+        record_digests,
+        reset_stream_state,
+    })
+}
+
+fn take_browser_step_state<B: Backend>(
+    model: &DragonModel<B>,
+    state_slot: &mut Option<ModelState<B>>,
+    reset_stream_state: bool,
+    persist_across_steps: bool,
+) -> ModelState<B> {
+    if !persist_across_steps {
+        return model.init_state_ephemeral();
+    }
+    if reset_stream_state {
+        *state_slot = None;
+    }
+    state_slot.take().unwrap_or_else(|| model.init_state())
+}
+
+fn store_browser_step_state<B: Backend>(
+    state_slot: &mut Option<ModelState<B>>,
+    mut state: ModelState<B>,
+    persist_across_steps: bool,
+) {
+    if !persist_across_steps {
+        return;
+    }
+    state.detach_in_place();
+    *state_slot = Some(state);
+}
+
+fn visit_browser_next_token_chunks<B: Backend>(
+    model: &DragonModel<B>,
+    batch: &TokenWindowBatch<B>,
+    state: &mut ModelState<B>,
+    tbptt_chunk_size: Option<usize>,
+    mut visit: impl FnMut(Tensor<B, 1>),
+) {
+    let [batch_size, block_size] = batch.inputs.shape().dims();
+    let chunk_size = tbptt_chunk_size
+        .filter(|chunk_size| *chunk_size > 0)
+        .unwrap_or(block_size.max(1))
+        .min(block_size.max(1));
+    for start in (0..block_size).step_by(chunk_size) {
+        let end = (start + chunk_size).min(block_size);
+        let inputs = batch.inputs.clone().slice([0..batch_size, start..end]);
+        let targets = batch.targets.clone().slice([0..batch_size, start..end]);
+        let hidden = model.forward_hidden_with_state(inputs, state);
+        let chunk_weight = (end - start) as f32 / block_size.max(1) as f32;
+        visit(
+            model
+                .language_loss_from_hidden(hidden, targets)
+                .mul_scalar(chunk_weight),
+        );
+        if end < block_size {
+            state.detach_in_place();
+        }
+    }
+}
+
+fn sum_scalar_losses<B: Backend>(losses: Vec<Tensor<B, 1>>) -> Tensor<B, 1> {
+    Tensor::cat(losses, 0).sum().reshape([1])
 }
 
 async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
@@ -1368,20 +1926,20 @@ async fn scalar_from_loss_async<B: Backend>(loss: Tensor<B, 1>) -> Result<f64> {
         .map_err(|error| anyhow!("failed to read browser loss scalar: {error}"))
 }
 
-fn browser_training_objective_loss<B: AutodiffBackend>(
-    model: &DragonModel<B>,
-    teacher: Option<&DragonModel<B>>,
-    batch: &TokenWindowBatch<B>,
-    objective: &crate::config::DragonBrowserTrainingObjectiveConfig,
-) -> Tensor<B, 1> {
-    let objective = objective.to_window_smoke_objective();
-    window_self_distillation_smoke_loss(
-        model,
-        teacher.unwrap_or(model),
-        batch.inputs.clone(),
-        batch.targets.clone(),
-        &objective,
-    )
+async fn scalar_values_from_loss_tensors_async<B: Backend>(
+    losses: Vec<Tensor<B, 1>>,
+) -> Result<Vec<f64>> {
+    if losses.is_empty() {
+        return Ok(Vec::new());
+    }
+    Tensor::cat(losses, 0)
+        .into_data_async()
+        .await
+        .map_err(|error| anyhow!("failed to read browser population losses: {error}"))?
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .map(|values| values.into_iter().map(f64::from).collect())
+        .map_err(|error| anyhow!("failed to decode browser population losses: {error}"))
 }
 
 struct BrowserTrainingContributionStats {
@@ -1394,6 +1952,36 @@ struct BrowserTrainingContributionStats {
     training_time_ms: u64,
     eval_time_ms: u64,
     total_time_ms: u64,
+}
+
+struct BrowserPublishedUpdate {
+    artifact: WorkloadTrainingArtifact,
+    workload_update: Option<WorkloadUpdateEnvelope>,
+}
+
+fn materialize_browser_training_artifact(
+    descriptor: burn_p2p::ArtifactDescriptor,
+    bytes: Vec<u8>,
+) -> Result<WorkloadTrainingArtifact> {
+    let mut chunks = Vec::with_capacity(descriptor.chunks.len());
+    for chunk in &descriptor.chunks {
+        let start = usize::try_from(chunk.offset_bytes)
+            .map_err(|_| anyhow!("browser artifact chunk offset exceeded local usize"))?;
+        let len = usize::try_from(chunk.length_bytes)
+            .map_err(|_| anyhow!("browser artifact chunk length exceeded local usize"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("browser artifact chunk range overflowed"))?;
+        let chunk_bytes = bytes
+            .get(start..end)
+            .ok_or_else(|| anyhow!("browser artifact chunk range exceeded artifact bytes"))?
+            .to_vec();
+        chunks.push(WorkloadTrainingArtifactChunk {
+            chunk: chunk.clone(),
+            bytes: chunk_bytes,
+        });
+    }
+    Ok(WorkloadTrainingArtifact { descriptor, chunks })
 }
 
 fn browser_training_head_artifact<B>(
@@ -1451,31 +2039,98 @@ where
         ChunkingScheme::new(1024 * 1024)?,
     )
     .map_err(|error| anyhow!("failed to materialize browser training artifact: {error}"))?;
-    let mut chunks = Vec::with_capacity(descriptor.chunks.len());
-    for chunk in &descriptor.chunks {
-        let start = usize::try_from(chunk.offset_bytes)
-            .map_err(|_| anyhow!("browser artifact chunk offset exceeded local usize"))?;
-        let len = usize::try_from(chunk.length_bytes)
-            .map_err(|_| anyhow!("browser artifact chunk length exceeded local usize"))?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| anyhow!("browser artifact chunk range overflowed"))?;
-        let chunk_bytes = bytes
-            .get(start..end)
-            .ok_or_else(|| anyhow!("browser artifact chunk range exceeded artifact bytes"))?
-            .to_vec();
-        chunks.push(WorkloadTrainingArtifactChunk {
-            chunk: chunk.clone(),
-            bytes: chunk_bytes,
-        });
+    materialize_browser_training_artifact(descriptor, bytes)
+}
+
+fn browser_training_compact_update(
+    context: &BrowserTrainingRunContext<'_>,
+    live: &LiveBrowserParticipantHandle,
+    trace: &BrowserCompactUpdateTrace,
+    model_schema_hash: ContentId,
+) -> Result<BrowserPublishedUpdate> {
+    let contract = live.revision_contract.as_ref().ok_or_else(|| {
+        anyhow!("browser compact update publication requires a signed revision contract")
+    })?;
+    let lease = context.config.training_lease.as_ref().ok_or_else(|| {
+        anyhow!("browser compact update publication requires an active training lease")
+    })?;
+    let base_head_id = live
+        .session_runtime
+        .runtime
+        .storage
+        .last_head_id
+        .clone()
+        .ok_or_else(|| anyhow!("browser compact update publication requires a synced base head"))?;
+    if model_schema_hash != contract.training.model_schema_hash {
+        bail!("browser compact update model schema does not match its signed contract");
     }
-    Ok(WorkloadTrainingArtifact { descriptor, chunks })
+    let burn_p2p::UpdateCodec::SeededFitness {
+        population,
+        rank,
+        seed,
+        ..
+    } = &contract.training.update_codec
+    else {
+        bail!("browser compact update requires the signed seeded-fitness codec");
+    };
+    let payload = CompactUpdatePayload {
+        version: COMPACT_UPDATE_PAYLOAD_VERSION,
+        training_contract_id: contract.training_contract_id.clone(),
+        model_schema_hash: model_schema_hash.clone(),
+        parameter_catalog_hash: trace.parameter_catalog_hash.clone(),
+        parameter_count: trace.parameter_count,
+        body: CompactUpdateBody::SeededFitness {
+            population: *population,
+            rank: *rank,
+            seed: *seed,
+            perturbation_generator_hash: trace.perturbation_generator_hash.clone(),
+            optimizer_update_hash: trace.optimizer_update_hash.clone(),
+            generations: trace.generations.clone(),
+        },
+    };
+    let bytes = burn_p2p_workload::encode_compact_update(
+        &payload,
+        &contract.training_contract_id,
+        &contract.training,
+    )
+    .context("encode browser compact update")?;
+    let descriptor = build_artifact_descriptor_from_bytes(
+        &ArtifactBuildSpec::new(
+            ArtifactKind::DeltaPack,
+            Precision::Custom("seeded-fitness".into()),
+            model_schema_hash,
+            "burn-p2p-compact-update-cbor-v1",
+        )
+        .with_base_head(base_head_id.clone()),
+        &bytes,
+        ChunkingScheme::new(256 * 1024)?,
+    )
+    .map_err(|error| anyhow!("failed to materialize browser compact update: {error}"))?;
+    let workload_update = WorkloadUpdateEnvelope {
+        training_contract_id: contract.training_contract_id.clone(),
+        revision_id: contract.revision.revision_id.clone(),
+        base_head_id,
+        window_id: lease.window_id,
+        lease_id: lease.lease_id.clone(),
+        codec: contract.training.update_codec.clone(),
+        artifact: descriptor.clone(),
+        decoded_tensor_digest: None,
+        claimed_norm_stats: None,
+        claimed_feature_sketch: None,
+    };
+    workload_update
+        .validate_against(&contract.training_contract_id, &contract.training)
+        .context("validate browser compact update envelope")?;
+    Ok(BrowserPublishedUpdate {
+        artifact: materialize_browser_training_artifact(descriptor, bytes)?,
+        workload_update: Some(workload_update),
+    })
 }
 
 fn browser_training_contribution(
     context: &BrowserTrainingRunContext<'_>,
     stats: BrowserTrainingContributionStats,
-    artifact: Option<WorkloadTrainingArtifact>,
+    published_update: Option<BrowserPublishedUpdate>,
 ) -> WorkloadTrainingContribution {
     let now = Utc::now();
     let fallback_artifact_id = ArtifactId::new(format!(
@@ -1493,6 +2148,7 @@ fn browser_training_contribution(
     let artifact_publication_decision = browser_canonical_artifact_publication_decision(
         requested_canonical_update,
         context.backend_kind,
+        context.config.optimizer.is_forward_only(),
     );
     let mut metadata = BTreeMap::from([
         ("contribution_kind".into(), "browser-local-window".into()),
@@ -1537,13 +2193,16 @@ fn browser_training_contribution(
     if let Some(reason) = artifact_publication_decision.disabled_reason {
         metadata.insert("artifact_publication_disabled_reason".into(), reason.into());
     }
-    let artifact_id = artifact
+    let artifact_id = published_update
         .as_ref()
-        .map(|artifact| artifact.descriptor.artifact_id.clone())
+        .map(|update| update.artifact.descriptor.artifact_id.clone())
         .unwrap_or(fallback_artifact_id);
-    let base_head_id = artifact
+    let base_head_id = published_update
         .as_ref()
-        .and_then(|artifact| artifact.descriptor.base_head_id.clone());
+        .and_then(|update| update.artifact.descriptor.base_head_id.clone());
+    let (published_artifact, workload_update) = published_update
+        .map(|update| (Some(update.artifact), update.workload_update))
+        .unwrap_or((None, None));
 
     WorkloadTrainingContribution {
         artifact_id,
@@ -1555,7 +2214,8 @@ fn browser_training_contribution(
         total_time_ms: stats.total_time_ms,
         artifact_published: false,
         base_head_id,
-        published_artifact: artifact,
+        published_artifact,
+        workload_update,
         metadata,
     }
 }
@@ -1566,6 +2226,7 @@ fn live_browser_training_requested_scopes(
     let experiment_id = ExperimentId::new(live.experiment_id.clone());
     BTreeSet::from([
         ExperimentScope::Connect,
+        ExperimentScope::Discover,
         ExperimentScope::Train {
             experiment_id: experiment_id.clone(),
         },
@@ -1583,6 +2244,27 @@ async fn start_live_browser_participant(
         return Ok(None);
     };
     let snapshot = fetch_edge_snapshot(edge_base_url).await?;
+    let directory_entry = snapshot
+        .directory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.experiment_id.as_str() == live.experiment_id
+                && entry.current_revision_id.as_str() == live.revision_id
+        })
+        .ok_or_else(|| anyhow!("browser training experiment revision is absent from the edge"))?;
+    ensure!(
+        matches!(
+            &directory_entry.training_protocol,
+            TrainingProtocol::ArtifactWindows
+        ),
+        "browser training does not implement the selected DiLoCo revision; participate as an observer or verifier"
+    );
+    let revision_contract = resolve_browser_revision_contract(&snapshot, config, live)?;
+    let bootstrap_head = revision_contract
+        .as_ref()
+        .map(|contract| browser_bootstrap_head(&snapshot, contract))
+        .transpose()?;
     let requested_scopes = live_browser_training_requested_scopes(live);
     let _ = browser_github_enrollment_config(
         &snapshot,
@@ -1633,6 +2315,7 @@ async fn start_live_browser_participant(
             enable_direct_swarm: true,
             sync_active_head_artifact: live.load_active_head_artifact
                 || live.publish_canonical_update,
+            bootstrap_head,
         },
         session,
     )
@@ -1641,6 +2324,7 @@ async fn start_live_browser_participant(
 
     Ok(Some(LiveBrowserParticipantHandle {
         session_runtime,
+        revision_contract,
         training_budget: capability_decision.training_budget.unwrap_or_else(|| {
             BrowserTrainingBudget {
                 max_window_secs: 30,
@@ -1650,6 +2334,169 @@ async fn start_live_browser_participant(
             }
         }),
     }))
+}
+
+fn browser_bootstrap_head(
+    snapshot: &burn_p2p::BrowserEdgeSnapshot,
+    contract: &burn_p2p::RevisionContractBundle,
+) -> Result<BrowserBootstrapHead> {
+    let genesis = &contract.genesis.payload.payload;
+    let artifact = genesis.artifact.clone();
+    let head_id = artifact
+        .head_id
+        .clone()
+        .ok_or_else(|| anyhow!("signed browser genesis artifact has no head id"))?;
+    let directory_entry = snapshot
+        .directory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.experiment_id == contract.revision.experiment_id
+                && entry.current_revision_id == contract.revision.revision_id
+        })
+        .ok_or_else(|| {
+            anyhow!("signed browser genesis has no matching browser directory experiment revision")
+        })?;
+
+    let head = snapshot
+        .heads
+        .iter()
+        .find(|head| head.head_id == head_id)
+        .map(|head| {
+            if head.study_id != directory_entry.study_id
+                || head.experiment_id != contract.revision.experiment_id
+                || head.revision_id != contract.revision.revision_id
+                || head.artifact_id != artifact.artifact_id
+            {
+                bail!("edge genesis head metadata disagrees with the signed genesis artifact");
+            }
+            Ok(head.clone())
+        })
+        .transpose()?
+        .unwrap_or_else(|| HeadDescriptor {
+            head_id,
+            study_id: directory_entry.study_id.clone(),
+            experiment_id: contract.revision.experiment_id.clone(),
+            revision_id: contract.revision.revision_id.clone(),
+            artifact_id: artifact.artifact_id.clone(),
+            parent_head_id: None,
+            global_step: 0,
+            created_at: genesis.created_at,
+            metrics: BTreeMap::new(),
+        });
+
+    Ok(BrowserBootstrapHead { head, artifact })
+}
+
+fn validate_browser_active_head_descriptor(
+    config: &DragonBrowserTrainingConfig,
+    contract: Option<&burn_p2p::RevisionContractBundle>,
+    head_id: &HeadId,
+    descriptor: &burn_p2p::ArtifactDescriptor,
+) -> Result<()> {
+    ensure!(
+        descriptor.kind == ArtifactKind::FullHead,
+        "browser active training head {} must use a full-head artifact, found {:?}",
+        head_id.as_str(),
+        descriptor.kind,
+    );
+    ensure!(
+        descriptor.head_id.as_ref() == Some(head_id),
+        "browser active artifact {} is not bound to head {}",
+        descriptor.artifact_id.as_str(),
+        head_id.as_str(),
+    );
+    let expected_model_schema = dragon_model_schema_hash(&config.model_config);
+    ensure!(
+        descriptor.model_schema_hash == expected_model_schema,
+        "browser active artifact model schema {} does not match configured Dragon schema {}",
+        descriptor.model_schema_hash.as_str(),
+        expected_model_schema.as_str(),
+    );
+    if let Some(contract) = contract {
+        ensure!(
+            descriptor.model_schema_hash == contract.training.model_schema_hash,
+            "browser active artifact does not match the signed revision model schema",
+        );
+        let genesis = &contract.genesis.payload.payload.artifact;
+        if genesis.head_id.as_ref() == Some(head_id) {
+            ensure!(
+                descriptor == genesis,
+                "browser active head {} claims the signed genesis identity but its descriptor differs",
+                head_id.as_str(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_browser_revision_contract(
+    snapshot: &burn_p2p::BrowserEdgeSnapshot,
+    config: &DragonBrowserTrainingConfig,
+    live: &DragonBrowserLiveParticipantConfig,
+) -> Result<Option<burn_p2p::RevisionContractBundle>> {
+    let embedded = live.revision_contract.as_ref();
+    let published = snapshot
+        .revision_contracts
+        .iter()
+        .find(|contract| contract.revision.revision_id.as_str() == live.revision_id);
+    if let (Some(embedded), Some(published)) = (embedded, published)
+        && embedded != published
+    {
+        bail!("embedded and edge-published browser revision contracts disagree");
+    }
+    let contract = embedded.or(published).cloned();
+    let Some(contract) = contract else {
+        if live.publish_canonical_update {
+            bail!(
+                "browser canonical training requires an authority-signed revision contract from the edge"
+            );
+        }
+        return Ok(None);
+    };
+    let trust_bundle = snapshot
+        .trust_bundle
+        .as_ref()
+        .ok_or_else(|| anyhow!("browser canonical training requires the edge trust bundle"))?;
+    burn_p2p::verify_revision_contract_with_trust_bundle(trust_bundle, &contract).map_err(
+        |error| anyhow!("browser revision contract signature verification failed: {error}"),
+    )?;
+    if contract.revision.experiment_id.as_str() != live.experiment_id
+        || contract.revision.revision_id.as_str() != live.revision_id
+        || contract.revision.workload_id.as_str() != live.workload_id
+    {
+        bail!("browser revision contract does not match the selected experiment revision");
+    }
+    if contract.training.model_schema_hash != dragon_model_schema_hash(&config.model_config) {
+        bail!("browser model config does not match the signed model schema");
+    }
+    let update_codec = config
+        .optimizer
+        .update_codec()
+        .map_err(anyhow::Error::msg)?;
+    if contract.training.update_codec != update_codec {
+        bail!(
+            "browser optimizer codec {:?} does not match signed revision codec {:?}",
+            update_codec,
+            contract.training.update_codec
+        );
+    }
+    let authorized_execution = contract
+        .training
+        .extensions
+        .get(DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION)
+        .ok_or_else(|| {
+            anyhow!("signed revision contract does not authorize a browser execution contract")
+        })?;
+    let runtime_execution = browser_runtime_execution_contract_hash(config)?;
+    if authorized_execution != &runtime_execution {
+        bail!(
+            "browser runtime execution contract {} does not match signed authorization {}",
+            runtime_execution.as_str(),
+            authorized_execution.as_str()
+        );
+    }
+    Ok(Some(contract))
 }
 
 async fn finish_live_browser_participant(
@@ -1742,6 +2589,9 @@ fn map_browser_session_runtime_error(error: BrowserSessionRuntimeError) -> anyho
         BrowserSessionRuntimeError::Worker(message) => {
             anyhow!("browser worker runtime failed during bootstrap: {message}")
         }
+        BrowserSessionRuntimeError::InvalidBootstrapHead(message) => {
+            anyhow!("browser signed genesis bootstrap is invalid: {message}")
+        }
     }
 }
 
@@ -1775,6 +2625,7 @@ mod tests {
         let decision = browser_canonical_artifact_publication_decision_for_platform(
             false,
             BrowserTrainingBackendKind::Cpu,
+            false,
             true,
         );
 
@@ -1788,6 +2639,7 @@ mod tests {
         let decision = browser_canonical_artifact_publication_decision_for_platform(
             true,
             BrowserTrainingBackendKind::Cpu,
+            false,
             true,
         );
 
@@ -1802,6 +2654,7 @@ mod tests {
         let decision = browser_canonical_artifact_publication_decision_for_platform(
             true,
             BrowserTrainingBackendKind::Wgpu,
+            false,
             true,
         );
 
@@ -1822,6 +2675,7 @@ mod tests {
             true,
             BrowserTrainingBackendKind::Wgpu,
             false,
+            false,
         );
 
         assert!(decision.requested);
@@ -1841,6 +2695,7 @@ mod tests {
             workload_id: "dragon-workload".into(),
             publish_canonical_update: true,
             load_active_head_artifact: true,
+            revision_contract: None,
         });
         let context = BrowserTrainingRunContext {
             edge_base_url: "https://edge.example.invalid",
@@ -1898,6 +2753,7 @@ mod tests {
             workload_id: "dragon-workload".into(),
             publish_canonical_update: true,
             load_active_head_artifact: true,
+            revision_contract: None,
         });
 
         let shard_key = browser_shard_selection_key(
@@ -1922,6 +2778,7 @@ mod tests {
             workload_id: "dragon-workload".into(),
             publish_canonical_update: true,
             load_active_head_artifact: true,
+            revision_contract: None,
         });
 
         let configured_key =
@@ -1948,8 +2805,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -1999,8 +2859,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config,
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2039,8 +2902,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::SdftSdpo(Default::default()),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2077,11 +2943,13 @@ mod tests {
                 inputs: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 targets: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 targets: vec![3, 4, 5, 6, 7, 8, 9, 10],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let payload = serde_json::to_string(&json!({ "records": records })).unwrap();
@@ -2093,8 +2961,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2127,11 +2998,13 @@ mod tests {
                 inputs: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 targets: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 targets: vec![3, 4, 5, 6, 7, 8, 9, 10],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_b = vec![
@@ -2139,11 +3012,13 @@ mod tests {
                 inputs: vec![10, 11, 12, 13, 14, 15, 16, 17],
                 targets: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 targets: vec![12, 13, 14, 15, 16, 17, 18, 19],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_a_bytes = serde_json::to_vec(&shard_a).expect("shard a bytes");
@@ -2171,8 +3046,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2207,11 +3085,13 @@ mod tests {
                 inputs: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 targets: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 targets: vec![3, 4, 5, 6, 7, 8, 9, 10],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_b = vec![
@@ -2219,11 +3099,13 @@ mod tests {
                 inputs: vec![10, 11, 12, 13, 14, 15, 16, 17],
                 targets: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 targets: vec![12, 13, 14, 15, 16, 17, 18, 19],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_a_bytes = serde_json::to_vec(&shard_a).expect("shard a bytes");
@@ -2251,8 +3133,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2287,11 +3172,13 @@ mod tests {
                 inputs: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 targets: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![2, 3, 4, 5, 6, 7, 8, 9],
                 targets: vec![3, 4, 5, 6, 7, 8, 9, 10],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_b = vec![
@@ -2299,11 +3186,13 @@ mod tests {
                 inputs: vec![10, 11, 12, 13, 14, 15, 16, 17],
                 targets: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![11, 12, 13, 14, 15, 16, 17, 18],
                 targets: vec![12, 13, 14, 15, 16, 17, 18, 19],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_c = vec![
@@ -2311,11 +3200,13 @@ mod tests {
                 inputs: vec![20, 21, 22, 23, 24, 25, 26, 27],
                 targets: vec![21, 22, 23, 24, 25, 26, 27, 28],
                 reset_stream_state: true,
+                ..TokenWindowRecord::default()
             },
             TokenWindowRecord {
                 inputs: vec![21, 22, 23, 24, 25, 26, 27, 28],
                 targets: vec![22, 23, 24, 25, 26, 27, 28, 29],
                 reset_stream_state: false,
+                ..TokenWindowRecord::default()
             },
         ];
         let shard_a_bytes = serde_json::to_vec(&shard_a).expect("shard a bytes");
@@ -2351,8 +3242,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::ClimbMixPretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2382,13 +3276,16 @@ mod tests {
 
     #[cfg(feature = "wgpu")]
     #[wasm_bindgen_test(async)]
-    async fn browser_training_downgrades_cleanly_under_tiny_budget() {
+    async fn browser_training_downgrades_cleanly_when_wgpu_cannot_train() {
         let config = DragonBrowserTrainingConfig {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Wgpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,
@@ -2413,9 +3310,11 @@ mod tests {
             &dummy_release_manifest(),
         )
         .await
-        .expect_err("tiny browser budget should downgrade before training starts");
+        .expect_err("browser preflight should downgrade before training starts");
+        let error = error.to_string();
         assert!(
-            error.to_string().contains("downgrading to verifier"),
+            error.contains("downgrading to verifier")
+                || error.contains("downgrading browser peer to verifier/observer"),
             "unexpected error: {error}"
         );
     }
@@ -2438,8 +3337,11 @@ mod tests {
             experiment_kind: crate::config::DragonExperimentKind::NcaPrepretraining,
             model_config: tiny_model_config(256),
             training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
             execution_backend: DragonBrowserExecutionBackend::Cpu,
             block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
             learning_rate: 1.0e-3,
             weight_decay: 0.0,
             batch_size: 2,

@@ -1,0 +1,17 @@
+extends = "ruliad-1m-la-16k.verifier-reward.training.toml"
+
+[training.ruliad_supervision.verifier_reward]
+mode = "vpo_independent"
+weight = 0.01
+every_steps = 32
+start_after_steps = 512
+clip_range = 1.0
+max_advantage_clip_fraction = 0.95
+positive_advantage_requires_correctness = true
+positive_advantage_min_partial_progress_ppm = 500000
+positive_advantage_min_completion_quality_ppm = 750000
+vpo_scalarizations = 8
+vpo_correctness_mass_floor = 0.85
+vpo_schema_quality_mass_floor = 0.10
+vpo_completion_health_mass_floor = 0.0
+vpo_compactness_max_weight = 0.05

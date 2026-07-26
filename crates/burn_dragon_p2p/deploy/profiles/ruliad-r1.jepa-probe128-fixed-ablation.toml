@@ -1,0 +1,6 @@
+extends = ["ruliad-r1.latent-jepa-fixed-ablation.toml"]
+
+[training.events]
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 64

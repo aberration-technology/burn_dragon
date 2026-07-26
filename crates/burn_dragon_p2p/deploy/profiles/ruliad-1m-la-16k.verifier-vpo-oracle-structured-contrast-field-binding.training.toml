@@ -1,0 +1,16 @@
+extends = ["ruliad-1m-la-16k.verifier-vpo-oracle-structured-contrast.training.toml"]
+
+[training.ruliad_supervision.verifier_reward]
+field_binding_contrast_weight = 0.05
+field_binding_contrast_every_steps = 8
+field_binding_contrast_start_after_steps = 0
+field_binding_contrast_margin = 0.25
+field_binding_contrast_pair_weight = 0.50
+field_binding_contrast_max_pairs = 24
+field_binding_contrast_rank_metric_every_steps = 8
+field_binding_contrast_replay_capacity = 64
+generated_attractor_replay_capacity = 128
+generated_attractor_replay_min_count = 2
+generated_attractor_replay_max_candidates = 4
+generated_attractor_replay_min_distinct_answers = 2
+generated_attractor_replay_max_dominant_fraction = 0.5

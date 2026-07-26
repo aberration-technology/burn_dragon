@@ -1,0 +1,31 @@
+[package]
+name = "burn_dragon_eggroll"
+description = "Dragon-specific EGGROLL optimizer integration helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[features]
+default = []
+
+[dependencies]
+anyhow.workspace = true
+burn = { workspace = true, features = ["fusion", "ndarray", "std", "wgpu"] }
+burn_eggroll.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+burn-ndarray.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "mapper"
+harness = false
+
+[lints]
+workspace = true

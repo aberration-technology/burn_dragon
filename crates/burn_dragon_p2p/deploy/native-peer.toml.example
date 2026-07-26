@@ -33,9 +33,22 @@ description = "burn_dragon mainnet native trainer"
 protocol_major = 0
 authority_public_keys = []
 bootstrap_addrs = []
+# Production peers fail closed unless this authority-signed bundle exists and
+# matches the local Dragon model, dataset, objective, optimizer, and revision.
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
+require_signed_revision_contracts = true
 
 [capability_policy]
 native_wgpu_memory_budget_bytes = 4294967296
 native_cuda_memory_budget_bytes = 6442450944
 native_rocm_memory_budget_bytes = 6442450944
 allow_native_validator_fallback = false
+
+[capability_policy.native_reprobe]
+enabled = true
+cooldown_secs = 30
+interval_secs = 15
+max_interval_secs = 300
+required_successes = 2
+memory_headroom_percent = 125
+min_available_memory_bytes = 536870912

@@ -173,6 +173,10 @@ fn legacy_flat_decoder_tail_enabled() -> bool {
         .get_or_init(|| std::env::var_os("BURN_DRAGON_LEGACY_FLAT_DECODER_TAIL").is_some())
 }
 
+pub(super) fn decode_y_neuron_tail_uses_legacy_flat() -> bool {
+    legacy_flat_decoder_tail_enabled()
+}
+
 fn lowrank_residual_profile_state() -> &'static Mutex<LowRankResidualProfileSnapshot> {
     LOWRANK_RESIDUAL_PROFILE.get_or_init(|| Mutex::new(LowRankResidualProfileSnapshot::default()))
 }
@@ -329,7 +333,10 @@ fn decode_y_neuron_tail_headwise<B: Backend>(
         .reshape([batch, 1, time, dim])
 }
 
-fn decode_y_neuron_tail<B: Backend>(y_neuron: Tensor<B, 4>, decoder: Tensor<B, 2>) -> Tensor<B, 4> {
+pub(super) fn decode_y_neuron_tail<B: Backend>(
+    y_neuron: Tensor<B, 4>,
+    decoder: Tensor<B, 2>,
+) -> Tensor<B, 4> {
     if legacy_flat_decoder_tail_enabled() {
         decode_y_neuron_tail_flat(y_neuron, decoder)
     } else {

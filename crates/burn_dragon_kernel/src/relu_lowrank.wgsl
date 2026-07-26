@@ -29,8 +29,8 @@ fn idx_input(
   return (((b * input_heads + input_head) * time + t) * embd + e);
 }
 
-fn idx_weight(h: u32, e: u32, l: u32, embd: u32, latent: u32) -> u32 {
-  return ((h * embd + e) * latent + l);
+fn idx_weight(wb: u32, h: u32, e: u32, l: u32, heads: u32, embd: u32, latent: u32) -> u32 {
+  return (((wb * heads + h) * embd + e) * latent + l);
 }
 
 fn idx_output(b: u32, h: u32, t: u32, l: u32, heads: u32, time: u32, latent: u32) -> u32 {
@@ -47,6 +47,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let latent = to_u32(params[5]);
   let threshold = params[6];
   let has_mask = params[7] > 0.5;
+  let weight_batch = to_u32(params[8]);
 
   let l = gid.x;
   let t = gid.y;
@@ -57,13 +58,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let h = bh % heads;
   let b = bh / heads;
+  let batch_per_weight = max(1u, batch / max(1u, weight_batch));
+  let wb = select(0u, b / batch_per_weight, weight_batch > 1u);
   let input_head = select(h, 0u, input_heads == 1u);
 
   var sum = 0.0;
   var e = 0u;
   while e < embd {
     sum += input[idx_input(b, input_head, t, e, input_heads, time, embd)]
-      * weight[idx_weight(h, e, l, embd, latent)];
+      * weight[idx_weight(wb, h, e, l, heads, embd, latent)];
     e += 1u;
   }
 

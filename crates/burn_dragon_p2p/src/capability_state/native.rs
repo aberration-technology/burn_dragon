@@ -143,10 +143,10 @@ pub fn apply_native_downgrade_state(
             "validator" => DragonNativeTarget::Validator,
             _ => DragonNativeTarget::Trainer,
         };
-        let target_label = match downgraded_target {
-            DragonNativeTarget::Reducer => "reducer",
-            DragonNativeTarget::Validator => "validator",
-            DragonNativeTarget::Auto | DragonNativeTarget::Trainer => "trainer",
+        let target_label = match record.downgrade_to.as_str() {
+            "reducer" => "reducer",
+            "validator" => "validator",
+            _ => "observer",
         };
         assessment.target_decision.effective_target = downgraded_target;
         assessment.target_decision.can_train = false;

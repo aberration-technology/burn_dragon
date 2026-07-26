@@ -2,6 +2,12 @@
 
 //! Shared Dragon core math and state contracts for the focused language-training repo.
 
+/// Canonical Burn record schema used by Dragon checkpoints.
+///
+/// Version 2 records GDN2 width-normalization state as a frozen tensor so
+/// save/reload preserves function-preserving neuron widening.
+pub const DRAGON_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+
 pub mod constants;
 pub mod experimental;
 pub mod kernel;
@@ -23,11 +29,12 @@ pub mod api {
             DragonResidualScalingConfig, DragonResidualScalingKind, DragonTopologyPriorConfig,
             DragonTopologyPriorKind, FusedAttentionExecutor, FusedKernelConfig,
             FusedProjectionExecutor, GatedDeltaNet2Config, GatedDeltaNet2GateMode,
-            GatedDeltaNet2Implementation, GatedDeltaNet2StatePrecision, LanguageHeadConfig,
-            LatentFanoutScheduleConfig, MambaSequenceConfig,
-            ManifoldHyperConnectionCoefficientPolicy, ManifoldHyperConnectionsConfig,
-            ResidualConnectorKind, SequenceKernelConfig, SequenceMemorySystem,
-            SequenceTrainingExecutor, SummaryMemoryConfig, YNeuronRecurrenceConfig,
+            GatedDeltaNet2Implementation, GatedDeltaNet2StatePrecision, HierarchicalDragonConfig,
+            HierarchicalDragonSharing, LanguageHeadConfig, LatentFanoutScheduleConfig,
+            MambaSequenceConfig, ManifoldHyperConnectionCoefficientPolicy,
+            ManifoldHyperConnectionsConfig, NextLatentTransitionConfig, ResidualConnectorKind,
+            SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor,
+            SummaryMemoryConfig, YNeuronRecurrenceConfig,
         };
         pub use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
     }
@@ -109,24 +116,26 @@ pub use model::{
     DragonResidualScalingKind, DragonTopologyPriorConfig, DragonTopologyPriorKind,
     FusedAttentionExecutor, FusedKernelConfig, FusedProjectionExecutor, GatedDeltaNet2Config,
     GatedDeltaNet2GateMode, GatedDeltaNet2Implementation, GatedDeltaNet2StatePrecision, HaltHead,
-    LanguageHeadConfig, LanguageMhcLayerDiagnostics, LanguagePipelineState,
-    LatentFanoutScheduleConfig, LogitsProjectionProfileSnapshot,
+    HierarchicalDragonConfig, HierarchicalDragonSharing, LanguageHeadConfig,
+    LanguageMhcLayerDiagnostics, LanguagePipelineState, LatentFanoutScheduleConfig,
+    LatentReasoningConfig, LatentReasoningOutput, LogitsProjectionProfileSnapshot,
     LowRankResidualMemoryProfileSnapshot, LowRankResidualMemoryStageSnapshot,
     LowRankResidualOutput, LowRankResidualProfileSnapshot, MambaSequenceConfig,
     ManifoldHyperConnectionCoefficientPolicy, ManifoldHyperConnectionCoefficients,
     ManifoldHyperConnectionStreamCoefficients, ManifoldHyperConnectionStreamOutput,
     ManifoldHyperConnectionWidthOutput, ManifoldHyperConnections, ManifoldHyperConnectionsConfig,
-    MicroTransformerBlock, ModelState, ResidualConnectorKind, SequenceKernelConfig,
-    SequenceMemorySystem, SequenceTrainingExecutor, SharedLowrankActivationBatchStats,
-    SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
-    SummaryMemoryConfig, YNeuronRecurrenceConfig, gated_deltanet2_reference,
-    logits_projection_profile_reset, logits_projection_profile_snapshot,
-    lowrank_residual_memory_profile_reset, lowrank_residual_memory_profile_snapshot,
-    lowrank_residual_profile_reset, lowrank_residual_profile_snapshot, lowrank_residual_step,
-    lowrank_residual_step_next, mhc_merge, mhc_merge_with_coefficients, mhc_passthrough,
-    mhc_passthrough_with_coefficients, mhc_split, mhc_split_with_coefficients,
-    near_critical_embedding_initializer, near_critical_embedding_std, near_critical_projection_std,
-    near_critical_residual_output_std,
+    MicroTransformerBlock, ModelState, NextLatentTransitionConfig, ResidualConnectorKind,
+    SequenceKernelConfig, SequenceMemorySystem, SequenceTrainingExecutor,
+    SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
+    SharedLowrankFeatureMetrics, SharedLowrankParamIds, SharedLowrankPopulationFactors,
+    SharedLowrankPopulationWeights, SharedLowrankWeights, SummaryMemoryConfig,
+    YNeuronRecurrenceConfig, gated_deltanet2_reference, logits_projection_profile_reset,
+    logits_projection_profile_snapshot, lowrank_residual_memory_profile_reset,
+    lowrank_residual_memory_profile_snapshot, lowrank_residual_profile_reset,
+    lowrank_residual_profile_snapshot, lowrank_residual_step, lowrank_residual_step_next,
+    mhc_merge, mhc_merge_with_coefficients, mhc_passthrough, mhc_passthrough_with_coefficients,
+    mhc_split, mhc_split_with_coefficients, near_critical_embedding_initializer,
+    near_critical_embedding_std, near_critical_projection_std, near_critical_residual_output_std,
 };
 #[cfg(any(feature = "probe", test))]
 pub use model::{

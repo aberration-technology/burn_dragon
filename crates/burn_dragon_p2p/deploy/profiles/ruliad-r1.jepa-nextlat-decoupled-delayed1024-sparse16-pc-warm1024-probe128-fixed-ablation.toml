@@ -1,0 +1,4 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-pc-probe128-fixed-ablation.toml"]
+
+[training.predictive_coding]
+warmup_steps = 1024

@@ -62,9 +62,11 @@ burn-rocm = { workspace = true, optional = true, features = ["std"] }
 burn-train = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true, features = ["fusion", "std", "webgpu"] }
 burn_dragon_core = { workspace = true, optional = true, default-features = false }
+burn_dragon_eggroll.workspace = true
 burn_dragon_time.workspace = true
 burn_dragon_universality = { workspace = true, optional = true, default-features = false }
-burn_p2p.workspace = true
+burn_eggroll.workspace = true
+burn_p2p = { workspace = true, features = ["tensor-identity"] }
 burn_p2p_admin.workspace = true
 burn_p2p_app = { workspace = true, optional = true, features = ["readonly"] }
 burn_p2p_browser = { workspace = true, optional = true }
@@ -87,7 +89,8 @@ url = "2"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 burn_dragon_language = { workspace = true, optional = true, default-features = false, features = ["train"] }
 burn_dragon_train = { workspace = true, optional = true, default-features = false, features = ["train"] }
-burn_p2p = { workspace = true, default-features = false, features = ["burn"] }
+burn_ecs.workspace = true
+burn_p2p = { workspace = true, default-features = false, features = ["burn", "ecs"] }
 burn_p2p_bootstrap.workspace = true
 burn_p2p_core.workspace = true
 ctrlc = "3.4"
@@ -121,7 +124,7 @@ tempfile.workspace = true
 
 [lib]
 path = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "burn_dragon_p2p_native"

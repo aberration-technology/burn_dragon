@@ -9,8 +9,20 @@ pub use burn_dragon_train::{
 };
 pub use load::load_training_config;
 pub use schema::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, RepromptTruncation, SdftObjectiveConfig,
+    AutoBatchSizeConfig, CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
+    DragonStateConsistencyConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
+    GreedyRolloutUnlikelihoodConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
+    LatentEnergyModelConfig, LatentReasoningAuxiliaryStartPolicy,
+    LatentReasoningConstraintBalancerConfig, LatentReasoningNegativeSource,
+    LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
+    LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LatentStepContractConfig,
+    LogitEntropyFloorConfig, ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, NeuronScalingConfig,
+    NeuronScalingGrowth, NeuronScalingStabilizationConfig, NextLatentPredictionConfig,
+    PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
+    PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepeatUnlikelihoodConfig,
+    RepromptTruncation, RuliadAnswerContractConfig, RuliadAnswerDenoisingConfig,
+    RuliadAnswerRankingConfig, RuliadSupervisionConfig, RuliadSupervisionMode,
+    RuliadVerifierRewardConfig, RuliadVerifierRewardMode, SdftObjectiveConfig,
     SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
     TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
     ValidationDatasetConfig,

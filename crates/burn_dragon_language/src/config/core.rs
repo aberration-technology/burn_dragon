@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::tokenizer::TokenizerConfig;
 use burn_dragon_core::{
     AttentionResidualConfig, BlockAttentionResidualConfig, ClockedSlowMemoryConfig,
-    DragonInitializationConfig, DragonNormConfig, GatedDeltaNet2Config, LanguageHeadConfig,
-    LatentFanoutScheduleConfig, MambaSequenceConfig, ManifoldHyperConnectionsConfig,
-    ResidualConnectorKind, RotaryEmbedding, SequenceKernelConfig, SummaryMemoryConfig,
-    YNeuronRecurrenceConfig,
+    DragonInitializationConfig, DragonNormConfig, GatedDeltaNet2Config, HierarchicalDragonConfig,
+    LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig, MambaSequenceConfig,
+    ManifoldHyperConnectionsConfig, NextLatentTransitionConfig, ResidualConnectorKind,
+    RotaryEmbedding, SequenceKernelConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -71,6 +71,7 @@ pub struct ModelOverrides {
     pub n_head: Option<usize>,
     pub mlp_internal_dim_multiplier: Option<usize>,
     pub language_head: Option<LanguageHeadConfig>,
+    pub tie_input_output_embeddings: Option<bool>,
     #[serde(alias = "neuron_space_dim")]
     pub latent_total: Option<usize>,
     #[serde(alias = "init")]
@@ -94,6 +95,9 @@ pub struct ModelOverrides {
     pub y_neuron_recurrence: Option<YNeuronRecurrenceConfig>,
     pub clocked_slow_memory: Option<ClockedSlowMemoryConfig>,
     pub summary_memory: Option<SummaryMemoryConfig>,
+    pub hierarchical_dragon: Option<HierarchicalDragonConfig>,
+    pub latent_reasoning: Option<LatentReasoningConfig>,
+    pub next_latent_transition: Option<NextLatentTransitionConfig>,
     pub mhc: Option<ManifoldHyperConnectionsConfig>,
 }
 

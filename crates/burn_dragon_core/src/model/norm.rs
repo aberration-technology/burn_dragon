@@ -261,6 +261,17 @@ impl<B: Backend> DragonNorm<B> {
         }
     }
 
+    pub(crate) fn value_clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            eps: self.eps,
+            gamma: Param::from_tensor(self.gamma.val()),
+            beta: Param::from_tensor(self.beta.val()),
+            alpha: Param::from_tensor(self.alpha.val()),
+            shift: Param::from_tensor(self.shift.val()),
+        }
+    }
+
     pub fn matched_fresh_rms(&self, fresh: &Self) -> Self {
         Self {
             kind: self.kind,

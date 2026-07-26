@@ -526,6 +526,29 @@ impl<B: Backend> Mamba3SequenceParameters<B> {
         }
     }
 
+    pub(crate) fn value_clone(&self) -> Self {
+        Self {
+            d_model: self.d_model,
+            d_inner: self.d_inner,
+            d_state: self.d_state,
+            headdim: self.headdim,
+            ngroups: self.ngroups,
+            nheads: self.nheads,
+            norm_eps: self.norm_eps,
+            num_rope_angles: self.num_rope_angles,
+            a_floor: self.a_floor,
+            chunk_size: self.chunk_size,
+            in_proj: Param::from_tensor(self.in_proj.val()),
+            dt_bias: Param::from_tensor(self.dt_bias.val()),
+            b_bias: Param::from_tensor(self.b_bias.val()),
+            c_bias: Param::from_tensor(self.c_bias.val()),
+            b_norm_weight: Param::from_tensor(self.b_norm_weight.val()),
+            c_norm_weight: Param::from_tensor(self.c_norm_weight.val()),
+            d_skip: Param::from_tensor(self.d_skip.val()),
+            out_proj: Param::from_tensor(self.out_proj.val()),
+        }
+    }
+
     pub fn matched_fresh_rms(&self, fresh: &Self) -> Self {
         Self {
             d_model: self.d_model,
@@ -629,6 +652,12 @@ impl<B: Backend> MambaSequenceParameters<B> {
     pub fn blended_with(&self, fresh: &Self, alpha: f32) -> Self {
         Self {
             mamba3: self.mamba3.blended_with(&fresh.mamba3, alpha),
+        }
+    }
+
+    pub(crate) fn value_clone(&self) -> Self {
+        Self {
+            mamba3: self.mamba3.value_clone(),
         }
     }
 

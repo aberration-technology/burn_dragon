@@ -4,6 +4,10 @@ use burn::tensor::{Distribution as TensorDistribution, Tensor, activation};
 pub use burn_gdn::GatedDeltaNet2GateMode;
 use serde::{Deserialize, Serialize};
 
+use super::super::widen::{
+    widen_2d_last_dim_prefix, widen_2d_last_dim_prefix_zero_tail,
+    widen_3d_last_dim_prefix_zero_tail,
+};
 use super::linear::expand_attention_values_to_heads;
 
 fn default_chunk_size() -> usize {
@@ -184,6 +188,7 @@ pub struct GatedDeltaNet2Parameters<B: Backend> {
     decay_bias: Param<Tensor<B, 2>>,
     write_proj: Param<Tensor<B, 3>>,
     write_bias: Param<Tensor<B, 2>>,
+    output_scale: Param<Tensor<B, 1>>,
 }
 
 #[derive(Debug)]
@@ -234,7 +239,89 @@ impl<B: Backend> GatedDeltaNet2Parameters<B> {
                 [config.n_head, config.dense_dim],
                 device,
             )),
+            output_scale: Param::from_tensor(
+                Tensor::<B, 1>::ones([1], device).mul_scalar(config.output_scale),
+            )
+            .no_grad(),
         }
+    }
+
+    pub fn widened_from_prefix(
+        &self,
+        fresh: &Self,
+        old_latent_per_head: usize,
+        new_latent_per_head: usize,
+    ) -> Result<Self, String> {
+        if self.n_head != fresh.n_head || self.dense_dim != fresh.dense_dim {
+            return Err(format!(
+                "cannot widen gated_deltanet2 with incompatible dense shape (current_heads={} fresh_heads={} current_dense={} fresh_dense={})",
+                self.n_head, fresh.n_head, self.dense_dim, fresh.dense_dim
+            ));
+        }
+        if self.max_latent_per_head != old_latent_per_head
+            || fresh.max_latent_per_head != new_latent_per_head
+            || old_latent_per_head > new_latent_per_head
+        {
+            return Err(format!(
+                "cannot widen gated_deltanet2 with incompatible latent shape (current={} fresh={} old={} new={})",
+                self.max_latent_per_head,
+                fresh.max_latent_per_head,
+                old_latent_per_head,
+                new_latent_per_head
+            ));
+        }
+        let mut widened = fresh.clone();
+        widened.key_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.key_proj.val(),
+            fresh.key_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.erase_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.erase_proj.val(),
+            fresh.erase_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_proj = Param::from_tensor(widen_3d_last_dim_prefix_zero_tail(
+            self.decay_proj.val(),
+            fresh.decay_proj.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.erase_bias = Param::from_tensor(widen_2d_last_dim_prefix_zero_tail(
+            self.erase_bias.val(),
+            fresh.erase_bias.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_log = Param::from_tensor(widen_2d_last_dim_prefix(
+            self.decay_log.val(),
+            fresh.decay_log.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.decay_bias = Param::from_tensor(widen_2d_last_dim_prefix(
+            self.decay_bias.val(),
+            fresh.decay_bias.val(),
+            old_latent_per_head,
+            new_latent_per_head,
+        )?);
+        widened.write_proj = Param::from_tensor(self.write_proj.val());
+        widened.write_bias = Param::from_tensor(self.write_bias.val());
+        let scale = (new_latent_per_head as f32 / old_latent_per_head.max(1) as f32).sqrt();
+        widened.output_scale =
+            Param::from_tensor(self.output_scale.val().mul_scalar(scale)).no_grad();
+        Ok(widened)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_proj_tensor(&self) -> Tensor<B, 3> {
+        self.key_proj.val()
+    }
+
+    pub(crate) fn apply_output_scale(&self, context: Tensor<B, 4>) -> Tensor<B, 4> {
+        context * self.output_scale.val().reshape([1, 1, 1, 1])
     }
 
     pub fn project_inputs(
@@ -436,6 +523,72 @@ mod tests {
             .zip(rhs)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn widened_adapter_is_function_preserving_for_zero_query_tail() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 41);
+        let heads = 2;
+        let dense = 4;
+        let time = 3;
+        let old_latent = 3;
+        let new_latent = 6;
+        let source_config = GatedDeltaNet2Config::default().resolve(heads, dense, old_latent);
+        let target_config = GatedDeltaNet2Config::default().resolve(heads, dense, new_latent);
+        let source = GatedDeltaNet2Parameters::<TestBackend>::new(source_config, &device);
+        let fresh = GatedDeltaNet2Parameters::<TestBackend>::new(target_config, &device);
+        let widened = source
+            .widened_from_prefix(&fresh, old_latent, new_latent)
+            .expect("widen adapter");
+        let dense_values = (0..heads * time * dense)
+            .map(|index| (index as f32 - 9.0) / 17.0)
+            .collect();
+        let query_values = (0..heads * time * old_latent)
+            .map(|index| (index as f32 - 5.0) / 13.0)
+            .collect();
+        let dense_stream = tensor4(dense_values, [1, heads, time, dense]);
+        let source_query = tensor4(query_values, [1, heads, time, old_latent]);
+        let widened_query = Tensor::cat(
+            vec![
+                source_query.clone(),
+                Tensor::<TestBackend, 4>::zeros([1, heads, time, new_latent - old_latent], &device),
+            ],
+            3,
+        );
+        let source_inputs = source.project_inputs(dense_stream.clone(), old_latent, source_config);
+        let widened_inputs =
+            widened.project_inputs(dense_stream.clone(), new_latent, target_config);
+        let (source_output, _) = gated_deltanet2_reference(
+            source_query,
+            source_inputs.key,
+            dense_stream.clone(),
+            source_inputs.erase,
+            source_inputs.write,
+            source_inputs.log_decay,
+            None,
+            source_config.qk_l2_norm,
+            source_config.state_epsilon,
+        );
+        let (widened_output, _) = gated_deltanet2_reference(
+            widened_query,
+            widened_inputs.key,
+            dense_stream,
+            widened_inputs.erase,
+            widened_inputs.write,
+            widened_inputs.log_decay,
+            None,
+            target_config.qk_l2_norm,
+            target_config.state_epsilon,
+        );
+        let diff = max_abs_diff(
+            source.apply_output_scale(source_output),
+            widened.apply_output_scale(widened_output),
+        );
+        assert!(
+            diff <= 1.0e-6,
+            "widened GDN2 adapter changed the active prefix by {diff}"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

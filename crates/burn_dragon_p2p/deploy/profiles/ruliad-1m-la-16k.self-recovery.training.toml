@@ -1,0 +1,156 @@
+extends = "ruliad-1m-la-16k.training.toml"
+
+[training]
+batch_size = 8
+max_iters = 4096
+checkpoint_interval_iters = 512
+log_frequency = 16
+
+[training.events]
+flush_every_steps = 8
+source_selection_every_steps = 8
+source_weighted_validation_batches = 1
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 64
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 64
+
+[training.ruliad_supervision]
+mode = "answer_window"
+mask_high_entropy_spans = true
+
+[training.input_corruption]
+enabled = true
+probability = 0.025
+warmup_steps = 16
+ramp_steps = 96
+
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.008
+target_entropy_bits = 1.5
+marginal_weight = 0.012
+target_marginal_entropy_bits = 4.5
+target_coverage_weight = 0.006
+target_coverage_epsilon = 0.000001
+warmup_steps = 16
+ramp_steps = 96
+every_steps = 1
+
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.006
+cycle_weight = 0.012
+cycle_margin_weight = 0.003
+cycle_margin = 0.35
+cycle_min_lag = 2
+cycle_max_lag = 64
+cycle_lags_per_step = 4
+warmup_steps = 16
+ramp_steps = 96
+every_steps = 4
+history_lags = [2, 3, 4, 8, 16, 32, 64]
+epsilon = 0.0001
+
+[training.greedy_rollout_unlikelihood]
+enabled = true
+recovery_only = false
+weight = 0.0
+margin_weight = 0.0
+margin = 0.35
+recovery_weight = 0.0
+sequence_recovery_weight = 1.0
+entropy_floor_weight = 0.0
+target_entropy_bits = 1.5
+cycle_weight = 0.0
+cycle_margin_weight = 0.0
+cycle_min_lag = 2
+cycle_max_lag = 64
+warmup_steps = 16
+ramp_steps = 96
+every_steps = 4
+prompt_tokens = 64
+rollout_tokens = 64
+history_tokens = 64
+batch_prompts = 4
+epsilon = 0.0001
+
+[training.dynamics_anchor]
+enabled = true
+weight = 0.035
+teacher_update_rate = 0.005
+kl = "jensen_shannon"
+mask = "all_tokens"
+warmup_steps = 0
+ramp_steps = 128
+every_steps = 1
+
+[training.latent_reasoning]
+enabled = true
+every_steps = 1
+jepa_future_offsets = [9999]
+target_encoder = "detached_student"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"
+
+[training.latent_reasoning.sigreg]
+enabled = true
+mode = "weak_covariance"
+target = "hidden_and_rho_memory_slots"
+target_variance = 1.0
+min_variance = 0.2
+mean_tolerance = 0.05
+max_rho_slots = 128
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.003
+warmup_steps = 0
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5
+
+[training.gates]
+validation_regression_patience_epochs = 1
+degeneracy_entropy_min_bits = 1.35
+degeneracy_max_probability_max = 0.82
+degeneracy_distinct_2_min_fraction = 0.35
+degeneracy_eos_max_fraction = 0.20
+degeneracy_repetition_max_fraction = 0.45
+degeneracy_period_2_max_fraction = 0.35
+degeneracy_period_3_max_fraction = 0.40
+degeneracy_period_2_to_16_max_fraction = 0.50
+degeneracy_period_2_to_64_max_fraction = 0.50
+degeneracy_patience = 1
+
+[training.dynamics]
+enabled = true
+hard_collapse_rollback_attempts = 2
+minimum_continual_backprop_scale = 0.25
+soft_recovery_lr_scale = 0.5
+validation_recovery_lr_scale = 1.0
+hard_recovery_lr_scale = 0.25
+soft_recovery_continual_backprop_scale = 1.0
+validation_recovery_continual_backprop_scale = 1.0
+hard_recovery_continual_backprop_scale = 1.0
+soft_recovery_max_replacements_per_interval = 0
+validation_recovery_max_replacements_per_interval = 0
+hard_recovery_max_replacements_per_interval = 0
+stable_source_difficulty_pressure = 1.0
+recovery_source_difficulty_pressure = 0.75
+difficulty_advance_source_pressure = 1.25
+stable_hash_noise_max_probability = 0.0
+recovery_hash_noise_max_probability = 0.0
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[optimizer]
+learning_rate = 0.0003
+weight_decay = 0.01

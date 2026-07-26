@@ -1,0 +1,7 @@
+extends = ["ruliad-1m-la-64k.answer-contract-schema.training.toml"]
+
+[training.ruliad_supervision]
+answer_schema_start_token_weight = 12
+
+[training.ruliad_supervision.answer_contract]
+schema_start_token_weight = 16.0

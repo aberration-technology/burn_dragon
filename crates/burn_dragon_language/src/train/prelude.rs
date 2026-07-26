@@ -36,7 +36,6 @@ pub(crate) use burn::tensor::{Int, Tensor, TensorData};
 pub(crate) use burn_collective::{
     PeerId, ReduceOperation, all_reduce, broadcast, finish_collective, register,
 };
-#[cfg(feature = "ddp")]
 pub(crate) use burn_train::checkpoint::{Checkpointer, FileCheckpointer};
 pub(crate) use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossMetric};
 pub(crate) use burn_train::{
@@ -52,8 +51,16 @@ pub(crate) use burn_cuda::Cuda;
 pub(crate) use serde::Serialize;
 
 pub(crate) use crate::config::{
-    DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-    RepromptTruncation, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
+    CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig, DragonStateConsistencyConfig,
+    DynamicsAnchorConfig, DynamicsAnchorMask, GreedyRolloutUnlikelihoodConfig,
+    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LatentReasoningAuxiliaryStartPolicy,
+    LatentReasoningConstraintBalancerConfig, LatentReasoningSigRegConfig,
+    LatentReasoningSigRegTarget, LatentReasoningTrainingConfig, LatentStepContractConfig,
+    LogitEntropyFloorConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
+    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
+    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadSupervisionConfig,
+    RuliadSupervisionMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
     SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
     TrainingObjectiveConfig, TrainingObjectiveKind, ValidationDatasetConfig,
 };
@@ -80,7 +87,9 @@ pub(crate) use crate::train::objective::{
 };
 pub(crate) use crate::train::steps::LanguageTrainModel;
 pub(crate) use burn_dragon_core::{
-    DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState, ModelState,
+    DragonConfig, DragonInitializationKind, DragonModel, LanguagePipelineState,
+    LatentReasoningOutput, ModelState, NextLatentTransitionConfig, SharedLowrankPopulationFactors,
+    SharedLowrankPopulationWeights, SharedLowrankWeights,
 };
 pub(crate) use burn_dragon_train::train::constants::ValidBackend;
 pub(crate) use burn_dragon_train::train::metrics::{
@@ -101,8 +110,10 @@ pub(crate) use burn_dragon_train::train::runtime::{
     resolve_pipeline_parallel_layout, resolve_training_devices,
 };
 pub(crate) use burn_dragon_train::{
-    GatedDeltaNet2Spec, GdpoConfig, GdpoHardGate, KernelSpec, LayerStateSpec,
-    LearningRateScheduleConfig, ModelSpec, OptimizerConfig, OptimizerKind, OptimizerScheduleMode,
-    OptimizerSpec, ParallelConfig, ParallelSpec, ParallelismKind, ReservoirInitializationSpec,
-    SequenceKernelConfig, StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
+    EggrollPerturbationScope, EggrollPopulationExecutionBackend, GatedDeltaNet2Spec, GdpoConfig,
+    GdpoHardGate, KernelSpec, LayerStateSpec, LearningRateScheduleConfig, ModelSpec,
+    OptimizerConfig, OptimizerKind, OptimizerScheduleMode, OptimizerSpec, ParallelConfig,
+    ParallelSpec, ParallelismKind, PredictiveCodingOptimizerConfig,
+    PredictiveCodingOptimizerTransform, ReservoirInitializationSpec, SequenceKernelConfig,
+    StateAxisSpec, StateLayout, StateTensorSpec, WgpuRuntimeConfig,
 };

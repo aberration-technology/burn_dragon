@@ -1,0 +1,28 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed1024-sparse16-probe128-fixed-ablation.toml"]
+
+[model.latent_reasoning]
+enabled = true
+max_steps = 2
+min_steps = 2
+adaptive_halting = false
+halt_threshold = 0.55
+refiner_hidden_multiplier = 1
+normalize_steps = false
+energy_head = false
+stop_bias_init = -2.0
+energy_margin = 1.0
+
+[training.latent_reasoning]
+eval_step_sweep = [1, 2, 4, 8]
+
+[training.latent_reasoning.step_contract]
+enabled = true
+every_steps = 16
+start_after_steps = 1024
+max_rollout_steps_for_loss = 4
+ce_weight = 0.25
+token_kl_weight = 0.0
+monotonic_ce_weight = 1.0
+contractive_weight = 0.05
+ce_tolerance = 0.01
+trust_radius = 1.0

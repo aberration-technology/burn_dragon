@@ -1,0 +1,5 @@
+extends = ["ruliad-r1.jepa-nextlat-decoupled-delayed2048-sparse32-probe128-fixed-ablation.toml"]
+
+[training]
+block_size = 256
+tbptt_chunk_size = 64

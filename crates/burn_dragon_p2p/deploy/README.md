@@ -39,6 +39,24 @@ The bootstrap publishes initial Dragon experiment directory entries for:
 Those entries include Dragon profile metadata, so peers can resolve experiment and training configuration from the network instead of requiring a matching static local config.
 The initial ClimbMix revision now defaults to the managed dataset CDN path under `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. The deploy workflow publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile, and browser peers fetch only the shards they train on from that managed shard pool unless you override the base URL explicitly.
 
+## Ruliad Training Profiles
+
+The ruliad profile family keeps recommended defaults and comparison baselines
+separate so ablations stay reproducible:
+
+- `profiles/ruliad-r1.jepa.training.toml`: promoted JEPA default profile.
+- `profiles/ruliad-r1.training.toml`: base CE/AdamW comparison profile.
+- `profiles/ruliad-r1.jepa-state.training.toml`: JEPA plus rho-state
+  consistency candidate for collapse-resistance experiments.
+- `profiles/ruliad-1m.jepa.training.toml` and
+  `profiles/ruliad-1m-la-16k.jepa.training.toml`: larger JEPA default
+  profiles.
+
+The plain non-JEPA profiles intentionally remain available as AdamW/CE
+comparison points. Treat the ruliad competence scalar as a coarse dashboard
+composite; use verifier/schema/degen metrics and source-bucket telemetry when
+promoting a profile.
+
 ## Minimal Topology
 
 The cheapest supported production topology is now:
@@ -61,6 +79,83 @@ Role split:
 - trainers: browser peers and any optional external or managed trainers
 
 Canonical promotion in the supported deploy path uses trainer-only diffusion steady-state.
+
+That minimal topology is a trusted-fleet deployment shape. Trainer-only
+diffusion is not a sufficient authority boundary for arbitrary public peers.
+Before enabling untrusted trainer membership, deploy separate validators,
+require a quorum greater than one, and enable independent compact-update replay
+as described in
+[the production-readiness ledger](../../../docs/p2p-production-readiness.md).
+
+## Signed Revision Provisioning
+
+Production native and browser peers must converge on the same signed revision
+contract and exact full-head genesis artifact.
+
+The bootstrap accepts one or more JSON contract bundle files through the
+comma-separated `BURN_P2P_REVISION_CONTRACT_FILES` environment variable. On
+startup it:
+
+1. loads the active authority trust bundle
+2. verifies the genesis and revision-contract Ed25519 signatures
+3. rejects stale content IDs, cross-revision mismatches, and conflicts
+4. publishes only verified bundles in the browser-edge snapshot
+
+Native peer config points to the same bundle with:
+
+```toml
+[manifest]
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
+require_signed_revision_contracts = true
+```
+
+Provision the referenced genesis artifact before starting peers. Verify from a
+clean native storage root and a clean browser profile that both peers load the
+same contract ID, genesis payload ID, tensor digest, artifact ID, and head ID.
+Missing or invalid material must prevent training rather than falling back to
+peer-local random initialization.
+
+Build and verify a bundle from explicit authority material:
+
+```bash
+cargo run -p xtask -- build-revision-contract \
+  --spec /secure/nca-r1.contract-spec.json \
+  --artifact-store-root /var/lib/burn-p2p/artifacts \
+  --authority-key /secure/authority.key \
+  --output /secure/nca-r1.revision-contract.json
+
+cargo run -p xtask -- verify-revision-contract \
+  --bundle /secure/nca-r1.revision-contract.json \
+  --trust-bundle /secure/trust-bundle.json \
+  --artifact-store-root /var/lib/burn-p2p/artifacts
+```
+
+The build command verifies the complete artifact descriptor and every
+content-addressed byte before signing. The authority supplies the canonical
+tensor digest in the spec; every native and browser training peer independently
+recomputes it after decoding and fails closed on mismatch.
+
+Rotate a set of bundles into a new atomically installed directory, then roll
+them out through the authenticated live admin API:
+
+```bash
+cargo run -p xtask -- rotate-revision-contracts \
+  --bundle /secure/nca-r1.revision-contract.json \
+  --new-authority-key /secure/next-authority.key \
+  --output-dir /secure/contracts-next
+
+cargo run -p xtask -- rollout-revision-contracts \
+  --edge-url https://edge.dragon.aberration.technology \
+  --bundle /secure/contracts-next/nca-r1.revision-contract.json \
+  --session-id "$BURN_P2P_ADMIN_SESSION_ID" \
+  --allow-signature-rotation
+```
+
+The rollout validates the complete replacement set before one atomic
+control-plane update; readers never observe a partially rotated revision set.
+Terraform deliberately does not manufacture authority keys or signed
+contracts. Secret custody, staging rotation, and disaster-recovery rehearsal
+remain operator release gates.
 
 ## Artifact Storage
 
@@ -100,6 +195,9 @@ That workflow:
 - runs `terraform fmt`, `init`, `validate`, `plan`, and `apply`
 - creates or reuses the S3 bucket used for durable direct artifact publication
 - optionally creates an autoscaled managed trainer pool that installs `burn_dragon_p2p_native` from crates.io and fetches its auth bundle from SSM
+- runs managed trainer instances with the protocol-aware
+  `run-trainer-daemon` command; `run-peer` is reserved for non-training network
+  service
 - auto-seeds a deploy-managed static trainer principal and mints its auth bundle after edge health when the trainer pool is enabled and no explicit bundle override secret is supplied
 - configures explicit GitHub admin logins for session-authenticated admin access when the auth connector is `github`
 - waits for the edge URL to answer over HTTPS
@@ -107,6 +205,13 @@ That workflow:
 - derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
 
 The supported production bootstrap path is the published `burn_p2p_bootstrap` crate. The `git` install path is still supported, but only as a deliberate pre-release validation path for unpublished upstream `burn_p2p` revisions.
+
+The trainer daemon follows the `TrainingProtocol` in the active signed
+directory revision. The currently browser-compatible public profile uses
+ArtifactWindows; the convergence-qualified native candidate uses DiLoCo.
+Browsers fail closed to observer/verifier on a DiLoCo revision until browser
+DiLoCo is implemented. Do not advertise one mixed native/browser trainer
+cohort across those two protocol revisions.
 
 If you trigger the workflow with a forced bootstrap replacement, Terraform replaces the bootstrap EC2 host. By default that also replaces bootstrap-local root-volume state. If you enable retained bootstrap storage, Terraform reattaches the retained data volume so local peer/runtime/auth state survives a normal rebuild. Artifact publication remains externalized in S3 either way.
 
@@ -488,6 +593,15 @@ The initial directory entries are seeded from:
 
 - `crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
+
+The checked-in `ruliad-1m` profile pair is the local ruliad trainability
+baseline: `profiles/ruliad-1m.training.toml` and `profiles/ruliad-1m.corpus.toml`.
+It remains intentionally small, AdamW-only, live-source-selected, and
+answer-completion supervised so dataset/model issues show up in an isolated CE
+comparison. The default ruliad research/training path is the JEPA-only profile
+family, starting with `profiles/ruliad-1m.jepa.training.toml`. The
+`ruliad-r1.eggroll-smoke.toml` override is quarantined for optimizer research
+and should not be treated as the default ruliad path.
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 

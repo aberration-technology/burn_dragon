@@ -1,0 +1,28 @@
+[training]
+max_iters = 4
+checkpoint_interval_iters = 4
+log_frequency = 1
+batch_size = 8
+
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 4
+max_batch_size = 16
+max_probe_batch_size = 8
+probe_steps = 1
+target_device_memory_mb = 60000
+binary_search = true
+recompute_on_neuron_scale = false
+max_system_memory_fraction = 0.9
+probe_safety_margin = 1.15
+
+[training.continual_backprop]
+enabled = true
+
+[training.neuron_scaling]
+enabled = false
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0

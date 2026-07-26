@@ -1,0 +1,7 @@
+extends = "ruliad-1m-la-16k.answer-completion.self-recovery.training.toml"
+
+[training.ruliad_supervision.answer_denoising]
+enabled = true
+weight = 0.5
+probability = 1.0
+corrupt_offset = 1

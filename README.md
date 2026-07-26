@@ -22,10 +22,20 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 ## quick start
 
 ```bash
+python3 scripts/bootstrap_stack.py
 cargo run -p xtask -- local-browser-e2e
 cargo run -p xtask -- smoke
 cargo run -p xtask -- deploy-check
 ```
+
+Dragon intentionally develops against sibling path dependencies. The exact
+`burn_ecs -> burn_p2p -> burn_dragon` stack plus `burn_eggroll` and `burn_pc`
+is pinned in `stack.lock.toml`. Run `scripts/bootstrap_stack.py` to clone
+missing siblings, `--verify` to reject revision/remote drift, or
+`--repair-existing` to move only clean existing siblings to the locked
+revisions. CI uses the same lock through the shared bootstrap action.
+All locked providers are public and clone over HTTPS, so stack bootstrap
+requires no cross-repository credential.
 
 Use `local-browser-e2e` as the first browser/p2p production-parity gate. It runs
 the deployment config drift checks, a local edge/auth/browser training receipt

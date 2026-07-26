@@ -70,6 +70,10 @@ where
         batch_stats.mean_abs()
     }
 
+    fn batch_stats_sample_count(batch_stats: &Self::BatchStats) -> usize {
+        batch_stats.samples
+    }
+
     fn feature_count(module: &LanguageTrainModel<B>) -> usize {
         module.model.shared_lowrank_feature_count()
     }

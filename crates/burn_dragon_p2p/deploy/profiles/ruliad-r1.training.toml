@@ -1,0 +1,158 @@
+[dataset]
+cache_dir = "./cache/ruliad-r1"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r1.corpus.toml"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 272
+eos_id = 271
+
+[model]
+n_layer = 8
+n_embd = 512
+n_head = 8
+latent_total = 1024
+dropout = 0.05
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = 512
+batch_size = 32
+# Long-run defaults. Use CLI overrides for smoke tests, e.g. --max-iters 64.
+max_iters = 1000000
+checkpoint_interval_iters = 2048
+log_frequency = 64
+seed = 1337
+
+[training.ruliad_supervision]
+mode = "answer_completion"
+mask_high_entropy_spans = true
+
+[training.auto_batch_size]
+enabled = true
+min_batch_size = 4
+max_batch_size = 64
+max_probe_batch_size = 8
+probe_steps = 1
+target_device_memory_mb = 90000
+binary_search = true
+recompute_on_neuron_scale = true
+max_system_memory_fraction = 0.9
+probe_safety_margin = 1.15
+
+[training.events]
+flush_every_steps = 200
+source_selection_every_steps = 64
+continual_backprop_every_steps = 256
+degeneracy_probe_every_epochs = 2
+degeneracy_probe_tokens = 64
+source_weighted_validation_batches = 1
+
+[training.continual_backprop]
+enabled = true
+target = "shared_lowrank_latents"
+utility_decay = 0.99
+replacement_rate = 0.0001
+maturity_steps = 100
+sample_interval_steps = 64
+replace_interval_steps = 256
+utility_epsilon = 0.000001
+lr_coupling = "none"
+lr_coupling_power = 1.0
+
+[training.input_corruption]
+enabled = true
+probability = 0.015
+warmup_steps = 64
+ramp_steps = 256
+
+[training.logit_entropy_floor]
+enabled = true
+weight = 0.01
+target_entropy_bits = 4.0
+marginal_weight = 0.04
+target_marginal_entropy_bits = 7.0
+target_coverage_weight = 0.08
+target_coverage_epsilon = 0.00000001
+warmup_steps = 32
+ramp_steps = 128
+every_steps = 32
+
+[training.repeat_unlikelihood]
+enabled = true
+weight = 0.04
+cycle_weight = 0.08
+cycle_margin_weight = 0.02
+cycle_margin = 0.25
+cycle_min_lag = 2
+cycle_max_lag = 64
+cycle_lags_per_step = 2
+warmup_steps = 32
+ramp_steps = 128
+every_steps = 32
+history_lags = [2, 4, 8, 16, 32]
+epsilon = 0.0001
+
+[training.greedy_rollout_unlikelihood]
+enabled = true
+recovery_only = true
+weight = 0.04
+margin_weight = 0.01
+margin = 0.25
+recovery_weight = 0.04
+entropy_floor_weight = 0.004
+target_entropy_bits = 4.0
+cycle_weight = 0.04
+cycle_margin_weight = 0.01
+cycle_min_lag = 2
+cycle_max_lag = 64
+warmup_steps = 32
+ramp_steps = 128
+every_steps = 256
+prompt_tokens = 32
+rollout_tokens = 8
+history_tokens = 32
+batch_prompts = 1
+epsilon = 0.0001
+
+[training.gates]
+degeneracy_patience = 1
+degeneracy_entropy_min_bits = 2.0
+degeneracy_max_probability_max = 0.90
+degeneracy_argmax_unique_min_fraction = 0.08
+degeneracy_distinct_2_min_fraction = 0.18
+degeneracy_repetition_max_fraction = 0.70
+degeneracy_period_2_max_fraction = 0.70
+degeneracy_period_3_max_fraction = 0.70
+degeneracy_period_2_to_16_max_fraction = 0.70
+degeneracy_period_2_to_64_max_fraction = 0.70
+
+[training.dynamics]
+enabled = true
+hard_collapse_rollback_attempts = 2
+minimum_continual_backprop_scale = 0.25
+soft_recovery_lr_scale = 0.5
+validation_recovery_lr_scale = 0.5
+hard_recovery_lr_scale = 0.25
+soft_recovery_continual_backprop_scale = 2.0
+validation_recovery_continual_backprop_scale = 1.25
+hard_recovery_continual_backprop_scale = 1.25
+soft_recovery_max_replacements_per_interval = 4
+validation_recovery_max_replacements_per_interval = 4
+hard_recovery_max_replacements_per_interval = 4
+stable_source_difficulty_pressure = 1.0
+recovery_source_difficulty_pressure = 0.75
+difficulty_advance_source_pressure = 1.5
+stable_hash_noise_max_probability = 0.01
+recovery_hash_noise_max_probability = 0.0
+
+[optimizer]
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "[R2"

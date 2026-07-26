@@ -338,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_attention_rho_can_be_signed_with_nonnegative_query() {
+        let query = tensor4(vec![0.5, 1.0], [1, 1, 1, 2]);
+        let value = tensor4(vec![2.0, -3.0, 4.0], [1, 1, 1, 3]);
+
+        let (_context, rho) = recurrent_attention_reference(query, value, None, None);
+        let rho = rho
+            .into_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("rho values");
+
+        assert!(
+            rho.iter().any(|value| *value < 0.0),
+            "rho should remain signed because linear attention stores query^T * value"
+        );
+    }
+
+    #[test]
     fn chunked_dense_score_reference_matches_full_without_decay() {
         let shape = [2, 3, 320, 8];
         let value_shape = [2, 1, 320, 8];

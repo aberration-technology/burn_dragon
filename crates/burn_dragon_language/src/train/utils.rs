@@ -208,6 +208,13 @@ pub(crate) fn build_model_spec(model_config: &DragonConfig) -> ModelSpec {
         latent_per_head: model_config.latent_per_head(),
         shared_layer_weights: true,
         sequence_kernel: model_config.sequence_kernel,
+        hierarchical_dragon_enabled: model_config.hierarchical_dragon.enabled,
+        hierarchical_dragon_rho_sharing: model_config.hierarchical_dragon.rho_sharing,
+        hierarchical_dragon_weight_sharing: model_config.hierarchical_dragon.weight_sharing,
+        hierarchical_dragon_fast_cycles: model_config.hierarchical_dragon.fast_cycles,
+        hierarchical_dragon_slow_cycles: model_config.hierarchical_dragon.slow_cycles,
+        latent_reasoning_enabled: model_config.latent_reasoning.enabled,
+        latent_reasoning_max_steps: model_config.latent_reasoning.max_steps,
         dragon_initialization_kind: model_config.initialization.kind,
         dragon_residual_scaling_kind: model_config.initialization.residual_scaling.kind,
         dragon_neuron_gain_kind: model_config.initialization.neuron_gains.kind,
@@ -277,7 +284,7 @@ mod tests {
     use super::*;
     use burn_dragon_core::{
         DragonInitializationConfig, DragonReservoirInitializationConfig, DragonTopologyPriorConfig,
-        DragonTopologyPriorKind,
+        DragonTopologyPriorKind, HierarchicalDragonSharing,
     };
 
     #[test]
@@ -315,6 +322,30 @@ mod tests {
         assert_eq!(reservoir_spec.density, 0.12);
         assert_eq!(reservoir_spec.encoder_value_scale, 0.5);
         assert_eq!(reservoir_spec.decoder_scale, 1.25);
+    }
+
+    #[test]
+    fn model_spec_records_hierarchical_dragon_settings() {
+        let mut config = DragonConfig::default();
+        config.hierarchical_dragon.enabled = true;
+        config.hierarchical_dragon.rho_sharing = HierarchicalDragonSharing::Split;
+        config.hierarchical_dragon.weight_sharing = HierarchicalDragonSharing::Split;
+        config.hierarchical_dragon.fast_cycles = 4;
+        config.hierarchical_dragon.slow_cycles = 2;
+
+        let spec = build_model_spec(&config);
+
+        assert!(spec.hierarchical_dragon_enabled);
+        assert_eq!(
+            spec.hierarchical_dragon_rho_sharing,
+            HierarchicalDragonSharing::Split
+        );
+        assert_eq!(
+            spec.hierarchical_dragon_weight_sharing,
+            HierarchicalDragonSharing::Split
+        );
+        assert_eq!(spec.hierarchical_dragon_fast_cycles, 4);
+        assert_eq!(spec.hierarchical_dragon_slow_cycles, 2);
     }
 }
 

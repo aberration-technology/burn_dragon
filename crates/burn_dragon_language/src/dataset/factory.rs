@@ -61,6 +61,26 @@ pub fn build_dataset(
                 )
             })?,
         ),
+        DatasetSourceConfig::UniversalityRuliad { config } => Dataset::from_universality(
+            UniversalityDataset::new_ruliad_on_the_fly(
+                config,
+                training.block_size,
+                training.batch_size,
+                &cfg.tokenizer,
+            )
+            .and_then(|dataset| {
+                dataset.with_source_selection_state_path(
+                    training.source_selection_state_path.as_deref(),
+                )
+            })
+            .map(|dataset| dataset.with_ruliad_supervision(training.ruliad_supervision))
+            .with_context(|| {
+                format!(
+                    "failed to prepare on-the-fly universality ruliad dataset {}",
+                    config.display()
+                )
+            })?,
+        ),
     };
 
     let description = match &dataset {

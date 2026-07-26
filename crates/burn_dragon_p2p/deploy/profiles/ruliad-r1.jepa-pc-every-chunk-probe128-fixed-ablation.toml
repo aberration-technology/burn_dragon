@@ -1,0 +1,4 @@
+extends = ["ruliad-r1.jepa-pc-probe128-fixed-ablation.toml"]
+
+[training.predictive_coding]
+apply_every_chunks = 1

@@ -1,0 +1,36 @@
+extends = ["ruliad-1m-la-32k.training.toml"]
+
+[model.latent_reasoning]
+enabled = true
+max_steps = 1
+min_steps = 1
+adaptive_halting = false
+halt_threshold = 0.55
+refiner_hidden_multiplier = 1
+normalize_steps = false
+energy_head = false
+stop_bias_init = -2.0
+energy_margin = 1.0
+
+[training.latent_reasoning]
+enabled = true
+every_steps = 16
+jepa_future_offsets = [1]
+target_encoder = "detached_student"
+teacher_update_rate = 0.01
+negative_source = "in_batch_and_corrupt_answer"
+
+[training.latent_reasoning.sigreg]
+enabled = false
+mode = "weak_covariance"
+target = "hidden"
+target_variance = 1.0
+min_variance = 0.2
+mean_tolerance = 0.05
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 0.01
+warmup_steps = 512
+stop_target_mean_steps = 2.0
+stop_tolerance_steps = 0.5

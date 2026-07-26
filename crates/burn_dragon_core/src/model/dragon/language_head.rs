@@ -61,8 +61,17 @@ impl<B: Backend> DragonModel<B> {
         if let Some(special) = self.nca_special_lm_head.as_ref() {
             output_head.insert(special.id);
         }
-        let shared_lowrank_encoder = HashSet::from([self.encoder.id, self.encoder_v.id]);
-        let shared_lowrank_decoder = HashSet::from([self.decoder.id]);
+        let mut shared_lowrank_encoder = HashSet::from([self.encoder.id, self.encoder_v.id]);
+        if let Some(encoder) = self.slow_encoder.as_ref() {
+            shared_lowrank_encoder.insert(encoder.id);
+        }
+        if let Some(encoder_v) = self.slow_encoder_v.as_ref() {
+            shared_lowrank_encoder.insert(encoder_v.id);
+        }
+        let mut shared_lowrank_decoder = HashSet::from([self.decoder.id]);
+        if let Some(decoder) = self.slow_decoder.as_ref() {
+            shared_lowrank_decoder.insert(decoder.id);
+        }
         let attention = Self::collect_param_ids_from_module(&self.attention);
         let mamba = Self::collect_optional_param_ids_from_module(self.mamba.as_ref());
         let gated_deltanet2 =
@@ -75,6 +84,35 @@ impl<B: Backend> DragonModel<B> {
         residual_modules.extend(Self::collect_optional_param_ids_from_module(
             self.block_attention_residual_shared.as_ref(),
         ));
+        let mut latent_reasoning =
+            Self::collect_optional_param_ids_from_module(self.latent_refiner_in.as_ref());
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_refiner_out.as_ref(),
+        ));
+        if let Some(gate) = self.latent_refiner_gate.as_ref() {
+            latent_reasoning.insert(gate.id);
+        }
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_energy_head.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_stop_head.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.latent_jepa_predictor.as_ref(),
+        ));
+        if let Some(embedding) = self.latent_step_decoder_embedding.as_ref() {
+            latent_reasoning.insert(embedding.id);
+        }
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_in.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_mid.as_ref(),
+        ));
+        latent_reasoning.extend(Self::collect_optional_param_ids_from_module(
+            self.next_latent_transition_out.as_ref(),
+        ));
 
         let ids = match target {
             LanguageModuleLrScaleTarget::Embedding => embedding,
@@ -86,6 +124,7 @@ impl<B: Backend> DragonModel<B> {
             LanguageModuleLrScaleTarget::Mamba => mamba,
             LanguageModuleLrScaleTarget::GatedDeltaNet2 => gated_deltanet2,
             LanguageModuleLrScaleTarget::ResidualModules => residual_modules,
+            LanguageModuleLrScaleTarget::LatentReasoning => latent_reasoning,
             LanguageModuleLrScaleTarget::OtherBackbone => {
                 let mut remaining = Self::collect_param_ids_from_module(self);
                 for excluded in embedding
@@ -98,6 +137,7 @@ impl<B: Backend> DragonModel<B> {
                     .chain(mamba)
                     .chain(gated_deltanet2)
                     .chain(residual_modules)
+                    .chain(latent_reasoning)
                 {
                     remaining.remove(&excluded);
                 }
@@ -437,9 +477,25 @@ impl<B: Backend> DragonModel<B> {
         hidden: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
     ) -> Tensor<B, 2> {
+        self.language_token_losses_from_hidden_for_latent_step(
+            hidden,
+            targets,
+            self.latent_decoder_step(),
+        )
+    }
+
+    pub fn language_token_losses_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        step: usize,
+    ) -> Tensor<B, 2> {
         match self.language_head_runtime() {
             LanguageHeadRuntimeRef::StandardTokenClassification { .. } => self
-                .language_token_losses_from_logits(self.project_hidden_to_logits(hidden), targets),
+                .language_token_losses_from_logits(
+                    self.project_hidden_to_logits_for_latent_step(hidden, step),
+                    targets,
+                ),
             LanguageHeadRuntimeRef::NcaFactorizedPatch { tables, .. } => {
                 self.nca_factorized_language_token_losses_from_hidden(hidden, targets, tables)
             }
@@ -451,10 +507,21 @@ impl<B: Backend> DragonModel<B> {
         hidden: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
     ) -> Tensor<B, 1> {
+        self.language_loss_from_hidden_for_latent_step(hidden, targets, self.latent_decoder_step())
+    }
+
+    pub fn language_loss_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        step: usize,
+    ) -> Tensor<B, 1> {
         match self.language_head_runtime() {
-            LanguageHeadRuntimeRef::StandardTokenClassification { .. } => {
-                self.language_loss_from_logits(self.project_hidden_to_logits(hidden), targets)
-            }
+            LanguageHeadRuntimeRef::StandardTokenClassification { .. } => self
+                .language_loss_from_logits(
+                    self.project_hidden_to_logits_for_latent_step(hidden, step),
+                    targets,
+                ),
             LanguageHeadRuntimeRef::NcaFactorizedPatch { tables, .. } => {
                 self.nca_factorized_language_loss_from_hidden(hidden, targets, tables)
             }

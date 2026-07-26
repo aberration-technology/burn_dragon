@@ -58,19 +58,8 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
-      - name: checkout burn_p2p sibling
-        uses: actions/checkout@v4
-        with:
-          repository: aberration-technology/burn_p2p
-          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
-          path: burn_p2p-sibling
-      - name: link burn_p2p path dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${GITHUB_WORKSPACE}/../burn_p2p"
-          rm -rf "$target"
-          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
+      - name: bootstrap locked sibling stack
+        uses: ./.github/actions/bootstrap-stack
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -97,19 +86,8 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
-      - name: checkout burn_p2p sibling
-        uses: actions/checkout@v4
-        with:
-          repository: aberration-technology/burn_p2p
-          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
-          path: burn_p2p-sibling
-      - name: link burn_p2p path dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${GITHUB_WORKSPACE}/../burn_p2p"
-          rm -rf "$target"
-          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
+      - name: bootstrap locked sibling stack
+        uses: ./.github/actions/bootstrap-stack
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -128,8 +106,29 @@ jobs:
         timeout-minutes: 5
       - run: cargo test --manifest-path Cargo.toml -p burn_dragon_train --all-targets -- --test-threads=1
         timeout-minutes: 15
-      - run: cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets -- --test-threads=1
+      - name: test universality and compile benchmarks
+        run: |
+          cargo test --manifest-path Cargo.toml -p burn_dragon_universality --all-targets --no-run
+          cargo test --manifest-path Cargo.toml -p burn_dragon_universality --lib -- --test-threads=1
         timeout-minutes: 15
+      - name: ruliad diagnostic and eval smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            generate --out target/ruliad-ci-smoke/manifest.json -n 32
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            diagnose --manifest target/ruliad-ci-smoke/manifest.json \
+            --fail-on-gates --out target/ruliad-ci-smoke/diagnose.json
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            eval --manifest target/ruliad-ci-smoke/manifest.json --max-items 8 \
+            --items-out target/ruliad-ci-smoke/items.jsonl \
+            --min-semantic-accuracy 1.0 --out target/ruliad-ci-smoke/eval-oracle.json
+          cargo run --manifest-path Cargo.toml -p burn_dragon_universality --features cli --bin bd-ruliad -- \
+            eval --manifest target/ruliad-ci-smoke/manifest.json --max-items 8 \
+            --baseline corrupt --max-semantic-accuracy 0.0 \
+            --out target/ruliad-ci-smoke/eval-corrupt.json
+        timeout-minutes: 10
       - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib deployment::tests:: -- --nocapture"
         timeout-minutes: 25
       - run: "cargo test --manifest-path Cargo.toml -p burn_dragon_p2p --no-default-features --features native --lib profile::tests::builtin_nca_profile_fallback_materializes_without_local_or_network_profile -- --exact"
@@ -146,19 +145,8 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
-      - name: checkout burn_p2p sibling
-        uses: actions/checkout@v4
-        with:
-          repository: aberration-technology/burn_p2p
-          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
-          path: burn_p2p-sibling
-      - name: link burn_p2p path dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${GITHUB_WORKSPACE}/../burn_p2p"
-          rm -rf "$target"
-          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
+      - name: bootstrap locked sibling stack
+        uses: ./.github/actions/bootstrap-stack
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -179,19 +167,8 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
-      - name: checkout burn_p2p sibling
-        uses: actions/checkout@v4
-        with:
-          repository: aberration-technology/burn_p2p
-          ref: 900a8fbc988edd7db503b1fb1ee2eed29dcc99bc
-          path: burn_p2p-sibling
-      - name: link burn_p2p path dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${GITHUB_WORKSPACE}/../burn_p2p"
-          rm -rf "$target"
-          ln -s "${GITHUB_WORKSPACE}/burn_p2p-sibling" "$target"
+      - name: bootstrap locked sibling stack
+        uses: ./.github/actions/bootstrap-stack
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

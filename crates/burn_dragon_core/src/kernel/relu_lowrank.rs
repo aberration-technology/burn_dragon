@@ -50,6 +50,53 @@ fn head_aligned_projection_flat<B: Backend>(
     )
 }
 
+fn grouped_single_stream_projection_flat<B: Backend>(
+    input: Tensor<B, 4>,
+    weight: Tensor<B, 4>,
+) -> Option<Tensor<B, 4>> {
+    let [batch, streams, time, embd] = input.shape().dims::<4>();
+    let [weight_batch, heads, weight_embd, latent] = weight.shape().dims::<4>();
+    if streams != 1 || weight_batch <= 1 || batch % weight_batch != 0 || embd != weight_embd {
+        return None;
+    }
+    let per_weight_batch = batch / weight_batch;
+    let input_grouped = input.reshape([weight_batch, per_weight_batch * time, embd]);
+    let weight_grouped = weight
+        .swap_dims(1, 2)
+        .reshape([weight_batch, embd, heads * latent]);
+    Some(
+        input_grouped
+            .matmul(weight_grouped)
+            .reshape([weight_batch, per_weight_batch, time, heads, latent])
+            .swap_dims(2, 3)
+            .reshape([batch, heads, time, latent]),
+    )
+}
+
+fn grouped_head_aligned_projection_flat<B: Backend>(
+    input: Tensor<B, 4>,
+    weight: Tensor<B, 4>,
+) -> Option<Tensor<B, 4>> {
+    let [batch, input_heads, time, embd] = input.shape().dims::<4>();
+    let [weight_batch, heads, weight_embd, latent] = weight.shape().dims::<4>();
+    if input_heads != heads || weight_batch <= 1 || batch % weight_batch != 0 || embd != weight_embd
+    {
+        return None;
+    }
+    let per_weight_batch = batch / weight_batch;
+    let input_grouped = input
+        .reshape([weight_batch, per_weight_batch, heads, time, embd])
+        .swap_dims(1, 2)
+        .reshape([weight_batch, heads, per_weight_batch * time, embd]);
+    Some(
+        input_grouped
+            .matmul(weight)
+            .reshape([weight_batch, heads, per_weight_batch, time, latent])
+            .swap_dims(1, 2)
+            .reshape([batch, heads, time, latent]),
+    )
+}
+
 pub fn reference_forward<B: Backend>(
     input: Tensor<B, 4>,
     weight: Tensor<B, 4>,
@@ -63,6 +110,8 @@ pub fn reference_forward<B: Backend>(
 
     let mut projected = single_stream_projection_flat(input.clone(), weight.clone())
         .or_else(|| head_aligned_projection_flat(input.clone(), weight.clone()))
+        .or_else(|| grouped_single_stream_projection_flat(input.clone(), weight.clone()))
+        .or_else(|| grouped_head_aligned_projection_flat(input.clone(), weight.clone()))
         .unwrap_or_else(|| input.matmul(weight));
 
     if let Some(bias) = bias {

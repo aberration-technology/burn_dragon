@@ -7,6 +7,11 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
+import {
+  contentTypeForPath,
+  resolveOverrideFilePath,
+} from "./browser-site-override.mjs";
+
 const SITE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL");
 const EDGE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_EDGE_BASE_URL");
 const PRINCIPAL_ID = requiredEnv("BURN_DRAGON_BROWSER_CANARY_PRINCIPAL_ID");
@@ -552,6 +557,14 @@ function trimPreview(text) {
 
 function uniqueStrings(values) {
   return Array.from(new Set(values.filter((value) => value != null).map(String)));
+}
+
+function assertSiteOverrideAssetClosure(report) {
+  if ((report.site_override_missing_assets ?? []).length > 0) {
+    fail(
+      `browser site artifact referenced missing assets: ${JSON.stringify(report.site_override_missing_assets)}`,
+    );
+  }
 }
 
 function endpoint(baseUrl, relativePath) {
@@ -1270,36 +1283,6 @@ function canonicalBrowserSeedUrls(edgeBaseUrl, seeds) {
   return Array.from(new Set(seeds.map((seed) => canonicalBrowserSeedUrl(edgeBaseUrl, seed))));
 }
 
-function contentTypeForPath(filePath) {
-  if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
-  if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
-  if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
-  if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
-  if (filePath.endsWith(".wasm")) return "application/wasm";
-  if (filePath.endsWith(".map")) return "application/json; charset=utf-8";
-  return "application/octet-stream";
-}
-
-function resolveOverrideAssetPath(overrideDir, requestUrl, siteBaseUrl) {
-  const request = new URL(requestUrl);
-  const siteBase = new URL(siteBaseUrl);
-  if (request.origin !== siteBase.origin) {
-    return null;
-  }
-  let pathname = request.pathname;
-  const siteBasePath = siteBase.pathname === "/" ? "" : siteBase.pathname.replace(/\/$/, "");
-  if (siteBasePath && pathname.startsWith(siteBasePath)) {
-    pathname = pathname.slice(siteBasePath.length) || "/";
-  }
-  const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
-  const decoded = decodeURIComponent(relativePath);
-  const normalized = path.normalize(decoded);
-  if (normalized.startsWith("..")) {
-    return null;
-  }
-  return path.join(overrideDir, normalized);
-}
-
 async function loadBrowserConfig() {
   if (SITE_OVERRIDE_DIR) {
     const configPath = path.join(SITE_OVERRIDE_DIR, "browser-app-config.json");
@@ -1565,6 +1548,7 @@ async function runCanary() {
     site_base_url: SITE_BASE_URL,
     edge_base_url: EDGE_BASE_URL,
     site_override_dir: SITE_OVERRIDE_DIR,
+    site_override_missing_assets: [],
     principal_id: PRINCIPAL_ID,
     experiment_id: EXPERIMENT_ID,
     browser_name: BROWSER_NAME,
@@ -1691,7 +1675,7 @@ async function runCanary() {
           await route.continue();
           return;
         }
-        const overridePath = resolveOverrideAssetPath(SITE_OVERRIDE_DIR, requestUrl, SITE_BASE_URL);
+        const overridePath = resolveOverrideFilePath(SITE_OVERRIDE_DIR, requestUrl, SITE_BASE_URL);
         if (!overridePath) {
           await route.continue();
           return;
@@ -1702,7 +1686,7 @@ async function runCanary() {
           playwrightRequest.isNavigationRequest() ||
           playwrightRequest.resourceType() === "document" ||
           new URL(requestUrl).pathname.includes("/callback/");
-        if (!fs.existsSync(overridePath) || fs.statSync(overridePath).isDirectory()) {
+        if (!fs.existsSync(overridePath)) {
           if (canServeIndex && fs.existsSync(indexPath)) {
             await route.fulfill({
               status: 200,
@@ -1714,7 +1698,15 @@ async function runCanary() {
             });
             return;
           }
-          await route.fallback();
+          report.site_override_missing_assets.push(new URL(requestUrl).pathname);
+          await route.fulfill({
+            status: 404,
+            body: `missing browser site artifact: ${new URL(requestUrl).pathname}\n`,
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-store",
+            },
+          });
           return;
         }
         await route.fulfill({
@@ -1958,6 +1950,7 @@ async function runCanary() {
       : (report.browser_machine_state?.last_error ?? null);
 
     if (!EXPECT_TRAINING) {
+      assertSiteOverrideAssetClosure(report);
       assertBrowserE2eContract(report);
       report.success = true;
       await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -2003,6 +1996,7 @@ async function runCanary() {
       snapshot.network_id,
     );
     report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+    assertSiteOverrideAssetClosure(report);
     assertBrowserE2eContract(report);
     report.success = true;
     await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -2022,6 +2016,7 @@ async function runCanary() {
       await context.tracing.stop({ path: tracePath }).catch(() => {});
     }
     report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);
+    report.site_override_missing_assets = uniqueStrings(report.site_override_missing_assets);
     report.console_errors = uniqueStrings(
       consoleMessages.filter((entry) => entry.type === "error").map((entry) => entry.text),
     );

@@ -1623,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_site_shell_writes_favicon_fallbacks() {
+    fn generated_site_shell_writes_callback_routes_and_static_entrypoints() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("unix time")
@@ -1633,6 +1633,11 @@ mod tests {
         write_site_shell(&temp, &BuildBrowserSiteArgs::default()).expect("write site shell");
         assert!(temp.join("favicon.svg").is_file());
         assert!(temp.join("favicon.ico").is_file());
+        assert!(temp.join("browser-app-loader.js").is_file());
+        assert!(temp.join("browser-app-config.json").is_file());
+        assert!(temp.join("callback/github/index.html").is_file());
+        assert!(temp.join("callback/oidc/index.html").is_file());
+        assert!(temp.join("callback/oauth/index.html").is_file());
         std::fs::remove_dir_all(&temp).expect("remove temp dir");
     }
 

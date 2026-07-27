@@ -1478,6 +1478,7 @@ jobs:
       - name: deploy browser pages before live browser canary
         id: deploy_pages
         if: ${{ github.event.inputs.plan_only != 'true' && steps.outputs.outputs.browser_app_url != '' }}
+        timeout-minutes: 190
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1486,6 +1487,7 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
+          BURN_DRAGON_DEPLOY_PAGES_WATCH_TIMEOUT_SECS: "10800"
         run: target/debug/xtask dispatch-pages-deploy-and-wait
 
       - name: verify live native canonical training dynamics

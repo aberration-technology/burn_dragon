@@ -801,7 +801,10 @@ fn agent_task_contracts() -> Result<()> {
         "input_env(\"edge_base_url\", \"BURN_DRAGON_NATIVE_CANARY_EDGE_BASE_URL\")",
         "\"mirror_live_head_to_edge\"",
         "\"repair_current_head_to_visible_root\"",
+        "env_u64(\n                \"BURN_DRAGON_DEPLOY_PAGES_WATCH_TIMEOUT_SECS\"",
         "env_u64(\"BURN_DRAGON_NATIVE_CANARY_WATCH_INTERVAL_SECS\", 60)",
+        "github_run_jobs(&client, &api_base, repo, run_id)",
+        "DEFAULT_GH_COMMAND_TIMEOUT_SECS",
     ] {
         require_contains(&source, snippet, "agent task dispatch helpers")?;
     }

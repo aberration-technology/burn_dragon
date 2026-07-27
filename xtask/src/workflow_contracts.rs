@@ -581,6 +581,16 @@ fn native_canary_contracts() -> Result<()> {
         "\"--require-head-advanced\",\n                    \"true\",",
         "require-head-advanced remains a presence flag",
     )?;
+    let native_cli = read("crates/burn_dragon_p2p/src/bin/burn_dragon_p2p_native.rs")?;
+    require_ordered(
+        &native_cli,
+        &[
+            "let mut diffusion_settlement = None;",
+            "mirroring settled and served artifact to edge",
+            "register_edge_head_and_directory(",
+        ],
+        "native trainer settles and serves before edge mirror and registration",
+    )?;
     Ok(())
 }
 
@@ -943,5 +953,16 @@ fn require_absent(text: &str, snippet: &str, label: &str) -> Result<()> {
         !text.contains(snippet),
         "{label} contains forbidden snippet: {snippet}"
     );
+    Ok(())
+}
+
+fn require_ordered(text: &str, snippets: &[&str], label: &str) -> Result<()> {
+    let mut cursor = 0;
+    for snippet in snippets {
+        let offset = text[cursor..]
+            .find(snippet)
+            .with_context(|| format!("{label} missing ordered snippet: {snippet}"))?;
+        cursor += offset + snippet.len();
+    }
     Ok(())
 }

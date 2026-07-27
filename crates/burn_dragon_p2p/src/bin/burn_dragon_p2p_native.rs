@@ -3433,33 +3433,6 @@ where
             &outcome.head,
             "after local training",
         )?;
-        let mirrored_edge_head = if let Some((registration_runtime, edge_base_url, session_id)) =
-            edge_registration.as_ref()
-        {
-            let announcement = HeadAnnouncement {
-                overlay: experiment.overlay_set()?.heads,
-                provider_peer_id: Some(local_peer_id.clone()),
-                head: outcome.head.clone(),
-                announced_at: chrono::Utc::now(),
-            };
-            Some(
-                mirror_head_artifact_with_edge(
-                    registration_runtime,
-                    edge_base_url,
-                    session_id,
-                    &announcement,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to mirror published head {} artifact {} to edge",
-                        announcement.head.head_id.as_str(),
-                        announcement.head.artifact_id.as_str()
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
         let mut diffusion_settlement = None;
         if options.settle_diffusion || options.serve_after_publish_secs > 0 {
             if directory_entry_promotes_with_diffusion(&experiment_entry) {
@@ -3615,6 +3588,39 @@ where
                 ));
             }
         }
+        let mirrored_edge_head = if let Some((registration_runtime, edge_base_url, session_id)) =
+            edge_registration.as_ref()
+        {
+            let announcement = HeadAnnouncement {
+                overlay: experiment.overlay_set()?.heads,
+                provider_peer_id: Some(local_peer_id.clone()),
+                head: outcome.head.clone(),
+                announced_at: chrono::Utc::now(),
+            };
+            eprintln!(
+                "train-window-once progress: mirroring settled and served artifact to edge head={} artifact={} elapsed_ms={}",
+                announcement.head.head_id.as_str(),
+                announcement.head.artifact_id.as_str(),
+                started.elapsed().as_millis(),
+            );
+            Some(
+                mirror_head_artifact_with_edge(
+                    registration_runtime,
+                    edge_base_url,
+                    session_id,
+                    &announcement,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to mirror settled published head {} artifact {} to edge",
+                        announcement.head.head_id.as_str(),
+                        announcement.head.artifact_id.as_str()
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         if let (Some((registration_runtime, edge_base_url, session_id)), Some(edge_announcement)) =
             (edge_registration.as_ref(), mirrored_edge_head)
         {

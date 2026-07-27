@@ -68,7 +68,7 @@ The cheapest supported production topology is now:
 
 Recommended operator defaults:
 
-- keep the managed deploy/restore default `bootstrap_install_source=git`; it installs the immutable public `burn_p2p` revision from `stack.lock.toml`, matching the peer binaries validated by Dragon CI
+- keep the managed deploy/restore default `bootstrap_install_source=git`; CI materializes the public sibling stack at `stack.lock.toml`, builds the bootstrap and head-mirror binaries from that coherent checkout, verifies their checksums, and uploads them for runtime sync
 - use `bootstrap_install_source=crate` only when the selected published release intentionally matches the protocol revision in the locked stack
 - leave the managed trainer pool at `0` until the control plane and browser path are stable under the intended traffic pattern
 - keep restore drills on `plan_only=true` until you are intentionally executing a failover
@@ -329,7 +329,7 @@ Configure the workflow to target one of those environments. Put the following va
 The production workflow path is intentionally narrower than the full Terraform surface:
 
 - use `terraform_workspace=mainnet`
-- keep the managed workflow default `bootstrap_install_source=git` so bootstrap and peer binaries use the same locked P2P revision
+- keep the managed workflow default `bootstrap_install_source=git` so bootstrap and peer binaries are runner-built from the same locked P2P revision; the remote host does not perform a standalone Git install because `burn_p2p` intentionally uses the sibling `burn_ecs` path dependency
 - keep bootstrap status alarms enabled
 - keep control-plane operational alarms enabled
 - keep the shared control-plane dashboard enabled

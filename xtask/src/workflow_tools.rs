@@ -1001,9 +1001,9 @@ fn build_guardrail_report() -> Result<GuardrailReport> {
                 }
             ));
         }
-        if bootstrap_install_source != "crate" {
+        if bootstrap_install_source != "git" {
             errors.push(format!(
-                "production deployment must use bootstrap_install_source=crate, got `{bootstrap_install_source}`"
+                "production deployment must use the locked public stack with bootstrap_install_source=git, got `{bootstrap_install_source}`"
             ));
         }
         if !enable_bootstrap_status_alarms {

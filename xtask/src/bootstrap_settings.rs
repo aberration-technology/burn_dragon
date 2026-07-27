@@ -1215,13 +1215,20 @@ fn validate_bootstrap_install(
 }
 
 fn resolve_bootstrap_git_ref(install_source: &str, configured_ref: &str) -> Result<String> {
-    if install_source != "git" || !configured_ref.trim().is_empty() {
+    if install_source != "git" {
         return Ok(configured_ref.trim().to_owned());
     }
-    Ok(stack_lock::workspace_stack_lock()?
+    let locked_ref = stack_lock::workspace_stack_lock()?
         .repository("burn_p2p")?
         .revision
-        .clone())
+        .clone();
+    let configured_ref = configured_ref.trim();
+    if !configured_ref.is_empty() && configured_ref != locked_ref {
+        bail!(
+            "bootstrap_git_ref must match the burn_p2p revision in stack.lock.toml ({locked_ref})"
+        );
+    }
+    Ok(locked_ref)
 }
 
 fn append_env_lines(lines: &[String]) -> Result<()> {
@@ -1551,6 +1558,13 @@ mod tests {
                 "acd6aba866202592b4ae33e8ce8fbcba4ab0dfb4"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn managed_git_bootstrap_rejects_stack_lock_drift() {
+        assert!(
+            resolve_bootstrap_git_ref("git", "1111111111111111111111111111111111111111").is_err()
         );
     }
 }

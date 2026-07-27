@@ -56,19 +56,12 @@ fn runtime_sync_contract() -> Result<()> {
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
         bootstrap_crate_version: "0.21.8".to_owned(),
-        bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
-            .to_owned(),
-        bootstrap_git_ref: String::new(),
         bootstrap_binary_object_uri: String::new(),
         bootstrap_binary_sha256: String::new(),
         bootstrap_features: "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,auth-github,rbac,social".to_owned(),
-        bootstrap_reinstall: "false".to_owned(),
-        dragon_git_repository: "https://github.com/aberration-technology/burn_dragon.git"
-            .to_owned(),
-        dragon_git_ref: "main".to_owned(),
-        head_mirror_binary_object_uri: String::new(),
-        head_mirror_binary_sha256: String::new(),
-        head_mirror_reinstall: "true".to_owned(),
+        head_mirror_binary_object_uri:
+            "s3://bucket/runtime/burn_dragon_p2p_native".to_owned(),
+        head_mirror_binary_sha256: "headmirrorsha".to_owned(),
     })?;
     let joined = commands.join("\n");
     require_contains(
@@ -117,18 +110,17 @@ fn runtime_sync_contract() -> Result<()> {
         "transfer state quarantine",
     )?;
 
-    let git_commands = render_bootstrap_runtime_sync_commands(&RuntimeCommandEnv {
+    let git_error = render_bootstrap_runtime_sync_commands(&RuntimeCommandEnv {
         bootstrap_install_source: "git".to_owned(),
-        bootstrap_git_ref: "b14acc12".to_owned(),
-        bootstrap_reinstall: "true".to_owned(),
         ..dummy_runtime_env()
-    })?
-    .join("\n");
-    require_contains(
-        &git_commands,
-        "cargo install --locked --git 'https://github.com/aberration-technology/burn_p2p.git' --rev 'b14acc12' burn_p2p_bootstrap",
-        "git bootstrap install command",
-    )?;
+    })
+    .expect_err("git runtime sync without a prebuilt binary must fail");
+    ensure!(
+        git_error
+            .to_string()
+            .contains("BOOTSTRAP_BINARY_OBJECT_URI is required"),
+        "git runtime sync failure should identify the required prebuilt binary"
+    );
 
     let prebuilt = render_bootstrap_runtime_sync_commands(&RuntimeCommandEnv {
         bootstrap_binary_object_uri: "s3://bucket/runtime/burn-p2p-bootstrap".to_owned(),
@@ -226,12 +218,7 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
         "scripts/bootstrap_stack.py",
         "stack bootstrap action invokes the pre-Cargo bootstrap",
     )?;
-    for snippet in [
-        "BURN_STACK_TOKEN",
-        "x-access-token",
-        ".insteadOf",
-        "${{ inputs.token }}",
-    ] {
+    for snippet in ["x-access-token", ".insteadOf", "${{ inputs.token }}"] {
         require_absent(
             &action,
             snippet,
@@ -249,11 +236,6 @@ fn workflow_stack_bootstrap_contract() -> Result<()> {
                 &text,
                 "uses: ./.github/actions/bootstrap-stack",
                 &format!("{path} materializes the locked sibling stack before Cargo"),
-            )?;
-            require_absent(
-                &text,
-                "BURN_STACK_TOKEN",
-                &format!("{path} does not require credentials for public sibling clones"),
             )?;
         }
         require_absent(
@@ -310,8 +292,18 @@ fn deployment_workflow_contracts() -> Result<()> {
         )?;
         require_contains(
             &text,
-            "Leave empty to use the revision in stack.lock.toml.",
-            "managed deployment resolves an omitted P2P ref from the stack lock",
+            "When set, it must equal the revision in stack.lock.toml.",
+            "managed deployment treats the optional P2P ref as a stack-lock assertion",
+        )?;
+        require_contains(
+            &text,
+            "--path \"${GITHUB_WORKSPACE}/../burn_p2p/crates/burn_p2p_bootstrap\"",
+            "managed deployment builds bootstrap from the materialized locked stack",
+        )?;
+        require_absent(
+            &text,
+            "--git \"https://github.com/aberration-technology/burn_p2p.git\"",
+            "managed deployment does not use an invalid standalone P2P git install",
         )?;
         require_absent(
             &text,
@@ -323,6 +315,17 @@ fn deployment_workflow_contracts() -> Result<()> {
             "git-based burn_p2p bootstrap deploys must replace the bootstrap host.",
             "git sync does not require replacement",
         )?;
+        for stale_runtime_fallback in [
+            "BOOTSTRAP_GIT_REPOSITORY:",
+            "BOOTSTRAP_REINSTALL:",
+            "HEAD_MIRROR_REINSTALL:",
+        ] {
+            require_absent(
+                &text,
+                stale_runtime_fallback,
+                "managed deployment uploads runner-built binaries instead of reinstalling on-host",
+            )?;
+        }
     }
 
     let deploy = read(".github/workflows/deploy-burn-dragon-p2p-aws.yml")?;
@@ -847,19 +850,12 @@ fn dummy_runtime_env() -> RuntimeCommandEnv {
             "s3://bucket/runtime/burn-dragon-p2p-head-mirror.service".to_owned(),
         bootstrap_install_source: "crate".to_owned(),
         bootstrap_crate_version: "0.21.8".to_owned(),
-        bootstrap_git_repository: "https://github.com/aberration-technology/burn_p2p.git"
-            .to_owned(),
-        bootstrap_git_ref: String::new(),
         bootstrap_binary_object_uri: String::new(),
         bootstrap_binary_sha256: String::new(),
         bootstrap_features: "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,auth-github,rbac,social".to_owned(),
-        bootstrap_reinstall: "false".to_owned(),
-        dragon_git_repository: "https://github.com/aberration-technology/burn_dragon.git"
-            .to_owned(),
-        dragon_git_ref: "main".to_owned(),
-        head_mirror_binary_object_uri: String::new(),
-        head_mirror_binary_sha256: String::new(),
-        head_mirror_reinstall: "true".to_owned(),
+        head_mirror_binary_object_uri:
+            "s3://bucket/runtime/burn_dragon_p2p_native".to_owned(),
+        head_mirror_binary_sha256: "headmirrorsha".to_owned(),
     }
 }
 

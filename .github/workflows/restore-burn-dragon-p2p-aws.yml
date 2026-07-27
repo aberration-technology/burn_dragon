@@ -37,9 +37,9 @@ on:
         default: aberration.technology
         type: string
       bootstrap_install_source:
-        description: "How to install `burn_p2p_bootstrap` on the restored hosts. Keep `crate` on the normal release path. Use `git` only when validating an unpublished burn_p2p revision against burn_dragon before publish."
+        description: "How to install `burn_p2p_bootstrap` on restored hosts. `git` uses the immutable public burn_p2p revision from stack.lock.toml by default; `crate` selects an explicitly published release."
         required: true
-        default: crate
+        default: git
         type: choice
         options:
           - crate
@@ -50,7 +50,7 @@ on:
         default: 0.21.8
         type: string
       bootstrap_git_ref:
-        description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
+        description: "Optional full burn_p2p Git SHA used when `bootstrap_install_source=git`. Leave empty to use the revision in stack.lock.toml."
         required: false
         default: ""
         type: string
@@ -187,7 +187,6 @@ jobs:
           INPUT_BOOTSTRAP_VERSION: ${{ github.event.inputs.bootstrap_version }}
           VAR_BOOTSTRAP_VERSION: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_VERSION }}
           INPUT_BOOTSTRAP_GIT_REF: ${{ github.event.inputs.bootstrap_git_ref }}
-          VAR_BOOTSTRAP_GIT_REF: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}
           VAR_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}
           VAR_ROOT_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}
           VAR_DATA_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}

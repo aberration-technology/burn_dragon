@@ -115,7 +115,9 @@ impl DragonNativeTargetDecision {
                     BurnTarget::Trainer
                 }
             },
-            DragonNativeTarget::Validator => BurnTarget::Validator,
+            DragonNativeTarget::Validator => {
+                BurnTarget::Custom(PeerRoleSet::new([PeerRole::Validator, PeerRole::Archive]))
+            }
             DragonNativeTarget::Reducer => BurnTarget::Reducer,
         }
     }
@@ -603,6 +605,23 @@ mod tests {
         assert_eq!(
             decision.burn_target(DragonCapabilityClass::NativeWgpu),
             BurnTarget::Custom(PeerRoleSet::new([PeerRole::Viewer]))
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn validator_target_does_not_request_authority_role() {
+        let decision = DragonNativeTargetDecision {
+            requested_target: DragonNativeTarget::Validator,
+            effective_target: DragonNativeTarget::Validator,
+            can_train: false,
+            trainer_memory_budget_bytes: None,
+            downgrade_reason: None,
+        };
+
+        assert_eq!(
+            decision.burn_target(DragonCapabilityClass::NativeCpu),
+            BurnTarget::Custom(PeerRoleSet::new([PeerRole::Validator, PeerRole::Archive,]))
         );
     }
 

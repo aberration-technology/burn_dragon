@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
+use crate::stack_lock;
 use crate::workflow_tools::BootstrapStackSettingsMode;
 
 pub fn resolve(mode: BootstrapStackSettingsMode) -> Result<()> {
@@ -95,7 +96,7 @@ fn resolve_deploy() -> Result<()> {
             "INPUT_BOOTSTRAP_INSTALL_SOURCE",
             "VAR_BOOTSTRAP_INSTALL_SOURCE",
         ],
-        "crate",
+        "git",
     );
     bootstrap_install_source = normalize_lower(&bootstrap_install_source);
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
@@ -103,7 +104,10 @@ fn resolve_deploy() -> Result<()> {
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
         "0.21.0",
     );
-    let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
+    let bootstrap_git_ref = resolve_bootstrap_git_ref(
+        &bootstrap_install_source,
+        &first_env(&["INPUT_BOOTSTRAP_GIT_REF"], ""),
+    )?;
     validate_bootstrap_install(
         &auth_connector_kind,
         &bootstrap_install_source,
@@ -280,7 +284,7 @@ fn resolve_restore() -> Result<()> {
             "INPUT_BOOTSTRAP_INSTALL_SOURCE",
             "VAR_BOOTSTRAP_INSTALL_SOURCE",
         ],
-        "crate",
+        "git",
     );
     bootstrap_install_source = normalize_lower(&bootstrap_install_source);
     ensure_bootstrap_install_source(&bootstrap_install_source)?;
@@ -288,7 +292,10 @@ fn resolve_restore() -> Result<()> {
         &["INPUT_BOOTSTRAP_VERSION", "VAR_BOOTSTRAP_VERSION"],
         "0.21.0",
     );
-    let bootstrap_git_ref = first_env(&["INPUT_BOOTSTRAP_GIT_REF", "VAR_BOOTSTRAP_GIT_REF"], "");
+    let bootstrap_git_ref = resolve_bootstrap_git_ref(
+        &bootstrap_install_source,
+        &first_env(&["INPUT_BOOTSTRAP_GIT_REF"], ""),
+    )?;
     validate_bootstrap_install(
         &auth_connector_kind,
         &bootstrap_install_source,
@@ -1180,8 +1187,15 @@ fn validate_bootstrap_install(
     version: &str,
     git_ref: &str,
 ) -> Result<()> {
-    if install_source == "git" && git_ref.is_empty() {
-        bail!("bootstrap_git_ref is required when bootstrap_install_source=git");
+    if install_source == "git"
+        && (git_ref.len() != 40
+            || !git_ref
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    {
+        bail!(
+            "bootstrap_git_ref must be a full lowercase Git SHA when bootstrap_install_source=git"
+        );
     }
     let broken_github_auth_bootstrap = semver::Version::parse(version)
         .map(|version| {
@@ -1198,6 +1212,16 @@ fn validate_bootstrap_install(
         );
     }
     Ok(())
+}
+
+fn resolve_bootstrap_git_ref(install_source: &str, configured_ref: &str) -> Result<String> {
+    if install_source != "git" || !configured_ref.trim().is_empty() {
+        return Ok(configured_ref.trim().to_owned());
+    }
+    Ok(stack_lock::workspace_stack_lock()?
+        .repository("burn_p2p")?
+        .revision
+        .clone())
 }
 
 fn append_env_lines(lines: &[String]) -> Result<()> {
@@ -1491,4 +1515,42 @@ fn slug(value: &str) -> String {
 
 fn aws_account_id(role_arn: &str) -> String {
     role_arn.split(':').nth(4).unwrap_or_default().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_git_bootstrap_defaults_to_locked_p2p_revision() {
+        let expected = stack_lock::workspace_stack_lock()
+            .expect("stack lock")
+            .repository("burn_p2p")
+            .expect("burn_p2p lock")
+            .revision
+            .clone();
+
+        assert_eq!(
+            resolve_bootstrap_git_ref("git", "").expect("locked git ref"),
+            expected
+        );
+        assert_eq!(
+            resolve_bootstrap_git_ref("crate", "").expect("crate ref"),
+            ""
+        );
+    }
+
+    #[test]
+    fn git_bootstrap_requires_immutable_revision() {
+        assert!(validate_bootstrap_install("github", "git", "0.21.8", "main").is_err());
+        assert!(
+            validate_bootstrap_install(
+                "github",
+                "git",
+                "0.21.8",
+                "acd6aba866202592b4ae33e8ce8fbcba4ab0dfb4"
+            )
+            .is_ok()
+        );
+    }
 }

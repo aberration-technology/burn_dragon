@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
+const VALIDATOR_READY_MARKER: &str = "validator-runtime-ready";
+
 pub fn run() -> Result<()> {
     let config = NativeCanaryConfig::from_env()?;
     fs::create_dir_all(&config.artifact_dir)?;
@@ -146,6 +148,7 @@ pub fn run() -> Result<()> {
         "diffusion_settle_passes": config.diffusion_settle_passes,
         "serve_after_publish_secs": config.serve_after_publish_secs,
         "start_local_validator": config.start_local_validator,
+        "validator_ready_timeout_secs": config.validator_ready_timeout_secs,
         "mirror_live_head_to_edge": config.mirror_live_head_to_edge,
         "require_edge_head_provider": config.require_edge_head_provider,
         "repair_current_head_to_visible_root": config.repair_current_head_to_visible_root,
@@ -340,6 +343,7 @@ struct NativeCanaryConfig {
     diffusion_settle_passes: u64,
     serve_after_publish_secs: u64,
     start_local_validator: bool,
+    validator_ready_timeout_secs: u64,
     mirror_live_head_to_edge: bool,
     require_edge_head_provider: bool,
     repair_current_head_to_visible_root: bool,
@@ -408,6 +412,10 @@ impl NativeCanaryConfig {
                 45,
             )?,
             start_local_validator: env_bool("BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR", false)?,
+            validator_ready_timeout_secs: parse_env(
+                "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS",
+                60,
+            )?,
             mirror_live_head_to_edge: env_bool(
                 "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE",
                 false,
@@ -577,12 +585,50 @@ fn start_validator(
         .stderr(Stdio::from(stderr))
         .spawn()
         .with_context(|| format!("failed to start {}", command.join(" ")))?;
-    thread::sleep(Duration::from_secs(5));
-    if let Some(status) = child.try_wait()? {
-        let tail = tail(log_path, 6000);
-        bail!("validator exited early with {status}\n{tail}");
-    }
+    wait_for_validator_ready(
+        &mut child,
+        log_path,
+        Duration::from_secs(config.validator_ready_timeout_secs.max(1)),
+    )?;
     Ok(child)
+}
+
+fn wait_for_validator_ready(child: &mut Child, log_path: &Path, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "validator exited before runtime readiness with {status}\n{}",
+                tail(log_path, 6000)
+            );
+        }
+        let log = fs::read_to_string(log_path)
+            .with_context(|| format!("failed to read validator log {}", log_path.display()))?;
+        if validator_log_has_ready_marker(&log) {
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "validator exited at runtime readiness with {status}\n{}",
+                    tail(log_path, 6000)
+                );
+            }
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "validator did not report runtime readiness within {}s\n{}",
+                timeout.as_secs(),
+                tail(log_path, 6000)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn validator_log_has_ready_marker(log: &str) -> bool {
+    log.lines()
+        .any(|line| line.trim_start().starts_with(VALIDATOR_READY_MARKER))
 }
 
 fn run_native(
@@ -1414,5 +1460,18 @@ mod tests {
         assert!(!restore_head_on_start(true, 0));
         assert!(restore_head_on_start(true, 1));
         assert!(restore_head_on_start(false, 0));
+    }
+
+    #[test]
+    fn validator_readiness_requires_explicit_runtime_marker() {
+        assert!(!validator_log_has_ready_marker(
+            "starting burn_dragon validator daemon"
+        ));
+        assert!(validator_log_has_ready_marker(
+            "validator-runtime-ready local_peer_id=peer-1 connected_peers=1"
+        ));
+        assert!(!validator_log_has_ready_marker(
+            "warning: validator-runtime-readiness delayed"
+        ));
     }
 }

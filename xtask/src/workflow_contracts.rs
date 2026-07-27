@@ -303,6 +303,21 @@ fn deployment_workflow_contracts() -> Result<()> {
             "head mirror checksum env",
         )?;
         require_contains(&text, "EDGE_BASE_URL", "edge base url env")?;
+        require_contains(
+            &text,
+            "default: git\n        type: choice\n        options:\n          - crate\n          - git",
+            "managed deployment defaults to the public locked P2P source",
+        )?;
+        require_contains(
+            &text,
+            "Leave empty to use the revision in stack.lock.toml.",
+            "managed deployment resolves an omitted P2P ref from the stack lock",
+        )?;
+        require_absent(
+            &text,
+            "VAR_BOOTSTRAP_GIT_REF",
+            "managed deployment cannot drift from the stack lock through an environment variable",
+        )?;
         require_absent(
             &text,
             "git-based burn_p2p bootstrap deploys must replace the bootstrap host.",
@@ -520,6 +535,7 @@ fn native_canary_contracts() -> Result<()> {
         "BURN_DRAGON_NATIVE_CANARY_P2P_TIMEOUT_SECS: ${{ github.event.inputs.p2p_timeout_secs || '300' }}",
         "BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1800' }}",
         "BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'true' }}",
+        "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS: \"60\"",
         "BURN_DRAGON_NATIVE_CANARY_HTTP_ATTEMPTS: ${{ github.event.inputs.http_attempts || '15' }}",
         "BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '180' }}",
         "BURN_DRAGON_NATIVE_CANARY_MIRROR_LIVE_HEAD_TO_EDGE: ${{ github.event.inputs.mirror_live_head_to_edge || 'false' }}",
@@ -550,6 +566,7 @@ fn native_canary_contracts() -> Result<()> {
         "BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES",
         "BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS",
         "BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR",
+        "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS",
         "BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE",
         "BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS",
         "BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES",
@@ -710,6 +727,11 @@ fn production_profile_contracts() -> Result<()> {
         &deploy_workflow,
         "BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_AFTER_RUN: \"true\"",
         "deploy canary repairs its synthetic head after proving native p2p training dynamics",
+    )?;
+    require_contains(
+        &deploy_workflow,
+        "BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS: \"60\"",
+        "deploy canary waits for explicit validator runtime readiness",
     )?;
     require_contains(
         &deploy_workflow,

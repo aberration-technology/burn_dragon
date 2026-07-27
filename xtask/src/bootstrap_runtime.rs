@@ -24,11 +24,6 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
 
     let bootstrap_install_source = env_or("BOOTSTRAP_INSTALL_SOURCE", "crate");
     let bootstrap_crate_version = env_or("BOOTSTRAP_CRATE_VERSION", "0.21.8");
-    let bootstrap_git_repository = env_or(
-        "BOOTSTRAP_GIT_REPOSITORY",
-        "https://github.com/aberration-technology/burn_p2p.git",
-    );
-    let bootstrap_git_ref = env_or("BOOTSTRAP_GIT_REF", "");
     let bootstrap_binary_path = env_or("BOOTSTRAP_BINARY_PATH", "");
     let bootstrap_binary_sha256 = env_or("BOOTSTRAP_BINARY_SHA256", "");
     let auth_connector_kind = env_or("AUTH_CONNECTOR_KIND", "github");
@@ -42,15 +37,8 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
             "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,{bootstrap_auth_feature},rbac,social"
         ),
     );
-    let bootstrap_reinstall = env_or("BOOTSTRAP_REINSTALL", "false");
-    let dragon_git_repository = env_or(
-        "DRAGON_GIT_REPOSITORY",
-        "https://github.com/aberration-technology/burn_dragon.git",
-    );
-    let dragon_git_ref = env_or("DRAGON_GIT_REF", "main");
     let head_mirror_binary_path = env_or("HEAD_MIRROR_BINARY_PATH", "");
     let head_mirror_binary_sha256 = env_or("HEAD_MIRROR_BINARY_SHA256", "");
-    let head_mirror_reinstall = env_or("HEAD_MIRROR_REINSTALL", "true");
     let edge_base_url = env_or("EDGE_BASE_URL", "");
 
     let tmpdir = TempDir::new().context("create runtime config tempdir")?;
@@ -132,8 +120,6 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         head_mirror_service_object_uri: objects.head_mirror_service.clone(),
         bootstrap_install_source,
         bootstrap_crate_version,
-        bootstrap_git_repository,
-        bootstrap_git_ref,
         bootstrap_binary_object_uri: if bootstrap_binary_path.is_empty() {
             String::new()
         } else {
@@ -141,16 +127,12 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         },
         bootstrap_binary_sha256,
         bootstrap_features,
-        bootstrap_reinstall,
-        dragon_git_repository,
-        dragon_git_ref,
         head_mirror_binary_object_uri: if head_mirror_binary_path.is_empty() {
             String::new()
         } else {
             objects.head_mirror_binary.clone()
         },
         head_mirror_binary_sha256,
-        head_mirror_reinstall,
     })?;
     let params_json = serde_json::to_string(&json!({ "commands": commands }))?;
     let command_id = aws_output(&[
@@ -214,11 +196,10 @@ pub fn render_bootstrap_runtime_sync_commands(env: &RuntimeCommandEnv) -> Result
                 env.head_mirror_binary_sha256, env.head_mirror_binary_sha256
             ));
         }
-    } else if !truthy(&env.head_mirror_reinstall) {
-        bail!("HEAD_MIRROR_BINARY_OBJECT_URI is required when HEAD_MIRROR_REINSTALL is false");
-    } else if truthy(&env.head_mirror_reinstall) {
-        head_mirror_setup.push(head_mirror_install_command(env)?);
-        head_mirror_setup.push("if [ -x /root/.cargo/bin/burn_dragon_p2p_native ]; then ln -sf /root/.cargo/bin/burn_dragon_p2p_native /usr/local/bin/burn_dragon_p2p_native; fi".to_owned());
+    } else {
+        bail!(
+            "HEAD_MIRROR_BINARY_OBJECT_URI is required; deploy the runner-built locked-stack binary"
+        );
     }
 
     let mut bootstrap_setup = Vec::new();
@@ -234,10 +215,8 @@ pub fn render_bootstrap_runtime_sync_commands(env: &RuntimeCommandEnv) -> Result
                 env.bootstrap_binary_sha256, env.bootstrap_binary_sha256
             ));
         }
-    } else if env.bootstrap_install_source == "git" && !truthy(&env.bootstrap_reinstall) {
-        bail!(
-            "BOOTSTRAP_BINARY_OBJECT_URI is required for git bootstrap sync when BOOTSTRAP_REINSTALL is false"
-        );
+    } else if env.bootstrap_install_source == "git" {
+        bail!("BOOTSTRAP_BINARY_OBJECT_URI is required for locked-stack git bootstrap sync");
     } else {
         bootstrap_setup.push(format!(
             "if [ ! -x /usr/local/bin/burn-p2p-bootstrap ] && [ ! -x /root/.cargo/bin/burn-p2p-bootstrap ]; then {}; fi",
@@ -303,17 +282,11 @@ pub struct RuntimeCommandEnv {
     pub head_mirror_service_object_uri: String,
     pub bootstrap_install_source: String,
     pub bootstrap_crate_version: String,
-    pub bootstrap_git_repository: String,
-    pub bootstrap_git_ref: String,
     pub bootstrap_binary_object_uri: String,
     pub bootstrap_binary_sha256: String,
     pub bootstrap_features: String,
-    pub bootstrap_reinstall: String,
-    pub dragon_git_repository: String,
-    pub dragon_git_ref: String,
     pub head_mirror_binary_object_uri: String,
     pub head_mirror_binary_sha256: String,
-    pub head_mirror_reinstall: String,
 }
 
 #[derive(Clone)]
@@ -488,28 +461,12 @@ fn bootstrap_install_command(env: &RuntimeCommandEnv) -> Result<String> {
                 env.bootstrap_crate_version, env.bootstrap_features
             ));
         }
-        "git" => {
-            if env.bootstrap_git_ref.is_empty() {
-                bail!("BOOTSTRAP_GIT_REF is required for git bootstrap install");
-            }
-            command.push_str(&format!(
-                "cargo install --locked --git '{}' --rev '{}' burn_p2p_bootstrap --bin burn-p2p-bootstrap --no-default-features --features '{}'",
-                env.bootstrap_git_repository, env.bootstrap_git_ref, env.bootstrap_features
-            ));
-        }
+        "git" => bail!(
+            "git bootstrap sync requires the runner-built binary from the materialized locked stack"
+        ),
         other => bail!("unsupported bootstrap install source: {other}"),
     }
     Ok(command)
-}
-
-fn head_mirror_install_command(env: &RuntimeCommandEnv) -> Result<String> {
-    if env.dragon_git_ref.is_empty() {
-        bail!("DRAGON_GIT_REF is required for head mirror install");
-    }
-    Ok(format!(
-        "if [ ! -x /usr/local/bin/burn_dragon_p2p_native ] && [ ! -x /root/.cargo/bin/burn_dragon_p2p_native ]; then export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup; if [ ! -x /root/.cargo/bin/cargo ]; then curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal; fi; . /root/.cargo/env; cargo install --locked --git '{}' --rev '{}' burn_dragon_p2p --bin burn_dragon_p2p_native --no-default-features --features native; fi",
-        env.dragon_git_repository, env.dragon_git_ref
-    ))
 }
 
 fn wait_for_runtime_sync_prereqs_command() -> String {
@@ -761,13 +718,6 @@ fn auth_feature_for_connector(kind: &str) -> &'static str {
         "external" => "auth-external",
         _ => "auth-static",
     }
-}
-
-fn truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 fn string_field(value: &Value, key: &str) -> String {

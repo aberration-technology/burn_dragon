@@ -133,6 +133,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '180' }}
       BURN_DRAGON_NATIVE_CANARY_COMMAND_TIMEOUT_SECS: ${{ github.event.inputs.command_timeout_secs || '1800' }}
       BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: ${{ github.event.inputs.start_validator || 'true' }}
+      BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS: "60"
       BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: ${{ github.event.inputs.training_batch_size || '1' }}
       BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: ${{ github.event.inputs.training_max_iters || '2' }}
       BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: ${{ github.event.inputs.evaluation_max_batches || '1' }}

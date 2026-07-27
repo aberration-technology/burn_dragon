@@ -37,9 +37,9 @@ on:
         default: aberration.technology
         type: string
       bootstrap_install_source:
-        description: "How to install `burn_p2p_bootstrap` on the bootstrap host. Keep `crate` on the normal release path. Use `git` only when validating an unpublished burn_p2p revision against burn_dragon before publish."
+        description: "Bootstrap binary source. `git` builds the immutable public burn_p2p revision from stack.lock.toml on the runner; `crate` builds an explicitly published release."
         required: true
-        default: crate
+        default: git
         type: choice
         options:
           - crate
@@ -50,7 +50,7 @@ on:
         default: 0.21.8
         type: string
       bootstrap_git_ref:
-        description: "Pinned burn_p2p git ref used when `bootstrap_install_source=git`. Example: `main` or a full commit SHA. Leave empty on the normal crate path."
+        description: "Optional assertion for the burn_p2p Git SHA. When set, it must equal the revision in stack.lock.toml."
         required: false
         default: ""
         type: string
@@ -224,7 +224,6 @@ jobs:
           INPUT_BOOTSTRAP_VERSION: ${{ github.event.inputs.bootstrap_version }}
           VAR_BOOTSTRAP_VERSION: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_VERSION }}
           INPUT_BOOTSTRAP_GIT_REF: ${{ github.event.inputs.bootstrap_git_ref }}
-          VAR_BOOTSTRAP_GIT_REF: ${{ vars.BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF }}
           VAR_INSTANCE_TYPE: ${{ vars.BURN_DRAGON_P2P_INSTANCE_TYPE }}
           VAR_ROOT_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_ROOT_VOLUME_SIZE_GIB }}
           VAR_DATA_VOLUME_SIZE_GIB: ${{ vars.BURN_DRAGON_P2P_DATA_VOLUME_SIZE_GIB }}
@@ -389,13 +388,11 @@ jobs:
           bootstrap_root="${RUNNER_TEMP}/bootstrap-install"
           rm -rf "$bootstrap_root"
           if [ "${TF_VAR_bootstrap_install_source}" = "git" ]; then
-            CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="$edge_target_dir" cargo install \
+            CARGO_TARGET_DIR="$edge_target_dir" cargo install \
               --force \
               --locked \
               --root "$bootstrap_root" \
-              --git "https://github.com/aberration-technology/burn_p2p.git" \
-              --rev "${TF_VAR_bootstrap_git_ref}" \
-              burn_p2p_bootstrap \
+              --path "${GITHUB_WORKSPACE}/../burn_p2p/crates/burn_p2p_bootstrap" \
               --bin burn-p2p-bootstrap \
               --no-default-features \
               --features "admin-http,metrics,metrics-indexer,artifact-publish,artifact-download,artifact-fs,artifact-s3,browser-edge,browser-join,${bootstrap_auth_feature},rbac,social"
@@ -855,18 +852,12 @@ jobs:
           BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_service_unit_b64 }}
           BOOTSTRAP_INSTALL_SOURCE: ${{ env.TF_VAR_bootstrap_install_source }}
           BOOTSTRAP_CRATE_VERSION: ${{ env.TF_VAR_bootstrap_crate_version }}
-          BOOTSTRAP_GIT_REPOSITORY: https://github.com/aberration-technology/burn_p2p.git
-          BOOTSTRAP_GIT_REF: ${{ env.TF_VAR_bootstrap_git_ref }}
           BOOTSTRAP_BINARY_PATH: ${{ steps.edge_binaries.outputs.bootstrap_binary_path }}
           BOOTSTRAP_BINARY_SHA256: ${{ steps.edge_binaries.outputs.bootstrap_binary_sha256 }}
           EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
-          DRAGON_GIT_REPOSITORY: ${{ env.TF_VAR_dragon_git_repository }}
-          DRAGON_GIT_REF: ${{ env.TF_VAR_dragon_git_ref }}
           HEAD_MIRROR_BINARY_PATH: ${{ steps.edge_binaries.outputs.head_mirror_binary_path }}
           HEAD_MIRROR_BINARY_SHA256: ${{ steps.edge_binaries.outputs.head_mirror_binary_sha256 }}
           AUTH_CONNECTOR_KIND: ${{ env.AUTH_CONNECTOR_KIND }}
-          BOOTSTRAP_REINSTALL: "false"
-          HEAD_MIRROR_REINSTALL: "false"
           RUNTIME_CONFIG_PREFIX: runtime-config/bootstrap/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           target/debug/xtask sync-bootstrap-runtime-config
@@ -1478,6 +1469,7 @@ jobs:
       - name: deploy browser pages before live browser canary
         id: deploy_pages
         if: ${{ github.event.inputs.plan_only != 'true' && steps.outputs.outputs.browser_app_url != '' }}
+        timeout-minutes: 190
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1486,6 +1478,7 @@ jobs:
           BURN_DRAGON_DEPLOY_PAGES_EXPERIMENT_ID: ${{ env.BROWSER_CANARY_EXPERIMENT_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REVISION_ID: ${{ env.BROWSER_CANARY_REVISION_ID }}
           BURN_DRAGON_DEPLOY_PAGES_REQUIRE_EDGE_AUTH: "true"
+          BURN_DRAGON_DEPLOY_PAGES_WATCH_TIMEOUT_SECS: "10800"
         run: target/debug/xtask dispatch-pages-deploy-and-wait
 
       - name: verify live native canonical training dynamics
@@ -1513,6 +1506,7 @@ jobs:
           BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_TO_VISIBLE_ROOT: "true"
           BURN_DRAGON_NATIVE_CANARY_REPAIR_CURRENT_HEAD_AFTER_RUN: "true"
           BURN_DRAGON_NATIVE_CANARY_START_VALIDATOR: "true"
+          BURN_DRAGON_NATIVE_CANARY_VALIDATOR_READY_TIMEOUT_SECS: "60"
           BURN_DRAGON_NATIVE_CANARY_TRAINING_BATCH_SIZE: "1"
           BURN_DRAGON_NATIVE_CANARY_TRAINING_MAX_ITERS: "2"
           BURN_DRAGON_NATIVE_CANARY_EVALUATION_MAX_BATCHES: "1"

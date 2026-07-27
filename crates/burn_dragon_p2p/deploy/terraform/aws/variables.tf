@@ -69,7 +69,7 @@ variable "allow_route53_zone_apex_records" {
 }
 
 variable "bootstrap_install_source" {
-  description = "How the bootstrap host installs burn_p2p_bootstrap. Supported values: crate or git. Production deployments should use the published crate by default."
+  description = "Bootstrap binary source. crate installs a published release during host initialization; git expects the managed workflow to build and runtime-sync the coherent locked public stack."
   type        = string
   default     = "crate"
 
@@ -86,13 +86,13 @@ variable "bootstrap_crate_version" {
 }
 
 variable "bootstrap_git_repository" {
-  description = "Git repository used to install burn_p2p_bootstrap when bootstrap_install_source = git."
+  description = "Public burn_p2p repository recorded as bootstrap source provenance when bootstrap_install_source = git."
   type        = string
   default     = "https://github.com/aberration-technology/burn_p2p.git"
 }
 
 variable "bootstrap_git_ref" {
-  description = "Pinned burn_p2p git ref used to install burn_p2p_bootstrap when bootstrap_install_source = git."
+  description = "Pinned burn_p2p Git SHA recorded as bootstrap source provenance when bootstrap_install_source = git."
   type        = string
   default     = ""
 }

@@ -68,8 +68,8 @@ The cheapest supported production topology is now:
 
 Recommended operator defaults:
 
-- keep `bootstrap_install_source=crate` for production deploys and restores
-- use `bootstrap_install_source=git` only when validating an unpublished `burn_p2p` revision before release
+- keep the managed deploy/restore default `bootstrap_install_source=git`; CI materializes the public sibling stack at `stack.lock.toml`, builds the bootstrap and head-mirror binaries from that coherent checkout, verifies their checksums, and uploads them for runtime sync
+- use `bootstrap_install_source=crate` only when the selected published release intentionally matches the protocol revision in the locked stack
 - leave the managed trainer pool at `0` until the control plane and browser path are stable under the intended traffic pattern
 - keep restore drills on `plan_only=true` until you are intentionally executing a failover
 
@@ -204,7 +204,7 @@ That workflow:
 - prints the bootstrap instance details, bootstrap state-storage mode, control-plane state backend, control-plane dashboard URL, bootstrap install source/version, managed trainer pool outputs, and artifact plus dataset S3 prefixes in the workflow summary
 - derives the managed stack name as `burn-dragon-p2p-<environment>` and rejects legacy stack-name overrides or duplicate bootstrap instances for the same deployment environment
 
-The supported production bootstrap path is the published `burn_p2p_bootstrap` crate. The `git` install path is still supported, but only as a deliberate pre-release validation path for unpublished upstream `burn_p2p` revisions.
+Managed production deploys install `burn_p2p_bootstrap` from the immutable public Git revision in `stack.lock.toml`. The crates.io path remains available for explicit released-stack deployments, but operators must keep its protocol revision aligned with the Dragon peer lock.
 
 The trainer daemon follows the `TrainingProtocol` in the active signed
 directory revision. The currently browser-compatible public profile uses
@@ -329,7 +329,7 @@ Configure the workflow to target one of those environments. Put the following va
 The production workflow path is intentionally narrower than the full Terraform surface:
 
 - use `terraform_workspace=mainnet`
-- keep `bootstrap_install_source=crate`
+- keep the managed workflow default `bootstrap_install_source=git` so bootstrap and peer binaries are runner-built from the same locked P2P revision; the remote host does not perform a standalone Git install because `burn_p2p` intentionally uses the sibling `burn_ecs` path dependency
 - keep bootstrap status alarms enabled
 - keep control-plane operational alarms enabled
 - keep the shared control-plane dashboard enabled
@@ -351,12 +351,9 @@ Recommended Midwest baseline:
 - leave `BURN_DRAGON_P2P_MANAGED_TRAINER_DESIRED_CAPACITY=0` on the default production path to stay under `$100` fixed monthly AWS cost
 - if you intentionally exceed that budget later, start with `BURN_DRAGON_P2P_MANAGED_TRAINER_BACKEND=cpu` and re-evaluate the fixed-cost estimate before apply
 - `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE`
-  - optional bootstrap installation source. Supported values: `crate` and `git`. Defaults to `crate`. Keep `crate` on the supported production path; use `git` only when validating an unpublished upstream `burn_p2p` revision.
+  - optional bootstrap installation source. Supported values: `git` and `crate`. Managed workflows default to `git` and resolve the public immutable revision from `stack.lock.toml`; direct Terraform remains configurable.
 - `BURN_DRAGON_P2P_BOOTSTRAP_VERSION`
   - optional published `burn_p2p_bootstrap` crate version used when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=crate`. Defaults to `0.21.0`.
-- `BURN_DRAGON_P2P_BOOTSTRAP_GIT_REF`
-  - optional pinned `burn_p2p` git ref used only when `BURN_DRAGON_P2P_BOOTSTRAP_INSTALL_SOURCE=git`.
-
 ### Optional Environment Variables
 
 - `BURN_DRAGON_P2P_AUTH_CONNECTOR_KIND`

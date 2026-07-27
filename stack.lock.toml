@@ -4,7 +4,7 @@ schema_version = 1
 name = "burn_ecs"
 path = "../burn_ecs"
 url = "https://github.com/aberration-technology/burn_ecs.git"
-revision = "76f75bed78d1c78cbdbcc480d73832628f903436"
+revision = "9d2ad75ab5227570b6f16f86a20cab8baa9e49bb"
 
 [[repositories]]
 name = "burn_p2p"

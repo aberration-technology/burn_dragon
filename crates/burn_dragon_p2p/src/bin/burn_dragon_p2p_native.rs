@@ -3433,6 +3433,33 @@ where
             &outcome.head,
             "after local training",
         )?;
+        let mirrored_edge_head = if let Some((registration_runtime, edge_base_url, session_id)) =
+            edge_registration.as_ref()
+        {
+            let announcement = HeadAnnouncement {
+                overlay: experiment.overlay_set()?.heads,
+                provider_peer_id: Some(local_peer_id.clone()),
+                head: outcome.head.clone(),
+                announced_at: chrono::Utc::now(),
+            };
+            Some(
+                mirror_head_artifact_with_edge(
+                    registration_runtime,
+                    edge_base_url,
+                    session_id,
+                    &announcement,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to mirror published head {} artifact {} to edge",
+                        announcement.head.head_id.as_str(),
+                        announcement.head.artifact_id.as_str()
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         let mut diffusion_settlement = None;
         if options.settle_diffusion || options.serve_after_publish_secs > 0 {
             if directory_entry_promotes_with_diffusion(&experiment_entry) {
@@ -3588,26 +3615,21 @@ where
                 ));
             }
         }
-        if let Some((registration_runtime, edge_base_url, session_id)) = edge_registration.as_ref()
+        if let (Some((registration_runtime, edge_base_url, session_id)), Some(edge_announcement)) =
+            (edge_registration.as_ref(), mirrored_edge_head)
         {
-            let announcement = HeadAnnouncement {
-                overlay: experiment.overlay_set()?.heads,
-                provider_peer_id: Some(local_peer_id.clone()),
-                head: outcome.head.clone(),
-                announced_at: chrono::Utc::now(),
-            };
-            mirror_live_head_with_edge(
+            register_edge_head_and_directory(
                 registration_runtime,
                 edge_base_url,
                 session_id,
-                &experiment_entry,
-                &announcement,
+                Some(&experiment_entry),
+                edge_announcement,
+                Some(&local_peer_id),
             )
             .with_context(|| {
                 format!(
-                    "failed to mirror published head {} artifact {} to edge",
-                    announcement.head.head_id.as_str(),
-                    announcement.head.artifact_id.as_str()
+                    "failed to register mirrored head {} on edge after diffusion settlement",
+                    outcome.head.head_id.as_str(),
                 )
             })?;
         }
@@ -3930,22 +3952,6 @@ fn diffusion_settlement_report(
     }
 }
 
-fn mirror_live_head_with_edge(
-    runtime: &tokio::runtime::Runtime,
-    edge_base_url: &str,
-    session_id: &str,
-    directory_template: &ExperimentDirectoryEntry,
-    announcement: &HeadAnnouncement,
-) -> Result<()> {
-    register_live_head_with_edge_options(
-        runtime,
-        edge_base_url,
-        session_id,
-        Some(directory_template),
-        announcement,
-    )
-}
-
 fn register_live_head_with_edge_options(
     runtime: &tokio::runtime::Runtime,
     edge_base_url: &str,
@@ -3953,10 +3959,33 @@ fn register_live_head_with_edge_options(
     directory_template: Option<&ExperimentDirectoryEntry>,
     announcement: &HeadAnnouncement,
 ) -> Result<()> {
+    let source_provider_peer_id = announcement
+        .provider_peer_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("live head registration requires a provider peer id"))?
+        .clone();
+    let edge_announcement =
+        mirror_head_artifact_with_edge(runtime, edge_base_url, session_id, announcement)?;
+    register_edge_head_and_directory(
+        runtime,
+        edge_base_url,
+        session_id,
+        directory_template,
+        edge_announcement,
+        Some(&source_provider_peer_id),
+    )
+}
+
+fn mirror_head_artifact_with_edge(
+    runtime: &tokio::runtime::Runtime,
+    edge_base_url: &str,
+    session_id: &str,
+    announcement: &HeadAnnouncement,
+) -> Result<HeadAnnouncement> {
     let provider_peer_id = announcement
         .provider_peer_id
         .as_ref()
-        .ok_or_else(|| anyhow!("live head registration requires a provider peer id"))?;
+        .ok_or_else(|| anyhow!("artifact mirror requires a provider peer id"))?;
     let mirror = runtime
         .block_on(mirror_peer_artifact(
             edge_base_url,
@@ -3989,16 +4018,10 @@ fn register_live_head_with_edge_options(
         mirror.chunk_count,
     );
 
-    let edge_announcement =
-        mirrored_edge_head_announcement(announcement, mirrored_provider_peer_id.clone());
-    register_edge_head_and_directory(
-        runtime,
-        edge_base_url,
-        session_id,
-        directory_template,
-        edge_announcement,
-        Some(provider_peer_id),
-    )
+    Ok(mirrored_edge_head_announcement(
+        announcement,
+        mirrored_provider_peer_id,
+    ))
 }
 
 fn register_edge_head_and_directory(
@@ -4419,6 +4442,16 @@ where
 
     let mut running = spawn_prepared_native_peer(prepared)?;
     wait_for_runtime_ready(&running, RUNTIME_READY_TIMEOUT)?;
+    let ready_snapshot = running.snapshot();
+    eprintln!(
+        "validator-runtime-ready local_peer_id={} connected_peers={}",
+        ready_snapshot
+            .local_peer_id
+            .as_ref()
+            .map(|peer_id| peer_id.as_str())
+            .unwrap_or("-"),
+        ready_snapshot.connected_peers,
+    );
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_requested_for_handler = Arc::clone(&shutdown_requested);
     let control = running.control_handle();
@@ -5350,6 +5383,33 @@ mod tests {
         assert_eq!(edge_announcement.provider_peer_id, Some(edge_provider));
         assert_eq!(edge_announcement.head, announcement.head);
         assert_eq!(edge_announcement.overlay, announcement.overlay);
+    }
+
+    #[test]
+    fn artifact_mirror_can_complete_before_canonical_head_registration() {
+        let source_provider = PeerId::new("12D3KooWCPbD9DgsaDHtPC6cC6DsvLNL64rtfo8UsQCVMBuazuuP");
+        let edge_provider = PeerId::new("12D3KooWJLKDYyWyB26bcJwV3u2ASqXvewHdKWRLkTe8xH7gb63");
+        let (edge_base_url, requests, server) = spawn_single_response_server(
+            "200 OK",
+            r#"{"artifact_id":"artifact-1","mirrored_from":"12D3KooWCPbD9DgsaDHtPC6cC6DsvLNL64rtfo8UsQCVMBuazuuP","mirrored_provider_peer_id":"12D3KooWJLKDYyWyB26bcJwV3u2ASqXvewHdKWRLkTe8xH7gb63","bytes_len":1024,"chunk_count":2}"#,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let announcement = test_head_announcement(Some(source_provider));
+
+        let mirrored =
+            mirror_head_artifact_with_edge(&runtime, &edge_base_url, "session-1", &announcement)
+                .expect("mirror artifact");
+
+        server.join().expect("server thread");
+        assert_eq!(mirrored.provider_peer_id, Some(edge_provider));
+        assert_eq!(mirrored.head, announcement.head);
+        assert_eq!(
+            *requests.lock().expect("requests lock"),
+            vec!["/admin/artifacts/mirror-peer".to_owned()]
+        );
     }
 
     #[test]

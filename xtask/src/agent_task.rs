@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -14,7 +14,10 @@ use serde_json::{Map, Value, json};
 
 const DEFAULT_INTERVAL_SECS: u64 = 180;
 const DEFAULT_DISCOVER_TIMEOUT_SECS: u64 = 150;
+const DEFAULT_DEPLOY_PAGES_TIMEOUT_SECS: u64 = 10_800;
 const DEFAULT_FAILED_LOG_LINES: usize = 40;
+const DEFAULT_GH_COMMAND_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_GITHUB_API_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_TAIL_LINES: usize = 40;
 
 #[derive(Debug, Subcommand)]
@@ -198,6 +201,10 @@ pub fn dispatch_pages_deploy_and_wait() -> Result<()> {
         common: CommonTaskArgs::default(),
         wait_options: WaitOptions {
             interval_secs: env_u64("BURN_DRAGON_DEPLOY_PAGES_WATCH_INTERVAL_SECS", 180),
+            timeout_secs: env_u64(
+                "BURN_DRAGON_DEPLOY_PAGES_WATCH_TIMEOUT_SECS",
+                DEFAULT_DEPLOY_PAGES_TIMEOUT_SECS,
+            ),
             exit_status: true,
             wait: true,
             ..WaitOptions::default()
@@ -787,20 +794,29 @@ fn wait_github_worker(task_dir: &Path) -> Result<i32> {
 }
 
 fn summarize_github_run(repo: &str, run_id: &str, failed_log_lines: usize) -> Result<RunSummary> {
-    let run = gh_json(&[
-        "run",
-        "view",
-        run_id,
-        "--repo",
-        repo,
-        "--json",
-        "conclusion,displayTitle,jobs,status,url,workflowName",
-    ])?;
-    let jobs = run
-        .get("jobs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(DEFAULT_GITHUB_API_TIMEOUT_SECS))
+        .build()
+        .context("failed to build GitHub API client")?;
+    let api_base = github_api_base_url();
+    let run = github_json(
+        &client,
+        &format!("{api_base}/repos/{repo}/actions/runs/{run_id}"),
+    )?;
+    let jobs = github_run_jobs(&client, &api_base, repo, run_id)?;
+    let mut summary = github_run_summary(&run, &jobs);
+    if !summary.failed_job.is_empty() {
+        summary.failed_log_tail =
+            match gh_text(&["run", "view", run_id, "--repo", repo, "--log-failed"]) {
+                Ok(log) => interesting_log_lines(&log, failed_log_lines),
+                Err(error) => vec![format!("failed to fetch GitHub logs: {error:#}")],
+            };
+    }
+    Ok(summary)
+}
+
+fn github_run_summary(run: &Value, jobs: &[Value]) -> RunSummary {
     let active = jobs
         .iter()
         .find(|job| {
@@ -821,25 +837,91 @@ fn summarize_github_run(repo: &str, run_id: &str, failed_log_lines: usize) -> Re
         })
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let failed_log_tail = if failed.as_object().is_some_and(|object| !object.is_empty()) {
-        interesting_log_lines(
-            &gh_text(&["run", "view", run_id, "--repo", repo, "--log-failed"])?,
-            failed_log_lines,
-        )
-    } else {
-        Vec::new()
-    };
-    Ok(RunSummary {
-        workflow_name: json_string(&run, "workflowName", "unknown"),
-        display_title: json_string(&run, "displayTitle", ""),
-        status: json_string(&run, "status", "unknown"),
-        conclusion: json_string(&run, "conclusion", ""),
-        url: json_string(&run, "url", ""),
+    RunSummary {
+        workflow_name: json_string(run, "name", "unknown"),
+        display_title: json_string(run, "display_title", ""),
+        status: json_string(run, "status", "unknown"),
+        conclusion: json_string(run, "conclusion", ""),
+        url: json_string(run, "html_url", ""),
         active_job: json_string(&active, "name", ""),
         active_step: active_step(&active),
         failed_job: json_string(&failed, "name", ""),
         failed_step: failed_step(&failed),
-        failed_log_tail,
+        failed_log_tail: Vec::new(),
+    }
+}
+
+fn github_run_jobs(
+    client: &reqwest::blocking::Client,
+    api_base: &str,
+    repo: &str,
+    run_id: &str,
+) -> Result<Vec<Value>> {
+    const PER_PAGE: usize = 100;
+
+    let mut jobs = Vec::new();
+    for page in 1..=100 {
+        let response = github_json(
+            client,
+            &format!(
+                "{api_base}/repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page={PER_PAGE}&page={page}"
+            ),
+        )?;
+        let mut page_jobs = response
+            .get("jobs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let page_len = page_jobs.len();
+        jobs.append(&mut page_jobs);
+        if page_len < PER_PAGE {
+            return Ok(jobs);
+        }
+    }
+    anyhow::bail!("GitHub run {run_id} exceeded the supported 10,000-job pagination limit")
+}
+
+fn github_json(client: &reqwest::blocking::Client, url: &str) -> Result<Value> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let mut request = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "burn-dragon-xtask")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Ok(token) = std::env::var("GH_TOKEN") {
+            request = request.bearer_auth(token);
+        }
+        match request
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+        {
+            Ok(response) => match response.json::<Value>() {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error.into()),
+            },
+            Err(error) => last_error = Some(error.into()),
+        }
+        if attempt < 2 {
+            thread::sleep(Duration::from_secs(2 * (attempt + 1)));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("GitHub API request failed for {url}")))
+        .with_context(|| format!("failed to fetch GitHub API resource {url}"))
+}
+
+fn github_api_base_url() -> String {
+    std::env::var("GITHUB_API_URL").unwrap_or_else(|_| {
+        std::env::var("GH_HOST").map_or_else(
+            |_| "https://api.github.com".to_owned(),
+            |host| {
+                if host == "github.com" {
+                    "https://api.github.com".to_owned()
+                } else {
+                    format!("https://{host}/api/v3")
+                }
+            },
+        )
     })
 }
 
@@ -941,14 +1023,60 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_capture_with_timeout(
+        program,
+        args,
+        cwd,
+        Duration::from_secs(DEFAULT_GH_COMMAND_TIMEOUT_SECS),
+    )
+}
+
+fn run_capture_with_timeout<I, S>(
+    program: &str,
+    args: I,
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut stdout = tempfile::tempfile().context("failed to create command stdout buffer")?;
+    let mut stderr = tempfile::tempfile().context("failed to create command stderr buffer")?;
     let mut command = Command::new(program);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     command
-        .output()
-        .with_context(|| format!("failed to run {program}"))
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {program}"))?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{program} timed out after {:.1}s", timeout.as_secs_f64());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    stdout.seek(SeekFrom::Start(0))?;
+    stderr.seek(SeekFrom::Start(0))?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes)?;
+    stderr.read_to_end(&mut stderr_bytes)?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
 }
 
 fn create_task(
@@ -1507,5 +1635,110 @@ impl Default for WaitOptions {
             wait: false,
             watch: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_run_summary_reports_active_and_failed_steps() {
+        let run = json!({
+            "name": "deploy github pages",
+            "display_title": "deploy github pages task-123",
+            "status": "in_progress",
+            "conclusion": null,
+            "html_url": "https://github.com/example/project/actions/runs/123",
+        });
+        let jobs = vec![
+            json!({
+                "name": "build",
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [
+                    {"name": "checkout", "status": "completed", "conclusion": "success"},
+                    {"name": "compile", "status": "completed", "conclusion": "failure"},
+                ],
+            }),
+            json!({
+                "name": "canary",
+                "status": "in_progress",
+                "conclusion": null,
+                "steps": [
+                    {"name": "setup", "status": "completed", "conclusion": "success"},
+                    {"name": "train", "status": "in_progress", "conclusion": null},
+                ],
+            }),
+        ];
+
+        let summary = github_run_summary(&run, &jobs);
+
+        assert_eq!(summary.workflow_name, "deploy github pages");
+        assert_eq!(summary.display_title, "deploy github pages task-123");
+        assert_eq!(summary.status, "in_progress");
+        assert_eq!(summary.active_job, "canary");
+        assert_eq!(summary.active_step, "train");
+        assert_eq!(summary.failed_job, "build");
+        assert_eq!(summary.failed_step, "compile");
+        assert!(summary.failed_log_tail.is_empty());
+    }
+
+    #[test]
+    fn github_run_summary_accepts_completed_success_payload() {
+        let run = json!({
+            "name": "deploy github pages",
+            "display_title": "deploy github pages task-456",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/example/project/actions/runs/456",
+        });
+        let jobs = vec![json!({
+            "name": "deploy",
+            "status": "completed",
+            "conclusion": "success",
+            "steps": [
+                {"name": "publish", "status": "completed", "conclusion": "success"},
+            ],
+        })];
+
+        let summary = github_run_summary(&run, &jobs);
+
+        assert_eq!(summary.status, "completed");
+        assert_eq!(summary.conclusion, "success");
+        assert!(summary.active_job.is_empty());
+        assert!(summary.failed_job.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_commands_preserve_output_and_status() {
+        let output = run_capture_with_timeout(
+            "sh",
+            ["-c", "printf stdout; printf stderr >&2; exit 7"],
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("command should complete");
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_commands_are_killed_at_the_deadline() {
+        let started = Instant::now();
+        let error = run_capture_with_timeout(
+            "sh",
+            ["-c", "exec sleep 5"],
+            None,
+            Duration::from_millis(100),
+        )
+        .expect_err("command should time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

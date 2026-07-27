@@ -686,6 +686,46 @@ const NATIVE_CALLBACK_BRIDGE_KEY: &str = "burn-dragon-p2p.native-cli-bridge";
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 const NATIVE_CALLBACK_BRIDGE_AUTH_KEY: &str = "burn-dragon-p2p.native-cli-bridge-auth";
 
+#[cfg(any(test, all(feature = "wasm-ui", target_arch = "wasm32")))]
+fn browser_session_refresh_required(
+    expires_at: Option<DateTime<Utc>>,
+    valid_through: DateTime<Utc>,
+) -> bool {
+    expires_at.is_some_and(|expires_at| expires_at <= valid_through)
+}
+
+#[cfg(test)]
+mod browser_session_refresh_policy_tests {
+    use super::*;
+
+    #[test]
+    fn missing_session_does_not_issue_refresh_request() {
+        assert!(!browser_session_refresh_required(None, Utc::now()));
+    }
+
+    #[test]
+    fn fresh_session_is_reused_without_rotation() {
+        let now = Utc::now();
+        assert!(!browser_session_refresh_required(
+            Some(now + Duration::minutes(10)),
+            now + Duration::seconds(30),
+        ));
+    }
+
+    #[test]
+    fn session_expiring_by_deadline_is_refreshed() {
+        let now = Utc::now();
+        assert!(browser_session_refresh_required(
+            Some(now + Duration::seconds(30)),
+            now + Duration::seconds(30),
+        ));
+        assert!(browser_session_refresh_required(
+            Some(now + Duration::seconds(20)),
+            now + Duration::seconds(30),
+        ));
+    }
+}
+
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingBrowserGitHubLogin {
@@ -1603,11 +1643,7 @@ async fn refresh_durable_browser_session(
     if durable.session.session.is_none() {
         return Ok(durable.session.clone());
     }
-    if durable.session.session_expires_before(valid_through) {
-        durable.remember_session(BrowserSessionState::default());
-        persist_durable_browser_storage(&snapshot.network_id, durable)
-            .await
-            .map_err(|error| anyhow!("failed to clear expired browser session: {error}"))?;
+    if !browser_session_refresh_required(durable.session.session_expires_at(), valid_through) {
         return Ok(durable.session.clone());
     }
 

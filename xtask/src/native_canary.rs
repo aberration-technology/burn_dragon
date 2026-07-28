@@ -400,7 +400,7 @@ impl NativeCanaryConfig {
             windows: parse_env("BURN_DRAGON_NATIVE_CANARY_WINDOWS", 1)?,
             head_sync_timeout_secs: parse_env(
                 "BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS",
-                300,
+                600,
             )?,
             settle_diffusion: env_bool("BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION", true)?,
             diffusion_settle_passes: parse_env(

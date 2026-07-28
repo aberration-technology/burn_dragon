@@ -127,7 +127,7 @@ jobs:
       BURN_DRAGON_NATIVE_CANARY_PRINCIPAL_ID: ${{ github.event.inputs.principal_id || 'native-canary-mainnet-nca' }}
       BURN_DRAGON_NATIVE_CANARY_CALLBACK_TOKEN: ${{ secrets.BURN_DRAGON_P2P_BROWSER_CANARY_CALLBACK_TOKEN }}
       BURN_DRAGON_NATIVE_CANARY_WINDOWS: ${{ github.event.inputs.windows || '1' }}
-      BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "300"
+      BURN_DRAGON_NATIVE_CANARY_HEAD_SYNC_TIMEOUT_SECS: "600"
       BURN_DRAGON_NATIVE_CANARY_SETTLE_DIFFUSION: ${{ github.event.inputs.settle_diffusion || 'true' }}
       BURN_DRAGON_NATIVE_CANARY_DIFFUSION_SETTLE_PASSES: ${{ github.event.inputs.diffusion_settle_passes || '2' }}
       BURN_DRAGON_NATIVE_CANARY_SERVE_AFTER_PUBLISH_SECS: ${{ github.event.inputs.serve_after_publish_secs || '180' }}

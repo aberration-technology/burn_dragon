@@ -457,6 +457,12 @@ pub struct DragonManifestSeed {
     pub training_protocol: TrainingProtocol,
     #[serde(default)]
     pub aggregation: DragonAggregationConfig,
+    /// Wire encoding for random-scaffold mutable-parameter updates.
+    ///
+    /// This is revision-scoped because every peer must decode the same update
+    /// contract. FP32 is the conservative convergence-parity default.
+    #[serde(default = "default_random_scaffold_update_encoding")]
+    pub random_scaffold_update_encoding: burn_p2p::CompactScalarEncoding,
     #[serde(default = "default_manifest_timestamp")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_manifest_timestamp")]
@@ -480,10 +486,15 @@ impl Default for DragonManifestSeed {
             require_signed_revision_contracts: false,
             training_protocol: TrainingProtocol::default(),
             aggregation: DragonAggregationConfig::default(),
+            random_scaffold_update_encoding: default_random_scaffold_update_encoding(),
             created_at: default_manifest_timestamp(),
             release_built_at: default_manifest_timestamp(),
         }
     }
+}
+
+const fn default_random_scaffold_update_encoding() -> burn_p2p::CompactScalarEncoding {
+    burn_p2p::CompactScalarEncoding::Fp32
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -715,6 +726,8 @@ pub struct DragonNativeAuthBundle {
 pub struct TokenWindowRecord {
     pub inputs: Vec<i64>,
     pub targets: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_mask: Option<Vec<i64>>,
     pub reset_stream_state: bool,
     #[serde(default)]
     pub stream_group_id: Option<u64>,
@@ -942,6 +955,18 @@ mod tests {
             DragonAggregationConfig::MAX_BASIS_POINTS
         );
         assert_eq!(aggregation.root_ema_update_weight(), 1.0);
+    }
+
+    #[test]
+    fn legacy_token_window_records_deserialize_without_loss_masks() {
+        let record: TokenWindowRecord = serde_json::from_value(serde_json::json!({
+            "inputs": [1, 2],
+            "targets": [2, 3],
+            "reset_stream_state": true
+        }))
+        .expect("legacy token record");
+
+        assert_eq!(record.loss_mask, None);
     }
 
     #[test]

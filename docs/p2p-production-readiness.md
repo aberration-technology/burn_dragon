@@ -90,7 +90,12 @@ Both conditions start at validation loss 5.689760 and process 216 records. The
 nine-step condition is better in both learning progress and protocol duty.
 More frequent promotion did not recover the gap.
 
-This result has two distinct conclusions:
+These figures predate target-loss-mask propagation for fixed-size Ruliad
+documents. Repeated EOS fill was supervised, so they are retained only as
+historical protocol evidence and must not be used as current quality evidence.
+The artifact-window matrix needs a corrected-objective rerun.
+
+The historical result had two distinct conclusions:
 
 - transport, artifact publication, merge replay, and validation are exact;
   candidate and canonical tensors match the oracle every round
@@ -104,70 +109,73 @@ merge are identical.
 
 The report's default convergence promotion threshold is 90% of matched central
 progress. Set `BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1` to make that
-threshold a hard test assertion. The current result fails that learning-quality
-gate, so the artifact-window AdamW protocol is not the production
+threshold a hard test assertion. Artifact-window AdamW is not the production
 continual-pretraining default.
 
 ### DiLoCo parity
 
-The protocol-aware DiLoCo path uses persistent outer SGD state, rotating
-reducers, content-addressed cohort commitments, a two-stage ready barrier, exact
-base-parameter checksums, and transport-decoded pseudo-gradients. The matched
-reference applies AdamW to gradients accumulated over the same three peer
-microbatches at each local-step index.
+The protocol-aware DiLoCo path uses persistent peer-local AdamW and scheduler
+records, outer SGD state, rotating reducers, content-addressed cohort
+commitments, a two-stage ready barrier, exact base-parameter checksums, and
+transport-decoded pseudo-gradients. The matched reference accumulates the same
+three peer microbatch gradients into each AdamW update.
 
-The release matrix uses four outer rounds, nine local AdamW steps per peer per
-round, batch size 4 per peer, and outer SGD learning rate 1.0 without momentum.
-Peer identities are deterministically derived from seed and role so lease
-partitioning and batch order remain fixed across conditions.
+The corrected matrix uses a 1,012,229-parameter random-scaffold model, six
+outer rounds, one local AdamW step per peer per round, batch size 4 per peer,
+and outer SGD learning rate 1.20 without momentum. Only 225,797 mutable values
+(22.31%) are synchronized. Fixed-document EOS fill is masked on native and
+browser paths. Each promoted run consumed 18 unique nonempty-supervision
+batches with no duplicates.
 
-| seed | genesis | P2P final | matched final | P2P/matched progress |
-| ---: | ---: | ---: | ---: | ---: |
-| 1337 | 5.710400 | 2.638148 | 2.585947 | 98.33% |
-| 1338 | 5.687529 | 2.534715 | 2.357901 | 94.69% |
-| 1339 | 5.670796 | 2.562618 | 2.457294 | 96.72% |
+| seed | genesis | P2P final | matched final | endpoint progress | trailing progress |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1337 | 5.677486 | 3.689056 | 3.568502 | 94.284% | 94.098% |
+| 1338 | 5.662974 | 3.655515 | 3.473025 | 91.667% | 91.635% |
+| 1339 | 5.676928 | 3.539646 | 3.385779 | 93.284% | 92.890% |
 
-Mean progress parity is 96.58%; the minimum seed clears the 90% promotion
-threshold. Across all 12 rounds, network parameters and aggregates exactly
-match the independent codec-aware protocol oracle, every peer applies the same
-parameter pack, all three contributions are committed, and hard DiLoCo request
-failures remain zero. The convergence assertion was enabled for every row, so a
-below-threshold seed could not emit a passing test result. Mean loopback
-network-round time is 8.53 seconds, mean compute duty is 76.4%, and aggregate
-peer-local throughput is 3.17 inner steps per network second.
+Mean endpoint parity is 93.08%; mean trailing parity is 92.87%; and the minimum
+seed clears the 90% promotion threshold. Across all 18 rounds, network
+parameters and aggregates exactly match the independent codec-aware protocol
+oracle, every peer applies the same parameter pack, all three contributions
+are committed, validation is monotonic, and hard DiLoCo request failures
+remain zero.
 
-The same-binary seed-1338 codec ablation used release executable SHA-256
-`2633d3dd42da98ae9bf89c5cbc3e1a1af960ff8a698ca3b7dba6a4b19a780aa6`:
+All three release-profile confirmations explicitly omitted the outer
+learning-rate environment override. Mean aggregate throughput was 1.031 peer
+inner steps per network second, and each condition completed in 71.19-72.64
+seconds. Native peers permit two established routes during simultaneous dial
+reconciliation; this removed the prior timeout-scale request stalls.
 
-| codec | local gradient payload | vs FP32 | P2P final | progress parity | network seconds |
+The matched three-seed codec matrix is:
+
+| codec | estimated wire payload/run | vs FP32 | mean P2P final | mean trailing progress | mean peer steps/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 44,458,080 | 100.0% | 2.534715 | 94.690% | 34.70 |
-| FP16 | 22,229,040 | 50.0% | 2.534802 | 94.687% | 34.42 |
-| blockwise int8/256 | 11,375,088 | 25.6% | 2.535125 | 94.677% | 33.45 |
+| FP32 | 21,676,512 | 100.0% | 3.628072 | 92.874% | 1.0312 |
+| FP16 | 10,838,256 | 50.0% | 3.628078 | 92.874% | 1.0138 |
 
-FP16 and int8 preserve the bounded-run learning trajectory while reducing
-payload. They do not improve loopback wall time because model compute and
-fixed control work dominate. WAN bandwidth/latency, mixed hardware, and longer
-training remain separate required measurements.
+FP16 preserves the bounded-run trajectory to a `+0.0000061` mean final-CE
+difference while halving payload. Loopback throughput is 1.69% lower because
+codec overhead is exposed when bandwidth is free, so FP16 is a bandwidth
+option rather than a local speed optimization. It remains opt-in pending a
+constrained real-network and browser measurement. WAN bandwidth/latency, mixed
+hardware, and longer training remain separate required measurements.
 
-The machine-readable reports for the final enforced matrix are under
-`target/test-artifacts/p2p-diloco-release-enforced-final-v2/`. Every report uses
-schema version 3, records the release build profile and ndarray CPU backend,
-contains 17 enforced gate assertions, and was produced by the executable above.
-The current-stack seed-1337 rerun independently reproduced `2.638148` P2P
-loss, `2.585947` synchronized loss, `98.329%` progress parity, all 17 passing
-gates, 108 peer-local inner updates, 3.030 aggregate inner steps per network
-second, and 59,277,440 estimated wire payload bytes excluding control
-overhead.
+Machine-readable reports are under
+`target/test-artifacts/random-scaffold-diloco/masked-route2/` and
+`target/test-artifacts/random-scaffold-diloco/release-contract-final/`. The
+final release reports use schema version 5 and record the corrected objective,
+supervision fingerprints, dual-route native transport, release build profile,
+gates asserting the signed persistent optimizer/scheduler policies, and hard
+convergence assertions.
 
 ### Local transport and recovery gate
 
 The convergence matrix runs above the complete local protocol suites:
 
-- `burn_p2p_swarm`: 84 serial tests, including rendezvous registration,
+- `burn_p2p_swarm`: serial tests including rendezvous registration,
   Kademlia recovery, relay reservation, 192 KiB relayed transfer, direct-route
-  handoff, and post-transfer single-route reconciliation
-- `burn_p2p`: 266 serial tests, including DiLoCo cohort/reducer behavior,
+  handoff, and bounded connection reconciliation
+- `burn_p2p`: tests including DiLoCo cohort/reducer behavior,
   runtime restart, security-state restoration, diffusion, and control-plane
   projection
 - the four-peer rotating-reducer authority scenario passed eight consecutive
@@ -281,14 +289,13 @@ This matters for both correctness and multi-run hosting. Two Dragon pipelines
 in one process must not share rho state, optimizer state, scheduler cursor,
 checkpoint files, or event sinks merely because they use the same model type.
 
-The current artifact-window parity profile declares both optimizer and
-scheduler state as `reset_per_window`. This is implemented behavior, not merely
-metadata. No optimizer moments are silently transferred between peers or
-attached to the canonical head. It also means the current protocol cannot
-claim optimizer-state equivalence with centralized AdamW. A stateful protocol
-must choose and implement either peer-local state invalidated on reconcile,
-canonical optimizer artifacts, or an explicit outer optimizer such as
-DiLoCo/FedOpt; changing that choice creates a new signed training contract.
+The artifact-window parity profile declares optimizer and scheduler state as
+`reset_per_window`. The protocol-aware DiLoCo profile instead declares both as
+`peer_local_persistent`: records survive reconciliation on the same peer but
+are not transferred when that peer adopts another model. Both behaviors are
+implemented and bound into distinct signed training contracts. No optimizer
+moments are silently attached to a canonical head or transferred between
+peers.
 
 ## shard partition and capacity
 
@@ -423,8 +430,8 @@ wiring/correctness evidence rather than convergence claims:
   medium rung
 - deployment workflow contract checks and WebGPU WASM target check
 - strict 1M-parameter three-peer DiLoCo bulk exchange
-- three-seed, four-round release DiLoCo convergence parity
-- same-binary FP32/FP16/blockwise-int8 codec quality and payload ablation
+- corrected-objective three-seed, six-round DiLoCo convergence parity
+- matched FP32/FP16 random-scaffold codec quality and payload ablation
 
 The current Firefox runner did not expose WebGPU. Its successful downgrade is
 valid role/capability evidence, not a browser GPU training result. A deployed

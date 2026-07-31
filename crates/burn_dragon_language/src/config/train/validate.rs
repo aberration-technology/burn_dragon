@@ -2533,6 +2533,16 @@ impl TrainingConfig {
             initialization.validate().map_err(anyhow::Error::msg)?;
             resolved_model.initialization = initialization.clone();
         }
+        if let Some(random_scaffold) = &self.model.random_scaffold {
+            random_scaffold
+                .validate_for_model(
+                    resolved_model.n_embd,
+                    resolved_model.n_head,
+                    resolved_model.latent_total(),
+                )
+                .map_err(|message| anyhow!("model.random_scaffold {message}"))?;
+            resolved_model.random_scaffold = random_scaffold.clone();
+        }
         if let Some(sequence_kernel) = self.model.sequence_kernel {
             sequence_kernel
                 .validate()
@@ -2626,6 +2636,11 @@ impl TrainingConfig {
             ));
         }
         if self.training.neuron_scaling.enabled {
+            if resolved_model.random_scaffold.enabled {
+                return Err(anyhow!(
+                    "training.neuron_scaling is not compatible with model.random_scaffold.enabled; scaffold growth history must be represented by a new model revision"
+                ));
+            }
             let max_latent_total = self.training.neuron_scaling.max_latent_total;
             if max_latent_total < resolved_model.latent_total() {
                 return Err(anyhow!(
@@ -2648,6 +2663,26 @@ impl TrainingConfig {
                     resolved_model.n_head
                 ));
             }
+        }
+        if resolved_model.random_scaffold.enabled
+            && matches!(
+                self.optimizer.name,
+                burn_dragon_train::OptimizerKind::Eggroll
+            )
+        {
+            return Err(anyhow!(
+                "optimizer.name=eggroll does not yet support adapter-parameter population evaluation for model.random_scaffold; use optimizer.name=adamw for the paper-faithful local baseline"
+            ));
+        }
+        if resolved_model.random_scaffold.enabled && self.training.continual_backprop.enabled {
+            return Err(anyhow!(
+                "training.continual_backprop is not compatible with model.random_scaffold because feature replacement mutates the immutable scaffold"
+            ));
+        }
+        if resolved_model.random_scaffold.enabled && self.training.init_checkpoint_path.is_some() {
+            return Err(anyhow!(
+                "training.init_checkpoint_path transfer is not supported for model.random_scaffold; resume an exact scaffold checkpoint or start a fresh revision"
+            ));
         }
         if matches!(
             self.parallel.tensor.partition,
@@ -4811,6 +4846,36 @@ start_policy = "capability_gate"
         let profile_path = profile_path(file_name);
         load_training_config(&[profile_path.clone()])
             .unwrap_or_else(|err| panic!("load {}: {err}", profile_path.display()))
+    }
+
+    #[test]
+    fn random_scaffold_ruliad_matrix_profiles_load_and_validate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/random_scaffold");
+        for profile in [
+            "ruliad-screen.dense.toml",
+            "ruliad-screen.rank1.toml",
+            "ruliad-screen.rank4.toml",
+            "ruliad-screen.rank8.toml",
+            "ruliad-screen.rank16.toml",
+            "ruliad-screen.rs-rank8.toml",
+            "ruliad-screen.rs-rank16.toml",
+            "ruliad-screen.rs-rank32.toml",
+            "ruliad-screen.rs-rank64.toml",
+            "ruliad-screen.rank8-fixed-gain.toml",
+            "ruliad-screen.rademacher-rank8.toml",
+            "ruliad-parity.dense.toml",
+            "ruliad-parity.rank8.toml",
+            "ruliad-parity.rs-rank16.toml",
+            "ruliad-parity.rs-rank32.toml",
+        ] {
+            let path = root.join(profile);
+            let config = load_training_config(std::slice::from_ref(&path))
+                .unwrap_or_else(|error| panic!("load {}: {error}", path.display()));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
+        }
     }
 
     #[test]

@@ -1577,6 +1577,14 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub(crate) fn materialize_random_scaffold_for_inference(mut self) -> Self {
+        self.model = self.model.materialize_random_scaffold_for_inference();
+        self.teacher_model = self
+            .teacher_model
+            .map(DragonModel::materialize_random_scaffold_for_inference);
+        self
+    }
+
     pub fn with_pipeline_plan(mut self, pipeline_plan: Option<PipelinePlan>) -> Self {
         self.pipeline_plan = pipeline_plan;
         self
@@ -6543,7 +6551,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         );
         let mut observed_generated_rows = 0usize;
         let mut recorded_attractor_rows = 0usize;
-        let sampling_model = self.model.valid();
+        let sampling_model = self
+            .model
+            .valid()
+            .materialize_random_scaffold_for_inference();
         for sample in policy_batch.samples.iter() {
             let mut prompt = sample.prompt_tokens.clone();
             if prompt.is_empty() {

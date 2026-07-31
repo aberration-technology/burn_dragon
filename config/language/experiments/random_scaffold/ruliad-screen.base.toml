@@ -1,0 +1,72 @@
+[dataset]
+cache_dir = "target/datasets/random-scaffold-ruliad-screen"
+train_split_ratio = 0.8
+type = "universality_ruliad"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.corpus.toml"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 272
+eos_id = 271
+
+[model]
+n_layer = 4
+n_embd = 64
+n_head = 4
+latent_total = 1024
+tie_input_output_embeddings = true
+dropout = 0.0
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = 128
+batch_size = 8
+max_iters = 512
+checkpoint_interval_iters = 512
+log_frequency = 8
+seed = 20260729
+
+[training.ruliad_supervision]
+mode = "answer_completion"
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.events]
+flush_every_steps = 8
+source_selection_every_steps = 16
+continual_backprop_every_steps = 128
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 64
+source_weighted_validation_batches = 1
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 16
+ruliad_correctness_probe_tokens = 64
+
+[training.dynamics]
+enabled = false
+
+[training.greedy_rollout_unlikelihood]
+enabled = false
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+grad_clip_norm = 1.0
+
+[generation]
+prompt = ""
+output_format = "decoded_text"
+
+[run_layout]
+base_dir = "target/experiments/random-scaffold"
+mirror_config_path = false

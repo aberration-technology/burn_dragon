@@ -19,6 +19,42 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 - p2p + deployment: [crates/burn_dragon_p2p](crates/burn_dragon_p2p), [crates/burn_dragon_p2p/deploy/README.md](crates/burn_dragon_p2p/deploy/README.md)
 - protocol/runtime layer: [`burn_p2p`](https://github.com/aberration-technology/burn_p2p)
 
+## random scaffold adapters
+
+Dragon can parameterize its three shared recurrent projections as immutable,
+seeded random scaffolds plus trainable low-rank adapters. This preserves the
+architecture's across-layer and through-time weight sharing: there is one
+adapter for each shared encoder, value encoder, and decoder, not one adapter per
+unrolled recurrent step.
+
+```toml
+[model.random_scaffold]
+enabled = true
+seed = 20260729
+distribution = "gaussian_clt12"
+rank = 16
+alpha = 16.0
+scaling = "rank_stabilized"
+trainable_gain = true
+```
+
+The portable generator and adapter manifest live in `burn_eggroll`; Dragon owns
+the projection selection and training behavior. A run writes
+`random_scaffold_manifest.json`, and resume rejects a different seed,
+generator, shape, rank, or gain contract. Matched local experiment profiles are
+under
+[`config/language/experiments/random_scaffold`](config/language/experiments/random_scaffold).
+Random-scaffold experiments currently use AdamW; EGGROLL's existing population
+executor evolves dense shared projections and is deliberately rejected rather
+than silently mutating the immutable scaffold.
+
+The selected rank-stabilized rank-16 profile clears the matched three-seed
+local CUDA quality/efficiency gate and the three-peer native
+synchronized-convergence gate. The implementation, corrected masked objective,
+compact P2P protocol, bandwidth matrix, GPU traces, and remaining WAN/browser
+production gates are documented in the
+[`random-scaffold Dragon report`](docs/random-scaffold-dragon-report.md).
+
 ## quick start
 
 ```bash

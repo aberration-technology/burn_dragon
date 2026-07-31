@@ -225,6 +225,10 @@ pub(crate) fn build_model_spec(model_config: &DragonConfig) -> ModelSpec {
             DragonInitializationKind::Reservoir
         )
         .then(|| ReservoirInitializationSpec::from(&model_config.initialization.reservoir)),
+        random_scaffold: model_config
+            .random_scaffold
+            .enabled
+            .then(|| burn_dragon_core::build_dragon_random_scaffold_manifest(model_config)),
         gated_deltanet2: matches!(
             model_config.sequence_kernel.memory_system,
             burn_dragon_core::SequenceMemorySystem::GatedDeltaNet2
@@ -346,6 +350,22 @@ mod tests {
         );
         assert_eq!(spec.hierarchical_dragon_fast_cycles, 4);
         assert_eq!(spec.hierarchical_dragon_slow_cycles, 2);
+    }
+
+    #[test]
+    fn model_spec_records_complete_random_scaffold_contract() {
+        let mut config = DragonConfig::default();
+        config.random_scaffold.enabled = true;
+        config.random_scaffold.seed = 29;
+        config.random_scaffold.rank = 4;
+        config.random_scaffold.alpha = 16.0;
+
+        let spec = build_model_spec(&config);
+        let scaffold = spec.random_scaffold.expect("random scaffold metadata");
+        scaffold.validate().expect("valid scaffold contract");
+        assert_eq!(scaffold.scaffold.seed, 29);
+        assert_eq!(scaffold.adapter.rank, 4);
+        assert_eq!(scaffold.tensors.len(), 3);
     }
 }
 

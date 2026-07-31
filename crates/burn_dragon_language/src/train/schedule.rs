@@ -2606,7 +2606,7 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    let valid_model = model.valid();
+    let valid_model = model.valid().materialize_random_scaffold_for_inference();
     let mut iterator = valid_loader.iter();
     let mut total = 0.0;
     let mut count = 0usize;
@@ -2815,7 +2815,7 @@ where
     )
     .with_batch_size(batch_size.max(1))
     .with_summary_event_token_ids(env.summary_event_token_ids.clone());
-    let valid_model = model.valid();
+    let valid_model = model.valid().materialize_random_scaffold_for_inference();
     let mut state = valid_model.model.init_state();
     let mut iterator = loader.iter();
     let mut total = 0.0;

@@ -27,11 +27,63 @@ use crate::{DragonModel, ModelOverrides, TrainingConfig, build_model_config_with
 const RUN_CONFIG_FILE_NAME: &str = "config.json";
 const TRAINING_SNAPSHOT_FILE_NAME: &str = "training_config.json";
 const TOKENIZER_SNAPSHOT_FILE_NAME: &str = "tokenizer.json";
+pub const RANDOM_SCAFFOLD_MANIFEST_FILE_NAME: &str = "random_scaffold_manifest.json";
 pub const RUN_ROOT_ENV: &str = "BURN_DRAGON_RUN_ROOT";
 pub const RUN_DIR_ENV: &str = "BURN_DRAGON_RUN_DIR";
 pub const RUN_NAME_ENV: &str = "BURN_DRAGON_RUN_NAME";
 
 type ExportBackend = NdArray<f32>;
+
+pub fn ensure_random_scaffold_run_manifest<B: BackendTrait>(
+    model: &DragonModel<B>,
+    run_dir: &Path,
+    write_if_missing: bool,
+) -> Result<()> {
+    let path = run_dir.join(RANDOM_SCAFFOLD_MANIFEST_FILE_NAME);
+    let Some(report) = model.random_scaffold_report() else {
+        if path.is_file() {
+            return Err(anyhow!(
+                "dense model cannot resume run containing random scaffold manifest {}",
+                path.display()
+            ));
+        }
+        return Ok(());
+    };
+    let expected_identity = report
+        .manifest
+        .canonical_identity()
+        .context("build random scaffold manifest identity")?;
+
+    if path.is_file() {
+        let existing: burn_dragon_core::DragonRandomScaffoldReport = serde_json::from_slice(
+            &fs::read(&path)
+                .with_context(|| format!("read random scaffold manifest {}", path.display()))?,
+        )
+        .with_context(|| format!("parse random scaffold manifest {}", path.display()))?;
+        let existing_identity = existing
+            .manifest
+            .canonical_identity()
+            .context("build existing random scaffold manifest identity")?;
+        if existing_identity != expected_identity {
+            return Err(anyhow!(
+                "random scaffold contract mismatch for {}: checkpoint/run manifest does not match the configured seed, generator, adapter, and tensor schema",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    if write_if_missing {
+        fs::create_dir_all(run_dir)
+            .with_context(|| format!("create random scaffold run dir {}", run_dir.display()))?;
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&report).context("serialize random scaffold report")?,
+        )
+        .with_context(|| format!("write random scaffold manifest {}", path.display()))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 pub struct LanguageRunConfigSnapshot {
@@ -549,6 +601,9 @@ pub fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverride
     }
     if let Some(value) = &incoming.initialization {
         base.initialization = Some(value.clone());
+    }
+    if let Some(value) = &incoming.random_scaffold {
+        base.random_scaffold = Some(value.clone());
     }
     if let Some(value) = incoming.sequence_kernel {
         base.sequence_kernel = Some(value);

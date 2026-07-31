@@ -123,6 +123,7 @@ mod tests {
         TokenWindowRecord {
             inputs: vec![token],
             targets: vec![token + 1],
+            loss_mask: None,
             reset_stream_state: chunk == Some(0),
             stream_group_id: group,
             stream_row: row,

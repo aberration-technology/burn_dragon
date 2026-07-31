@@ -8,10 +8,10 @@ use burn_p2p::{
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentId, ExperimentOptInPolicy,
     ExperimentResourceRequirements, ExperimentScope, ExperimentVisibility, HeadPromotionMode,
     HeadPromotionPolicy, LocalOptimizerStatePolicy, MergeStrategy, MergeTopologyPolicy, NetworkId,
-    NetworkManifest, PeerRole, PeerRoleSet, Precision, ProjectFamilyId, RecurrentStatePolicy,
-    RevisionId, RevisionManifest, RobustnessPolicy, SchedulerStatePolicy, StudyId,
-    SupportedWorkload, TRAINING_CONTRACT_VERSION, TrainingContractManifest, TrainingProtocol,
-    UpdateCodec, WindowActivation, WindowId, WorkloadId,
+    NetworkManifest, ParameterSubsetCatalog, PeerRole, PeerRoleSet, Precision, ProjectFamilyId,
+    RecurrentStatePolicy, RevisionId, RevisionManifest, RobustnessPolicy, SchedulerStatePolicy,
+    StudyId, SupportedWorkload, TRAINING_CONTRACT_VERSION, TrainingContractManifest,
+    TrainingProtocol, UpdateCodec, WindowActivation, WindowId, WorkloadId,
 };
 use sha2::{Digest, Sha256};
 
@@ -57,6 +57,9 @@ struct DragonTrainingContractInput<'a> {
     merge_topology_policy: &'a MergeTopologyPolicy,
     root_ema_update_basis_points: u16,
     browser_profile: Option<&'a DragonBrowserExperimentProfile>,
+    random_scaffold_catalog: Option<&'a ParameterSubsetCatalog>,
+    random_scaffold_update_encoding: burn_p2p::CompactScalarEncoding,
+    training_protocol: &'a TrainingProtocol,
 }
 
 fn dragon_training_contract(
@@ -71,6 +74,9 @@ fn dragon_training_contract(
         merge_topology_policy,
         root_ema_update_basis_points,
         browser_profile,
+        random_scaffold_catalog,
+        random_scaffold_update_encoding,
+        training_protocol,
     } = input;
     let update_codec = match training_config.map(|config| config.optimizer.name) {
         Some(burn_dragon_train::OptimizerKind::Eggroll) => {
@@ -87,9 +93,28 @@ fn dragon_training_contract(
                 replay: burn_p2p::SeededFitnessReplayPolicy::default(),
             }
         }
+        _ if model_config.random_scaffold.enabled => {
+            let catalog = random_scaffold_catalog.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "random-scaffold training requires a canonical trainable parameter catalog"
+                )
+            })?;
+            catalog.validate()?;
+            anyhow::ensure!(
+                catalog.model_schema_hash == dragon_model_schema_hash(model_config),
+                "random-scaffold parameter catalog model schema mismatch"
+            );
+            UpdateCodec::MutableSubsetParameters {
+                parameter_catalog_hash: catalog.catalog_id()?,
+                parameter_count: catalog.parameter_count()?,
+                encoding: random_scaffold_update_encoding,
+            }
+        }
         _ => UpdateCodec::FullModel,
     };
     let forward_only_update = matches!(update_codec, UpdateCodec::SeededFitness { .. });
+    let persistent_peer_local_state =
+        !forward_only_update && matches!(training_protocol, TrainingProtocol::DiLoCo(_));
     let model_program_hash = stable_content_id(
         "dragon-model-program",
         &serde_json::json!({
@@ -105,6 +130,7 @@ fn dragon_training_contract(
             "hierarchical_dragon": model_config.hierarchical_dragon,
             "latent_reasoning": model_config.latent_reasoning,
             "next_latent_transition": model_config.next_latent_transition,
+            "random_scaffold": model_config.random_scaffold,
         }),
     );
     let tokenizer_hash = stable_content_id(
@@ -186,6 +212,14 @@ fn dragon_training_contract(
             browser_profile_execution_contract_hash(experiment_kind, browser_profile)?,
         );
     }
+    if model_config.random_scaffold.enabled {
+        extensions.insert(
+            "dragon_random_scaffold".into(),
+            ContentId::derive(&burn_dragon_core::build_dragon_random_scaffold_manifest(
+                model_config,
+            ))?,
+        );
+    }
     let contract = TrainingContractManifest {
         version: TRAINING_CONTRACT_VERSION,
         workload_id: WorkloadId::new(format!("dragon-{}", experiment_kind.workload_slug())),
@@ -198,15 +232,17 @@ fn dragon_training_contract(
         objective_hash,
         optimizer_hash,
         scheduler_hash,
-        // The current learner adapter reconstructs optimizer and scheduler state
-        // for each distributed window. The contract makes that behavior explicit.
         optimizer_state_policy: if forward_only_update {
             LocalOptimizerStatePolicy::StatelessForwardOnly
+        } else if persistent_peer_local_state {
+            LocalOptimizerStatePolicy::PeerLocalPersistent
         } else {
             LocalOptimizerStatePolicy::ResetPerWindow
         },
         scheduler_state_policy: if forward_only_update {
             SchedulerStatePolicy::CanonicalAcceptedWork
+        } else if persistent_peer_local_state {
+            SchedulerStatePolicy::PeerLocalPersistent
         } else {
             SchedulerStatePolicy::ResetPerWindow
         },
@@ -312,6 +348,7 @@ pub fn build_manifest_bundle(
     backend_label: &str,
     model_config: &DragonConfig,
     training_config: Option<&TrainingConfig>,
+    random_scaffold_catalog: Option<&ParameterSubsetCatalog>,
     profile: &DragonExperimentProfile,
     dataset_view_id: DatasetViewId,
     footprint: &DragonTrainingFootprint,
@@ -342,6 +379,7 @@ pub fn build_manifest_bundle(
             "latent_per_head": model_config.latent_per_head(),
             "sequence_kernel": model_config.sequence_kernel,
             "vocab_size": model_config.vocab_size,
+            "random_scaffold": model_config.random_scaffold,
         }),
     );
     let checkpoint_format_hash = stable_content_id(
@@ -441,6 +479,9 @@ pub fn build_manifest_bundle(
             merge_topology_policy: &merge_topology_policy,
             root_ema_update_basis_points: seed.aggregation.root_ema_update_basis_points,
             browser_profile: profile.browser.as_ref(),
+            random_scaffold_catalog,
+            random_scaffold_update_encoding: seed.random_scaffold_update_encoding,
+            training_protocol: &seed.training_protocol,
         })?;
     let resource_requirements = ExperimentResourceRequirements {
         minimum_roles: BTreeSet::new(),
@@ -602,6 +643,7 @@ pub fn build_manifest_bundle(
         BurnArtifactConfig::named_mpk(BurnRecordPrecision::Half, ChunkingScheme::new(1024 * 1024)?),
     )
     .with_model_schema_hash(training_contract.model_schema_hash.clone())
+    .with_diloco_parameter_subset(random_scaffold_catalog.cloned())
     .with_root_ema(root_ema_update_weight);
     Ok(DragonManifestBundle {
         release_manifest,
@@ -639,6 +681,71 @@ mod tests {
     }
 
     #[test]
+    fn random_scaffold_revision_binds_mutable_catalog_and_wire_encoding() {
+        let mut model_config = DragonConfig::default();
+        model_config.random_scaffold.enabled = true;
+        model_config.random_scaffold.seed = 23;
+        model_config.random_scaffold.rank = 8;
+        let catalog = ParameterSubsetCatalog::new(
+            dragon_model_schema_hash(&model_config),
+            vec![burn_p2p::ParameterSubsetEntry {
+                path: "model.random_scaffold_adapters.fast.encoder.a".into(),
+                shape: vec![4, 256, 8],
+            }],
+        );
+        let merge_topology =
+            dragon_diffusion_merge_topology(DragonExperimentKind::NcaPrepretraining);
+        let (contract, _) = dragon_training_contract(DragonTrainingContractInput {
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            model_config: &model_config,
+            training_config: None,
+            dataset_view_id: DatasetViewId::new("dataset"),
+            checkpoint_format_hash: ContentId::new("checkpoint"),
+            merge_topology_policy: &merge_topology,
+            root_ema_update_basis_points: 10_000,
+            browser_profile: None,
+            random_scaffold_catalog: Some(&catalog),
+            random_scaffold_update_encoding: burn_p2p::CompactScalarEncoding::SymmetricInt16,
+            training_protocol: &TrainingProtocol::ArtifactWindows,
+        })
+        .expect("random-scaffold contract");
+
+        assert_eq!(
+            contract.update_codec,
+            UpdateCodec::MutableSubsetParameters {
+                parameter_catalog_hash: catalog.catalog_id().expect("catalog id"),
+                parameter_count: catalog.parameter_count().expect("parameter count"),
+                encoding: burn_p2p::CompactScalarEncoding::SymmetricInt16,
+            }
+        );
+        assert!(contract.extensions.contains_key("dragon_random_scaffold"));
+        assert_eq!(
+            contract.optimizer_state_policy,
+            LocalOptimizerStatePolicy::ResetPerWindow
+        );
+        assert_eq!(
+            contract.scheduler_state_policy,
+            SchedulerStatePolicy::ResetPerWindow
+        );
+
+        let error = dragon_training_contract(DragonTrainingContractInput {
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            model_config: &model_config,
+            training_config: None,
+            dataset_view_id: DatasetViewId::new("dataset"),
+            checkpoint_format_hash: ContentId::new("checkpoint"),
+            merge_topology_policy: &merge_topology,
+            root_ema_update_basis_points: 10_000,
+            browser_profile: None,
+            random_scaffold_catalog: None,
+            random_scaffold_update_encoding: burn_p2p::CompactScalarEncoding::Fp32,
+            training_protocol: &TrainingProtocol::ArtifactWindows,
+        })
+        .expect_err("missing catalog must fail");
+        assert!(error.to_string().contains("requires a canonical"));
+    }
+
+    #[test]
     fn manifests_publish_backend_neutral_revision_requirements() {
         let model_config = DragonConfig::default();
         let footprint = DragonTrainingFootprint {
@@ -655,6 +762,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "wgpu",
             &model_config,
+            None,
             None,
             &DragonExperimentProfile {
                 version: 1,
@@ -720,6 +828,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             None,
             &DragonExperimentProfile {
                 version: 1,
@@ -793,6 +902,7 @@ mod tests {
             "cpu",
             &model_config,
             None,
+            None,
             &profile,
             DatasetViewId::new("dataset-view"),
             &footprint,
@@ -862,6 +972,7 @@ mod tests {
                 DragonExperimentKind::NcaPrepretraining,
                 backend,
                 &model_config,
+                None,
                 None,
                 &profile,
                 DatasetViewId::new("dataset-view"),
@@ -934,6 +1045,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             None,
             &DragonExperimentProfile {
                 version: 1,
@@ -1041,6 +1153,7 @@ mod tests {
                 momentum_micros: Some(500_000),
                 nesterov: true,
                 weight_decay_micros: None,
+                max_pseudo_gradient_rms_ratio_micros: None,
             },
             ..DiLoCoPolicy::default()
         };
@@ -1052,6 +1165,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             None,
             &profile,
             DatasetViewId::new("dataset-view"),
@@ -1066,6 +1180,14 @@ mod tests {
         let entry = &bundle.experiment_directory[0];
         assert_eq!(entry.training_protocol(), expected);
         assert_eq!(bundle.revision_manifest.training_protocol, expected);
+        assert_eq!(
+            bundle.training_contract.optimizer_state_policy,
+            LocalOptimizerStatePolicy::PeerLocalPersistent
+        );
+        assert_eq!(
+            bundle.training_contract.scheduler_state_policy,
+            SchedulerStatePolicy::PeerLocalPersistent
+        );
         assert_eq!(
             entry.metadata.get("training_protocol").map(String::as_str),
             Some("diloco")
@@ -1102,6 +1224,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             None,
             &profile,
             DatasetViewId::new("dataset-view"),
@@ -1144,6 +1267,7 @@ mod tests {
                 DragonExperimentKind::NcaPrepretraining,
                 "cpu",
                 &model_config,
+                None,
                 None,
                 &profile,
                 DatasetViewId::new("dataset-view"),
@@ -1209,6 +1333,7 @@ mod tests {
             DragonExperimentKind::NcaPrepretraining,
             "cpu",
             &model_config,
+            None,
             None,
             &DragonExperimentProfile {
                 version: 1,

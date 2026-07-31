@@ -44,14 +44,16 @@ use burn_p2p::{
     CallbackPayload, ClientPlatform, ContentId, DatasetRegistration, DiLoCoPolicy,
     DiLoCoReferenceCoordinator, DiLoCoReferencePeer, DiLoCoWorkload, EdgePeerEnrollmentRequest,
     ExperimentDirectoryEntry, ExperimentDirectoryPolicyExt, ExperimentHandle, ExperimentScope,
-    FsArtifactStore, GradientCodec, HeadDescriptor, HeadPromotionMode, LeaseId, LoginRequest,
-    MODEL_GENESIS_SIGNATURE_KEY_ID, MergeModelCandidate, MergePolicy, MergeStrategy, MetricValue,
-    MicroShardId, MicroShardPlan, ModelGenesisManifest, NodeCertificate, NodeCertificateClaims,
-    OuterOptimizerPolicy, P2pWorkload, PeerId, PeerRole, PeerRoleSet, PrincipalClaims, PrincipalId,
-    PrincipalSession, ProjectFamilyId, REVISION_CONTRACT_SIGNATURE_KEY_ID, RequestFailureOperation,
-    RequestFailureReason, RevisionContractBundle, RevocationEpoch, RoundCursor, ShardCache,
-    SignedPayload, TrainingProtocol, TrustedIssuer, WindowCtx, WindowId, WorkloadInputSource,
-    WorkloadTrainingLease, sign_revision_contract_bundle, verify_revision_contract_bundle,
+    FsArtifactStore, GradientCodec, HeadDescriptor, HeadPromotionMode, LeaseId,
+    LocalOptimizerStatePolicy, LoginRequest, MODEL_GENESIS_SIGNATURE_KEY_ID, MergeModelCandidate,
+    MergePolicy, MergeStrategy, MetricValue, MicroShardId, MicroShardPlan, ModelGenesisManifest,
+    NodeCertificate, NodeCertificateClaims, OuterOptimizerPolicy, P2pWorkload, PeerId, PeerRole,
+    PeerRoleSet, PrincipalClaims, PrincipalId, PrincipalSession, ProjectFamilyId,
+    REVISION_CONTRACT_SIGNATURE_KEY_ID, RequestFailureOperation, RequestFailureReason,
+    RevisionContractBundle, RevocationEpoch, RoundCursor, SchedulerStatePolicy, ShardCache,
+    SignedPayload, StateBlob, TrainingProtocol, TrustedIssuer, WindowCtx, WindowId,
+    WorkloadInputSource, WorkloadTrainingLease, sign_revision_contract_bundle,
+    verify_revision_contract_bundle,
 };
 use burn_p2p_browser::{
     BrowserConformanceHarness, BrowserDirectorySnapshot, BrowserEdgeClient, BrowserEdgeMode,
@@ -154,11 +156,16 @@ const P2P_PARITY_RESTART_AFTER_ROUND_ENV: &str = "BURN_DRAGON_P2P_PARITY_RESTART
 const P2P_PARITY_MIN_SYNC_PROGRESS_RATIO_ENV: &str =
     "BURN_DRAGON_P2P_PARITY_MIN_SYNC_PROGRESS_RATIO";
 const P2P_PARITY_REQUIRE_CONVERGENCE_ENV: &str = "BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE";
+const P2P_PARITY_RANDOM_SCAFFOLD_ENV: &str = "BURN_DRAGON_P2P_PARITY_RANDOM_SCAFFOLD";
+const P2P_PARITY_RANDOM_SCAFFOLD_ENCODING_ENV: &str =
+    "BURN_DRAGON_P2P_PARITY_RANDOM_SCAFFOLD_ENCODING";
 const P2P_DILOCO_CODEC_ENV: &str = "BURN_DRAGON_P2P_DILOCO_CODEC";
 const P2P_DILOCO_OUTER_LR_MICROS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_OUTER_LR_MICROS";
 const P2P_DILOCO_MOMENTUM_MICROS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_MOMENTUM_MICROS";
 const P2P_DILOCO_NESTEROV_ENV: &str = "BURN_DRAGON_P2P_DILOCO_NESTEROV";
 const P2P_DILOCO_WEIGHT_DECAY_MICROS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_WEIGHT_DECAY_MICROS";
+const P2P_DILOCO_MAX_PSEUDO_GRADIENT_RMS_RATIO_MICROS_ENV: &str =
+    "BURN_DRAGON_P2P_DILOCO_MAX_PSEUDO_GRADIENT_RMS_RATIO_MICROS";
 const P2P_DILOCO_REPORT_ROOT_ENV: &str = "BURN_DRAGON_P2P_DILOCO_REPORT_ROOT";
 const P2P_DILOCO_MATCHMAKING_TIMEOUT_MS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_MATCHMAKING_TIMEOUT_MS";
 
@@ -207,6 +214,21 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_compact_scalar_encoding(
+    name: &str,
+    default: burn_p2p::CompactScalarEncoding,
+) -> burn_p2p::CompactScalarEncoding {
+    let Ok(value) = std::env::var(name) else {
+        return default;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fp32" => burn_p2p::CompactScalarEncoding::Fp32,
+        "int16" | "symmetric_int16" => burn_p2p::CompactScalarEncoding::SymmetricInt16,
+        "int8" | "symmetric_int8" => burn_p2p::CompactScalarEncoding::SymmetricInt8,
+        other => panic!("{name} must be one of fp32, int16, or int8; got {other}"),
+    }
+}
+
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
@@ -223,6 +245,48 @@ fn convergence_parity_passes(
     progress_ratio
         .zip(reference_loss_reduction)
         .is_some_and(|(ratio, reduction)| reduction > 0.0 && ratio >= minimum_progress_ratio)
+}
+
+fn trailing_mean(values: &[f64], window: usize) -> Option<f64> {
+    let count = values.len().min(window);
+    (count > 0).then(|| values.iter().rev().take(count).sum::<f64>() / count as f64)
+}
+
+fn maximum_loss_drawup(values: &[f64]) -> f64 {
+    let mut running_minimum = f64::INFINITY;
+    let mut maximum_drawup = 0.0_f64;
+    for value in values.iter().copied() {
+        running_minimum = running_minimum.min(value);
+        maximum_drawup = maximum_drawup.max(value - running_minimum);
+    }
+    maximum_drawup
+}
+
+fn parameter_pack_rms(pack: &burn_p2p::FlattenedTensorPack) -> f64 {
+    let count = pack.values.len().max(1) as f64;
+    (pack
+        .values
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        / count)
+        .sqrt()
+}
+
+fn parameter_pack_delta_rms(
+    left: &burn_p2p::FlattenedTensorPack,
+    right: &burn_p2p::FlattenedTensorPack,
+) -> f64 {
+    assert!(left.is_compatible_with(right));
+    let count = left.values.len().max(1) as f64;
+    (left
+        .values
+        .iter()
+        .zip(&right.values)
+        .map(|(left, right)| f64::from(*left - *right).powi(2))
+        .sum::<f64>()
+        / count)
+        .sqrt()
 }
 
 fn is_diloco_request_operation(operation: &RequestFailureOperation) -> bool {
@@ -285,10 +349,14 @@ fn diloco_policy_from_env(num_inner_steps: usize) -> DiLoCoPolicy {
         checkpoint_interval_rounds: 1,
         codec,
         outer_optimizer_policy: OuterOptimizerPolicy::Sgd {
-            learning_rate_micros: env_u64(P2P_DILOCO_OUTER_LR_MICROS_ENV, 1_000_000),
+            learning_rate_micros: env_u64(P2P_DILOCO_OUTER_LR_MICROS_ENV, 1_200_000),
             momentum_micros: (momentum_micros > 0).then_some(momentum_micros),
             nesterov: env_bool(P2P_DILOCO_NESTEROV_ENV, false),
             weight_decay_micros: (weight_decay_micros > 0).then_some(weight_decay_micros),
+            max_pseudo_gradient_rms_ratio_micros: {
+                let value = env_u64(P2P_DILOCO_MAX_PSEUDO_GRADIENT_RMS_RATIO_MICROS_ENV, 0);
+                (value > 0).then_some(value)
+            },
         },
         ..DiLoCoPolicy::default()
     };
@@ -319,11 +387,13 @@ fn diloco_policy_slug(policy: &DiLoCoPolicy) -> String {
             momentum_micros,
             nesterov,
             weight_decay_micros,
+            max_pseudo_gradient_rms_ratio_micros,
         } => format!(
-            "{codec}-lr{learning_rate_micros}-m{}-n{}-wd{}",
+            "{codec}-lr{learning_rate_micros}-m{}-n{}-wd{}-trust{}",
             momentum_micros.unwrap_or_default(),
             u8::from(*nesterov),
             weight_decay_micros.unwrap_or_default(),
+            max_pseudo_gradient_rms_ratio_micros.unwrap_or_default(),
         ),
     }
 }
@@ -334,6 +404,12 @@ fn convergence_parity_gate_requires_positive_reference_progress_and_threshold() 
     assert!(!convergence_parity_passes(Some(0.89), Some(1.0), 0.90));
     assert!(!convergence_parity_passes(Some(1.0), Some(0.0), 0.90));
     assert!(!convergence_parity_passes(None, Some(1.0), 0.90));
+}
+
+#[test]
+fn validation_drawup_tracks_regression_from_the_best_observed_loss() {
+    assert!((maximum_loss_drawup(&[5.0, 4.0, 4.2, 3.0, 3.1]) - 0.2).abs() <= 1.0e-12);
+    assert_eq!(maximum_loss_drawup(&[5.0, 4.0, 3.0]), 0.0);
 }
 
 #[test]
@@ -608,12 +684,19 @@ prompt = "[R2"
     )
 }
 
-fn ruliad_parity_corpus_config_toml(output_dir: &Path, seed: u64) -> String {
+fn ruliad_parity_corpus_config_toml(
+    output_dir: &Path,
+    seed: u64,
+    minimum_train_samples: usize,
+) -> String {
     let config = RuliadCorpusConfig {
         output_dir: output_dir.into(),
         seed,
         name: format!("dragon-p2p-ruliad-parity-{seed}"),
-        train_samples: 48,
+        // A fixed document contributes at least one non-padding stream chunk. Using the
+        // requested record count as a conservative sample floor prevents window rotation
+        // from silently cycling a small synthetic corpus during convergence gates.
+        train_samples: minimum_train_samples.max(48),
         validation_samples: 12,
         chunk_token_capacity: 16 * 1024,
         serialization: RuliadSerializationConfig {
@@ -642,8 +725,25 @@ fn ruliad_parity_training_config_toml(
     seed: u64,
     max_iters: usize,
     gradient_accumulation_steps: usize,
+    random_scaffold: bool,
 ) -> String {
     let spec = RULIAD_PARITY_1M_SPEC;
+    let random_scaffold_config = if random_scaffold {
+        format!(
+            r#"
+[model.random_scaffold]
+enabled = true
+seed = {seed}
+distribution = "gaussian_clt12"
+rank = 16
+alpha = 16.0
+scaling = "rank_stabilized"
+trainable_gain = true
+"#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"
 [dataset]
@@ -664,6 +764,7 @@ n_head = {}
 latent_total = {}
 dropout = 0.0
 
+{}
 [model.language_head]
 type = "standard_token_classification"
 
@@ -700,6 +801,7 @@ prompt = ""
         spec.n_embd,
         spec.n_head,
         spec.latent_total,
+        random_scaffold_config,
         spec.block_size,
         spec.batch_size,
         max_iters,
@@ -708,12 +810,18 @@ prompt = ""
     )
 }
 
-fn write_ruliad_parity_training_config(root: &Path, seed: u64, max_iters: usize) -> PathBuf {
+fn write_ruliad_parity_training_config(
+    root: &Path,
+    seed: u64,
+    max_iters: usize,
+    minimum_train_samples: usize,
+    random_scaffold: bool,
+) -> PathBuf {
     let ruliad_config_path = root.join("ruliad-parity.toml");
     let training_config_path = root.join("ruliad-parity-training.toml");
     write(
         &ruliad_config_path,
-        &ruliad_parity_corpus_config_toml(root, seed),
+        &ruliad_parity_corpus_config_toml(root, seed, minimum_train_samples),
     );
     write(
         &training_config_path,
@@ -723,6 +831,7 @@ fn write_ruliad_parity_training_config(root: &Path, seed: u64, max_iters: usize)
             seed,
             max_iters,
             1,
+            random_scaffold,
         ),
     );
     training_config_path
@@ -733,6 +842,7 @@ fn write_ruliad_synchronized_reference_config(
     seed: u64,
     max_iters: usize,
     gradient_accumulation_steps: usize,
+    random_scaffold: bool,
 ) -> PathBuf {
     let ruliad_config_path = root.join("ruliad-parity.toml");
     let training_config_path = root.join("ruliad-synchronized-reference-training.toml");
@@ -744,6 +854,7 @@ fn write_ruliad_synchronized_reference_config(
             seed,
             max_iters,
             gradient_accumulation_steps,
+            random_scaffold,
         ),
     );
     training_config_path
@@ -908,6 +1019,19 @@ fn metric_integer(stats: &std::collections::BTreeMap<String, MetricValue>, key: 
     match metric {
         MetricValue::Integer(value) => *value,
         other => panic!("expected integer metric for {key}, got {other:?}"),
+    }
+}
+
+fn metric_bool(stats: &std::collections::BTreeMap<String, MetricValue>, key: &str) -> bool {
+    let Some(metric) = stats.get(key) else {
+        panic!(
+            "missing bool metric {key}; available metrics: {:?}",
+            stats.keys().collect::<Vec<_>>()
+        );
+    };
+    match metric {
+        MetricValue::Bool(value) => *value,
+        other => panic!("expected bool metric for {key}, got {other:?}"),
     }
 }
 
@@ -1549,9 +1673,76 @@ type CpuParityProject = BurnWorkloadAdapter<DragonBurnProject<NativeCpuBackend>>
 type CpuParityModel = <CpuParityProject as P2pWorkload>::Model;
 type CpuParityBatch = <CpuParityProject as P2pWorkload>::Batch;
 
+struct CpuParityBatchEvidence {
+    fingerprint: ContentId,
+    token_count: usize,
+    supervised_token_count: usize,
+    supervision_weight_sum: u64,
+}
+
+impl CpuParityBatchEvidence {
+    fn to_json(&self, peer_id: &PeerId, batch_index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "peer_id": peer_id.as_str(),
+            "batch_index": batch_index,
+            "fingerprint": self.fingerprint.as_str(),
+            "token_count": self.token_count,
+            "supervised_token_count": self.supervised_token_count,
+            "supervision_weight_sum": self.supervision_weight_sum,
+            "supervised_token_fraction":
+                self.supervised_token_count as f64 / self.token_count.max(1) as f64,
+        })
+    }
+}
+
+fn cpu_parity_batch_evidence(batch: &CpuParityBatch) -> CpuParityBatchEvidence {
+    let inputs = batch
+        .inputs
+        .clone()
+        .into_data()
+        .into_vec::<i64>()
+        .expect("CPU parity inputs");
+    let targets = batch
+        .targets
+        .clone()
+        .into_data()
+        .into_vec::<i64>()
+        .expect("CPU parity targets");
+    let loss_mask = batch
+        .loss_mask
+        .clone()
+        .map(|mask| {
+            mask.into_data()
+                .into_vec::<i64>()
+                .expect("CPU parity loss mask")
+        })
+        .unwrap_or_else(|| vec![1; targets.len()]);
+    assert_eq!(inputs.len(), targets.len());
+    assert_eq!(targets.len(), loss_mask.len());
+    let supervised_token_count = loss_mask.iter().filter(|weight| **weight != 0).count();
+    let supervision_weight_sum = loss_mask
+        .iter()
+        .map(|weight| u64::try_from((*weight).max(0)).expect("nonnegative mask weight"))
+        .sum();
+    let fingerprint = ContentId::derive(&(
+        "dragon-cpu-parity-supervised-batch-v1",
+        &inputs,
+        &targets,
+        &loss_mask,
+    ))
+    .expect("derive CPU parity batch fingerprint");
+    CpuParityBatchEvidence {
+        fingerprint,
+        token_count: targets.len(),
+        supervised_token_count,
+        supervision_weight_sum,
+    }
+}
+
 struct ReferenceWindow {
     model: CpuParityModel,
     stats: BTreeMap<String, MetricValue>,
+    inner_optimizer_state: Option<StateBlob>,
 }
 
 struct OracleCandidate {
@@ -1606,6 +1797,7 @@ fn train_reference_lease(
     ReferenceWindow {
         model: ctx.model,
         stats: report.stats,
+        inner_optimizer_state: None,
     }
 }
 
@@ -1619,6 +1811,7 @@ fn train_synchronized_reference_round(
     microshard_plan: &MicroShardPlan,
     shard_cache: &ShardCache,
     expected_batches_per_peer: usize,
+    inner_optimizer_state: Option<&StateBlob>,
 ) -> ReferenceWindow {
     let peer_batches = leases
         .iter()
@@ -1646,59 +1839,24 @@ fn train_synchronized_reference_round(
         }
     }
 
-    let microshard_ids = leases
-        .iter()
-        .flat_map(|lease| lease.microshards.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let selected_microshards = microshard_plan
-        .microshards
-        .iter()
-        .filter(|microshard| microshard_ids.contains(&microshard.microshard_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected_microshards.len(),
-        microshard_ids.len(),
-        "synchronized reference must resolve every peer microshard"
-    );
-    let first = leases.first().expect("at least one synchronized lease");
-    let mut planner = burn_p2p::LeasePlanner::default();
-    planner.config.max_microshards_per_lease = selected_microshards.len().max(1);
-    let synchronized_lease = planner
-        .plan_lease(
-            first.network_id.clone(),
-            first.study_id.clone(),
-            first.experiment_id.clone(),
-            first.revision_id.clone(),
-            &registration.view,
-            PeerId::new("central-synchronized-reference"),
-            first.window_id,
-            Utc::now(),
-            leases
-                .iter()
-                .map(|lease| lease.budget_work_units)
-                .sum::<u64>()
-                .max(1),
-            &selected_microshards,
-        )
-        .expect("plan synchronized reference lease")
-        .lease;
-    let cached = shard_cache
-        .fetch_lease_microshards(registration, microshard_plan, &synchronized_lease)
-        .expect("cache synchronized reference lease");
-    let mut ctx = WindowCtx {
-        device: synchronized_project.runtime_device(),
-        model,
-        lease: synchronized_lease,
-        cached_microshards: cached,
-        batches,
-    };
     let report = synchronized_project
-        .train_window(&mut ctx)
+        .run_inner_steps(
+            &model,
+            &batches,
+            u32::try_from(batches.len()).expect("synchronized batch count fits u32"),
+            inner_optimizer_state,
+        )
         .expect("train synchronized reference round");
+    let model = synchronized_project
+        .import_parameter_pack(
+            &synchronized_project.runtime_device(),
+            &report.local_parameters,
+        )
+        .expect("import synchronized reference parameters");
     ReferenceWindow {
-        model: ctx.model,
-        stats: report.stats,
+        model,
+        stats: report.metrics,
+        inner_optimizer_state: report.inner_optimizer_state,
     }
 }
 
@@ -1752,17 +1910,29 @@ fn signed_revision_contract_fixture(
         prepared.manifests.revision_manifest.experiment_id.as_str(),
         prepared.manifests.revision_manifest.revision_id.as_str(),
     ));
+    let materialization = prepared.genesis_materialization.clone();
     let artifact = project
-        .materialize_model_artifact(
-            &initialized_model,
-            ArtifactKind::FullHead,
+        .materialize_genesis_artifact(burn_p2p::GenesisArtifactMaterializationContext {
+            model: &initialized_model,
             head_id,
-            None,
-            &store,
-        )
+            training_contract_id: &prepared.manifests.training_contract_id,
+            contract: &prepared.manifests.training_contract,
+            materialization: &materialization,
+            store: &store,
+        })
         .expect("materialize signed genesis");
     let canonical_model = project
-        .load_model_artifact(initialized_model, &artifact, &store, &device)
+        .load_genesis_artifact(
+            initialized_model,
+            burn_p2p::GenesisArtifactLoadContext {
+                descriptor: &artifact,
+                training_contract_id: &prepared.manifests.training_contract_id,
+                contract: &prepared.manifests.training_contract,
+                materialization: &materialization,
+                store: &store,
+                device: &device,
+            },
+        )
         .expect("reload signed genesis");
     let tensor_digest = project
         .model_tensor_digest(&canonical_model)
@@ -1777,6 +1947,7 @@ fn signed_revision_contract_fixture(
         tensor_digest,
         initialization_algorithm: "burn-dragon-deterministic-init-v1".into(),
         initialization_seed: Some(initialization_seed),
+        materialization,
         authority_epoch: 1,
         created_at,
     };
@@ -2086,8 +2257,8 @@ fn ensure_three_peer_full_mesh<B>(
                 .runtime_boundary
                 .as_ref()
                 .and_then(|boundary| boundary.transport_policy.max_established_per_peer),
-            Some(1),
-            "DiLoCo {label} must constrain each trainer pair to one request route"
+            Some(2),
+            "DiLoCo {label} must retain two native request routes per trainer pair"
         );
         if std::env::var_os("BURN_P2P_DILOCO_TRACE").is_some() {
             let route_events = snapshot
@@ -4025,6 +4196,15 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
         let run_sequential_reference = env_bool(P2P_PARITY_SEQUENTIAL_ENV, true);
         let run_synchronized_reference = env_bool(P2P_PARITY_SYNCHRONIZED_ENV, true);
         let use_signed_revision_contract = env_bool(P2P_PARITY_SIGNED_CONTRACT_ENV, false);
+        let random_scaffold = env_bool(P2P_PARITY_RANDOM_SCAFFOLD_ENV, false);
+        let random_scaffold_update_encoding = env_compact_scalar_encoding(
+            P2P_PARITY_RANDOM_SCAFFOLD_ENCODING_ENV,
+            burn_p2p::CompactScalarEncoding::Fp32,
+        );
+        assert!(
+            !random_scaffold || use_signed_revision_contract,
+            "random-scaffold typed updates require the signed revision-contract path"
+        );
         let minimum_synchronized_progress_ratio =
             env_f64(P2P_PARITY_MIN_SYNC_PROGRESS_RATIO_ENV, 0.90);
         let require_convergence_parity = env_bool(P2P_PARITY_REQUIRE_CONVERGENCE_ENV, false);
@@ -4059,8 +4239,13 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             .expect("parity exported record count");
         let root = tempdir().expect("parity root");
         let bootstrap_storage = tempdir().expect("parity bootstrap storage");
-        let training_config_path =
-            write_ruliad_parity_training_config(root.path(), seed_value, peer_local_steps);
+        let training_config_path = write_ruliad_parity_training_config(
+            root.path(),
+            seed_value,
+            peer_local_steps,
+            exported_records,
+            random_scaffold,
+        );
         let synchronized_training_config_path = run_synchronized_reference.then(|| {
             write_ruliad_synchronized_reference_config(
                 root.path(),
@@ -4069,6 +4254,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     .checked_mul(3)
                     .expect("synchronized reference batch count"),
                 3,
+                random_scaffold,
             )
         });
         let shared_shard_root = root.path().join("shared-ruliad-shards");
@@ -4140,6 +4326,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     aggregation: DragonAggregationConfig {
                         root_ema_update_basis_points,
                     },
+                    random_scaffold_update_encoding,
                     ..native_manifest_seed()
                 },
                 app_semver: semver::Version::parse("0.21.0").expect("valid burn_dragon version"),
@@ -4253,6 +4440,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             );
         }
         let training_contract_id = seed_prepared.manifests.training_contract_id.clone();
+        let training_contract = seed_prepared.manifests.training_contract.clone();
         let optimizer_state_policy = seed_prepared
             .manifests
             .training_contract
@@ -4415,14 +4603,29 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
         let canonical_genesis_descriptor = seed_artifact_store
             .load_manifest(&genesis_head.artifact_id)
             .expect("load canonical genesis descriptor");
-        let canonical_genesis_model = reference_project
-            .load_model_artifact(
-                reference_project.init_model(&reference_device),
-                &canonical_genesis_descriptor,
-                &seed_artifact_store,
-                &reference_device,
-            )
-            .expect("load canonical genesis through reference adapter");
+        let canonical_genesis_model = match signed_setup.as_ref() {
+            Some((_, _, bundle)) => reference_project
+                .load_genesis_artifact(
+                    reference_project.init_model(&reference_device),
+                    burn_p2p::GenesisArtifactLoadContext {
+                        descriptor: &canonical_genesis_descriptor,
+                        training_contract_id: &bundle.training_contract_id,
+                        contract: &bundle.training,
+                        materialization: &bundle.genesis.payload.payload.materialization,
+                        store: &seed_artifact_store,
+                        device: &reference_device,
+                    },
+                )
+                .expect("load signed canonical genesis through reconstruction contract"),
+            None => reference_project
+                .load_model_artifact(
+                    reference_project.init_model(&reference_device),
+                    &canonical_genesis_descriptor,
+                    &seed_artifact_store,
+                    &reference_device,
+                )
+                .expect("load canonical genesis through reference adapter"),
+        };
         let canonical_genesis_digest = model_digest(&reference_project, &canonical_genesis_model);
         assert!(
             genesis_digests
@@ -4444,6 +4647,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
         oracle_model = canonical_genesis_model;
         let mut sequential_model = oracle_model.clone();
         let mut synchronized_model = synchronized_project.as_ref().map(|_| oracle_model.clone());
+        let mut synchronized_inner_optimizer_state = None;
         let genesis_losses = [
             metric_float_any(
                 &seed
@@ -4702,16 +4906,66 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 3
             );
 
-            let runtime_candidate_digests = [
-                seed.materialized_head_tensor_digest(&seed_window.head)
-                    .expect("seed candidate digest"),
-                trainer_b
-                    .materialized_head_tensor_digest(&trainer_b_window.head)
-                    .expect("trainer b candidate digest"),
-                trainer_c
-                    .materialized_head_tensor_digest(&trainer_c_window.head)
-                    .expect("trainer c candidate digest"),
-            ];
+            let typed_updates = matches!(
+                &training_contract.update_codec,
+                burn_p2p::UpdateCodec::MutableSubsetParameters { .. }
+            );
+            let typed_candidate_models: Option<[CpuParityModel; 3]> = typed_updates.then(|| {
+                std::array::from_fn(|index| {
+                    let update = visible_updates
+                        .iter()
+                        .find(|update| update.peer_id == provider_peer_ids[index])
+                        .expect("visible typed peer update");
+                    let envelope = seed_telemetry
+                        .snapshot()
+                        .control_plane
+                        .update_announcements
+                        .into_iter()
+                        .find(|announcement| {
+                            announcement.update.peer_id == provider_peer_ids[index]
+                                && announcement.update.window_id == window_id
+                                && announcement.update.base_head_id == base_head_id
+                        })
+                        .and_then(|announcement| announcement.workload_update)
+                        .expect("typed workload update envelope");
+                    let descriptor = seed_artifact_store
+                        .load_manifest(&update.delta_artifact_id)
+                        .expect("load typed update descriptor");
+                    let candidate = reference_project
+                        .apply_workload_update(
+                            oracle_model.clone(),
+                            &descriptor,
+                            &envelope,
+                            &training_contract,
+                            &seed_artifact_store,
+                            &reference_device,
+                        )
+                        .expect("reconstruct typed candidate");
+                    let digest = model_digest(&reference_project, &candidate);
+                    assert_eq!(
+                        envelope.decoded_tensor_digest.as_ref(),
+                        Some(&digest),
+                        "typed candidate did not reconstruct its trainer-declared model digest"
+                    );
+                    candidate
+                })
+            });
+            let runtime_candidate_digests = if let Some(candidates) =
+                typed_candidate_models.as_ref()
+            {
+                std::array::from_fn(|index| model_digest(&reference_project, &candidates[index]))
+            } else {
+                [
+                    seed.materialized_head_tensor_digest(&seed_window.head)
+                        .expect("seed candidate digest"),
+                    trainer_b
+                        .materialized_head_tensor_digest(&trainer_b_window.head)
+                        .expect("trainer b candidate digest"),
+                    trainer_c
+                        .materialized_head_tensor_digest(&trainer_c_window.head)
+                        .expect("trainer c candidate digest"),
+                ]
+            };
             let mut oracle_candidates = Vec::new();
             for (index, outcome) in outcomes.iter().enumerate() {
                 let model = if replay_candidates {
@@ -4733,13 +4987,36 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                         runtime_loss,
                         reference_loss
                     );
-                    round_trip_reference_model(
-                        &reference_project,
-                        &reference.model,
-                        &reference_artifact_store,
-                        &format!("oracle-candidate-{}-{index}", round + 1),
-                        Some(base_head_id.clone()),
-                    )
+                    if typed_updates {
+                        let candidate = typed_candidate_models
+                            .as_ref()
+                            .expect("typed candidate models")[index]
+                            .clone();
+                        if matches!(
+                            &training_contract.update_codec,
+                            burn_p2p::UpdateCodec::MutableSubsetParameters {
+                                encoding: burn_p2p::CompactScalarEncoding::Fp32,
+                                ..
+                            }
+                        ) {
+                            assert_eq!(
+                                model_digest(&reference_project, &reference.model),
+                                runtime_candidate_digests[index],
+                                "round {} peer {} fp32 candidate tensors diverged from local replay",
+                                round + 1,
+                                index
+                            );
+                        }
+                        candidate
+                    } else {
+                        round_trip_reference_model(
+                            &reference_project,
+                            &reference.model,
+                            &reference_artifact_store,
+                            &format!("oracle-candidate-{}-{index}", round + 1),
+                            Some(base_head_id.clone()),
+                        )
+                    }
                 } else {
                     let descriptor = seed_artifact_store
                         .load_manifest(&outcome.head.artifact_id)
@@ -4852,10 +5129,15 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     let model = synchronized_model
                         .take()
                         .expect("synchronized reference model");
-                    let leases = outcomes
+                    let mut leases = outcomes
                         .iter()
                         .map(|outcome| &outcome.lease)
                         .collect::<Vec<_>>();
+                    leases.sort_by(|left, right| {
+                        left.microshards
+                            .cmp(&right.microshards)
+                            .then(left.assignment_hash.cmp(&right.assignment_hash))
+                    });
                     let reference = train_synchronized_reference_round(
                         &reference_project,
                         synchronized_project,
@@ -4865,6 +5147,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                         &reference_microshard_plan,
                         &reference_shard_cache,
                         peer_local_steps,
+                        synchronized_inner_optimizer_state.as_ref(),
                     );
                     let train_steps = metric_integer(&reference.stats, "train_steps");
                     assert_eq!(
@@ -4881,6 +5164,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     );
                     let loss = validation_loss(synchronized_project, &model);
                     synchronized_model = Some(model);
+                    synchronized_inner_optimizer_state = reference.inner_optimizer_state;
                     (loss, train_steps)
                 });
             let synchronized_loss =
@@ -4958,8 +5242,9 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             ];
             assert!(
                 p2p_digests.iter().all(|digest| digest == &oracle_digest),
-                "round {} promoted tensors diverged from federated oracle",
-                round + 1
+                "round {} promoted tensors diverged from federated oracle: oracle={} peers={p2p_digests:?}",
+                round + 1,
+                oracle_digest.as_str(),
             );
             let p2p_losses = [
                 metric_float_any(
@@ -4999,6 +5284,16 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 .expect("seed artifact store")
                 .load_manifest(&promoted_head.artifact_id)
                 .expect("load promoted descriptor");
+            let candidate_to_promoted_byte_ratios = outcomes
+                .iter()
+                .map(|outcome| {
+                    outcome.artifact.bytes_len as f64 / promoted_descriptor.bytes_len.max(1) as f64
+                })
+                .collect::<Vec<_>>();
+            let candidate_bandwidth_savings_fractions = candidate_to_promoted_byte_ratios
+                .iter()
+                .map(|ratio| 1.0 - ratio)
+                .collect::<Vec<_>>();
 
             p2p_validation_losses.push(p2p_losses[0]);
             oracle_validation_losses.push(oracle_loss);
@@ -5031,6 +5326,8 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 "lease_microshards": outcomes.iter().map(|outcome| outcome.lease.microshards.iter().map(|id| id.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>(),
                 "sequential_lease_order": sequential_lease_order,
                 "candidate_artifact_bytes": outcomes.iter().map(|outcome| outcome.artifact.bytes_len).collect::<Vec<_>>(),
+                "candidate_to_promoted_byte_ratios": candidate_to_promoted_byte_ratios,
+                "candidate_bandwidth_savings_fractions": candidate_bandwidth_savings_fractions,
                 "training_elapsed_secs": training_elapsed.as_secs_f64(),
                 "promotion_elapsed_secs": promotion_elapsed.as_secs_f64(),
                 "aggregate_peer_steps_per_training_second": aggregate_peer_steps_per_training_second,
@@ -5167,11 +5464,31 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             "sequential_reference_enabled": run_sequential_reference,
             "synchronized_reference_enabled": run_synchronized_reference,
             "signed_revision_contract_exercised": use_signed_revision_contract,
+            "update_transport": {
+                "random_scaffold": random_scaffold,
+                "codec": &training_contract.update_codec,
+                "mutable_parameter_count": match &training_contract.update_codec {
+                    burn_p2p::UpdateCodec::MutableSubsetParameters {
+                        parameter_count,
+                        ..
+                    } => Some(*parameter_count),
+                    _ => None,
+                },
+                "mutable_parameter_fraction": match &training_contract.update_codec {
+                    burn_p2p::UpdateCodec::MutableSubsetParameters {
+                        parameter_count,
+                        ..
+                    } => Some(*parameter_count as f64 / inventory.total_scalar_parameters.max(1) as f64),
+                    _ => None,
+                },
+            },
             "signed_revision_contract": signed_setup.as_ref().map(|(_, _, bundle)| serde_json::json!({
                 "signer": bundle.contract_signature.signer.as_str(),
                 "training_contract_id": bundle.training_contract_id.as_str(),
                 "genesis_artifact_id": bundle.genesis.payload.payload.artifact.artifact_id.as_str(),
+                "genesis_artifact_bytes": bundle.genesis.payload.payload.artifact.bytes_len,
                 "genesis_tensor_digest": bundle.genesis.payload.payload.tensor_digest.as_str(),
+                "genesis_materialization": &bundle.genesis.payload.payload.materialization,
             })),
             "recovery_drill": restart_report.clone(),
             "aggregation": {
@@ -5316,8 +5633,9 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
     run_with_large_stack("ruliad-p2p-1m-diloco", || {
         let _guard = native_swarm_test_guard();
         let seed_value = env_u64(P2P_PARITY_SEED_ENV, 1337);
-        let rounds = positive_env_usize(P2P_PARITY_ROUNDS_ENV, 2);
-        let peer_local_steps = positive_env_usize(P2P_PARITY_LOCAL_STEPS_ENV, 9);
+        let rounds = positive_env_usize(P2P_PARITY_ROUNDS_ENV, 6);
+        let peer_local_steps = positive_env_usize(P2P_PARITY_LOCAL_STEPS_ENV, 1);
+        let random_scaffold = env_bool(P2P_PARITY_RANDOM_SCAFFOLD_ENV, false);
         let minimum_synchronized_progress_ratio =
             env_f64(P2P_PARITY_MIN_SYNC_PROGRESS_RATIO_ENV, 0.90);
         let require_convergence_parity = env_bool(P2P_PARITY_REQUIRE_CONVERGENCE_ENV, false);
@@ -5341,8 +5659,13 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
 
         let root = tempdir().expect("DiLoCo root");
         let bootstrap_storage = tempdir().expect("DiLoCo bootstrap storage");
-        let training_config_path =
-            write_ruliad_parity_training_config(root.path(), seed_value, peer_local_steps);
+        let training_config_path = write_ruliad_parity_training_config(
+            root.path(),
+            seed_value,
+            peer_local_steps,
+            exported_records,
+            random_scaffold,
+        );
         let synchronized_training_config_path = write_ruliad_synchronized_reference_config(
             root.path(),
             seed_value,
@@ -5350,6 +5673,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 .checked_mul(3)
                 .expect("synchronized reference batch count"),
             3,
+            random_scaffold,
         );
         let shared_shard_root = root.path().join("shared-ruliad-shards");
         let deterministic_peer_ids = ["seed", "trainer-b", "trainer-c"].map(|role| {
@@ -5474,6 +5798,20 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             seed_prepared.manifests.revision_manifest.training_protocol,
             TrainingProtocol::DiLoCo(policy.clone())
         );
+        assert_eq!(
+            seed_prepared
+                .manifests
+                .training_contract
+                .optimizer_state_policy,
+            LocalOptimizerStatePolicy::PeerLocalPersistent
+        );
+        assert_eq!(
+            seed_prepared
+                .manifests
+                .training_contract
+                .scheduler_state_policy,
+            SchedulerStatePolicy::PeerLocalPersistent
+        );
         let trainer_b_prepared = prepare_nca_native_cpu(
             &make_trainer_config("trainer-b", false),
             Some(&dummy_auth_bundle()),
@@ -5503,6 +5841,10 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         let initial_reference_model = reference_project.init_model(&reference_device);
         let inventory =
             burn_p2p::burn::inspect_module::<NativeCpuBackend, _>(&initial_reference_model);
+        let synchronized_parameter_count = reference_project
+            .export_parameter_pack(&initial_reference_model)
+            .expect("export DiLoCo synchronization parameters")
+            .parameter_count();
         assert!(
             (800_000..=1_200_000).contains(&inventory.total_scalar_parameters),
             "DiLoCo model should be 1m-class, got {} parameters",
@@ -5634,6 +5976,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         )
         .with_chunk_size_bytes(1024 * 1024);
         let mut synchronized_model = canonical_genesis_model;
+        let mut synchronized_inner_optimizer_state = None;
         let mut p2p_validation_losses = vec![genesis_loss];
         let mut synchronized_validation_losses = vec![genesis_loss];
         let mut round_reports = Vec::new();
@@ -5642,8 +5985,17 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         let mut total_aggregate_payload_bytes = 0_u64;
         let mut total_estimated_wire_payload_bytes = 0_u64;
         let mut all_protocol_oracle_exact = true;
+        let mut unique_batch_fingerprints = BTreeSet::new();
+        let mut total_batch_count = 0usize;
+        let mut zero_supervision_batch_count = 0usize;
+        let mut total_batch_tokens = 0usize;
+        let mut total_supervised_tokens = 0usize;
+        let mut total_supervision_weight = 0_u64;
 
         for round in 0..rounds {
+            let round_base_parameters = reference_project
+                .export_parameter_pack(&oracle_peers[0].model)
+                .expect("export round base parameters");
             let (outcomes, preparation_elapsed, network_elapsed) =
                 run_three_peer_diloco_round(&experiment, &mut seed, &mut trainer_b, &mut trainer_c);
             total_network_round_secs += network_elapsed.as_secs_f64();
@@ -5764,6 +6116,47 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 })
                 .collect::<Vec<_>>();
             assert!(local_train_losses.iter().all(|loss| loss.is_finite()));
+            let inner_optimizer_state_restored = outcomes
+                .iter()
+                .map(|outcome| {
+                    metric_bool(
+                        &outcome.local_inner_report.metrics,
+                        "diloco_inner_state_restored",
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                inner_optimizer_state_restored
+                    .iter()
+                    .all(|restored| *restored == (round > 0)),
+                "every peer must initialize state in round one and restore it in later rounds"
+            );
+            let inner_optimizer_steps = outcomes
+                .iter()
+                .map(|outcome| {
+                    metric_integer(&outcome.local_inner_report.metrics, "optimizer_steps")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                inner_optimizer_steps
+                    .iter()
+                    .all(|steps| *steps == peer_local_steps as i64)
+            );
+            let inner_microstep_offsets = outcomes
+                .iter()
+                .map(|outcome| {
+                    (
+                        metric_integer(
+                            &outcome.local_inner_report.metrics,
+                            "diloco_inner_microstep_offset_start",
+                        ),
+                        metric_integer(
+                            &outcome.local_inner_report.metrics,
+                            "diloco_inner_microstep_offset_end",
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
 
             let peer_batches = provider_peer_ids
                 .iter()
@@ -5785,6 +6178,29 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 peer_batches
                     .values()
                     .all(|batches| batches.len() == peer_local_steps)
+            );
+            let mut round_batch_evidence = Vec::new();
+            for peer_id in &provider_peer_ids {
+                let batches = peer_batches
+                    .get(peer_id)
+                    .expect("every provider peer must have reference batches");
+                for (batch_index, batch) in batches.iter().enumerate() {
+                    let evidence = cpu_parity_batch_evidence(batch);
+                    total_batch_count = total_batch_count.saturating_add(1);
+                    total_batch_tokens = total_batch_tokens.saturating_add(evidence.token_count);
+                    total_supervised_tokens =
+                        total_supervised_tokens.saturating_add(evidence.supervised_token_count);
+                    total_supervision_weight =
+                        total_supervision_weight.saturating_add(evidence.supervision_weight_sum);
+                    zero_supervision_batch_count = zero_supervision_batch_count
+                        .saturating_add(usize::from(evidence.supervised_token_count == 0));
+                    unique_batch_fingerprints.insert(evidence.fingerprint.as_str().to_owned());
+                    round_batch_evidence.push(evidence.to_json(peer_id, batch_index));
+                }
+            }
+            assert_eq!(
+                zero_supervision_batch_count, 0,
+                "DiLoCo must never spend an optimizer step on an all-padding batch"
             );
             let oracle_started = Instant::now();
             let oracle_outcome = coordinator
@@ -5837,13 +6253,27 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 &reference_microshard_plan,
                 &reference_shard_cache,
                 peer_local_steps,
+                synchronized_inner_optimizer_state.as_ref(),
             );
             let synchronized_elapsed = synchronized_started.elapsed();
             assert_eq!(
                 metric_integer(&synchronized.stats, "train_steps"),
                 peer_local_steps.saturating_mul(3) as i64
             );
+            assert_eq!(
+                metric_integer(&synchronized.stats, "optimizer_steps"),
+                peer_local_steps as i64,
+                "synchronized reference must aggregate one microbatch per peer into each AdamW update"
+            );
+            let synchronized_inner_state_restored =
+                metric_bool(&synchronized.stats, "diloco_inner_state_restored");
+            assert_eq!(
+                synchronized_inner_state_restored,
+                round > 0,
+                "synchronized AdamW state must persist after round one"
+            );
             synchronized_model = synchronized.model;
+            synchronized_inner_optimizer_state = synchronized.inner_optimizer_state;
             let synchronized_loss = validation_loss(&synchronized_project, &synchronized_model);
 
             let unique_payload_bytes = outcomes
@@ -5881,6 +6311,12 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 .unwrap_or_default();
             let compute_duty_fraction =
                 max_inner_ms as f64 / network_elapsed.as_secs_f64().mul_add(1000.0, 0.0).max(1.0);
+            let base_parameter_rms = parameter_pack_rms(&round_base_parameters);
+            let aggregate_pseudo_gradient_rms = parameter_pack_rms(&outcomes[0].aggregate);
+            let aggregate_to_parameter_rms_ratio =
+                aggregate_pseudo_gradient_rms / base_parameter_rms.max(f64::EPSILON);
+            let applied_outer_update_rms =
+                parameter_pack_delta_rms(&round_base_parameters, &outcomes[0].current_parameters);
 
             p2p_validation_losses.push(p2p_loss);
             synchronized_validation_losses.push(synchronized_loss);
@@ -5905,16 +6341,30 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                     .iter()
                     .map(|lease| lease.microshards.iter().map(MicroShardId::as_str).collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
+                "batch_evidence": round_batch_evidence,
                 "local_train_losses": local_train_losses,
+                "inner_optimizer_state_restored": inner_optimizer_state_restored,
+                "inner_optimizer_steps": inner_optimizer_steps,
+                "inner_microstep_offsets": inner_microstep_offsets,
                 "inner_steps_completed": outcomes
                     .iter()
                     .map(|outcome| outcome.local_inner_report.steps_completed)
                     .collect::<Vec<_>>(),
                 "p2p_validation_loss": p2p_loss,
                 "synchronized_validation_loss": synchronized_loss,
+                "synchronized_inner_optimizer_state_restored":
+                    synchronized_inner_state_restored,
                 "network_protocol_oracle_exact": protocol_oracle_exact,
                 "network_parameter_checksum": outcomes[0].current_parameters.checksum().expect("network checksum").as_str(),
                 "oracle_parameter_checksum": oracle_pack.checksum().expect("oracle checksum").as_str(),
+                "outer_update": {
+                    "base_parameter_rms": base_parameter_rms,
+                    "aggregate_pseudo_gradient_rms": aggregate_pseudo_gradient_rms,
+                    "aggregate_to_parameter_rms_ratio": aggregate_to_parameter_rms_ratio,
+                    "applied_outer_update_rms": applied_outer_update_rms,
+                    "applied_to_parameter_rms_ratio":
+                        applied_outer_update_rms / base_parameter_rms.max(f64::EPSILON),
+                },
                 "transport": {
                     "codec": &policy.codec,
                     "unique_local_gradient_payload_bytes": unique_payload_bytes,
@@ -5965,15 +6415,29 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             .expect("final synchronized loss");
         let p2p_loss_reduction = genesis_loss - final_p2p_loss;
         let synchronized_loss_reduction = genesis_loss - synchronized_final_loss;
-        let progress_ratio = (synchronized_loss_reduction > f64::EPSILON)
+        let endpoint_progress_ratio = (synchronized_loss_reduction > f64::EPSILON)
             .then_some(p2p_loss_reduction / synchronized_loss_reduction);
+        let trailing_window = rounds.min(3);
+        let trailing_p2p_loss = trailing_mean(&p2p_validation_losses[1..], trailing_window)
+            .expect("at least one P2P round");
+        let trailing_synchronized_loss =
+            trailing_mean(&synchronized_validation_losses[1..], trailing_window)
+                .expect("at least one synchronized round");
+        let trailing_p2p_loss_reduction = genesis_loss - trailing_p2p_loss;
+        let trailing_synchronized_loss_reduction = genesis_loss - trailing_synchronized_loss;
+        let progress_ratio = (trailing_synchronized_loss_reduction > f64::EPSILON)
+            .then_some(trailing_p2p_loss_reduction / trailing_synchronized_loss_reduction);
         let convergence_parity = convergence_parity_passes(
             progress_ratio,
-            Some(synchronized_loss_reduction),
+            Some(trailing_synchronized_loss_reduction),
             minimum_synchronized_progress_ratio,
         );
         let material_improvement = best_loss(&p2p_validation_losses) <= genesis_loss - 0.01;
         let no_final_regression = final_p2p_loss <= genesis_loss + 0.01;
+        let maximum_p2p_validation_drawup = maximum_loss_drawup(&p2p_validation_losses);
+        let maximum_allowed_validation_drawup = 0.25;
+        let no_transient_validation_collapse =
+            maximum_p2p_validation_drawup <= maximum_allowed_validation_drawup;
         let mut hard_diloco_request_failure_count = 0_u64;
         let diloco_request_failures = [
             ("seed", &seed),
@@ -6004,13 +6468,20 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         })
         .collect::<Vec<_>>();
         let no_hard_diloco_request_failures = hard_diloco_request_failure_count == 0;
+        let unique_batch_count = unique_batch_fingerprints.len();
+        let duplicate_batch_count = total_batch_count.saturating_sub(unique_batch_count);
+        let duplicate_batch_fraction =
+            duplicate_batch_count as f64 / total_batch_count.max(1) as f64;
+        let supervised_token_fraction =
+            total_supervised_tokens as f64 / total_batch_tokens.max(1) as f64;
+        let no_zero_supervision_batches = zero_supervision_batch_count == 0;
         let build_profile = if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         };
         let report = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 5,
             "experiment": "dragon_ruliad_1m_three_peer_diloco",
             "seed": seed_value,
             "backend": "ndarray-cpu",
@@ -6030,6 +6501,10 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 "parameter_count": inventory.total_scalar_parameters,
                 "parameter_tensor_count": inventory.parameter_count,
                 "parameter_bytes": inventory.total_scalar_parameters.saturating_mul(4),
+                "random_scaffold": random_scaffold,
+                "synchronized_parameter_count": synchronized_parameter_count,
+                "synchronized_parameter_fraction":
+                    synchronized_parameter_count as f64 / inventory.total_scalar_parameters as f64,
             },
             "work": {
                 "peer_local_steps_per_round": peer_local_steps,
@@ -6042,7 +6517,19 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 "synchronized_optimizer_updates": peer_local_steps.saturating_mul(rounds),
                 "synchronized_microbatches_per_optimizer_update": 3,
                 "synchronized_reference_semantics": "AdamW on gradients accumulated over the same three peer microbatches at each local-step index",
-                "inner_optimizer_state_semantics": "burn_adapter_resets_optimizer_each_round; persistence hook is present but current learner returns the input opaque state",
+                "inner_optimizer_state_semantics": "peer-local Burn optimizer and scheduler records persist across rounds; state is not transmitted with model updates",
+                "data_supervision": {
+                    "batch_count": total_batch_count,
+                    "unique_batch_count": unique_batch_count,
+                    "duplicate_batch_count": duplicate_batch_count,
+                    "duplicate_batch_fraction": duplicate_batch_fraction,
+                    "token_count": total_batch_tokens,
+                    "supervised_token_count": total_supervised_tokens,
+                    "supervised_token_fraction": supervised_token_fraction,
+                    "supervision_weight_sum": total_supervision_weight,
+                    "zero_supervision_batch_count": zero_supervision_batch_count,
+                    "batch_fingerprint_contract": "inputs-targets-loss-mask-v1",
+                },
             },
             "timing": {
                 "network_round_wall_secs": total_network_round_secs,
@@ -6055,7 +6542,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 "total_estimated_wire_payload_bytes_excluding_protocol_overhead": total_estimated_wire_payload_bytes,
                 "control_plane_and_request_overhead_included": false,
                 "multiplexer": "libp2p-yamux-current-auto-tuned",
-                "configured_max_established_per_peer": 1,
+                "configured_max_established_per_peer": 2,
                 "temporary_route_reconciliation_slack": 1,
                 "diloco_request_failures": diloco_request_failures,
                 "hard_diloco_request_failure_count": hard_diloco_request_failure_count,
@@ -6068,16 +6555,26 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             "convergence": {
                 "p2p_loss_reduction": p2p_loss_reduction,
                 "synchronized_loss_reduction": synchronized_loss_reduction,
+                "endpoint_progress_ratio": endpoint_progress_ratio,
+                "trailing_window_rounds": trailing_window,
+                "trailing_p2p_validation_loss": trailing_p2p_loss,
+                "trailing_synchronized_validation_loss": trailing_synchronized_loss,
+                "trailing_p2p_loss_reduction": trailing_p2p_loss_reduction,
+                "trailing_synchronized_loss_reduction": trailing_synchronized_loss_reduction,
                 "p2p_to_synchronized_progress_ratio": progress_ratio,
                 "minimum_progress_ratio": minimum_synchronized_progress_ratio,
+                "maximum_validation_drawup": maximum_p2p_validation_drawup,
+                "maximum_allowed_validation_drawup": maximum_allowed_validation_drawup,
             },
             "rounds": round_reports,
             "gates": {
                 "deployable_manifest_protocol_bound": true,
+                "persistent_peer_local_optimizer_contract": true,
+                "persistent_peer_local_scheduler_contract": true,
                 "automatic_disjoint_nonempty_leases": true,
                 "deterministic_seeded_peer_identities": true,
                 "full_trainer_mesh_before_rounds": true,
-                "deterministic_single_route_reconciliation": true,
+                "stable_dual_route_native_transport": true,
                 "two_phase_cohort_state_barrier": true,
                 "rotating_reducer_cohort_commitment": true,
                 "uniform_transport_decode_for_lossy_codecs": true,
@@ -6086,8 +6583,10 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 "all_peer_parameter_packs_exact": true,
                 "network_protocol_oracle_exact": all_protocol_oracle_exact,
                 "no_hard_diloco_request_failures": no_hard_diloco_request_failures,
+                "no_zero_supervision_batches": no_zero_supervision_batches,
                 "material_validation_improvement": material_improvement,
                 "no_final_validation_regression": no_final_regression,
+                "no_transient_validation_collapse": no_transient_validation_collapse,
                 "synchronized_convergence_parity": convergence_parity,
                 "hard_convergence_assertion_enabled": require_convergence_parity,
             },
@@ -6112,8 +6611,16 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             "DiLoCo validation regressed: genesis={genesis_loss:.6} final={final_p2p_loss:.6}"
         );
         assert!(
+            no_transient_validation_collapse,
+            "DiLoCo transient validation collapse: maximum drawup={maximum_p2p_validation_drawup:.6} allowed={maximum_allowed_validation_drawup:.6}"
+        );
+        assert!(
             no_hard_diloco_request_failures,
             "DiLoCo transport recorded {hard_diloco_request_failure_count} hard request failure(s)"
+        );
+        assert!(
+            no_zero_supervision_batches,
+            "DiLoCo observed {zero_supervision_batch_count} all-padding batch(es)"
         );
         if require_convergence_parity {
             assert!(

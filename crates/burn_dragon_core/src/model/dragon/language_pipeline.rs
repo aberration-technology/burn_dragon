@@ -88,6 +88,9 @@ impl<B: Backend> DragonModel<B> {
             (!mhc.coefficient_policy().uses_dynamic_stream_controller()).then(|| mhc.coefficients())
         });
         let layer_end = layer_range.end.min(self.n_layer);
+        // Dragon reuses these projectors at every layer. Materialize each adapter delta once for
+        // this pipeline stage instead of rebuilding A*B inside the recurrent layer loop.
+        let shared_lowrank_weights = self.shared_lowrank_effective_weights();
 
         for layer_idx in layer_range.start.min(layer_end)..layer_end {
             let layer_state = &mut state.layers[layer_idx];
@@ -198,7 +201,8 @@ impl<B: Backend> DragonModel<B> {
                 branch_input.shape().dims::<4>();
             let branch_flat =
                 branch_input.reshape([branch_batch * branch_views, 1, branch_time, branch_dim]);
-            let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_idx);
+            let (encoder, encoder_v, decoder, latent) =
+                self.layer_lowrank_weights_from_tensors(layer_idx, shared_lowrank_weights.clone());
             let latent_pattern = &self.kernel.block_sparse.latent;
             let sparse_mask = if fused && latent_pattern.is_sparse() {
                 Some(latent_pattern.mask::<B>(latent, &branch_flat.device()))

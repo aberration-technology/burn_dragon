@@ -71,9 +71,9 @@ pub mod api {
         pub use crate::checkpoint::{
             LanguageBurnpackExportReport, LanguageRunConfigSnapshot,
             apply_init_checkpoint_to_language_core, default_checkpoint_dir,
-            export_language_checkpoint_to_burnpack, load_language_core_from_checkpoint,
-            load_tokenizer_for_checkpoint, load_training_config_for_checkpoint,
-            write_training_snapshot,
+            ensure_random_scaffold_run_manifest, export_language_checkpoint_to_burnpack,
+            load_language_core_from_checkpoint, load_tokenizer_for_checkpoint,
+            load_training_config_for_checkpoint, write_training_snapshot,
         };
     }
 
@@ -94,8 +94,9 @@ pub use burn_dragon_core::{
 pub use checkpoint::{
     LanguageBurnpackExportReport, LanguageRunConfigSnapshot,
     apply_init_checkpoint_to_language_core, default_checkpoint_dir,
-    export_language_checkpoint_to_burnpack, load_language_core_from_checkpoint,
-    load_tokenizer_for_checkpoint, load_training_config_for_checkpoint, write_training_snapshot,
+    ensure_random_scaffold_run_manifest, export_language_checkpoint_to_burnpack,
+    load_language_core_from_checkpoint, load_tokenizer_for_checkpoint,
+    load_training_config_for_checkpoint, write_training_snapshot,
 };
 pub use config::{
     ContextStrategyConfig, GenerationConfig, GenerationOutputFormat,

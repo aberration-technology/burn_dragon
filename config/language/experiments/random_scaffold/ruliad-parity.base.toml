@@ -1,0 +1,15 @@
+extends = "ruliad-screen.base.toml"
+
+[training]
+max_iters = 2048
+checkpoint_interval_iters = 2048
+log_frequency = 32
+
+[training.events]
+flush_every_steps = 32
+source_selection_every_steps = 64
+ruliad_correctness_probe_items = 64
+ruliad_correctness_probe_tokens = 64
+
+[run_layout]
+category = "random-scaffold-parity"

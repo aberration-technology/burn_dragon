@@ -4,6 +4,10 @@ use burn::module::{
 };
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
+use burn_eggroll::{
+    LowRankAdapterSpec, LowRankScaling, RandomScaffoldSpec, ScaffoldDistribution,
+    ScaffoldTensorSpec,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{BlockPattern1d, BlockPattern2d, BlockSparseConfig};
@@ -870,6 +874,85 @@ impl NextLatentTransitionConfig {
     }
 }
 
+/// LottaLoRA-style parameterization for Dragon's shared recurrent projections.
+///
+/// The immutable scaffold is reconstructed from `seed` and the versioned
+/// generator in `burn_eggroll`; the trainable state consists of low-rank
+/// adapters and optional scalar gains.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DragonRandomScaffoldConfig {
+    pub enabled: bool,
+    pub seed: u64,
+    pub distribution: ScaffoldDistribution,
+    pub rank: usize,
+    pub alpha: f32,
+    pub scaling: LowRankScaling,
+    pub trainable_gain: bool,
+}
+
+impl Default for DragonRandomScaffoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            seed: 1337,
+            distribution: ScaffoldDistribution::GaussianClt12,
+            rank: 8,
+            alpha: 16.0,
+            scaling: LowRankScaling::Standard,
+            trainable_gain: true,
+        }
+    }
+}
+
+impl DragonRandomScaffoldConfig {
+    pub fn scaffold_spec(&self) -> RandomScaffoldSpec {
+        RandomScaffoldSpec::new(self.seed, self.distribution)
+    }
+
+    pub fn adapter_spec(&self) -> LowRankAdapterSpec {
+        LowRankAdapterSpec {
+            scaling: self.scaling,
+            trainable_gain: self.trainable_gain,
+            ..LowRankAdapterSpec::new(self.rank, self.alpha)
+        }
+    }
+
+    pub fn validate_for_model(
+        &self,
+        n_embd: usize,
+        n_head: usize,
+        latent_total: usize,
+    ) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if n_head == 0 {
+            return Err("requires model.n_head > 0".to_string());
+        }
+        if !latent_total.is_multiple_of(n_head) {
+            return Err(format!(
+                "requires model.latent_total ({latent_total}) to divide evenly across model.n_head ({n_head})"
+            ));
+        }
+        let latent_per_head = latent_total / n_head;
+        let scaffold = self.scaffold_spec();
+        let adapter = self.adapter_spec();
+        scaffold.validate().map_err(|error| error.to_string())?;
+        adapter.validate().map_err(|error| error.to_string())?;
+        for tensor in [
+            ScaffoldTensorSpec::new("shared.encoder", [n_embd, latent_per_head]),
+            ScaffoldTensorSpec::new("shared.encoder_v", [n_embd, latent_per_head]),
+            ScaffoldTensorSpec::new("shared.decoder", [latent_total, n_embd]),
+        ] {
+            tensor
+                .validate(&adapter)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DragonConfig {
     pub n_layer: usize,
@@ -879,6 +962,8 @@ pub struct DragonConfig {
     pub mlp_internal_dim_multiplier: usize,
     #[serde(default)]
     pub initialization: DragonInitializationConfig,
+    #[serde(default)]
+    pub random_scaffold: DragonRandomScaffoldConfig,
     #[serde(default)]
     pub sequence_kernel: SequenceKernelConfig,
     #[serde(default)]
@@ -925,6 +1010,7 @@ impl Default for DragonConfig {
             n_head: 4,
             mlp_internal_dim_multiplier: 4,
             initialization: DragonInitializationConfig::default(),
+            random_scaffold: DragonRandomScaffoldConfig::default(),
             sequence_kernel: SequenceKernelConfig::default(),
             latent_fanout_schedule: None,
             mamba: MambaSequenceConfig::default(),
@@ -1161,7 +1247,7 @@ fn lcm(lhs: usize, rhs: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DragonConfig, LatentFanoutScheduleConfig};
+    use super::{DragonConfig, DragonRandomScaffoldConfig, LatentFanoutScheduleConfig};
 
     #[test]
     fn late_layer_schedule_uses_base_then_full_latent_total() {
@@ -1208,5 +1294,23 @@ mod tests {
         assert_eq!(totals.last().copied(), Some(32768));
         assert!(totals.windows(2).all(|window| window[0] <= window[1]));
         assert!(totals.iter().all(|total| total % config.n_embd == 0));
+    }
+
+    #[test]
+    fn random_scaffold_rank_is_validated_against_head_local_width() {
+        let scaffold = DragonRandomScaffoldConfig {
+            enabled: true,
+            rank: 65,
+            ..Default::default()
+        };
+
+        let error = scaffold
+            .validate_for_model(128, 4, 256)
+            .expect_err("rank exceeds the encoder's head-local latent width");
+
+        assert!(
+            error.contains("rank"),
+            "unexpected validation error: {error}"
+        );
     }
 }

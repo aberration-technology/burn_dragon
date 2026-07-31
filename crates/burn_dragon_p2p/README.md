@@ -183,21 +183,23 @@ The three-peer 1M-class release harness separates three questions:
 - upper-bound convergence: a sequential reference consumes the same examples
   with three times as many optimizer updates
 
-Protocol parity passes. At seed 1337, full-FedAvg AdamW with nine local steps
-reached validation loss `3.551498`, while the matched-update centralized
-reference reached `2.472019`. That is `66.45%` of centralized loss reduction,
-below the default `90%` promotion threshold. Three-step windows were worse at
-`64.32%` and reduced protocol duty from `45.29%` to `25.05%`.
+Protocol parity passes. A historical pre-mask full-FedAvg run reached 66.45%
+of centralized loss reduction with nine local steps and 64.32% with
+three-step windows. Those values supervised repeated fixed-document EOS fill,
+so they remain transport evidence but are not current quality evidence.
 
 The artifact-window profile explicitly resets optimizer and scheduler state
 per window. It is mechanically correct but is not the production
 continual-pretraining default until it closes the convergence gate.
-The protocol-aware DiLoCo path closes the bounded local gate: across seeds
-1337-1339, four outer rounds with nine local steps reached 94.69%-98.33% of
-matched synchronized progress. Every network round exactly matched the
-codec-aware protocol oracle and recorded zero hard DiLoCo request failures.
-FP16 and blockwise-int8 retained the seed-1338 trajectory while reducing local
-gradient payloads to 50.0% and 25.6% of FP32, respectively.
+The protocol-aware DiLoCo path closes the corrected bounded local gate. Its
+signed contract declares optimizer and scheduler state
+`peer_local_persistent`, while artifact windows declare `reset_per_window`. A
+six-round random-scaffold matrix with persistent peer-local AdamW state reached
+91.63%-94.10% of matched synchronized trailing progress across seeds
+1337-1339. Every batch had nonzero masked supervision, every network round
+exactly matched the codec-aware protocol oracle, and hard DiLoCo request
+failures remained zero. A matched three-seed FP16 matrix retained the
+trajectory while halving parameter payload.
 
 Run the release gate with
 `BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1` to make convergence parity a
@@ -727,36 +729,42 @@ artifact.
 ### Native DiLoCo Convergence Parity
 
 The ignored `ruliad_native_runtime_1m_diloco_matches_protocol_oracle` test uses
-the same 926,210-parameter model and data accounting, but executes three local
-inner loops followed by one codec-aware DiLoCo outer update. It checks the
+the same 1M-class model and data accounting, but executes three local inner
+loops followed by one codec-aware DiLoCo outer update. With random scaffolds
+enabled, the model has 1,012,229 parameters and synchronizes 225,797 values
+(22.31%). It checks the
 matched cohort, rotating reducer, contribution commitments, aggregate and
 parameter equality, deterministic peer identities, request-failure telemetry,
-and convergence against synchronized AdamW over the same microbatches.
+masked supervision, and convergence against synchronized AdamW over the same
+microbatches.
 
 Run one hard-gated release condition:
 
 ```bash
 RUSTC="$(rustup which rustc --toolchain stable)" \
 RUSTFLAGS="-C target-cpu=native" \
-BURN_DRAGON_P2P_PARITY_SEED=1337 \
-BURN_DRAGON_P2P_PARITY_ROUNDS=4 \
-BURN_DRAGON_P2P_PARITY_LOCAL_STEPS=9 \
+BURN_DRAGON_P2P_PARITY_SEED=1339 \
+BURN_DRAGON_P2P_PARITY_ROUNDS=6 \
+BURN_DRAGON_P2P_PARITY_LOCAL_STEPS=1 \
+BURN_DRAGON_P2P_PARITY_RANDOM_SCAFFOLD=true \
 BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1 \
 BURN_DRAGON_P2P_DILOCO_CODEC=fp32 \
-BURN_DRAGON_P2P_DILOCO_REPORT_ROOT=target/test-artifacts/p2p-diloco-convergence \
+BURN_DRAGON_P2P_DILOCO_REPORT_ROOT=target/test-artifacts/random-scaffold-diloco/release-default \
 "$(rustup which cargo --toolchain stable)" test --release \
-  -p burn_dragon_p2p --test native_training \
+  -p burn_dragon_p2p --features native --test native_training \
   ruliad_native_runtime_1m_diloco_matches_protocol_oracle -- \
   --ignored --exact --nocapture
 ```
 
-Repeat with distinct seeds and `fp16` or `int8` codecs for a promotion matrix.
-The current release matrix passes three FP32 seeds at 94.69% to 98.33% of
-synchronized-reference learning progress. On seed 1338, FP16 and blockwise
-int8/256 retain 94.69% and 94.68% progress while reducing local gradient
-payload to 50.0% and 25.6% of FP32. All conditions use the same release
-executable, enforce the 90% convergence gate, match the codec-aware protocol
-oracle exactly, and record zero hard DiLoCo request failures.
+Repeat with distinct seeds for a promotion matrix. The corrected FP32 matrix
+passes three seeds at 91.63%-94.10% of synchronized-reference trailing
+learning progress in release profile, with monotonic validation and no hard
+request failure. The untouched seed-1339 holdout achieved 92.89% trailing
+progress. Across the matched three-seed matrix, FP16 changed mean final CE by
+`+0.0000061`, reduced estimated wire payload from 21,676,512 to 10,838,256
+bytes per run, and changed mean aggregate peer-step throughput from 1.031 to
+1.014 steps/s on loopback. FP16 remains opt-in pending constrained-link and
+browser measurements.
 
 The complete local methodology and current production blockers are tracked in
 [P2P production readiness](../../docs/p2p-production-readiness.md).

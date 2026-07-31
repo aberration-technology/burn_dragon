@@ -50,6 +50,16 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(initialization) = &overrides.initialization {
         model_config.initialization = initialization.clone();
     }
+    if let Some(random_scaffold) = &overrides.random_scaffold {
+        random_scaffold
+            .validate_for_model(
+                model_config.n_embd,
+                model_config.n_head,
+                model_config.latent_total(),
+            )
+            .unwrap_or_else(|message| panic!("invalid model.random_scaffold override: {message}"));
+        model_config.random_scaffold = random_scaffold.clone();
+    }
     if let Some(sequence_kernel) = overrides.sequence_kernel {
         sequence_kernel
             .validate()

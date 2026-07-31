@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::data::dataloader::batcher::Batcher;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
-use burn::train::{Learner, LearningComponentsMarker};
+use burn::train::LearningComponentsMarker;
 use burn_dragon_language::api::checkpoint::apply_init_checkpoint_to_language_core;
 use burn_dragon_language::api::inference::build_model_config_with_tokenizer;
 use burn_dragon_language::config::ValidationDatasetConfig;
@@ -30,7 +30,8 @@ use burn_dragon_train::train::metrics::{
 use burn_dragon_train::train::pipeline::ResolvedLrScheduler;
 use burn_p2p::burn::{
     BurnLearnerDataPipeline, BurnLearnerProject, BurnLearnerProjectBuilder, BurnTrainLoader,
-    BurnValidationLoader, BurnWorkloadAdapter, connect, from_learner, from_loaders,
+    BurnValidationLoader, BurnWorkloadAdapter, connect, from_stateful_components,
+    from_stateful_loaders,
 };
 use burn_p2p::{
     DatasetViewId, EvalSplit, GeneratedWorkloadInputProvider, LeaseDataPipeline,
@@ -52,9 +53,17 @@ use crate::capability_state::{
 use crate::config::{
     DragonExistingShardDatasetConfig, DragonExperimentKind, DragonManifestBundle,
     DragonNativeAuthBundle, DragonNativePeerConfig, DragonShardExportConfig, TokenWindowRecord,
+    dragon_model_schema_hash,
 };
 use crate::manifests::build_manifest_bundle;
 use crate::profile::resolve_native_training_profile;
+use crate::random_scaffold::{
+    DragonRandomScaffoldP2pContract, apply_random_scaffold_update,
+    dragon_random_scaffold_p2p_contract, load_random_scaffold_genesis, load_random_scaffold_head,
+    materialize_random_scaffold_genesis, materialize_random_scaffold_head,
+    materialize_random_scaffold_update, random_scaffold_genesis_materialization,
+    validate_random_scaffold_update,
+};
 
 pub type DragonLearningComponents<B> =
     LearningComponentsMarker<B, ResolvedLrScheduler, LanguageTrainModel<B>, LanguageOptimizer<B>>;
@@ -70,11 +79,71 @@ pub type DragonNodeBuilder<B> = NodeBuilder<SelectedWorkloadProject<DragonProjec
 fn attach_dragon_workload_update_applier<B>(
     builder: DragonLearnerProjectBuilder<B>,
     config: &TrainingConfig,
+    random_scaffold: Option<&DragonRandomScaffoldP2pContract>,
 ) -> DragonLearnerProjectBuilder<B>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    if let Some(random_scaffold) = random_scaffold {
+        let materialize_catalog = random_scaffold.catalog.clone();
+        let apply_catalog = random_scaffold.catalog.clone();
+        let validate_catalog = random_scaffold.catalog.clone();
+        let materialize_genesis_contract = random_scaffold.clone();
+        let load_genesis_contract = random_scaffold.clone();
+        let materialize_head_contract = random_scaffold.clone();
+        let load_head_contract = random_scaffold.clone();
+        return builder
+            .with_genesis_materializer(move |context| {
+                materialize_random_scaffold_genesis::<B>(context, &materialize_genesis_contract)
+            })
+            .with_genesis_loader(move |model, context| {
+                load_random_scaffold_genesis::<B>(model, context, &load_genesis_contract)
+            })
+            .with_model_artifact_materializer(
+                move |model, artifact_kind, head_id, base_head_id, store, model_schema_hash| {
+                    materialize_random_scaffold_head::<B>(
+                        model,
+                        artifact_kind,
+                        head_id,
+                        base_head_id,
+                        store,
+                        model_schema_hash,
+                        &materialize_head_contract,
+                    )
+                },
+            )
+            .with_model_artifact_loader(
+                move |model, descriptor, store, device, model_schema_hash| {
+                    load_random_scaffold_head::<B>(
+                        model,
+                        descriptor,
+                        store,
+                        device,
+                        model_schema_hash,
+                        &load_head_contract,
+                    )
+                },
+            )
+            .with_workload_update_materializer(move |context| {
+                materialize_random_scaffold_update::<B>(context, &materialize_catalog)
+            })
+            .with_workload_update_applier(
+                move |base_model, descriptor, envelope, contract, store, _device| {
+                    apply_random_scaffold_update::<B>(
+                        base_model,
+                        descriptor,
+                        envelope,
+                        contract,
+                        store,
+                        &apply_catalog,
+                    )
+                },
+            )
+            .with_workload_update_validator(move |base_model, context| {
+                validate_random_scaffold_update::<B>(base_model, context, &validate_catalog)
+            });
+    }
     if config.optimizer.name != burn_dragon_train::OptimizerKind::Eggroll {
         return builder;
     }
@@ -169,6 +238,7 @@ where
     pub footprint: DragonTrainingFootprint,
     pub target_decision: DragonNativeTargetDecision,
     pub capability_reprobe_policy: crate::config::DragonNativeCapabilityReprobePolicy,
+    pub genesis_materialization: burn_p2p::GenesisMaterialization,
 }
 
 impl<B> PreparedNativePeer<B>
@@ -397,6 +467,10 @@ impl TokenWindowBatcher {
             .max(1);
         let mut inputs = Vec::with_capacity(batch_size * block_size);
         let mut targets = Vec::with_capacity(batch_size * block_size);
+        let mut loss_mask = items
+            .iter()
+            .any(|item| item.loss_mask.is_some())
+            .then(|| Vec::with_capacity(batch_size * block_size));
         for item in items {
             assert_eq!(
                 item.inputs.len(),
@@ -408,6 +482,20 @@ impl TokenWindowBatcher {
                 block_size,
                 "token-window target lengths must match within one stream batch"
             );
+            if let Some(item_loss_mask) = item.loss_mask.as_ref() {
+                assert_eq!(
+                    item_loss_mask.len(),
+                    block_size,
+                    "token-window loss-mask lengths must match inputs and targets"
+                );
+            }
+            if let Some(batch_loss_mask) = loss_mask.as_mut() {
+                if let Some(item_loss_mask) = item.loss_mask.as_ref() {
+                    batch_loss_mask.extend(item_loss_mask);
+                } else {
+                    batch_loss_mask.extend(std::iter::repeat_n(1, block_size));
+                }
+            }
             inputs.extend(item.inputs);
             targets.extend(item.targets);
         }
@@ -427,7 +515,12 @@ impl TokenWindowBatcher {
                 TensorData::new(targets, [batch_size, block_size]),
                 device,
             ),
-            loss_mask: None,
+            loss_mask: loss_mask.map(|loss_mask| {
+                Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(loss_mask, [batch_size, block_size]),
+                    device,
+                )
+            }),
             summary_event_mask,
             ruliad_policy_batch: None,
             reset_stream_state,
@@ -926,6 +1019,8 @@ fn window_records_from_dataset(
     for (group_id, document_group_start) in (0..num_documents).step_by(batch_size).enumerate() {
         let group_rows = (num_documents - document_group_start).min(batch_size);
         for chunk_index in 0..chunks_per_document {
+            let mut chunk_records = Vec::with_capacity(group_rows);
+            let mut chunk_has_supervision = !dataset.uses_target_loss_mask();
             for stream_row in 0..group_rows {
                 let document_index = document_group_start + stream_row;
                 let start = offset
@@ -933,20 +1028,36 @@ fn window_records_from_dataset(
                     + chunk_index.saturating_mul(block_size);
                 let mut sample = vec![0_u32; block_size + 1];
                 dataset.copy_token_range(start, &mut sample);
-                records.push(TokenWindowRecord {
+                let loss_mask = dataset.uses_target_loss_mask().then(|| {
+                    let mut mask = vec![0_i64; block_size];
+                    dataset.target_loss_mask_for_window(&sample, &mut mask);
+                    mask
+                });
+                chunk_has_supervision |= loss_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.iter().any(|weight| *weight != 0));
+                chunk_records.push(TokenWindowRecord {
                     inputs: sample[..block_size]
                         .iter()
                         .map(|token| *token as i64)
                         .collect(),
                     targets: sample[1..].iter().map(|token| *token as i64).collect(),
+                    loss_mask,
                     reset_stream_state: chunk_index == 0,
                     stream_group_id: Some(group_id as u64),
                     stream_row: Some(stream_row),
                     chunk_index: Some(chunk_index),
                 });
-                if max_records.is_some_and(|limit| records.len() >= limit) {
-                    return records;
-                }
+            }
+            if !chunk_has_supervision {
+                continue;
+            }
+            if max_records.is_some_and(|limit| records.len() + chunk_records.len() > limit) {
+                return records;
+            }
+            records.extend(chunk_records);
+            if max_records.is_some_and(|limit| records.len() >= limit) {
+                return records;
             }
         }
     }
@@ -1008,7 +1119,7 @@ where
         &shard_export.root,
         &records,
         config,
-        "dragon-bounded-stream-segment-balanced-v2",
+        "dragon-bounded-stream-segment-balanced-v3-target-masks",
         |record_index, record| {
             stream_segment_partition_key(record_index, record, max_train_batches)
         },
@@ -1076,14 +1187,18 @@ where
     )
 }
 
-fn build_language_learner<B>(
+fn build_language_learning_components<B>(
     config: &TrainingConfig,
     backend_label: &str,
     model_config: &DragonConfig,
     total_steps: usize,
     scheduler_iters: Option<usize>,
     device: &B::Device,
-) -> Result<Learner<DragonLearningComponents<B>>>
+) -> Result<(
+    LanguageTrainModel<B>,
+    LanguageOptimizer<B>,
+    ResolvedLrScheduler,
+)>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
@@ -1118,7 +1233,7 @@ where
         scheduler_iters,
         model_config,
     )?;
-    Ok(Learner::new(model, optimizer, scheduler))
+    Ok((model, optimizer, scheduler))
 }
 
 fn shard_dataset_upstream(
@@ -1251,7 +1366,9 @@ where
     let footprint = capability_assessment.footprint.clone();
     let target_decision = capability_assessment.target_decision.clone();
 
-    let (project, dataset_view_id) = if let Some(existing_shards) = use_existing_shards {
+    let (project, dataset_view_id, random_scaffold) = if let Some(existing_shards) =
+        use_existing_shards
+    {
         let sharded = burn_p2p::burn::BurnShardedDataset::<TokenWindowRecord>::read_local(
             &existing_shards.root,
         )?;
@@ -1270,7 +1387,7 @@ where
         };
         let tokenizer = load_tokenizer_without_dataset(&config)?;
         let summary_event_token_ids = summary_event_token_ids_for_tokenizer(tokenizer.as_ref());
-        let learner = build_language_learner::<B>(
+        let (model, optimizer, scheduler) = build_language_learning_components::<B>(
             &config,
             backend_label,
             &model_config,
@@ -1278,30 +1395,36 @@ where
             scheduler_iters,
             &device,
         )?;
+        let random_scaffold = dragon_random_scaffold_p2p_contract::<B>(
+            &model,
+            dragon_model_schema_hash(&model_config),
+        )?;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
-        let mut builder = from_learner(learner, device.clone())
-            .with_benchmark(move |model, _device| {
-                let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
-                burn_p2p::CapabilityEstimate {
-                    preferred_backends: vec![backend_label_owned.clone()],
-                    work_units_per_second: estimated_tokens_per_second
-                        .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
-                    target_window_seconds: 30,
-                }
-            })
-            .with_step_metrics(|step_index, output, metrics| {
-                metrics.insert(
-                    "train_steps".into(),
-                    MetricValue::Integer((step_index + 1) as i64),
-                );
-                insert_train_loss_metrics(
-                    metrics,
-                    step_index,
-                    mean_loss_from_train_output_ref(output),
-                );
-                Ok(())
-            });
+        let mut builder = from_stateful_components(
+            model,
+            optimizer,
+            scheduler,
+            config.training.gradient_accumulation_steps,
+            device.clone(),
+        )
+        .with_benchmark(move |model, _device| {
+            let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
+            burn_p2p::CapabilityEstimate {
+                preferred_backends: vec![backend_label_owned.clone()],
+                work_units_per_second: estimated_tokens_per_second
+                    .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
+                target_window_seconds: 30,
+            }
+        })
+        .with_step_metrics(|step_index, output, metrics| {
+            metrics.insert(
+                "train_steps".into(),
+                MetricValue::Integer((step_index + 1) as i64),
+            );
+            insert_train_loss_metrics(metrics, step_index, mean_loss_from_train_output_ref(output));
+            Ok(())
+        });
         if let Some(validation_loader) = prepare_validation_loader_only::<B>(
             &config,
             &device,
@@ -1330,10 +1453,11 @@ where
             config.training.max_iters,
             summary_event_token_ids,
         )?;
-        builder = attach_dragon_workload_update_applier(builder, &config);
+        builder = attach_dragon_workload_update_applier(builder, &config, random_scaffold.as_ref());
         (
             builder.build()?,
             sharded.registration().view.dataset_view_id.clone(),
+            random_scaffold,
         )
     } else {
         let datasets = prepare_datasets(&config.dataset, &config.training)?;
@@ -1361,7 +1485,7 @@ where
             &valid_device,
             summary_event_token_ids.clone(),
         );
-        let learner = build_language_learner::<B>(
+        let (model, optimizer, scheduler) = build_language_learning_components::<B>(
             &config,
             backend_label,
             &model_config,
@@ -1369,38 +1493,50 @@ where
             scheduler_iters,
             &device,
         )?;
+        let random_scaffold = dragon_random_scaffold_p2p_contract::<B>(
+            &model,
+            dragon_model_schema_hash(&model_config),
+        )?;
         let validation_for_eval = validation_loader.clone();
         let max_eval_batches = native.training_overrides.max_eval_batches;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
         let source_selection_dataset = Arc::clone(&datasets.train);
-        let mut builder = from_loaders(learner, device.clone(), train_loader, validation_loader)
-            .with_benchmark(move |model, _device| {
-                let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
-                burn_p2p::CapabilityEstimate {
-                    preferred_backends: vec![backend_label_owned.clone()],
-                    work_units_per_second: estimated_tokens_per_second
-                        .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
-                    target_window_seconds: 30,
-                }
-            })
-            .with_evaluate(move |model, split| {
-                language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
-            })
-            .with_step_metrics(move |step_index, output, metrics| {
-                let train_loss = mean_loss_from_train_output_ref(output);
-                metrics.insert(
-                    "train_steps".into(),
-                    MetricValue::Integer((step_index + 1) as i64),
-                );
-                insert_train_loss_metrics(metrics, step_index, train_loss);
-                if let Some(snapshot) = source_selection_dataset
-                    .record_source_selection_loss(step_index, train_loss as f32)
-                {
-                    insert_ruliad_source_selection_metrics(metrics, &snapshot);
-                }
-                Ok(())
-            });
+        let mut builder = from_stateful_loaders(
+            model,
+            optimizer,
+            scheduler,
+            config.training.gradient_accumulation_steps,
+            device.clone(),
+            train_loader,
+            validation_loader,
+        )
+        .with_benchmark(move |model, _device| {
+            let inventory = burn_p2p::burn::inspect_module::<B, _>(model);
+            burn_p2p::CapabilityEstimate {
+                preferred_backends: vec![backend_label_owned.clone()],
+                work_units_per_second: estimated_tokens_per_second
+                    .max((inventory.total_scalar_parameters.max(1) as f64).sqrt()),
+                target_window_seconds: 30,
+            }
+        })
+        .with_evaluate(move |model, split| {
+            language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
+        })
+        .with_step_metrics(move |step_index, output, metrics| {
+            let train_loss = mean_loss_from_train_output_ref(output);
+            metrics.insert(
+                "train_steps".into(),
+                MetricValue::Integer((step_index + 1) as i64),
+            );
+            insert_train_loss_metrics(metrics, step_index, train_loss);
+            if let Some(snapshot) =
+                source_selection_dataset.record_source_selection_loss(step_index, train_loss as f32)
+            {
+                insert_ruliad_source_selection_metrics(metrics, &snapshot);
+            }
+            Ok(())
+        });
 
         let exported_dataset_view_id = if let Some(shard_export) = &native.shard_export {
             let (next_builder, dataset_view_id) = attach_sharded_dataset::<B>(
@@ -1417,13 +1553,14 @@ where
         } else {
             None
         };
-        builder = attach_dragon_workload_update_applier(builder, &config);
+        builder = attach_dragon_workload_update_applier(builder, &config, random_scaffold.as_ref());
         (
             builder.build()?,
             match exported_dataset_view_id {
                 Some(dataset_view_id) => dataset_view_id,
                 None => inline_dataset_view_id(&datasets.train)?,
             },
+            random_scaffold,
         )
     };
 
@@ -1437,12 +1574,28 @@ where
     if !effective_seed_node_urls.is_empty() {
         manifest_seed.bootstrap_addrs = effective_seed_node_urls;
     }
+    if let Some(random_scaffold) = &random_scaffold {
+        let mutable_parameter_count = random_scaffold.catalog.parameter_count()?;
+        log::info!(
+            "random-scaffold P2P contract: scaffold={} mutable_params={} frozen_params={} encoding={:?}",
+            random_scaffold.scaffold_contract_hash.as_str(),
+            mutable_parameter_count,
+            random_scaffold.frozen_parameter_count,
+            manifest_seed.random_scaffold_update_encoding,
+        );
+    }
+    let genesis_materialization = random_scaffold
+        .as_ref()
+        .map(random_scaffold_genesis_materialization)
+        .transpose()?
+        .unwrap_or_default();
     let manifests = build_manifest_bundle(
         &manifest_seed,
         experiment_kind,
         backend_label,
         &model_config,
         Some(&config),
+        random_scaffold.as_ref().map(|contract| &contract.catalog),
         &resolved.profile,
         dataset_view_id,
         &footprint,
@@ -1576,6 +1729,7 @@ where
         footprint,
         target_decision,
         capability_reprobe_policy: native.capability_policy.native_reprobe.clone(),
+        genesis_materialization,
     })
 }
 
@@ -1595,6 +1749,7 @@ mod tests {
         TokenWindowRecord {
             inputs: vec![token, token + 1],
             targets: vec![token + 1, token + 2],
+            loss_mask: None,
             reset_stream_state: reset,
             stream_group_id: group,
             stream_row: row,
@@ -1634,6 +1789,26 @@ mod tests {
                 .into_vec::<i64>()
                 .expect("tokens"),
             vec![30, 31, 31, 32]
+        );
+    }
+
+    #[test]
+    fn sharded_batches_preserve_loss_masks_and_default_legacy_rows_to_supervised() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let batcher = TokenWindowBatcher::new(None);
+        let mut masked = record(Some(7), Some(0), Some(0), 10, true);
+        masked.loss_mask = Some(vec![1, 0]);
+        let legacy = record(Some(7), Some(1), Some(0), 20, true);
+        let batch = batcher.batch_items::<NdArray<f32>>(vec![masked, legacy], true, &device);
+
+        assert_eq!(
+            batch
+                .loss_mask
+                .expect("mixed masked and legacy rows should emit a mask")
+                .into_data()
+                .into_vec::<i64>()
+                .expect("mask values"),
+            vec![1, 0, 1, 1]
         );
     }
 

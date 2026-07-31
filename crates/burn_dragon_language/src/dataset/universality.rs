@@ -1389,6 +1389,31 @@ impl UniversalityDataset {
         self
     }
 
+    fn emits_target_loss_mask(&self) -> bool {
+        self.ruliad_supervision.uses_target_loss_mask() || self.tokenizer.eos_id().is_some()
+    }
+
+    fn fill_target_loss_mask(
+        &self,
+        window: &[u32],
+        mask: &mut [i64],
+        supervision: RuliadSupervisionConfig,
+    ) -> bool {
+        let valid = if supervision.uses_target_loss_mask() {
+            ruliad_target_loss_mask(window, mask, supervision)
+        } else if window.len() >= mask.len().saturating_add(1) {
+            mask.fill(1);
+            !mask.is_empty()
+        } else {
+            mask.fill(0);
+            false
+        };
+        if !valid {
+            return false;
+        }
+        mask_fixed_document_eos_padding(window, mask, self.tokenizer.eos_id())
+    }
+
     fn effective_ruliad_supervision(
         &self,
         split: DatasetSplit,
@@ -2031,14 +2056,13 @@ impl TokenSequenceDataset for UniversalityDataset {
             batch_size,
             block_size,
         )?;
-        let emit_masks =
-            self.ruliad_supervision.uses_target_loss_mask() || supervision.uses_target_loss_mask();
+        let emit_masks = self.emits_target_loss_mask() || supervision.uses_target_loss_mask();
         let masks = emit_masks.then(|| {
             windows
                 .iter()
                 .map(|window| {
                     let mut mask = vec![0; block_size];
-                    ruliad_target_loss_mask(window, &mut mask, supervision);
+                    self.fill_target_loss_mask(window, &mut mask, supervision);
                     mask
                 })
                 .collect::<Vec<_>>()
@@ -2123,8 +2147,7 @@ impl TokenSequenceDataset for UniversalityDataset {
     ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
         let supervision = self.effective_ruliad_supervision(split, epoch_index, absolute_step);
         let prefer_answer_window = matches!(supervision.mode, RuliadSupervisionMode::AnswerWindow);
-        let emit_loss_masks =
-            self.ruliad_supervision.uses_target_loss_mask() || supervision.uses_target_loss_mask();
+        let emit_loss_masks = self.emits_target_loss_mask() || supervision.uses_target_loss_mask();
         match (split, &self.storage) {
             (DatasetSplit::Train, UniversalityStorage::OnTheFly(storage)) => storage
                 .source_selected_stream_token_windows_with_loss_masks(
@@ -2167,14 +2190,11 @@ impl TokenSequenceDataset for UniversalityDataset {
     }
 
     fn uses_target_loss_mask(&self) -> bool {
-        self.ruliad_supervision.uses_target_loss_mask()
+        self.emits_target_loss_mask()
     }
 
     fn target_loss_mask_for_window(&self, window: &[u32], mask: &mut [i64]) -> bool {
-        if !self.ruliad_supervision.uses_target_loss_mask() {
-            return false;
-        }
-        ruliad_target_loss_mask(window, mask, self.ruliad_supervision)
+        self.fill_target_loss_mask(window, mask, self.ruliad_supervision)
     }
 
     fn preferred_logical_document_tokens(&self, _split: DatasetSplit) -> Option<usize> {
@@ -3128,6 +3148,28 @@ fn valid_document_token_count(document: &[u32], eos_id: Option<u32>) -> usize {
         .min(document.len())
 }
 
+fn mask_fixed_document_eos_padding(window: &[u32], mask: &mut [i64], eos_id: Option<u32>) -> bool {
+    let Some(eos_id) = eos_id else {
+        return mask.iter().any(|value| *value != 0);
+    };
+    if window.len() < mask.len().saturating_add(1) {
+        mask.fill(0);
+        return false;
+    }
+
+    let mut document_ended = window.first() == Some(&eos_id);
+    for (target_index, weight) in mask.iter_mut().enumerate() {
+        if document_ended {
+            *weight = 0;
+            continue;
+        }
+        if window[target_index + 1] == eos_id {
+            document_ended = true;
+        }
+    }
+    mask.iter().any(|value| *value != 0)
+}
+
 fn selected_window_start<R: Rng + ?Sized>(
     document: &[u32],
     usable_len: usize,
@@ -3826,6 +3868,52 @@ mod tests {
         dataset
             .decode_ruliad_payload_tokens(&masked_tokens, true)
             .unwrap_or_else(|| masked_ascii_targets(targets, mask))
+    }
+
+    #[test]
+    fn fixed_document_padding_mask_keeps_first_eos_and_suppresses_fill() {
+        let mut mask = vec![1, 3, 2, 4];
+        assert!(mask_fixed_document_eos_padding(
+            &[10, 11, 271, 271, 271],
+            &mut mask,
+            Some(271),
+        ));
+        assert_eq!(mask, vec![1, 3, 0, 0]);
+
+        let mut padding_only = vec![1; 4];
+        assert!(!mask_fixed_document_eos_padding(
+            &[271; 5],
+            &mut padding_only,
+            Some(271),
+        ));
+        assert_eq!(padding_only, vec![0; 4]);
+    }
+
+    #[test]
+    fn full_document_universality_emits_eos_padding_loss_masks() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad.toml");
+        fs::write(
+            &config_path,
+            toml::to_string_pretty(&fixed_ruliad_runtime_config()).expect("toml"),
+        )
+        .expect("write config");
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load ruliad dataset");
+
+        assert!(TokenSequenceDataset::uses_target_loss_mask(&dataset));
+        let mut mask = vec![0; 4];
+        assert!(TokenSequenceDataset::target_loss_mask_for_window(
+            &dataset,
+            &[10, 11, 50_256, 50_256, 50_256],
+            &mut mask,
+        ));
+        assert_eq!(mask, vec![1, 1, 0, 0]);
     }
 
     #[test]

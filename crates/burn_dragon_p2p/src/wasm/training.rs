@@ -11,6 +11,7 @@ use burn::optim::{AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Opt
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
+use burn_dragon_core::objective::masked_token_mean;
 use burn_dragon_core::{DragonModel, ModelState};
 use burn_dragon_eggroll::{
     AntitheticFitness, EggrollModuleOptimizerState, apply_antithetic_update_with_allowed_param_ids,
@@ -47,9 +48,11 @@ use crate::auth::{
 };
 use crate::browser_data::deterministic_sample_indices;
 use crate::browser_record::{
-    BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_record_format_name,
+    BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_random_scaffold_contract,
+    browser_random_scaffold_tensor_digest_from_mutable, browser_record_format_name,
     browser_record_precision_descriptor, encode_browser_record_bytes,
-    load_browser_active_head_model, verify_browser_genesis_tensor_digest,
+    flatten_browser_random_scaffold_mutable, load_browser_active_head_model,
+    load_browser_genesis_model, verify_browser_signed_genesis_tensor_digest,
 };
 use crate::capability::{decide_browser_capability, detect_browser_host_capabilities};
 #[cfg(target_arch = "wasm32")]
@@ -134,6 +137,7 @@ pub struct DragonBrowserLiveParticipantResult {
 struct TokenWindowBatch<B: Backend> {
     inputs: Tensor<B, 2, Int>,
     targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
     token_count: usize,
     batch_digest: ContentId,
     record_digests: Vec<ContentId>,
@@ -602,6 +606,12 @@ fn browser_canonical_artifact_publication_decision(
     )
 }
 
+fn browser_uses_compact_update(config: &DragonBrowserTrainingConfig) -> bool {
+    config.optimizer.is_forward_only()
+        || (matches!(config.optimizer, DragonBrowserOptimizerConfig::Adamw)
+            && config.model_config.random_scaffold.enabled)
+}
+
 fn browser_canonical_artifact_publication_decision_for_platform(
     requested: bool,
     backend_kind: BrowserTrainingBackendKind,
@@ -1041,7 +1051,7 @@ where
     let artifact_publication_decision = browser_canonical_artifact_publication_decision(
         requested_canonical_update,
         context.backend_kind,
-        context.config.optimizer.is_forward_only(),
+        browser_uses_compact_update(context.config),
     );
     if artifact_publication_decision.should_publish && !load_active_head {
         bail!("browser canonical artifact publication requires loading the active head artifact");
@@ -1101,16 +1111,34 @@ where
         if let Some(contract) = revision_contract
             && descriptor == contract.genesis.payload.payload.artifact
         {
-            verify_browser_genesis_tensor_digest(
+            let genesis = &contract.genesis.payload.payload;
+            verify_browser_signed_genesis_tensor_digest(
                 &context.config.model_config,
                 &descriptor,
                 &bytes,
-                &contract.genesis.payload.payload.tensor_digest,
+                &contract.training_contract_id,
+                &contract.training,
+                &genesis.materialization,
+                &genesis.tensor_digest,
             )
             .context("verify decoded browser genesis tensors")?;
         }
         active_model_schema_hash = Some(descriptor.model_schema_hash.clone());
-        model = load_browser_active_head_model(model, &descriptor, bytes, device)?;
+        model = if let Some(contract) = revision_contract
+            && descriptor == contract.genesis.payload.payload.artifact
+        {
+            load_browser_genesis_model(
+                model,
+                &descriptor,
+                bytes,
+                &contract.training_contract_id,
+                &contract.training,
+                &contract.genesis.payload.payload.materialization,
+                device,
+            )?
+        } else {
+            load_browser_active_head_model(model, &descriptor, bytes, device)?
+        };
         info!(
             "browser training loaded active head artifact: head_id={} artifact_id={}",
             head_id.as_str(),
@@ -1276,6 +1304,15 @@ where
             Some(match compact_trace.as_ref() {
                 Some(trace) => {
                     browser_training_compact_update(&context, live, trace, model_schema_hash)?
+                }
+                None if context.config.model_config.random_scaffold.enabled => {
+                    browser_training_mutable_subset_update(
+                        &context,
+                        live,
+                        &model,
+                        model_schema_hash,
+                    )
+                    .await?
                 }
                 None => BrowserPublishedUpdate {
                     artifact: browser_training_head_artifact(
@@ -1783,6 +1820,15 @@ fn validate_token_records(records: &[TokenWindowRecord], block_size: usize) -> R
                 block_size
             );
         }
+        if let Some(loss_mask) = record.loss_mask.as_ref()
+            && loss_mask.len() != block_size
+        {
+            bail!(
+                "token window record {index} loss-mask length {} does not match block_size {}",
+                loss_mask.len(),
+                block_size
+            );
+        }
     }
     Ok(())
 }
@@ -1829,12 +1875,23 @@ fn build_batch_from_records<B: Backend>(
 ) -> Result<TokenWindowBatch<B>> {
     let mut inputs = Vec::with_capacity(records.len() * block_size);
     let mut targets = Vec::with_capacity(records.len() * block_size);
+    let mut loss_mask = records
+        .iter()
+        .any(|record| record.loss_mask.is_some())
+        .then(|| Vec::with_capacity(records.len() * block_size));
     for record in records {
         inputs.extend(record.inputs.iter().copied());
         targets.extend(record.targets.iter().copied());
+        if let Some(batch_loss_mask) = loss_mask.as_mut() {
+            if let Some(record_loss_mask) = record.loss_mask.as_ref() {
+                batch_loss_mask.extend(record_loss_mask);
+            } else {
+                batch_loss_mask.extend(std::iter::repeat_n(1, block_size));
+            }
+        }
     }
     let batch_digest = ContentId::derive(&(
-        "dragon-token-window-batch-v2",
+        "dragon-token-window-batch-v3-target-mask",
         records,
         block_size,
         reset_stream_state,
@@ -1852,6 +1909,12 @@ fn build_batch_from_records<B: Backend>(
             TensorData::new(targets, [records.len(), block_size]),
             device,
         ),
+        loss_mask: loss_mask.map(|loss_mask| {
+            Tensor::<B, 2, Int>::from_data(
+                TensorData::new(loss_mask, [records.len(), block_size]),
+                device,
+            )
+        }),
         token_count: records.len() * block_size,
         batch_digest,
         record_digests,
@@ -1902,13 +1965,21 @@ fn visit_browser_next_token_chunks<B: Backend>(
         let end = (start + chunk_size).min(block_size);
         let inputs = batch.inputs.clone().slice([0..batch_size, start..end]);
         let targets = batch.targets.clone().slice([0..batch_size, start..end]);
+        let loss_mask = batch
+            .loss_mask
+            .clone()
+            .map(|mask| mask.slice([0..batch_size, start..end]));
         let hidden = model.forward_hidden_with_state(inputs, state);
         let chunk_weight = (end - start) as f32 / block_size.max(1) as f32;
-        visit(
-            model
-                .language_loss_from_hidden(hidden, targets)
-                .mul_scalar(chunk_weight),
-        );
+        let loss = if let Some(loss_mask) = loss_mask {
+            masked_token_mean(
+                model.language_token_losses_from_hidden(hidden, targets),
+                Some(loss_mask),
+            )
+        } else {
+            model.language_loss_from_hidden(hidden, targets)
+        };
+        visit(loss.mul_scalar(chunk_weight));
         if end < block_size {
             state.detach_in_place();
         }
@@ -2127,6 +2198,107 @@ fn browser_training_compact_update(
     })
 }
 
+async fn browser_training_mutable_subset_update<B: Backend>(
+    context: &BrowserTrainingRunContext<'_>,
+    live: &LiveBrowserParticipantHandle,
+    model: &DragonModel<B>,
+    model_schema_hash: ContentId,
+) -> Result<BrowserPublishedUpdate>
+where
+    DragonModel<B>: Module<B>,
+{
+    let contract = live.revision_contract.as_ref().ok_or_else(|| {
+        anyhow!("browser mutable-subset publication requires a signed revision contract")
+    })?;
+    let lease = context.config.training_lease.as_ref().ok_or_else(|| {
+        anyhow!("browser mutable-subset publication requires an active training lease")
+    })?;
+    let base_head_id = live
+        .session_runtime
+        .runtime
+        .storage
+        .last_head_id
+        .clone()
+        .ok_or_else(|| anyhow!("browser mutable-subset publication requires a synced base head"))?;
+    ensure!(
+        model_schema_hash == contract.training.model_schema_hash,
+        "browser mutable-subset model schema does not match signed contract"
+    );
+    let burn_p2p::UpdateCodec::MutableSubsetParameters {
+        parameter_catalog_hash,
+        parameter_count,
+        encoding,
+    } = &contract.training.update_codec
+    else {
+        bail!("browser random-scaffold AdamW requires the mutable-subset update codec");
+    };
+    let scaffold = browser_random_scaffold_contract(model, model_schema_hash.clone())?
+        .ok_or_else(|| anyhow!("browser mutable-subset update requires random-scaffold mode"))?;
+    ensure!(
+        parameter_catalog_hash == &scaffold.catalog.catalog_id()?
+            && *parameter_count == scaffold.catalog.parameter_count()?,
+        "browser mutable-subset catalog does not match signed contract"
+    );
+    let values = flatten_browser_random_scaffold_mutable(model, &scaffold).await?;
+    let encoded = CompactScalarVector::encode(&values, *encoding)?;
+    let decoded = encoded.decode()?;
+    let decoded_tensor_digest = browser_random_scaffold_tensor_digest_from_mutable(
+        &context.config.model_config,
+        model_schema_hash.clone(),
+        &decoded,
+    )?;
+    let payload = CompactUpdatePayload {
+        version: COMPACT_UPDATE_PAYLOAD_VERSION,
+        training_contract_id: contract.training_contract_id.clone(),
+        model_schema_hash: model_schema_hash.clone(),
+        parameter_catalog_hash: scaffold.catalog.catalog_id()?,
+        parameter_count: scaffold.catalog.parameter_count()?,
+        body: CompactUpdateBody::MutableSubsetParameters { values: encoded },
+    };
+    let bytes = burn_p2p_workload::encode_compact_update(
+        &payload,
+        &contract.training_contract_id,
+        &contract.training,
+    )
+    .context("encode browser mutable-subset update")?;
+    let precision = match encoding {
+        CompactScalarEncoding::Fp32 => "mutable-subset-fp32",
+        CompactScalarEncoding::SymmetricInt8 => "mutable-subset-int8",
+        CompactScalarEncoding::SymmetricInt16 => "mutable-subset-int16",
+    };
+    let descriptor = build_artifact_descriptor_from_bytes(
+        &ArtifactBuildSpec::new(
+            ArtifactKind::DeltaPack,
+            Precision::Custom(precision.into()),
+            model_schema_hash,
+            "burn-p2p-compact-update-cbor-v1",
+        )
+        .with_base_head(base_head_id.clone()),
+        &bytes,
+        ChunkingScheme::new(256 * 1024)?,
+    )
+    .map_err(|error| anyhow!("failed to materialize browser mutable-subset update: {error}"))?;
+    let workload_update = WorkloadUpdateEnvelope {
+        training_contract_id: contract.training_contract_id.clone(),
+        revision_id: contract.revision.revision_id.clone(),
+        base_head_id,
+        window_id: lease.window_id,
+        lease_id: lease.lease_id.clone(),
+        codec: contract.training.update_codec.clone(),
+        artifact: descriptor.clone(),
+        decoded_tensor_digest: Some(decoded_tensor_digest),
+        claimed_norm_stats: None,
+        claimed_feature_sketch: None,
+    };
+    workload_update
+        .validate_against(&contract.training_contract_id, &contract.training)
+        .context("validate browser mutable-subset update envelope")?;
+    Ok(BrowserPublishedUpdate {
+        artifact: materialize_browser_training_artifact(descriptor, bytes)?,
+        workload_update: Some(workload_update),
+    })
+}
+
 fn browser_training_contribution(
     context: &BrowserTrainingRunContext<'_>,
     stats: BrowserTrainingContributionStats,
@@ -2148,7 +2320,7 @@ fn browser_training_contribution(
     let artifact_publication_decision = browser_canonical_artifact_publication_decision(
         requested_canonical_update,
         context.backend_kind,
-        context.config.optimizer.is_forward_only(),
+        browser_uses_compact_update(context.config),
     );
     let mut metadata = BTreeMap::from([
         ("contribution_kind".into(), "browser-local-window".into()),
@@ -2470,17 +2642,7 @@ fn resolve_browser_revision_contract(
     if contract.training.model_schema_hash != dragon_model_schema_hash(&config.model_config) {
         bail!("browser model config does not match the signed model schema");
     }
-    let update_codec = config
-        .optimizer
-        .update_codec()
-        .map_err(anyhow::Error::msg)?;
-    if contract.training.update_codec != update_codec {
-        bail!(
-            "browser optimizer codec {:?} does not match signed revision codec {:?}",
-            update_codec,
-            contract.training.update_codec
-        );
-    }
+    validate_browser_optimizer_contract(config, &contract)?;
     let authorized_execution = contract
         .training
         .extensions
@@ -2497,6 +2659,49 @@ fn resolve_browser_revision_contract(
         );
     }
     Ok(Some(contract))
+}
+
+fn validate_browser_optimizer_contract(
+    config: &DragonBrowserTrainingConfig,
+    contract: &burn_p2p::RevisionContractBundle,
+) -> Result<()> {
+    if matches!(config.optimizer, DragonBrowserOptimizerConfig::Adamw)
+        && config.model_config.random_scaffold.enabled
+    {
+        let burn_p2p::UpdateCodec::MutableSubsetParameters {
+            parameter_catalog_hash,
+            parameter_count,
+            ..
+        } = &contract.training.update_codec
+        else {
+            bail!("browser random-scaffold AdamW requires the mutable-subset update codec");
+        };
+        let device = burn::tensor::Device::<BrowserCpuEvalBackend>::default();
+        let model = DragonModel::<BrowserCpuEvalBackend>::new(config.model_config.clone(), &device);
+        let scaffold =
+            browser_random_scaffold_contract(&model, contract.training.model_schema_hash.clone())?
+                .ok_or_else(|| {
+                    anyhow!("browser random-scaffold model did not expose its contract")
+                })?;
+        ensure!(
+            parameter_catalog_hash == &scaffold.catalog.catalog_id()?
+                && *parameter_count == scaffold.catalog.parameter_count()?,
+            "browser random-scaffold mutable catalog does not match signed revision"
+        );
+        return Ok(());
+    }
+
+    let update_codec = config
+        .optimizer
+        .update_codec()
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        contract.training.update_codec == update_codec,
+        "browser optimizer codec {:?} does not match signed revision codec {:?}",
+        update_codec,
+        contract.training.update_codec
+    );
+    Ok(())
 }
 
 async fn finish_live_browser_participant(
@@ -2619,6 +2824,54 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn browser_batches_preserve_native_shard_loss_masks() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let masked = TokenWindowRecord {
+            inputs: vec![1, 2, 3, 4],
+            targets: vec![2, 3, 4, 5],
+            loss_mask: Some(vec![1, 1, 0, 0]),
+            reset_stream_state: true,
+            ..TokenWindowRecord::default()
+        };
+        let legacy = TokenWindowRecord {
+            inputs: vec![5, 6, 7, 8],
+            targets: vec![6, 7, 8, 9],
+            reset_stream_state: true,
+            ..TokenWindowRecord::default()
+        };
+        let batch = build_batch_from_records::<NdArray<f32>>(&[&masked, &legacy], true, 4, &device)
+            .expect("browser token batch");
+
+        assert_eq!(
+            batch
+                .loss_mask
+                .expect("mixed masked and legacy browser rows should emit a mask")
+                .into_data()
+                .into_vec::<i64>()
+                .expect("browser mask values"),
+            vec![1, 1, 0, 0, 1, 1, 1, 1]
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_records_reject_misaligned_loss_masks() {
+        let records = [TokenWindowRecord {
+            inputs: vec![1, 2, 3, 4],
+            targets: vec![2, 3, 4, 5],
+            loss_mask: Some(vec![1, 0]),
+            reset_stream_state: true,
+            ..TokenWindowRecord::default()
+        }];
+
+        assert!(
+            validate_token_records(&records, 4)
+                .expect_err("misaligned browser loss mask must fail")
+                .to_string()
+                .contains("loss-mask length")
+        );
+    }
 
     #[wasm_bindgen_test]
     fn canonical_artifact_publication_is_disabled_when_not_requested() {

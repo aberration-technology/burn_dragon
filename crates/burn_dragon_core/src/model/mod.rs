@@ -9,6 +9,7 @@ mod mhc;
 mod micro_transformer;
 mod norm;
 mod residual_stream;
+mod scaffold;
 mod sequence;
 mod state;
 mod widen;
@@ -19,10 +20,11 @@ pub use attention_residual::{
 };
 pub use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
 pub use config::{
-    ClockedSlowMemoryConfig, DragonConfig, FusedAttentionExecutor, FusedKernelConfig,
-    FusedProjectionExecutor, HierarchicalDragonConfig, HierarchicalDragonSharing,
-    LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig,
-    NextLatentTransitionConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
+    ClockedSlowMemoryConfig, DragonConfig, DragonRandomScaffoldConfig, FusedAttentionExecutor,
+    FusedKernelConfig, FusedProjectionExecutor, HierarchicalDragonConfig,
+    HierarchicalDragonSharing, LanguageHeadConfig, LatentFanoutScheduleConfig,
+    LatentReasoningConfig, NextLatentTransitionConfig, SummaryMemoryConfig,
+    YNeuronRecurrenceConfig,
 };
 pub use dragon::{
     DragonModel, LanguageModuleLrScaleTarget, LatentReasoningOutput,
@@ -68,6 +70,7 @@ pub use residual_stream::{
     lowrank_residual_memory_profile_snapshot, lowrank_residual_profile_reset,
     lowrank_residual_profile_snapshot, lowrank_residual_step, lowrank_residual_step_next,
 };
+pub use scaffold::{DragonRandomScaffoldReport, build_dragon_random_scaffold_manifest};
 pub use sequence::{
     GatedDeltaNet2Config, GatedDeltaNet2GateMode, GatedDeltaNet2Implementation,
     GatedDeltaNet2StatePrecision, MambaSequenceConfig, SequenceKernelConfig, SequenceMemorySystem,

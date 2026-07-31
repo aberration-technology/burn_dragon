@@ -1,0 +1,4 @@
+extends = "ruliad-parity.base.toml"
+
+[run_layout]
+variant = "dense"

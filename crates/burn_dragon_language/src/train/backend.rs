@@ -11,7 +11,7 @@ use crate::train::startup_autotune::{
 };
 use crate::train::utils::{build_training_execution_form, write_run_config};
 use crate::train::{resolve_dragon_language_optimizer, validate_dragon_continual_backprop};
-use crate::write_training_snapshot;
+use crate::{ensure_random_scaffold_run_manifest, write_training_snapshot};
 use burn_dragon_core::{SequenceMemorySystem, SequenceTrainingExecutor};
 use serde::Serialize;
 use std::fs;
@@ -383,7 +383,7 @@ where
         return Ok(());
     }
 
-    let valid_model = model.valid();
+    let valid_model = model.valid().materialize_random_scaffold_for_inference();
     let iterator = valid_loader.iter();
     let mut total = 0.0;
     let mut count = 0usize;
@@ -788,6 +788,21 @@ where
         &device,
         backend_name,
     )?;
+    ensure_random_scaffold_run_manifest(&base_model, &run_dir, parallel_runtime.is_primary())?;
+    if let Some(report) = base_model.random_scaffold_report() {
+        info!(
+            "random scaffold: identity={} frozen_projection_params={} trainable_adapter_params={} fp32_full_bytes={} fp32_adapter_bytes={} byte_reduction={:.2}%",
+            report
+                .manifest
+                .canonical_identity()
+                .context("random scaffold identity")?,
+            report.frozen_scaffold_elements,
+            report.trainable_adapter_elements,
+            report.fp32_size.full_model_bytes(),
+            report.fp32_size.adapter_payload_bytes(),
+            report.fp32_size.byte_reduction_fraction() * 100.0,
+        );
+    }
     let ruliad_policy_telemetry_path = training
         .ruliad_supervision
         .verifier_reward
@@ -1371,6 +1386,21 @@ where
         &device,
         backend_name,
     )?;
+    ensure_random_scaffold_run_manifest(&base_model, &run_dir, parallel_runtime.is_primary())?;
+    if let Some(report) = base_model.random_scaffold_report() {
+        info!(
+            "random scaffold: identity={} frozen_projection_params={} trainable_adapter_params={} fp32_full_bytes={} fp32_adapter_bytes={} byte_reduction={:.2}%",
+            report
+                .manifest
+                .canonical_identity()
+                .context("random scaffold identity")?,
+            report.frozen_scaffold_elements,
+            report.trainable_adapter_elements,
+            report.fp32_size.full_model_bytes(),
+            report.fp32_size.adapter_payload_bytes(),
+            report.fp32_size.byte_reduction_fraction() * 100.0,
+        );
+    }
     validate_dragon_continual_backprop(training, &base_model, parallel_runtime.world_size)?;
     let ruliad_policy_telemetry_path = training
         .ruliad_supervision

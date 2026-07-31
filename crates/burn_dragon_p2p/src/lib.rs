@@ -24,6 +24,8 @@ pub mod logging;
 pub mod manifests;
 pub mod profile;
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
+mod random_scaffold;
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
 pub(crate) mod seeded_fitness;
 pub(crate) mod stream_batch;
 

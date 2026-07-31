@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::tokenizer::TokenizerConfig;
 use burn_dragon_core::{
     AttentionResidualConfig, BlockAttentionResidualConfig, ClockedSlowMemoryConfig,
-    DragonInitializationConfig, DragonNormConfig, GatedDeltaNet2Config, HierarchicalDragonConfig,
-    LanguageHeadConfig, LatentFanoutScheduleConfig, LatentReasoningConfig, MambaSequenceConfig,
-    ManifoldHyperConnectionsConfig, NextLatentTransitionConfig, ResidualConnectorKind,
-    RotaryEmbedding, SequenceKernelConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
+    DragonInitializationConfig, DragonNormConfig, DragonRandomScaffoldConfig, GatedDeltaNet2Config,
+    HierarchicalDragonConfig, LanguageHeadConfig, LatentFanoutScheduleConfig,
+    LatentReasoningConfig, MambaSequenceConfig, ManifoldHyperConnectionsConfig,
+    NextLatentTransitionConfig, ResidualConnectorKind, RotaryEmbedding, SequenceKernelConfig,
+    SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -76,6 +77,7 @@ pub struct ModelOverrides {
     pub latent_total: Option<usize>,
     #[serde(alias = "init")]
     pub initialization: Option<DragonInitializationConfig>,
+    pub random_scaffold: Option<DragonRandomScaffoldConfig>,
     pub sequence_kernel: Option<SequenceKernelConfig>,
     pub mamba: Option<MambaSequenceConfig>,
     pub gated_deltanet2: Option<GatedDeltaNet2Config>,

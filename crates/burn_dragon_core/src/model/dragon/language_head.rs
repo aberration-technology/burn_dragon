@@ -61,17 +61,29 @@ impl<B: Backend> DragonModel<B> {
         if let Some(special) = self.nca_special_lm_head.as_ref() {
             output_head.insert(special.id);
         }
-        let mut shared_lowrank_encoder = HashSet::from([self.encoder.id, self.encoder_v.id]);
-        if let Some(encoder) = self.slow_encoder.as_ref() {
-            shared_lowrank_encoder.insert(encoder.id);
-        }
-        if let Some(encoder_v) = self.slow_encoder_v.as_ref() {
-            shared_lowrank_encoder.insert(encoder_v.id);
-        }
-        let mut shared_lowrank_decoder = HashSet::from([self.decoder.id]);
-        if let Some(decoder) = self.slow_decoder.as_ref() {
-            shared_lowrank_decoder.insert(decoder.id);
-        }
+        let (shared_lowrank_encoder, shared_lowrank_decoder) = if self.uses_random_scaffold() {
+            (
+                self.random_scaffold_encoder_param_ids()
+                    .into_iter()
+                    .collect(),
+                self.random_scaffold_decoder_param_ids()
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            let mut encoder_ids = HashSet::from([self.encoder.id, self.encoder_v.id]);
+            if let Some(encoder) = self.slow_encoder.as_ref() {
+                encoder_ids.insert(encoder.id);
+            }
+            if let Some(encoder_v) = self.slow_encoder_v.as_ref() {
+                encoder_ids.insert(encoder_v.id);
+            }
+            let mut decoder_ids = HashSet::from([self.decoder.id]);
+            if let Some(decoder) = self.slow_decoder.as_ref() {
+                decoder_ids.insert(decoder.id);
+            }
+            (encoder_ids, decoder_ids)
+        };
         let attention = Self::collect_param_ids_from_module(&self.attention);
         let mamba = Self::collect_optional_param_ids_from_module(self.mamba.as_ref());
         let gated_deltanet2 =

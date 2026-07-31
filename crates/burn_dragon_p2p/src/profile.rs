@@ -1207,6 +1207,7 @@ mod tests {
                 records: vec![TokenWindowRecord {
                     inputs: vec![1; 8],
                     targets: vec![2; 8],
+                    loss_mask: None,
                     reset_stream_state: true,
                     stream_group_id: Some(1),
                     stream_row: Some(0),

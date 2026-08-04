@@ -14,7 +14,7 @@ use burn_ecs::prelude::{
     TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry, TrainingSet, Update,
 };
 
-use crate::config::{TrainingAlgorithm, TrainingHyperparameters};
+use crate::config::{LocalPredictiveCodingSolver, TrainingAlgorithm, TrainingHyperparameters};
 use crate::dataset::Dataset;
 use crate::train::dynamics::{DragonDynamicsControlPlugin, DragonDynamicsControlSlot};
 use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
@@ -42,6 +42,20 @@ pub struct TrainingEventHandles {
 #[derive(Clone, Component)]
 struct LocalPredictiveCodingTelemetryConfig {
     profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
+    solver: LocalPredictiveCodingSolver,
+}
+
+fn local_predictive_coding_event_contract(
+    solver: LocalPredictiveCodingSolver,
+) -> (&'static str, &'static str) {
+    match solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium => {
+            ("local_factor_vjp_v1", "equilibrium_layer_activities")
+        }
+        LocalPredictiveCodingSolver::FixedPrediction => {
+            ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
+        }
+    }
 }
 
 pub fn train_loss_metric_frequency(
@@ -104,7 +118,10 @@ pub fn build_training_event_handles_with_local_predictive_coding(
         .filter(|_| matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding))
         .map(|profile| {
             profile.reset();
-            LocalPredictiveCodingTelemetryConfig { profile }
+            LocalPredictiveCodingTelemetryConfig {
+                profile,
+                solver: training.local_predictive_coding.solver,
+            }
         });
     let neuron_scaling = (training
         .neuron_scaling
@@ -215,14 +232,16 @@ fn record_local_predictive_coding_from_loss(
         if snapshot.steps == 0 {
             continue;
         }
+        let (learning_contract, observation_contract) =
+            local_predictive_coding_event_contract(config.solver);
         output.write(PredictiveCodingSample {
             run_id: sample.run_id.clone(),
             epoch: Some(sample.epoch),
             absolute_step: sample.absolute_step,
             optimizer_step: sample.absolute_step,
-            learning_contract: "local_factor_vjp_v1".to_string(),
+            learning_contract: learning_contract.to_string(),
             global_autodiff_graph: false,
-            observation_contract: "equilibrium_layer_activities".to_string(),
+            observation_contract: observation_contract.to_string(),
             deployment_aligned: false,
             chunks_seen: snapshot.steps as usize,
             chunks_corrected: snapshot.steps as usize,
@@ -447,5 +466,19 @@ mod tests {
         assert_eq!(metric.task_coverage, 0.5);
         assert_eq!(metric.contract_coverage, 0.25);
         assert!(!metric.mastered);
+    }
+
+    #[test]
+    fn local_pc_event_contract_distinguishes_error_solvers() {
+        assert_eq!(
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::SynchronousEquilibrium
+            ),
+            ("local_factor_vjp_v1", "equilibrium_layer_activities")
+        );
+        assert_eq!(
+            local_predictive_coding_event_contract(LocalPredictiveCodingSolver::FixedPrediction),
+            ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
+        );
     }
 }

@@ -4370,6 +4370,21 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn local_fixed_prediction_solver_validates_with_plain_vjp_contract() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+
+        config
+            .validate()
+            .expect("fixed-prediction local PC contract should validate");
+    }
+
+    #[test]
     fn local_predictive_coding_rejects_dropout_mismatch() {
         let mut config = parse_config("");
         config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
@@ -6687,6 +6702,10 @@ start_policy = "capability_gate"
                 crate::config::PredictiveCodingFactorReduction::Sum
             );
             assert_eq!(
+                config.training.local_predictive_coding.solver,
+                crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium
+            );
+            assert_eq!(
                 config
                     .training
                     .local_predictive_coding
@@ -6700,6 +6719,24 @@ start_policy = "capability_gate"
                 crate::config::TrainingValidationSampling::FixedHoldout
             );
         }
+    }
+
+    #[test]
+    fn local_fixed_prediction_overlay_selects_the_control_solver() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let paths = [
+            root.join("local-pc-1m.toml"),
+            root.join("pc-fixed-prediction.overlay.toml"),
+        ];
+        let config = load_training_config(&paths).expect("load fixed-prediction PC overlay");
+        config
+            .validate()
+            .expect("validate fixed-prediction PC overlay");
+        assert_eq!(
+            config.training.local_predictive_coding.solver,
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction
+        );
     }
 
     #[test]

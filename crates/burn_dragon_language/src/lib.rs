@@ -44,14 +44,14 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            LocalPredictiveCodingConfig, PcGradientNormScope, PredictiveCodingBackwardMode,
-            PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
-            PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
-            RuliadProbeGenerationConfig, SdftObjectiveConfig, SdftSdpoObjectiveConfig,
-            SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm,
-            TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
-            TrainingObjectiveKind, TrainingValidationConfig, TrainingValidationExecution,
-            load_training_config,
+            LocalPredictiveCodingConfig, LocalPredictiveCodingSolver, PcGradientNormScope,
+            PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingFactorReduction,
+            PredictiveCodingMode, PredictiveCodingParameterUpdate, PredictiveCodingStateScope,
+            RepromptTruncation, RuliadProbeGenerationConfig, SdftObjectiveConfig,
+            SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+            TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
+            TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
+            TrainingValidationExecution, load_training_config,
         };
     }
 
@@ -125,14 +125,14 @@ pub use config::{
 pub use config::{
     DatasetConfig, DatasetSourceConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
     HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LocalPredictiveCodingConfig,
-    PcGradientNormScope, PredictiveCodingBackwardMode, PredictiveCodingConfig,
-    PredictiveCodingFactorReduction, PredictiveCodingMode, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, RepromptTruncation, RuliadAnswerDenoisingConfig,
-    RuliadAnswerRankingConfig, RuliadProbeGenerationConfig, RuliadSupervisionConfig,
-    RuliadSupervisionMode, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-    TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
-    TrainingValidationExecution, load_training_config,
+    LocalPredictiveCodingSolver, PcGradientNormScope, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
+    PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
+    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadProbeGenerationConfig,
+    RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    TrainingValidationConfig, TrainingValidationExecution, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings,

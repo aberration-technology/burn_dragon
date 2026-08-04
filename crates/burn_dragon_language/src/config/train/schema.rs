@@ -584,6 +584,20 @@ pub enum PredictiveCodingFactorReduction {
     Mean,
 }
 
+/// Activity/error solver used by canonical layer-local predictive coding.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPredictiveCodingSolver {
+    /// Parallel block-Jacobi activity relaxation. Credit advances through the
+    /// depth graph over repeated inference rounds.
+    #[default]
+    SynchronousEquilibrium,
+    /// Solve the fixed-prediction triangular error system with one reverse
+    /// local-VJP wave. This is a backprop-equivalent PC control, but it never
+    /// creates a global autodiff graph or calls global backward.
+    FixedPrediction,
+}
+
 /// Canonical layer-local predictive-coding learning configuration.
 ///
 /// This is distinct from [`PredictiveCodingConfig`], which is the historical
@@ -591,6 +605,7 @@ pub enum PredictiveCodingFactorReduction {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct LocalPredictiveCodingConfig {
+    pub solver: LocalPredictiveCodingSolver,
     pub inference: burn_pc::PcInferenceConfig,
     pub learning_schedule: burn_pc::PcLearningSchedule,
     pub prediction_precision: f32,
@@ -601,6 +616,7 @@ pub struct LocalPredictiveCodingConfig {
 impl Default for LocalPredictiveCodingConfig {
     fn default() -> Self {
         Self {
+            solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
             inference: burn_pc::PcInferenceConfig {
                 steps: 4,
                 step_size: 0.05,

@@ -31,6 +31,7 @@ sampling = "fixed_holdout"
 seed = 3509215397
 
 [training.local_predictive_coding]
+solver = "synchronous_equilibrium"
 learning_schedule = "equilibrium"
 prediction_precision = 1.0
 factor_reduction = "sum"
@@ -55,6 +56,18 @@ The implemented equilibrium schedule is:
    Dragon's shared weights, and normalize by the number of supervised tokens.
 5. Pass those derivative tensors to Burn's AdamW transform. AdamW only updates parameters and its
    moments from supplied local derivatives; there is no preceding AdamW/backprop training pass.
+
+`solver = "fixed_prediction"` selects a second, deliberately narrower control. It retains the
+feed-forward prediction at every shared layer use, initializes the terminal token error, and sends
+that error through one reverse sequence of exact local layer VJPs. Contributions from each use are
+summed into the same shared encoder, value encoder, decoder, and normalization parameters. This
+path still creates no global autodiff graph and never calls global backward. It is nevertheless a
+backpropagation-equivalent triangular error solve, not a claim that depth dependencies have become
+parallel. The activity-inference `steps`, `step_size`, clipping, and prediction precision are not
+used by this solver; the report records one fixed-prediction error wave.
+
+The fixed-prediction control can be applied to either canonical profile with
+`config/language/experiments/predictive_coding/pc-fixed-prediction.overlay.toml`.
 
 Activities and errors are batch-local transient state. Checkpoints continue to contain model
 parameters and optimizer moments, not an equilibrium trajectory. Layer forwards and local VJPs are
@@ -198,6 +211,63 @@ Raw artifacts are under `target/pc-gradient-fidelity-1m-cuda-20260804/`,
 `target/pc-gradient-fidelity-1m-cuda-unclipped-20260804/`,
 `target/local-pc-batch-throughput-20260804/`, and
 `target/local-pc-fidelity-quality-128-b16-3seed-analysis-20260804/`.
+
+#### Fixed-prediction shared-weight control
+
+The follow-up control directly tests whether Dragon's shared weights remove the finite-depth
+failure above. They remove duplicated parameter sets, but not the activity graph: each layer use
+has a different input, trace, and Jacobian. A synchronous Jacobi solver therefore still advances
+terminal credit by roughly one factor per round. Once the error at every use is available, however,
+all derivatives target the same shared parameter IDs and can be accumulated before one optimizer
+update.
+
+On the same 937,154-parameter, four-use CUDA geometry, fixed prediction matches the exact masked
+reference derivative with global cosine `0.99999964`, norm ratio `1.00000285`, and relative L2
+error `8.27e-4`. Every active parameter family has cosine above `0.9999992`; the local step reports
+zero global backward calls. The default synchronous `4 x 0.05` control remains at cosine `0.338`
+and relative L2 error `0.953`. CPU tests match to relative L2 below `1e-4`; the larger CUDA residual
+comes from different reduction/aggregation order.
+
+A 16-update release-CUDA batch sweep reports model-step throughput from the ECS event counters:
+
+| Batch | AdamW tok/s | Fixed prediction tok/s | Synchronous PC-4 tok/s |
+| ---: | ---: | ---: | ---: |
+| 16 | 65,743 | 37,590 | 12,555 |
+| 32 | 73,532 | 47,684 | **12,895** |
+| 64 | 70,933 | **48,219** | 12,748 |
+| 128 | **76,825** | 43,567 | 12,426 |
+
+Fixed prediction retains 62.8% of AdamW's independently best tested throughput and is 3.7x faster
+than the best synchronous arm. At matched batch 32 it retains 64.9%. Its peak host use was at most
+11.7 GB across the sweep, versus 15.4 GB for AdamW and 20.7 GB for synchronous PC. This is a large
+improvement over equilibrium relaxation, but not a throughput win over Burn's fused autodiff path.
+
+The required matched three-seed screen used release CUDA, batch 32, block 128, 128 updates, the
+same fixed holdout, and 524,288 train tokens per run:
+
+| Arm | Valid loss | Last train loss | Verifier | Partial progress | Tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AdamW | 2.095 +/- 0.0120 | 0.999 +/- 0.203 | 0.0104 +/- 0.0204 | 0.182 +/- 0.182 | **55,633 +/- 686** |
+| Fixed prediction | **2.086 +/- 0.0100** | **0.994 +/- 0.197** | 0.0104 +/- 0.0204 | 0.0694 +/- 0.107 | 35,305 +/- 881 |
+| Synchronous PC-4 | 3.138 +/- 0.0903 | 2.343 +/- 0.216 | 0 | 0.111 +/- 0.111 | 10,904 +/- 366 |
+
+The paired fixed-prediction-minus-AdamW validation delta is `-0.00977 +/- 0.0216` and train-loss
+delta is `-0.00516 +/- 0.0504`: convergence parity is achieved at this short horizon. Verifier and
+partial-progress samples are too sparse/noisy to support a reasoning-quality claim. Median GPU
+utilization was 90-91% for fixed prediction, 83.5-89% for AdamW, and 92.5-93% for synchronous PC;
+the fixed path is device-work limited rather than host stalled.
+
+**Decision:** fixed prediction is promoted as a numerical and convergence control for local VJPs,
+not as the default learner. It proves that shared-weight gradient aggregation is correct and that
+the synchronous activity solver caused the quality deficit. AdamW backpropagation remains the
+default because it is about 1.58x faster at matched batch 32 and supports the full Dragon/TBPTT
+architecture. A genuinely PC-native promotion still requires a causal/local schedule that avoids
+the reverse depth barrier, supports recurrent rho/TBPTT state, and demonstrates long-horizon
+continual-learning benefit rather than merely reproducing the backpropagation derivative.
+
+Raw artifacts are under `target/pc-fixed-prediction-1m-cuda-20260804/`,
+`target/pc-fixed-prediction-throughput-analysis-20260804/`, and
+`target/pc-fixed-prediction-quality-128-b32-3seed-analysis-20260804/`.
 
 ### 2026-08 causal-contract correction
 

@@ -381,4 +381,67 @@ mod tests {
             assert_eq!(family.pc_norm, 0.0);
         }
     }
+
+    #[test]
+    fn fixed_prediction_matches_reference_through_shared_layer_uses() {
+        let device = Default::default();
+        let mut config = DragonConfig {
+            n_layer: 4,
+            n_embd: 8,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 16,
+            dropout: 0.0,
+            ..DragonConfig::default()
+        };
+        config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
+        let model = DragonModel::new(config, &device);
+        let (inputs, targets, mask) = batch(&device);
+        let report = local_predictive_coding_gradient_fidelity(
+            &model,
+            inputs,
+            targets,
+            Some(mask),
+            &LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect("fixed-prediction gradient fidelity report");
+
+        assert_eq!(
+            report.pc_step.solver,
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction
+        );
+        assert_eq!(report.pc_step.inference_steps, 1);
+        assert_eq!(report.pc_step.global_backward_calls, 0);
+        assert_eq!(report.pc_gradient_tensors, 9);
+        assert!(report.loss_absolute_error < 1.0e-6);
+        assert!(
+            report.global.cosine.is_some_and(|cosine| cosine > 0.999_99),
+            "global fidelity: {:?}",
+            report.global
+        );
+        assert!(
+            report
+                .global
+                .relative_l2_error
+                .is_some_and(|error| error < 1.0e-4),
+            "global fidelity: {:?}",
+            report.global
+        );
+        for family in &report.parameter_families {
+            if family.reference_norm > 1.0e-8 {
+                assert!(
+                    family.cosine.is_some_and(|cosine| cosine > 0.999_9),
+                    "shared-weight family mismatch: {family:?}"
+                );
+                assert!(
+                    family.relative_l2_error.is_some_and(|error| error < 1.0e-3),
+                    "shared-weight family mismatch: {family:?}"
+                );
+            }
+        }
+    }
 }

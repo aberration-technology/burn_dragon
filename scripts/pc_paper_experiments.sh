@@ -483,6 +483,18 @@ steps = $local_steps
 
 EOF
       ;;
+    local_pc_fixed_prediction)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+
+EOF
+      ;;
     local_pc_steps4_eta05_lr003|local_pc_steps4_eta05_lr01)
       local local_lr="0.003"
       if [[ "$arm" == *_lr01 ]]; then

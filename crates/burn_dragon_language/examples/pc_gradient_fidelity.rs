@@ -11,11 +11,11 @@ use burn_autodiff::Autodiff;
 #[cfg(feature = "train")]
 use burn_dragon_core::{DragonConfig, DragonModel, RotaryEmbedding, SequenceTrainingExecutor};
 #[cfg(feature = "train")]
-use burn_dragon_language::LocalPredictiveCodingConfig;
-#[cfg(feature = "train")]
 use burn_dragon_language::train::{
     LocalPredictiveCodingGradientFidelityReport, local_predictive_coding_gradient_fidelity,
 };
+#[cfg(feature = "train")]
+use burn_dragon_language::{LocalPredictiveCodingConfig, LocalPredictiveCodingSolver};
 #[cfg(feature = "train")]
 use burn_ndarray::NdArray;
 #[cfg(feature = "train")]
@@ -25,6 +25,7 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 struct Args {
     backend: String,
+    solver: LocalPredictiveCodingSolver,
     seed: u64,
     n_layer: usize,
     n_embd: usize,
@@ -44,6 +45,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             backend: "cpu".to_string(),
+            solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
             seed: 20260804,
             n_layer: 4,
             n_embd: 96,
@@ -63,8 +65,9 @@ impl Default for Args {
 #[cfg(feature = "train")]
 #[derive(Debug, Serialize)]
 struct FidelityArm {
+    solver: LocalPredictiveCodingSolver,
     inference_steps: usize,
-    step_size: f32,
+    step_size: Option<f32>,
     max_grad_norm: Option<f32>,
     report: LocalPredictiveCodingGradientFidelityReport,
 }
@@ -74,6 +77,7 @@ struct FidelityArm {
 struct FidelityMatrix {
     schema_version: u32,
     backend: String,
+    solver: LocalPredictiveCodingSolver,
     seed: u64,
     parameters: usize,
     n_layer: usize,
@@ -133,6 +137,19 @@ fn parse_args() -> Result<Args> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--backend" => parsed.backend = parse_value(&mut args, "--backend")?,
+            "--solver" => {
+                parsed.solver = match parse_value::<String>(&mut args, "--solver")?.as_str() {
+                    "synchronous_equilibrium" => {
+                        LocalPredictiveCodingSolver::SynchronousEquilibrium
+                    }
+                    "fixed_prediction" => LocalPredictiveCodingSolver::FixedPrediction,
+                    value => {
+                        return Err(anyhow!(
+                            "unsupported --solver {value}; expected synchronous_equilibrium or fixed_prediction"
+                        ));
+                    }
+                }
+            }
             "--seed" => parsed.seed = parse_value(&mut args, "--seed")?,
             "--n-layer" => parsed.n_layer = parse_value(&mut args, "--n-layer")?,
             "--n-embd" => parsed.n_embd = parse_value(&mut args, "--n-embd")?,
@@ -170,7 +187,7 @@ fn parse_args() -> Result<Args> {
             "--mask-period" => parsed.mask_period = parse_value(&mut args, "--mask-period")?,
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
+                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--solver <synchronous_equilibrium|fixed_prediction>] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
                 );
                 std::process::exit(0);
             }
@@ -269,35 +286,53 @@ where
     let parameters = model.num_params();
     let batch = deterministic_batch::<B>(args, &device);
 
-    let mut arms = Vec::with_capacity(args.inference_steps.len() * args.step_sizes.len());
-    for &steps in &args.inference_steps {
-        for &step_size in &args.step_sizes {
-            let mut config = LocalPredictiveCodingConfig::default();
+    let settings = match args.solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium => args
+            .inference_steps
+            .iter()
+            .flat_map(|&steps| {
+                args.step_sizes
+                    .iter()
+                    .map(move |&step_size| Some((steps, step_size)))
+            })
+            .collect::<Vec<_>>(),
+        LocalPredictiveCodingSolver::FixedPrediction => vec![None],
+    };
+    let mut arms = Vec::with_capacity(settings.len());
+    for setting in settings {
+        let mut config = LocalPredictiveCodingConfig {
+            solver: args.solver,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        if let Some((steps, step_size)) = setting {
             config.inference.steps = steps;
             config.inference.step_size = step_size;
-            config.inference.max_grad_norm = args.max_grad_norm;
-            config.sync_diagnostics = true;
-            let report = local_predictive_coding_gradient_fidelity(
-                &model,
-                batch.inputs.clone(),
-                batch.targets.clone(),
-                batch.loss_mask.clone(),
-                &config,
-            )
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("PC fidelity arm steps={steps} step_size={step_size}"))?;
-            arms.push(FidelityArm {
-                inference_steps: steps,
-                step_size,
-                max_grad_norm: args.max_grad_norm,
-                report,
-            });
         }
+        let applied_max_grad_norm = setting.and(args.max_grad_norm);
+        config.inference.max_grad_norm = applied_max_grad_norm;
+        config.sync_diagnostics = true;
+        let report = local_predictive_coding_gradient_fidelity(
+            &model,
+            batch.inputs.clone(),
+            batch.targets.clone(),
+            batch.loss_mask.clone(),
+            &config,
+        )
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("PC fidelity arm solver={:?}", args.solver))?;
+        arms.push(FidelityArm {
+            solver: args.solver,
+            inference_steps: report.pc_step.inference_steps,
+            step_size: setting.map(|(_, step_size)| step_size),
+            max_grad_norm: applied_max_grad_norm,
+            report,
+        });
     }
 
     Ok(FidelityMatrix {
-        schema_version: 1,
+        schema_version: 2,
         backend: args.backend.clone(),
+        solver: args.solver,
         seed: args.seed,
         parameters,
         n_layer: args.n_layer,

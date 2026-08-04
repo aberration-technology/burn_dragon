@@ -4,10 +4,15 @@ use burn::module::AutodiffModule;
 use burn::optim::GradientsParams;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
-use burn_dragon_core::{DragonModel, DragonPredictiveCodingLayerTrace};
+use burn_dragon_core::{
+    DragonModel, DragonPredictiveCodingLayerTrace, DragonPredictiveCodingLayerVjp,
+    DragonPredictiveCodingParameterIds,
+};
 use burn_dragon_time::Instant;
 
-use crate::config::{LocalPredictiveCodingConfig, PredictiveCodingFactorReduction};
+use crate::config::{
+    LocalPredictiveCodingConfig, LocalPredictiveCodingSolver, PredictiveCodingFactorReduction,
+};
 
 mod diagnostics;
 pub use diagnostics::*;
@@ -21,6 +26,7 @@ pub(crate) struct LocalPredictiveCodingTrainStep<B: AutodiffBackend> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct LocalPredictiveCodingStepReport {
+    pub solver: LocalPredictiveCodingSolver,
     pub inference_steps: usize,
     pub factors: usize,
     pub local_vjp_calls: usize,
@@ -212,6 +218,176 @@ fn slice_trace_batch<B: Backend>(
     }
 }
 
+fn concatenate_traces<B: Backend>(
+    traces: &[DragonPredictiveCodingLayerTrace<B>],
+) -> DragonPredictiveCodingLayerTrace<B> {
+    assert!(!traces.is_empty(), "PC trace list must not be empty");
+    DragonPredictiveCodingLayerTrace {
+        input: Tensor::cat(traces.iter().map(|trace| trace.input.clone()).collect(), 0),
+        attention_readout: Tensor::cat(
+            traces
+                .iter()
+                .map(|trace| trace.attention_readout.clone())
+                .collect(),
+            0,
+        ),
+        residual_delta: Tensor::cat(
+            traces
+                .iter()
+                .map(|trace| trace.residual_delta.clone())
+                .collect(),
+            0,
+        ),
+        x_neuron: Tensor::cat(
+            traces.iter().map(|trace| trace.x_neuron.clone()).collect(),
+            0,
+        ),
+        y_gate: Tensor::cat(traces.iter().map(|trace| trace.y_gate.clone()).collect(), 0),
+        y_neuron: Tensor::cat(
+            traces.iter().map(|trace| trace.y_neuron.clone()).collect(),
+            0,
+        ),
+        next: Tensor::cat(traces.iter().map(|trace| trace.next.clone()).collect(), 0),
+    }
+}
+
+struct SharedParameterVjp<B: Backend> {
+    grad_encoder: Tensor<B, 3>,
+    grad_encoder_v: Tensor<B, 3>,
+    grad_decoder: Tensor<B, 2>,
+    grad_norm_gamma: Tensor<B, 1>,
+    grad_norm_beta: Tensor<B, 1>,
+    grad_norm_alpha: Tensor<B, 1>,
+    grad_norm_shift: Tensor<B, 1>,
+}
+
+impl<B: Backend> SharedParameterVjp<B> {
+    fn from_layer(vjp: DragonPredictiveCodingLayerVjp<B>) -> (Tensor<B, 4>, Self) {
+        (
+            vjp.grad_input,
+            Self {
+                grad_encoder: vjp.grad_encoder,
+                grad_encoder_v: vjp.grad_encoder_v,
+                grad_decoder: vjp.grad_decoder,
+                grad_norm_gamma: vjp.grad_norm_gamma,
+                grad_norm_beta: vjp.grad_norm_beta,
+                grad_norm_alpha: vjp.grad_norm_alpha,
+                grad_norm_shift: vjp.grad_norm_shift,
+            },
+        )
+    }
+
+    fn accumulate_layer(&mut self, vjp: DragonPredictiveCodingLayerVjp<B>) -> Tensor<B, 4> {
+        self.grad_encoder = self.grad_encoder.clone() + vjp.grad_encoder;
+        self.grad_encoder_v = self.grad_encoder_v.clone() + vjp.grad_encoder_v;
+        self.grad_decoder = self.grad_decoder.clone() + vjp.grad_decoder;
+        self.grad_norm_gamma = self.grad_norm_gamma.clone() + vjp.grad_norm_gamma;
+        self.grad_norm_beta = self.grad_norm_beta.clone() + vjp.grad_norm_beta;
+        self.grad_norm_alpha = self.grad_norm_alpha.clone() + vjp.grad_norm_alpha;
+        self.grad_norm_shift = self.grad_norm_shift.clone() + vjp.grad_norm_shift;
+        vjp.grad_input
+    }
+}
+
+struct FixedPredictionContext<B: Backend> {
+    parameter_ids: DragonPredictiveCodingParameterIds,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    activities: Vec<Tensor<B, 4>>,
+    traces: Vec<DragonPredictiveCodingLayerTrace<B>>,
+    factors: usize,
+    scale: f32,
+}
+
+fn fixed_prediction_train_step<B: AutodiffBackend>(
+    plain: &DragonModel<B::InnerBackend>,
+    context: FixedPredictionContext<B::InnerBackend>,
+    started: Instant,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingTrainStep<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let FixedPredictionContext {
+        parameter_ids,
+        inputs,
+        targets,
+        loss_mask,
+        activities,
+        traces,
+        factors,
+        scale,
+    } = context;
+    let terminal_activity = activities.last().expect("terminal PC activity");
+    let terminal_hidden = plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+    let terminal = plain.predictive_coding_head_vjp(terminal_hidden, targets, loss_mask);
+    let mut grad_activity = terminal
+        .grad_hidden
+        .clone()
+        .reshape(terminal_activity.shape())
+        .mul_scalar(scale);
+
+    let mut shared: Option<SharedParameterVjp<B::InnerBackend>> = None;
+    for (layer, trace) in traces.into_iter().enumerate().rev() {
+        let vjp = plain.predictive_coding_layer_vjp(layer, &trace, grad_activity);
+        grad_activity = match shared.as_mut() {
+            Some(shared) => shared.accumulate_layer(vjp),
+            None => {
+                let (grad_input, first) = SharedParameterVjp::from_layer(vjp);
+                shared = Some(first);
+                grad_input
+            }
+        };
+    }
+    let shared = shared.expect("validated PC model has at least one layer");
+    let initial_vjp = plain.predictive_coding_initial_vjp(inputs, grad_activity);
+    let mut grads = GradientsParams::new();
+    grads.register(parameter_ids.embedding, initial_vjp.grad_embedding);
+    grads.register(parameter_ids.encoder, shared.grad_encoder);
+    grads.register(parameter_ids.encoder_v, shared.grad_encoder_v);
+    grads.register(parameter_ids.decoder, shared.grad_decoder);
+    grads.register(
+        parameter_ids.norm_gamma,
+        shared.grad_norm_gamma + initial_vjp.grad_norm_gamma,
+    );
+    grads.register(
+        parameter_ids.norm_beta,
+        shared.grad_norm_beta + initial_vjp.grad_norm_beta,
+    );
+    grads.register(
+        parameter_ids.norm_alpha,
+        shared.grad_norm_alpha + initial_vjp.grad_norm_alpha,
+    );
+    grads.register(
+        parameter_ids.norm_shift,
+        shared.grad_norm_shift + initial_vjp.grad_norm_shift,
+    );
+    grads.register(
+        parameter_ids.lm_head,
+        terminal.grad_lm_head.mul_scalar(scale),
+    );
+
+    let report = LocalPredictiveCodingStepReport {
+        solver: LocalPredictiveCodingSolver::FixedPrediction,
+        inference_steps: 1,
+        factors,
+        local_vjp_calls: factors + 1,
+        global_backward_calls: 0,
+        gradient_tensors: grads.len(),
+        energy_before: None,
+        energy_after: None,
+        elapsed_ns: started.elapsed().as_nanos(),
+    };
+    profile.record(report);
+    LocalPredictiveCodingTrainStep {
+        grads,
+        loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        report,
+    }
+}
+
 fn total_energy<B: Backend>(
     model: &DragonModel<B>,
     activities: &[Tensor<B, 4>],
@@ -274,10 +450,30 @@ where
     let scale = factor_scale(config, factors);
 
     let mut activities = Vec::with_capacity(layers + 1);
+    let mut feedforward_traces = Vec::with_capacity(layers);
     activities.push(initial);
     for layer in 0..layers {
         let trace = plain.predictive_coding_forward_layer(activities[layer].clone(), layer);
-        activities.push(trace.next.detach());
+        activities.push(trace.next.clone().detach());
+        feedforward_traces.push(trace);
+    }
+
+    if matches!(config.solver, LocalPredictiveCodingSolver::FixedPrediction) {
+        return fixed_prediction_train_step::<B>(
+            &plain,
+            FixedPredictionContext {
+                parameter_ids,
+                inputs,
+                targets,
+                loss_mask,
+                activities,
+                traces: feedforward_traces,
+                factors,
+                scale,
+            },
+            started,
+            profile,
+        );
     }
 
     let energy_before = config.sync_diagnostics.then(|| {
@@ -292,8 +488,12 @@ where
 
     let mut local_vjp_calls = 0usize;
     let mut feedforward_loss = None;
+    let mut feedforward_trace = Some(concatenate_traces(&feedforward_traces));
+    drop(feedforward_traces);
     for _ in 0..config.inference.steps {
-        let trace = forward_trace_batch(&plain, &activities);
+        let trace = feedforward_trace
+            .take()
+            .unwrap_or_else(|| forward_trace_batch(&plain, &activities));
         let terminal_hidden = plain.predictive_coding_hidden_from_activity(
             activities.last().expect("terminal PC activity").clone(),
         );
@@ -415,6 +615,7 @@ where
     local_vjp_calls = local_vjp_calls.saturating_add(1);
 
     let report = LocalPredictiveCodingStepReport {
+        solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
         inference_steps: config.inference.steps,
         factors,
         local_vjp_calls,

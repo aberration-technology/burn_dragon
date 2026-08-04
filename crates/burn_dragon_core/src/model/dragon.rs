@@ -6,6 +6,7 @@ mod diagnostics;
 mod interpretability;
 mod language_head;
 mod language_pipeline;
+mod predictive_coding;
 mod sequence_dispatch;
 pub use continual_backprop::{
     SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
@@ -18,6 +19,12 @@ pub use interpretability::{
     LanguageLowRankLayerComparisonDiagnostics, LanguageLowRankLayerGeometryDiagnostics,
     TensorComparisonDiagnostics, TensorDistributionDiagnostics, TensorStateDeltaDiagnostics,
     TensorStateSummaryDiagnostics, compare_model_states, summarize_model_state,
+};
+pub use predictive_coding::{
+    DragonPredictiveCodingHeadActivityVjp, DragonPredictiveCodingHeadVjp,
+    DragonPredictiveCodingInitialVjp, DragonPredictiveCodingLayerTrace,
+    DragonPredictiveCodingLayerVjp, DragonPredictiveCodingParameterIds,
+    DragonPredictiveCodingSupport,
 };
 
 use burn::module::{AutodiffModule, Module, Param};

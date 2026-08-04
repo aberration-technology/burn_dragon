@@ -88,6 +88,12 @@ EVENT_SUMMARY_COLUMNS = [
     "capacity_scale_count",
     "pc_event_count",
     "pc_ms_mean",
+    "pc_learning_contract_last",
+    "pc_global_autodiff_graph_last",
+    "pc_global_backward_calls_total",
+    "pc_local_vjp_calls_total",
+    "pc_factors_last",
+    "pc_gradient_tensors_last",
     "pc_observation_contract_last",
     "pc_deployment_aligned_last",
     "pc_amortization_components_last",
@@ -451,6 +457,8 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["fatal_gate_count"] = 0
     summary["capacity_scale_count"] = 0
     summary["pc_event_count"] = 0
+    summary["pc_global_backward_calls_total"] = 0
+    summary["pc_local_vjp_calls_total"] = 0
     summary["_pc_ms_values"] = []
     return summary
 
@@ -521,6 +529,22 @@ def collect_event_summaries(
                 summary["capacity_scale_count"] += 1
             elif event_type == "predictive_coding":
                 summary["pc_event_count"] += 1
+                summary["pc_learning_contract_last"] = event.get(
+                    "learning_contract", ""
+                )
+                summary["pc_global_autodiff_graph_last"] = event.get(
+                    "global_autodiff_graph", ""
+                )
+                summary["pc_global_backward_calls_total"] += as_int(
+                    event.get("global_backward_calls")
+                ) or 0
+                summary["pc_local_vjp_calls_total"] += as_int(
+                    event.get("local_vjp_calls")
+                ) or 0
+                summary["pc_factors_last"] = event.get("factors", "")
+                summary["pc_gradient_tensors_last"] = event.get(
+                    "gradient_tensors", ""
+                )
                 summary["pc_observation_contract_last"] = event.get(
                     "observation_contract", ""
                 )
@@ -629,9 +653,9 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
 def merge_summary_rows(
     legacy_rows: Iterable[dict[str, Any]], event_rows: Iterable[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    merged: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    merged: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
     for row in [*legacy_rows, *event_rows]:
-        key = (row.get("iters"), row.get("arm"), row.get("seed"))
+        key = (row.get("iters"), row.get("arm"), row.get("seed"), row.get("run"))
         existing = merged.get(key)
         if existing is None:
             merged[key] = dict(row)
@@ -645,6 +669,7 @@ def merge_summary_rows(
             row.get("iters") or -1,
             str(row.get("arm") or ""),
             row.get("seed") or -1,
+            str(row.get("run") or ""),
         ),
     )
 
@@ -810,7 +835,12 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "pc_ms_mean",
     ]
     for (iters, arm), group in sorted(groups.items(), key=lambda item: (item[0][0] or -1, str(item[0][1]))):
-        row: dict[str, Any] = {"iters": iters, "arm": arm, "seeds": len({g.get("seed") for g in group})}
+        row: dict[str, Any] = {
+            "iters": iters,
+            "arm": arm,
+            "runs": len(group),
+            "seeds": len({g.get("seed") for g in group}),
+        }
         for metric in metrics:
             metric_stats = stats(as_float(g.get(metric)) for g in group)
             row[f"{metric}_mean"] = metric_stats.mean
@@ -879,14 +909,15 @@ def write_markdown(
     lines.append("## Fixed-Token Summary")
     lines.append("")
     lines.append(
-        "| Iters | Arm | Seeds | Valid loss | Verifier acc | Partial progress | Tok/s | PC ms |"
+        "| Iters | Arm | Runs | Seeds | Valid loss | Verifier acc | Partial progress | Tok/s | PC ms |"
     )
-    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in summary_rows:
         lines.append(
-            "| {iters} | {arm} | {seeds} | {valid} | {verifier} | {partial} | {tok} | {pc} |".format(
+            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {verifier} | {partial} | {tok} | {pc} |".format(
                 iters=row.get("iters", ""),
                 arm=row.get("arm", ""),
+                runs=row.get("runs", ""),
                 seeds=row.get("seeds", ""),
                 valid=fmt_mean_ci(row, "valid_last"),
                 verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
@@ -916,6 +947,28 @@ def write_markdown(
     if event_rows:
         lines.append("## Event-Stream Diagnostics")
         lines.append("")
+
+        pc_rows = [row for row in event_rows if as_int(row.get("pc_event_count"))]
+        if pc_rows:
+            lines.append("## Local Learning Contract")
+            lines.append("")
+            lines.append(
+                "| Run | Contract | Global graph | Global backwards | Local VJPs | Factors | Gradient tensors |"
+            )
+            lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+            for row in pc_rows[:40]:
+                lines.append(
+                    "| {run} | {contract} | {graph} | {backwards} | {vjps} | {factors} | {grads} |".format(
+                        run=row.get("run", ""),
+                        contract=row.get("pc_learning_contract_last", ""),
+                        graph=row.get("pc_global_autodiff_graph_last", ""),
+                        backwards=row.get("pc_global_backward_calls_total", ""),
+                        vjps=row.get("pc_local_vjp_calls_total", ""),
+                        factors=row.get("pc_factors_last", ""),
+                        grads=row.get("pc_gradient_tensors_last", ""),
+                    )
+                )
+            lines.append("")
         lines.append("| Run | Valid loss | Source difficulty | Verifier acc | Output entropy | Gates | Fatal gates |")
         lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for row in event_rows[:40]:
@@ -990,7 +1043,7 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
     write_csv(out_dir / "normalized_summary.csv", SUMMARY_COLUMNS, summary_rows)
     write_csv(
         out_dir / "summary_by_arm.csv",
-        ["iters", "arm", "seeds"]
+        ["iters", "arm", "runs", "seeds"]
         + [
             f"{metric}_{suffix}"
             for metric in [
@@ -1057,6 +1110,20 @@ def self_test() -> None:
                     "split": "valid",
                     "name": "Loss",
                     "value": 0.4,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "predictive_coding",
+                    "run_id": "run-a",
+                    "learning_contract": "local_factor_vjp_v1",
+                    "global_autodiff_graph": False,
+                    "global_backward_calls": 0,
+                    "local_vjp_calls": 12,
+                    "factors": 4,
+                    "gradient_tensors": 9,
+                    "elapsed_ms": 3.5,
                 }
             )
             + "\n"
@@ -1184,6 +1251,10 @@ def self_test() -> None:
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
         assert event_rows[0]["source_loss_last"] == "0.6"
         assert event_rows[0]["source_capability_allowed_max_difficulty_last"] == "5.0"
+        assert event_rows[0]["pc_learning_contract_last"] == "local_factor_vjp_v1"
+        assert event_rows[0]["pc_global_autodiff_graph_last"] == "False"
+        assert event_rows[0]["pc_global_backward_calls_total"] == "0"
+        assert event_rows[0]["pc_local_vjp_calls_total"] == "12"
         normalized = list(csv.DictReader((out / "normalized_summary.csv").open()))
         event_normalized = next(row for row in normalized if row["run"] == "run-a")
         assert event_normalized["tok_s"] == "512.0"
@@ -1196,6 +1267,7 @@ def self_test() -> None:
         assert gpu[0]["util_mean"] == "90.0"
         markdown = (out / "paper_tables.md").read_text()
         assert "Fixed-Token Summary" in markdown
+        assert "Local Learning Contract" in markdown
         print("self-test ok")
 
 

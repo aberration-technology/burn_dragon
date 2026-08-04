@@ -541,7 +541,17 @@ where
 }
 
 pub fn optimizer_uses_forward_only_eggroll(config: &TrainingConfig) -> bool {
-    matches!(config.optimizer.name, OptimizerKind::Eggroll)
+    matches!(
+        config.resolved_training_algorithm(),
+        TrainingAlgorithm::Eggroll
+    )
+}
+
+pub fn training_uses_local_predictive_coding(config: &TrainingConfig) -> bool {
+    matches!(
+        config.resolved_training_algorithm(),
+        TrainingAlgorithm::PredictiveCoding
+    )
 }
 
 pub(crate) fn resolve_effective_training_sequence_kernel(
@@ -587,9 +597,9 @@ where
     B::Device: Clone + 'static,
     Init: Fn(&B::Device),
 {
-    if !matches!(config.optimizer.name, OptimizerKind::Eggroll) {
+    if !optimizer_uses_forward_only_eggroll(config) {
         return Err(anyhow!(
-            "train_backend_forward_eggroll requires optimizer.name=eggroll"
+            "train_backend_forward_eggroll requires training.algorithm=eggroll (or auto with optimizer.name=eggroll)"
         ));
     }
     if config.optimizer.eggroll.gradient_learning_rate.is_some() {
@@ -821,6 +831,7 @@ where
                 steps_per_epoch,
                 Some(total_steps),
             )
+            .with_seed(training.seed)
             .with_initial_consumed_steps(resume_consumed_steps)
             .with_ruliad_policy_supervision(training.ruliad_supervision)
             .with_ruliad_policy_stratified_difficulty_levels(
@@ -837,7 +848,8 @@ where
     let valid_steps =
         resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
     info!(
-        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch}"
+        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch} sampling={:?} seed={}",
+        training.validation.sampling, training.validation.seed,
     );
     let valid_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> = Arc::new(
         RandomDataLoader::<B>::new(
@@ -847,6 +859,8 @@ where
             valid_steps,
             None,
         )
+        .with_seed(training.validation.seed)
+        .with_source_selection_enabled(training.validation.sampling.uses_live_source_selection())
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -1116,9 +1130,9 @@ where
     B::Device: Clone + 'static,
     Init: Fn(&B::Device),
 {
-    if matches!(config.optimizer.name, OptimizerKind::Eggroll) {
+    if optimizer_uses_forward_only_eggroll(config) {
         return Err(anyhow!(
-            "optimizer.name=eggroll must use train_backend_forward_eggroll so autodiff is not enabled"
+            "training.algorithm=eggroll must use train_backend_forward_eggroll so autodiff is not enabled"
         ));
     }
 
@@ -1195,9 +1209,17 @@ where
             rollout: resolved_config.wgpu.training.fused_core_rollout,
         },
     );
+    let (backend_mode, autodiff_graph) = if training_uses_local_predictive_coding(&resolved_config)
+    {
+        ("predictive_coding_local_vjp", false)
+    } else {
+        ("global_backpropagation", true)
+    };
     info!(
-        "training path fingerprint: backend={} execution_form={} launch_mode={:?} effective_sequence_kernel={:?} sequence_kernel_override={:?} tbptt_chunk_size={:?} kernel_block_size={} pipeline_enabled={}",
+        "training path fingerprint: backend={} backend_mode={} autodiff_graph={} execution_form={} launch_mode={:?} effective_sequence_kernel={:?} sequence_kernel_override={:?} tbptt_chunk_size={:?} kernel_block_size={} pipeline_enabled={}",
         backend_name,
+        backend_mode,
+        autodiff_graph,
         build_training_execution_form(&resolved_config),
         training.launch_mode,
         model_config.sequence_kernel,
@@ -1427,6 +1449,7 @@ where
                 steps_per_epoch,
                 Some(total_steps),
             )
+            .with_seed(training.seed)
             .with_initial_consumed_steps(resume_consumed_steps)
             .with_ruliad_policy_supervision(training.ruliad_supervision)
             .with_ruliad_policy_stratified_difficulty_levels(
@@ -1443,7 +1466,8 @@ where
     let valid_steps =
         resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
     info!(
-        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch}"
+        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch} sampling={:?} seed={}",
+        training.validation.sampling, training.validation.seed,
     );
 
     let valid_device = device.clone();
@@ -1455,6 +1479,10 @@ where
                 &valid_device,
                 valid_steps,
                 None,
+            )
+            .with_seed(training.validation.seed)
+            .with_source_selection_enabled(
+                training.validation.sampling.uses_live_source_selection(),
             )
             .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
@@ -1710,7 +1738,8 @@ where
             .saturating_mul(resolved_config.training.block_size as u128);
         let main_model_step_ns = snapshot
             .forward_ns
-            .saturating_add(snapshot.loss_backward_ns);
+            .saturating_add(snapshot.loss_backward_ns)
+            .saturating_add(snapshot.local_learning_ns);
         let model_step_ns = main_model_step_ns.saturating_add(snapshot.auxiliary_objective_ns);
         let train_compute_ns = model_step_ns.saturating_add(snapshot.optimizer_ns);
         let accounted_ns = train_compute_ns
@@ -1741,13 +1770,14 @@ where
             snapshot.dataloader_foreground_wait_ns as f64 / elapsed_ns as f64
         };
         info!(
-            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} local_learning_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
             snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
             snapshot.forward_ns,
+            snapshot.local_learning_ns,
             snapshot.auxiliary_objective_ns,
             snapshot.proof_policy_ns,
             snapshot.loss_backward_ns,
@@ -1772,13 +1802,14 @@ where
             snapshot.max_step_in_use_after_backward_bytes,
         );
         eprintln!(
-            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} local_learning_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
             snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
             snapshot.forward_ns,
+            snapshot.local_learning_ns,
             snapshot.auxiliary_objective_ns,
             snapshot.proof_policy_ns,
             snapshot.loss_backward_ns,

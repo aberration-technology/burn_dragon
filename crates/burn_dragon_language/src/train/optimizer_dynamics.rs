@@ -320,6 +320,7 @@ fn tiny_model_config() -> DragonConfig {
 
 fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparameters {
     TrainingHyperparameters {
+        algorithm: TrainingAlgorithm::Auto,
         block_size: 4,
         tbptt_chunk_size: None,
         tbptt_persist_across_steps: false,
@@ -348,6 +349,7 @@ fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparam
         greedy_rollout_unlikelihood: Default::default(),
         dynamics_anchor: Default::default(),
         predictive_coding: Default::default(),
+        local_predictive_coding: Default::default(),
         latent_reasoning: Default::default(),
         ruliad_supervision: Default::default(),
         ruliad_probe_generation: Default::default(),

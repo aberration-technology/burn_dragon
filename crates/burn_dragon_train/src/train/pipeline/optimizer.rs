@@ -250,37 +250,9 @@ where
         OptimizerKind::Eggroll => Err(anyhow!(
             "optimizer.name=eggroll uses the EGGROLL evolution-strategy training path, not the Burn gradient optimizer resolver"
         )),
-        OptimizerKind::PredictiveCoding => match optimizer_cfg.predictive_coding.transform {
-            PredictiveCodingOptimizerTransform::Sgd => Ok(ResolvedOptimizer::PredictiveCodingSgd(
-                sgd_config_from_predictive_coding(optimizer_cfg, false).init::<B, M>(),
-            )),
-            PredictiveCodingOptimizerTransform::Momentum => {
-                Ok(ResolvedOptimizer::PredictiveCodingMomentum(
-                    sgd_config_from_predictive_coding(optimizer_cfg, true).init::<B, M>(),
-                ))
-            }
-            PredictiveCodingOptimizerTransform::Adamw => {
-                Ok(ResolvedOptimizer::PredictiveCodingAdamW(
-                    adamw_config_from_optimizer(optimizer_cfg).init::<B, M>(),
-                ))
-            }
-            PredictiveCodingOptimizerTransform::DiagonalNatural => {
-                let mut optimizer = OptimizerAdaptor::from(PredictiveCodingDiagonalNatural::new(
-                    &optimizer_cfg.predictive_coding,
-                    optimizer_cfg.weight_decay,
-                ));
-                if let Some(clip) = optimizer_cfg.grad_clip_norm {
-                    optimizer =
-                        optimizer.with_grad_clipping(GradientClippingConfig::Norm(clip).init());
-                } else if let Some(clip) = optimizer_cfg.grad_clip_value {
-                    optimizer =
-                        optimizer.with_grad_clipping(GradientClippingConfig::Value(clip).init());
-                }
-                Ok(ResolvedOptimizer::PredictiveCodingDiagonalNatural(
-                    optimizer,
-                ))
-            }
-        },
+        OptimizerKind::PredictiveCoding => Err(anyhow!(
+            "optimizer.name=predictive_coding is retired; predictive coding is a training algorithm, so use training.algorithm=predictive_coding with an ordinary parameter update transform"
+        )),
     }
 }
 
@@ -327,26 +299,23 @@ mod tests {
         }
     }
 
-    fn assert_transform_steps(transform: PredictiveCodingOptimizerTransform, expected_kind: u8) {
+    fn assert_retired_transform_rejected(transform: PredictiveCodingOptimizerTransform) {
         let config = base_optimizer_config(transform);
-        let mut optimizer = resolve_optimizer::<TestBackend, TestModule<TestBackend>>(&config, 1)
-            .expect("optimizer should resolve");
-        let module = test_module();
-        let loss = module.weight.val().sum();
-        let grads = GradientsParams::from_grads(loss.backward(), &module);
-        let module = optimizer.step(config.learning_rate, module, grads);
-        let record = optimizer.to_record();
-
-        assert_eq!(record.kind, expected_kind);
-        let _module = module;
-        let _optimizer = optimizer.load_record(record);
+        let error = resolve_optimizer::<TestBackend, TestModule<TestBackend>>(&config, 1)
+            .err()
+            .expect("legacy PC optimizer must not resolve");
+        assert!(
+            error
+                .to_string()
+                .contains("training.algorithm=predictive_coding")
+        );
     }
 
     #[test]
-    fn predictive_coding_optimizer_transforms_resolve_and_step() {
-        assert_transform_steps(PredictiveCodingOptimizerTransform::Sgd, 1);
-        assert_transform_steps(PredictiveCodingOptimizerTransform::Momentum, 2);
-        assert_transform_steps(PredictiveCodingOptimizerTransform::Adamw, 3);
-        assert_transform_steps(PredictiveCodingOptimizerTransform::DiagonalNatural, 4);
+    fn predictive_coding_optimizer_transforms_are_retired() {
+        assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::Sgd);
+        assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::Momentum);
+        assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::Adamw);
+        assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::DiagonalNatural);
     }
 }

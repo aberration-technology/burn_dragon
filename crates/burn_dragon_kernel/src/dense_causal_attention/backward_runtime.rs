@@ -1,12 +1,20 @@
 use super::*;
 use burn::tensor::backend::AutodiffBackend;
 
-fn dense_causal_backward_impl<B: BackendTrait>(
+/// Plain-backend VJP for dense causal linear attention.
+#[derive(Debug, Clone)]
+pub struct DenseCausalAttentionVjp<B: BackendTrait> {
+    pub grad_query: BurnTensor<B, 4>,
+    pub grad_value: BurnTensor<B, 4>,
+    pub grad_decay: BurnTensor<B, 1>,
+}
+
+pub fn dense_causal_attention_vjp<B: BackendTrait>(
     grad_output: BurnTensor<B, 4>,
     query: BurnTensor<B, 4>,
     value: BurnTensor<B, 4>,
     decay: BurnTensor<B, 1>,
-) -> (BurnTensor<B, 4>, BurnTensor<B, 4>, BurnTensor<B, 1>)
+) -> DenseCausalAttentionVjp<B>
 where
     B::FloatTensorPrimitive: 'static,
 {
@@ -76,7 +84,11 @@ where
         .sum_dim(3)
         .reshape([heads]);
 
-    (grad_query, grad_value, grad_decay)
+    DenseCausalAttentionVjp {
+        grad_query,
+        grad_value,
+        grad_decay,
+    }
 }
 
 fn dense_causal_attention_backward_impl<B: BackendTrait>(
@@ -96,17 +108,16 @@ fn dense_causal_attention_backward_impl<B: BackendTrait>(
     let value = BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(value));
     let decay = BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(decay));
 
-    let (grad_query, grad_value, grad_decay) =
-        dense_causal_backward_impl(grad_output, query, value, decay);
+    let vjp = dense_causal_attention_vjp(grad_output, query, value, decay);
 
     if let Some(parent) = &ops.parents[0] {
-        grads.register::<B>(parent.id, grad_query.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_query.into_primitive().tensor());
     }
     if let Some(parent) = &ops.parents[1] {
-        grads.register::<B>(parent.id, grad_value.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_value.into_primitive().tensor());
     }
     if let Some(parent) = &ops.parents[2] {
-        grads.register::<B>(parent.id, grad_decay.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_decay.into_primitive().tensor());
     }
 }
 

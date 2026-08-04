@@ -8,6 +8,7 @@ pub struct TrainProfileSnapshot {
     pub dataloader_host_to_device_copy_bytes: u128,
     pub host_sync_points: u64,
     pub forward_ns: u128,
+    pub local_learning_ns: u128,
     pub auxiliary_objective_ns: u128,
     pub proof_policy_ns: u128,
     pub loss_backward_ns: u128,
@@ -137,6 +138,7 @@ struct TrainProfileState {
     dataloader_host_to_device_copy_bytes: u128,
     host_sync_points: u64,
     forward_ns: u128,
+    local_learning_ns: u128,
     auxiliary_objective_ns: u128,
     proof_policy_ns: u128,
     loss_backward_ns: u128,
@@ -256,6 +258,7 @@ pub fn snapshot() -> TrainProfileSnapshot {
             dataloader_host_to_device_copy_bytes: profile.dataloader_host_to_device_copy_bytes,
             host_sync_points: profile.host_sync_points,
             forward_ns: profile.forward_ns,
+            local_learning_ns: profile.local_learning_ns,
             auxiliary_objective_ns: profile.auxiliary_objective_ns,
             proof_policy_ns: profile.proof_policy_ns,
             loss_backward_ns: profile.loss_backward_ns,
@@ -431,6 +434,13 @@ pub fn record_train_step(forward_ns: u128, loss_backward_ns: u128) {
     });
 }
 
+pub fn record_local_learning_step(elapsed_ns: u128) {
+    record(|profile| {
+        profile.local_learning_ns = profile.local_learning_ns.saturating_add(elapsed_ns);
+        profile.train_steps = profile.train_steps.saturating_add(1);
+    });
+}
+
 pub fn record_auxiliary_objectives(elapsed_ns: u128, proof_policy_ns: u128) {
     record(|profile| {
         profile.auxiliary_objective_ns = profile.auxiliary_objective_ns.saturating_add(elapsed_ns);
@@ -527,7 +537,9 @@ pub fn record_detail_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::{detail_due_for, record_auxiliary_objectives, reset, snapshot};
+    use super::{
+        detail_due_for, record_auxiliary_objectives, record_local_learning_step, reset, snapshot,
+    };
 
     #[test]
     fn detail_due_respects_interval_and_max_steps() {
@@ -546,6 +558,19 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(snapshot.auxiliary_objective_ns, 22);
         assert_eq!(snapshot.proof_policy_ns, 11);
+        reset();
+    }
+
+    #[test]
+    fn local_learning_profile_counts_compute_without_backward() {
+        reset();
+        record_local_learning_step(17);
+        record_local_learning_step(5);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.local_learning_ns, 22);
+        assert_eq!(snapshot.forward_ns, 0);
+        assert_eq!(snapshot.loss_backward_ns, 0);
+        assert_eq!(snapshot.train_steps, 2);
         reset();
     }
 }

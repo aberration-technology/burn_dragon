@@ -36,7 +36,7 @@ Usage:
 
 Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
-                               pc-optimizer | hparam | nextlat-tbptt
+                               local-factor | hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
@@ -190,12 +190,21 @@ matrix_defaults() {
         TIMEOUT_SECONDS="$WALL_CLOCK_SECONDS"
       fi
       ;;
-    pc-optimizer)
-      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
-      : "${SEEDS_CSV:=20260621,20260622,20260623}"
-      : "${ITERS_CSV:=512,2048}"
-      : "${ARMS_CSV:=pcopt_sgd,pcopt_momentum,pcopt_adamw,pcopt_diagonal_natural}"
-      : "${BATCH_SIZE:=64}"
+    local-factor)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128}"
+      : "${ARMS_CSV:=local_backprop,local_pc_steps1,local_pc_steps2,local_pc_steps4}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=128
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
       ;;
     hparam)
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
@@ -404,15 +413,30 @@ write_overlay() {
   local seed="$3"
   local iters="$4"
   local batch_size="$5"
+  local algorithm_line=""
+  local tbptt_line=""
+
+  case "$arm" in
+    local_backprop)
+      algorithm_line='algorithm = "backpropagation"'
+      ;;
+    local_pc*)
+      algorithm_line='algorithm = "predictive_coding"'
+      ;;
+  esac
+  if (( TBPTT_CHUNK_SIZE > 0 )); then
+    tbptt_line="tbptt_chunk_size = $TBPTT_CHUNK_SIZE"
+  fi
 
   cat > "$path" <<EOF
 [training]
+${algorithm_line}
 batch_size = $batch_size
 max_iters = $iters
 checkpoint_interval_iters = $CHECKPOINT_INTERVAL_ITERS
 log_frequency = $LOG_FREQUENCY
 seed = $seed
-tbptt_chunk_size = $TBPTT_CHUNK_SIZE
+${tbptt_line}
 launch_mode = "fresh"
 
 [training.events]
@@ -437,6 +461,71 @@ enabled = false
 EOF
 
   case "$arm" in
+    local_backprop)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      ;;
+    local_pc_steps1|local_pc_steps2|local_pc_steps4|local_pc_steps8)
+      local local_steps="${arm#local_pc_steps}"
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+
+EOF
+      ;;
+    local_pc_steps4_eta05_lr003|local_pc_steps4_eta05_lr01)
+      local local_lr="0.003"
+      if [[ "$arm" == *_lr01 ]]; then
+        local_lr="0.01"
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = 4
+step_size = 0.5
+
+EOF
+      ;;
+    local_pc_steps*_eta*)
+      if [[ ! "$arm" =~ ^local_pc_steps(1|2|4|8)_eta(01|02|05|10)$ ]]; then
+        echo "unknown local PC arm: $arm" >&2
+        return 2
+      fi
+      local local_steps="${BASH_REMATCH[1]}"
+      local eta_code="${BASH_REMATCH[2]}"
+      local local_eta=""
+      case "$eta_code" in
+        01) local_eta="0.1" ;;
+        02) local_eta="0.2" ;;
+        05) local_eta="0.5" ;;
+        10) local_eta="1.0" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
+
+EOF
+      ;;
     adamw)
       cat >> "$path" <<EOF
 [optimizer]
@@ -606,24 +695,6 @@ weight_decay = 0.01
 
 EOF
       write_pc_block "$path" true core block optimizer 1 0.01 2 0 oracle_next_token_negative_control
-      ;;
-    pcopt_sgd|pcopt_momentum|pcopt_adamw|pcopt_diagonal_natural)
-      local transform="${arm#pcopt_}"
-      cat >> "$path" <<EOF
-[optimizer]
-name = "predictive_coding"
-learning_rate = 0.001
-weight_decay = 0.01
-
-[optimizer.predictive_coding]
-transform = "$transform"
-momentum = 0.9
-fisher_decay = 0.95
-damping = 0.001
-nesterov = false
-
-EOF
-      write_pc_block "$path" true core chunked optimizer 1 0.01 2
       ;;
     *)
       echo "unknown arm: $arm" >&2

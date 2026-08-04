@@ -34,7 +34,10 @@ pub use config::{
     SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 pub use dragon::{
-    DragonModel, LanguageModuleLrScaleTarget, LatentReasoningOutput,
+    DragonModel, DragonPredictiveCodingHeadActivityVjp, DragonPredictiveCodingHeadVjp,
+    DragonPredictiveCodingInitialVjp, DragonPredictiveCodingLayerTrace,
+    DragonPredictiveCodingLayerVjp, DragonPredictiveCodingParameterIds,
+    DragonPredictiveCodingSupport, LanguageModuleLrScaleTarget, LatentReasoningOutput,
     SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
     SharedLowrankFeatureMetrics, SharedLowrankParamIds, SharedLowrankPopulationFactors,
     SharedLowrankPopulationWeights, SharedLowrankWeights,

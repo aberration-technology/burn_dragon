@@ -25,6 +25,8 @@ use crate::fusion_compat::register_fusion_float_tensor;
 mod backward_runtime;
 mod forward_runtime;
 
+pub use backward_runtime::{DenseCausalAttentionVjp, dense_causal_attention_vjp};
+
 #[cfg(feature = "cuda")]
 use self::backward_runtime::dense_causal_attention_autodiff_fusion_cuda;
 use self::backward_runtime::{

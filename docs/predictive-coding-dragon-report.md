@@ -1,16 +1,130 @@
-# Predictive Coding State Correction in Dragon TBPTT Training
+# Predictive Coding in Dragon Training
 
-Date: 2026-06-20
+Date: 2026-08-04
 
 ## Status
 
-This document is a preprint draft and experiment protocol. It is **not publish-grade yet** because
-the current evidence is a small local ablation, not a complete controlled study.
+This document records two separate mechanisms: canonical layer-local predictive coding and the
+older recurrent-state correction auxiliary. It is **not a promotion paper**. The layer-local path
+now has a controlled, reproducible three-seed screen, but it does not yet match AdamW quality or
+throughput. AdamW remains the default training algorithm.
 
-The correct paper framing is a neutral result: predictive-coding (PC) recurrent-state correction is
-technically viable in Dragon training, but the current evidence does not show a fixed-wall-clock
-advantage over AdamW. The draft should not claim that PC prevents collapse, improves long-run
-continual learning, or should be enabled by default until the experiment matrix below is complete.
+The correct framing is a neutral result. Dragon can now train by local factor VJPs without a global
+autodiff graph or global backward pass. That establishes the intended learning contract, not a
+quality win. Neither PC implementation has shown that it prevents collapse, improves long-run
+continual learning, or should replace AdamW.
+
+### 2026-08-04 canonical local-factor implementation
+
+Set `training.algorithm = "predictive_coding"` to select the canonical local-learning path. The
+outer learner retains Burn's `Autodiff<B>` model type only for checkpoint and optimizer
+compatibility. Each train step immediately takes `model.valid()` and performs factor evaluation,
+activity inference, analytic VJPs, and derivative accumulation on `B::InnerBackend`. It never calls
+`.backward()` and does not retain a global parameter graph.
+
+```toml
+[training]
+algorithm = "predictive_coding"
+
+[training.validation]
+sampling = "fixed_holdout"
+seed = 3509215397
+
+[training.local_predictive_coding]
+learning_schedule = "equilibrium"
+prediction_precision = 1.0
+factor_reduction = "sum"
+
+[training.local_predictive_coding.inference]
+steps = 4
+step_size = 0.05
+gradient_norm_scope = "per_row"
+
+[optimizer]
+name = "adamw" # update transform over local derivatives only
+```
+
+The implemented equilibrium schedule is:
+
+1. Run the current shared-weight Dragon layers to initialize one activity per layer.
+2. Define a local squared prediction-error factor between every inferred activity and its current
+   layer prediction, plus a terminal token cross-entropy factor.
+3. Relax unclamped activities with analytic input VJPs for the configured number of local
+   inference steps.
+4. Evaluate parameter VJPs once at the settled activities, aggregate derivatives from every use of
+   Dragon's shared weights, and normalize by the number of supervised tokens.
+5. Pass those derivative tensors to Burn's AdamW transform. AdamW only updates parameters and its
+   moments from supplied local derivatives; there is no preceding AdamW/backprop training pass.
+
+Activities and errors are batch-local transient state. Checkpoints continue to contain model
+parameters and optimizer moments, not an equilibrium trajectory. Layer forwards and local VJPs are
+tensorized over batch/token positions. Shared-weight layer uses are aggregated before the update.
+The exported train-loss metric is the ordinary feed-forward token cross entropy measured before
+activity relaxation; post-inference energy is reported separately when synchronized diagnostics are
+enabled. This keeps train-loss comparisons with the backpropagation baseline meaningful.
+
+This first exact implementation is deliberately fail-closed. It supports the flat, untied standard
+language head; vanilla residual stream; dense short-context linear attention with ALiBi; uniform
+full latent fanout; one rollout; and no dropout, random scaffold, hierarchy, slow memory, summary
+memory, latent-reasoning recurrence, or TBPTT. Unsupported combinations fail configuration
+validation instead of silently falling back to global backprop.
+
+The historical `[training.predictive_coding]` configuration below is a different mechanism: it
+corrects recurrent state as an auxiliary inside ordinary global-backprop training. It remains
+useful as a control, but is not the canonical local-factor contract. The former
+`optimizer.name = "predictive_coding"` spelling has been retired and now returns a migration error;
+optimizer transforms are not learning algorithms.
+
+#### Validation contract
+
+The matrix exposed that ordinary Ruliad validation had followed the evolving live source-selection
+distribution. That made nominal validation losses incomparable across trajectories. Validation now
+defaults to a deterministic `fixed_holdout` stream with its own seed, independent of both the
+training seed and live source-selection weights. `live_source_selection` remains an explicit
+validation mode. Source-weighted validation and the free-running verifier remain adaptive
+diagnostics; they are not the fixed holdout.
+
+An exact-repeat check at four inference steps and `step_size = 0.05` produced identical train loss
+2.400160 and fixed-holdout loss 3.177092 in both runs. Mean throughput was 11,240 +/- 61 tokens/s.
+The matched CUDA AdamW repeats were not bitwise deterministic: an early logged-loss difference of
+about `4.5e-5` amplified to train losses 0.90773 and 1.00839 and validation losses 2.10056 and
+2.07079. The holdout examples are fixed; this residual variation belongs to the CUDA global-
+backprop trajectory and is why promotion comparisons use multiple seeds. In an earlier diagnostic,
+otherwise identical PC `step_size = 0.5` repeats followed the same trajectory through step 95 and
+then diverged sharply. The larger step is retained only as an instability ablation; 0.05 is the
+profile default.
+
+#### Fixed-token CUDA matrix
+
+Each row is a release-CUDA, three-seed run on NVIDIA GB10: 937,154 shared parameters, 4 shared
+Dragon layers, embedding 96, 4 heads, latent width 3,072, batch 32, block 128, and 128 updates
+(524,288 train tokens per run).
+Adaptive dynamics, continual backprop, and neuron scaling are disabled. Validation uses the same
+fixed holdout seed in every arm.
+
+| Arm | Valid loss | Last train loss | Verifier | Partial progress | Tokens/s | Local-PC time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **2.078 +/- 0.0325** | **0.944 +/- 0.0919** | **0.0417 +/- 0.0540** | **0.2144 +/- 0.0493** | **56,620 +/- 1,600** | - |
+| Local PC, 1 step | 3.235 +/- 0.129 | 2.497 +/- 0.284 | 0 | 0.0625 +/- 0.122 | 21,170 +/- 619 | 2,061 +/- 51 ms |
+| Local PC, 2 steps | 3.214 +/- 0.135 | 2.466 +/- 0.236 | 0 | 0.0625 +/- 0.122 | 16,210 +/- 300 | 3,285 +/- 50 ms |
+| Local PC, 4 steps | 3.136 +/- 0.0886 | 2.340 +/- 0.215 | 0 | 0.1111 +/- 0.111 | 11,003 +/- 65 | 5,163 +/- 31 ms |
+
+The paired four-step-minus-AdamW delta is +1.058 +/- 0.108 validation loss and -45,613 +/- 1,610
+tokens/s. All local-PC event rows report `learning_contract = "local_factor_vjp_v1"`,
+`global_autodiff_graph = false`, and zero global backward calls. Median GPU utilization is 92-93%
+for PC, versus 79-89.5% for the much shorter AdamW runs, so the PC path is not host-stalled. Its
+lower throughput is added local inference/VJP work. At this scale the removal of global backward
+does not compensate for repeated local sweeps.
+
+Verifier performance remains near zero because these are short optimization screens, not
+reasoning-quality runs. No arm crossed a fatal training gate. Peak host RAM was 8.9-10.9 GB with at
+least 113 GB available. The raw analyzed tables are in
+`target/local-pc-factor-fixed-final-metric-128x3-20260804/analysis/`; exact-repeat evidence is in
+`target/local-pc-fixed-repeat-final-20260804/analysis/`.
+
+**Decision:** retain canonical local PC as an experimental, mechanically verified algorithm; do
+not promote it as the default. The next quality experiment must improve the local objective or
+schedule and beat this fixed-holdout baseline before a longer continual-learning claim is warranted.
 
 ### 2026-08 causal-contract correction
 
@@ -104,7 +218,7 @@ this report's historical 28k-token/s fused-path evidence; AdamW backward alone c
 seconds over the eight-update batch-48 screen. This is a separate shared Dragon backward-path
 regression. These rows establish relative PC cost only and are not production throughput promotion.
 
-## Abstract Draft
+## Historical Recurrent-State Abstract Draft
 
 We evaluate causal recurrent-state correction as an amortized teacher for Dragon TBPTT language
 training. In the deployable contract, correction uses only an already-observed prefix and the
@@ -120,7 +234,7 @@ recurrent denoising/replay auxiliary, not layer-local predictive coding and not 
 replacement. It remains disabled and useful as a reproducible control. A genuine PC follow-up must
 expose layer-local Dragon activities and prediction errors directly.
 
-## Method
+## Historical Recurrent-State Method
 
 The training path under test is Dragon language modeling with TBPTT. In AdamW+PC mode, PC performs
 one or more recurrent-state correction steps inside each selected TBPTT chunk, then normal gradient
@@ -158,27 +272,11 @@ enabled = true
 parameter_update = "state_only_control"
 ```
 
-The implementation also exposes a coupled conventional parameter-transform control:
-
-```toml
-[optimizer]
-name = "predictive_coding"
-learning_rate = 0.001
-weight_decay = 0.0
-
-[optimizer.predictive_coding]
-transform = "sgd" # sgd | momentum | adamw | diagonal_natural
-
-[training.predictive_coding]
-enabled = true
-backward_mode = "chunked"
-parameter_update = "optimizer"
-```
-
-Despite the historical `optimizer.name` spelling, these transforms consume ordinary backpropagated
-parameter gradients; they are not layer-local predictive-coding weight rules. This path is
-validated and smoke-tested, but it is appendix material until it has its own controlled matrix. The
-main scientific claim remains about PC state correction plus AdamW.
+The historical `optimizer.name = "predictive_coding"` parameter-transform control has been removed.
+It consumed ordinary backpropagated gradients and therefore obscured the learning contract. Old
+configurations now fail with a migration message. Use `training.algorithm = "predictive_coding"`
+for local factor learning, or `training.algorithm = "backpropagation"` with an ordinary optimizer
+for global backpropagation.
 
 Paper-matrix overlays disable adaptive dynamics recovery, continual backprop, and neuron scaling.
 Those systems are important continual-learning machinery, but they would confound an optimizer and

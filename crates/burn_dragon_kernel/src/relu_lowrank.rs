@@ -402,6 +402,202 @@ fn lowrank_projection_reference_forward<B: BackendTrait>(
     }
 }
 
+/// Plain-backend vector-Jacobian product for a ReLU low-rank projection.
+///
+/// This is the numerical contract shared by Burn's autodiff node and local
+/// learning algorithms such as predictive coding. Calling it never creates or
+/// traverses a global autodiff graph.
+#[derive(Debug, Clone)]
+pub struct ReluLowrankVjp<B: BackendTrait> {
+    pub grad_input: BurnTensor<B, 4>,
+    pub grad_weight: BurnTensor<B, 4>,
+}
+
+fn relu_lowrank_linearized_output<B: BackendTrait>(
+    input: &BurnTensor<B, 4>,
+    weight: &BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    threshold: f32,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<(LowrankProjectionShape, BurnTensor<B, 4>)>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let shape = LowrankProjectionShape::from_tensors(
+        input,
+        weight,
+        threshold,
+        sparse_mask.as_ref(),
+        grad_input_executor,
+    )?;
+    if shape.weight_batch != 1
+        || grad_output.shape().dims::<4>() != [shape.batch, shape.heads, shape.time, shape.latent]
+    {
+        return None;
+    }
+
+    let projected = lowrank_projection_reference(input.clone(), weight.clone());
+    let activation_mask = projected
+        .sub_scalar(shape.threshold)
+        .greater_elem(0.0)
+        .float();
+    let mut grad_projected = grad_output * activation_mask;
+    if let Some(mask) = sparse_mask {
+        grad_projected = grad_projected * mask;
+    }
+    Some((shape, grad_projected))
+}
+
+fn relu_lowrank_grad_input_from_projected<B: BackendTrait>(
+    grad_projected: &BurnTensor<B, 4>,
+    weight: &BurnTensor<B, 4>,
+    shape: LowrankProjectionShape,
+) -> BurnTensor<B, 4>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    if let Some(fused) = try_lowrank_grad_input_cuda_direct::<B>(grad_projected, weight, shape) {
+        fused
+    } else if shape.input_heads == 1 {
+        let grad_flat = grad_projected
+            .clone()
+            .swap_dims(1, 2)
+            .reshape([shape.batch * shape.time, shape.heads * shape.latent]);
+        let weight_flat = weight
+            .clone()
+            .reshape([shape.heads, shape.embd, shape.latent])
+            .swap_dims(0, 1)
+            .reshape([shape.embd, shape.heads * shape.latent]);
+        grad_flat
+            .matmul(weight_flat.swap_dims(0, 1))
+            .reshape([shape.batch, shape.time, shape.embd])
+            .reshape([shape.batch, 1, shape.time, shape.embd])
+    } else {
+        try_head_aligned_grad_input_wgpu(grad_projected, weight, shape).unwrap_or_else(|| {
+            let grad_by_head = grad_projected.clone().swap_dims(0, 1).reshape([
+                shape.heads,
+                shape.batch * shape.time,
+                shape.latent,
+            ]);
+            let weight_by_head = weight
+                .clone()
+                .reshape([shape.heads, shape.embd, shape.latent]);
+            grad_by_head
+                .matmul(weight_by_head.swap_dims(1, 2))
+                .reshape([shape.heads, shape.batch, shape.time, shape.embd])
+                .swap_dims(0, 1)
+        })
+    }
+}
+
+fn relu_lowrank_grad_weight_from_projected<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    grad_projected: BurnTensor<B, 4>,
+    shape: LowrankProjectionShape,
+) -> BurnTensor<B, 4>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let grad_weight_start = profile_enabled().then(Instant::now);
+    let grad_weight = if shape.input_heads == 1 {
+        let input_flat = input
+            .reshape([shape.batch, shape.time, shape.embd])
+            .reshape([shape.batch * shape.time, shape.embd]);
+        let grad_flat = grad_projected
+            .swap_dims(1, 2)
+            .reshape([shape.batch * shape.time, shape.heads * shape.latent]);
+        input_flat
+            .swap_dims(0, 1)
+            .matmul(grad_flat)
+            .reshape([shape.embd, shape.heads, shape.latent])
+            .swap_dims(0, 1)
+            .reshape([1, shape.heads, shape.embd, shape.latent])
+    } else {
+        let input_by_head =
+            input
+                .swap_dims(0, 1)
+                .reshape([shape.heads, shape.batch * shape.time, shape.embd]);
+        let grad_by_head = grad_projected.swap_dims(0, 1).reshape([
+            shape.heads,
+            shape.batch * shape.time,
+            shape.latent,
+        ]);
+        input_by_head.swap_dims(1, 2).matmul(grad_by_head).reshape([
+            1,
+            shape.heads,
+            shape.embd,
+            shape.latent,
+        ])
+    };
+    if let Some(start) = grad_weight_start {
+        profile_record(&RELU_LOWRANK_GRAD_WEIGHT_PROFILE, |state| {
+            state.calls = state.calls.saturating_add(1);
+            state.total_ns = state.total_ns.saturating_add(start.elapsed().as_nanos());
+        });
+    }
+    grad_weight
+}
+
+/// Plain-backend VJP for only the projection input.
+///
+/// Activity inference uses this route because parameter derivatives are not
+/// consumed until the final local-learning phase.
+pub fn relu_lowrank_input_vjp<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    threshold: f32,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<BurnTensor<B, 4>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (shape, grad_projected) = relu_lowrank_linearized_output(
+        &input,
+        &weight,
+        grad_output,
+        threshold,
+        sparse_mask,
+        grad_input_executor,
+    )?;
+    Some(relu_lowrank_grad_input_from_projected(
+        &grad_projected,
+        &weight,
+        shape,
+    ))
+}
+
+pub fn relu_lowrank_vjp<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    threshold: f32,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<ReluLowrankVjp<B>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (shape, grad_projected) = relu_lowrank_linearized_output(
+        &input,
+        &weight,
+        grad_output,
+        threshold,
+        sparse_mask,
+        grad_input_executor,
+    )?;
+    let grad_input = relu_lowrank_grad_input_from_projected(&grad_projected, &weight, shape);
+
+    let grad_weight = relu_lowrank_grad_weight_from_projected(input, grad_projected, shape);
+
+    Some(ReluLowrankVjp {
+        grad_input,
+        grad_weight,
+    })
+}
+
 fn relu_lowrank_backward_impl<B: BackendTrait>(
     ops: Ops<
         (
@@ -424,96 +620,21 @@ fn relu_lowrank_backward_impl<B: BackendTrait>(
     let sparse_mask =
         mask_inner.map(|mask| BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(mask)));
 
-    let projected = lowrank_projection_reference(input.clone(), weight.clone());
-    let activation_mask = projected
-        .sub_scalar(shape.threshold)
-        .greater_elem(0.0)
-        .float();
-    let mut grad_projected = grad_output * activation_mask;
-    if let Some(mask) = sparse_mask {
-        grad_projected = grad_projected * mask;
-    }
-
+    let (shape, grad_projected) = relu_lowrank_linearized_output(
+        &input,
+        &weight,
+        grad_output,
+        shape.threshold,
+        sparse_mask,
+        shape.grad_input_executor,
+    )
+    .expect("autodiff low-rank projection VJP shape must match its forward node");
     if let Some(parent) = &parents[0] {
-        let grad_input = if let Some(fused) =
-            try_lowrank_grad_input_cuda_direct::<B>(&grad_projected, &weight, shape)
-        {
-            fused
-        } else if shape.input_heads == 1 {
-            let grad_flat = grad_projected
-                .clone()
-                .swap_dims(1, 2)
-                .reshape([shape.batch * shape.time, shape.heads * shape.latent]);
-            let weight_flat = weight
-                .clone()
-                .reshape([shape.heads, shape.embd, shape.latent])
-                .swap_dims(0, 1)
-                .reshape([shape.embd, shape.heads * shape.latent]);
-            grad_flat
-                .matmul(weight_flat.swap_dims(0, 1))
-                .reshape([shape.batch, shape.time, shape.embd])
-                .reshape([shape.batch, 1, shape.time, shape.embd])
-        } else {
-            try_head_aligned_grad_input_wgpu(&grad_projected, &weight, shape).unwrap_or_else(|| {
-                let grad_by_head = grad_projected.clone().swap_dims(0, 1).reshape([
-                    shape.heads,
-                    shape.batch * shape.time,
-                    shape.latent,
-                ]);
-                let weight_by_head =
-                    weight
-                        .clone()
-                        .reshape([shape.heads, shape.embd, shape.latent]);
-                grad_by_head
-                    .matmul(weight_by_head.swap_dims(1, 2))
-                    .reshape([shape.heads, shape.batch, shape.time, shape.embd])
-                    .swap_dims(0, 1)
-            })
-        };
+        let grad_input = relu_lowrank_grad_input_from_projected(&grad_projected, &weight, shape);
         grads.register::<B>(parent.id, grad_input.into_primitive().tensor());
     }
-
     if let Some(parent) = &parents[1] {
-        let grad_weight_start = profile_enabled().then(Instant::now);
-        let grad_weight = if shape.input_heads == 1 {
-            let input_flat = input
-                .clone()
-                .reshape([shape.batch, shape.time, shape.embd])
-                .reshape([shape.batch * shape.time, shape.embd]);
-            let grad_flat = grad_projected
-                .clone()
-                .swap_dims(1, 2)
-                .reshape([shape.batch * shape.time, shape.heads * shape.latent]);
-            input_flat
-                .swap_dims(0, 1)
-                .matmul(grad_flat)
-                .reshape([shape.embd, shape.heads, shape.latent])
-                .swap_dims(0, 1)
-                .reshape([1, shape.heads, shape.embd, shape.latent])
-        } else {
-            let input_by_head = input.clone().swap_dims(0, 1).reshape([
-                shape.heads,
-                shape.batch * shape.time,
-                shape.embd,
-            ]);
-            let grad_by_head = grad_projected.clone().swap_dims(0, 1).reshape([
-                shape.heads,
-                shape.batch * shape.time,
-                shape.latent,
-            ]);
-            input_by_head.swap_dims(1, 2).matmul(grad_by_head).reshape([
-                1,
-                shape.heads,
-                shape.embd,
-                shape.latent,
-            ])
-        };
-        if let Some(start) = grad_weight_start {
-            profile_record(&RELU_LOWRANK_GRAD_WEIGHT_PROFILE, |state| {
-                state.calls = state.calls.saturating_add(1);
-                state.total_ns = state.total_ns.saturating_add(start.elapsed().as_nanos());
-            });
-        }
+        let grad_weight = relu_lowrank_grad_weight_from_projected(input, grad_projected, shape);
         grads.register::<B>(parent.id, grad_weight.into_primitive().tensor());
     }
 }

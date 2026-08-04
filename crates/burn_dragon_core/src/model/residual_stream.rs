@@ -58,6 +58,13 @@ impl LowRankResidualStepMode {
             ..Self::full_output()
         }
     }
+    const fn full_output_with_metrics_relu_native() -> Self {
+        Self {
+            native_projection_relu_fused: true,
+            keep_aux: true,
+            keep_metric_aux: true,
+        }
+    }
     #[cfg(any(feature = "probe", test))]
     const fn with_metrics() -> Self {
         Self {
@@ -630,6 +637,106 @@ where
     FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
     FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
 {
+    lowrank_residual_step_branch_thresholds_relu_native_impl(
+        current,
+        encoder,
+        encoder_v,
+        decoder,
+        dropout,
+        use_fused_x,
+        use_fused_y,
+        x_relu_threshold,
+        y_relu_threshold,
+        apply_threshold,
+        latent_pattern,
+        lowrank_grad_input_executor,
+        sparse_mask,
+        false,
+        attention,
+        apply_latent,
+        apply_norm,
+    )
+}
+
+/// Full ReLU-native residual trace including the intermediate tensors needed
+/// by local factor VJPs. Ordinary full-output callers avoid retaining these
+/// additional tensors.
+#[allow(clippy::too_many_arguments)]
+pub fn lowrank_residual_step_with_metrics_branch_thresholds_relu_native<B, FAttn, FNorm, FAct>(
+    current: Tensor<B, 4>,
+    encoder: Tensor<B, 4>,
+    encoder_v: Tensor<B, 4>,
+    decoder: Tensor<B, 2>,
+    dropout: &Dropout,
+    use_fused_x: bool,
+    use_fused_y: bool,
+    x_relu_threshold: f32,
+    y_relu_threshold: f32,
+    apply_threshold: bool,
+    latent_pattern: &BlockPattern1d,
+    lowrank_grad_input_executor: LowrankGradInputExecutor,
+    sparse_mask: Option<Tensor<B, 4>>,
+    attention: FAttn,
+    apply_latent: FAct,
+    apply_norm: FNorm,
+) -> LowRankResidualOutput<B>
+where
+    B: Backend,
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+    FAttn: FnMut(Tensor<B, 4>, Tensor<B, 4>) -> Tensor<B, 4>,
+    FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+    FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+{
+    lowrank_residual_step_branch_thresholds_relu_native_impl(
+        current,
+        encoder,
+        encoder_v,
+        decoder,
+        dropout,
+        use_fused_x,
+        use_fused_y,
+        x_relu_threshold,
+        y_relu_threshold,
+        apply_threshold,
+        latent_pattern,
+        lowrank_grad_input_executor,
+        sparse_mask,
+        true,
+        attention,
+        apply_latent,
+        apply_norm,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lowrank_residual_step_branch_thresholds_relu_native_impl<B, FAttn, FNorm, FAct>(
+    current: Tensor<B, 4>,
+    encoder: Tensor<B, 4>,
+    encoder_v: Tensor<B, 4>,
+    decoder: Tensor<B, 2>,
+    dropout: &Dropout,
+    use_fused_x: bool,
+    use_fused_y: bool,
+    x_relu_threshold: f32,
+    y_relu_threshold: f32,
+    apply_threshold: bool,
+    latent_pattern: &BlockPattern1d,
+    lowrank_grad_input_executor: LowrankGradInputExecutor,
+    sparse_mask: Option<Tensor<B, 4>>,
+    keep_metric_aux: bool,
+    attention: FAttn,
+    apply_latent: FAct,
+    apply_norm: FNorm,
+) -> LowRankResidualOutput<B>
+where
+    B: Backend,
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+    FAttn: FnMut(Tensor<B, 4>, Tensor<B, 4>) -> Tensor<B, 4>,
+    FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+    FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+{
     let output = lowrank_residual_step_impl(
         current,
         LowRankResidualStepConfig {
@@ -645,7 +752,11 @@ where
             latent_pattern,
             lowrank_grad_input_executor,
             sparse_mask,
-            mode: LowRankResidualStepMode::full_output_relu_native(),
+            mode: if keep_metric_aux {
+                LowRankResidualStepMode::full_output_with_metrics_relu_native()
+            } else {
+                LowRankResidualStepMode::full_output_relu_native()
+            },
         },
         attention,
         apply_latent,

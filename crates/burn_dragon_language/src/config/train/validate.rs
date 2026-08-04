@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 
 use burn_dragon_core::{
-    DragonConfig, LanguageHeadConfig, ResidualConnectorKind,
-    objective::validate_training_objective_config,
+    DragonConfig, LanguageHeadConfig, ResidualConnectorKind, RotaryEmbedding, SequenceMemorySystem,
+    SequenceTrainingExecutor, objective::validate_training_objective_config,
 };
 use burn_dragon_train::{
     LearningRateScheduleConfig, OptimizerKind, ParallelismKind, PipelineCommunicationKind,
@@ -12,12 +12,24 @@ use burn_dragon_train::{
 
 use super::{
     DatasetSourceConfig, PredictiveCodingBackwardMode, PredictiveCodingMode,
-    PredictiveCodingObservationContract, PredictiveCodingParameterUpdate, RuliadVerifierRewardMode,
-    SequenceBatchingMode, TrainingConfig,
+    PredictiveCodingObservationContract, RuliadVerifierRewardMode, SequenceBatchingMode,
+    TrainingAlgorithm, TrainingConfig,
 };
 use crate::tokenizer::TokenizerKind;
 
 impl TrainingConfig {
+    pub fn resolved_training_algorithm(&self) -> TrainingAlgorithm {
+        match self.training.algorithm {
+            TrainingAlgorithm::Auto => match self.optimizer.name {
+                OptimizerKind::Eggroll => TrainingAlgorithm::Eggroll,
+                OptimizerKind::Adamw | OptimizerKind::PredictiveCoding => {
+                    TrainingAlgorithm::Backpropagation
+                }
+            },
+            explicit => explicit,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.training.block_size == 0 {
             return Err(anyhow!("training.block_size must be > 0"));
@@ -1964,42 +1976,9 @@ impl TrainingConfig {
         }
         self.optimizer.validate()?;
         if matches!(self.optimizer.name, OptimizerKind::PredictiveCoding) {
-            if !self.training.predictive_coding.enabled {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding requires training.predictive_coding.enabled"
-                ));
-            }
-            if matches!(
-                self.training.predictive_coding.parameter_update,
-                PredictiveCodingParameterUpdate::StateOnlyControl
-            ) {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding requires training.predictive_coding.parameter_update=optimizer"
-                ));
-            }
-            if matches!(
-                self.training.predictive_coding.backward_mode,
-                PredictiveCodingBackwardMode::Block
-            ) {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding currently requires training.predictive_coding.backward_mode=chunked"
-                ));
-            }
-            if self.training.continual_backprop.enabled {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding does not yet support training.continual_backprop.enabled"
-                ));
-            }
-            if self.training.neuron_scaling.enabled {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding does not yet support training.neuron_scaling.enabled"
-                ));
-            }
-            if self.training.tbptt_persist_across_steps {
-                return Err(anyhow!(
-                    "optimizer.name=predictive_coding does not yet support training.tbptt_persist_across_steps"
-                ));
-            }
+            return Err(anyhow!(
+                "optimizer.name=predictive_coding is retired because it used global backpropagation; set training.algorithm=predictive_coding with optimizer.name=adamw for analytic local VJPs"
+            ));
         }
         if matches!(self.optimizer.name, OptimizerKind::Eggroll) {
             if self.optimizer.eggroll.gradient_learning_rate.is_some() {
@@ -2039,7 +2018,7 @@ impl TrainingConfig {
             }
             if self.training.predictive_coding.enabled {
                 return Err(anyhow!(
-                    "optimizer.name=eggroll does not support training.predictive_coding.enabled; use optimizer.name=predictive_coding for the PC optimizer path"
+                    "optimizer.name=eggroll does not support the historical training.predictive_coding recurrent-state replay auxiliary"
                 ));
             }
             if self.training.tbptt_persist_across_steps {
@@ -3593,6 +3572,147 @@ impl TrainingConfig {
             }
         }
 
+        self.validate_training_algorithm()?;
+
+        Ok(())
+    }
+
+    fn validate_training_algorithm(&self) -> Result<()> {
+        let algorithm = self.resolved_training_algorithm();
+        match algorithm {
+            TrainingAlgorithm::Auto => unreachable!("training algorithm must resolve"),
+            TrainingAlgorithm::Backpropagation => {
+                if matches!(self.optimizer.name, OptimizerKind::Eggroll) {
+                    return Err(anyhow!(
+                        "training.algorithm=backpropagation is incompatible with optimizer.name=eggroll"
+                    ));
+                }
+            }
+            TrainingAlgorithm::Eggroll => {
+                if !matches!(self.optimizer.name, OptimizerKind::Eggroll) {
+                    return Err(anyhow!(
+                        "training.algorithm=eggroll requires optimizer.name=eggroll"
+                    ));
+                }
+            }
+            TrainingAlgorithm::PredictiveCoding => self.validate_local_predictive_coding()?,
+        }
+        Ok(())
+    }
+
+    fn validate_local_predictive_coding(&self) -> Result<()> {
+        let pc = &self.training.local_predictive_coding;
+        pc.inference
+            .validate("training.local_predictive_coding.inference")?;
+        if pc.prediction_precision <= 0.0 || !pc.prediction_precision.is_finite() {
+            return Err(anyhow!(
+                "training.local_predictive_coding.prediction_precision must be finite and > 0"
+            ));
+        }
+        if !matches!(
+            pc.learning_schedule,
+            burn_pc::PcLearningSchedule::Equilibrium
+        ) {
+            return Err(anyhow!(
+                "Dragon local PC currently supports learning_schedule=equilibrium; incremental updates require an in-executor optimizer state"
+            ));
+        }
+        if !matches!(self.optimizer.name, OptimizerKind::Adamw) {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires optimizer.name=adamw; AdamW is only the local-derivative update transform"
+            ));
+        }
+        if self.training.predictive_coding.enabled {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding cannot be combined with the historical training.predictive_coding recurrent-state replay auxiliary"
+            ));
+        }
+        if !self.training.objective.is_next_token() {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires the next-token objective"
+            ));
+        }
+        if self.training.tbptt_chunk_size.is_some() || self.training.tbptt_persist_across_steps {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently uses one local factor graph per full block and does not support TBPTT state persistence"
+            ));
+        }
+        if self.parallel.mode != ParallelismKind::Single || self.parallel.pipeline.enabled {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires local single-process execution"
+            ));
+        }
+        if self.training.gradient_accumulation_steps != 1 {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires training.gradient_accumulation_steps=1"
+            ));
+        }
+        if self.training.continual_backprop.enabled || self.training.neuron_scaling.enabled {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding does not yet compose with continual_backprop or neuron_scaling"
+            ));
+        }
+        if self.training.input_corruption.enabled
+            || self.training.dynamics_anchor.enabled
+            || self.training.latent_reasoning.enabled
+            || self.training.logit_entropy_floor.enabled
+            || self.training.repeat_unlikelihood.enabled
+            || self.training.greedy_rollout_unlikelihood.enabled
+        {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently supports only its local prediction factors and terminal next-token factor; input corruption and global auxiliary losses must be disabled"
+            ));
+        }
+        let ruliad = self.training.ruliad_supervision;
+        if ruliad.answer_ranking.enabled
+            || ruliad.answer_denoising.enabled
+            || ruliad.answer_contract.enabled
+            || ruliad.verifier_reward.enabled
+            || ruliad.proof_policy.enabled
+        {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding does not yet support Ruliad auxiliary objectives; token target masking and weighting remain supported"
+            ));
+        }
+        if self.training.gdpo.is_some() {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding does not yet support training.gdpo"
+            ));
+        }
+
+        let mut model = crate::inference::build_model_config(&self.model, self.training.block_size);
+        if let Some(sequence_kernel) = self.training.sequence_kernel_override {
+            model.sequence_kernel = sequence_kernel;
+        }
+        if model.random_scaffold.enabled
+            || model.dropout != 0.0
+            || model.y_neuron_recurrence.enabled
+            || model.hierarchical_dragon.enabled
+            || model.clocked_slow_memory.enabled
+            || model.summary_memory.enabled
+            || model.latent_reasoning.enabled
+            || model.rollout_fast_steps_per_slow_step != 1
+            || model.tie_input_output_embeddings
+            || !model.language_head.uses_flat_token_logits()
+            || model.latent_fanout_schedule.is_some()
+        {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding selected a model outside the current analytic local-VJP contract (including dropout=0)"
+            ));
+        }
+        if model.resolved_residual_connector_kind() != ResidualConnectorKind::Vanilla {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires model.residual_connector=vanilla"
+            ));
+        }
+        if model.sequence_kernel.memory_system != SequenceMemorySystem::LinearAttention
+            || model.sequence_kernel.executor != SequenceTrainingExecutor::DenseScoreShortContext
+            || model.fused_kernels.rotary_embedding != RotaryEmbedding::Alibi
+        {
+            return Err(anyhow!(
+                "training.algorithm=predictive_coding currently requires linear_attention, dense_score_short_context, and ALiBi"
+            ));
+        }
         Ok(())
     }
 }
@@ -3605,7 +3725,9 @@ mod tests {
     use crate::config::load_training_config;
     use crate::config::train::RuliadSupervisionMode;
     use crate::inference::build_model_config;
-    use burn_dragon_core::{HierarchicalDragonSharing, RotaryEmbedding, SequenceMemorySystem};
+    use burn_dragon_core::{
+        HierarchicalDragonSharing, RotaryEmbedding, SequenceKernelConfig, SequenceMemorySystem,
+    };
     use burn_dragon_train::OptimizerKind;
     use std::path::{Path, PathBuf};
 
@@ -3640,6 +3762,39 @@ prompt = ""
         let config = parse_config("");
         assert!(config.training.objective.is_next_token());
         config.validate().expect("default objective validates");
+    }
+
+    #[test]
+    fn validation_defaults_to_a_training_seed_independent_fixed_holdout() {
+        let first = parse_config("seed = 1");
+        let second = parse_config("seed = 2");
+        assert_eq!(
+            first.training.validation.sampling,
+            crate::config::TrainingValidationSampling::FixedHoldout
+        );
+        assert_eq!(
+            first.training.validation.seed,
+            second.training.validation.seed
+        );
+        assert_ne!(first.training.seed, second.training.seed);
+    }
+
+    #[test]
+    fn live_source_selected_validation_is_an_explicit_compatibility_mode() {
+        let config = parse_config(
+            "\n[training.validation]\nsampling = \"live_source_selection\"\nseed = 19",
+        );
+        assert!(
+            config
+                .training
+                .validation
+                .sampling
+                .uses_live_source_selection()
+        );
+        assert_eq!(config.training.validation.seed, 19);
+        config
+            .validate()
+            .expect("explicit live validation mode should remain supported");
     }
 
     #[test]
@@ -4184,47 +4339,68 @@ start_policy = "capability_gate"
     }
 
     #[test]
-    fn predictive_coding_optimizer_validates_for_local_chunked_pc_training() {
+    fn retired_predictive_coding_optimizer_points_to_the_algorithm_contract() {
         let mut config = parse_config("");
         config.optimizer.name = OptimizerKind::PredictiveCoding;
-        config.training.tbptt_chunk_size = Some(4);
-        config.training.predictive_coding.enabled = true;
-
-        config
-            .validate()
-            .expect("predictive coding optimizer should validate for local chunked PC training");
-    }
-
-    #[test]
-    fn predictive_coding_optimizer_requires_enabled_pc_inference() {
-        let mut config = parse_config("");
-        config.optimizer.name = OptimizerKind::PredictiveCoding;
-        config.training.tbptt_chunk_size = Some(4);
-
         let err = config
             .validate()
-            .expect_err("predictive coding optimizer without PC should be rejected");
+            .expect_err("retired optimizer route must be rejected");
         assert!(
             err.to_string()
-                .contains("requires training.predictive_coding.enabled"),
+                .contains("training.algorithm=predictive_coding"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn predictive_coding_optimizer_rejects_state_only_control() {
+    fn local_predictive_coding_algorithm_validates_with_plain_vjp_contract() {
         let mut config = parse_config("");
-        config.optimizer.name = OptimizerKind::PredictiveCoding;
-        config.training.tbptt_chunk_size = Some(4);
-        config.training.predictive_coding.enabled = true;
-        config.training.predictive_coding.parameter_update =
-            PredictiveCodingParameterUpdate::StateOnlyControl;
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+
+        config
+            .validate()
+            .expect("canonical local predictive-coding contract should validate");
+        assert_eq!(
+            config.resolved_training_algorithm(),
+            TrainingAlgorithm::PredictiveCoding
+        );
+    }
+
+    #[test]
+    fn local_predictive_coding_rejects_dropout_mismatch() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.model.dropout = Some(0.1);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
 
         let err = config
             .validate()
-            .expect_err("predictive coding optimizer with state-only control should be rejected");
+            .expect_err("plain local VJP path must not silently drop configured dropout");
         assert!(
-            err.to_string().contains("parameter_update=optimizer"),
+            err.to_string().contains("dropout=0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn local_predictive_coding_rejects_ignored_ruliad_auxiliaries() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+        config.training.ruliad_supervision.answer_contract.enabled = true;
+
+        let err = config
+            .validate_local_predictive_coding()
+            .expect_err("local PC must not silently skip Ruliad auxiliary objectives");
+        assert!(
+            err.to_string().contains("Ruliad auxiliary objectives"),
             "unexpected error: {err}"
         );
     }
@@ -5780,8 +5956,10 @@ start_policy = "capability_gate"
 
         let mut conditioned =
             load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
-        let mut latent = burn_dragon_core::LatentReasoningConfig::default();
-        latent.step_conditioned_decoder = true;
+        let latent = burn_dragon_core::LatentReasoningConfig {
+            step_conditioned_decoder: true,
+            ..Default::default()
+        };
         conditioned.model.latent_reasoning = Some(latent);
         let error = conditioned
             .validate()
@@ -6485,6 +6663,42 @@ start_policy = "capability_gate"
             config
                 .validate()
                 .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
+        }
+    }
+
+    #[test]
+    fn local_predictive_coding_profiles_load_with_canonical_factor_contract() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        for profile in ["local-pc-smoke.toml", "local-pc-1m.toml"] {
+            let path = root.join(profile);
+            let config = load_training_config(std::slice::from_ref(&path))
+                .unwrap_or_else(|error| panic!("load {}: {error}", path.display()));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
+            assert_eq!(
+                config.resolved_training_algorithm(),
+                TrainingAlgorithm::PredictiveCoding
+            );
+            assert_eq!(config.optimizer.name, OptimizerKind::Adamw);
+            assert_eq!(
+                config.training.local_predictive_coding.factor_reduction,
+                crate::config::PredictiveCodingFactorReduction::Sum
+            );
+            assert_eq!(
+                config
+                    .training
+                    .local_predictive_coding
+                    .inference
+                    .gradient_norm_scope,
+                burn_pc::PcGradientNormScope::PerRow
+            );
+            assert!(!config.training.local_predictive_coding.sync_diagnostics);
+            assert_eq!(
+                config.training.validation.sampling,
+                crate::config::TrainingValidationSampling::FixedHoldout
+            );
         }
     }
 

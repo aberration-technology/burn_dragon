@@ -17,9 +17,10 @@ pub use schema::{
     LatentReasoningConstraintBalancerConfig, LatentReasoningNegativeSource,
     LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
     LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LatentStepContractConfig,
-    LogitEntropyFloorConfig, ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, NeuronScalingConfig,
-    NeuronScalingGrowth, NeuronScalingStabilizationConfig, NextLatentPredictionConfig,
-    PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
+    LocalPredictiveCodingConfig, LogitEntropyFloorConfig, ModuleLrScaleEntry,
+    ModuleLrScaleScheduleConfig, NeuronScalingConfig, NeuronScalingGrowth,
+    NeuronScalingStabilizationConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
     PredictiveCodingObservationContract, PredictiveCodingParameterUpdate,
     PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
     RuliadAnswerContractConfig, RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig,
@@ -30,9 +31,10 @@ pub use schema::{
     RuliadProofPolicyTrainingMode, RuliadSupervisionConfig, RuliadSupervisionMode,
     RuliadVerifierRewardConfig, RuliadVerifierRewardMode, SdftObjectiveConfig,
     SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, SequenceBatchingMode,
-    SequenceStateProbeConfig, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
-    TrainingValidationExecution, ValidationDatasetConfig,
+    SequenceStateProbeConfig, TeacherRegularization, TrainingAlgorithm, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    TrainingValidationConfig, TrainingValidationExecution, TrainingValidationSampling,
+    ValidationDatasetConfig,
 };
 
 use crate::tokenizer::TokenizerConfig;

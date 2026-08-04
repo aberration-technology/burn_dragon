@@ -1020,17 +1020,19 @@ where
             ));
         }
     };
-    let event_handles = crate::train::events::build_training_event_handles(
-        env.run_name,
-        env.run_dir,
-        env.train_loader.num_items(),
-        env.training,
-        source_selection_dataset,
-        env.neuron_scaling_slot
-            .as_ref()
-            .map(|slot| (env.model_config.latent_total(), slot.clone())),
-        None,
-    )?;
+    let event_handles =
+        crate::train::events::build_training_event_handles_with_local_predictive_coding(
+            env.run_name,
+            env.run_dir,
+            env.train_loader.num_items(),
+            env.training,
+            source_selection_dataset,
+            env.neuron_scaling_slot
+                .as_ref()
+                .map(|slot| (env.model_config.latent_total(), slot.clone())),
+            None,
+            Some(model.local_predictive_coding_profile()),
+        )?;
 
     let builder = SupervisedTraining::new(
         env.run_dir,
@@ -2219,6 +2221,7 @@ where
                 env.train_loader.num_items().max(1),
                 Some(env.total_steps),
             )
+            .with_seed(env.training.seed)
             .with_batch_size(batch_size)
             .with_initial_consumed_steps(consumed_steps)
             .with_ruliad_policy_supervision(env.training.ruliad_supervision)
@@ -2252,6 +2255,13 @@ where
             env.valid_steps.max(1),
             None,
         )
+        .with_seed(env.training.validation.seed)
+        .with_source_selection_enabled(
+            env.training
+                .validation
+                .sampling
+                .uses_live_source_selection(),
+        )
         .with_batch_size(batch_size.max(1))
         .with_summary_event_token_ids(env.summary_event_token_ids.clone()),
     )
@@ -2271,17 +2281,19 @@ where
     fs::create_dir_all(env.run_dir)?;
     let source_selection_dataset = env.source_selection_dataset.clone();
     let dynamics_control_slot = DragonDynamicsControlSlot::default();
-    let event_handles = crate::train::events::build_training_event_handles(
-        env.run_name,
-        env.run_dir,
-        env.train_loader.num_items(),
-        env.training,
-        source_selection_dataset,
-        env.neuron_scaling_slot
-            .as_ref()
-            .map(|slot| (env.model_config.latent_total(), slot.clone())),
-        Some(dynamics_control_slot.clone()),
-    )?;
+    let event_handles =
+        crate::train::events::build_training_event_handles_with_local_predictive_coding(
+            env.run_name,
+            env.run_dir,
+            env.train_loader.num_items(),
+            env.training,
+            source_selection_dataset,
+            env.neuron_scaling_slot
+                .as_ref()
+                .map(|slot| (env.model_config.latent_total(), slot.clone())),
+            Some(dynamics_control_slot.clone()),
+            Some(model.local_predictive_coding_profile()),
+        )?;
     let bus = event_handles.metric_logger.bus();
     let emit_step_events = env.training.events.persist_step_events;
     let steps_per_epoch = env.train_loader.num_items().max(1);
@@ -2999,7 +3011,13 @@ where
         env.valid_steps.max(1),
         None,
         env.training.min_logical_block_size,
-        env.training.seed,
+        env.training.validation.seed,
+    )
+    .with_source_selection_enabled(
+        env.training
+            .validation
+            .sampling
+            .uses_live_source_selection(),
     )
     .with_batch_size(batch_size.max(1))
     .with_summary_event_token_ids(env.summary_event_token_ids.clone());
@@ -8390,12 +8408,18 @@ fn emit_predictive_coding_telemetry<B>(
         epoch: Some(epoch),
         absolute_step,
         optimizer_step,
+        learning_contract: "recurrent_state_replay_auxiliary".to_string(),
+        global_autodiff_graph: true,
         observation_contract: observation_contract.to_string(),
         deployment_aligned,
         chunks_seen: snapshot.chunks_seen,
         chunks_corrected: snapshot.chunks_corrected,
         inference_steps: snapshot.inference_steps,
         skipped_empty_state: snapshot.skipped_empty_state,
+        factors: 0,
+        local_vjp_calls: 0,
+        global_backward_calls: usize::from(snapshot.chunks_corrected > 0),
+        gradient_tensors: 0,
         energy_before: snapshot.energy_before_mean(),
         energy_after: snapshot.energy_after_mean(),
         energy_delta,
@@ -14142,6 +14166,7 @@ mod tests {
 
     fn tiny_training_hparams() -> TrainingHyperparameters {
         TrainingHyperparameters {
+            algorithm: TrainingAlgorithm::Auto,
             block_size: 4,
             tbptt_chunk_size: None,
             tbptt_persist_across_steps: false,
@@ -14170,6 +14195,7 @@ mod tests {
             greedy_rollout_unlikelihood: Default::default(),
             dynamics_anchor: Default::default(),
             predictive_coding: Default::default(),
+            local_predictive_coding: Default::default(),
             latent_reasoning: Default::default(),
             ruliad_supervision: Default::default(),
             ruliad_probe_generation: Default::default(),
@@ -14938,7 +14964,7 @@ mod tests {
     }
 
     #[test]
-    fn train_with_scheduler_accepts_predictive_coding_optimizer() {
+    fn train_with_scheduler_accepts_local_predictive_coding_algorithm() {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_dir = dir.path().join("single-pc-optimizer-smoke");
         let parallel_config = burn_dragon_train::ParallelConfig::default();
@@ -14970,11 +14996,13 @@ mod tests {
         )];
 
         let mut training = tiny_training_hparams();
-        training.tbptt_chunk_size = Some(2);
-        training.predictive_coding.enabled = true;
-        training.predictive_coding.steps = 1;
-        training.predictive_coding.step_size = 0.01;
-        let model_config = tiny_model_config();
+        training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        training.local_predictive_coding.inference.steps = 2;
+        training.local_predictive_coding.inference.step_size = 0.05;
+        let mut model_config = tiny_model_config();
+        model_config.dropout = 0.0;
+        model_config.sequence_kernel = SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
         let devices = vec![primary_device];
         let env = TrainEnvironment {
             parallel_runtime: &parallel_runtime,
@@ -15002,32 +15030,18 @@ mod tests {
             model_config.clone(),
             &primary_device,
         ))
-        .with_predictive_coding(training.predictive_coding.clone())
-        .with_tbptt_chunk_size(training.tbptt_chunk_size);
-        let optimizer_cfg = OptimizerConfig {
-            name: OptimizerKind::PredictiveCoding,
-            learning_rate: 1.0e-3,
-            weight_decay: 0.0,
-            weight_decay_final: None,
-            lr_schedule: None,
-            schedule_mode: OptimizerScheduleMode::DragonReference,
-            grad_clip_norm: Some(1.0),
-            grad_clip_value: None,
-            eggroll: burn_eggroll::EggrollConfig::default(),
-            eggroll_population_execution: Default::default(),
-            eggroll_auto_population: Default::default(),
-            predictive_coding: PredictiveCodingOptimizerConfig {
-                transform: PredictiveCodingOptimizerTransform::Sgd,
-                ..Default::default()
-            },
-        };
-        let optimizer =
-            resolve_optimizer::<TestBackend, LanguageTrainModel<TestBackend>>(&optimizer_cfg, 2)
-                .expect("predictive coding optimizer");
+        .with_training_algorithm(training.algorithm)
+        .with_local_predictive_coding(training.local_predictive_coding.clone());
+        let optimizer = AdamWConfig::new()
+            .with_weight_decay(0.0)
+            .init::<TestBackend, LanguageTrainModel<TestBackend>>();
 
-        let trained =
-            train_with_scheduler(&env, model, optimizer, 1e-3).expect("PC optimizer train");
+        let trained = train_with_scheduler(&env, model, optimizer, 1e-3).expect("local PC train");
         assert!(run_dir.join("checkpoint").join("model-1.bin").is_file());
+        let events = std::fs::read_to_string(run_dir.join("events/training_events.jsonl"))
+            .expect("local PC training events");
+        assert!(events.contains("local_factor_vjp_v1"));
+        assert!(events.contains("\"global_backward_calls\":0"));
 
         let probe = make_batch::<TestValidBackend>(
             &valid_device,
@@ -15366,6 +15380,118 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(train_loss_steps, vec![2, 3]);
+    }
+
+    #[test]
+    fn dynamic_scheduler_emits_canonical_local_predictive_coding_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let parallel_config = burn_dragon_train::ParallelConfig::default();
+        let parallel_runtime =
+            resolve_parallel_runtime(&parallel_config).expect("resolve single runtime");
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 31);
+        let valid_device = burn::tensor::Device::<TestValidBackend>::default();
+        let mut training = tiny_training_hparams();
+        training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        training.log_frequency = 2;
+        training.local_predictive_coding.inference.steps = 2;
+        training.local_predictive_coding.inference.step_size = 0.05;
+        training.events.flush_every_steps = 1;
+        training.events.degeneracy_probe_every_epochs = usize::MAX;
+        let mut model_config = tiny_model_config();
+        model_config.sequence_kernel = SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let devices = vec![device];
+        let train_batches = vec![
+            make_batch::<TestBackend>(
+                &device,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[1, 2, 3, 4, 5, 6, 7, 0],
+                [2, 4],
+            ),
+            make_batch::<TestBackend>(
+                &device,
+                &[3, 4, 5, 6, 7, 0, 1, 2],
+                &[4, 5, 6, 7, 0, 1, 2, 3],
+                [2, 4],
+            ),
+        ];
+        let valid_batches = vec![make_batch::<TestValidBackend>(
+            &valid_device,
+            &[0, 0, 1, 1, 2, 2, 3, 3],
+            &[0, 1, 1, 2, 2, 3, 3, 0],
+            [2, 4],
+        )];
+        let env = TrainEnvironment {
+            parallel_runtime: &parallel_runtime,
+            parallel_config: &parallel_config,
+            run_dir: &run_dir,
+            run_name: "dynamic-local-pc-smoke",
+            backend_name: "cpu",
+            training: &training,
+            resume_checkpoint_epoch: None,
+            model_config: &model_config,
+            device: &device,
+            devices: &devices,
+            train_dataset: None,
+            valid_dataset: None,
+            train_loader: Arc::new(StaticSequenceLoader::new(train_batches)),
+            valid_loader: Arc::new(StaticSequenceLoader::new(valid_batches)),
+            source_selection_dataset: None,
+            summary_event_token_ids: None,
+            neuron_scaling_slot: None,
+            epochs: 1,
+            total_steps: 2,
+            valid_steps: 1,
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            model_config.clone(),
+            &device,
+        ))
+        .with_training_configuration(&training, 2);
+        let optimizer = tiny_language_optimizer(&training, &model_config, &device);
+
+        let _trained = train_with_dynamic_neuron_scaling_scheduler(&env, model, optimizer, 1e-3)
+            .expect("dynamic local-PC train");
+
+        let events = read_training_events(&run_dir);
+        let sample = events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(|value| value.as_str()) == Some("predictive_coding")
+            })
+            .expect("local-PC telemetry event");
+        assert_eq!(
+            sample
+                .get("learning_contract")
+                .and_then(|value| value.as_str()),
+            Some("local_factor_vjp_v1")
+        );
+        assert_eq!(
+            sample
+                .get("global_autodiff_graph")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            sample
+                .get("global_backward_calls")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert!(
+            sample
+                .get("local_vjp_calls")
+                .and_then(|value| value.as_u64())
+                .is_some_and(|calls| calls > 0)
+        );
+        assert_eq!(
+            sample
+                .get("gradient_tensors")
+                .and_then(|value| value.as_u64()),
+            Some(18)
+        );
     }
 
     #[test]

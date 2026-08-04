@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use burn_dragon_train::train::events::{
     BurnInterrupterControl, DynamicsEquilibriumPlugin, ModelCapacityConfig, ModelCapacityState,
-    TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext, TrainingRunOptions,
-    TrainingRuntimeThread,
+    PredictiveCodingSample, TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext,
+    TrainingRunOptions, TrainingRuntimeThread,
 };
 use burn_ecs::bevy_ecs;
 use burn_ecs::prelude::{
@@ -14,7 +14,7 @@ use burn_ecs::prelude::{
     TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry, TrainingSet, Update,
 };
 
-use crate::config::TrainingHyperparameters;
+use crate::config::{TrainingAlgorithm, TrainingHyperparameters};
 use crate::dataset::Dataset;
 use crate::train::dynamics::{DragonDynamicsControlPlugin, DragonDynamicsControlSlot};
 use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
@@ -37,6 +37,11 @@ impl RuliadSourceSelectionConfig {
 pub struct TrainingEventHandles {
     pub interrupter: burn_train::Interrupter,
     pub metric_logger: TrainingEventMetricLogger,
+}
+
+#[derive(Clone, Component)]
+struct LocalPredictiveCodingTelemetryConfig {
+    profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
 }
 
 pub fn train_loss_metric_frequency(
@@ -62,6 +67,31 @@ pub fn build_training_event_handles(
     neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
     dynamics_control_slot: Option<DragonDynamicsControlSlot>,
 ) -> Result<TrainingEventHandles> {
+    build_training_event_handles_with_local_predictive_coding(
+        run_name,
+        run_dir,
+        steps_per_epoch,
+        training,
+        source_selection_dataset,
+        neuron_scaling_slot,
+        dynamics_control_slot,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_training_event_handles_with_local_predictive_coding(
+    run_name: &str,
+    run_dir: &std::path::Path,
+    steps_per_epoch: usize,
+    training: &TrainingHyperparameters,
+    source_selection_dataset: Option<Arc<Dataset>>,
+    neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
+    dynamics_control_slot: Option<DragonDynamicsControlSlot>,
+    local_predictive_coding_profile: Option<
+        crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
+    >,
+) -> Result<TrainingEventHandles> {
     let interrupter = burn_train::Interrupter::new();
     let control = BurnInterrupterControl::new(interrupter.clone());
     let run = TrainingRunContext::new(run_name, run_name, run_dir, steps_per_epoch);
@@ -69,6 +99,12 @@ pub fn build_training_event_handles(
         .filter(|dataset| dataset.uses_live_source_selection())
         .map(|dataset| {
             RuliadSourceSelectionConfig::new(dataset, training.events.source_selection_every_steps)
+        });
+    let local_predictive_coding = local_predictive_coding_profile
+        .filter(|_| matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding))
+        .map(|profile| {
+            profile.reset();
+            LocalPredictiveCodingTelemetryConfig { profile }
         });
     let neuron_scaling = (training
         .neuron_scaling
@@ -102,6 +138,9 @@ pub fn build_training_event_handles(
             if source_selection.is_some() {
                 app.add_plugins(RuliadSourceSelectionTelemetryPlugin);
             }
+            if local_predictive_coding.is_some() {
+                app.add_plugins(DragonLocalPredictiveCodingTelemetryPlugin);
+            }
             if neuron_scaling.is_some() {
                 app.add_plugins(DragonNeuronScalingPlugin);
             }
@@ -116,6 +155,11 @@ pub fn build_training_event_handles(
                 app.world_mut()
                     .entity_mut(run_entity)
                     .insert(source_selection);
+            }
+            if let Some(local_predictive_coding) = local_predictive_coding {
+                app.world_mut()
+                    .entity_mut(run_entity)
+                    .insert(local_predictive_coding);
             }
             if let Some((config, (_, request_slot))) = neuron_scaling {
                 app.world_mut().entity_mut(run_entity).insert(
@@ -138,6 +182,70 @@ pub fn build_training_event_handles(
         interrupter,
         metric_logger,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DragonLocalPredictiveCodingTelemetryPlugin;
+
+impl Plugin for DragonLocalPredictiveCodingTelemetryPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            record_local_predictive_coding_from_loss.in_set(TrainingSet::Telemetry),
+        );
+    }
+}
+
+fn record_local_predictive_coding_from_loss(
+    mut metrics: MessageReader<TrainingMetricSample>,
+    registry: Res<TrainingRunRegistry>,
+    runs: Query<&LocalPredictiveCodingTelemetryConfig>,
+    mut output: MessageWriter<PredictiveCodingSample>,
+) {
+    for sample in metrics.read() {
+        if sample.split != TrainingMetricSplit::Train
+            || (sample.name != "Loss" && sample.name != "Stream Warm Loss")
+        {
+            continue;
+        }
+        let Some(config) = registry.get_query(&sample.run_id, &runs) else {
+            continue;
+        };
+        let snapshot = config.profile.take();
+        if snapshot.steps == 0 {
+            continue;
+        }
+        output.write(PredictiveCodingSample {
+            run_id: sample.run_id.clone(),
+            epoch: Some(sample.epoch),
+            absolute_step: sample.absolute_step,
+            optimizer_step: sample.absolute_step,
+            learning_contract: "local_factor_vjp_v1".to_string(),
+            global_autodiff_graph: false,
+            observation_contract: "equilibrium_layer_activities".to_string(),
+            deployment_aligned: false,
+            chunks_seen: snapshot.steps as usize,
+            chunks_corrected: snapshot.steps as usize,
+            inference_steps: snapshot.inference_steps as usize,
+            skipped_empty_state: 0,
+            factors: snapshot.factors as usize,
+            local_vjp_calls: snapshot.local_vjp_calls as usize,
+            global_backward_calls: snapshot.global_backward_calls as usize,
+            gradient_tensors: snapshot.gradient_tensors as usize,
+            energy_before: snapshot.last_energy_before,
+            energy_after: snapshot.last_energy_after,
+            energy_delta: snapshot
+                .last_energy_before
+                .zip(snapshot.last_energy_after)
+                .map(|(before, after)| before - after),
+            grad_norm_mean: None,
+            grad_norm_max: None,
+            delta_rms_mean: None,
+            amortization_components: 0,
+            amortization_loss: None,
+            elapsed_ms: snapshot.elapsed_ns as f64 / 1_000_000.0,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

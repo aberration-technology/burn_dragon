@@ -560,6 +560,63 @@ pub enum PredictiveCodingParameterUpdate {
     StateOnlyControl,
 }
 
+/// Algorithm responsible for producing parameter derivatives or updates.
+///
+/// This is deliberately separate from `optimizer`: AdamW can transform either
+/// globally backpropagated gradients or local predictive-coding derivatives.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingAlgorithm {
+    /// Preserve existing profiles: EGGROLL selects its forward-only executor;
+    /// every gradient optimizer selects global backpropagation.
+    #[default]
+    Auto,
+    Backpropagation,
+    PredictiveCoding,
+    Eggroll,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingFactorReduction {
+    #[default]
+    Sum,
+    Mean,
+}
+
+/// Canonical layer-local predictive-coding learning configuration.
+///
+/// This is distinct from [`PredictiveCodingConfig`], which is the historical
+/// recurrent-state replay auxiliary used inside global backpropagation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LocalPredictiveCodingConfig {
+    pub inference: burn_pc::PcInferenceConfig,
+    pub learning_schedule: burn_pc::PcLearningSchedule,
+    pub prediction_precision: f32,
+    pub factor_reduction: PredictiveCodingFactorReduction,
+    pub sync_diagnostics: bool,
+}
+
+impl Default for LocalPredictiveCodingConfig {
+    fn default() -> Self {
+        Self {
+            inference: burn_pc::PcInferenceConfig {
+                steps: 4,
+                step_size: 0.05,
+                latent_decay: 0.0,
+                max_grad_norm: Some(1.0),
+                gradient_norm_scope: burn_pc::PcGradientNormScope::PerRow,
+                eps: 1.0e-8,
+            },
+            learning_schedule: burn_pc::PcLearningSchedule::Equilibrium,
+            prediction_precision: 1.0,
+            factor_reduction: PredictiveCodingFactorReduction::Sum,
+            sync_diagnostics: false,
+        }
+    }
+}
+
 fn default_predictive_coding_step_size() -> f32 {
     0.03
 }
@@ -973,10 +1030,48 @@ impl TrainingValidationExecution {
     }
 }
 
+/// Selects the distribution used by the primary teacher-forced validation loss.
+///
+/// Fixed holdout validation is independent of the live curriculum policy, which makes validation
+/// losses comparable across epochs and repeated runs. Live source selection is retained as an
+/// explicit compatibility/diagnostic mode; prefer `training.events.source_weighted_validation_batches`
+/// when both a stable promotion metric and current-policy telemetry are needed.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingValidationSampling {
+    #[default]
+    FixedHoldout,
+    LiveSourceSelection,
+}
+
+impl TrainingValidationSampling {
+    pub fn uses_live_source_selection(self) -> bool {
+        matches!(self, Self::LiveSourceSelection)
+    }
+}
+
+fn default_validation_seed() -> u64 {
+    0xD12A_60A5
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TrainingValidationConfig {
     pub execution: TrainingValidationExecution,
+    pub sampling: TrainingValidationSampling,
+    /// Sampling seed for the fixed teacher-forced holdout. This is deliberately independent of
+    /// the training seed so training-seed ablations evaluate identical examples.
+    pub seed: u64,
+}
+
+impl Default for TrainingValidationConfig {
+    fn default() -> Self {
+        Self {
+            execution: TrainingValidationExecution::default(),
+            sampling: TrainingValidationSampling::default(),
+            seed: default_validation_seed(),
+        }
+    }
 }
 
 /// Selects how token blocks are presented to the training step independently of whether recurrent
@@ -1038,6 +1133,8 @@ impl Default for SequenceStateProbeConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
+    #[serde(default)]
+    pub algorithm: TrainingAlgorithm,
     pub block_size: usize,
     #[serde(default)]
     pub tbptt_chunk_size: Option<usize>,
@@ -1096,6 +1193,8 @@ pub struct TrainingHyperparameters {
     pub dynamics_anchor: DynamicsAnchorConfig,
     #[serde(default)]
     pub predictive_coding: PredictiveCodingConfig,
+    #[serde(default)]
+    pub local_predictive_coding: LocalPredictiveCodingConfig,
     #[serde(default)]
     pub latent_reasoning: LatentReasoningTrainingConfig,
     #[serde(default)]

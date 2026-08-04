@@ -6,6 +6,7 @@ pub mod backend;
 mod continual_backprop;
 mod dynamics;
 pub mod events;
+mod local_predictive_coding;
 pub mod neuron_scaling;
 pub(crate) mod next_latent;
 pub mod objective;
@@ -26,6 +27,8 @@ pub use backend::*;
 pub use continual_backprop::*;
 #[allow(unused_imports)]
 pub use dynamics::*;
+#[allow(unused_imports)]
+pub use local_predictive_coding::*;
 #[allow(unused_imports)]
 pub use neuron_scaling::*;
 #[allow(unused_imports)]

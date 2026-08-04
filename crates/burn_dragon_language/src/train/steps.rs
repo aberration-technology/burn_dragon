@@ -1044,6 +1044,12 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     predictive_coding: PredictiveCodingConfig,
     #[module(skip)]
+    training_algorithm: TrainingAlgorithm,
+    #[module(skip)]
+    local_predictive_coding: LocalPredictiveCodingConfig,
+    #[module(skip)]
+    local_predictive_coding_profile: super::local_predictive_coding::LocalPredictiveCodingProfile,
+    #[module(skip)]
     latent_reasoning: LatentReasoningTrainingConfig,
     #[module(skip)]
     ruliad_supervision: RuliadSupervisionConfig,
@@ -2285,6 +2291,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             greedy_rollout_unlikelihood: GreedyRolloutUnlikelihoodConfig::default(),
             dynamics_anchor: DynamicsAnchorConfig::default(),
             predictive_coding: PredictiveCodingConfig::default(),
+            training_algorithm: TrainingAlgorithm::Auto,
+            local_predictive_coding: LocalPredictiveCodingConfig::default(),
+            local_predictive_coding_profile:
+                super::local_predictive_coding::LocalPredictiveCodingProfile::default(),
             latent_reasoning: LatentReasoningTrainingConfig::default(),
             ruliad_supervision: RuliadSupervisionConfig::default(),
             latent_reasoning_capability_gate_open: Arc::new(AtomicBool::new(false)),
@@ -2371,6 +2381,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .with_greedy_rollout_unlikelihood(training.greedy_rollout_unlikelihood.clone())
             .with_dynamics_anchor(training.dynamics_anchor.clone())
             .with_predictive_coding(training.predictive_coding.clone())
+            .with_training_algorithm(training.algorithm)
+            .with_local_predictive_coding(training.local_predictive_coding.clone())
             .with_latent_reasoning(training.latent_reasoning.clone())
             .with_ruliad_supervision(training.ruliad_supervision)
     }
@@ -2446,6 +2458,22 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     pub fn with_predictive_coding(mut self, config: PredictiveCodingConfig) -> Self {
         self.predictive_coding = config;
         self
+    }
+
+    pub fn with_training_algorithm(mut self, algorithm: TrainingAlgorithm) -> Self {
+        self.training_algorithm = algorithm;
+        self
+    }
+
+    pub fn with_local_predictive_coding(mut self, config: LocalPredictiveCodingConfig) -> Self {
+        self.local_predictive_coding = config;
+        self
+    }
+
+    pub fn local_predictive_coding_profile(
+        &self,
+    ) -> super::local_predictive_coding::LocalPredictiveCodingProfile {
+        self.local_predictive_coding_profile.clone()
     }
 
     pub fn with_latent_reasoning(mut self, config: LatentReasoningTrainingConfig) -> Self {
@@ -11313,6 +11341,24 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         );
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
+        if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
+            let step = super::local_predictive_coding::local_predictive_coding_train_step(
+                &self.model,
+                clean_inputs,
+                targets,
+                loss_mask,
+                &self.local_predictive_coding,
+                &self.local_predictive_coding_profile,
+            );
+            debug_assert_eq!(step.report.global_backward_calls, 0);
+            if prof_enabled {
+                crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+            }
+            return TrainOutput {
+                grads: self.apply_gradient_scale_schedule(step.grads),
+                item: LanguageModelTrainItem::new(step.loss),
+            };
+        }
         let ruliad_policy_batch = batch.ruliad_policy_batch;
         if !self.objective.is_next_token() {
             self.update_teacher_runtime();
@@ -13197,24 +13243,36 @@ mod objective_step_tests {
                 .with_pipeline_plan(Some(tiny_pipeline_plan()));
         assert!(pipeline.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
 
-        let mut predictive_coding = PredictiveCodingConfig::default();
-        predictive_coding.enabled = true;
+        let predictive_coding = PredictiveCodingConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let predictive =
             LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
                 .with_predictive_coding(predictive_coding);
         assert!(predictive.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
 
-        let mut latent_reasoning = LatentReasoningTrainingConfig::default();
-        latent_reasoning.enabled = true;
-        latent_reasoning.sigreg.target = crate::config::LatentReasoningSigRegTarget::RhoMemorySlots;
+        let latent_reasoning = LatentReasoningTrainingConfig {
+            enabled: true,
+            sigreg: crate::config::LatentReasoningSigRegConfig {
+                target: crate::config::LatentReasoningSigRegTarget::RhoMemorySlots,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let rho_regularized =
             LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
                 .with_latent_reasoning(latent_reasoning);
         assert!(rho_regularized.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
 
-        let mut dragon_state_reasoning = LatentReasoningTrainingConfig::default();
-        dragon_state_reasoning.enabled = true;
-        dragon_state_reasoning.dragon_state.enabled = true;
+        let dragon_state_reasoning = LatentReasoningTrainingConfig {
+            enabled: true,
+            dragon_state: crate::config::DragonStateConsistencyConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let dragon_state =
             LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
                 .with_latent_reasoning(dragon_state_reasoning);
@@ -15222,13 +15280,13 @@ mod objective_step_tests {
                     .is_some()
         }));
         let oracle_fields = answer.split('|').collect::<Vec<_>>();
-        for field_index in 0..oracle_fields.len() {
+        for (field_index, oracle_field) in oracle_fields.iter().enumerate() {
             assert!(negatives.iter().any(|(candidate, kind)| {
                 *kind == RuliadStructuredNegativeKind::FieldMutation
                     && candidate
                         .split('|')
                         .nth(field_index)
-                        .is_some_and(|field| field != oracle_fields[field_index])
+                        .is_some_and(|field| field != *oracle_field)
             }));
         }
     }

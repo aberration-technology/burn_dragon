@@ -126,6 +126,79 @@ least 113 GB available. The raw analyzed tables are in
 not promote it as the default. The next quality experiment must improve the local objective or
 schedule and beat this fixed-holdout baseline before a longer continual-learning claim is warranted.
 
+#### Gradient-fidelity and batch-scaling diagnosis
+
+`pc_gradient_fidelity` is an offline diagnostic for the canonical local-factor executor. It runs
+one local-PC step and exactly one reference backward pass over the same deterministic, optionally
+masked next-token objective. It reports dot product, cosine, norm ratio, relative L2 error,
+least-squares rescaling, and elementwise non-negative-product fraction globally and for all nine
+PC parameter families. The reference backward is isolated from the training and telemetry paths;
+the report records one reference backward while the nested PC step must continue to record zero.
+
+```bash
+cargo run -p burn_dragon_language --release \
+  --example pc_gradient_fidelity --features train,cuda -- \
+  --backend cuda --n-layer 4 --n-embd 96 --n-head 4 \
+  --latent-total 3072 --vocab-size 272 --batch-size 32 --block-size 128 \
+  --inference-steps 1,2,4,8,16,32,64,128 --step-sizes 0.05,0.1
+```
+
+On the 937,154-parameter CUDA geometry, the feed-forward PC and reference masked losses agree
+exactly. The derivative comparison identifies finite-relaxation credit latency rather than a
+numerical VJP failure: the language-head derivative is nearly exact immediately, while error
+reaches the shared layers and embedding only after repeated synchronous activity updates.
+
+| Inference | Global cosine | PC/reference norm | Embedding cosine | Embedding norm ratio | Encoder cosine | Local step ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 x 0.05 | 0.338 | 0.188 | 0.987 | 0.000006 | 0.611 | 318 |
+| 32 x 0.10 | 0.700 | 0.403 | 0.734 | 0.0938 | 0.732 | 1,946 |
+| 64 x 0.10 | 0.787 | 0.509 | 0.765 | 0.230 | 0.801 | 3,829 |
+| 128 x 0.10 | 0.850 | 0.642 | 0.829 | 0.412 | 0.865 | 7,644 |
+
+These synchronized diagnostic times include pre/post energy readbacks and are not production
+throughput measurements. `step_size = 0.1` lowers joint factor energy monotonically over this
+range. At 0.2, energy rises after 16 steps and directional fidelity regresses; 0.5 is clearly
+unstable. More brute-force relaxation therefore improves derivative fidelity only on the slower
+stable branch. Removing the default per-row gradient clip does not repair the solver: at 128 steps
+the unclipped global cosine is 0.832 versus 0.850 clipped, with nearly identical energy.
+
+A release-CUDA batch sweep used 16 updates per arm at block 128. Event-level throughput peaks at a
+different batch for each executor, but larger batches do not recover PC solver cost:
+
+| Batch | AdamW tok/s | PC-4 tok/s | PC-32 x 0.1 tok/s |
+| ---: | ---: | ---: | ---: |
+| 16 | 46,450 | 10,530 | **2,071** |
+| 32 | 55,330 | **11,100** | 2,056 |
+| 64 | **58,410** | 10,840 | 1,945 |
+| 128 | 58,330 | 10,260 | 1,940 |
+
+All trials stayed inside the host-memory guard; the largest batch-128 PC arm peaked at 17.4 GB
+with more than 107 GB available. PC-32 sustained roughly 87% mean and 90% median GPU utilization
+in the longer quality screen, so its throughput loss is repeated device work, not CPU starvation.
+
+A matched three-seed, 128-update, batch-16 screen then compared the higher-fidelity PC-32 arm with
+AdamW at equal token exposure (262,144 tokens per run):
+
+| Arm | Valid loss | Verifier | Partial progress | Tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| AdamW | 2.165 +/- 0.0445 | 0.0521 +/- 0.0204 | 0.2109 +/- 0.190 | **44,190 +/- 1,510** |
+| PC-32 x 0.1 | 2.146 +/- 0.0402 | 0.1458 +/- 0.0540 | 0.2396 | 1,949 +/- 49 |
+
+The paired PC-minus-AdamW validation delta is `-0.0188 +/- 0.0539`, verifier delta is
+`+0.0938 +/- 0.0707`, and partial-progress delta is `+0.0287 +/- 0.190`. This is weak short-run
+quality evidence and a 22.7x throughput regression, not a promotion result. Four-step PC remains a
+cheap control and 32-step PC remains a fidelity control; neither should become the default. The
+next algorithmic gate is a solver or inference schedule that propagates local credit across the
+four shared layer uses without dozens of full factor sweeps. It must improve gradient fidelity and
+fixed-holdout convergence while retaining materially more of AdamW throughput before any long-run
+continual-learning test.
+
+Raw artifacts are under `target/pc-gradient-fidelity-1m-cuda-20260804/`,
+`target/pc-gradient-fidelity-1m-cuda-frontier-20260804/`,
+`target/pc-gradient-fidelity-1m-cuda-unclipped-20260804/`,
+`target/local-pc-batch-throughput-20260804/`, and
+`target/local-pc-fidelity-quality-128-b16-3seed-analysis-20260804/`.
+
 ### 2026-08 causal-contract correction
 
 The historical runs in this report optimized recurrent state against the same chunk's next-token

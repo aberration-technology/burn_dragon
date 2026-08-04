@@ -9,6 +9,9 @@ use burn_dragon_time::Instant;
 
 use crate::config::{LocalPredictiveCodingConfig, PredictiveCodingFactorReduction};
 
+mod diagnostics;
+pub use diagnostics::*;
+
 #[derive(Debug)]
 pub(crate) struct LocalPredictiveCodingTrainStep<B: AutodiffBackend> {
     pub grads: GradientsParams,
@@ -16,7 +19,7 @@ pub(crate) struct LocalPredictiveCodingTrainStep<B: AutodiffBackend> {
     pub report: LocalPredictiveCodingStepReport,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct LocalPredictiveCodingStepReport {
     pub inference_steps: usize,
     pub factors: usize,

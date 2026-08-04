@@ -470,7 +470,7 @@ weight_decay = 0.01
 
 EOF
       ;;
-    local_pc_steps1|local_pc_steps2|local_pc_steps4|local_pc_steps8)
+    local_pc_steps1|local_pc_steps2|local_pc_steps4|local_pc_steps8|local_pc_steps16|local_pc_steps32|local_pc_steps64|local_pc_steps128)
       local local_steps="${arm#local_pc_steps}"
       cat >> "$path" <<EOF
 [optimizer]
@@ -501,7 +501,7 @@ step_size = 0.5
 EOF
       ;;
     local_pc_steps*_eta*)
-      if [[ ! "$arm" =~ ^local_pc_steps(1|2|4|8)_eta(01|02|05|10)$ ]]; then
+      if [[ ! "$arm" =~ ^local_pc_steps(1|2|4|8|16|32|64|128)_eta(01|02|05|10)$ ]]; then
         echo "unknown local PC arm: $arm" >&2
         return 2
       fi

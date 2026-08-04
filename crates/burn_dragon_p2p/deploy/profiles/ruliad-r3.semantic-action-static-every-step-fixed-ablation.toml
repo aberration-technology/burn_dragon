@@ -1,0 +1,8 @@
+extends = ["ruliad-r3.semantic-action-static-fixed-ablation.toml"]
+
+# One bounded verifier-policy batch accompanies every language-model update. The candidate loss
+# already has comparable scale at weight 0.25, so this arm changes semantic update density without
+# introducing a second loss-weight intervention.
+[training.ruliad_supervision.proof_policy]
+every_steps = 1
+start_after_steps = 0

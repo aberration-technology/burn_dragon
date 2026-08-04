@@ -1,0 +1,19 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# Dataset aggregation over states visited by the current greedy policy. The
+# verifier supplies the shortest-progress action; no textual reasoning trace
+# is imitated and holdout rollouts never feed back into this objective.
+[training.ruliad_supervision.proof_policy]
+enabled = true
+# Candidate-normalized, verifier-equivalent DAgger remains an experimental
+# control. The structural-holdout promotion matrix must pass before this mode
+# can be inherited by a production profile.
+mode = "dagger"
+weight = 0.25
+every_steps = 16
+start_after_steps = 512
+stratified_difficulty_levels = 4
+rollout_steps = 8
+max_rows_per_update = 32
+candidates = 4
+max_completion_tokens = 16

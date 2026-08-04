@@ -18,22 +18,12 @@ fn default_run_prefix() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct OptimizerPipelinePhaseConfig {
     pub config_paths: Vec<PathBuf>,
     pub run_name: Option<String>,
     pub max_iters: Option<usize>,
     pub checkpoint_interval_iters: Option<usize>,
-}
-
-impl Default for OptimizerPipelinePhaseConfig {
-    fn default() -> Self {
-        Self {
-            config_paths: Vec::new(),
-            run_name: None,
-            max_iters: None,
-            checkpoint_interval_iters: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

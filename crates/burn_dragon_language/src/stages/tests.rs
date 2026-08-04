@@ -193,8 +193,8 @@ steps = { min = 4, max = 4 }
 #[test]
 fn generate_prepared_universality_stage_corpus_handles_ruliad() {
     let dir = tempdir().expect("tempdir");
-    let config =
-        PreparedUniversalityCorpusConfig::Ruliad(burn_dragon_universality::RuliadCorpusConfig {
+    let config = PreparedUniversalityCorpusConfig::Ruliad(Box::new(
+        burn_dragon_universality::RuliadCorpusConfig {
             output_dir: dir.path().join("out"),
             seed: 7,
             name: "stage-ruliad-generate".to_string(),
@@ -207,6 +207,7 @@ fn generate_prepared_universality_stage_corpus_handles_ruliad() {
                 ..burn_dragon_universality::RuliadSerializationConfig::default()
             },
             tokenization: burn_dragon_universality::RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: burn_dragon_universality::RuliadSourceSelectionConfig::default(),
             families: vec![burn_dragon_universality::RuliadFamilyConfig {
                 kind: burn_dragon_universality::RuliadFamilyKind::Eca,
@@ -216,7 +217,8 @@ fn generate_prepared_universality_stage_corpus_handles_ruliad() {
             }],
             proof_tasks: None,
             lean_task_limit: None,
-        });
+        },
+    ));
     let report =
         generate_prepared_universality_stage_corpus(&config).expect("generate ruliad corpus");
     assert!(report.manifest_path().is_file());

@@ -1,30 +1,34 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 
 use crate::manifest::{SampleSplit, UniversalityTokenizerManifest};
-use crate::ruliad::config::{
-    RuliadCorpusConfig, RuliadDocumentMode, load_ruliad_config, ruliad_source_semantics,
-};
+use crate::ruliad::config::{RuliadCorpusConfig, RuliadDocumentMode, load_ruliad_config};
 use crate::ruliad::eval::RuliadEvalItem;
 use crate::ruliad::oracles::{
     GeneratedRuliadSample, LeanProofTask, RuliadCategoricalPresentation, RuliadSampleSpec,
     compact_ruliad_label, default_proof_tasks, generate_sample, generate_sample_for_source_bucket,
     load_proof_tasks, ruliad_answer_contract, ruliad_expected_answer, ruliad_prompt_prefix,
+    ruliad_sample_math_domains, ruliad_sample_reasoning_modes,
 };
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::search::RuliadSamplerCandidate;
 use crate::ruliad::source_selection::{
     RuliadSourceBucket, ruliad_sampler_candidates, ruliad_source_bucket_by_label,
-    ruliad_source_buckets,
+    ruliad_source_buckets, ruliad_source_buckets_for_difficulty,
+};
+use crate::ruliad::supervision::{
+    RuliadTokenSupervisionConfig, RuliadTokenSupervisionMode, ruliad_token_loss_mask,
 };
 use crate::ruliad::tokenize::RuliadByteTokenizer;
 use crate::stats::{ComplexityHistogramBin, SampleStats, build_complexity_histogram};
 
 const DEFAULT_PROBE_SAMPLES: usize = 32;
 const SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT: usize = 32;
+pub const RULIAD_SUPERVISION_AUDIT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct RuliadRuntimeSampleDocument {
@@ -39,10 +43,98 @@ pub struct RuliadRuntimeSampleDocument {
     pub math_domains: Vec<String>,
     pub reasoning_modes: Vec<String>,
     pub source_difficulty_level: Option<usize>,
+    /// Number of capacity-driven seed substitutions used to materialize this
+    /// document. Formal proof buckets never substitute a different seed.
+    pub generation_retry_count: usize,
     pub token_count: usize,
     pub tokens: Vec<u32>,
     pub serialized_preview: String,
     pub stats: SampleStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuliadFrontierFeasibilitySample {
+    pub bucket_label: String,
+    pub difficulty_level: usize,
+    pub sample_index: usize,
+    pub payload_tokens: usize,
+    pub payload_capacity: usize,
+    pub fits: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_complexity: Option<crate::ruliad::ir::RuliadComplexityVector>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuliadFrontierFeasibilityReport {
+    pub difficulty_level: usize,
+    pub payload_capacity: usize,
+    pub sample_count: usize,
+    pub fit_count: usize,
+    pub fit_fraction: f32,
+    pub mean_payload_tokens: f32,
+    pub max_payload_tokens: usize,
+    pub samples: Vec<RuliadFrontierFeasibilitySample>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuliadSupervisionAuditBucket {
+    pub bucket_label: String,
+    pub family: String,
+    pub task_kind: String,
+    pub answer_contract: String,
+    pub difficulty_level: usize,
+    pub sample_count: usize,
+    pub mean_document_tokens: f64,
+    pub max_document_tokens: usize,
+    pub mean_stream_chunks: f64,
+    pub stream_chunk_share: f64,
+    pub mean_answer_target_tokens: f64,
+    pub answer_target_share: f64,
+    pub mean_trace_answer_target_tokens: f64,
+    pub trace_answer_target_share: f64,
+    pub mean_answer_weight_units: f64,
+    pub mean_trace_answer_weight_units: f64,
+    pub query_conditioning_samples: usize,
+    pub mean_query_to_answer_tokens: f64,
+    pub max_query_to_answer_tokens: usize,
+    pub query_visible_within_block_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuliadSupervisionAuditReport {
+    pub version: u32,
+    pub block_size: usize,
+    pub samples_per_bucket: usize,
+    pub sample_count: usize,
+    pub total_document_tokens: usize,
+    pub total_stream_chunks: usize,
+    pub total_answer_target_tokens: usize,
+    pub total_trace_answer_target_tokens: usize,
+    pub total_query_conditioning_samples: usize,
+    pub query_visible_within_block_fraction: f64,
+    pub max_to_min_mean_stream_chunks_ratio: f64,
+    pub buckets: Vec<RuliadSupervisionAuditBucket>,
+}
+
+#[derive(Default)]
+struct RuliadSupervisionAuditAccumulator {
+    bucket_label: String,
+    family: String,
+    task_kind: String,
+    answer_contract: String,
+    difficulty_level: usize,
+    sample_count: usize,
+    document_tokens: usize,
+    max_document_tokens: usize,
+    stream_chunks: usize,
+    answer_target_tokens: usize,
+    trace_answer_target_tokens: usize,
+    answer_weight_units: usize,
+    trace_answer_weight_units: usize,
+    query_conditioning_samples: usize,
+    query_to_answer_tokens: usize,
+    max_query_to_answer_tokens: usize,
+    query_visible_within_block_samples: usize,
 }
 
 #[derive(Clone)]
@@ -147,6 +239,278 @@ impl OnlineRuliadCorpus {
         self.sampler_candidates.as_ref().clone()
     }
 
+    /// Measure a frontier level without replacing an over-capacity sample with
+    /// a different seed. This exposes resource-induced curriculum bias before
+    /// a long-running trainer reaches the level.
+    pub fn probe_frontier_feasibility(
+        &self,
+        difficulty_level: usize,
+        samples_per_bucket: usize,
+    ) -> Result<RuliadFrontierFeasibilityReport> {
+        let payload_capacity = self
+            .tokenizer
+            .payload_token_capacity(self.document_token_count);
+        let buckets = ruliad_source_buckets_for_difficulty(&self.config, difficulty_level);
+        let samples_per_bucket = samples_per_bucket.max(1);
+        let mut samples = Vec::with_capacity(buckets.len().saturating_mul(samples_per_bucket));
+        for bucket in &buckets {
+            for sample_index in 0..samples_per_bucket {
+                let sample = generate_sample_for_source_bucket(
+                    &self.config,
+                    self.proof_tasks.as_slice(),
+                    SampleSplit::Train,
+                    0,
+                    sample_index,
+                    bucket,
+                )?;
+                let payload_tokens = self.tokenizer.payload_token_count(&sample.text);
+                let formal_complexity = match &sample.spec {
+                    RuliadSampleSpec::FormalProof {
+                        problem,
+                        certificate,
+                        ..
+                    } => Some(crate::ruliad::kernel::complexity_vector(
+                        problem,
+                        Some(certificate),
+                    )),
+                    _ => None,
+                };
+                samples.push(RuliadFrontierFeasibilitySample {
+                    bucket_label: bucket.label(),
+                    difficulty_level,
+                    sample_index,
+                    payload_tokens,
+                    payload_capacity,
+                    fits: payload_tokens <= payload_capacity,
+                    formal_complexity,
+                });
+            }
+        }
+        let sample_count = samples.len();
+        let fit_count = samples.iter().filter(|sample| sample.fits).count();
+        let payload_token_sum = samples
+            .iter()
+            .map(|sample| sample.payload_tokens)
+            .fold(0usize, usize::saturating_add);
+        let max_payload_tokens = samples
+            .iter()
+            .map(|sample| sample.payload_tokens)
+            .max()
+            .unwrap_or_default();
+        Ok(RuliadFrontierFeasibilityReport {
+            difficulty_level,
+            payload_capacity,
+            sample_count,
+            fit_count,
+            fit_fraction: if sample_count == 0 {
+                0.0
+            } else {
+                fit_count as f32 / sample_count as f32
+            },
+            mean_payload_tokens: if sample_count == 0 {
+                0.0
+            } else {
+                payload_token_sum as f32 / sample_count as f32
+            },
+            max_payload_tokens,
+            samples,
+        })
+    }
+
+    /// Audit realized training-token exposure for source buckets. Source
+    /// probabilities are per document, while persistent TBPTT consumes one
+    /// optimizer update per chunk, so stream-chunk share is the relevant
+    /// compute balance rather than sample share alone.
+    pub fn audit_frontier_supervision(
+        &self,
+        difficulty_levels: &[usize],
+        samples_per_bucket: usize,
+        block_size: usize,
+        supervision: RuliadTokenSupervisionConfig,
+    ) -> Result<RuliadSupervisionAuditReport> {
+        if difficulty_levels.is_empty() {
+            return Err(anyhow!(
+                "ruliad supervision audit requires at least one difficulty level"
+            ));
+        }
+        let samples_per_bucket = samples_per_bucket.max(1);
+        let block_size = block_size.max(1);
+        let mut accumulators = BTreeMap::<String, RuliadSupervisionAuditAccumulator>::new();
+
+        for difficulty_level in difficulty_levels.iter().copied() {
+            for bucket in ruliad_source_buckets_for_difficulty(&self.config, difficulty_level) {
+                let bucket_label = bucket.label();
+                for sample_index in 0..samples_per_bucket {
+                    let document = self.generate_document_for_source_bucket_with_padding(
+                        SampleSplit::Train,
+                        0,
+                        sample_index,
+                        &bucket_label,
+                        false,
+                    )?;
+                    let target_count = document.tokens.len().saturating_sub(1);
+                    let stream_chunks = target_count.div_ceil(block_size).max(1);
+                    let answer = supervision_mask_summary(
+                        &document.tokens,
+                        RuliadTokenSupervisionMode::AnswerCompletion,
+                        supervision,
+                    );
+                    let trace_answer = supervision_mask_summary(
+                        &document.tokens,
+                        RuliadTokenSupervisionMode::TraceAndAnswer,
+                        supervision,
+                    );
+                    let accumulator =
+                        accumulators.entry(bucket_label.clone()).or_insert_with(|| {
+                            RuliadSupervisionAuditAccumulator {
+                                bucket_label: bucket_label.clone(),
+                                family: document.family.clone(),
+                                task_kind: document.task_kind.clone(),
+                                answer_contract: ruliad_answer_contract(&document.spec),
+                                difficulty_level,
+                                ..RuliadSupervisionAuditAccumulator::default()
+                            }
+                        });
+                    accumulator.sample_count = accumulator.sample_count.saturating_add(1);
+                    accumulator.document_tokens = accumulator
+                        .document_tokens
+                        .saturating_add(document.tokens.len());
+                    accumulator.max_document_tokens =
+                        accumulator.max_document_tokens.max(document.tokens.len());
+                    accumulator.stream_chunks =
+                        accumulator.stream_chunks.saturating_add(stream_chunks);
+                    accumulator.answer_target_tokens = accumulator
+                        .answer_target_tokens
+                        .saturating_add(answer.nonzero_targets);
+                    accumulator.trace_answer_target_tokens = accumulator
+                        .trace_answer_target_tokens
+                        .saturating_add(trace_answer.nonzero_targets);
+                    accumulator.answer_weight_units = accumulator
+                        .answer_weight_units
+                        .saturating_add(answer.weight_units);
+                    accumulator.trace_answer_weight_units = accumulator
+                        .trace_answer_weight_units
+                        .saturating_add(trace_answer.weight_units);
+                    if let Some(span) =
+                        query_to_answer_token_span(&self.tokenizer, &document.serialized_preview)
+                    {
+                        accumulator.query_conditioning_samples =
+                            accumulator.query_conditioning_samples.saturating_add(1);
+                        accumulator.query_to_answer_tokens =
+                            accumulator.query_to_answer_tokens.saturating_add(span);
+                        accumulator.max_query_to_answer_tokens =
+                            accumulator.max_query_to_answer_tokens.max(span);
+                        if span <= block_size {
+                            accumulator.query_visible_within_block_samples = accumulator
+                                .query_visible_within_block_samples
+                                .saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        let sample_count = accumulators
+            .values()
+            .map(|bucket| bucket.sample_count)
+            .sum::<usize>();
+        let total_document_tokens = accumulators
+            .values()
+            .map(|bucket| bucket.document_tokens)
+            .sum::<usize>();
+        let total_stream_chunks = accumulators
+            .values()
+            .map(|bucket| bucket.stream_chunks)
+            .sum::<usize>();
+        let total_answer_target_tokens = accumulators
+            .values()
+            .map(|bucket| bucket.answer_target_tokens)
+            .sum::<usize>();
+        let total_trace_answer_target_tokens = accumulators
+            .values()
+            .map(|bucket| bucket.trace_answer_target_tokens)
+            .sum::<usize>();
+        let total_query_conditioning_samples = accumulators
+            .values()
+            .map(|bucket| bucket.query_conditioning_samples)
+            .sum::<usize>();
+        let total_query_visible_within_block_samples = accumulators
+            .values()
+            .map(|bucket| bucket.query_visible_within_block_samples)
+            .sum::<usize>();
+        let mut min_mean_chunks = f64::INFINITY;
+        let mut max_mean_chunks = 0.0f64;
+        let buckets = accumulators
+            .into_values()
+            .map(|bucket| {
+                let denominator = bucket.sample_count.max(1) as f64;
+                let mean_stream_chunks = bucket.stream_chunks as f64 / denominator;
+                min_mean_chunks = min_mean_chunks.min(mean_stream_chunks);
+                max_mean_chunks = max_mean_chunks.max(mean_stream_chunks);
+                RuliadSupervisionAuditBucket {
+                    bucket_label: bucket.bucket_label,
+                    family: bucket.family,
+                    task_kind: bucket.task_kind,
+                    answer_contract: bucket.answer_contract,
+                    difficulty_level: bucket.difficulty_level,
+                    sample_count: bucket.sample_count,
+                    mean_document_tokens: bucket.document_tokens as f64 / denominator,
+                    max_document_tokens: bucket.max_document_tokens,
+                    mean_stream_chunks,
+                    stream_chunk_share: ratio(bucket.stream_chunks, total_stream_chunks),
+                    mean_answer_target_tokens: bucket.answer_target_tokens as f64 / denominator,
+                    answer_target_share: ratio(
+                        bucket.answer_target_tokens,
+                        total_answer_target_tokens,
+                    ),
+                    mean_trace_answer_target_tokens: bucket.trace_answer_target_tokens as f64
+                        / denominator,
+                    trace_answer_target_share: ratio(
+                        bucket.trace_answer_target_tokens,
+                        total_trace_answer_target_tokens,
+                    ),
+                    mean_answer_weight_units: bucket.answer_weight_units as f64 / denominator,
+                    mean_trace_answer_weight_units: bucket.trace_answer_weight_units as f64
+                        / denominator,
+                    query_conditioning_samples: bucket.query_conditioning_samples,
+                    mean_query_to_answer_tokens: ratio_mean(
+                        bucket.query_to_answer_tokens,
+                        bucket.query_conditioning_samples,
+                    ),
+                    max_query_to_answer_tokens: bucket.max_query_to_answer_tokens,
+                    query_visible_within_block_fraction: ratio(
+                        bucket.query_visible_within_block_samples,
+                        bucket.query_conditioning_samples,
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        let max_to_min_mean_stream_chunks_ratio =
+            if min_mean_chunks.is_finite() && min_mean_chunks > 0.0 {
+                max_mean_chunks / min_mean_chunks
+            } else {
+                0.0
+            };
+
+        Ok(RuliadSupervisionAuditReport {
+            version: RULIAD_SUPERVISION_AUDIT_VERSION,
+            block_size,
+            samples_per_bucket,
+            sample_count,
+            total_document_tokens,
+            total_stream_chunks,
+            total_answer_target_tokens,
+            total_trace_answer_target_tokens,
+            total_query_conditioning_samples,
+            query_visible_within_block_fraction: ratio(
+                total_query_visible_within_block_samples,
+                total_query_conditioning_samples,
+            ),
+            max_to_min_mean_stream_chunks_ratio,
+            buckets,
+        })
+    }
+
     pub fn generate_document(
         &self,
         split: SampleSplit,
@@ -161,12 +525,27 @@ impl OnlineRuliadCorpus {
         epoch_index: usize,
         sample_index: usize,
     ) -> Result<RuliadRuntimeSampleDocument> {
+        self.generate_document_for_epoch_with_padding(split, epoch_index, sample_index, true)
+    }
+
+    fn generate_document_for_epoch_with_padding(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        pad_to_envelope: bool,
+    ) -> Result<RuliadRuntimeSampleDocument> {
         if self.config.serialization.document_mode == RuliadDocumentMode::MultiChunkProofTree {
-            return self.generate_multi_chunk_document_for_epoch(split, epoch_index, sample_index);
+            return self.generate_multi_chunk_document_for_epoch(
+                split,
+                epoch_index,
+                sample_index,
+                pad_to_envelope,
+            );
         }
         let sample = self.generate_raw_sample(split, epoch_index, sample_index)?;
         let text = sample.text.clone();
-        self.document_from_sample_text(split, sample_index, sample, text)
+        self.document_from_sample_text(split, sample_index, sample, text, pad_to_envelope)
     }
 
     pub fn generate_document_for_source_bucket(
@@ -175,6 +554,23 @@ impl OnlineRuliadCorpus {
         epoch_index: usize,
         sample_index: usize,
         bucket_label: &str,
+    ) -> Result<RuliadRuntimeSampleDocument> {
+        self.generate_document_for_source_bucket_with_padding(
+            split,
+            epoch_index,
+            sample_index,
+            bucket_label,
+            true,
+        )
+    }
+
+    fn generate_document_for_source_bucket_with_padding(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket_label: &str,
+        pad_to_envelope: bool,
     ) -> Result<RuliadRuntimeSampleDocument> {
         let bucket = self
             .source_buckets
@@ -192,8 +588,14 @@ impl OnlineRuliadCorpus {
             .cloned()
             .or_else(|| ruliad_source_bucket_by_label(&self.config, bucket_label))
             .ok_or_else(|| anyhow!("unknown ruliad source bucket `{bucket_label}`"))?;
+        let retry_limit =
+            if bucket.id.family == crate::ruliad::config::RuliadFamilyKind::FormalProof {
+                1
+            } else {
+                SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT
+            };
         let mut last_error = None;
-        for retry in 0..SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT {
+        for retry in 0..retry_limit {
             let candidate_sample_index = source_bucket_retry_sample_index(sample_index, retry);
             let result = if self.config.serialization.document_mode
                 == RuliadDocumentMode::MultiChunkProofTree
@@ -203,6 +605,7 @@ impl OnlineRuliadCorpus {
                     epoch_index,
                     candidate_sample_index,
                     &bucket,
+                    pad_to_envelope,
                 )
             } else {
                 let sample = generate_sample_for_source_bucket(
@@ -214,15 +617,27 @@ impl OnlineRuliadCorpus {
                     &bucket,
                 )?;
                 let text = sample.text.clone();
-                self.document_from_sample_text(split, candidate_sample_index, sample, text)
+                self.document_from_sample_text(
+                    split,
+                    candidate_sample_index,
+                    sample,
+                    text,
+                    pad_to_envelope,
+                )
             };
             match result {
                 Ok(mut document) => {
                     document.sample_index = sample_index;
                     document.source_difficulty_level = Some(bucket.id.difficulty_level);
+                    document.generation_retry_count = retry;
                     return Ok(document);
                 }
                 Err(error) if is_document_payload_capacity_error(&error) => {
+                    if bucket.id.family == crate::ruliad::config::RuliadFamilyKind::FormalProof {
+                        return Err(anyhow!(
+                            "formal source bucket `{bucket_label}` exceeds the configured resource envelope; seed substitution is disabled: {error}"
+                        ));
+                    }
                     last_error = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -254,14 +669,55 @@ impl OnlineRuliadCorpus {
             .tokens)
     }
 
+    pub fn generate_compact_document_tokens_for_epoch(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .generate_document_for_epoch_with_padding(split, epoch_index, sample_index, false)?
+            .tokens)
+    }
+
+    pub fn generate_compact_document_tokens_for_source_bucket(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket_label: &str,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .generate_document_for_source_bucket_with_padding(
+                split,
+                epoch_index,
+                sample_index,
+                bucket_label,
+                false,
+            )?
+            .tokens)
+    }
+
     pub fn generate_eval_item_for_epoch(
         &self,
         split: SampleSplit,
         epoch_index: usize,
         sample_index: usize,
     ) -> Result<RuliadEvalItem> {
-        let document = self.generate_document_for_epoch(split, epoch_index, sample_index)?;
+        let document =
+            self.generate_document_for_epoch_with_padding(split, epoch_index, sample_index, false)?;
         Ok(eval_item_from_document(document))
+    }
+
+    pub fn generate_training_serialization_eval_item_for_epoch(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+    ) -> Result<RuliadEvalItem> {
+        let document =
+            self.generate_document_for_epoch_with_padding(split, epoch_index, sample_index, false)?;
+        training_serialization_eval_item_from_document(document)
     }
 
     pub fn generate_eval_item_for_source_bucket(
@@ -271,13 +727,31 @@ impl OnlineRuliadCorpus {
         sample_index: usize,
         bucket_label: &str,
     ) -> Result<RuliadEvalItem> {
-        let document = self.generate_document_for_source_bucket(
+        let document = self.generate_document_for_source_bucket_with_padding(
             split,
             epoch_index,
             sample_index,
             bucket_label,
+            false,
         )?;
         Ok(eval_item_from_document(document))
+    }
+
+    pub fn generate_training_serialization_eval_item_for_source_bucket(
+        &self,
+        split: SampleSplit,
+        epoch_index: usize,
+        sample_index: usize,
+        bucket_label: &str,
+    ) -> Result<RuliadEvalItem> {
+        let document = self.generate_document_for_source_bucket_with_padding(
+            split,
+            epoch_index,
+            sample_index,
+            bucket_label,
+            false,
+        )?;
+        training_serialization_eval_item_from_document(document)
     }
 
     pub fn generate_raw_sample(
@@ -309,6 +783,7 @@ impl OnlineRuliadCorpus {
         split: SampleSplit,
         epoch_index: usize,
         sample_index: usize,
+        pad_to_envelope: bool,
     ) -> Result<RuliadRuntimeSampleDocument> {
         let chunk_count =
             multi_chunk_count_for_document(&self.config, split, epoch_index, sample_index, 0);
@@ -329,7 +804,7 @@ impl OnlineRuliadCorpus {
             .cloned()
             .ok_or_else(|| anyhow!("multi-chunk ruliad document has no root sample"))?;
         let text = multi_chunk_proof_tree_text(&samples);
-        self.document_from_sample_text(split, sample_index, root, text)
+        self.document_from_sample_text(split, sample_index, root, text, pad_to_envelope)
     }
 
     fn generate_multi_chunk_document_for_source_bucket(
@@ -338,6 +813,7 @@ impl OnlineRuliadCorpus {
         epoch_index: usize,
         sample_index: usize,
         bucket: &RuliadSourceBucket,
+        pad_to_envelope: bool,
     ) -> Result<RuliadRuntimeSampleDocument> {
         let chunk_count = multi_chunk_count_for_document(
             &self.config,
@@ -364,7 +840,8 @@ impl OnlineRuliadCorpus {
             .cloned()
             .ok_or_else(|| anyhow!("multi-chunk ruliad source document has no root sample"))?;
         let text = multi_chunk_proof_tree_text(&samples);
-        let mut document = self.document_from_sample_text(split, sample_index, root, text)?;
+        let mut document =
+            self.document_from_sample_text(split, sample_index, root, text, pad_to_envelope)?;
         document.source_difficulty_level = Some(bucket.id.difficulty_level);
         Ok(document)
     }
@@ -375,6 +852,7 @@ impl OnlineRuliadCorpus {
         sample_index: usize,
         sample: GeneratedRuliadSample,
         text: String,
+        pad_to_envelope: bool,
     ) -> Result<RuliadRuntimeSampleDocument> {
         let payload_capacity = self
             .tokenizer
@@ -390,27 +868,48 @@ impl OnlineRuliadCorpus {
                 text.len()
             ));
         }
-        let tokens = self
-            .tokenizer
-            .encode_document(&text, self.document_token_count);
-        if tokens.len() != self.document_token_count {
+        let tokens = if pad_to_envelope {
+            self.tokenizer
+                .encode_document(&text, self.document_token_count)
+        } else {
+            self.tokenizer.encode_compact_document(&text)
+        };
+        let token_length_is_valid = if pad_to_envelope {
+            tokens.len() == self.document_token_count
+        } else {
+            tokens.len() <= self.document_token_count
+        };
+        if !token_length_is_valid {
             return Err(anyhow!(
-                "ruliad document token length drifted (expected={} actual={})",
+                "ruliad document token length drifted (envelope={} actual={} padded={})",
                 self.document_token_count,
-                tokens.len()
+                tokens.len(),
+                pad_to_envelope
             ));
         }
-        let semantics = ruliad_source_semantics(sample.family, sample.task_kind);
-        let math_domains = semantics
-            .math_domains
-            .iter()
+        let math_domains = ruliad_sample_math_domains(&sample.spec)
+            .into_iter()
             .map(|domain| domain.label().to_string())
             .collect::<Vec<_>>();
-        let reasoning_modes = semantics
-            .reasoning_modes
-            .iter()
+        let mut reasoning_modes = ruliad_sample_reasoning_modes(&sample.spec)
+            .into_iter()
             .map(|mode| mode.label().to_string())
             .collect::<Vec<_>>();
+        if matches!(&sample.spec, RuliadSampleSpec::FormalProof { .. }) {
+            use crate::ruliad::config::RuliadFormalGeneralizationContract;
+
+            let partition = match (self.config.formal_generalization, split) {
+                (RuliadFormalGeneralizationContract::SeedDisjointV1, _) => "seed_disjoint_v1",
+                (RuliadFormalGeneralizationContract::StructuralHoldoutV1, SampleSplit::Train) => {
+                    "structural_train_v1"
+                }
+                (
+                    RuliadFormalGeneralizationContract::StructuralHoldoutV1,
+                    SampleSplit::Validation,
+                ) => "structural_validation_v1",
+            };
+            reasoning_modes.push(partition.to_string());
+        }
         let token_count = tokens.len();
         Ok(RuliadRuntimeSampleDocument {
             split,
@@ -424,6 +923,7 @@ impl OnlineRuliadCorpus {
             math_domains,
             reasoning_modes,
             source_difficulty_level: None,
+            generation_retry_count: 0,
             token_count,
             tokens,
             serialized_preview: text,
@@ -441,7 +941,8 @@ impl OnlineRuliadCorpus {
         let mut gzip_ratios = Vec::with_capacity(probe_count);
         let mut complexity_scores = Vec::with_capacity(probe_count);
         for sample_index in 0..probe_count {
-            let sample = self.generate_document(split, sample_index)?;
+            let sample =
+                self.generate_document_for_epoch_with_padding(split, 0, sample_index, false)?;
             gzip_ratios.push(sample.stats.gzip_complexity_ratio);
             complexity_scores.push(sample.stats.complexity_score);
         }
@@ -562,7 +1063,7 @@ fn multi_chunk_proof_tree_text(samples: &[GeneratedRuliadSample]) -> String {
         "?:root {}\nA:{}\n!:{}\n[/R2]\n",
         compact_runtime_text(root_view.query.as_str(), 96),
         ruliad_answer_contract(&root.spec),
-        compact_runtime_text(&ruliad_expected_answer(&root.spec), 96)
+        ruliad_expected_answer(&root.spec)
     ));
     text
 }
@@ -573,17 +1074,14 @@ fn multi_chunk_semantic_labels(
     let mut domains = BTreeSet::new();
     let mut modes = BTreeSet::new();
     for sample in samples {
-        let semantics = ruliad_source_semantics(sample.family, sample.task_kind);
         domains.extend(
-            semantics
-                .math_domains
-                .iter()
+            ruliad_sample_math_domains(&sample.spec)
+                .into_iter()
                 .map(|domain| domain.label().to_string()),
         );
         modes.extend(
-            semantics
-                .reasoning_modes
-                .iter()
+            ruliad_sample_reasoning_modes(&sample.spec)
+                .into_iter()
                 .map(|mode| mode.label().to_string()),
         );
     }
@@ -701,6 +1199,56 @@ fn load_configured_proof_tasks(config: &RuliadCorpusConfig) -> Result<Vec<LeanPr
     Ok(default_proof_tasks())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SupervisionMaskSummary {
+    nonzero_targets: usize,
+    weight_units: usize,
+}
+
+fn supervision_mask_summary(
+    document_tokens: &[u32],
+    mode: RuliadTokenSupervisionMode,
+    supervision: RuliadTokenSupervisionConfig,
+) -> SupervisionMaskSummary {
+    let mut mask = vec![0; document_tokens.len().saturating_sub(1)];
+    let supervision = RuliadTokenSupervisionConfig {
+        mode,
+        ..supervision
+    };
+    if !ruliad_token_loss_mask(document_tokens, &mut mask, supervision) {
+        return SupervisionMaskSummary::default();
+    }
+    SupervisionMaskSummary {
+        nonzero_targets: mask.iter().filter(|weight| **weight > 0).count(),
+        weight_units: mask
+            .iter()
+            .filter_map(|weight| usize::try_from((*weight).max(0)).ok())
+            .fold(0usize, usize::saturating_add),
+    }
+}
+
+fn query_to_answer_token_span(tokenizer: &RuliadByteTokenizer, text: &str) -> Option<usize> {
+    let query_line_break = text.find("\n?:")?;
+    let query_start = query_line_break.saturating_add(1);
+    let answer_line_break = text[query_start..]
+        .find("\n!:")?
+        .saturating_add(query_start);
+    let answer_marker_end = answer_line_break.saturating_add(3);
+    Some(tokenizer.payload_token_count(text.get(query_start..answer_marker_end)?))
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn ratio_mean(total: usize, count: usize) -> f64 {
+    ratio(total, count)
+}
+
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
     let values = values.collect::<Vec<_>>();
     if values.is_empty() {
@@ -736,6 +1284,28 @@ fn eval_item_from_document(document: RuliadRuntimeSampleDocument) -> RuliadEvalI
     }
 }
 
+fn training_serialization_eval_item_from_document(
+    document: RuliadRuntimeSampleDocument,
+) -> Result<RuliadEvalItem> {
+    let answer_marker = document
+        .serialized_preview
+        .rfind("\n!:")
+        .ok_or_else(|| anyhow!("ruliad training document is missing its root answer slot"))?;
+    let answer_start = answer_marker.saturating_add(3);
+    let answer_tail = &document.serialized_preview[answer_start..];
+    let answer_end = answer_tail.find('\n').unwrap_or(answer_tail.len());
+    let expected_answer = answer_tail[..answer_end].trim().to_string();
+    if expected_answer.is_empty() {
+        return Err(anyhow!("ruliad training document has an empty root answer"));
+    }
+
+    let prompt = document.serialized_preview[..answer_start].to_string();
+    let mut item = eval_item_from_document(document);
+    item.prompt = prompt;
+    item.expected_answer = expected_answer;
+    Ok(item)
+}
+
 #[allow(dead_code)]
 fn _assert_histogram_type(_: Vec<ComplexityHistogramBin>) {}
 
@@ -744,8 +1314,9 @@ mod tests {
     use super::*;
     use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
-        RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
-        RuliadSourceSelectionConfig, RuliadTokenizationConfig, default_ruliad_families,
+        RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadFormalTaskMixConfig,
+        RuliadSerializationConfig, RuliadSourceSelectionConfig, RuliadTokenizationConfig,
+        default_ruliad_families,
     };
 
     fn config() -> RuliadCorpusConfig {
@@ -762,6 +1333,7 @@ mod tests {
                 ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
             families: default_ruliad_families(),
             proof_tasks: None,
@@ -796,12 +1368,159 @@ mod tests {
     }
 
     #[test]
+    fn structural_holdout_partition_is_visible_to_eval_telemetry_not_model_symbols() {
+        let mut config = config();
+        config.serialization.document_tokens = 8192;
+        config.formal_generalization =
+            crate::ruliad::config::RuliadFormalGeneralizationContract::StructuralHoldoutV1;
+        config.source_selection = RuliadSourceSelectionConfig {
+            enabled: true,
+            formal_task_mix: RuliadFormalTaskMixConfig {
+                advance_proof_weight: 0,
+                select_proof_action_weight: 1,
+                construct_proof_weight: 0,
+                check_proof_weight: 0,
+                proof_action_answer_contract: Default::default(),
+            },
+            ..RuliadSourceSelectionConfig::default()
+        };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+            steps: Some(UsizeRangeConfig { min: 3, max: 3 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("structural corpus");
+        let bucket = corpus.source_buckets()[0].label();
+        let train = corpus
+            .generate_document_for_source_bucket(SampleSplit::Train, 0, 0, &bucket)
+            .expect("train document");
+        let validation = corpus
+            .generate_document_for_source_bucket(SampleSplit::Validation, 0, 0, &bucket)
+            .expect("validation document");
+
+        assert!(
+            train
+                .reasoning_modes
+                .iter()
+                .any(|mode| mode == "structural_train_v1")
+        );
+        assert!(
+            validation
+                .reasoning_modes
+                .iter()
+                .any(|mode| mode == "structural_validation_v1")
+        );
+        for document in [&train, &validation] {
+            assert!(!document.serialized_preview.contains("identity_left"));
+            assert!(!document.serialized_preview.contains("identity_right"));
+            assert!(!document.serialized_preview.contains("compose"));
+        }
+    }
+
+    #[test]
+    fn seed_disjoint_control_is_explicit_in_eval_telemetry() {
+        let mut config = config();
+        config.serialization.document_tokens = 8192;
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("seed-disjoint corpus");
+        let bucket = corpus.source_buckets()[0].label();
+        let validation = corpus
+            .generate_document_for_source_bucket(SampleSplit::Validation, 0, 0, &bucket)
+            .expect("validation document");
+
+        assert!(
+            validation
+                .reasoning_modes
+                .iter()
+                .any(|mode| mode == "seed_disjoint_v1")
+        );
+        assert!(
+            validation
+                .reasoning_modes
+                .iter()
+                .all(|mode| mode != "structural_validation_v1")
+        );
+    }
+
+    #[test]
+    fn structural_action_labels_are_balanced_in_both_partitions() {
+        let mut config = config();
+        config.serialization.document_tokens = 8192;
+        config.formal_generalization =
+            crate::ruliad::config::RuliadFormalGeneralizationContract::StructuralHoldoutV1;
+        config.source_selection = RuliadSourceSelectionConfig {
+            enabled: true,
+            formal_task_mix: RuliadFormalTaskMixConfig {
+                advance_proof_weight: 0,
+                select_proof_action_weight: 1,
+                construct_proof_weight: 0,
+                check_proof_weight: 0,
+                proof_action_answer_contract: Default::default(),
+            },
+            ..RuliadSourceSelectionConfig::default()
+        };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 2, max: 4 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 4 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("structural corpus");
+        let bucket = corpus.source_buckets()[0].label();
+
+        for split in [SampleSplit::Train, SampleSplit::Validation] {
+            let mut counts = [0usize; 4];
+            for sample_index in 0..256 {
+                let item = corpus
+                    .generate_eval_item_for_source_bucket(split, 0, sample_index, &bucket)
+                    .expect("action item");
+                let index = crate::ruliad::policy::parse_proof_action_index(&item.expected_answer)
+                    .expect("action index");
+                counts[index] += 1;
+            }
+            let entropy = counts.iter().fold(0.0f64, |entropy, count| {
+                let probability = *count as f64 / 256.0;
+                entropy - probability * probability.log2()
+            });
+            assert!(
+                counts.iter().all(|count| (38..=90).contains(count)),
+                "{split:?} action labels are position-biased: {counts:?}"
+            );
+            assert!(
+                entropy >= 1.9,
+                "{split:?} action-label entropy is too low: entropy={entropy} counts={counts:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ruliad_documents_have_fixed_length() {
         let corpus = OnlineRuliadCorpus::new(config()).expect("corpus");
         let doc = corpus
             .generate_document(SampleSplit::Train, 0)
             .expect("document");
         assert_eq!(doc.tokens.len(), 513);
+    }
+
+    #[test]
+    fn compact_ruliad_documents_end_at_eos_without_envelope_padding() {
+        let corpus = OnlineRuliadCorpus::new(config()).expect("corpus");
+        let compact = corpus
+            .generate_compact_document_tokens_for_epoch(SampleSplit::Train, 0, 0)
+            .expect("compact document");
+        assert!(compact.len() < corpus.document_token_count());
+        assert_eq!(compact.last().copied(), corpus.tokenizer_manifest().eos_id);
+        let padded = corpus
+            .generate_document_tokens_for_epoch(SampleSplit::Train, 0, 0)
+            .expect("padded document");
+        assert_eq!(padded.len(), corpus.document_token_count());
+        assert_eq!(&padded[..compact.len()], compact.as_slice());
     }
 
     #[test]
@@ -846,13 +1565,39 @@ mod tests {
             .expect("multi-chunk document answer line");
         assert_eq!(
             answer_line,
-            format!(
-                "!:{}",
-                compact_runtime_text(&ruliad_expected_answer(&doc.spec), 96)
-            ),
+            format!("!:{}", ruliad_expected_answer(&doc.spec)),
             "multi-chunk root answer slot must train the full keyed expected answer"
         );
         assert!(doc.serialized_preview.contains("[/R2]"));
+    }
+
+    #[test]
+    fn training_serialization_eval_preserves_multi_chunk_prompt_contract() {
+        let mut config = config();
+        config.serialization.document_tokens = 1539;
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 3, max: 3 };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+
+        let canonical = corpus
+            .generate_eval_item_for_epoch(SampleSplit::Validation, 0, 0)
+            .expect("canonical item");
+        let matched = corpus
+            .generate_training_serialization_eval_item_for_epoch(SampleSplit::Validation, 0, 0)
+            .expect("training-serialization item");
+
+        assert!(canonical.prompt.trim_start().starts_with("[R3"));
+        assert!(matched.prompt.trim_start().starts_with("[R2"));
+        assert!(matched.prompt.ends_with("\n!:"));
+        assert_eq!(matched.document_close_marker(), "[/R2]");
+        assert_eq!(matched.expected_answer, canonical.expected_answer);
+        assert_eq!(matched.oracle_hash, canonical.oracle_hash);
     }
 
     #[test]
@@ -909,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn source_bucket_generation_retries_overlong_far_out_draws() {
+    fn source_bucket_generation_reports_bounded_capacity_retries() {
         let mut config = config();
         config.seed = 1337;
         config.train_samples = 256;
@@ -940,6 +1685,114 @@ mod tests {
         assert_eq!(doc.sample_index, 27);
         assert_eq!(doc.family, "automaton");
         assert_eq!(doc.task_kind, "evaluate_automaton");
+        assert!(doc.generation_retry_count < SOURCE_BUCKET_DOCUMENT_RETRY_LIMIT);
+    }
+
+    #[test]
+    fn formal_source_overflow_is_explicit_and_never_changes_seed() {
+        let mut config = config();
+        config.serialization.document_tokens = 64;
+        config.serialization.document_mode = RuliadDocumentMode::MultiChunkProofTree;
+        config.serialization.document_chunks = UsizeRangeConfig { min: 1, max: 1 };
+        config.source_selection = RuliadSourceSelectionConfig {
+            enabled: true,
+            difficulty_levels: UsizeRangeConfig { min: 8, max: 8 },
+            ..RuliadSourceSelectionConfig::default()
+        };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 4, max: 4 }),
+            steps: Some(UsizeRangeConfig { min: 4, max: 4 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+        let bucket = corpus.source_buckets()[0].label();
+        let error = corpus
+            .generate_document_for_source_bucket(SampleSplit::Train, 0, 0, &bucket)
+            .expect_err("formal sample exceeds intentionally tiny envelope");
+        let message = error.to_string();
+        assert!(
+            message.contains("seed substitution is disabled"),
+            "{message}"
+        );
+        assert!(
+            message.contains("exceeds document payload capacity"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn formal_supervision_audit_reports_realized_stream_compute_imbalance() {
+        let mut config = config();
+        config.chunk_token_capacity = 32_768;
+        config.serialization.document_tokens = 16_384;
+        config.source_selection = RuliadSourceSelectionConfig {
+            enabled: true,
+            difficulty_levels: UsizeRangeConfig { min: 0, max: 0 },
+            formal_task_mix: RuliadFormalTaskMixConfig {
+                advance_proof_weight: 2,
+                select_proof_action_weight: 0,
+                construct_proof_weight: 1,
+                check_proof_weight: 1,
+                proof_action_answer_contract: Default::default(),
+            },
+            ..RuliadSourceSelectionConfig::default()
+        };
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        }];
+        let corpus = OnlineRuliadCorpus::new(config).expect("corpus");
+
+        let report = corpus
+            .audit_frontier_supervision(
+                &[0],
+                4,
+                128,
+                RuliadTokenSupervisionConfig {
+                    mask_high_entropy_spans: true,
+                    ..RuliadTokenSupervisionConfig::default()
+                },
+            )
+            .expect("audit");
+
+        assert_eq!(report.version, RULIAD_SUPERVISION_AUDIT_VERSION);
+        assert_eq!(report.sample_count, 12);
+        assert_eq!(report.buckets.len(), 3);
+        assert!(report.total_stream_chunks > 0);
+        assert!(report.total_answer_target_tokens > 0);
+        assert!(report.total_trace_answer_target_tokens > report.total_answer_target_tokens);
+        assert!(report.max_to_min_mean_stream_chunks_ratio >= 1.0);
+        assert_eq!(report.total_query_conditioning_samples, report.sample_count);
+        assert_eq!(report.query_visible_within_block_fraction, 1.0);
+        let stream_share_sum = report
+            .buckets
+            .iter()
+            .map(|bucket| bucket.stream_chunk_share)
+            .sum::<f64>();
+        assert!((stream_share_sum - 1.0).abs() < 1.0e-9);
+        assert!(
+            report
+                .buckets
+                .iter()
+                .any(|bucket| bucket.answer_contract == "certificate")
+        );
+        assert!(
+            report
+                .buckets
+                .iter()
+                .any(|bucket| bucket.answer_contract == "ok,vg,vs,g,s,k")
+        );
+        let transition = report
+            .buckets
+            .iter()
+            .find(|bucket| bucket.answer_contract == "proof_step")
+            .expect("transition bucket");
+        assert_eq!(transition.query_conditioning_samples, 4);
+        assert_eq!(transition.query_visible_within_block_fraction, 1.0);
+        assert!(transition.max_query_to_answer_tokens <= 128);
     }
 
     #[test]

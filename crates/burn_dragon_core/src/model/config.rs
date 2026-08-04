@@ -953,6 +953,28 @@ impl DragonRandomScaffoldConfig {
     }
 }
 
+/// Optional low-rank compatibility score over an encoded prompt-candidate pair.
+///
+/// This head is deliberately task-neutral: downstream pipelines may use it for candidate
+/// ranking, energy-based decoding, or verifier-guided search without routing those objectives
+/// through the language-model vocabulary projection.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SequenceScoreHeadConfig {
+    pub enabled: bool,
+    /// Rank of the learned query-key compatibility space.
+    pub projection_dim: usize,
+}
+
+impl Default for SequenceScoreHeadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            projection_dim: 64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DragonConfig {
     pub n_layer: usize,
@@ -976,6 +998,8 @@ pub struct DragonConfig {
     pub vocab_size: usize,
     #[serde(default)]
     pub language_head: LanguageHeadConfig,
+    #[serde(default)]
+    pub sequence_score_head: SequenceScoreHeadConfig,
     #[serde(default)]
     pub tie_input_output_embeddings: bool,
     /// Number of fast internal recurrent updates to run before each slow token emission.
@@ -1018,6 +1042,7 @@ impl Default for DragonConfig {
             n_expert: 1,
             vocab_size: 256,
             language_head: LanguageHeadConfig::default(),
+            sequence_score_head: SequenceScoreHeadConfig::default(),
             tie_input_output_embeddings: false,
             rollout_fast_steps_per_slow_step: 1,
             fused_kernels: FusedKernelConfig::default(),

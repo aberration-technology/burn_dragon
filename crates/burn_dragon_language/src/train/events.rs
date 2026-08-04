@@ -9,9 +9,9 @@ use burn_dragon_train::train::events::{
 use burn_ecs::bevy_ecs;
 use burn_ecs::prelude::{
     App, Component, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Query, Res,
-    SourceSelectionBucketMetric, SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt,
-    TrainingMetricSample, TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry,
-    TrainingSet, Update,
+    SourceSelectionBucketMetric, SourceSelectionCapabilityCoverageMetric,
+    SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt, TrainingMetricSample,
+    TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry, TrainingSet, Update,
 };
 
 use crate::config::TrainingHyperparameters;
@@ -223,6 +223,13 @@ pub(crate) fn source_selection_sample_from_snapshot(
         capability_malformed_ema: snapshot.capability_malformed_ema as f64,
         capability_missing_ema: snapshot.capability_missing_ema as f64,
         capability_lagging_probability: snapshot.capability_lagging_probability as f64,
+        capability_frontier_allowed_max_difficulty: snapshot
+            .capability_frontier_allowed_max_difficulty,
+        capability_frontier_coverage: snapshot
+            .capability_frontier_coverage
+            .iter()
+            .map(source_selection_capability_coverage_metric)
+            .collect(),
         frontier_extension_count: snapshot.frontier_extension_count,
         frontier_saturated: snapshot.frontier_saturated,
         unbounded_frontier: snapshot.frontier_unbounded,
@@ -272,6 +279,20 @@ pub(crate) fn source_selection_sample_from_snapshot(
     }
 }
 
+fn source_selection_capability_coverage_metric(
+    coverage: &burn_dragon_universality::RuliadCapabilityCoverageMetric,
+) -> SourceSelectionCapabilityCoverageMetric {
+    SourceSelectionCapabilityCoverageMetric {
+        difficulty_level: coverage.difficulty_level,
+        candidate_coverage: coverage.candidate_coverage as f64,
+        family_coverage: coverage.family_coverage as f64,
+        task_coverage: coverage.task_coverage as f64,
+        contract_coverage: coverage.contract_coverage as f64,
+        observed_items: coverage.observed_items,
+        mastered: coverage.mastered,
+    }
+}
+
 fn source_selection_group_metric(
     group: &burn_dragon_universality::RuliadGroupMetric,
 ) -> SourceSelectionGroupMetric {
@@ -290,5 +311,33 @@ fn source_selection_group_metric(
         capability_malformed_ema: group.capability_malformed_ema as f64,
         capability_missing_ema: group.capability_missing_ema as f64,
         capability_lagging_probability: group.capability_lagging_probability as f64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_frontier_coverage_survives_the_ecs_event_boundary() {
+        let metric = source_selection_capability_coverage_metric(
+            &burn_dragon_universality::RuliadCapabilityCoverageMetric {
+                difficulty_level: 7,
+                candidate_coverage: 0.75,
+                family_coverage: 1.0,
+                task_coverage: 0.5,
+                contract_coverage: 0.25,
+                observed_items: 128,
+                mastered: false,
+            },
+        );
+
+        assert_eq!(metric.difficulty_level, 7);
+        assert_eq!(metric.observed_items, 128);
+        assert_eq!(metric.candidate_coverage, 0.75);
+        assert_eq!(metric.family_coverage, 1.0);
+        assert_eq!(metric.task_coverage, 0.5);
+        assert_eq!(metric.contract_coverage, 0.25);
+        assert!(!metric.mastered);
     }
 }

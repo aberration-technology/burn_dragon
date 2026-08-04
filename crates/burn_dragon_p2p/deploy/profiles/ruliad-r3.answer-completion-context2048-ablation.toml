@@ -1,0 +1,12 @@
+extends = ["ruliad-r3.answer-completion-fixed-ablation.toml"]
+
+# Context-coverage ablation: difficulty-zero R3 formal documents observed by
+# the supervision audit fit in one model window. Keep model, optimizer, and
+# batch fixed so this arm isolates usable conditioning context.
+[training]
+block_size = 2048
+tbptt_chunk_size = 2048
+tbptt_persist_across_steps = false
+max_iters = 4096
+checkpoint_interval_iters = 4096
+log_frequency = 4

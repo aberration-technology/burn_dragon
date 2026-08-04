@@ -2,13 +2,73 @@ use std::f32::consts::PI;
 
 use burn::module::Module;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor, activation};
+use burn::tensor::{Int, Tensor, TensorData, activation};
 
 use super::config::FusedKernelConfig;
 use crate::kernel::{BlockPattern2d, linear_attention};
+use crate::model::backend_float_dtype;
 use crate::positional::RotaryEmbedding;
 
 const ROW_NORM_EPS: f32 = 1e-6;
+const MAX_DENSE_SCORE_DECAY_CACHE_TIME: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct DenseScoreDecayCache<B: Backend> {
+    pub score: Tensor<B, 4>,
+    pub initial_state: Tensor<B, 4>,
+    pub final_state: Tensor<B, 4>,
+    pub carry: Tensor<B, 4>,
+    time: usize,
+}
+
+impl<B: Backend> DenseScoreDecayCache<B> {
+    pub(crate) fn new(slopes: &[f32], time: usize, device: &B::Device) -> Option<Self> {
+        if slopes.is_empty() || time == 0 || time > MAX_DENSE_SCORE_DECAY_CACHE_TIME {
+            return None;
+        }
+
+        let heads = slopes.len();
+        let mut score = Vec::with_capacity(heads * time * time);
+        let mut initial_state = Vec::with_capacity(heads * time);
+        let mut final_state = Vec::with_capacity(heads * time);
+        let mut carry = Vec::with_capacity(heads);
+        for slope in slopes {
+            let decay = (-slope).exp();
+            for row in 0..time {
+                for col in 0..time {
+                    let exponent = row.saturating_sub(col) as f32;
+                    score.push(if col < row { decay.powf(exponent) } else { 1.0 });
+                }
+            }
+            for position in 0..time {
+                initial_state.push(decay.powf(position as f32));
+                final_state.push(decay.powf((time - position) as f32));
+            }
+            carry.push(decay.powf(time as f32));
+        }
+
+        Some(Self {
+            score: Tensor::<B, 4>::from_data(
+                TensorData::new(score, [1, heads, time, time]),
+                device,
+            )
+            .cast(backend_float_dtype::<B>()),
+            initial_state: Tensor::<B, 4>::from_data(
+                TensorData::new(initial_state, [1, heads, time, 1]),
+                device,
+            )
+            .cast(backend_float_dtype::<B>()),
+            final_state: Tensor::<B, 4>::from_data(
+                TensorData::new(final_state, [1, heads, time, 1]),
+                device,
+            )
+            .cast(backend_float_dtype::<B>()),
+            carry: Tensor::<B, 4>::from_data(TensorData::new(carry, [1, heads, 1, 1]), device)
+                .cast(backend_float_dtype::<B>()),
+            time,
+        })
+    }
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct AttentionCache<B: Backend> {
@@ -106,6 +166,16 @@ pub struct Attention<B: Backend> {
     block_pattern: BlockPattern2d,
     use_alibi: bool,
     alibi_slopes: Tensor<B, 1>,
+    alibi_decay: Tensor<B, 1>,
+    #[module(skip)]
+    dense_score_decay_score: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    dense_score_decay_initial_state: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    dense_score_decay_final_state: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    dense_score_decay_carry: Option<Tensor<B, 4>>,
+    dense_score_decay_time: usize,
     rotary_embedding: RotaryEmbedding,
 }
 
@@ -118,15 +188,48 @@ impl<B: Backend> Attention<B> {
     ) -> Self {
         let freqs = Self::build_freqs(latent, kernel.rope_theta, kernel.rotary_embedding, device);
         let use_alibi = matches!(kernel.rotary_embedding, RotaryEmbedding::Alibi);
-        let (use_alibi, alibi_slopes) = if use_alibi {
+        let (use_alibi, slopes) = if use_alibi {
             let slopes = kernel
                 .alibi_slopes
                 .clone()
                 .filter(|slopes| !slopes.is_empty())
                 .unwrap_or_else(|| linear_attention::default_alibi_slopes(n_head));
-            (true, Tensor::<B, 1>::from_floats(slopes.as_slice(), device))
+            (true, slopes)
         } else {
-            (false, Tensor::<B, 1>::zeros([n_head], device))
+            (false, vec![0.0; n_head])
+        };
+        let alibi_slopes =
+            Tensor::<B, 1>::from_floats(slopes.as_slice(), device).cast(backend_float_dtype::<B>());
+        let decay_values = slopes
+            .iter()
+            .map(|slope| (-slope).exp())
+            .collect::<Vec<_>>();
+        let alibi_decay = Tensor::<B, 1>::from_floats(decay_values.as_slice(), device)
+            .cast(backend_float_dtype::<B>());
+        let dense_score_decay_cache = use_alibi
+            .then(|| {
+                DenseScoreDecayCache::new(
+                    slopes.as_slice(),
+                    kernel.block_sparse.time.block_size(),
+                    device,
+                )
+            })
+            .flatten();
+        let (
+            dense_score_decay_score,
+            dense_score_decay_initial_state,
+            dense_score_decay_final_state,
+            dense_score_decay_carry,
+            dense_score_decay_time,
+        ) = match dense_score_decay_cache {
+            Some(cache) => (
+                Some(cache.score),
+                Some(cache.initial_state),
+                Some(cache.final_state),
+                Some(cache.carry),
+                cache.time,
+            ),
+            None => (None, None, None, None, 0),
         };
 
         Self {
@@ -136,6 +239,12 @@ impl<B: Backend> Attention<B> {
             block_pattern: kernel.block_sparse.time.clone(),
             use_alibi,
             alibi_slopes,
+            alibi_decay,
+            dense_score_decay_score,
+            dense_score_decay_initial_state,
+            dense_score_decay_final_state,
+            dense_score_decay_carry,
+            dense_score_decay_time,
             rotary_embedding: kernel.rotary_embedding,
         }
     }
@@ -182,6 +291,12 @@ impl<B: Backend> Attention<B> {
         )
         .detach();
         widened.alibi_slopes = self.alibi_slopes.clone();
+        widened.alibi_decay = self.alibi_decay.clone();
+        widened.dense_score_decay_score = self.dense_score_decay_score.clone();
+        widened.dense_score_decay_initial_state = self.dense_score_decay_initial_state.clone();
+        widened.dense_score_decay_final_state = self.dense_score_decay_final_state.clone();
+        widened.dense_score_decay_carry = self.dense_score_decay_carry.clone();
+        widened.dense_score_decay_time = self.dense_score_decay_time;
         widened.block_pattern = self.block_pattern.clone();
         Ok(widened)
     }
@@ -207,10 +322,10 @@ impl<B: Backend> Attention<B> {
             let slopes = self.alibi_slopes.clone().reshape([1, self.n_head, 1, 1]);
             let time = q_rot.shape().dims::<4>()[2];
             let pos_row = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, time, 1]);
             let pos_new = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, 1, time]);
             let alibi = slopes * (pos_new - pos_row).tril(-1);
             scores = scores + alibi;
@@ -237,7 +352,20 @@ impl<B: Backend> Attention<B> {
         if !self.use_alibi {
             return None;
         }
-        Some(self.alibi_slopes.clone().neg().exp())
+        Some(self.alibi_decay.clone())
+    }
+
+    pub(crate) fn dense_score_decay_cache(&self, time: usize) -> Option<DenseScoreDecayCache<B>> {
+        if self.dense_score_decay_time != time {
+            return None;
+        }
+        Some(DenseScoreDecayCache {
+            score: self.dense_score_decay_score.clone()?,
+            initial_state: self.dense_score_decay_initial_state.clone()?,
+            final_state: self.dense_score_decay_final_state.clone()?,
+            carry: self.dense_score_decay_carry.clone()?,
+            time,
+        })
     }
 
     pub fn forward_cached(
@@ -269,11 +397,11 @@ impl<B: Backend> Attention<B> {
                     position as i64..(position + time_new) as i64,
                     &device,
                 )
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, time_new, 1]);
 
                 let pos_prev = Tensor::<B, 1, Int>::arange(0..prev_len as i64, &device)
-                    .float()
+                    .cast(backend_float_dtype::<B>())
                     .reshape([1, 1, 1, prev_len]);
                 let alibi_prev = slopes.clone() * (pos_prev - pos_row.clone());
 
@@ -281,7 +409,7 @@ impl<B: Backend> Attention<B> {
                     position as i64..(position + time_new) as i64,
                     &device,
                 )
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, 1, time_new]);
                 let alibi_self = slopes * (pos_new - pos_row).tril(-1);
 
@@ -316,13 +444,13 @@ impl<B: Backend> Attention<B> {
                     position as i64..(position + time_new) as i64,
                     &device,
                 )
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, time_new, 1]);
                 let pos_new = Tensor::<B, 1, Int>::arange(
                     position as i64..(position + time_new) as i64,
                     &device,
                 )
-                .float()
+                .cast(backend_float_dtype::<B>())
                 .reshape([1, 1, 1, time_new]);
                 let alibi = slopes * (pos_new - pos_row).tril(-1);
                 scores = scores + alibi;
@@ -388,7 +516,7 @@ impl<B: Backend> Attention<B> {
         let time = values.shape().dims::<4>()[2];
         let device = values.device();
         let positions = Tensor::<B, 1, Int>::arange(start as i64..(start + time) as i64, &device)
-            .float()
+            .cast(backend_float_dtype::<B>())
             .reshape([1, 1, time, 1]);
 
         self.rotate_with_positions(values, positions)
@@ -401,7 +529,7 @@ impl<B: Backend> Attention<B> {
         let time = values.shape().dims::<4>()[2];
         let device = values.device();
         let positions = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
-            .float()
+            .cast(backend_float_dtype::<B>())
             .mul_scalar(0.0)
             .add_scalar(position as f32)
             .reshape([1, 1, time, 1]);
@@ -442,7 +570,9 @@ impl<B: Backend> Attention<B> {
             };
             data.push(value);
         }
-        Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, 1, latent])
+        Tensor::<B, 1>::from_floats(data.as_slice(), device)
+            .cast(backend_float_dtype::<B>())
+            .reshape([1, 1, 1, latent])
     }
 }
 

@@ -1,11 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ruliad::config::{RuliadFamilyKind, RuliadTaskKind, ruliad_source_semantics};
+use crate::ruliad::config::{
+    RuliadFamilyKind, RuliadProofActionAnswerContract, RuliadTaskKind, ruliad_source_semantics,
+};
 use crate::ruliad::metrics::{
-    RuliadBucketMetric, RuliadCapabilityFeedback, RuliadGroupMetric, RuliadMetricSnapshot,
-    RuliadSampleTelemetry,
+    RULIAD_SOURCE_CAPABILITY_LABEL_PREFIX, RuliadBucketMetric, RuliadCapabilityCoverageMetric,
+    RuliadCapabilityFeedback, RuliadGroupMetric, RuliadMetricSnapshot, RuliadSampleTelemetry,
+    ruliad_source_capability_label,
+};
+use crate::ruliad::world::{
+    RuliadCapabilityCoverage, RuliadCapabilityMasteryThresholds, RuliadCapabilityPosterior,
 };
 
 const SNAPSHOT_TOP_BUCKET_COUNT: usize = 12;
@@ -41,6 +47,10 @@ pub struct RuliadSamplerConfig {
     pub capability_frontier_max_unverified_probability: f32,
     #[serde(default = "default_capability_remediation_weight")]
     pub capability_remediation_weight: f32,
+    #[serde(default = "default_capability_frontier_min_coverage")]
+    pub capability_frontier_min_coverage: f32,
+    #[serde(default)]
+    pub capability_mastery: RuliadCapabilityMasteryThresholds,
 }
 
 impl Default for RuliadSamplerConfig {
@@ -62,6 +72,8 @@ impl Default for RuliadSamplerConfig {
             capability_frontier_max_unverified_probability:
                 default_capability_frontier_max_unverified_probability(),
             capability_remediation_weight: default_capability_remediation_weight(),
+            capability_frontier_min_coverage: default_capability_frontier_min_coverage(),
+            capability_mastery: RuliadCapabilityMasteryThresholds::default(),
         }
     }
 }
@@ -71,6 +83,9 @@ pub struct RuliadSamplerCandidate {
     pub oracle_hash: String,
     pub family: String,
     pub task_kind: String,
+    /// Stable semantic contract for the supervised answer emitted by this source bucket.
+    #[serde(default)]
+    pub answer_contract: String,
     #[serde(default)]
     pub difficulty_level: usize,
     #[serde(default)]
@@ -144,12 +159,15 @@ impl RuliadSamplerCandidate {
 pub struct RuliadFrontierSampler {
     config: RuliadSamplerConfig,
     candidates: Vec<RuliadSamplerCandidate>,
+    capability_posteriors: BTreeMap<String, RuliadCapabilityPosterior>,
     verifier_failures: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadFrontierSamplerState {
     pub candidates: Vec<RuliadSamplerCandidate>,
+    #[serde(default)]
+    pub capability_posteriors: BTreeMap<String, RuliadCapabilityPosterior>,
     #[serde(default)]
     pub verifier_failures: usize,
 }
@@ -159,6 +177,7 @@ impl RuliadFrontierSampler {
         Self {
             config,
             candidates,
+            capability_posteriors: BTreeMap::new(),
             verifier_failures: 0,
         }
     }
@@ -170,6 +189,7 @@ impl RuliadFrontierSampler {
     pub fn export_state(&self) -> RuliadFrontierSamplerState {
         RuliadFrontierSamplerState {
             candidates: self.candidates.clone(),
+            capability_posteriors: self.capability_posteriors.clone(),
             verifier_failures: self.verifier_failures,
         }
     }
@@ -178,6 +198,7 @@ impl RuliadFrontierSampler {
         Self {
             config,
             candidates: state.candidates,
+            capability_posteriors: state.capability_posteriors,
             verifier_failures: state.verifier_failures,
         }
     }
@@ -192,11 +213,17 @@ impl RuliadFrontierSampler {
 
     pub fn add_candidates(&mut self, candidates: impl IntoIterator<Item = RuliadSamplerCandidate>) {
         for candidate in candidates {
-            if self
+            if let Some(existing) = self
                 .candidates
-                .iter()
-                .any(|existing| existing.oracle_hash == candidate.oracle_hash)
+                .iter_mut()
+                .find(|existing| existing.oracle_hash == candidate.oracle_hash)
             {
+                // Runtime metadata evolves independently from learned sampler state. Refresh
+                // additive semantic fields when restoring an older checkpoint while preserving
+                // its loss and capability EMAs.
+                if !candidate.answer_contract.is_empty() {
+                    existing.answer_contract = candidate.answer_contract;
+                }
                 continue;
             }
             self.candidates.push(candidate);
@@ -345,12 +372,7 @@ impl RuliadFrontierSampler {
     }
 
     fn enforce_capability_frontier(&self, probs: &mut [f32]) {
-        if probs.is_empty()
-            || !self
-                .candidates
-                .iter()
-                .any(|candidate| candidate.capability_feedback_count > 0)
-        {
+        if probs.is_empty() || self.capability_posteriors.is_empty() {
             return;
         }
         let max_difficulty = self.max_difficulty_level();
@@ -398,14 +420,15 @@ impl RuliadFrontierSampler {
     }
 
     fn capability_frontier_allowed_max_difficulty(&self) -> Option<usize> {
-        let mut difficulty_mastery = BTreeMap::<usize, bool>::new();
-        for candidate in &self.candidates {
-            let mastered = difficulty_mastery
-                .entry(candidate.difficulty_level)
-                .or_insert(false);
-            *mastered |= candidate_capability_backed_mastered(candidate);
-        }
-        let mut iter = difficulty_mastery.into_iter();
+        let mut iter = self
+            .capability_coverage_by_difficulty()
+            .into_iter()
+            .map(|coverage| {
+                (
+                    coverage.difficulty_level,
+                    coverage.mastered(self.config.capability_frontier_min_coverage),
+                )
+            });
         let (min_difficulty, mut backed_mastered) = iter.next()?;
         let mut base = min_difficulty;
         if backed_mastered {
@@ -419,6 +442,63 @@ impl RuliadFrontierSampler {
             }
         }
         Some(base.saturating_add(self.config.capability_frontier_max_ahead))
+    }
+
+    fn capability_coverage_by_difficulty(&self) -> Vec<RuliadCapabilityCoverage> {
+        let mut levels = BTreeMap::<usize, Vec<&RuliadSamplerCandidate>>::new();
+        for candidate in &self.candidates {
+            if !candidate.is_hash_noise {
+                levels
+                    .entry(candidate.difficulty_level)
+                    .or_default()
+                    .push(candidate);
+            }
+        }
+        levels
+            .into_iter()
+            .map(|(difficulty_level, candidates)| {
+                let mastered = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        self.capability_posteriors
+                            .get(&candidate.oracle_hash)
+                            .is_some_and(|posterior| {
+                                posterior.mastered(self.config.capability_mastery)
+                            })
+                    })
+                    .map(|candidate| candidate.oracle_hash.as_str())
+                    .collect::<BTreeSet<_>>();
+                let candidate_coverage = coverage_ratio(mastered.len(), candidates.len());
+                let family_coverage =
+                    grouped_mastery_coverage(&candidates, &mastered, |candidate| {
+                        candidate.family.as_str()
+                    });
+                let task_coverage = grouped_mastery_coverage(&candidates, &mastered, |candidate| {
+                    candidate.task_kind.as_str()
+                });
+                let contract_coverage =
+                    grouped_mastery_coverage(&candidates, &mastered, |candidate| {
+                        if candidate.answer_contract.is_empty() {
+                            "untyped"
+                        } else {
+                            candidate.answer_contract.as_str()
+                        }
+                    });
+                let observed_items = candidates
+                    .iter()
+                    .filter_map(|candidate| self.capability_posteriors.get(&candidate.oracle_hash))
+                    .map(|posterior| posterior.observation_count())
+                    .sum();
+                RuliadCapabilityCoverage {
+                    difficulty_level,
+                    candidate_coverage,
+                    family_coverage,
+                    task_coverage,
+                    contract_coverage,
+                    observed_items,
+                }
+            })
+            .collect()
     }
 
     fn allowed_capability_frontier_distribution(&self, allowed_max: usize) -> Vec<f32> {
@@ -562,6 +642,12 @@ impl RuliadFrontierSampler {
         for candidate in &mut self.candidates {
             if candidate_matches_capability_feedback(candidate, &feedback.group_label) {
                 matched_any = true;
+                record_capability_posterior(
+                    self.capability_posteriors
+                        .entry(candidate.oracle_hash.clone())
+                        .or_default(),
+                    feedback,
+                );
                 record_candidate_capability_feedback(candidate, feedback);
             }
         }
@@ -679,6 +765,28 @@ impl RuliadFrontierSampler {
             })
             .sum::<f32>();
         let capability_summary = capability_probability_summary(probs, &self.candidates);
+        let capability_frontier_coverage = self
+            .capability_coverage_by_difficulty()
+            .into_iter()
+            .map(|coverage| RuliadCapabilityCoverageMetric {
+                difficulty_level: coverage.difficulty_level,
+                candidate_coverage: coverage.candidate_coverage,
+                family_coverage: coverage.family_coverage,
+                task_coverage: coverage.task_coverage,
+                contract_coverage: coverage.contract_coverage,
+                observed_items: coverage.observed_items,
+                mastered: coverage.mastered(self.config.capability_frontier_min_coverage),
+            })
+            .collect::<Vec<_>>();
+        let capability_frontier_allowed_max_difficulty = self
+            .capability_frontier_allowed_max_difficulty()
+            .unwrap_or_else(|| {
+                self.candidates
+                    .iter()
+                    .map(|candidate| candidate.difficulty_level)
+                    .min()
+                    .unwrap_or(0)
+            });
         let top_buckets = top_bucket_metrics(
             probs,
             &self.candidates,
@@ -741,6 +849,8 @@ impl RuliadFrontierSampler {
             capability_malformed_ema: capability_summary.malformed,
             capability_missing_ema: capability_summary.missing,
             capability_lagging_probability: capability_summary.lagging_probability,
+            capability_frontier_allowed_max_difficulty,
+            capability_frontier_coverage,
             frontier_extension_count: 0,
             frontier_saturated: false,
             frontier_unbounded: false,
@@ -770,10 +880,6 @@ fn candidate_capability_mastered(candidate: &RuliadSamplerCandidate) -> bool {
         && candidate.capability_schema_wrong_ema <= 0.25
         && candidate.capability_malformed_ema <= 0.05
         && candidate.capability_missing_ema <= 0.05
-}
-
-fn candidate_capability_backed_mastered(candidate: &RuliadSamplerCandidate) -> bool {
-    candidate.capability_feedback_count > 0 && candidate_capability_mastered(candidate)
 }
 
 fn candidate_capability_lagging(candidate: &RuliadSamplerCandidate) -> bool {
@@ -826,6 +932,58 @@ fn record_candidate_capability_feedback(
         feedback.missing_rate.clamp(0.0, 1.0),
         alpha,
     );
+}
+
+fn record_capability_posterior(
+    posterior: &mut RuliadCapabilityPosterior,
+    feedback: &RuliadCapabilityFeedback,
+) {
+    posterior
+        .verifier
+        .observe_rate(feedback.verifier_rate, feedback.item_count);
+    posterior
+        .partial_credit
+        .observe_rate(feedback.partial_credit_rate, feedback.item_count);
+    posterior
+        .completion_health
+        .observe_rate(feedback.completion_health_rate, feedback.item_count);
+    posterior
+        .schema_wrong
+        .observe_rate(feedback.schema_valid_wrong_rate, feedback.item_count);
+    posterior
+        .malformed
+        .observe_rate(feedback.malformed_rate, feedback.item_count);
+    posterior
+        .missing
+        .observe_rate(feedback.missing_rate, feedback.item_count);
+}
+
+fn coverage_ratio(mastered: usize, total: usize) -> f32 {
+    if total == 0 {
+        1.0
+    } else {
+        mastered as f32 / total as f32
+    }
+}
+
+fn grouped_mastery_coverage<'a, F>(
+    candidates: &[&'a RuliadSamplerCandidate],
+    mastered: &BTreeSet<&str>,
+    key: F,
+) -> f32
+where
+    F: Fn(&'a RuliadSamplerCandidate) -> &'a str,
+{
+    let all_groups = candidates
+        .iter()
+        .map(|candidate| key(candidate))
+        .collect::<BTreeSet<_>>();
+    let mastered_groups = candidates
+        .iter()
+        .filter(|candidate| mastered.contains(candidate.oracle_hash.as_str()))
+        .map(|candidate| key(candidate))
+        .collect::<BTreeSet<_>>();
+    coverage_ratio(mastered_groups.len(), all_groups.len())
 }
 
 fn ema_update(previous: f32, value: f32, alpha: f32) -> f32 {
@@ -907,6 +1065,17 @@ fn candidate_matches_capability_feedback(
     candidate: &RuliadSamplerCandidate,
     group_label: &str,
 ) -> bool {
+    if group_label.starts_with(RULIAD_SOURCE_CAPABILITY_LABEL_PREFIX) {
+        let Some(answer_contract) = candidate_answer_contract(candidate) else {
+            return false;
+        };
+        return ruliad_source_capability_label(
+            &candidate.family,
+            &candidate.task_kind,
+            candidate.difficulty_level,
+            &answer_contract,
+        ) == group_label;
+    }
     if let Some(difficulty) = group_label
         .strip_prefix("difficulty:")
         .and_then(|label| label.strip_prefix('d'))
@@ -1006,66 +1175,54 @@ fn capability_probability_summary(
 }
 
 fn candidate_answer_contract(candidate: &RuliadSamplerCandidate) -> Option<String> {
+    if !candidate.answer_contract.is_empty() {
+        return Some(candidate.answer_contract.clone());
+    }
     let (family, task_kind) = candidate_family_and_task(candidate)?;
-    Some(
-        match (family, task_kind) {
-            (RuliadFamilyKind::Eca, _) => "xlen,xalpha,xcounts,xedge",
-            (RuliadFamilyKind::Simulation, RuliadTaskKind::VerifySimulation) => "ok",
-            (RuliadFamilyKind::Automaton, RuliadTaskKind::EvaluateAutomaton) => "acc",
-            (RuliadFamilyKind::Rewrite, RuliadTaskKind::RewriteNormalForm) => {
-                "nflen,nfalpha,nfcounts,nfedge"
-            }
-            (RuliadFamilyKind::Algebra, RuliadTaskKind::CheckAlgebraLaw) => "ok",
-            (RuliadFamilyKind::Category, _) | (RuliadFamilyKind::ProofTree, _) => "ok,l,r",
-            (RuliadFamilyKind::LeanTask, RuliadTaskKind::CompleteProof)
-            | (RuliadFamilyKind::HashNoise, RuliadTaskKind::HashCanary) => "sha",
-            _ => return None,
-        }
-        .to_string(),
+    source_answer_contract(
+        family,
+        task_kind,
+        RuliadProofActionAnswerContract::PresentationIndex,
     )
+    .map(str::to_string)
+}
+
+pub(crate) fn source_answer_contract(
+    family: RuliadFamilyKind,
+    task_kind: RuliadTaskKind,
+    proof_action_contract: RuliadProofActionAnswerContract,
+) -> Option<&'static str> {
+    Some(match (family, task_kind) {
+        (RuliadFamilyKind::Eca, _) => "xlen,xalpha,xcounts,xedge",
+        (RuliadFamilyKind::Simulation, RuliadTaskKind::VerifySimulation) => "ok",
+        (RuliadFamilyKind::Automaton, RuliadTaskKind::EvaluateAutomaton) => "acc",
+        (RuliadFamilyKind::Rewrite, RuliadTaskKind::RewriteNormalForm) => {
+            "nflen,nfalpha,nfcounts,nfedge"
+        }
+        (RuliadFamilyKind::Algebra, RuliadTaskKind::CheckAlgebraLaw) => "ok",
+        (RuliadFamilyKind::Category, _) | (RuliadFamilyKind::ProofTree, _) => "ok,l,r",
+        (RuliadFamilyKind::FormalProof, RuliadTaskKind::AdvanceProof) => "proof_step",
+        (RuliadFamilyKind::FormalProof, RuliadTaskKind::SelectProofAction) => {
+            match proof_action_contract {
+                RuliadProofActionAnswerContract::PresentationIndex => "action_index",
+                RuliadProofActionAnswerContract::SemanticStep => "proof_action_step",
+            }
+        }
+        (RuliadFamilyKind::FormalProof, RuliadTaskKind::ConstructProof) => "certificate",
+        (RuliadFamilyKind::FormalProof, RuliadTaskKind::CheckProof) => "ok,vg,vs,g,s,k",
+        (RuliadFamilyKind::LeanTask, RuliadTaskKind::CompleteProof)
+        | (RuliadFamilyKind::HashNoise, RuliadTaskKind::HashCanary) => "sha",
+        _ => return None,
+    })
 }
 
 fn candidate_family_and_task(
     candidate: &RuliadSamplerCandidate,
 ) -> Option<(RuliadFamilyKind, RuliadTaskKind)> {
     Some((
-        family_kind_from_label(&candidate.family)?,
-        task_kind_from_label(&candidate.task_kind)?,
+        RuliadFamilyKind::from_label(&candidate.family)?,
+        RuliadTaskKind::from_label(&candidate.task_kind)?,
     ))
-}
-
-fn family_kind_from_label(label: &str) -> Option<RuliadFamilyKind> {
-    match label {
-        "eca" => Some(RuliadFamilyKind::Eca),
-        "simulation" => Some(RuliadFamilyKind::Simulation),
-        "automaton" => Some(RuliadFamilyKind::Automaton),
-        "rewrite" => Some(RuliadFamilyKind::Rewrite),
-        "algebra" => Some(RuliadFamilyKind::Algebra),
-        "category" => Some(RuliadFamilyKind::Category),
-        "proof_tree" => Some(RuliadFamilyKind::ProofTree),
-        "lean_task" => Some(RuliadFamilyKind::LeanTask),
-        "hash_noise" => Some(RuliadFamilyKind::HashNoise),
-        _ => None,
-    }
-}
-
-fn task_kind_from_label(label: &str) -> Option<RuliadTaskKind> {
-    match label {
-        "next_state" => Some(RuliadTaskKind::NextState),
-        "multi_step_state" => Some(RuliadTaskKind::MultiStepState),
-        "verify_simulation" => Some(RuliadTaskKind::VerifySimulation),
-        "evaluate_automaton" => Some(RuliadTaskKind::EvaluateAutomaton),
-        "rewrite_normal_form" => Some(RuliadTaskKind::RewriteNormalForm),
-        "check_algebra_law" => Some(RuliadTaskKind::CheckAlgebraLaw),
-        "compose_category_path" => Some(RuliadTaskKind::ComposeCategoryPath),
-        "verify_category_law" => Some(RuliadTaskKind::VerifyCategoryLaw),
-        "verify_functor_preservation" => Some(RuliadTaskKind::VerifyFunctorPreservation),
-        "verify_naturality_square" => Some(RuliadTaskKind::VerifyNaturalitySquare),
-        "prove_theorem" => Some(RuliadTaskKind::ProveTheorem),
-        "complete_proof" => Some(RuliadTaskKind::CompleteProof),
-        "hash_canary" => Some(RuliadTaskKind::HashCanary),
-        _ => None,
-    }
 }
 
 fn top_bucket_metrics(
@@ -1433,6 +1590,10 @@ fn default_capability_remediation_weight() -> f32 {
     0.75
 }
 
+fn default_capability_frontier_min_coverage() -> f32 {
+    1.0
+}
+
 fn default_prior() -> f32 {
     1.0
 }
@@ -1454,6 +1615,7 @@ mod tests {
             oracle_hash: oracle_hash.to_string(),
             family: family.to_string(),
             task_kind: task_kind.to_string(),
+            answer_contract: String::new(),
             difficulty_level: 1,
             params_hash: String::new(),
             prior: 1.0,
@@ -1473,6 +1635,70 @@ mod tests {
     }
 
     #[test]
+    fn adding_existing_candidate_refreshes_semantic_metadata_only() {
+        let mut restored = candidate_for_contract_test(
+            "formal_proof:select_proof_action@d1#00000001",
+            "formal_proof",
+            "select_proof_action",
+        );
+        restored.loss_ema = 1.25;
+        restored.capability_feedback_count = 7;
+        let mut current = restored.clone();
+        current.answer_contract = "proof_action_step".to_string();
+        current.loss_ema = 9.0;
+        current.capability_feedback_count = 0;
+        let mut sampler =
+            RuliadFrontierSampler::new(RuliadSamplerConfig::default(), vec![restored]);
+
+        sampler.add_candidates([current]);
+
+        assert_eq!(sampler.candidates().len(), 1);
+        assert_eq!(sampler.candidates()[0].answer_contract, "proof_action_step");
+        assert_eq!(sampler.candidates()[0].loss_ema, 1.25);
+        assert_eq!(sampler.candidates()[0].capability_feedback_count, 7);
+    }
+
+    #[test]
+    fn source_feedback_matches_joint_contract_and_difficulty_once() {
+        let mut d1 = candidate_for_contract_test(
+            "formal_proof:select_proof_action@d1#00000001",
+            "formal_proof",
+            "select_proof_action",
+        );
+        d1.answer_contract = "proof_action_step".to_string();
+        let mut d2 = d1.clone();
+        d2.oracle_hash = "formal_proof:select_proof_action@d2#00000002".to_string();
+        d2.difficulty_level = 2;
+        let mut legacy_contract = d1.clone();
+        legacy_contract.oracle_hash = "formal_proof:select_proof_action@d1#00000003".to_string();
+        legacy_contract.answer_contract = "action_index".to_string();
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig::default(),
+            vec![d1, d2, legacy_contract],
+        );
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: ruliad_source_capability_label(
+                "formal_proof",
+                "select_proof_action",
+                1,
+                "proof_action_step",
+            ),
+            item_count: 8,
+            verifier_rate: 0.75,
+            partial_credit_rate: 0.8,
+            schema_valid_wrong_rate: 0.25,
+            malformed_rate: 0.0,
+            missing_rate: 0.0,
+            completion_health_rate: 1.0,
+        });
+
+        assert_eq!(sampler.candidates()[0].capability_feedback_count, 1);
+        assert_eq!(sampler.candidates()[1].capability_feedback_count, 0);
+        assert_eq!(sampler.candidates()[2].capability_feedback_count, 0);
+    }
+
+    #[test]
     fn sampler_penalizes_hash_noise_canary() {
         let sampler = RuliadFrontierSampler::new(
             RuliadSamplerConfig::default(),
@@ -1481,6 +1707,7 @@ mod tests {
                     oracle_hash: "structured".to_string(),
                     family: "eca".to_string(),
                     task_kind: "multi_step_state".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 0,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1501,6 +1728,7 @@ mod tests {
                     oracle_hash: "noise".to_string(),
                     family: "hash_noise".to_string(),
                     task_kind: "hash_canary".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 0,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1537,6 +1765,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d2#00000001".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 2,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1557,6 +1786,7 @@ mod tests {
                     oracle_hash: "proof_tree:prove_theorem@d2#00000002".to_string(),
                     family: "proof_tree".to_string(),
                     task_kind: "prove_theorem".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 2,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1641,6 +1871,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d1#00000001".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1661,6 +1892,7 @@ mod tests {
                     oracle_hash: "proof_tree:prove_theorem@d1#00000002".to_string(),
                     family: "proof_tree".to_string(),
                     task_kind: "prove_theorem".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1735,6 +1967,7 @@ mod tests {
                 oracle_hash: "category:verify_category_law@d1#00000001".to_string(),
                 family: "category".to_string(),
                 task_kind: "verify_category_law".to_string(),
+                answer_contract: String::new(),
                 difficulty_level: 1,
                 params_hash: String::new(),
                 prior: 1.0,
@@ -1785,6 +2018,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d1#00000001".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1805,6 +2039,7 @@ mod tests {
                     oracle_hash: "rewrite:rewrite_normal_form@d1#00000002".to_string(),
                     family: "rewrite".to_string(),
                     task_kind: "rewrite_normal_form".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -1910,6 +2145,49 @@ mod tests {
             "contract feedback should promote matching ok/l/r candidates"
         );
         assert_eq!(sampler.candidates()[2].loss_ema, 4.0);
+    }
+
+    #[test]
+    fn formal_proof_tasks_have_distinct_answer_contracts() {
+        let advance = candidate_for_contract_test(
+            "formal_proof:advance_proof@d0#00000000",
+            "formal_proof",
+            "advance_proof",
+        );
+        let construct = candidate_for_contract_test(
+            "formal_proof:construct_proof@d0#00000001",
+            "formal_proof",
+            "construct_proof",
+        );
+        assert_eq!(
+            candidate_answer_contract(&advance).as_deref(),
+            Some("proof_step")
+        );
+        let check = candidate_for_contract_test(
+            "formal_proof:check_proof@d0#00000002",
+            "formal_proof",
+            "check_proof",
+        );
+        assert_eq!(
+            candidate_answer_contract(&construct).as_deref(),
+            Some("certificate")
+        );
+        assert_eq!(
+            candidate_answer_contract(&check).as_deref(),
+            Some("ok,vg,vs,g,s,k")
+        );
+
+        let sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                exploration_floor: 0.0,
+                max_answer_contract_probability: 0.70,
+                min_answer_contract_probability: 0.30,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![advance, construct, check],
+        );
+        let probabilities = sampler.probabilities();
+        assert!(probabilities.iter().all(|probability| *probability >= 0.30));
     }
 
     #[test]
@@ -2039,6 +2317,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d0#00000001".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 0,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2059,6 +2338,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d12#00000002".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 12,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2120,6 +2400,7 @@ mod tests {
                 oracle_hash: "eca:multi_step_state@d0#00000001".to_string(),
                 family: "eca".to_string(),
                 task_kind: "multi_step_state".to_string(),
+                answer_contract: String::new(),
                 difficulty_level: 0,
                 params_hash: String::new(),
                 prior: 1.0,
@@ -2177,6 +2458,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d0#00000001".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 0,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2197,6 +2479,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d1#00000002".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2217,6 +2500,7 @@ mod tests {
                     oracle_hash: "category:verify_category_law@d12#00000003".to_string(),
                     family: "category".to_string(),
                     task_kind: "verify_category_law".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 12,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2256,12 +2540,81 @@ mod tests {
     }
 
     #[test]
+    fn one_mastered_bucket_does_not_unlock_a_multitask_level() {
+        let mut category = candidate_for_contract_test(
+            "category:verify_category_law@d0#00000001",
+            "category",
+            "verify_category_law",
+        );
+        category.difficulty_level = 0;
+        let mut proof = candidate_for_contract_test(
+            "formal_proof:construct_proof@d0#00000002",
+            "formal_proof",
+            "construct_proof",
+        );
+        proof.difficulty_level = 0;
+        let mut next = candidate_for_contract_test(
+            "category:verify_category_law@d1#00000003",
+            "category",
+            "verify_category_law",
+        );
+        next.difficulty_level = 1;
+        let mut far = candidate_for_contract_test(
+            "category:verify_category_law@d2#00000004",
+            "category",
+            "verify_category_law",
+        );
+        far.difficulty_level = 2;
+        let category_label = category.oracle_hash.clone();
+        let mut sampler = RuliadFrontierSampler::new(
+            RuliadSamplerConfig {
+                temperature: 100.0,
+                exploration_floor: 0.0,
+                mastery_escape_weight: 0.0,
+                capability_frontier_max_ahead: 1,
+                capability_frontier_max_unverified_probability: 0.05,
+                ..RuliadSamplerConfig::default()
+            },
+            vec![category, proof, next, far],
+        );
+
+        sampler.record_capability_feedback(&RuliadCapabilityFeedback {
+            group_label: format!("bucket:{category_label}"),
+            item_count: 64,
+            verifier_rate: 1.0,
+            partial_credit_rate: 1.0,
+            schema_valid_wrong_rate: 0.0,
+            malformed_rate: 0.0,
+            missing_rate: 0.0,
+            completion_health_rate: 1.0,
+        });
+        let snapshot = sampler.snapshot();
+        let d0 = snapshot
+            .capability_frontier_coverage
+            .iter()
+            .find(|coverage| coverage.difficulty_level == 0)
+            .expect("d0 coverage");
+        let d2_probability = snapshot
+            .difficulty_buckets
+            .iter()
+            .find(|bucket| bucket.label == "d2")
+            .map(|bucket| bucket.probability)
+            .unwrap_or_default();
+
+        assert!((d0.candidate_coverage - 0.5).abs() < 1.0e-6, "{d0:?}");
+        assert!(!d0.mastered, "{d0:?}");
+        assert_eq!(snapshot.capability_frontier_allowed_max_difficulty, 1);
+        assert!(d2_probability <= 0.051, "d2_probability={d2_probability}");
+    }
+
+    #[test]
     fn contiguous_capability_mastery_unlocks_next_frontier_band() {
         let candidates = (0..=4)
             .map(|difficulty_level| RuliadSamplerCandidate {
                 oracle_hash: format!("category:verify_category_law@d{difficulty_level}"),
                 family: "category".to_string(),
                 task_kind: "verify_category_law".to_string(),
+                answer_contract: String::new(),
                 difficulty_level,
                 params_hash: String::new(),
                 prior: 1.0,
@@ -2368,6 +2721,7 @@ mod tests {
                     oracle_hash: "easy".to_string(),
                     family: "category".to_string(),
                     task_kind: "trace".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 0,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2388,6 +2742,7 @@ mod tests {
                     oracle_hash: "hard".to_string(),
                     family: "category".to_string(),
                     task_kind: "proof".to_string(),
+                    answer_contract: String::new(),
                     difficulty_level: 1,
                     params_hash: String::new(),
                     prior: 1.0,
@@ -2462,6 +2817,7 @@ mod tests {
                 oracle_hash: format!("d{difficulty_level}"),
                 family: "category".to_string(),
                 task_kind: "proof".to_string(),
+                answer_contract: String::new(),
                 difficulty_level,
                 params_hash: String::new(),
                 prior: 1.0,
@@ -2495,6 +2851,8 @@ mod tests {
                 capability_frontier_max_ahead: 1,
                 capability_frontier_max_unverified_probability: 0.08,
                 capability_remediation_weight: default_capability_remediation_weight(),
+                capability_frontier_min_coverage: default_capability_frontier_min_coverage(),
+                capability_mastery: RuliadCapabilityMasteryThresholds::default(),
             },
             candidates,
         );

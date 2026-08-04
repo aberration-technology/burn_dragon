@@ -8,7 +8,7 @@ pub use burn_dragon_core::objective::TrainingObjectiveConfig as DragonBrowserTra
 #[cfg(feature = "native")]
 use burn_dragon_language::DragonConfig;
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
-use burn_dragon_universality::NcaCorpusConfig;
+use burn_dragon_universality::{NcaCorpusConfig, RuliadCorpusConfig};
 #[cfg(feature = "native")]
 use burn_p2p::NetworkManifest;
 use burn_p2p::{
@@ -219,13 +219,17 @@ fn default_manifest_timestamp() -> DateTime<Utc> {
 #[serde(rename_all = "snake_case")]
 pub enum DragonExperimentKind {
     NcaPrepretraining,
+    RuliadPretraining,
     ClimbMixPretraining,
 }
+
+pub const DRAGON_RULIAD_SEMANTIC_CONTRACT_EXTENSION: &str = "dragon.ruliad_semantics.v1";
 
 impl DragonExperimentKind {
     pub fn workload_slug(self) -> &'static str {
         match self {
             Self::NcaPrepretraining => "nca-prepretraining",
+            Self::RuliadPretraining => "ruliad-pretraining",
             Self::ClimbMixPretraining => "climbmix-pretraining",
         }
     }
@@ -233,6 +237,7 @@ impl DragonExperimentKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::NcaPrepretraining => "NCA pre-pre-training",
+            Self::RuliadPretraining => "Ruliad pre-training",
             Self::ClimbMixPretraining => "ClimbMix pre-training",
         }
     }
@@ -428,6 +433,37 @@ const fn default_root_ema_update_basis_points() -> u16 {
     DragonAggregationConfig::MAX_BASIS_POINTS
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DragonPromotionMode {
+    /// Trainer-only bounded diffusion, suitable when no validator fleet is available.
+    #[default]
+    DiffusionSteadyState,
+    /// Dedicated validators evaluate exact candidate heads before quorum promotion.
+    ValidatorQuorum,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragonPromotionConfig {
+    #[serde(default)]
+    pub mode: DragonPromotionMode,
+    #[serde(default = "default_validator_quorum")]
+    pub validator_quorum: u16,
+}
+
+impl Default for DragonPromotionConfig {
+    fn default() -> Self {
+        Self {
+            mode: DragonPromotionMode::DiffusionSteadyState,
+            validator_quorum: default_validator_quorum(),
+        }
+    }
+}
+
+const fn default_validator_quorum() -> u16 {
+    1
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonManifestSeed {
     pub project_family_id: String,
@@ -457,6 +493,9 @@ pub struct DragonManifestSeed {
     pub training_protocol: TrainingProtocol,
     #[serde(default)]
     pub aggregation: DragonAggregationConfig,
+    /// Revision-bound ownership of candidate evaluation and canonical promotion.
+    #[serde(default)]
+    pub promotion: DragonPromotionConfig,
     /// Wire encoding for random-scaffold mutable-parameter updates.
     ///
     /// This is revision-scoped because every peer must decode the same update
@@ -486,6 +525,7 @@ impl Default for DragonManifestSeed {
             require_signed_revision_contracts: false,
             training_protocol: TrainingProtocol::default(),
             aggregation: DragonAggregationConfig::default(),
+            promotion: DragonPromotionConfig::default(),
             random_scaffold_update_encoding: default_random_scaffold_update_encoding(),
             created_at: default_manifest_timestamp(),
             release_built_at: default_manifest_timestamp(),
@@ -737,7 +777,7 @@ pub struct TokenWindowRecord {
     pub chunk_index: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DragonBrowserDatasetSplit {
     Train,
@@ -774,6 +814,14 @@ pub enum DragonBrowserTokenSource {
         split: DragonBrowserDatasetSplit,
         #[serde(default)]
         max_documents: Option<usize>,
+    },
+    GeneratedRuliad {
+        corpus: Box<RuliadCorpusConfig>,
+        split: DragonBrowserDatasetSplit,
+        #[serde(default)]
+        max_documents: Option<usize>,
+        #[serde(default)]
+        supervision: burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig,
     },
 }
 
@@ -1053,6 +1101,24 @@ mod tests {
         };
 
         assert_eq!(config.target_or_default(), DragonNativeTarget::Auto);
+    }
+
+    #[test]
+    fn promotion_config_deserializes_operator_facing_modes() {
+        let config: DragonPromotionConfig = toml::from_str(
+            r#"
+mode = "validator_quorum"
+validator_quorum = 3
+"#,
+        )
+        .expect("validator promotion config");
+
+        assert_eq!(config.mode, DragonPromotionMode::ValidatorQuorum);
+        assert_eq!(config.validator_quorum, 3);
+        assert_eq!(
+            DragonPromotionConfig::default().mode,
+            DragonPromotionMode::DiffusionSteadyState
+        );
     }
 
     #[test]

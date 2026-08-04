@@ -61,6 +61,9 @@ impl<B: Backend> DragonModel<B> {
         if let Some(special) = self.nca_special_lm_head.as_ref() {
             output_head.insert(special.id);
         }
+        output_head.extend(Self::collect_optional_param_ids_from_module(
+            self.sequence_score_head.as_ref(),
+        ));
         let (shared_lowrank_encoder, shared_lowrank_decoder) = if self.uses_random_scaffold() {
             (
                 self.random_scaffold_encoder_param_ids()
@@ -182,6 +185,9 @@ impl<B: Backend> DragonModel<B> {
         if let Some(special) = self.nca_special_lm_head.as_ref() {
             ids.insert(special.id);
         }
+        ids.extend(Self::collect_optional_param_ids_from_module(
+            self.sequence_score_head.as_ref(),
+        ));
 
         ids.into_iter().collect()
     }

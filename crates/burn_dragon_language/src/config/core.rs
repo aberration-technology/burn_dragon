@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use crate::tokenizer::TokenizerConfig;
 use burn_dragon_core::{
     AttentionResidualConfig, BlockAttentionResidualConfig, ClockedSlowMemoryConfig,
-    DragonInitializationConfig, DragonNormConfig, DragonRandomScaffoldConfig, GatedDeltaNet2Config,
+    DragonInitializationConfig, DragonNormConfig, DragonRandomScaffoldConfig,
+    FusedAttentionExecutor, FusedProjectionExecutor, GatedDeltaNet2Config,
     HierarchicalDragonConfig, LanguageHeadConfig, LatentFanoutScheduleConfig,
-    LatentReasoningConfig, MambaSequenceConfig, ManifoldHyperConnectionsConfig,
-    NextLatentTransitionConfig, ResidualConnectorKind, RotaryEmbedding, SequenceKernelConfig,
-    SummaryMemoryConfig, YNeuronRecurrenceConfig,
+    LatentReasoningConfig, LowrankGradInputExecutor, MambaSequenceConfig,
+    ManifoldHyperConnectionsConfig, NextLatentTransitionConfig, ResidualConnectorKind,
+    RotaryEmbedding, SequenceKernelConfig, SequenceScoreHeadConfig, SummaryMemoryConfig,
+    YNeuronRecurrenceConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -72,6 +74,7 @@ pub struct ModelOverrides {
     pub n_head: Option<usize>,
     pub mlp_internal_dim_multiplier: Option<usize>,
     pub language_head: Option<LanguageHeadConfig>,
+    pub sequence_score_head: Option<SequenceScoreHeadConfig>,
     pub tie_input_output_embeddings: Option<bool>,
     #[serde(alias = "neuron_space_dim")]
     pub latent_total: Option<usize>,
@@ -89,6 +92,16 @@ pub struct ModelOverrides {
     pub dropout: Option<f64>,
     pub normalization: Option<DragonNormConfig>,
     pub fused_kernels: Option<bool>,
+    /// Configures the recurrent state sub-kernel when the fused-kernel master switch is enabled.
+    pub fused_recurrent_kernel: Option<bool>,
+    /// Configures the full-chunk causal attention sub-kernel when fused kernels are enabled.
+    pub fused_rollout_kernel: Option<bool>,
+    /// Selects which low-rank projections use custom kernels.
+    pub fused_projection_executor: Option<FusedProjectionExecutor>,
+    /// Selects the fused attention output contract.
+    pub fused_attention_executor: Option<FusedAttentionExecutor>,
+    /// Selects the low-rank backward input-gradient implementation.
+    pub fused_lowrank_grad_input_executor: Option<LowrankGradInputExecutor>,
     pub block_size: Option<usize>,
     #[serde(alias = "rollout_fast_steps")]
     pub rollout_fast_steps_per_slow_step: Option<usize>,

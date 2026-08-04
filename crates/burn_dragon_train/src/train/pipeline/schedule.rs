@@ -250,11 +250,11 @@ impl LrScheduler for ResolvedLrScheduler {
 }
 
 pub fn resolve_valid_steps_per_epoch(
-    total_steps: usize,
+    train_steps_per_epoch: usize,
     log_frequency: usize,
     val_steps_per_epoch: usize,
 ) -> usize {
-    let desired_valid_steps = usize::max(1, total_steps / log_frequency.max(1));
+    let desired_valid_steps = usize::max(1, train_steps_per_epoch / log_frequency.max(1));
     desired_valid_steps.min(val_steps_per_epoch.max(1)).max(1)
 }
 
@@ -383,5 +383,22 @@ pub fn resolve_train_schedule(
                 source: ScheduleSource::MaxIters,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_valid_steps_per_epoch;
+
+    #[test]
+    fn validation_budget_scales_with_each_logical_epoch() {
+        assert_eq!(resolve_valid_steps_per_epoch(128, 16, 256), 8);
+        assert_eq!(resolve_valid_steps_per_epoch(512, 16, 256), 32);
+    }
+
+    #[test]
+    fn validation_budget_is_bounded_and_never_empty() {
+        assert_eq!(resolve_valid_steps_per_epoch(4_096, 16, 64), 64);
+        assert_eq!(resolve_valid_steps_per_epoch(1, 16, 0), 1);
     }
 }

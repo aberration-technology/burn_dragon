@@ -1,0 +1,5 @@
+extends = "ruliad-r3.stateful-tbptt-base.training.toml"
+
+[training]
+tbptt_chunk_size = 512
+tbptt_persist_across_steps = false

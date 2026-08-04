@@ -25,7 +25,11 @@ use crate::fusion_compat::register_fusion_float_tensor;
 mod backward_runtime;
 mod forward_runtime;
 
-use self::backward_runtime::dense_causal_attention_autodiff_custom;
+#[cfg(feature = "cuda")]
+use self::backward_runtime::dense_causal_attention_autodiff_fusion_cuda;
+use self::backward_runtime::{
+    dense_causal_attention_autodiff_custom, dense_causal_attention_autodiff_fusion_wgpu,
+};
 use self::forward_runtime::{
     try_direct_path_autodiff_cube_runtime, try_direct_path_runtime,
     try_fusion_path_autodiff_runtime, try_fusion_path_runtime,
@@ -127,6 +131,7 @@ where
     B::FloatTensorPrimitive: 'static,
 {
     matches_type::<B::FloatTensorPrimitive, CubeTensor<WgpuRuntime>>()
+        || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>()
         || matches_type::<B::FloatTensorPrimitive, WgpuCubeAutodiffTensor>()
         || matches_type::<B::FloatTensorPrimitive, WgpuFusionAutodiffTensor<u32>>()
         || matches_type::<B::FloatTensorPrimitive, WgpuFusionAutodiffTensor<u8>>()
@@ -134,6 +139,10 @@ where
             #[cfg(feature = "cuda")]
             {
                 matches_type::<B::FloatTensorPrimitive, CubeTensor<CudaRuntime>>()
+                    || matches_type::<
+                        B::FloatTensorPrimitive,
+                        FusionTensor<FusionCubeRuntime<CudaRuntime>>,
+                    >()
                     || matches_type::<B::FloatTensorPrimitive, CudaCubeAutodiffTensor>()
                     || matches_type::<B::FloatTensorPrimitive, CudaFusionAutodiffTensor<u32>>()
                     || matches_type::<B::FloatTensorPrimitive, CudaFusionAutodiffTensor<u8>>()
@@ -295,7 +304,7 @@ fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
 }
 
 #[cube(launch)]
-fn dense_causal_attention_cube_kernel(
+fn dense_causal_attention_cube_kernel_v2(
     query: &Tensor<f32>,
     value: &Tensor<f32>,
     context: &mut Tensor<f32>,
@@ -310,10 +319,10 @@ fn dense_causal_attention_cube_kernel(
     let latent = u32::cast_from(params[4]) as usize;
     let value_dim = u32::cast_from(params[5]) as usize;
 
-    let h = CUBE_POS_Y as usize;
-    let batch_row = CUBE_POS_Z as usize;
-    let b = batch_row / time;
-    let row = batch_row % time;
+    let row = CUBE_POS_Y as usize;
+    let batch_head = CUBE_POS_Z as usize;
+    let b = batch_head / heads;
+    let h = batch_head % heads;
     let e = (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize;
     let lane = UNIT_POS_X as usize;
 
@@ -390,92 +399,6 @@ where
         return None;
     }
     Some(cube)
-}
-
-fn matches_autodiff_fusion_type<B, BT, R>() -> bool
-where
-    B: BackendTrait,
-    B::FloatTensorPrimitive: 'static,
-    BT: BoolElement + 'static,
-    R: CubeRuntime + 'static,
-{
-    if TypeId::of::<R>() == TypeId::of::<WgpuRuntime>() {
-        matches_type::<B::FloatTensorPrimitive, WgpuFusionAutodiffTensor<BT>>()
-    } else {
-        #[cfg(feature = "cuda")]
-        {
-            if TypeId::of::<R>() == TypeId::of::<CudaRuntime>() {
-                return matches_type::<B::FloatTensorPrimitive, CudaFusionAutodiffTensor<BT>>();
-            }
-        }
-        false
-    }
-}
-
-fn extract_fusion_autodiff_inner<B, BT, R>(
-    value: B::FloatTensorPrimitive,
-) -> Option<FusionTensor<FusionCubeRuntime<R>>>
-where
-    B: BackendTrait,
-    B::FloatTensorPrimitive: 'static,
-    BT: BoolElement + 'static,
-    R: CubeRuntime + 'static,
-{
-    if TypeId::of::<R>() == TypeId::of::<WgpuRuntime>() {
-        let query_ad: WgpuFusionAutodiffTensor<BT> = try_cast_primitive::<B, _>(value)?;
-        let inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query_ad);
-        let boxed: Box<dyn Any> = Box::new(inner);
-        return boxed
-            .downcast::<FusionTensor<FusionCubeRuntime<R>>>()
-            .ok()
-            .map(|boxed| *boxed);
-    }
-    #[cfg(feature = "cuda")]
-    {
-        if TypeId::of::<R>() == TypeId::of::<CudaRuntime>() {
-            let query_ad: CudaFusionAutodiffTensor<BT> = try_cast_primitive::<B, _>(value)?;
-            let inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query_ad);
-            let boxed: Box<dyn Any> = Box::new(inner);
-            return boxed
-                .downcast::<FusionTensor<FusionCubeRuntime<R>>>()
-                .ok()
-                .map(|boxed| *boxed);
-        }
-    }
-    None
-}
-
-fn wrap_fusion_autodiff_inner<B, BT, R>(
-    value: FusionTensor<FusionCubeRuntime<R>>,
-) -> Option<B::FloatTensorPrimitive>
-where
-    B: BackendTrait,
-    B::FloatTensorPrimitive: 'static,
-    BT: BoolElement + 'static,
-    R: CubeRuntime + 'static,
-{
-    if TypeId::of::<R>() == TypeId::of::<WgpuRuntime>() {
-        let boxed: Box<dyn Any> = Box::new(value);
-        let inner = boxed
-            .downcast::<FusionTensor<FusionCubeRuntime<WgpuRuntime>>>()
-            .ok()
-            .map(|boxed| *boxed)?;
-        let ad = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::from_inner(inner);
-        return try_cast_backend::<B, _>(ad);
-    }
-    #[cfg(feature = "cuda")]
-    {
-        if TypeId::of::<R>() == TypeId::of::<CudaRuntime>() {
-            let boxed: Box<dyn Any> = Box::new(value);
-            let inner = boxed
-                .downcast::<FusionTensor<FusionCubeRuntime<CudaRuntime>>>()
-                .ok()
-                .map(|boxed| *boxed)?;
-            let ad = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::from_inner(inner);
-            return try_cast_backend::<B, _>(ad);
-        }
-    }
-    None
 }
 
 #[derive(Clone)]

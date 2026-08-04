@@ -1,0 +1,18 @@
+extends = ["ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml"]
+
+# Orthogonal decoder-binding arm: retain the sparse verifier-valid energy objective while training
+# semantic proof-step fields at their causal decode boundaries.
+[training.ruliad_supervision.answer_contract]
+enabled = true
+weight = 0.25
+premature_close_unlikelihood_weight = 0.0
+every_steps = 2
+start_after_steps = 128
+max_completion_tokens = 64
+max_rows_per_step = 4
+prompt_schema_max_rows_per_step = 4
+schema_token_weight = 1.0
+schema_start_token_weight = 1.0
+value_token_weight = 1.0
+other_token_weight = 1.0
+prompt_schema_value_weight = 1.0

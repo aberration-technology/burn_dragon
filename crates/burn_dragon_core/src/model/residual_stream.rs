@@ -151,7 +151,6 @@ static LOWRANK_RESIDUAL_MEMORY_PROFILE: OnceLock<Mutex<LowRankResidualMemoryProf
 static LOWRANK_RESIDUAL_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOWRANK_RESIDUAL_MEMORY_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOWRANK_RESIDUAL_MEMORY_PROFILE_SYNC_ENABLED: OnceLock<bool> = OnceLock::new();
-static LEGACY_FLAT_DECODER_TAIL_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn lowrank_residual_profile_enabled() -> bool {
     *LOWRANK_RESIDUAL_PROFILE_ENABLED
@@ -166,15 +165,6 @@ fn lowrank_residual_memory_profile_enabled() -> bool {
 fn lowrank_residual_memory_profile_sync_enabled() -> bool {
     *LOWRANK_RESIDUAL_MEMORY_PROFILE_SYNC_ENABLED
         .get_or_init(|| std::env::var_os("DragonModel_STAGE_PROFILE_MEMORY_SYNC").is_some())
-}
-
-fn legacy_flat_decoder_tail_enabled() -> bool {
-    *LEGACY_FLAT_DECODER_TAIL_ENABLED
-        .get_or_init(|| std::env::var_os("BURN_DRAGON_LEGACY_FLAT_DECODER_TAIL").is_some())
-}
-
-pub(super) fn decode_y_neuron_tail_uses_legacy_flat() -> bool {
-    legacy_flat_decoder_tail_enabled()
 }
 
 fn lowrank_residual_profile_state() -> &'static Mutex<LowRankResidualProfileSnapshot> {
@@ -301,47 +291,18 @@ fn lowrank_residual_memory_record_stage<B: Backend>(
     }
 }
 
-fn decode_y_neuron_tail_flat<B: Backend>(
+pub(super) fn decode_y_neuron_tail<B: Backend>(
     y_neuron: Tensor<B, 4>,
     decoder: Tensor<B, 2>,
 ) -> Tensor<B, 4> {
     let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
     let dim = decoder.shape().dims::<2>()[1];
+    // Decoder rows already concatenate the head-latent axis; one GEMM is the exact headwise sum.
     y_neuron
         .swap_dims(1, 2)
         .reshape([batch * time, heads * latent])
         .matmul(decoder)
         .reshape([batch, 1, time, dim])
-}
-
-fn decode_y_neuron_tail_headwise<B: Backend>(
-    y_neuron: Tensor<B, 4>,
-    decoder: Tensor<B, 2>,
-) -> Tensor<B, 4> {
-    let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
-    let dim = decoder.shape().dims::<2>()[1];
-    if heads == 1 {
-        return decode_y_neuron_tail_flat(y_neuron, decoder);
-    }
-    let decoder_by_head = decoder.reshape([heads, latent, dim]);
-    let mixed_by_head = y_neuron
-        .swap_dims(0, 1)
-        .reshape([heads, batch * time, latent]);
-    mixed_by_head
-        .matmul(decoder_by_head)
-        .sum_dim(0)
-        .reshape([batch, 1, time, dim])
-}
-
-pub(super) fn decode_y_neuron_tail<B: Backend>(
-    y_neuron: Tensor<B, 4>,
-    decoder: Tensor<B, 2>,
-) -> Tensor<B, 4> {
-    if legacy_flat_decoder_tail_enabled() {
-        decode_y_neuron_tail_flat(y_neuron, decoder)
-    } else {
-        decode_y_neuron_tail_headwise(y_neuron, decoder)
-    }
 }
 
 fn lowrank_residual_step_impl<B, FAttn, FNorm, FAct>(
@@ -952,4 +913,153 @@ where
         apply_latent,
         apply_norm,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = NdArray<f32>;
+    type TestAutodiffBackend = Autodiff<TestBackend>;
+
+    fn assert_close<const D: usize, B: Backend>(
+        lhs: Tensor<B, D>,
+        rhs: Tensor<B, D>,
+        tolerance: f32,
+    ) {
+        let lhs = lhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lhs values");
+        let rhs = rhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("rhs values");
+        assert_eq!(lhs.len(), rhs.len(), "tensor length mismatch");
+        let max_error = lhs
+            .into_iter()
+            .zip(rhs)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error <= tolerance,
+            "tensor mismatch: max_error={max_error}, tolerance={tolerance}"
+        );
+    }
+
+    fn decode_y_neuron_tail_headwise_reference<B: Backend>(
+        y_neuron: Tensor<B, 4>,
+        decoder: Tensor<B, 2>,
+    ) -> Tensor<B, 4> {
+        let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
+        let dim = decoder.shape().dims::<2>()[1];
+        y_neuron
+            .swap_dims(0, 1)
+            .reshape([heads, batch * time, latent])
+            .matmul(decoder.reshape([heads, latent, dim]))
+            .sum_dim(0)
+            .reshape([batch, 1, time, dim])
+    }
+
+    #[test]
+    fn flat_decoder_matches_headwise_sum_reference() {
+        let device = Default::default();
+        let batch = 2;
+        let heads = 3;
+        let time = 4;
+        let latent = 5;
+        let dim = 7;
+        let y_neuron = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * heads * time * latent))
+                    .map(|index| ((index * 17) % 47) as f32 / 47.0 - 0.5)
+                    .collect(),
+                [batch, heads, time, latent],
+            ),
+            &device,
+        );
+        let decoder = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                (0..(heads * latent * dim))
+                    .map(|index| ((index * 19) % 53) as f32 / 53.0 - 0.5)
+                    .collect(),
+                [heads * latent, dim],
+            ),
+            &device,
+        );
+        let reference = decode_y_neuron_tail_headwise_reference(y_neuron.clone(), decoder.clone());
+
+        assert_close(decode_y_neuron_tail(y_neuron, decoder), reference, 2.0e-5);
+    }
+
+    #[test]
+    fn flat_decoder_matches_headwise_activation_and_weight_gradients() {
+        let device = burn::tensor::Device::<TestAutodiffBackend>::default();
+        let batch = 2;
+        let heads = 3;
+        let time = 4;
+        let latent = 5;
+        let dim = 7;
+        let y_neuron = Tensor::<TestAutodiffBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * heads * time * latent))
+                    .map(|index| ((index * 17) % 47) as f32 / 47.0 - 0.5)
+                    .collect(),
+                [batch, heads, time, latent],
+            ),
+            &device,
+        )
+        .require_grad();
+        let decoder = Tensor::<TestAutodiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..(heads * latent * dim))
+                    .map(|index| ((index * 19) % 53) as f32 / 53.0 - 0.5)
+                    .collect(),
+                [heads * latent, dim],
+            ),
+            &device,
+        )
+        .require_grad();
+        let output_weight = Tensor::<TestAutodiffBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * time * dim))
+                    .map(|index| ((index * 23) % 59) as f32 / 59.0 - 0.5)
+                    .collect(),
+                [batch, 1, time, dim],
+            ),
+            &device,
+        );
+
+        let flat_grads = (decode_y_neuron_tail(y_neuron.clone(), decoder.clone())
+            * output_weight.clone())
+        .sum()
+        .backward();
+        let headwise_grads =
+            (decode_y_neuron_tail_headwise_reference(y_neuron.clone(), decoder.clone())
+                * output_weight)
+                .sum()
+                .backward();
+
+        assert_close(
+            y_neuron
+                .grad(&flat_grads)
+                .expect("flat activation gradient"),
+            y_neuron
+                .grad(&headwise_grads)
+                .expect("headwise activation gradient"),
+            2.0e-5,
+        );
+        assert_close(
+            decoder.grad(&flat_grads).expect("flat decoder gradient"),
+            decoder
+                .grad(&headwise_grads)
+                .expect("headwise decoder gradient"),
+            2.0e-5,
+        );
+    }
 }

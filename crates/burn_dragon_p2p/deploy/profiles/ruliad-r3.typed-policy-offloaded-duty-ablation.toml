@@ -1,0 +1,13 @@
+extends = ["ruliad-r3.typed-policy-duty-base-ablation.toml"]
+
+# Trainer side of the external-evaluator condition. The P2P validator owns the
+# canonical loss/formal panels and checkpoint promotion; the trainer only persists candidates.
+[training.validation]
+execution = "external_evaluator"
+
+[training.events]
+ruliad_correctness_probe_items = 0
+source_weighted_validation_batches = 0
+
+[training.ruliad_policy_probe]
+enabled = false

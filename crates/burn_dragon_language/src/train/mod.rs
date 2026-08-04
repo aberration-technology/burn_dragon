@@ -14,6 +14,7 @@ pub mod phased;
 pub mod profile;
 #[cfg(feature = "rerun")]
 pub mod rerun;
+pub mod ruliad_policy;
 pub mod schedule;
 pub mod startup_autotune;
 pub mod steps;

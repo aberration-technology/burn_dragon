@@ -1,0 +1,61 @@
+extends = ["ruliad-r3.answer-completion-fixed-ablation.toml"]
+
+[dataset]
+cache_dir = "./cache/ruliad-r3-action-policy"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.action-policy.corpus.toml"
+
+[training]
+block_size = 512
+tbptt_chunk_size = 512
+tbptt_persist_across_steps = false
+
+[training.events]
+ruliad_correctness_probe_every_epochs = 2
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 32
+ruliad_correctness_probe_hard_token_cap = 64
+
+[training.ruliad_probe_generation]
+enabled = true
+# Rows remain at one absolute recurrent position while prompt and generated tokens coexist, so
+# variable prompt lengths require neither padding nor per-row position state.
+# The matched release-CUDA sweep reached the training-batch memory bound at 64 rows: exact
+# completion records, 40.3% lower probe latency than independent decoding, and no host-memory
+# increase relative to 32 rows.
+max_batch_rows = 64
+minimum_batch_rows = 2
+# Preserve efficient common-prefix forwards; only the bounded prompt-length tail advances one
+# recurrent position at a time.
+maximum_prompt_position_span = 32
+device_buffer_tokens = 4
+
+[training.ruliad_policy_probe]
+enabled = true
+# Bounded inline health gate. Exhaustive checkpoint promotion uses the explicit
+# `ruliad-r3.action-policy-promotion-audit.toml` profile and must not stall the
+# training loop for hundreds of sequential proof transitions.
+every_epochs = 4
+items = 16
+max_steps = 64
+candidates = 4
+beam_width = 1
+# Ragged recurrent staircase scoring preserves exact prompt boundaries without padding-state
+# corruption. On the matched 512-step CUDA probe, 32 rows reduced policy-probe latency from
+# 17.7 s to 13.3 s with byte-identical rollout decisions; the token budget remains the hard bound.
+scoring_batch_rows = 32
+scoring_token_budget = 32768
+scoring_pipeline_depth = 2
+stratified_difficulty_levels = 4
+# Proof-action indices are presentation labels. Rotate the verifier-preferred
+# action evenly across slots so promotion cannot exploit canonical menu order.
+candidate_symmetry = "balanced_rotation"
+
+[training.ruliad_policy_probe.promotion_gate]
+enabled = true
+minimum_items = 16
+minimum_solve_rate = 0.50
+minimum_goal_completion_rate = 0.80
+minimum_valid_action_rate = 0.95
+maximum_invalid_action_rate = 0.05
+maximum_repeated_state_rate = 0.35
+maximum_backtrack_rate = 0.25

@@ -123,6 +123,23 @@ impl Backward<WgpuCubeBackend, 3> for FusedDenseCausalAttentionBackward<WgpuCube
     }
 }
 
+impl<BT> Backward<WgpuFusionBackend<BT>, 3>
+    for FusedDenseCausalAttentionBackward<WgpuFusionBackend<BT>>
+where
+    BT: BoolElement + 'static,
+{
+    type State = DenseCausalAttentionBackwardState<FusionTensor<FusionCubeRuntime<WgpuRuntime>>>;
+
+    fn backward(
+        self,
+        ops: Ops<Self::State, 3>,
+        grads: &mut Gradients,
+        _checkpointer: &mut Checkpointer,
+    ) {
+        dense_causal_attention_backward_impl::<WgpuFusionBackend<BT>>(ops, grads);
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl Backward<CudaCubeBackend, 3> for FusedDenseCausalAttentionBackward<CudaCubeBackend> {
     type State = DenseCausalAttentionBackwardState<CubeTensor<CudaRuntime>>;
@@ -134,6 +151,85 @@ impl Backward<CudaCubeBackend, 3> for FusedDenseCausalAttentionBackward<CudaCube
         _checkpointer: &mut Checkpointer,
     ) {
         dense_causal_attention_backward_impl::<CudaCubeBackend>(ops, grads);
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<BT> Backward<CudaFusionBackend<BT>, 3>
+    for FusedDenseCausalAttentionBackward<CudaFusionBackend<BT>>
+where
+    BT: BoolElement + 'static,
+{
+    type State = DenseCausalAttentionBackwardState<FusionTensor<FusionCubeRuntime<CudaRuntime>>>;
+
+    fn backward(
+        self,
+        ops: Ops<Self::State, 3>,
+        grads: &mut Gradients,
+        _checkpointer: &mut Checkpointer,
+    ) {
+        dense_causal_attention_backward_impl::<CudaFusionBackend<BT>>(ops, grads);
+    }
+}
+
+pub(super) fn dense_causal_attention_autodiff_fusion_wgpu<BT>(
+    query: WgpuFusionAutodiffTensor<BT>,
+    value: WgpuFusionAutodiffTensor<BT>,
+    decay: WgpuFusionAutodiffTensor<BT>,
+    output: FusionTensor<FusionCubeRuntime<WgpuRuntime>>,
+) -> WgpuFusionAutodiffTensor<BT>
+where
+    BT: BoolElement + 'static,
+{
+    let query_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query.clone());
+    let value_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(value.clone());
+    let decay_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay.clone());
+
+    match FusedDenseCausalAttentionBackward::<WgpuFusionBackend<BT>>(PhantomData)
+        .prepare::<NoCheckpointing>([query.node.clone(), value.node.clone(), decay.node.clone()])
+        .compute_bound()
+        .stateful()
+    {
+        OpsKind::Tracked(prep) => prep.finish(
+            DenseCausalAttentionBackwardState {
+                query: query_inner,
+                value: value_inner,
+                decay: decay_inner,
+            },
+            output,
+        ),
+        OpsKind::UnTracked(prep) => prep.finish(output),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn dense_causal_attention_autodiff_fusion_cuda<BT>(
+    query: CudaFusionAutodiffTensor<BT>,
+    value: CudaFusionAutodiffTensor<BT>,
+    decay: CudaFusionAutodiffTensor<BT>,
+    output: FusionTensor<FusionCubeRuntime<CudaRuntime>>,
+) -> CudaFusionAutodiffTensor<BT>
+where
+    BT: BoolElement + 'static,
+{
+    let query_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query.clone());
+    let value_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(value.clone());
+    let decay_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay.clone());
+
+    match FusedDenseCausalAttentionBackward::<CudaFusionBackend<BT>>(PhantomData)
+        .prepare::<NoCheckpointing>([query.node.clone(), value.node.clone(), decay.node.clone()])
+        .compute_bound()
+        .stateful()
+    {
+        OpsKind::Tracked(prep) => prep.finish(
+            DenseCausalAttentionBackwardState {
+                query: query_inner,
+                value: value_inner,
+                decay: decay_inner,
+            },
+            output,
+        ),
+        OpsKind::UnTracked(prep) => prep.finish(output),
     }
 }
 

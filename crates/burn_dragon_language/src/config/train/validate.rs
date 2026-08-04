@@ -12,7 +12,8 @@ use burn_dragon_train::{
 
 use super::{
     DatasetSourceConfig, PredictiveCodingBackwardMode, PredictiveCodingMode,
-    PredictiveCodingParameterUpdate, RuliadVerifierRewardMode, TrainingConfig,
+    PredictiveCodingObservationContract, PredictiveCodingParameterUpdate, RuliadVerifierRewardMode,
+    SequenceBatchingMode, TrainingConfig,
 };
 use crate::tokenizer::TokenizerKind;
 
@@ -20,6 +21,15 @@ impl TrainingConfig {
     pub fn validate(&self) -> Result<()> {
         if self.training.block_size == 0 {
             return Err(anyhow!("training.block_size must be > 0"));
+        }
+        if self
+            .model
+            .sequence_score_head
+            .is_some_and(|head| head.enabled && head.projection_dim == 0)
+        {
+            return Err(anyhow!(
+                "model.sequence_score_head.projection_dim must be > 0 when enabled"
+            ));
         }
         if let Some(tbptt_chunk_size) = self.training.tbptt_chunk_size {
             if tbptt_chunk_size == 0 {
@@ -45,11 +55,76 @@ impl TrainingConfig {
                 "training.tbptt_persist_across_steps requires training.tbptt_chunk_size"
             ));
         }
+        if self.training.tbptt_persist_across_steps
+            && self.training.sequence_batching == SequenceBatchingMode::Random
+        {
+            return Err(anyhow!(
+                "training.sequence_batching=random is incompatible with training.tbptt_persist_across_steps=true"
+            ));
+        }
+        if self.training.sequence_state_probe.enabled {
+            if self.training.sequence_state_probe.paired_batches == 0 {
+                return Err(anyhow!(
+                    "training.sequence_state_probe.paired_batches must be > 0 when enabled"
+                ));
+            }
+            if self.training.sequence_state_probe.max_rho_slots < 2 {
+                return Err(anyhow!(
+                    "training.sequence_state_probe.max_rho_slots must be >= 2 when enabled"
+                ));
+            }
+        }
         if self.training.batch_size == 0 {
             return Err(anyhow!("training.batch_size must be > 0"));
         }
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
+        }
+        if !self.training.validation.execution.is_local() {
+            if self.parallel.mode != ParallelismKind::Single {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator currently requires parallel.mode=single"
+                ));
+            }
+            if self.training.gates.enabled {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.gates.enabled=false; the external evaluator owns promotion gates"
+                ));
+            }
+            if self.training.dynamics.enabled {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.dynamics.enabled=false; local dynamics depend on validation results"
+                ));
+            }
+            if self.training.neuron_scaling.enabled {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.neuron_scaling.enabled=false; local scaling depends on validation results"
+                ));
+            }
+            if self.training.events.ruliad_correctness_probe_items > 0 {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.events.ruliad_correctness_probe_items=0"
+                ));
+            }
+            if self.training.events.source_weighted_validation_batches > 0 {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.events.source_weighted_validation_batches=0"
+                ));
+            }
+            if self.training.ruliad_policy_probe.enabled {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator requires training.ruliad_policy_probe.enabled=false"
+                ));
+            }
+            if self
+                .training
+                .latent_reasoning
+                .start_after_capability_gate_passed
+            {
+                return Err(anyhow!(
+                    "training.validation.execution=external_evaluator is incompatible with training.latent_reasoning.start_after_capability_gate_passed=true"
+                ));
+            }
         }
         if self.training.auto_batch_size.enabled {
             let auto_batch = &self.training.auto_batch_size;
@@ -174,6 +249,157 @@ impl TrainingConfig {
         }
         if self.training.events.flush_every_steps == 0 {
             return Err(anyhow!("training.events.flush_every_steps must be > 0"));
+        }
+        if self.training.events.ruliad_correctness_probe_tokens == 0 {
+            return Err(anyhow!(
+                "training.events.ruliad_correctness_probe_tokens must be > 0"
+            ));
+        }
+        if self.training.events.ruliad_correctness_probe_hard_token_cap
+            < self.training.events.ruliad_correctness_probe_tokens
+        {
+            return Err(anyhow!(
+                "training.events.ruliad_correctness_probe_hard_token_cap must be >= ruliad_correctness_probe_tokens"
+            ));
+        }
+        if self.training.ruliad_probe_generation.enabled {
+            let generation = self.training.ruliad_probe_generation;
+            if generation.max_batch_rows == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_probe_generation.max_batch_rows must be > 0 when enabled"
+                ));
+            }
+            if generation.minimum_batch_rows == 0
+                || generation.minimum_batch_rows > generation.max_batch_rows
+            {
+                return Err(anyhow!(
+                    "training.ruliad_probe_generation.minimum_batch_rows must be in 1..=max_batch_rows when enabled"
+                ));
+            }
+            if generation.maximum_prompt_position_span == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_probe_generation.maximum_prompt_position_span must be > 0 when enabled"
+                ));
+            }
+            if generation.device_buffer_tokens == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_probe_generation.device_buffer_tokens must be > 0 when enabled"
+                ));
+            }
+            if generation.max_in_flight_rows == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_probe_generation.max_in_flight_rows must be > 0 when enabled"
+                ));
+            }
+        }
+        if self.training.ruliad_policy_probe.enabled {
+            if self.training.ruliad_policy_probe.scoring
+                == crate::config::RuliadProofPolicyScoring::SemanticEnergy
+                && !self
+                    .model
+                    .sequence_score_head
+                    .is_some_and(|head| head.enabled)
+            {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.scoring=semantic_energy requires model.sequence_score_head.enabled=true"
+                ));
+            }
+            if self.training.ruliad_policy_probe.every_epochs == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.every_epochs must be > 0 when enabled"
+                ));
+            }
+            if self
+                .training
+                .ruliad_policy_probe
+                .closed_loop_every_epochs
+                .is_some_and(|every_epochs| every_epochs == 0)
+            {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.closed_loop_every_epochs must be > 0 when set"
+                ));
+            }
+            if self.training.ruliad_policy_probe.items == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.items must be > 0 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.max_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.max_steps must be > 0 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.candidates < 2 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.candidates must be >= 2 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.beam_width == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.beam_width must be > 0 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.scoring_batch_rows == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.scoring_batch_rows must be > 0 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.scoring_token_budget == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.scoring_token_budget must be > 0 when enabled"
+                ));
+            }
+            if self.training.ruliad_policy_probe.scoring_pipeline_depth == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.scoring_pipeline_depth must be > 0 when enabled"
+                ));
+            }
+            if self
+                .training
+                .ruliad_policy_probe
+                .stratified_difficulty_levels
+                > self.training.ruliad_policy_probe.items
+            {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.stratified_difficulty_levels must be <= training.ruliad_policy_probe.items"
+                ));
+            }
+            let gate = self.training.ruliad_policy_probe.promotion_gate;
+            if gate.enabled {
+                if gate.minimum_items == 0 {
+                    return Err(anyhow!(
+                        "training.ruliad_policy_probe.promotion_gate.minimum_items must be > 0 when enabled"
+                    ));
+                }
+                if gate.minimum_items > self.training.ruliad_policy_probe.items {
+                    return Err(anyhow!(
+                        "training.ruliad_policy_probe.promotion_gate.minimum_items must be <= training.ruliad_policy_probe.items"
+                    ));
+                }
+                for (name, value) in [
+                    ("minimum_solve_rate", gate.minimum_solve_rate),
+                    (
+                        "minimum_goal_completion_rate",
+                        gate.minimum_goal_completion_rate,
+                    ),
+                    ("minimum_valid_action_rate", gate.minimum_valid_action_rate),
+                    (
+                        "maximum_invalid_action_rate",
+                        gate.maximum_invalid_action_rate,
+                    ),
+                    (
+                        "maximum_repeated_state_rate",
+                        gate.maximum_repeated_state_rate,
+                    ),
+                    ("maximum_backtrack_rate", gate.maximum_backtrack_rate),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        return Err(anyhow!(
+                            "training.ruliad_policy_probe.promotion_gate.{name} must be finite and in [0, 1]"
+                        ));
+                    }
+                }
+            }
         }
         if self.training.input_corruption.enabled {
             if !(0.0..=1.0).contains(&self.training.input_corruption.probability)
@@ -332,13 +558,7 @@ impl TrainingConfig {
                     "training.repeat_unlikelihood.epsilon must be finite and in (0, 1)"
                 ));
             }
-            if self
-                .training
-                .repeat_unlikelihood
-                .history_lags
-                .iter()
-                .any(|lag| *lag == 0)
-            {
+            if self.training.repeat_unlikelihood.history_lags.contains(&0) {
                 return Err(anyhow!(
                     "training.repeat_unlikelihood.history_lags must contain only positive lags"
                 ));
@@ -532,34 +752,39 @@ impl TrainingConfig {
                     "training.predictive_coding.mode currently supports only recurrent_state"
                 ));
             }
-            if pc.steps == 0 {
-                return Err(anyhow!("training.predictive_coding.steps must be > 0"));
-            }
-            if pc.step_size <= 0.0 || !pc.step_size.is_finite() {
-                return Err(anyhow!(
-                    "training.predictive_coding.step_size must be finite and > 0"
-                ));
-            }
-            if pc.latent_decay < 0.0 || !pc.latent_decay.is_finite() {
-                return Err(anyhow!(
-                    "training.predictive_coding.latent_decay must be finite and >= 0"
-                ));
-            }
-            if let Some(max_grad_norm) = pc.max_grad_norm
-                && (max_grad_norm <= 0.0 || !max_grad_norm.is_finite())
-            {
-                return Err(anyhow!(
-                    "training.predictive_coding.max_grad_norm must be finite and > 0"
-                ));
-            }
-            if pc.eps <= 0.0 || !pc.eps.is_finite() {
-                return Err(anyhow!(
-                    "training.predictive_coding.eps must be finite and > 0"
-                ));
-            }
+            pc.inference_config()
+                .validate("training.predictive_coding")?;
             if pc.apply_every_chunks == 0 {
                 return Err(anyhow!(
                     "training.predictive_coding.apply_every_chunks must be > 0"
+                ));
+            }
+            if pc.amortization_tolerance < 0.0 || !pc.amortization_tolerance.is_finite() {
+                return Err(anyhow!(
+                    "training.predictive_coding.amortization_tolerance must be finite and >= 0"
+                ));
+            }
+            if pc.amortization_max_state_slots == 0 {
+                return Err(anyhow!(
+                    "training.predictive_coding.amortization_max_state_slots must be > 0"
+                ));
+            }
+            if matches!(
+                pc.observation_contract,
+                PredictiveCodingObservationContract::OracleNextTokenNegativeControl
+            ) && !pc.allow_oracle_target_leak
+            {
+                return Err(anyhow!(
+                    "training.predictive_coding.observation_contract=oracle_next_token_negative_control requires allow_oracle_target_leak=true"
+                ));
+            }
+            if matches!(
+                pc.observation_contract,
+                PredictiveCodingObservationContract::ObservedPrefix
+            ) && matches!(pc.backward_mode, PredictiveCodingBackwardMode::Block)
+            {
+                return Err(anyhow!(
+                    "training.predictive_coding.observation_contract=observed_prefix requires backward_mode=chunked so correction follows the observed chunk"
                 ));
             }
             if self.training.tbptt_chunk_size.is_none() {
@@ -584,7 +809,7 @@ impl TrainingConfig {
             }
         }
         let latent = &self.training.latent_reasoning;
-        if latent.eval_step_sweep.iter().any(|steps| *steps == 0) {
+        if latent.eval_step_sweep.contains(&0) {
             return Err(anyhow!(
                 "training.latent_reasoning.eval_step_sweep must contain only positive step counts"
             ));
@@ -611,7 +836,7 @@ impl TrainingConfig {
                     "training.latent_reasoning.jepa_future_offsets must not be empty unless next_latent, dragon_state, energy_model, step_contract, or sigreg is enabled"
                 ));
             }
-            if latent.jepa_future_offsets.iter().any(|offset| *offset == 0) {
+            if latent.jepa_future_offsets.contains(&0) {
                 return Err(anyhow!(
                     "training.latent_reasoning.jepa_future_offsets must contain only positive offsets"
                 ));
@@ -1838,6 +2063,11 @@ impl TrainingConfig {
                     "optimizer.name=eggroll does not yet support training.ruliad_supervision.verifier_reward.enabled"
                 ));
             }
+            if self.training.ruliad_supervision.proof_policy.enabled {
+                return Err(anyhow!(
+                    "optimizer.name=eggroll does not yet support training.ruliad_supervision.proof_policy.enabled"
+                ));
+            }
         }
         if self.training.ruliad_supervision.answer_ranking.enabled {
             let ranking = self.training.ruliad_supervision.answer_ranking;
@@ -2006,6 +2236,204 @@ impl TrainingConfig {
             if self.parallel.pipeline.enabled {
                 return Err(anyhow!(
                     "training.ruliad_supervision.answer_denoising.enabled does not yet support parallel.pipeline.enabled"
+                ));
+            }
+        }
+        if self.training.ruliad_supervision.proof_policy.enabled {
+            let proof_policy = self.training.ruliad_supervision.proof_policy;
+            if proof_policy.scoring == crate::config::RuliadProofPolicyScoring::SemanticEnergy {
+                if !self
+                    .model
+                    .sequence_score_head
+                    .is_some_and(|head| head.enabled)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.scoring=semantic_energy requires model.sequence_score_head.enabled=true"
+                    ));
+                }
+                if proof_policy.normalization
+                    != crate::config::RuliadProofPolicyNormalization::CandidateConditional
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.scoring=semantic_energy requires normalization=candidate_conditional"
+                    ));
+                }
+            }
+            match proof_policy.gradient_scope {
+                crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly
+                    if proof_policy.scoring
+                        != crate::config::RuliadProofPolicyScoring::SemanticEnergy =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=score_head_only requires scoring=semantic_energy"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
+                    if proof_policy.scoring
+                        != crate::config::RuliadProofPolicyScoring::CompletionLikelihood =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=language_head_only requires scoring=completion_likelihood"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
+                    if self.model.tie_input_output_embeddings.unwrap_or(false) =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=language_head_only requires model.tie_input_output_embeddings=false"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
+                    if self
+                        .model
+                        .language_head
+                        .as_ref()
+                        .is_some_and(|head| !head.uses_flat_token_logits()) =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=language_head_only requires model.language_head.type=standard_token_classification"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
+                    if self
+                        .model
+                        .latent_reasoning
+                        .as_ref()
+                        .is_some_and(|latent| latent.step_conditioned_decoder) =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=language_head_only requires model.latent_reasoning.step_conditioned_decoder=false"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::FullModel
+                | crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly
+                | crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {}
+            }
+            if !proof_policy.weight.is_finite() || proof_policy.weight <= 0.0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.weight must be finite and positive when enabled"
+                ));
+            }
+            if proof_policy.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.every_steps must be positive when enabled"
+                ));
+            }
+            if proof_policy.rollout_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.rollout_steps must be positive when enabled"
+                ));
+            }
+            if proof_policy.mode
+                == crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+            {
+                if proof_policy.dagger_start_after_steps <= proof_policy.start_after_steps {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.dagger_start_after_steps must exceed start_after_steps for static_then_paired_dagger"
+                    ));
+                }
+                if !proof_policy
+                    .dagger_start_after_steps
+                    .is_multiple_of(proof_policy.every_steps)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.dagger_start_after_steps must align with every_steps for static_then_paired_dagger"
+                    ));
+                }
+                if proof_policy.max_rows_per_update < 2 {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.max_rows_per_update must be at least 2 for static_then_paired_dagger"
+                    ));
+                }
+                if proof_policy.rollout_steps > 1 {
+                    let dagger_rows = proof_policy.base_semantic_rows_per_update() / 2;
+                    let maximum_stratified_trajectories = dagger_rows / 2;
+                    if dagger_rows < 2 {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.proof_policy row budgets must fit an initial and model-visited DAgger state for static_then_paired_dagger"
+                        ));
+                    }
+                    if proof_policy.stratified_difficulty_levels > maximum_stratified_trajectories {
+                        return Err(anyhow!(
+                            "training.ruliad_supervision.proof_policy.stratified_difficulty_levels exceeds the paired DAgger trajectory budget after reserving one model-visited state per trajectory"
+                        ));
+                    }
+                }
+            }
+            if proof_policy.max_rows_per_update == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.max_rows_per_update must be positive when enabled"
+                ));
+            }
+            if proof_policy.max_presentation_rows_per_update == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.max_presentation_rows_per_update must be positive when enabled"
+                ));
+            }
+            if proof_policy.candidates < 2 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.candidates must be at least 2 when enabled"
+                ));
+            }
+            if proof_policy.counterfactual_targets_per_state > 0 {
+                let semantic_energy =
+                    proof_policy.scoring == crate::config::RuliadProofPolicyScoring::SemanticEnergy;
+                let isolated_completion = proof_policy.scoring
+                    == crate::config::RuliadProofPolicyScoring::CompletionLikelihood
+                    && proof_policy.gradient_scope
+                        == crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
+                    && proof_policy.normalization
+                        == crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+                if !semantic_energy && !isolated_completion {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.counterfactual_targets_per_state requires scoring=semantic_energy or completion_likelihood with gradient_scope=language_head_only and normalization=candidate_conditional"
+                    ));
+                }
+            }
+            if proof_policy.counterfactual_targets_per_state >= proof_policy.candidates {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.counterfactual_targets_per_state must be less than candidates"
+                ));
+            }
+            if proof_policy.presentation_risk
+                == crate::config::RuliadProofPolicyPresentationRisk::Worst
+                && proof_policy.candidate_symmetry
+                    != crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.presentation_risk=worst requires candidate_symmetry=cyclic_orbit_average"
+                ));
+            }
+            if proof_policy.normalization
+                == crate::config::RuliadProofPolicyNormalization::PrefixConditional
+                && proof_policy.presentation_risk
+                    != crate::config::RuliadProofPolicyPresentationRisk::Mean
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.normalization=prefix_conditional requires presentation_risk=mean"
+                ));
+            }
+            if proof_policy.semantic_rows_per_update() == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy row budgets must fit one complete target-variant presentation group"
+                ));
+            }
+            if proof_policy.mode
+                == crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+                && proof_policy.base_semantic_rows_per_update() < 2
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy presentation budget must fit at least 2 base semantic rows for static_then_paired_dagger"
+                ));
+            }
+            if proof_policy.max_completion_tokens == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.max_completion_tokens must be positive when enabled"
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.enabled does not yet support parallel.pipeline.enabled"
                 ));
             }
         }
@@ -2649,14 +3077,14 @@ impl TrainingConfig {
                     resolved_model.latent_total()
                 ));
             }
-            if max_latent_total % resolved_model.n_embd != 0 {
+            if !max_latent_total.is_multiple_of(resolved_model.n_embd) {
                 return Err(anyhow!(
                     "training.neuron_scaling.max_latent_total must be divisible by model.n_embd (got max={} n_embd={})",
                     max_latent_total,
                     resolved_model.n_embd
                 ));
             }
-            if max_latent_total % resolved_model.n_head != 0 {
+            if !max_latent_total.is_multiple_of(resolved_model.n_head) {
                 return Err(anyhow!(
                     "training.neuron_scaling.max_latent_total must be divisible by model.n_head (got max={} n_head={})",
                     max_latent_total,
@@ -3215,6 +3643,106 @@ prompt = ""
     }
 
     #[test]
+    fn explicit_streaming_batching_is_independent_of_state_persistence() {
+        let config = parse_config("sequence_batching = \"streaming\"");
+        config
+            .validate()
+            .expect("ordered streaming batches should support a reset-state control");
+        assert!(
+            config
+                .training
+                .sequence_batching
+                .uses_streaming_loader(config.training.tbptt_persist_across_steps)
+        );
+    }
+
+    #[test]
+    fn persistent_state_rejects_random_batch_order() {
+        let config = parse_config(
+            "tbptt_chunk_size = 4\ntbptt_persist_across_steps = true\nsequence_batching = \"random\"",
+        );
+        let error = config
+            .validate()
+            .expect_err("persistent state cannot follow unrelated random windows");
+        assert!(error.to_string().contains("sequence_batching=random"));
+    }
+
+    #[test]
+    fn sequence_state_probe_supports_matched_stateless_and_persistent_arms() {
+        let config = parse_config(
+            "sequence_batching = \"streaming\"\n\n[training.sequence_state_probe]\nenabled = true\npaired_batches = 2\nmax_rho_slots = 8",
+        );
+        config
+            .validate()
+            .expect("stateless training should still support carried-state evaluation");
+        let config = parse_config(
+            "tbptt_chunk_size = 4\ntbptt_persist_across_steps = true\nsequence_batching = \"streaming\"\n\n[training.sequence_state_probe]\nenabled = true\npaired_batches = 2\nmax_rho_slots = 8",
+        );
+        config
+            .validate()
+            .expect("persistent stream carry diagnostics should validate");
+    }
+
+    fn external_evaluator_config() -> TrainingConfig {
+        let mut config = parse_config("");
+        config.training.validation.execution =
+            crate::config::TrainingValidationExecution::ExternalEvaluator;
+        config.training.gates.enabled = false;
+        config.training.dynamics.enabled = false;
+        config.training.neuron_scaling.enabled = false;
+        config.training.events.ruliad_correctness_probe_items = 0;
+        config.training.events.source_weighted_validation_batches = 0;
+        config.training.ruliad_policy_probe.enabled = false;
+        config
+    }
+
+    #[test]
+    fn external_evaluator_contract_validates_when_local_consumers_are_disabled() {
+        external_evaluator_config()
+            .validate()
+            .expect("external evaluator contract should validate");
+    }
+
+    #[test]
+    fn external_evaluator_contract_rejects_local_validation_consumers() {
+        let cases = [
+            (
+                "gates",
+                Box::new(|config: &mut TrainingConfig| config.training.gates.enabled = true)
+                    as Box<dyn Fn(&mut TrainingConfig)>,
+            ),
+            (
+                "dynamics",
+                Box::new(|config: &mut TrainingConfig| config.training.dynamics.enabled = true),
+            ),
+            (
+                "source_weighted_validation_batches",
+                Box::new(|config: &mut TrainingConfig| {
+                    config.training.events.source_weighted_validation_batches = 1;
+                }),
+            ),
+            (
+                "ruliad_correctness_probe_items",
+                Box::new(|config: &mut TrainingConfig| {
+                    config.training.events.ruliad_correctness_probe_items = 1;
+                }),
+            ),
+        ];
+
+        for (expected, mutate) in cases {
+            let mut config = external_evaluator_config();
+            mutate(&mut config);
+            let error = config
+                .validate()
+                .expect_err("local validation consumer should be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {expected}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn latent_reasoning_jepa_training_requires_model_modules() {
         let mut config = parse_config("");
         config.training.latent_reasoning.enabled = true;
@@ -3586,6 +4114,76 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn predictive_coding_rejects_invalid_amortization_contract() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.predictive_coding.amortization_tolerance = f32::NAN;
+
+        let err = config
+            .validate()
+            .expect_err("non-finite amortization tolerance should fail validation");
+        assert!(err.to_string().contains("amortization_tolerance"));
+
+        config.training.predictive_coding.amortization_tolerance = 0.05;
+        config
+            .training
+            .predictive_coding
+            .amortization_max_state_slots = 0;
+        let err = config
+            .validate()
+            .expect_err("empty amortization sample should fail validation");
+        assert!(err.to_string().contains("amortization_max_state_slots"));
+    }
+
+    #[test]
+    fn predictive_coding_rejects_unacknowledged_oracle_target_control() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.predictive_coding.observation_contract =
+            PredictiveCodingObservationContract::OracleNextTokenNegativeControl;
+
+        let err = config
+            .validate()
+            .expect_err("oracle target leakage must require explicit acknowledgement");
+        assert!(
+            err.to_string().contains("allow_oracle_target_leak=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predictive_coding_oracle_target_control_is_explicitly_available_for_ablations() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.predictive_coding.observation_contract =
+            PredictiveCodingObservationContract::OracleNextTokenNegativeControl;
+        config.training.predictive_coding.allow_oracle_target_leak = true;
+
+        config
+            .validate()
+            .expect("acknowledged oracle negative control should remain reproducible");
+    }
+
+    #[test]
+    fn observed_prefix_predictive_coding_rejects_block_backward() {
+        let mut config = parse_config("");
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.predictive_coding.enabled = true;
+        config.training.predictive_coding.backward_mode = PredictiveCodingBackwardMode::Block;
+
+        let err = config
+            .validate()
+            .expect_err("causal correction must follow each completed chunk");
+        assert!(
+            err.to_string().contains("requires backward_mode=chunked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn predictive_coding_optimizer_validates_for_local_chunked_pc_training() {
         let mut config = parse_config("");
         config.optimizer.name = OptimizerKind::PredictiveCoding;
@@ -3717,6 +4315,32 @@ start_policy = "capability_gate"
         supervision.answer_contract.enabled = true;
         supervision.answer_contract.weight = 0.25;
         assert!(supervision.needs_ruliad_policy_batch());
+    }
+
+    #[test]
+    fn ruliad_policy_batch_schedule_matches_active_auxiliary_cadence() {
+        let mut supervision = crate::RuliadSupervisionConfig::default();
+        supervision.proof_policy.enabled = true;
+        supervision.proof_policy.weight = 0.25;
+        supervision.proof_policy.start_after_steps = 4;
+        supervision.proof_policy.every_steps = 3;
+
+        for step in 0..10 {
+            assert_eq!(
+                supervision.needs_ruliad_policy_batch_at_step(step),
+                matches!(step, 6 | 9),
+                "step={step}"
+            );
+        }
+
+        supervision.verifier_reward.enabled = true;
+        supervision.verifier_reward.weight = 0.05;
+        supervision.verifier_reward.start_after_steps = 2;
+        supervision.verifier_reward.every_steps = 4;
+        assert!(!supervision.needs_ruliad_policy_batch_at_step(2));
+        assert!(!supervision.needs_ruliad_policy_batch_at_step(3));
+        assert!(supervision.needs_ruliad_policy_batch_at_step(4));
+        assert!(supervision.needs_ruliad_policy_batch_at_step(8));
     }
 
     #[test]
@@ -4844,8 +5468,994 @@ start_policy = "capability_gate"
 
     fn load_profile(file_name: &str) -> TrainingConfig {
         let profile_path = profile_path(file_name);
-        load_training_config(&[profile_path.clone()])
+        load_training_config(std::slice::from_ref(&profile_path))
             .unwrap_or_else(|err| panic!("load {}: {err}", profile_path.display()))
+    }
+
+    #[test]
+    fn ruliad_r3_profile_streams_the_full_formal_proof_contract() {
+        let config = load_profile("ruliad-r3.training.toml");
+        config.validate().expect("R3 profile should validate");
+
+        assert_eq!(config.training.tbptt_chunk_size, Some(512));
+        assert!(config.training.tbptt_persist_across_steps);
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::TraceAndAnswer
+        );
+        assert!(config.training.ruliad_supervision.mask_high_entropy_spans);
+    }
+
+    #[test]
+    fn ruliad_r3_stateful_tbptt_profiles_form_a_matched_factorial_ablation() {
+        use crate::config::SequenceBatchingMode;
+
+        let arms = [
+            ("ruliad-r3.stateful-tbptt-block512-reset.toml", 512, false),
+            ("ruliad-r3.stateful-tbptt-block512-carry.toml", 512, true),
+            ("ruliad-r3.stateful-tbptt-chunk128-reset.toml", 128, false),
+            ("ruliad-r3.stateful-tbptt-chunk128-carry.toml", 128, true),
+            ("ruliad-r3.stateful-tbptt-chunk64-carry.toml", 64, true),
+        ];
+        let mut shared_contract = None;
+        for (profile, chunk_size, persist) in arms {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{profile} should validate: {error}"));
+            assert_eq!(config.training.block_size, 512, "{profile}");
+            assert_eq!(
+                config.training.tbptt_chunk_size,
+                Some(chunk_size),
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.tbptt_persist_across_steps, persist,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.sequence_batching,
+                SequenceBatchingMode::Streaming,
+                "{profile}"
+            );
+            assert!(config.training.sequence_state_probe.enabled, "{profile}");
+            assert!(
+                config.training.ruliad_supervision.balance_trace_answer_mass,
+                "{profile}"
+            );
+            assert!(!config.training.auto_batch_size.enabled, "{profile}");
+            assert!(!config.training.continual_backprop.enabled, "{profile}");
+            assert!(!config.training.neuron_scaling.enabled, "{profile}");
+            assert!(!config.training.gates.enabled, "{profile}");
+            assert!(!config.training.dynamics.enabled, "{profile}");
+            let contract = (
+                config.dataset.clone(),
+                config.model.clone(),
+                config.optimizer.clone(),
+                config.training.ruliad_supervision,
+                config.training.ruliad_probe_generation,
+                config.training.objective.clone(),
+                config.training.batch_size,
+                config.training.seed,
+            );
+            if let Some(expected) = shared_contract.as_ref() {
+                assert_eq!(
+                    &contract, expected,
+                    "{profile} changed a controlled variable"
+                );
+            } else {
+                shared_contract = Some(contract);
+            }
+        }
+
+        let corpus_path = profile_path("ruliad-r3.stateful-tbptt.corpus.toml");
+        let corpus = burn_dragon_universality::load_ruliad_config(&corpus_path)
+            .unwrap_or_else(|error| panic!("load {}: {error}", corpus_path.display()));
+        assert_eq!(corpus.serialization.document_mode.label(), "single_sample");
+        assert_eq!(corpus.serialization.document_chunks.min, 1);
+        assert_eq!(corpus.serialization.document_chunks.max, 1);
+        assert_eq!(corpus.serialization.document_tokens, 6145);
+        assert!(corpus.source_selection.enabled);
+        assert!(!corpus.source_selection.feedback_updates_enabled);
+    }
+
+    #[test]
+    fn ruliad_r3_typed_policy_profile_has_a_long_run_semantic_action_contract() {
+        use crate::config::{RuliadProofPolicyCandidateSymmetry, RuliadProofPolicyTrainingMode};
+
+        let config = load_profile("ruliad-r3.typed-policy.training.toml");
+        config
+            .validate()
+            .expect("R3 typed-policy profile should validate");
+
+        assert_eq!(config.training.max_iters, 1_000_000);
+        assert!(config.training.auto_batch_size.enabled);
+        assert_eq!(config.training.tbptt_chunk_size, Some(512));
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert_eq!(
+            config.training.ruliad_supervision.mode,
+            RuliadSupervisionMode::AnswerCompletion
+        );
+        let policy = config.training.ruliad_supervision.proof_policy;
+        assert!(policy.enabled);
+        assert_eq!(policy.mode, RuliadProofPolicyTrainingMode::StaticExpert);
+        assert_eq!(policy.every_steps, 2);
+        assert_eq!(policy.start_after_steps, 128);
+        assert_eq!(policy.max_rows_per_update, 8);
+        assert_eq!(
+            policy.candidate_symmetry,
+            RuliadProofPolicyCandidateSymmetry::BalancedRotation
+        );
+        assert_eq!(
+            config.training.ruliad_policy_probe.candidate_symmetry,
+            RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage
+        );
+        assert_eq!(
+            config
+                .training
+                .ruliad_policy_probe
+                .effective_closed_loop_every_epochs(),
+            16
+        );
+        assert!(config.training.ruliad_policy_probe.promotion_gate.enabled);
+    }
+
+    #[test]
+    fn ruliad_r3_semantic_energy_profile_decouples_policy_from_language_serialization() {
+        use crate::config::RuliadProofPolicyScoring;
+
+        let config = load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        config
+            .validate()
+            .expect("R3 semantic-energy profile should validate");
+        assert!(
+            config
+                .model
+                .sequence_score_head
+                .is_some_and(|head| head.enabled)
+        );
+        assert_eq!(
+            config.training.ruliad_supervision.proof_policy.scoring,
+            RuliadProofPolicyScoring::SemanticEnergy
+        );
+        assert_eq!(
+            config.training.ruliad_policy_probe.scoring,
+            RuliadProofPolicyScoring::SemanticEnergy
+        );
+        let proof_policy = config.training.ruliad_supervision.proof_policy;
+        assert_eq!(proof_policy.counterfactual_targets_per_state, 1);
+        assert_eq!(proof_policy.target_variants_per_state(), 2);
+        assert_eq!(proof_policy.semantic_rows_per_update(), 8);
+        assert_eq!(proof_policy.base_semantic_rows_per_update(), 4);
+        assert!(
+            build_model_config(&config.model, config.training.block_size)
+                .sequence_score_head
+                .enabled
+        );
+        assert_eq!(
+            build_model_config(&config.model, config.training.block_size)
+                .sequence_score_head
+                .projection_dim,
+            64
+        );
+    }
+
+    #[test]
+    fn ruliad_r3_semantic_energy_head_only_profile_is_explicit_and_valid() {
+        use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
+
+        let config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-head-only-fixed-ablation.toml");
+        config
+            .validate()
+            .expect("R3 head-only semantic-energy profile should validate");
+        let policy = config.training.ruliad_supervision.proof_policy;
+        assert_eq!(policy.scoring, RuliadProofPolicyScoring::SemanticEnergy);
+        assert_eq!(
+            policy.gradient_scope,
+            RuliadProofPolicyGradientScope::ScoreHeadOnly
+        );
+
+        let fullrate = load_profile(
+            "ruliad-r3.action-policy-semantic-energy-head-only-fullrate-ablation.toml",
+        );
+        fullrate
+            .validate()
+            .expect("R3 full-rate head-only semantic-energy profile should validate");
+        let policy = fullrate.training.ruliad_supervision.proof_policy;
+        assert_eq!(policy.scoring, RuliadProofPolicyScoring::SemanticEnergy);
+        assert_eq!(
+            policy.gradient_scope,
+            RuliadProofPolicyGradientScope::ScoreHeadOnly
+        );
+        assert_eq!(policy.weight, 1.0);
+        assert_eq!(policy.every_steps, 1);
+        assert_eq!(policy.start_after_steps, 0);
+        assert_eq!(policy.max_rows_per_update, 32);
+        assert_eq!(policy.max_presentation_rows_per_update, 32);
+    }
+
+    #[test]
+    fn score_head_only_gradient_scope_requires_semantic_energy() {
+        use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
+
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        let policy = &mut config.training.ruliad_supervision.proof_policy;
+        policy.scoring = RuliadProofPolicyScoring::CompletionLikelihood;
+        policy.gradient_scope = RuliadProofPolicyGradientScope::ScoreHeadOnly;
+        let error = config
+            .validate()
+            .expect_err("head-only scope must not silently target the language head");
+        assert!(
+            error
+                .to_string()
+                .contains("gradient_scope=score_head_only requires scoring=semantic_energy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn language_head_only_profile_is_explicit_untied_and_valid() {
+        use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
+
+        let config =
+            load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
+        config
+            .validate()
+            .expect("R3 language-head-only completion profile should validate");
+        let policy = config.training.ruliad_supervision.proof_policy;
+        assert_eq!(
+            policy.scoring,
+            RuliadProofPolicyScoring::CompletionLikelihood
+        );
+        assert_eq!(
+            policy.gradient_scope,
+            RuliadProofPolicyGradientScope::LanguageHeadOnly
+        );
+        assert_eq!(policy.counterfactual_targets_per_state, 1);
+        assert_eq!(policy.target_variants_per_state(), 2);
+        assert_eq!(policy.base_semantic_rows_per_update(), 4);
+        assert!(!config.model.tie_input_output_embeddings.unwrap_or(false));
+    }
+
+    #[test]
+    fn language_head_only_gradient_scope_rejects_tied_embeddings_and_energy_scoring() {
+        use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
+
+        let mut tied =
+            load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
+        tied.model.tie_input_output_embeddings = Some(true);
+        let error = tied
+            .validate()
+            .expect_err("language-head-only scope must not update tied input embeddings");
+        assert!(
+            error
+                .to_string()
+                .contains("language_head_only requires model.tie_input_output_embeddings=false"),
+            "{error}"
+        );
+
+        let mut energy =
+            load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
+        energy.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        energy.training.ruliad_supervision.proof_policy.scoring =
+            RuliadProofPolicyScoring::SemanticEnergy;
+        energy
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .gradient_scope = RuliadProofPolicyGradientScope::LanguageHeadOnly;
+        let error = energy
+            .validate()
+            .expect_err("language-head-only scope must target completion likelihood");
+        assert!(
+            error
+                .to_string()
+                .contains("language_head_only requires scoring=completion_likelihood"),
+            "{error}"
+        );
+
+        let mut factorized =
+            load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
+        factorized.model.language_head =
+            Some(burn_dragon_core::LanguageHeadConfig::NcaFactorizedPatch {
+                state_count: 2,
+                patch_size: 2,
+                frame_special_tokens: false,
+                eos_id: None,
+            });
+        let error = factorized
+            .validate()
+            .expect_err("language-head-only scope requires a flat token projection");
+        assert!(
+            error.to_string().contains(
+                "language_head_only requires model.language_head.type=standard_token_classification"
+            ),
+            "{error}"
+        );
+
+        let mut conditioned =
+            load_profile("ruliad-r3.semantic-action-language-head-only-fixed-ablation.toml");
+        let mut latent = burn_dragon_core::LatentReasoningConfig::default();
+        latent.step_conditioned_decoder = true;
+        conditioned.model.latent_reasoning = Some(latent);
+        let error = conditioned
+            .validate()
+            .expect_err("language-head-only scope must not update latent-step conditioning");
+        assert!(
+            error.to_string().contains(
+                "language_head_only requires model.latent_reasoning.step_conditioned_decoder=false"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn paired_dagger_validation_preserves_causal_and_model_visited_rows() {
+        use crate::config::{
+            RuliadProofPolicyEffectiveMode, RuliadProofPolicyScoring, RuliadProofPolicyTrainingMode,
+        };
+
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        let proof_policy = &mut config.training.ruliad_supervision.proof_policy;
+        proof_policy.mode = RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+        proof_policy.dagger_start_after_steps = 512;
+        proof_policy.stratified_difficulty_levels = 1;
+        proof_policy.rollout_steps = 2;
+        config
+            .validate()
+            .expect("bounded semantic-energy paired DAgger should validate");
+        let policy = config.training.ruliad_supervision.proof_policy;
+        assert_eq!(policy.scoring, RuliadProofPolicyScoring::SemanticEnergy);
+        assert_eq!(
+            policy.mode,
+            RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+        );
+        assert_eq!(
+            policy.effective_mode(511),
+            RuliadProofPolicyEffectiveMode::StaticExpert
+        );
+        assert_eq!(
+            policy.effective_mode(512),
+            RuliadProofPolicyEffectiveMode::PairedDagger
+        );
+        assert_eq!(policy.stratified_difficulty_levels, 1);
+        assert_eq!(policy.rollout_steps, 2);
+        assert_eq!(policy.counterfactual_targets_per_state, 1);
+        assert_eq!(policy.semantic_rows_per_update(), 8);
+        assert_eq!(policy.base_semantic_rows_per_update(), 4);
+
+        let mut invalid = config;
+        invalid
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .stratified_difficulty_levels = 2;
+        let error = invalid
+            .validate()
+            .expect_err("paired DAgger must reserve one visited state per trajectory");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the paired DAgger trajectory budget"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_energy_rejects_an_empty_compatibility_projection() {
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        config
+            .model
+            .sequence_score_head
+            .as_mut()
+            .expect("semantic-energy head")
+            .projection_dim = 0;
+        let error = config
+            .validate()
+            .expect_err("zero-rank compatibility head must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence_score_head.projection_dim must be > 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ruliad_counterfactual_policy_requires_energy_candidates_and_complete_groups() {
+        use crate::config::RuliadProofPolicyScoring;
+
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        config.training.ruliad_supervision.proof_policy.scoring =
+            RuliadProofPolicyScoring::CompletionLikelihood;
+        let error = config
+            .validate()
+            .expect_err("full-model completion counterfactuals must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requires scoring=semantic_energy or completion_likelihood with gradient_scope=language_head_only")
+        );
+
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .counterfactual_targets_per_state = 4;
+        let error = config
+            .validate()
+            .expect_err("counterfactual targets must leave an original candidate class");
+        assert!(error.to_string().contains("must be less than candidates"));
+
+        let mut config =
+            load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .max_rows_per_update = 1;
+        let error = config
+            .validate()
+            .expect_err("row budget must fit a complete target pair");
+        assert!(
+            error
+                .to_string()
+                .contains("target-variant presentation group")
+        );
+    }
+
+    #[test]
+    fn ruliad_action_policy_profiles_load_with_explicit_search_contracts() {
+        use crate::config::RuliadProofPolicyCandidateSymmetry::{
+            BalancedRotation, CyclicOrbitAverage,
+        };
+        for (profile, beam_width, dagger, symmetry) in [
+            (
+                "ruliad-r3.action-policy-fixed-ablation.toml",
+                1,
+                false,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-fixed-ablation.toml",
+                1,
+                false,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-static-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-static-every-step-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-static-every-two-steps-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-static-prefix-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.semantic-action-static-marginal-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-beam4-fixed-ablation.toml",
+                4,
+                false,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-dagger-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-dagger-marginal-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-static-marginal-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-static-orbit-marginal-fixed-ablation.toml",
+                1,
+                true,
+                CyclicOrbitAverage,
+            ),
+            (
+                "ruliad-r3.action-policy-static-orbit-worst-marginal-fixed-ablation.toml",
+                1,
+                true,
+                CyclicOrbitAverage,
+            ),
+            (
+                "ruliad-r3.action-policy-bc-paired-dagger-marginal-fixed-ablation.toml",
+                1,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-bc-paired-dagger-orbit-marginal-fixed-ablation.toml",
+                1,
+                true,
+                CyclicOrbitAverage,
+            ),
+            (
+                "ruliad-r3.action-policy-dagger-beam4-fixed-ablation.toml",
+                4,
+                true,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-promotion-audit.toml",
+                1,
+                false,
+                BalancedRotation,
+            ),
+            (
+                "ruliad-r3.action-policy-beam4-promotion-audit.toml",
+                4,
+                false,
+                BalancedRotation,
+            ),
+        ] {
+            let config = load_profile(profile);
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("validate {profile}: {error}"));
+            assert!(config.training.ruliad_probe_generation.enabled, "{profile}");
+            assert_eq!(
+                config.training.ruliad_probe_generation.max_batch_rows, 64,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_probe_generation.minimum_batch_rows, 2,
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_probe_generation
+                    .maximum_prompt_position_span,
+                32,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_probe_generation.device_buffer_tokens, 4,
+                "{profile}"
+            );
+            assert_eq!(config.training.ruliad_policy_probe.beam_width, beam_width);
+            assert_eq!(config.training.ruliad_policy_probe.scoring_batch_rows, 32);
+            assert_eq!(
+                config.training.ruliad_policy_probe.scoring_token_budget,
+                32_768
+            );
+            assert_eq!(
+                config.training.ruliad_policy_probe.scoring_pipeline_depth,
+                2
+            );
+            assert_eq!(
+                config.training.ruliad_policy_probe.candidate_symmetry, symmetry,
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_supervision.proof_policy.enabled,
+                dagger
+            );
+            if dagger {
+                assert_eq!(
+                    config.training.ruliad_supervision.proof_policy.weight, 0.25,
+                    "{profile}"
+                );
+            }
+            let promotion_audit = profile.contains("promotion-audit");
+            assert_eq!(
+                config.training.ruliad_policy_probe.every_epochs,
+                if promotion_audit { 1 } else { 4 },
+                "{profile}"
+            );
+            assert_eq!(
+                config
+                    .training
+                    .ruliad_policy_probe
+                    .effective_closed_loop_every_epochs(),
+                if promotion_audit { 1 } else { 4 },
+                "ablation profiles must retain matched closed-loop cadence: {profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_policy_probe.items,
+                if promotion_audit { 64 } else { 16 },
+                "{profile}"
+            );
+            assert_eq!(
+                config.training.ruliad_policy_probe.max_steps,
+                if promotion_audit { 256 } else { 64 },
+                "{profile}"
+            );
+        }
+
+        let marginal = load_profile("ruliad-r3.action-policy-dagger-marginal-fixed-ablation.toml");
+        assert_eq!(
+            marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .normalization,
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal
+        );
+        let semantic_marginal =
+            load_profile("ruliad-r3.semantic-action-static-marginal-fixed-ablation.toml");
+        assert_eq!(
+            semantic_marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .normalization,
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal
+        );
+        assert_eq!(
+            semantic_marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .max_rows_per_update,
+            8
+        );
+        assert_eq!(
+            semantic_marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .max_completion_tokens,
+            64
+        );
+        let semantic_prefix =
+            load_profile("ruliad-r3.semantic-action-static-prefix-fixed-ablation.toml");
+        assert_eq!(
+            semantic_prefix
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .normalization,
+            crate::config::RuliadProofPolicyNormalization::PrefixConditional
+        );
+        let semantic_every_step =
+            load_profile("ruliad-r3.semantic-action-static-every-step-fixed-ablation.toml");
+        assert_eq!(
+            semantic_every_step
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .every_steps,
+            1
+        );
+        assert_eq!(
+            semantic_every_step
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .start_after_steps,
+            0
+        );
+        let semantic_every_two_steps =
+            load_profile("ruliad-r3.semantic-action-static-every-two-steps-fixed-ablation.toml");
+        assert_eq!(
+            semantic_every_two_steps
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .every_steps,
+            2
+        );
+        assert_eq!(
+            semantic_every_two_steps
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .start_after_steps,
+            0
+        );
+        assert_eq!(
+            marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .candidate_symmetry,
+            crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation
+        );
+        let static_marginal =
+            load_profile("ruliad-r3.action-policy-static-marginal-fixed-ablation.toml");
+        assert_eq!(
+            static_marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .mode,
+            crate::config::RuliadProofPolicyTrainingMode::StaticExpert
+        );
+        assert_eq!(
+            static_marginal
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .every_steps,
+            4
+        );
+        let orbit =
+            load_profile("ruliad-r3.action-policy-static-orbit-marginal-fixed-ablation.toml");
+        assert_eq!(
+            orbit
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .candidate_symmetry,
+            CyclicOrbitAverage
+        );
+        assert_eq!(
+            orbit
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .max_presentation_rows_per_update,
+            32
+        );
+        assert_eq!(
+            orbit
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .semantic_rows_per_update(),
+            8
+        );
+        let worst_orbit =
+            load_profile("ruliad-r3.action-policy-static-orbit-worst-marginal-fixed-ablation.toml");
+        assert_eq!(
+            worst_orbit
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .presentation_risk,
+            crate::config::RuliadProofPolicyPresentationRisk::Worst
+        );
+        let scheduled =
+            load_profile("ruliad-r3.action-policy-bc-paired-dagger-marginal-fixed-ablation.toml");
+        assert_eq!(
+            scheduled.training.ruliad_supervision.proof_policy.mode,
+            crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+        );
+        assert_eq!(
+            scheduled
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .dagger_start_after_steps,
+            768
+        );
+        assert_eq!(
+            scheduled
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .effective_mode(767),
+            crate::config::RuliadProofPolicyEffectiveMode::StaticExpert
+        );
+        assert_eq!(
+            scheduled
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .effective_mode(768),
+            crate::config::RuliadProofPolicyEffectiveMode::PairedDagger
+        );
+    }
+
+    #[test]
+    fn ruliad_action_policy_probe_rejects_zero_cadence() {
+        let mut config = load_profile("ruliad-r3.action-policy-fixed-ablation.toml");
+        config.training.ruliad_policy_probe.every_epochs = 0;
+
+        let error = config.validate().expect_err("zero cadence must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("ruliad_policy_probe.every_epochs must be > 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ruliad_action_policy_probe_rejects_zero_closed_loop_cadence() {
+        let mut config = load_profile("ruliad-r3.action-policy-fixed-ablation.toml");
+        config.training.ruliad_policy_probe.closed_loop_every_epochs = Some(0);
+
+        let error = config
+            .validate()
+            .expect_err("zero closed-loop cadence must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("ruliad_policy_probe.closed_loop_every_epochs must be > 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ruliad_probe_generation_rejects_unbounded_or_empty_batches() {
+        let mut config = load_profile("ruliad-r3.action-policy-fixed-ablation.toml");
+        config.training.ruliad_probe_generation.minimum_batch_rows = config
+            .training
+            .ruliad_probe_generation
+            .max_batch_rows
+            .saturating_add(1);
+        let error = config
+            .validate()
+            .expect_err("minimum rows above maximum must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("minimum_batch_rows must be in 1..=max_batch_rows"),
+            "{error}"
+        );
+
+        config.training.ruliad_probe_generation.minimum_batch_rows = 2;
+        config
+            .training
+            .ruliad_probe_generation
+            .maximum_prompt_position_span = 0;
+        let error = config.validate().expect_err("zero prompt span must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("maximum_prompt_position_span must be > 0"),
+            "{error}"
+        );
+
+        config
+            .training
+            .ruliad_probe_generation
+            .maximum_prompt_position_span = 32;
+        config.training.ruliad_probe_generation.device_buffer_tokens = 0;
+        let error = config.validate().expect_err("zero device buffer must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("device_buffer_tokens must be > 0"),
+            "{error}"
+        );
+
+        config.training.ruliad_probe_generation.device_buffer_tokens = 4;
+        config.training.ruliad_probe_generation.max_in_flight_rows = 0;
+        let error = config
+            .validate()
+            .expect_err("zero in-flight row bound must fail");
+        assert!(
+            error.to_string().contains("max_in_flight_rows must be > 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ruliad_static_then_paired_dagger_requires_an_aligned_later_transition() {
+        let mut config =
+            load_profile("ruliad-r3.action-policy-bc-paired-dagger-marginal-fixed-ablation.toml");
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .dagger_start_after_steps = 128;
+        let error = config
+            .validate()
+            .expect_err("DAgger transition must follow static warmup");
+        assert!(error.to_string().contains("must exceed start_after_steps"));
+
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .dagger_start_after_steps = 769;
+        let error = config
+            .validate()
+            .expect_err("DAgger transition must align to policy cadence");
+        assert!(error.to_string().contains("must align with every_steps"));
+
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .dagger_start_after_steps = 768;
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .max_rows_per_update = 1;
+        let error = config
+            .validate()
+            .expect_err("paired DAgger needs both row populations");
+        assert!(error.to_string().contains("must be at least 2"));
+    }
+
+    #[test]
+    fn ruliad_orbit_policy_requires_a_complete_bounded_presentation_set() {
+        let mut config =
+            load_profile("ruliad-r3.action-policy-static-orbit-marginal-fixed-ablation.toml");
+        let proof_policy = &mut config.training.ruliad_supervision.proof_policy;
+        proof_policy.max_presentation_rows_per_update = proof_policy.candidates - 1;
+
+        let error = config
+            .validate()
+            .expect_err("an incomplete orbit must not be materialized");
+        assert!(error.to_string().contains("fit one complete"), "{error}");
+    }
+
+    #[test]
+    fn ruliad_worst_presentation_risk_requires_an_exact_orbit() {
+        let mut config =
+            load_profile("ruliad-r3.action-policy-static-orbit-worst-marginal-fixed-ablation.toml");
+        assert!(config.validate().is_ok());
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .candidate_symmetry =
+            crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation;
+
+        let error = config
+            .validate()
+            .expect_err("worst presentation risk needs a complete orbit");
+        assert!(
+            error
+                .to_string()
+                .contains("presentation_risk=worst requires"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ruliad_paired_orbit_policy_requires_both_semantic_populations() {
+        let mut config = load_profile(
+            "ruliad-r3.action-policy-bc-paired-dagger-orbit-marginal-fixed-ablation.toml",
+        );
+        let proof_policy = &mut config.training.ruliad_supervision.proof_policy;
+        proof_policy.rollout_steps = 1;
+        proof_policy.max_presentation_rows_per_update = proof_policy.candidates;
+
+        let error = config
+            .validate()
+            .expect_err("paired DAgger needs two complete semantic orbits");
+        assert!(
+            error.to_string().contains("at least 2 base semantic rows"),
+            "{error}"
+        );
     }
 
     #[test]

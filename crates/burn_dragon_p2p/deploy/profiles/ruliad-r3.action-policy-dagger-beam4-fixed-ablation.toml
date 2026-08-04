@@ -1,0 +1,4 @@
+extends = ["ruliad-r3.action-policy-dagger-fixed-ablation.toml"]
+
+[training.ruliad_policy_probe]
+beam_width = 4

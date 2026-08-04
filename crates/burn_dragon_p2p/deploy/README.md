@@ -87,6 +87,24 @@ require a quorum greater than one, and enable independent compact-update replay
 as described in
 [the production-readiness ledger](../../../docs/p2p-production-readiness.md).
 
+For that topology, bind promotion ownership into the shared manifest seed:
+
+```toml
+[manifest.promotion]
+mode = "validator_quorum"
+validator_quorum = 2
+```
+
+Run trainer peers with `target = "trainer"` and at least two independent peers
+with `target = "validator"`. Trainers publish candidate artifacts without
+performing canonical validation. Each validator materializes the candidate,
+persists its evaluation report, and publishes an attestation bound to the exact
+head ID, artifact ID, evaluation protocol, and report content ID. Promotion
+fails closed until the control plane can match a distinct report and reduction
+certificate from every member of the required quorum. The validator daemon
+does not re-evaluate the newly promoted head because that exact materialization
+was already evaluated before attestation.
+
 ## Signed Revision Provisioning
 
 Production native and browser peers must converge on the same signed revision

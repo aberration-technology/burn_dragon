@@ -1,0 +1,6 @@
+extends = ["ruliad-r3.semantic-action-static-fixed-ablation.toml"]
+
+# Optimize absolute verifier-equivalent sequence probability, not only ranking within the
+# candidate menu. This is the direct intervention for schema-valid modal free-answer collapse.
+[training.ruliad_supervision.proof_policy]
+normalization = "vocabulary_marginal"

@@ -1,13 +1,31 @@
 use crate::config::train::NeuronScalingStabilizationConfig;
 use crate::train::prelude::*;
 use burn::tensor::activation;
+use burn::tensor::backend::Backend;
 use burn_dragon_core::ModelState;
 use burn_dragon_time::Instant;
 use std::any::Any;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+const RULIAD_FIELD_BINDING_OBJECTIVE: &str =
+    "first_divergence_plus_paired_sequence_log_probability_v2";
+
+const STOCHASTIC_STREAM_MAIN: u64 = 0x6d61_696e_5f73_7465;
+const STOCHASTIC_STREAM_PROOF_POLICY: u64 = 0x7072_6f6f_665f_706f;
+const STOCHASTIC_STREAM_VERIFIER_POLICY: u64 = 0x7665_7269_6669_6572;
+const STOCHASTIC_STREAM_PC_AMORTIZATION: u64 = 0x7063_5f61_6d6f_7274;
+
+fn stochastic_step_seed(base_seed: u64, step_index: usize, stream: u64) -> u64 {
+    let mut value = base_seed
+        ^ (step_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ stream.rotate_left(23);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
 
 #[derive(Clone, Default)]
 struct PipelineRuntimeCell {
@@ -475,7 +493,7 @@ fn scale_2d_headed_latent_rows<B: BackendTrait, const D: usize>(
     let device = tensor.device();
     let rows = dims[0];
     let cols = dims[1];
-    if rows % new_latent_per_head != 0 {
+    if !rows.is_multiple_of(new_latent_per_head) {
         return tensor;
     }
     let heads = rows / new_latent_per_head;
@@ -607,6 +625,61 @@ fn ema_blend_model<B: BackendTrait>(
     blended
 }
 
+trait PredictiveCodingStateMapper<B: BackendTrait> {
+    fn map_rank3(
+        &mut self,
+        name: &'static str,
+        tensor: Option<Tensor<B, 3>>,
+    ) -> Option<Tensor<B, 3>>;
+
+    fn map_rank4(
+        &mut self,
+        name: &'static str,
+        tensor: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>>;
+}
+
+fn map_predictive_coding_state<B: BackendTrait>(
+    state: &mut ModelState<B>,
+    scope: PredictiveCodingStateScope,
+    mapper: &mut impl PredictiveCodingStateMapper<B>,
+) {
+    for layer in &mut state.layers {
+        layer.rho_norm = None;
+        layer.rho = mapper.map_rank4("rho", layer.rho.take());
+        layer.y_neuron_state = mapper.map_rank3("y_neuron_state", layer.y_neuron_state.take());
+        if !matches!(scope, PredictiveCodingStateScope::All) {
+            continue;
+        }
+
+        layer.slow_rho_norm = None;
+        layer.sequence_aux = mapper.map_rank4("sequence_aux", layer.sequence_aux.take());
+        layer.mamba_angle_state =
+            mapper.map_rank3("mamba_angle_state", layer.mamba_angle_state.take());
+        layer.mamba_k_state = mapper.map_rank3("mamba_k_state", layer.mamba_k_state.take());
+        layer.mamba_v_state = mapper.map_rank3("mamba_v_state", layer.mamba_v_state.take());
+        layer.slow_rho = mapper.map_rank4("slow_rho", layer.slow_rho.take());
+        layer.slow_sequence_aux =
+            mapper.map_rank4("slow_sequence_aux", layer.slow_sequence_aux.take());
+        layer.slow_mamba_angle_state = mapper.map_rank3(
+            "slow_mamba_angle_state",
+            layer.slow_mamba_angle_state.take(),
+        );
+        layer.slow_mamba_k_state =
+            mapper.map_rank3("slow_mamba_k_state", layer.slow_mamba_k_state.take());
+        layer.slow_mamba_v_state =
+            mapper.map_rank3("slow_mamba_v_state", layer.slow_mamba_v_state.take());
+        layer.hierarchical_slow_hidden = mapper.map_rank4(
+            "hierarchical_slow_hidden",
+            layer.hierarchical_slow_hidden.take(),
+        );
+        layer.clocked_slow_hidden =
+            mapper.map_rank4("clocked_slow_hidden", layer.clocked_slow_hidden.take());
+        layer.summary_memory_hidden =
+            mapper.map_rank4("summary_memory_hidden", layer.summary_memory_hidden.take());
+    }
+}
+
 fn attach_predictive_coding_tensor<B: BackendTrait, const D: usize>(
     slot: &mut Option<Tensor<B, D>>,
 ) -> bool {
@@ -615,6 +688,120 @@ fn attach_predictive_coding_tensor<B: BackendTrait, const D: usize>(
     };
     *slot = Some(tensor.detach().require_grad());
     true
+}
+
+type PredictiveCodingSampleIndexCache<B> = HashMap<(usize, usize, usize), Tensor<B, 1, Int>>;
+
+fn rotating_sample_state_axis_pair<B: BackendTrait, const D: usize>(
+    student: Tensor<B, D>,
+    teacher: Tensor<B, D>,
+    axis: usize,
+    max_slots: usize,
+    sample_offset: usize,
+    cache: &mut PredictiveCodingSampleIndexCache<B>,
+) -> (Tensor<B, D>, Tensor<B, D>) {
+    let dims = student.shape().dims::<D>();
+    let slots = dims[axis];
+    if slots <= max_slots.max(1) {
+        return (student, teacher);
+    }
+    let sample_slots = max_slots.max(1).min(slots);
+    let sample_offset = sample_offset % slots;
+    let key = (slots, sample_slots, sample_offset);
+    let indices = cache
+        .entry(key)
+        .or_insert_with(|| {
+            let indices = (0..sample_slots)
+                .map(|index| {
+                    (((index * slots + sample_slots / 2) / sample_slots + sample_offset) % slots)
+                        as i64
+                })
+                .collect::<Vec<_>>();
+            Tensor::<B, 1, Int>::from_data(
+                TensorData::new(indices, [sample_slots]),
+                &student.device(),
+            )
+        })
+        .clone();
+    (
+        student.select(axis, indices.clone()),
+        teacher.select(axis, indices),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PredictiveCodingAmortizationConstraint {
+    sample_axis: usize,
+    max_slots: usize,
+    sample_offset: usize,
+    tolerance: f32,
+    eps: f32,
+}
+
+fn predictive_coding_chunk_due(
+    observation_contract: PredictiveCodingObservationContract,
+    step_index: usize,
+    chunk_index: usize,
+    chunks_per_step: usize,
+    apply_every_chunks: usize,
+) -> bool {
+    let ordinal = step_index
+        .saturating_mul(chunks_per_step.max(1))
+        .saturating_add(chunk_index);
+    let cadence = apply_every_chunks.max(1);
+    match observation_contract {
+        // A causal correction needs a state produced by an earlier observed chunk.
+        PredictiveCodingObservationContract::ObservedPrefix => {
+            ordinal.saturating_add(1).is_multiple_of(cadence)
+        }
+        // Preserve historical phase alignment for the explicitly non-causal control.
+        PredictiveCodingObservationContract::OracleNextTokenNegativeControl => {
+            ordinal.is_multiple_of(cadence)
+        }
+    }
+}
+
+fn accumulate_predictive_coding_amortization_constraint<B: BackendTrait, const D: usize>(
+    total: &mut Option<Tensor<B, 1>>,
+    components: &mut usize,
+    student: &Option<Tensor<B, D>>,
+    teacher: &Option<Tensor<B, D>>,
+    constraint: PredictiveCodingAmortizationConstraint,
+    sample_indices: &mut PredictiveCodingSampleIndexCache<B>,
+) {
+    let (Some(student), Some(teacher)) = (student.as_ref(), teacher.as_ref()) else {
+        return;
+    };
+    if student.shape().dims::<D>() != teacher.shape().dims::<D>() {
+        return;
+    }
+    let (student, teacher) = rotating_sample_state_axis_pair(
+        student.clone(),
+        teacher.clone().detach(),
+        constraint.sample_axis,
+        constraint.max_slots,
+        constraint.sample_offset,
+        sample_indices,
+    );
+    let student_scale = student
+        .clone()
+        .detach()
+        .powf_scalar(2.0)
+        .mean()
+        .reshape([1]);
+    let teacher_scale = teacher.clone().powf_scalar(2.0).mean().reshape([1]);
+    let scale = (student_scale + teacher_scale)
+        .clamp_min(constraint.eps.max(1.0e-12))
+        .detach();
+    let relative_mse = (student - teacher).powf_scalar(2.0).mean().reshape([1]) / scale;
+    let violation = relative_mse
+        .add_scalar(-constraint.tolerance.max(0.0).powi(2))
+        .clamp_min(0.0);
+    *total = Some(match total.take() {
+        Some(accumulated) => accumulated + violation,
+        None => violation,
+    });
+    *components = components.saturating_add(1);
 }
 
 fn update_predictive_coding_tensor<B: AutodiffBackend, const D: usize>(
@@ -635,13 +822,151 @@ fn update_predictive_coding_tensor<B: AutodiffBackend, const D: usize>(
     };
     if sync_diagnostics {
         let update = burn_pc::pc_sgd_update_with_metrics(base, grad, config);
-        stats.record_synced(update.grad_norm, update.delta_rms);
+        stats.record_synced(
+            update.grad_norm,
+            update.grad_norm_max,
+            update.delta_rms,
+            update.clip_fraction,
+        );
         *slot = Some(Tensor::from_inner(update.tensor).detach());
     } else {
         let updated = burn_pc::pc_sgd_update(base, grad, config);
         stats.record_unsynced();
         *slot = Some(Tensor::from_inner(updated).detach());
     }
+}
+
+#[derive(Default)]
+struct PredictiveCodingPresenceMapper {
+    present: bool,
+}
+
+impl<B: BackendTrait> PredictiveCodingStateMapper<B> for PredictiveCodingPresenceMapper {
+    fn map_rank3(
+        &mut self,
+        _name: &'static str,
+        tensor: Option<Tensor<B, 3>>,
+    ) -> Option<Tensor<B, 3>> {
+        self.present |= tensor.is_some();
+        tensor
+    }
+
+    fn map_rank4(
+        &mut self,
+        _name: &'static str,
+        tensor: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>> {
+        self.present |= tensor.is_some();
+        tensor
+    }
+}
+
+#[derive(Default)]
+struct PredictiveCodingAttachMapper {
+    attached: bool,
+}
+
+impl<B: BackendTrait> PredictiveCodingStateMapper<B> for PredictiveCodingAttachMapper {
+    fn map_rank3(
+        &mut self,
+        _name: &'static str,
+        mut tensor: Option<Tensor<B, 3>>,
+    ) -> Option<Tensor<B, 3>> {
+        self.attached |= attach_predictive_coding_tensor(&mut tensor);
+        tensor
+    }
+
+    fn map_rank4(
+        &mut self,
+        _name: &'static str,
+        mut tensor: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>> {
+        self.attached |= attach_predictive_coding_tensor(&mut tensor);
+        tensor
+    }
+}
+
+struct PredictiveCodingUpdateMapper<'a, B: AutodiffBackend> {
+    grads: &'a B::Gradients,
+    config: &'a burn_pc::PcInferenceConfig,
+    sync_diagnostics: bool,
+    stats: PredictiveCodingTensorUpdateStats,
+}
+
+impl<B: AutodiffBackend> PredictiveCodingStateMapper<B> for PredictiveCodingUpdateMapper<'_, B> {
+    fn map_rank3(
+        &mut self,
+        _name: &'static str,
+        mut tensor: Option<Tensor<B, 3>>,
+    ) -> Option<Tensor<B, 3>> {
+        update_predictive_coding_tensor(
+            &mut tensor,
+            self.grads,
+            self.config,
+            self.sync_diagnostics,
+            &mut self.stats,
+        );
+        tensor
+    }
+
+    fn map_rank4(
+        &mut self,
+        _name: &'static str,
+        mut tensor: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>> {
+        update_predictive_coding_tensor(
+            &mut tensor,
+            self.grads,
+            self.config,
+            self.sync_diagnostics,
+            &mut self.stats,
+        );
+        tensor
+    }
+}
+
+struct PredictiveCodingStateSnapshot<B: BackendTrait> {
+    rank3: Vec<(&'static str, Option<Tensor<B, 3>>)>,
+    rank4: Vec<(&'static str, Option<Tensor<B, 4>>)>,
+}
+
+impl<B: BackendTrait> Default for PredictiveCodingStateSnapshot<B> {
+    fn default() -> Self {
+        Self {
+            rank3: Vec::new(),
+            rank4: Vec::new(),
+        }
+    }
+}
+
+impl<B: BackendTrait> PredictiveCodingStateMapper<B> for PredictiveCodingStateSnapshot<B> {
+    fn map_rank3(
+        &mut self,
+        name: &'static str,
+        tensor: Option<Tensor<B, 3>>,
+    ) -> Option<Tensor<B, 3>> {
+        self.rank3.push((name, tensor.clone()));
+        tensor
+    }
+
+    fn map_rank4(
+        &mut self,
+        name: &'static str,
+        tensor: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>> {
+        self.rank4.push((name, tensor.clone()));
+        tensor
+    }
+}
+
+fn predictive_coding_state_snapshot<B: BackendTrait>(
+    state: &ModelState<B>,
+    scope: PredictiveCodingStateScope,
+) -> PredictiveCodingStateSnapshot<B> {
+    let mut state = state.clone();
+    let mut snapshot = PredictiveCodingStateSnapshot::default();
+    map_predictive_coding_state(&mut state, scope, &mut snapshot);
+    snapshot
 }
 
 fn scalar_tensor_to_f64<B: BackendTrait>(tensor: Tensor<B, 1>) -> f64 {
@@ -703,6 +1028,8 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     pub tbptt_persist_across_steps: bool,
     #[module(skip)]
+    retain_ephemeral_terminal_sequence_state: bool,
+    #[module(skip)]
     pub objective: TrainingObjectiveConfig,
     #[module(skip)]
     input_corruption: CausalInputCorruptionConfig,
@@ -737,6 +1064,8 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     gradient_scale_step: Arc<AtomicUsize>,
     #[module(skip)]
+    stochastic_seed: u64,
+    #[module(skip)]
     ruliad_policy_telemetry_path: Option<Arc<PathBuf>>,
     #[module(skip)]
     ruliad_structured_recovery_telemetry_path: Option<Arc<PathBuf>>,
@@ -754,6 +1083,8 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     ruliad_generated_attractor_telemetry_path: Option<Arc<PathBuf>>,
     #[module(skip)]
     ruliad_verifier_rollout_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
+    ruliad_proof_policy_telemetry_path: Option<Arc<PathBuf>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -854,12 +1185,15 @@ struct RuliadAnswerContractTelemetry {
 #[derive(Clone, Debug, Serialize)]
 struct RuliadFieldBindingContrastTelemetry {
     version: u32,
+    objective: &'static str,
     step_index: usize,
     skip_reason: Option<String>,
     sample_groups: usize,
+    oracle_prompt_count: usize,
     prompt_pairs: usize,
     contrast_pairs: usize,
     candidate_pairs: usize,
+    filtered_presented_action_candidates: usize,
     contrast_discriminative_tokens: usize,
     negative_pool_size: usize,
     replay_pool_size: usize,
@@ -874,6 +1208,10 @@ struct RuliadFieldBindingContrastTelemetry {
     margin_satisfied_token_fraction: Option<f64>,
     exact_pair_rank_fraction: Option<f64>,
     exact_pair_margin_fraction: Option<f64>,
+    sequence_rank_metric_pairs: usize,
+    sequence_log_probability_margin_mean: Option<f64>,
+    positive_sequence_fraction: Option<f64>,
+    sequence_margin_satisfied_fraction: Option<f64>,
     field_binding_contrast_weight: f32,
     field_binding_contrast_margin: f32,
     field_binding_contrast_pair_weight: f32,
@@ -941,6 +1279,42 @@ struct RuliadGeneratedAttractorReplayTelemetry {
     max_dominant_fraction: f32,
 }
 
+struct RuliadGeneratedAttractorQuery<'a> {
+    family: &'a str,
+    task_kind: &'a str,
+    expected_contract: &'a str,
+    expected_answer: &'a str,
+    min_count: usize,
+    max_candidates: usize,
+    min_distinct_answers: usize,
+    max_dominant_fraction: f32,
+}
+
+type RuliadPromptSchemaValueRow = (Vec<i64>, Vec<i64>, Vec<f32>, usize);
+
+fn take_rows_round_robin<T: Clone>(groups: &[Vec<T>], limit: usize) -> Vec<(usize, T)> {
+    let mut selected = Vec::with_capacity(limit);
+    let mut rank = 0usize;
+    while selected.len() < limit {
+        let mut selected_this_round = 0usize;
+        for (group_index, group) in groups.iter().enumerate() {
+            if let Some(row) = group.get(rank) {
+                selected.push((group_index, row.clone()));
+                selected_this_round = selected_this_round.saturating_add(1);
+                if selected.len() == limit {
+                    break;
+                }
+            }
+        }
+        if selected_this_round == 0 {
+            break;
+        }
+        rank = rank.saturating_add(1);
+    }
+    selected
+}
+type LaggedPredictionTensors<B> = (Tensor<B, 3>, Tensor<B, 2, Int>, Tensor<B, 2, Int>);
+
 impl RuliadGeneratedAttractorReplay {
     fn record(
         &mut self,
@@ -985,15 +1359,18 @@ impl RuliadGeneratedAttractorReplay {
 
     fn candidates_for(
         &self,
-        family: &str,
-        task_kind: &str,
-        expected_contract: &str,
-        expected_answer: &str,
-        min_count: usize,
-        max_candidates: usize,
-        min_distinct_answers: usize,
-        max_dominant_fraction: f32,
+        query: RuliadGeneratedAttractorQuery<'_>,
     ) -> Vec<RuliadGeneratedAttractorEntry> {
+        let RuliadGeneratedAttractorQuery {
+            family,
+            task_kind,
+            expected_contract,
+            expected_answer,
+            min_count,
+            max_candidates,
+            min_distinct_answers,
+            max_dominant_fraction,
+        } = query;
         if max_candidates == 0 {
             return Vec::new();
         }
@@ -1091,6 +1468,14 @@ struct RuliadFieldBindingRankStats {
     exact_pair_margin_fraction: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RuliadFieldBindingSequenceRankStats {
+    pairs: usize,
+    log_probability_margin_mean: Option<f64>,
+    positive_sequence_fraction: Option<f64>,
+    margin_satisfied_sequence_fraction: Option<f64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct RuliadStructuredRecoveryTelemetry {
     version: u32,
@@ -1137,6 +1522,312 @@ struct RuliadVerifierRolloutImitationTelemetry {
     rollout_imitation_weight: f32,
     rollout_recovery_weight: f32,
     max_completion_tokens: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadProofPolicyDaggerTelemetry {
+    version: u32,
+    answer_contract: &'static str,
+    objective: &'static str,
+    gradient_scope: &'static str,
+    presentation_risk: &'static str,
+    configured_mode: &'static str,
+    mode: &'static str,
+    candidate_symmetry: &'static str,
+    step_index: usize,
+    skip_reason: Option<String>,
+    available_sample_groups: usize,
+    sample_groups: usize,
+    nonzero_start_trajectories: usize,
+    mean_start_step: f64,
+    visited_states: usize,
+    semantic_state_rows: usize,
+    base_semantic_state_rows: usize,
+    counterfactual_semantic_state_rows: usize,
+    counterfactual_target_shortfall: usize,
+    expert_rows: usize,
+    static_expert_rows: usize,
+    dagger_expert_rows: usize,
+    model_visited_expert_rows: usize,
+    supervised_action_tokens: usize,
+    supervised_presentation_rows: usize,
+    mean_presentations_per_state: f64,
+    model_valid_actions: usize,
+    model_invalid_actions: usize,
+    model_expert_equivalent_actions: usize,
+    model_off_expert_actions: usize,
+    repeated_states: usize,
+    model_backtracks: usize,
+    solved_proofs: usize,
+    model_scoring_batches: usize,
+    maximum_model_scoring_batch_rows: usize,
+    model_scoring_padded_tokens: usize,
+    sampling_model_materialize_ms: f64,
+    state_prepare_ms: f64,
+    rollout_cpu_prepare_ms: f64,
+    model_scoring_ms: f64,
+    difficulty_sample_groups: BTreeMap<usize, usize>,
+    difficulty_visited_states: BTreeMap<usize, usize>,
+    difficulty_expert_rows: BTreeMap<usize, usize>,
+    expert_selected_index_histogram: BTreeMap<usize, usize>,
+    expert_equivalent_index_histogram: BTreeMap<usize, usize>,
+    model_selected_index_histogram: BTreeMap<usize, usize>,
+    candidate_target_tokens: usize,
+    equivalent_target_tokens: usize,
+    mean_candidate_targets_per_row: f64,
+    mean_equivalent_targets_per_row: f64,
+    prefix_branch_rows: usize,
+    prefix_candidate_tokens: usize,
+    prefix_equivalent_tokens: usize,
+    weight: f32,
+    rollout_steps: usize,
+    rollout_depth_reached: usize,
+    configured_rollout_steps: usize,
+    trajectory_budget: usize,
+    semantic_row_budget: usize,
+    base_semantic_row_budget: usize,
+    configured_counterfactual_targets_per_state: usize,
+    target_variants_per_state: usize,
+    max_rows_per_update: usize,
+    max_presentation_rows_per_update: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuliadProofPolicyBatchPlan {
+    static_row_budget: usize,
+    dagger_row_budget: usize,
+    dagger_trajectory_budget: usize,
+    dagger_base_depth: usize,
+    dagger_depth_remainder: usize,
+    rollout_steps: usize,
+}
+
+impl RuliadProofPolicyBatchPlan {
+    fn new(
+        mode: crate::config::RuliadProofPolicyEffectiveMode,
+        max_rows_per_update: usize,
+        configured_rollout_steps: usize,
+        stratified_difficulty_levels: usize,
+    ) -> Self {
+        let maximum_rows = max_rows_per_update.max(1);
+        let (static_row_budget, dagger_row_budget) = match mode {
+            crate::config::RuliadProofPolicyEffectiveMode::StaticExpert => (maximum_rows, 0),
+            crate::config::RuliadProofPolicyEffectiveMode::Dagger => (0, maximum_rows),
+            crate::config::RuliadProofPolicyEffectiveMode::PairedDagger => {
+                let dagger_rows = maximum_rows / 2;
+                (maximum_rows - dagger_rows, dagger_rows)
+            }
+        };
+        let configured_rollout_steps = configured_rollout_steps.max(1);
+        let dagger_trajectory_budget = if dagger_row_budget == 0 {
+            0
+        } else {
+            dagger_row_budget
+                .div_ceil(configured_rollout_steps)
+                .max(stratified_difficulty_levels.max(1).min(dagger_row_budget))
+        };
+        let dagger_base_depth = dagger_row_budget
+            .checked_div(dagger_trajectory_budget)
+            .unwrap_or(0);
+        let dagger_depth_remainder = dagger_row_budget
+            .checked_rem(dagger_trajectory_budget)
+            .unwrap_or(0);
+        let rollout_steps = if dagger_trajectory_budget == 0 {
+            1
+        } else {
+            dagger_base_depth + usize::from(dagger_depth_remainder > 0)
+        };
+        debug_assert!(rollout_steps <= configured_rollout_steps);
+        Self {
+            static_row_budget,
+            dagger_row_budget,
+            dagger_trajectory_budget,
+            dagger_base_depth,
+            dagger_depth_remainder,
+            rollout_steps,
+        }
+    }
+
+    fn trajectory_budget(self) -> usize {
+        self.static_row_budget
+            .saturating_add(self.dagger_trajectory_budget)
+    }
+
+    fn dagger_depth(self, trajectory_index: usize) -> usize {
+        self.dagger_base_depth + usize::from(trajectory_index < self.dagger_depth_remainder)
+    }
+}
+
+fn verifier_equivalent_action_loss<B: Backend>(
+    branch_logits: Tensor<B, 3>,
+    candidate_mask: Tensor<B, 3>,
+    equivalent_mask: Tensor<B, 3>,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    weight: f32,
+) -> Tensor<B, 1> {
+    let row_count = branch_logits.shape().dims::<3>()[0];
+    verifier_equivalent_action_log_probabilities(
+        branch_logits,
+        candidate_mask,
+        equivalent_mask,
+        normalization,
+    )
+    .sum()
+    .reshape([1])
+    .div_scalar(row_count.max(1) as f32)
+    .mul_scalar(-weight)
+}
+
+fn verifier_equivalent_action_log_probabilities<B: Backend>(
+    branch_logits: Tensor<B, 3>,
+    candidate_mask: Tensor<B, 3>,
+    equivalent_mask: Tensor<B, 3>,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+) -> Tensor<B, 1> {
+    let [row_count, branch_count, _] = branch_logits.shape().dims::<3>();
+    debug_assert_eq!(branch_count, 1);
+    let probabilities = log_probs_from_logits(branch_logits).exp();
+    let candidate_probability = (probabilities.clone() * candidate_mask)
+        .sum_dim(2)
+        .reshape([row_count])
+        .clamp_min(1.0e-12);
+    let equivalent_probability = (probabilities * equivalent_mask)
+        .sum_dim(2)
+        .reshape([row_count])
+        .clamp_min(1.0e-12);
+    let objective_probability = match normalization {
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
+            equivalent_probability
+                .div(candidate_probability)
+                .clamp_max(1.0)
+        }
+        crate::config::RuliadProofPolicyNormalization::PrefixConditional => equivalent_probability
+            .div(candidate_probability)
+            .clamp_max(1.0),
+        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => equivalent_probability,
+    };
+    objective_probability.clamp_min(1.0e-12).log()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_verifier_equivalent_action_loss<B: Backend>(
+    branch_logits: Tensor<B, 3>,
+    candidate_mask: Tensor<B, 3>,
+    equivalent_mask: Tensor<B, 3>,
+    row_weights: Tensor<B, 1>,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    presentation_risk: crate::config::RuliadProofPolicyPresentationRisk,
+    presentation_group_size: usize,
+    weight: f32,
+) -> Tensor<B, 1> {
+    let row_log_probabilities = verifier_equivalent_action_log_probabilities(
+        branch_logits,
+        candidate_mask,
+        equivalent_mask,
+        normalization,
+    );
+    grouped_action_log_probability_loss(
+        row_log_probabilities,
+        row_weights,
+        presentation_risk,
+        presentation_group_size,
+        weight,
+    )
+}
+
+fn sequence_logsumexp<B: Backend>(scores: Tensor<B, 2>) -> Tensor<B, 1> {
+    let row_count = scores.shape().dims::<2>()[0];
+    let maximum = scores.clone().max_dim(1);
+    ((scores - maximum.clone())
+        .exp()
+        .sum_dim(1)
+        .clamp_min(1.0e-12)
+        .log()
+        + maximum)
+        .reshape([row_count])
+}
+
+fn verifier_equivalent_sequence_log_probabilities<B: Backend>(
+    mean_log_scores: Tensor<B, 2>,
+    sum_log_scores: Tensor<B, 2>,
+    equivalent_mask: Tensor<B, 2>,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+) -> Tensor<B, 1> {
+    match normalization {
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
+            let equivalent_scores =
+                mean_log_scores.clone() + equivalent_mask.sub_scalar(1.0).mul_scalar(1.0e9);
+            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(mean_log_scores)
+        }
+        crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
+            let equivalent_scores =
+                mean_log_scores.clone() + equivalent_mask.sub_scalar(1.0).mul_scalar(1.0e9);
+            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(mean_log_scores)
+        }
+        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
+            let equivalent_scores =
+                sum_log_scores + equivalent_mask.sub_scalar(1.0).mul_scalar(1.0e9);
+            sequence_logsumexp(equivalent_scores)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GroupedVerifierSequenceLossConfig {
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    presentation_risk: crate::config::RuliadProofPolicyPresentationRisk,
+    presentation_group_size: usize,
+    weight: f32,
+}
+
+fn grouped_verifier_equivalent_sequence_loss<B: Backend>(
+    mean_log_scores: Tensor<B, 2>,
+    sum_log_scores: Tensor<B, 2>,
+    equivalent_mask: Tensor<B, 2>,
+    row_weights: Tensor<B, 1>,
+    config: GroupedVerifierSequenceLossConfig,
+) -> Tensor<B, 1> {
+    let row_log_probabilities = verifier_equivalent_sequence_log_probabilities(
+        mean_log_scores,
+        sum_log_scores,
+        equivalent_mask,
+        config.normalization,
+    );
+    grouped_action_log_probability_loss(
+        row_log_probabilities,
+        row_weights,
+        config.presentation_risk,
+        config.presentation_group_size,
+        config.weight,
+    )
+}
+
+fn grouped_action_log_probability_loss<B: Backend>(
+    row_log_probabilities: Tensor<B, 1>,
+    row_weights: Tensor<B, 1>,
+    presentation_risk: crate::config::RuliadProofPolicyPresentationRisk,
+    presentation_group_size: usize,
+    weight: f32,
+) -> Tensor<B, 1> {
+    if presentation_risk == crate::config::RuliadProofPolicyPresentationRisk::Mean {
+        let normalizer = row_weights.clone().sum().reshape([1]).clamp_min(1.0e-12);
+        return (row_log_probabilities * row_weights)
+            .sum()
+            .reshape([1])
+            .div(normalizer)
+            .mul_scalar(-weight);
+    }
+    let row_count = row_log_probabilities.shape().dims::<1>()[0];
+    let group_size = presentation_group_size.max(1);
+    debug_assert!(row_count.is_multiple_of(group_size));
+    let group_count = row_count.checked_div(group_size).unwrap_or_default().max(1);
+    row_log_probabilities
+        .reshape([group_count, group_size])
+        .min_dim(1)
+        .sum()
+        .reshape([1])
+        .div_scalar(group_count as f32)
+        .mul_scalar(-weight)
 }
 
 #[derive(Clone, Debug)]
@@ -1302,7 +1993,7 @@ impl RuliadPolicyRewardTelemetryAccumulator {
             }
         };
         Some(RuliadPolicyRewardTelemetry {
-            version: 1,
+            version: 2,
             step_index: self.step_index,
             mode: self.mode,
             sample_groups: self.sample_groups,
@@ -1425,6 +2116,16 @@ pub(crate) struct LatentReasoningStepDiagnostics {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SequenceStateDiagnostics {
+    pub rho_layers: usize,
+    pub rho_rms: f64,
+    /// Fraction of rho energy that varies across sampled latent-memory rows.
+    pub rho_slot_variance_ratio: f64,
+    /// RMS off-diagonal cosine similarity between sampled rho rows. Lower is less redundant.
+    pub rho_slot_redundancy: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct PredictiveCodingChunkReport {
     chunks_seen: usize,
     chunks_corrected: usize,
@@ -1435,6 +2136,9 @@ struct PredictiveCodingChunkReport {
     grad_norm_mean: Option<f64>,
     grad_norm_max: Option<f64>,
     delta_rms_mean: Option<f64>,
+    clip_fraction_mean: Option<f64>,
+    amortization_components: usize,
+    amortization_loss: Option<f64>,
     elapsed_ns: u128,
 }
 
@@ -1452,21 +2156,29 @@ impl PredictiveCodingChunkReport {
         self.skipped_empty_state = self
             .skipped_empty_state
             .saturating_add(report.skipped_empty_state);
+        self.amortization_components = self
+            .amortization_components
+            .saturating_add(report.amortization_components);
         self.elapsed_ns = self.elapsed_ns.saturating_add(report.elapsed_ns);
     }
 
     fn record(self) {
         crate::train::profile::record_predictive_coding(
-            self.chunks_seen,
-            self.chunks_corrected,
-            self.inference_steps,
-            self.skipped_empty_state,
-            self.energy_before,
-            self.energy_after,
-            self.grad_norm_mean,
-            self.grad_norm_max,
-            self.delta_rms_mean,
-            self.elapsed_ns,
+            crate::train::profile::PredictiveCodingProfileRecord {
+                chunks_seen: self.chunks_seen,
+                chunks_corrected: self.chunks_corrected,
+                inference_steps: self.inference_steps,
+                skipped_empty_state: self.skipped_empty_state,
+                energy_before: self.energy_before,
+                energy_after: self.energy_after,
+                grad_norm_mean: self.grad_norm_mean,
+                grad_norm_max: self.grad_norm_max,
+                delta_rms_mean: self.delta_rms_mean,
+                clip_fraction_mean: self.clip_fraction_mean,
+                amortization_components: self.amortization_components,
+                amortization_loss: self.amortization_loss,
+                elapsed_ns: self.elapsed_ns,
+            },
         );
     }
 }
@@ -1478,6 +2190,7 @@ struct PredictiveCodingTensorUpdateStats {
     grad_norm_sum: f64,
     grad_norm_max: f64,
     delta_rms_sum: f64,
+    clip_fraction_sum: f64,
 }
 
 impl PredictiveCodingTensorUpdateStats {
@@ -1485,15 +2198,38 @@ impl PredictiveCodingTensorUpdateStats {
         self.tensor_count = self.tensor_count.saturating_add(1);
     }
 
-    fn record_synced<B: BackendTrait>(&mut self, grad_norm: Tensor<B, 1>, delta_rms: Tensor<B, 1>) {
-        let grad_norm = scalar_tensor_to_f64(grad_norm);
-        let delta_rms = scalar_tensor_to_f64(delta_rms);
-        if grad_norm.is_finite() && delta_rms.is_finite() {
+    fn record_synced<B: BackendTrait>(
+        &mut self,
+        grad_norm: Tensor<B, 1>,
+        grad_norm_max: Tensor<B, 1>,
+        delta_rms: Tensor<B, 1>,
+        clip_fraction: Tensor<B, 1>,
+    ) {
+        let values = Tensor::cat(vec![grad_norm, grad_norm_max, delta_rms, clip_fraction], 0)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("predictive-coding diagnostic tensor");
+        let [grad_norm, grad_norm_max, delta_rms, clip_fraction] = values.as_slice() else {
+            return;
+        };
+        let (grad_norm, grad_norm_max, delta_rms, clip_fraction) = (
+            *grad_norm as f64,
+            *grad_norm_max as f64,
+            *delta_rms as f64,
+            *clip_fraction as f64,
+        );
+        if grad_norm.is_finite()
+            && grad_norm_max.is_finite()
+            && delta_rms.is_finite()
+            && clip_fraction.is_finite()
+        {
             self.tensor_count = self.tensor_count.saturating_add(1);
             self.diagnostic_count = self.diagnostic_count.saturating_add(1);
             self.grad_norm_sum += grad_norm;
-            self.grad_norm_max = self.grad_norm_max.max(grad_norm);
+            self.grad_norm_max = self.grad_norm_max.max(grad_norm_max);
             self.delta_rms_sum += delta_rms;
+            self.clip_fraction_sum += clip_fraction;
         }
     }
 
@@ -1507,6 +2243,10 @@ impl PredictiveCodingTensorUpdateStats {
 
     fn delta_rms_mean(self) -> Option<f64> {
         (self.diagnostic_count > 0).then(|| self.delta_rms_sum / self.diagnostic_count as f64)
+    }
+
+    fn clip_fraction_mean(self) -> Option<f64> {
+        (self.diagnostic_count > 0).then(|| self.clip_fraction_sum / self.diagnostic_count as f64)
     }
 }
 
@@ -1537,6 +2277,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             tbptt_chunk_size: None,
             pipeline_plan: None,
             tbptt_persist_across_steps: false,
+            retain_ephemeral_terminal_sequence_state: false,
             objective: TrainingObjectiveConfig::NextToken,
             input_corruption: CausalInputCorruptionConfig::default(),
             logit_entropy_floor: LogitEntropyFloorConfig::default(),
@@ -1553,6 +2294,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             streaming_state: PipelineRuntimeCell::default(),
             gradient_scale_schedule: GradientScaleSchedule::default(),
             gradient_scale_step: Arc::new(AtomicUsize::new(0)),
+            stochastic_seed: 0,
             ruliad_policy_telemetry_path: None,
             ruliad_structured_recovery_telemetry_path: None,
             ruliad_answer_contract_telemetry_path: None,
@@ -1564,6 +2306,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             )),
             ruliad_generated_attractor_telemetry_path: None,
             ruliad_verifier_rollout_telemetry_path: None,
+            ruliad_proof_policy_telemetry_path: None,
         }
     }
 
@@ -1595,6 +2338,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub fn with_ephemeral_terminal_sequence_state_retention(mut self, retain: bool) -> Self {
+        self.retain_ephemeral_terminal_sequence_state = retain;
+        self
+    }
+
     pub fn with_training_objective(mut self, objective: TrainingObjectiveConfig) -> Self {
         self.teacher_model =
             (!objective.is_next_token()).then(|| detach_teacher_model(&self.model));
@@ -1615,7 +2363,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     /// Keep this path shared by local, distributed, and peer-to-peer executors so that
     /// changing the launch mode cannot silently change what the model is optimizing.
     pub fn with_training_objectives(self, training: &TrainingHyperparameters) -> Self {
-        self.with_training_objective(training.objective.clone())
+        self.with_stochastic_seed(training.seed)
+            .with_training_objective(training.objective.clone())
             .with_input_corruption(training.input_corruption.clone())
             .with_logit_entropy_floor(training.logit_entropy_floor.clone())
             .with_repeat_unlikelihood(training.repeat_unlikelihood.clone())
@@ -1624,6 +2373,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .with_predictive_coding(training.predictive_coding.clone())
             .with_latent_reasoning(training.latent_reasoning.clone())
             .with_ruliad_supervision(training.ruliad_supervision)
+    }
+
+    pub fn with_stochastic_seed(mut self, seed: u64) -> Self {
+        self.stochastic_seed = seed;
+        self
     }
 
     /// Applies the complete launch-independent language training contract.
@@ -1638,6 +2392,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self.with_training_objectives(training)
             .with_tbptt_chunk_size(training.tbptt_chunk_size)
             .with_tbptt_persist_across_steps(training.tbptt_persist_across_steps)
+            .with_ephemeral_terminal_sequence_state_retention(
+                training.retain_ephemeral_terminal_sequence_state,
+            )
             .with_continual_backprop(&training.continual_backprop)
             .with_gradient_scale_schedule(training, total_steps)
     }
@@ -1772,6 +2529,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self
     }
 
+    pub fn with_ruliad_proof_policy_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
+        self.ruliad_proof_policy_telemetry_path = path.map(Arc::new);
+        self
+    }
+
     pub fn set_recovery_auxiliary_active(&self, active: bool) {
         self.greedy_rollout_recovery_active
             .store(active, Ordering::Relaxed);
@@ -1855,9 +2617,30 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .filter(|chunk_size| *chunk_size > 0 && *chunk_size < block_size)
     }
 
-    fn load_step_state(&self, reset_stream_state: bool) -> ModelState<B> {
+    fn can_elide_terminal_sequence_state(&self, block_size: usize) -> bool {
+        !self.retain_ephemeral_terminal_sequence_state
+            && !self.tbptt_persist_across_steps
+            && self.effective_tbptt_chunk_size(block_size).is_none()
+            && !self.pipeline_enabled()
+            && !self.predictive_coding.enabled
+            && !(self.latent_reasoning.enabled
+                && (self.latent_reasoning.dragon_state.enabled
+                    || (self.latent_reasoning.sigreg.enabled
+                        && matches!(
+                            self.latent_reasoning.sigreg.target,
+                            crate::config::LatentReasoningSigRegTarget::RhoMemorySlots
+                                | crate::config::LatentReasoningSigRegTarget::HiddenAndRhoMemorySlots
+                        ))))
+            && self.model.supports_terminal_sequence_state_elision()
+    }
+
+    fn load_step_state(&self, reset_stream_state: bool, block_size: usize) -> ModelState<B> {
         if !self.tbptt_persist_across_steps {
-            return self.model.init_state_ephemeral();
+            return if self.can_elide_terminal_sequence_state(block_size) {
+                self.model.init_state_stateless()
+            } else {
+                self.model.init_state_ephemeral()
+            };
         }
         let mut runtime = self
             .streaming_state
@@ -2577,57 +3360,45 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         None
     }
 
-    fn predictive_coding_active_for_chunk(&self, step_index: usize, chunk_index: usize) -> bool {
-        self.predictive_coding.enabled
-            && step_index >= self.predictive_coding.warmup_steps
-            && chunk_index.is_multiple_of(self.predictive_coding.apply_every_chunks.max(1))
+    fn predictive_coding_active_for_chunk(
+        &self,
+        step_index: usize,
+        chunk_index: usize,
+        chunks_per_step: usize,
+    ) -> bool {
+        if !self.predictive_coding.enabled || step_index < self.predictive_coding.warmup_steps {
+            return false;
+        }
+        predictive_coding_chunk_due(
+            self.predictive_coding.observation_contract,
+            step_index,
+            chunk_index,
+            chunks_per_step,
+            self.predictive_coding.apply_every_chunks,
+        )
     }
 
     fn predictive_coding_inference_config(&self) -> burn_pc::PcInferenceConfig {
-        burn_pc::PcInferenceConfig {
-            steps: self.predictive_coding.steps,
-            step_size: self.predictive_coding.step_size,
-            latent_decay: self.predictive_coding.latent_decay,
-            max_grad_norm: self.predictive_coding.max_grad_norm,
-            eps: self.predictive_coding.eps,
-        }
+        self.predictive_coding.inference_config()
     }
 
     fn predictive_coding_state_has_latents(
         state: &ModelState<B>,
         scope: PredictiveCodingStateScope,
     ) -> bool {
-        state.layers.iter().any(|layer| {
-            let core = layer.rho.is_some() || layer.y_neuron_state.is_some();
-            core || (matches!(scope, PredictiveCodingStateScope::All)
-                && (layer.sequence_aux.is_some()
-                    || layer.mamba_angle_state.is_some()
-                    || layer.mamba_k_state.is_some()
-                    || layer.mamba_v_state.is_some()
-                    || layer.clocked_slow_hidden.is_some()
-                    || layer.summary_memory_hidden.is_some()))
-        })
+        let mut state = state.clone();
+        let mut mapper = PredictiveCodingPresenceMapper::default();
+        map_predictive_coding_state(&mut state, scope, &mut mapper);
+        mapper.present
     }
 
     fn attach_predictive_coding_state_latents(
         state: &mut ModelState<B>,
         scope: PredictiveCodingStateScope,
     ) -> bool {
-        let mut attached = false;
-        for layer in &mut state.layers {
-            layer.rho_norm = None;
-            attached |= attach_predictive_coding_tensor(&mut layer.rho);
-            attached |= attach_predictive_coding_tensor(&mut layer.y_neuron_state);
-            if matches!(scope, PredictiveCodingStateScope::All) {
-                attached |= attach_predictive_coding_tensor(&mut layer.sequence_aux);
-                attached |= attach_predictive_coding_tensor(&mut layer.mamba_angle_state);
-                attached |= attach_predictive_coding_tensor(&mut layer.mamba_k_state);
-                attached |= attach_predictive_coding_tensor(&mut layer.mamba_v_state);
-                attached |= attach_predictive_coding_tensor(&mut layer.clocked_slow_hidden);
-                attached |= attach_predictive_coding_tensor(&mut layer.summary_memory_hidden);
-            }
-        }
-        attached
+        let mut mapper = PredictiveCodingAttachMapper::default();
+        map_predictive_coding_state(state, scope, &mut mapper);
+        mapper.attached
     }
 
     fn update_predictive_coding_state_latents(
@@ -2640,73 +3411,19 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     where
         B: AutodiffBackend,
     {
-        let mut stats = PredictiveCodingTensorUpdateStats::default();
-        for layer in &mut state.layers {
-            layer.rho_norm = None;
-            update_predictive_coding_tensor(
-                &mut layer.rho,
-                grads,
-                config,
-                sync_diagnostics,
-                &mut stats,
-            );
-            update_predictive_coding_tensor(
-                &mut layer.y_neuron_state,
-                grads,
-                config,
-                sync_diagnostics,
-                &mut stats,
-            );
-            if matches!(scope, PredictiveCodingStateScope::All) {
-                update_predictive_coding_tensor(
-                    &mut layer.sequence_aux,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-                update_predictive_coding_tensor(
-                    &mut layer.mamba_angle_state,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-                update_predictive_coding_tensor(
-                    &mut layer.mamba_k_state,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-                update_predictive_coding_tensor(
-                    &mut layer.mamba_v_state,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-                update_predictive_coding_tensor(
-                    &mut layer.clocked_slow_hidden,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-                update_predictive_coding_tensor(
-                    &mut layer.summary_memory_hidden,
-                    grads,
-                    config,
-                    sync_diagnostics,
-                    &mut stats,
-                );
-            }
-        }
-        stats
+        let mut mapper = PredictiveCodingUpdateMapper::<B> {
+            grads,
+            config,
+            sync_diagnostics,
+            stats: PredictiveCodingTensorUpdateStats::default(),
+        };
+        map_predictive_coding_state(state, scope, &mut mapper);
+        mapper.stats
     }
 
-    fn predictive_coding_energy_with_state(
+    fn predictive_coding_oracle_energy_with_state(
         &self,
+        inference_model: &DragonModel<B>,
         inputs: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
         loss_mask: Option<Tensor<B, 2, Int>>,
@@ -2714,16 +3431,73 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         state: &mut ModelState<B>,
     ) -> Tensor<B, 1> {
         let hidden = if let Some(mask) = summary_event_mask {
-            self.model
-                .forward_hidden_with_state_and_summary_event_mask(inputs, mask, state)
+            inference_model.forward_hidden_with_state_and_summary_event_mask(inputs, mask, state)
         } else {
-            self.model.forward_hidden_with_state(inputs, state)
+            inference_model.forward_hidden_with_state(inputs, state)
         };
         self.language_loss_from_hidden(hidden, targets, loss_mask)
     }
 
-    fn correct_state_with_predictive_coding(
+    fn predictive_coding_amortization_constraint(
         &self,
+        student: &ModelState<B>,
+        teacher: &ModelState<B>,
+    ) -> (Option<Tensor<B, 1>>, usize) {
+        let mut total = None;
+        let mut components = 0usize;
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let constraint = PredictiveCodingAmortizationConstraint {
+            sample_axis: 2,
+            max_slots: self.predictive_coding.amortization_max_state_slots.max(1),
+            sample_offset: stochastic_step_seed(
+                self.stochastic_seed,
+                step_index,
+                STOCHASTIC_STREAM_PC_AMORTIZATION,
+            ) as usize,
+            tolerance: self.predictive_coding.amortization_tolerance.max(0.0),
+            eps: self.predictive_coding.eps.max(1.0e-12),
+        };
+        let scope = self.predictive_coding.state_scope;
+        let student = predictive_coding_state_snapshot(student, scope);
+        let teacher = predictive_coding_state_snapshot(teacher, scope);
+        let mut sample_indices = PredictiveCodingSampleIndexCache::new();
+        debug_assert_eq!(student.rank3.len(), teacher.rank3.len());
+        debug_assert_eq!(student.rank4.len(), teacher.rank4.len());
+        for ((student_name, student), (teacher_name, teacher)) in
+            student.rank3.iter().zip(&teacher.rank3)
+        {
+            debug_assert_eq!(student_name, teacher_name);
+            accumulate_predictive_coding_amortization_constraint(
+                &mut total,
+                &mut components,
+                student,
+                teacher,
+                constraint,
+                &mut sample_indices,
+            );
+        }
+        for ((student_name, student), (teacher_name, teacher)) in
+            student.rank4.iter().zip(&teacher.rank4)
+        {
+            debug_assert_eq!(student_name, teacher_name);
+            accumulate_predictive_coding_amortization_constraint(
+                &mut total,
+                &mut components,
+                student,
+                teacher,
+                constraint,
+                &mut sample_indices,
+            );
+        }
+        (
+            total.map(|loss| loss.div_scalar(components.max(1) as f32)),
+            components,
+        )
+    }
+
+    fn correct_state_with_oracle_predictive_coding_using_model(
+        &self,
+        inference_model: &DragonModel<B>,
         state: ModelState<B>,
         inputs: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
@@ -2755,7 +3529,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 break;
             }
             let mut inference_state = corrected.clone();
-            let energy = self.predictive_coding_energy_with_state(
+            let energy = self.predictive_coding_oracle_energy_with_state(
+                inference_model,
                 inputs.clone(),
                 targets.clone(),
                 loss_mask.clone(),
@@ -2787,6 +3562,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             update_stats.grad_norm_sum += step_stats.grad_norm_sum;
             update_stats.grad_norm_max = update_stats.grad_norm_max.max(step_stats.grad_norm_max);
             update_stats.delta_rms_sum += step_stats.delta_rms_sum;
+            update_stats.clip_fraction_sum += step_stats.clip_fraction_sum;
             report.inference_steps = report.inference_steps.saturating_add(1);
             corrected.detach_in_place();
         }
@@ -2794,7 +3570,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if report.inference_steps > 0 {
             if sync_diagnostics {
                 let mut post_state = corrected.clone();
-                let post_energy = self.predictive_coding_energy_with_state(
+                let post_energy = self.predictive_coding_oracle_energy_with_state(
+                    inference_model,
                     inputs,
                     targets,
                     loss_mask,
@@ -2807,9 +3584,223 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             report.grad_norm_mean = update_stats.grad_norm_mean();
             report.grad_norm_max = update_stats.grad_norm_max();
             report.delta_rms_mean = update_stats.delta_rms_mean();
+            report.clip_fraction_mean = update_stats.clip_fraction_mean();
         }
         report.elapsed_ns = start.elapsed().as_nanos();
         (corrected, report)
+    }
+
+    fn correct_state_with_oracle_predictive_coding(
+        &self,
+        state: ModelState<B>,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (ModelState<B>, PredictiveCodingChunkReport)
+    where
+        B: AutodiffBackend,
+    {
+        let inference_model = detach_teacher_model(&self.model);
+        self.correct_state_with_oracle_predictive_coding_using_model(
+            &inference_model,
+            state,
+            inputs,
+            targets,
+            loss_mask,
+            summary_event_mask,
+        )
+    }
+
+    fn replay_observed_prefix(
+        &self,
+        inference_model: &DragonModel<B>,
+        mut state: ModelState<B>,
+        observed_inputs: Tensor<B, 2, Int>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> ModelState<B> {
+        if let Some(mask) = summary_event_mask {
+            inference_model.forward_hidden_with_state_and_summary_event_mask(
+                observed_inputs,
+                mask,
+                &mut state,
+            );
+        } else {
+            inference_model.forward_hidden_with_state(observed_inputs, &mut state);
+        }
+        state.detach_in_place();
+        state
+    }
+
+    /// Corrects the state entering an already-observed token span, then replays
+    /// that span to produce state for subsequent predictions. No next-token
+    /// targets are accepted by this API.
+    fn correct_state_from_observed_prefix_using_model(
+        &self,
+        inference_model: &DragonModel<B>,
+        state: ModelState<B>,
+        observed_inputs: Tensor<B, 2, Int>,
+        observed_loss_mask: Option<Tensor<B, 2, Int>>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (ModelState<B>, PredictiveCodingChunkReport)
+    where
+        B: AutodiffBackend,
+    {
+        let start = Instant::now();
+        let mut report = PredictiveCodingChunkReport {
+            chunks_seen: 1,
+            ..PredictiveCodingChunkReport::default()
+        };
+        let state_scope = self.predictive_coding.state_scope;
+        if !Self::predictive_coding_state_has_latents(&state, state_scope) {
+            report.skipped_empty_state = 1;
+            let replayed = self.replay_observed_prefix(
+                inference_model,
+                state,
+                observed_inputs,
+                summary_event_mask,
+            );
+            report.elapsed_ns = start.elapsed().as_nanos();
+            return (replayed, report);
+        }
+        let [batch_size, observed_length] = observed_inputs.shape().dims();
+        if observed_length < 2 {
+            report.skipped_empty_state = 1;
+            let replayed = self.replay_observed_prefix(
+                inference_model,
+                state,
+                observed_inputs,
+                summary_event_mask,
+            );
+            report.elapsed_ns = start.elapsed().as_nanos();
+            return (replayed, report);
+        }
+
+        let energy_inputs =
+            Self::slice_tokens(observed_inputs.clone(), batch_size, 0, observed_length - 1);
+        let energy_targets =
+            Self::slice_tokens(observed_inputs.clone(), batch_size, 1, observed_length);
+        let energy_loss_mask = observed_loss_mask
+            .clone()
+            .map(|mask| Self::slice_tokens(mask, batch_size, 0, observed_length - 1));
+        let energy_summary_mask = summary_event_mask
+            .clone()
+            .map(|mask| Self::slice_tokens(mask, batch_size, 0, observed_length - 1));
+
+        let config = self.predictive_coding_inference_config();
+        let sync_diagnostics = self.predictive_coding.sync_diagnostics;
+        let mut corrected_entry = state.detached_clone();
+        let mut update_stats = PredictiveCodingTensorUpdateStats::default();
+        for step in 0..config.steps {
+            if !Self::attach_predictive_coding_state_latents(&mut corrected_entry, state_scope) {
+                report.skipped_empty_state = report.skipped_empty_state.saturating_add(1);
+                break;
+            }
+            let mut inference_state = corrected_entry.clone();
+            let hidden = if let Some(mask) = energy_summary_mask.clone() {
+                inference_model.forward_hidden_with_state_and_summary_event_mask(
+                    energy_inputs.clone(),
+                    mask,
+                    &mut inference_state,
+                )
+            } else {
+                inference_model
+                    .forward_hidden_with_state(energy_inputs.clone(), &mut inference_state)
+            };
+            let energy = self.language_loss_from_hidden(
+                hidden,
+                energy_targets.clone(),
+                energy_loss_mask.clone(),
+            );
+            if sync_diagnostics && step == 0 {
+                report.energy_before = Some(scalar_tensor_to_f64(energy.clone().detach().inner()));
+            }
+            let grads = energy.backward();
+            let step_stats = Self::update_predictive_coding_state_latents(
+                &mut corrected_entry,
+                &grads,
+                &config,
+                sync_diagnostics,
+                state_scope,
+            );
+            if step_stats.tensor_count == 0 {
+                report.skipped_empty_state = report.skipped_empty_state.saturating_add(1);
+                corrected_entry.detach_in_place();
+                break;
+            }
+            update_stats.tensor_count = update_stats
+                .tensor_count
+                .saturating_add(step_stats.tensor_count);
+            update_stats.diagnostic_count = update_stats
+                .diagnostic_count
+                .saturating_add(step_stats.diagnostic_count);
+            update_stats.grad_norm_sum += step_stats.grad_norm_sum;
+            update_stats.grad_norm_max = update_stats.grad_norm_max.max(step_stats.grad_norm_max);
+            update_stats.delta_rms_sum += step_stats.delta_rms_sum;
+            update_stats.clip_fraction_sum += step_stats.clip_fraction_sum;
+            report.inference_steps = report.inference_steps.saturating_add(1);
+            corrected_entry.detach_in_place();
+        }
+
+        if report.inference_steps == 0 {
+            let replayed = self.replay_observed_prefix(
+                inference_model,
+                state,
+                observed_inputs,
+                summary_event_mask,
+            );
+            report.elapsed_ns = start.elapsed().as_nanos();
+            return (replayed, report);
+        }
+        if sync_diagnostics {
+            let mut post_state = corrected_entry.clone();
+            let hidden = if let Some(mask) = energy_summary_mask {
+                inference_model.forward_hidden_with_state_and_summary_event_mask(
+                    energy_inputs,
+                    mask,
+                    &mut post_state,
+                )
+            } else {
+                inference_model.forward_hidden_with_state(energy_inputs, &mut post_state)
+            };
+            let post_energy =
+                self.language_loss_from_hidden(hidden, energy_targets, energy_loss_mask);
+            report.energy_after = Some(scalar_tensor_to_f64(post_energy.detach().inner()));
+        }
+
+        let replayed = self.replay_observed_prefix(
+            inference_model,
+            corrected_entry,
+            observed_inputs,
+            summary_event_mask,
+        );
+        report.chunks_corrected = 1;
+        report.grad_norm_mean = update_stats.grad_norm_mean();
+        report.grad_norm_max = update_stats.grad_norm_max();
+        report.delta_rms_mean = update_stats.delta_rms_mean();
+        report.clip_fraction_mean = update_stats.clip_fraction_mean();
+        report.elapsed_ns = start.elapsed().as_nanos();
+        (replayed, report)
+    }
+
+    fn correct_state_from_observed_prefix(
+        &self,
+        state: ModelState<B>,
+        observed_inputs: Tensor<B, 2, Int>,
+        observed_loss_mask: Option<Tensor<B, 2, Int>>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+    ) -> (ModelState<B>, PredictiveCodingChunkReport)
+    where
+        B: AutodiffBackend,
+    {
+        let inference_model = detach_teacher_model(&self.model);
+        self.correct_state_from_observed_prefix_using_model(
+            &inference_model,
+            state,
+            observed_inputs,
+            observed_loss_mask,
+            summary_event_mask,
+        )
     }
 
     fn greedy_rollout_unlikelihood_weight(&self) -> f32 {
@@ -3194,7 +4185,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.structured_recovery_start_after_steps {
             return 0.0;
         }
-        if step_index % config.structured_recovery_every_steps != 0 {
+        if !step_index.is_multiple_of(config.structured_recovery_every_steps) {
             return 0.0;
         }
         config.structured_recovery_weight
@@ -3262,7 +4253,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.start_after_steps {
             return 0.0;
         }
-        if step_index % config.every_steps != 0 {
+        if !step_index.is_multiple_of(config.every_steps) {
             return 0.0;
         }
         config.weight
@@ -3304,14 +4295,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             premature_close_mask: Vec<f32>,
         }
 
-        let mut close_token_ids = tokenizer.encode_payload("\n[/R2]");
-        close_token_ids.extend(tokenizer.encode_payload("[/R2]"));
-        close_token_ids.sort_unstable();
-        close_token_ids.dedup();
-        let close_token_ids = close_token_ids
-            .into_iter()
-            .map(i64::from)
-            .collect::<Vec<_>>();
+        // A sequence terminator may only be penalized as one event when the
+        // tokenizer represents it with one structural token. Penalizing each
+        // byte in `[/R*]` independently suppresses common answer characters.
+        let close_token_ids = policy_batch.stop_token_id.into_iter().collect::<Vec<_>>();
         let premature_close_weight = config.premature_close_unlikelihood_weight;
         let mut rows = Vec::<ContractRow>::new();
         let mut sample_groups = 0usize;
@@ -3427,52 +4414,58 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         let oracle_rows = rows.len();
         if config.prompt_schema_value_weight > f32::EPSILON {
-            for sample in policy_batch.samples.iter() {
-                if prompt_schema_rows >= prompt_schema_max_rows {
-                    break;
-                }
-                let prompt = sample.prompt_tokens.clone();
-                if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+            let field_rows_by_sample = policy_batch
+                .samples
+                .iter()
+                .filter_map(|sample| {
+                    let prompt = sample.prompt_tokens.clone();
+                    if prompt.is_empty() || sample.item.expected_answer.trim().is_empty() {
+                        return None;
+                    }
+                    let field_rows = Self::ruliad_prompt_schema_value_completion_rows(
+                        &tokenizer,
+                        &prompt,
+                        &sample.item.expected_answer,
+                        sample.item.document_close_marker(),
+                        completion_budget,
+                        block_size,
+                        prompt_schema_max_rows,
+                    );
+                    (!field_rows.is_empty()).then_some(field_rows)
+                })
+                .collect::<Vec<_>>();
+            let selected_rows =
+                take_rows_round_robin(&field_rows_by_sample, prompt_schema_max_rows);
+            prompt_schema_sample_groups = selected_rows
+                .iter()
+                .map(|(sample_index, _)| *sample_index)
+                .collect::<HashSet<_>>()
+                .len();
+            for (_sample_index, (inputs, targets, mask, active_tokens)) in selected_rows {
+                if active_tokens == 0 {
                     continue;
                 }
-                let field_rows = Self::ruliad_prompt_schema_value_completion_rows(
-                    &tokenizer,
-                    &prompt,
-                    &sample.item.expected_answer,
-                    completion_budget,
-                    block_size,
-                    prompt_schema_max_rows.saturating_sub(prompt_schema_rows),
-                );
-                let mut sample_row_count = 0usize;
-                for (inputs, targets, mask, active_tokens) in field_rows {
-                    if active_tokens == 0 {
-                        continue;
-                    }
-                    let mask = mask
-                        .into_iter()
-                        .map(|value| {
-                            if value > f32::EPSILON {
-                                config.prompt_schema_value_weight
-                            } else {
-                                0.0
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let premature_close_mask = vec![0.0f32; targets.len()];
-                    contract_tokens = contract_tokens.saturating_add(active_tokens);
-                    prompt_schema_value_tokens =
-                        prompt_schema_value_tokens.saturating_add(active_tokens);
-                    prompt_schema_rows = prompt_schema_rows.saturating_add(1);
-                    sample_row_count = sample_row_count.saturating_add(1);
-                    rows.push(ContractRow {
-                        inputs,
-                        targets,
-                        mask,
-                        premature_close_mask,
-                    });
-                }
-                prompt_schema_sample_groups =
-                    prompt_schema_sample_groups.saturating_add(usize::from(sample_row_count > 0));
+                let mask = mask
+                    .into_iter()
+                    .map(|value| {
+                        if value > f32::EPSILON {
+                            config.prompt_schema_value_weight
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let premature_close_mask = vec![0.0f32; targets.len()];
+                contract_tokens = contract_tokens.saturating_add(active_tokens);
+                prompt_schema_value_tokens =
+                    prompt_schema_value_tokens.saturating_add(active_tokens);
+                prompt_schema_rows = prompt_schema_rows.saturating_add(1);
+                rows.push(ContractRow {
+                    inputs,
+                    targets,
+                    mask,
+                    premature_close_mask,
+                });
             }
         }
         let skip_reason = rows
@@ -3510,7 +4503,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let mut target_values = vec![0i64; row_count * max_len];
         let mut mask_values = vec![0.0f32; row_count * max_len];
         let mut premature_close_mask_values = vec![0.0f32; row_count * max_len];
-        for (row_index, row) in rows.into_iter().enumerate() {
+        for (row_index, row) in rows.iter().enumerate() {
             let offset = row_index * max_len;
             let len = row.inputs.len().min(max_len);
             input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
@@ -3660,6 +4653,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &negative,
+                        sample.item.document_close_marker(),
                         completion_budget,
                     )
                 else {
@@ -3798,7 +4792,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.start_after_steps {
             return 0.0;
         }
-        if step_index % config.every_steps != 0 {
+        if !step_index.is_multiple_of(config.every_steps) {
             return 0.0;
         }
         config.weight
@@ -3816,7 +4810,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.structured_contrast_start_after_steps {
             return 0.0;
         }
-        if step_index % config.structured_contrast_every_steps != 0 {
+        if !step_index.is_multiple_of(config.structured_contrast_every_steps) {
             return 0.0;
         }
         config.structured_contrast_weight
@@ -3834,7 +4828,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.field_binding_contrast_start_after_steps {
             return 0.0;
         }
-        if step_index % config.field_binding_contrast_every_steps != 0 {
+        if !step_index.is_multiple_of(config.field_binding_contrast_every_steps) {
             return 0.0;
         }
         config.field_binding_contrast_weight
@@ -3853,10 +4847,22 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if step_index < config.rollout_imitation_start_after_steps {
             return false;
         }
-        if step_index % config.rollout_imitation_every_steps != 0 {
+        if !step_index.is_multiple_of(config.rollout_imitation_every_steps) {
             return false;
         }
         true
+    }
+
+    fn ruliad_proof_policy_dagger_weight(&self) -> f32 {
+        let config = self.ruliad_supervision.proof_policy;
+        if !config.enabled || config.weight <= f32::EPSILON || config.every_steps == 0 {
+            return 0.0;
+        }
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        if step_index < config.start_after_steps || !step_index.is_multiple_of(config.every_steps) {
+            return 0.0;
+        }
+        config.weight
     }
 
     fn mix_ruliad_policy_seed(mut value: u64) -> u64 {
@@ -4243,13 +5249,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     fn write_ruliad_field_binding_contrast_skip(&self, reason: &str, weight: f32) {
         self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
-            version: 1,
+            version: 3,
+            objective: RULIAD_FIELD_BINDING_OBJECTIVE,
             step_index: self.gradient_scale_step.load(Ordering::Relaxed),
             skip_reason: Some(reason.to_string()),
             sample_groups: 0,
+            oracle_prompt_count: 0,
             prompt_pairs: 0,
             contrast_pairs: 0,
             candidate_pairs: 0,
+            filtered_presented_action_candidates: 0,
             contrast_discriminative_tokens: 0,
             negative_pool_size: 0,
             replay_pool_size: 0,
@@ -4264,6 +5273,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             margin_satisfied_token_fraction: None,
             exact_pair_rank_fraction: None,
             exact_pair_margin_fraction: None,
+            sequence_rank_metric_pairs: 0,
+            sequence_log_probability_margin_mean: None,
+            positive_sequence_fraction: None,
+            sequence_margin_satisfied_fraction: None,
             field_binding_contrast_weight: weight,
             field_binding_contrast_margin: self
                 .ruliad_supervision
@@ -4369,6 +5382,28 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
     }
 
+    fn write_ruliad_proof_policy_dagger_telemetry(
+        &self,
+        telemetry: RuliadProofPolicyDaggerTelemetry,
+    ) {
+        let Some(path) = self.ruliad_proof_policy_telemetry_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(&telemetry) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
     fn ruliad_policy_row_from_completion(
         prompt: &[i64],
         completion: &[i64],
@@ -4389,6 +5424,25 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         for value in mask.iter_mut().skip(completion_start) {
             *value = 1.0;
         }
+        Some((inputs, targets, mask))
+    }
+
+    fn ruliad_policy_row_from_completion_token(
+        prompt: &[i64],
+        completion: &[i64],
+        completion_token_index: usize,
+    ) -> Option<(Vec<i64>, Vec<i64>, Vec<f32>)> {
+        if completion_token_index >= completion.len() {
+            return None;
+        }
+        let (inputs, targets, mut mask) =
+            Self::ruliad_policy_row_from_completion(prompt, completion)?;
+        mask.fill(0.0);
+        let target_index = prompt
+            .len()
+            .saturating_sub(1)
+            .saturating_add(completion_token_index);
+        *mask.get_mut(target_index)? = 1.0;
         Some((inputs, targets, mask))
     }
 
@@ -4417,7 +5471,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if answer.is_empty() || completion_budget == 0 {
             return None;
         }
-        let full_completion = format!("{answer}\n[/R2]");
+        let full_completion = format!("{answer}\n{}", sample.item.document_close_marker());
         let mut payload_tokens = tokenizer.encode_payload(&full_completion);
         let truncated = payload_tokens.len() > completion_budget;
         payload_tokens.truncate(completion_budget);
@@ -4490,18 +5544,18 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         self.ruliad_generated_attractor_replay
             .lock()
             .map(|replay| {
-                replay.candidates_for(
-                    &sample.item.family,
-                    &sample.item.task_kind,
-                    &expected_contract,
-                    sample.item.expected_answer.trim(),
-                    config.generated_attractor_replay_min_count.max(1),
-                    config.generated_attractor_replay_max_candidates,
-                    config
+                replay.candidates_for(RuliadGeneratedAttractorQuery {
+                    family: &sample.item.family,
+                    task_kind: &sample.item.task_kind,
+                    expected_contract: &expected_contract,
+                    expected_answer: sample.item.expected_answer.trim(),
+                    min_count: config.generated_attractor_replay_min_count.max(1),
+                    max_candidates: config.generated_attractor_replay_max_candidates,
+                    min_distinct_answers: config
                         .generated_attractor_replay_min_distinct_answers
                         .max(1),
-                    config.generated_attractor_replay_max_dominant_fraction,
-                )
+                    max_dominant_fraction: config.generated_attractor_replay_max_dominant_fraction,
+                })
             })
             .unwrap_or_default()
     }
@@ -4513,6 +5567,101 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .collect()
     }
 
+    fn ruliad_model_proof_step_negative_answers(
+        answer: &str,
+        mutation_count: usize,
+        template_count: usize,
+    ) -> Option<Vec<(String, RuliadStructuredNegativeKind)>> {
+        use burn_dragon_universality::ruliad::{
+            RuliadProofSource, RuliadProofStep, RuliadRewriteDirection,
+        };
+
+        let (goal, step) = burn_dragon_universality::ruliad::wire::decode_model_proof_step(answer)?;
+
+        let mut negatives = Vec::with_capacity(mutation_count.saturating_add(template_count));
+        let mut template_rows = 0usize;
+        for index in 0..template_count.saturating_add(4) {
+            if template_rows >= template_count {
+                break;
+            }
+            let candidate = burn_dragon_universality::ruliad::wire::encode_model_proof_step(
+                index,
+                &RuliadProofStep {
+                    source: RuliadProofSource::Axiom {
+                        id: format!("r{index}"),
+                    },
+                    direction: if index.is_multiple_of(2) {
+                        RuliadRewriteDirection::Forward
+                    } else {
+                        RuliadRewriteDirection::Reverse
+                    },
+                    path: (!index.is_multiple_of(3))
+                        .then_some(vec![0])
+                        .unwrap_or_default(),
+                },
+            );
+            let previous_len = negatives.len();
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                candidate,
+                RuliadStructuredNegativeKind::TemplateCollapse,
+            );
+            template_rows =
+                template_rows.saturating_add(usize::from(negatives.len() > previous_len));
+        }
+
+        for index in 0..mutation_count {
+            let mut candidate_goal = goal;
+            let mut candidate_step = step.clone();
+            let field_count = 4;
+            let delta = index / field_count + 1;
+            match index % field_count {
+                0 => {
+                    candidate_goal = candidate_goal.saturating_add(delta);
+                }
+                1 => match &mut candidate_step.source {
+                    RuliadProofSource::Axiom { id } => {
+                        let mutated = Self::mutate_ruliad_answer_value(id, delta);
+                        *id = mutated
+                            .strip_suffix("_wrong")
+                            .map(|prefix| format!("{prefix}x"))
+                            .unwrap_or(mutated);
+                    }
+                    RuliadProofSource::Lemma { goal } => {
+                        *goal = goal.saturating_add(delta);
+                    }
+                },
+                2 => {
+                    candidate_step.direction = match candidate_step.direction {
+                        RuliadRewriteDirection::Forward => RuliadRewriteDirection::Reverse,
+                        RuliadRewriteDirection::Reverse => RuliadRewriteDirection::Forward,
+                    };
+                }
+                3 => {
+                    if candidate_step.path.is_empty() {
+                        candidate_step.path.push(delta.saturating_sub(1));
+                    } else {
+                        let path_index = (index / field_count) % candidate_step.path.len();
+                        let value = candidate_step.path.get_mut(path_index)?;
+                        *value = value.saturating_add(delta);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Self::push_ruliad_negative_answer(
+                &mut negatives,
+                answer,
+                burn_dragon_universality::ruliad::wire::encode_model_proof_step(
+                    candidate_goal,
+                    &candidate_step,
+                ),
+                RuliadStructuredNegativeKind::FieldMutation,
+            );
+        }
+        Some(negatives)
+    }
+
     fn ruliad_structured_negative_answers_with_templates(
         answer: &str,
         mutation_count: usize,
@@ -4521,6 +5670,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let answer = answer.trim();
         if answer.is_empty() || (mutation_count == 0 && template_count == 0) {
             return Vec::new();
+        }
+        if let Some(negatives) =
+            Self::ruliad_model_proof_step_negative_answers(answer, mutation_count, template_count)
+        {
+            return negatives;
         }
         let fields = answer
             .split(';')
@@ -4835,12 +5989,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     fn ruliad_completion_tokens_from_answer(
         tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
         answer: &str,
+        close_marker: &str,
         completion_budget: usize,
     ) -> Option<(Vec<i64>, String)> {
         if answer.trim().is_empty() || completion_budget == 0 {
             return None;
         }
-        let full_completion = format!("{}\n[/R2]", answer.trim());
+        let full_completion = format!("{}\n{close_marker}", answer.trim());
         let mut payload_tokens = tokenizer.encode_payload(&full_completion);
         payload_tokens.truncate(completion_budget);
         if payload_tokens.is_empty() {
@@ -4865,6 +6020,34 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         let full_completion = format!("{answer}\n[/R2]");
         let mut mask = vec![false; completion_len];
+        if burn_dragon_universality::ruliad::wire::decode_model_proof_step(answer).is_some() {
+            let mut segment_start = 0usize;
+            for (segment_index, segment) in answer.split('|').enumerate() {
+                let value_offset = match segment_index {
+                    0 => 1,
+                    1 => 2,
+                    2 | 3 => 0,
+                    _ => return vec![false; completion_len],
+                };
+                let value_start = segment_start.saturating_add(value_offset);
+                let value_end = segment_start.saturating_add(segment.len());
+                if value_start < value_end {
+                    let prefix_tokens = tokenizer
+                        .encode_payload(&full_completion[..value_start])
+                        .len();
+                    let value_tokens = tokenizer
+                        .encode_payload(&full_completion[value_start..value_end])
+                        .len();
+                    for index in prefix_tokens..prefix_tokens.saturating_add(value_tokens) {
+                        if let Some(slot) = mask.get_mut(index) {
+                            *slot = true;
+                        }
+                    }
+                }
+                segment_start = value_end.saturating_add(1);
+            }
+            return mask;
+        }
         let bytes = answer.as_bytes();
         let mut field_start = 0usize;
         while field_start < answer.len() {
@@ -5038,6 +6221,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 
     fn ruliad_answer_contract(answer: &str) -> Option<String> {
+        if burn_dragon_universality::ruliad::wire::decode_model_proof_step(answer).is_some() {
+            return Some("proof_action_step".to_string());
+        }
         let mut keys = Vec::<String>::new();
         for part in answer.trim().split(';') {
             let (key, _value) = part.split_once('=')?;
@@ -5068,36 +6254,79 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
         base_prompt: &[i64],
         answer: &str,
+        close_marker: &str,
         completion_budget: usize,
         block_size: usize,
         max_rows: usize,
-    ) -> Vec<(Vec<i64>, Vec<i64>, Vec<f32>, usize)> {
+    ) -> Vec<RuliadPromptSchemaValueRow> {
         if base_prompt.is_empty() || completion_budget == 0 || block_size < 4 || max_rows == 0 {
             return Vec::new();
         }
-        let Some(fields) = Self::ruliad_answer_fields(answer) else {
-            return Vec::new();
+        let fields = if burn_dragon_universality::ruliad::wire::decode_model_proof_step(answer)
+            .is_some()
+        {
+            let parts = answer.trim().split('|').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                return Vec::new();
+            }
+            let Some(goal) = parts[0].strip_prefix('g') else {
+                return Vec::new();
+            };
+            let (source_schema, source_value) = if let Some(source) = parts[1].strip_prefix("a:") {
+                ("a:", source)
+            } else if let Some(source) = parts[1].strip_prefix("l:") {
+                ("l:", source)
+            } else {
+                return Vec::new();
+            };
+            vec![
+                ("g".to_string(), goal.to_string(), "|".to_string()),
+                (
+                    format!("g{goal}|{source_schema}"),
+                    source_value.to_string(),
+                    "|".to_string(),
+                ),
+                (
+                    format!("g{goal}|{}|", parts[1]),
+                    parts[2].to_string(),
+                    "|".to_string(),
+                ),
+                (
+                    format!("g{goal}|{}|{}|", parts[1], parts[2]),
+                    parts[3].to_string(),
+                    format!("\n{close_marker}"),
+                ),
+            ]
+        } else {
+            let Some(answer_fields) = Self::ruliad_answer_fields(answer) else {
+                return Vec::new();
+            };
+            let mut fields = Vec::with_capacity(answer_fields.len());
+            let mut prior = String::new();
+            let field_count = answer_fields.len();
+            for (index, (key, value)) in answer_fields.into_iter().enumerate() {
+                let close = if index + 1 == field_count {
+                    format!("\n{close_marker}")
+                } else {
+                    ";".to_string()
+                };
+                fields.push((format!("{prior}{key}="), value.clone(), close));
+                prior.push_str(&key);
+                prior.push('=');
+                prior.push_str(&value);
+                prior.push(';');
+            }
+            fields
         };
         let row_completion_budget = completion_budget.min(block_size.saturating_sub(2).max(1));
-        let mut rows = Vec::<(Vec<i64>, Vec<i64>, Vec<f32>, usize)>::new();
-        let mut prior = String::new();
-        for (index, (key, value)) in fields.iter().enumerate() {
+        let mut rows = Vec::<RuliadPromptSchemaValueRow>::new();
+        for (schema_prefix, value, close) in fields {
             if rows.len() >= max_rows {
                 break;
             }
-            let schema_prefix = format!("{prior}{key}=");
-            let close = if index + 1 == fields.len() {
-                "\n[/R2]"
-            } else {
-                ";"
-            };
             let mut completion_tokens = tokenizer.encode_payload(&format!("{value}{close}"));
             completion_tokens.truncate(row_completion_budget);
             if completion_tokens.is_empty() {
-                prior.push_str(key);
-                prior.push('=');
-                prior.push_str(value);
-                prior.push(';');
                 continue;
             }
             let mut schema_prefix_tokens = tokenizer.encode_payload(&schema_prefix);
@@ -5105,10 +6334,6 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 .saturating_sub(completion_tokens.len())
                 .saturating_sub(1);
             if prefix_budget == 0 {
-                prior.push_str(key);
-                prior.push('=');
-                prior.push_str(value);
-                prior.push(';');
                 continue;
             }
             if schema_prefix_tokens.len() > prefix_budget {
@@ -5137,10 +6362,6 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     rows.push((inputs, targets, mask, active_tokens));
                 }
             }
-            prior.push_str(key);
-            prior.push('=');
-            prior.push_str(value);
-            prior.push(';');
         }
         rows
     }
@@ -5221,6 +6442,42 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
     }
 
+    fn ruliad_field_binding_sequence_rank_stats(
+        log_probability_margin: Tensor<B, 1>,
+        required_margin: f64,
+    ) -> RuliadFieldBindingSequenceRankStats {
+        let Ok(margins) = log_probability_margin
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+        else {
+            return RuliadFieldBindingSequenceRankStats::default();
+        };
+        let finite = margins
+            .into_iter()
+            .map(f64::from)
+            .filter(|margin| margin.is_finite())
+            .collect::<Vec<_>>();
+        if finite.is_empty() {
+            return RuliadFieldBindingSequenceRankStats::default();
+        }
+        let denominator = finite.len() as f64;
+        RuliadFieldBindingSequenceRankStats {
+            pairs: finite.len(),
+            log_probability_margin_mean: Some(finite.iter().sum::<f64>() / denominator),
+            positive_sequence_fraction: Some(
+                finite.iter().filter(|margin| **margin > 0.0).count() as f64 / denominator,
+            ),
+            margin_satisfied_sequence_fraction: Some(
+                finite
+                    .iter()
+                    .filter(|margin| **margin >= required_margin)
+                    .count() as f64
+                    / denominator,
+            ),
+        }
+    }
+
     fn ruliad_field_binding_contrast_loss(
         &self,
         policy_batch: &crate::dataset::RuliadPolicyBatch,
@@ -5251,6 +6508,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             family: String,
             task_kind: String,
             contract: String,
+            presented_action_answers: Option<HashSet<String>>,
             oracle_completion: Vec<i64>,
             value_mask: Vec<bool>,
             schema_mask: Vec<bool>,
@@ -5274,7 +6532,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             oracle_index: usize,
             negative_index: usize,
             negative_source_index: Option<usize>,
-            negative_completion: Vec<i64>,
+            negative_answer: String,
             discriminative_tokens: usize,
             from_replay: bool,
             from_generated_attractor: bool,
@@ -5283,6 +6541,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
         #[derive(Clone)]
         struct ContrastRow {
+            prompt: Vec<i64>,
+            oracle_completion: Vec<i64>,
+            negative_completion: Vec<i64>,
             inputs: Vec<i64>,
             oracle_targets: Vec<i64>,
             negative_targets: Vec<i64>,
@@ -5333,6 +6594,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 family: sample.item.family.clone(),
                 task_kind: sample.item.task_kind.clone(),
                 contract,
+                presented_action_answers:
+                    burn_dragon_universality::ruliad::ruliad_presented_action_answers(&sample.item)
+                        .map(|answers| answers.into_iter().collect()),
                 oracle_completion,
                 value_mask,
                 schema_mask,
@@ -5398,6 +6662,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 Self::ruliad_completion_tokens_from_answer(
                     &tokenizer,
                     &entry.key.answer,
+                    burn_dragon_universality::ruliad::RULIAD_V2_DOCUMENT_CLOSE_MARKER,
                     completion_budget,
                 )
             else {
@@ -5442,6 +6707,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &answer,
+                        burn_dragon_universality::ruliad::RULIAD_V2_DOCUMENT_CLOSE_MARKER,
                         completion_budget,
                     )
                 else {
@@ -5479,6 +6745,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &answer,
+                        burn_dragon_universality::ruliad::RULIAD_V2_DOCUMENT_CLOSE_MARKER,
                         completion_budget,
                     )
                 else {
@@ -5504,7 +6771,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let negative_pool_size = negative_pool.len();
 
         let max_pairs = config.field_binding_contrast_max_pairs.max(1);
-        let mut candidates = Vec::<ContrastCandidate>::new();
+        let mut candidates_by_oracle = (0..eligible.len())
+            .map(|_| Vec::<ContrastCandidate>::new())
+            .collect::<Vec<_>>();
+        let mut candidate_pairs = 0usize;
+        let mut filtered_presented_action_candidates = 0usize;
         for (oracle_index, oracle) in eligible.iter().enumerate() {
             for (negative_index, negative) in negative_pool.iter().enumerate() {
                 if negative.current_source_index == Some(oracle.source_index)
@@ -5513,6 +6784,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     || oracle.task_kind != negative.task_kind
                     || (!negative.schema_negative && oracle.contract != negative.contract)
                 {
+                    continue;
+                }
+                if !negative.schema_negative
+                    && oracle
+                        .presented_action_answers
+                        .as_ref()
+                        .is_some_and(|answers| answers.contains(negative.answer.trim()))
+                {
+                    filtered_presented_action_candidates =
+                        filtered_presented_action_candidates.saturating_add(1);
                     continue;
                 }
                 let diff_len = oracle
@@ -5544,39 +6825,82 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 if discriminative_tokens == 0 {
                     continue;
                 }
-                candidates.push(ContrastCandidate {
+                candidates_by_oracle[oracle_index].push(ContrastCandidate {
                     oracle_index,
                     negative_index,
                     negative_source_index: negative.current_source_index,
-                    negative_completion: negative.oracle_completion.clone(),
+                    negative_answer: negative.answer.clone(),
                     discriminative_tokens,
                     from_replay: negative.from_replay,
                     from_generated_attractor: negative.from_generated_attractor,
                     schema_negative: negative.schema_negative,
                 });
+                candidate_pairs = candidate_pairs.saturating_add(1);
             }
         }
-        candidates.sort_by(|left, right| {
-            right
-                .discriminative_tokens
-                .cmp(&left.discriminative_tokens)
-                .then_with(|| left.from_replay.cmp(&right.from_replay))
-                .then_with(|| left.oracle_index.cmp(&right.oracle_index))
-                .then_with(|| left.negative_index.cmp(&right.negative_index))
-        });
-        let candidate_pairs = candidates.len();
+        let candidate_priority = |candidate: &ContrastCandidate| {
+            if candidate.from_generated_attractor {
+                0usize
+            } else if candidate.schema_negative {
+                2
+            } else {
+                1
+            }
+        };
+        for candidates in candidates_by_oracle.iter_mut() {
+            candidates.sort_by(|left, right| {
+                candidate_priority(left)
+                    .cmp(&candidate_priority(right))
+                    .then_with(|| right.discriminative_tokens.cmp(&left.discriminative_tokens))
+                    .then_with(|| left.from_replay.cmp(&right.from_replay))
+                    .then_with(|| left.negative_index.cmp(&right.negative_index))
+            });
+        }
+        // Spend the bounded auxiliary batch across prompts before taking a second negative for any
+        // prompt. A global top-k here repeatedly trained only the rows with the longest byte-level
+        // answer differences and left most prompts without a binding gradient.
+        let mut selected_candidates = Vec::<ContrastCandidate>::new();
+        let mut rank = 0usize;
+        while selected_candidates.len() < max_pairs {
+            let mut selected_this_round = 0usize;
+            for candidates in candidates_by_oracle.iter() {
+                if let Some(candidate) = candidates.get(rank) {
+                    selected_candidates.push(candidate.clone());
+                    selected_this_round = selected_this_round.saturating_add(1);
+                    if selected_candidates.len() == max_pairs {
+                        break;
+                    }
+                }
+            }
+            if selected_this_round == 0 {
+                break;
+            }
+            rank = rank.saturating_add(1);
+        }
         let mut rows = Vec::<ContrastRow>::new();
-        for candidate in candidates.into_iter().take(max_pairs) {
+        for candidate in selected_candidates {
             let oracle = &eligible[candidate.oracle_index];
+            let Some((negative_completion, _negative_text)) =
+                Self::ruliad_completion_tokens_from_answer(
+                    &tokenizer,
+                    &candidate.negative_answer,
+                    policy_batch.samples[oracle.source_index]
+                        .item
+                        .document_close_marker(),
+                    completion_budget,
+                )
+            else {
+                continue;
+            };
             let prompt = Self::ruliad_trim_prompt_for_completion(
                 &oracle.prompt,
                 oracle
                     .oracle_completion
                     .len()
-                    .max(candidate.negative_completion.len()),
+                    .max(negative_completion.len()),
                 block_size,
             );
-            let Some((inputs, oracle_targets, _oracle_mask)) =
+            let Some((mut inputs, mut oracle_targets, _oracle_mask)) =
                 Self::ruliad_policy_row_from_completion(&prompt, &oracle.oracle_completion)
             else {
                 continue;
@@ -5585,11 +6909,17 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             let diff_len = oracle
                 .oracle_completion
                 .len()
-                .min(candidate.negative_completion.len());
+                .min(negative_completion.len());
             let mut negative_targets = oracle_targets.clone();
             let mut mask = vec![0i64; oracle_targets.len()];
-            let mut discriminative_tokens = 0usize;
-            for completion_index in 0..diff_len {
+            let mut first_discriminative_token = None;
+            for (completion_index, (&oracle_token, &negative_token)) in oracle
+                .oracle_completion
+                .iter()
+                .zip(&negative_completion)
+                .take(diff_len)
+                .enumerate()
+            {
                 let target_index = completion_start.saturating_add(completion_index);
                 let active = if candidate.schema_negative {
                     oracle
@@ -5604,26 +6934,33 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         .copied()
                         .unwrap_or(false)
                 };
-                if active
-                    && target_index < negative_targets.len()
-                    && oracle.oracle_completion[completion_index]
-                        != candidate.negative_completion[completion_index]
+                if active && target_index < negative_targets.len() && oracle_token != negative_token
                 {
-                    negative_targets[target_index] =
-                        candidate.negative_completion[completion_index];
+                    negative_targets[target_index] = negative_token;
                     mask[target_index] = 1;
-                    discriminative_tokens = discriminative_tokens.saturating_add(1);
+                    first_discriminative_token = Some(completion_index);
+                    break;
                 }
             }
-            if discriminative_tokens == 0 {
+            let Some(first_discriminative_token) = first_discriminative_token else {
                 continue;
-            }
+            };
+            let causal_len = completion_start
+                .saturating_add(first_discriminative_token)
+                .saturating_add(1);
+            inputs.truncate(causal_len);
+            oracle_targets.truncate(causal_len);
+            negative_targets.truncate(causal_len);
+            mask.truncate(causal_len);
             rows.push(ContrastRow {
+                prompt,
+                oracle_completion: oracle.oracle_completion.clone(),
+                negative_completion,
                 inputs,
                 oracle_targets,
                 negative_targets,
                 mask,
-                discriminative_tokens,
+                discriminative_tokens: 1,
                 source_index: oracle.source_index,
                 negative_source_index: candidate.negative_source_index,
                 from_replay: candidate.from_replay,
@@ -5631,20 +6968,21 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             });
         }
 
-        if replay_capacity > 0 && !eligible.is_empty() {
-            if let Ok(mut replay) = self.ruliad_field_binding_replay.lock() {
-                for sample in eligible.iter() {
-                    replay.push_back(RuliadFieldBindingReplaySample {
-                        answer: sample.answer.clone(),
-                        family: sample.family.clone(),
-                        task_kind: sample.task_kind.clone(),
-                        contract: sample.contract.clone(),
-                        oracle_completion: sample.oracle_completion.clone(),
-                    });
-                }
-                while replay.len() > replay_capacity {
-                    replay.pop_front();
-                }
+        if replay_capacity > 0
+            && !eligible.is_empty()
+            && let Ok(mut replay) = self.ruliad_field_binding_replay.lock()
+        {
+            for sample in eligible.iter() {
+                replay.push_back(RuliadFieldBindingReplaySample {
+                    answer: sample.answer.clone(),
+                    family: sample.family.clone(),
+                    task_kind: sample.task_kind.clone(),
+                    contract: sample.contract.clone(),
+                    oracle_completion: sample.oracle_completion.clone(),
+                });
+            }
+            while replay.len() > replay_capacity {
+                replay.pop_front();
             }
         }
 
@@ -5681,13 +7019,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             );
             self.write_ruliad_field_binding_contrast_telemetry(
                 RuliadFieldBindingContrastTelemetry {
-                    version: 1,
+                    version: 3,
+                    objective: RULIAD_FIELD_BINDING_OBJECTIVE,
                     step_index,
                     skip_reason: Some("no_counterfactual_pairs".to_string()),
                     sample_groups: eligible.len(),
+                    oracle_prompt_count: 0,
                     prompt_pairs: 0,
                     contrast_pairs: 0,
                     candidate_pairs,
+                    filtered_presented_action_candidates,
                     contrast_discriminative_tokens: 0,
                     negative_pool_size,
                     replay_pool_size,
@@ -5702,6 +7043,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     margin_satisfied_token_fraction: None,
                     exact_pair_rank_fraction: None,
                     exact_pair_margin_fraction: None,
+                    sequence_rank_metric_pairs: 0,
+                    sequence_log_probability_margin_mean: None,
+                    positive_sequence_fraction: None,
+                    sequence_margin_satisfied_fraction: None,
                     field_binding_contrast_weight: weight,
                     field_binding_contrast_margin: config.field_binding_contrast_margin,
                     field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
@@ -5711,7 +7056,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
 
         let mut participating_samples = HashSet::<usize>::new();
+        let mut oracle_prompts = HashSet::<usize>::new();
         for row in rows.iter() {
+            oracle_prompts.insert(row.source_index);
             participating_samples.insert(row.source_index);
             if let Some(negative_source_index) = row.negative_source_index {
                 participating_samples.insert(negative_source_index);
@@ -5733,7 +7080,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let mut oracle_target_values = vec![0i64; row_count * max_len];
         let mut negative_target_values = vec![0i64; row_count * max_len];
         let mut mask_values = vec![0i64; row_count * max_len];
-        for (row_index, row) in rows.into_iter().enumerate() {
+        for (row_index, row) in rows.iter().enumerate() {
             let offset = row_index * max_len;
             let len = row.inputs.len().min(max_len);
             input_values[offset..offset + len].copy_from_slice(&row.inputs[..len]);
@@ -5764,7 +7111,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let logit_margin = oracle_logits.clone() - negative_logits.clone();
         let contrast_margin = config.field_binding_contrast_margin.max(0.0);
         let should_collect_rank_metric = config.field_binding_contrast_rank_metric_every_steps > 0
-            && step_index % config.field_binding_contrast_rank_metric_every_steps == 0;
+            && step_index.is_multiple_of(config.field_binding_contrast_rank_metric_every_steps);
         let rank_stats = should_collect_rank_metric.then(|| {
             Self::ruliad_field_binding_rank_stats(
                 logit_margin.clone(),
@@ -5774,14 +7121,59 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 contrast_margin as f64,
             )
         });
+        let pair_weight = config.field_binding_contrast_pair_weight.max(0.0);
+        let sequence_log_probability_margin = if pair_weight > f32::EPSILON {
+            let prompts = rows
+                .iter()
+                .map(|row| row.prompt.clone())
+                .collect::<Vec<_>>();
+            let candidates = rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        row.oracle_completion.clone(),
+                        row.negative_completion.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let scores = crate::train::ruliad_policy::sequence_completion_score_tensor(
+                &self.model,
+                &prompts,
+                &candidates,
+                device,
+            )
+            .ok()?;
+            if scores.group_sizes.iter().any(|group_size| *group_size != 2) {
+                return None;
+            }
+            let scores = scores.mean_log_scores.reshape([row_count, 2]);
+            let oracle_scores = scores
+                .clone()
+                .slice([0..row_count, 0..1])
+                .reshape([row_count]);
+            let negative_scores = scores.slice([0..row_count, 1..2]).reshape([row_count]);
+            Some(oracle_scores - negative_scores)
+        } else {
+            None
+        };
+        let sequence_rank_stats = should_collect_rank_metric
+            .then(|| {
+                sequence_log_probability_margin.clone().map(|margin| {
+                    Self::ruliad_field_binding_sequence_rank_stats(margin, contrast_margin as f64)
+                })
+            })
+            .flatten();
         self.write_ruliad_field_binding_contrast_telemetry(RuliadFieldBindingContrastTelemetry {
-            version: 1,
+            version: 3,
+            objective: RULIAD_FIELD_BINDING_OBJECTIVE,
             step_index,
             skip_reason: None,
             sample_groups: participating_samples.len(),
+            oracle_prompt_count: oracle_prompts.len(),
             prompt_pairs: row_count,
             contrast_pairs: row_count,
             candidate_pairs,
+            filtered_presented_action_candidates,
             contrast_discriminative_tokens,
             negative_pool_size,
             replay_pool_size,
@@ -5806,6 +7198,19 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             exact_pair_margin_fraction: rank_stats
                 .as_ref()
                 .and_then(|stats| stats.exact_pair_margin_fraction),
+            sequence_rank_metric_pairs: sequence_rank_stats
+                .as_ref()
+                .map(|stats| stats.pairs)
+                .unwrap_or(0),
+            sequence_log_probability_margin_mean: sequence_rank_stats
+                .as_ref()
+                .and_then(|stats| stats.log_probability_margin_mean),
+            positive_sequence_fraction: sequence_rank_stats
+                .as_ref()
+                .and_then(|stats| stats.positive_sequence_fraction),
+            sequence_margin_satisfied_fraction: sequence_rank_stats
+                .as_ref()
+                .and_then(|stats| stats.margin_satisfied_sequence_fraction),
             field_binding_contrast_weight: weight,
             field_binding_contrast_margin: config.field_binding_contrast_margin,
             field_binding_contrast_pair_weight: config.field_binding_contrast_pair_weight,
@@ -5843,22 +7248,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             ),
             Some(mask.clone()),
         );
-        let pair_weight = config.field_binding_contrast_pair_weight.max(0.0);
-        let loss = if pair_weight > f32::EPSILON {
-            let mask = mask.float();
-            let active_per_pair = mask.clone().sum_dim(1).reshape([row_count]).clamp_min(1.0);
-            let pair_logit_gap = ((negative_logits - oracle_logits) * mask)
-                .sum_dim(1)
-                .reshape([row_count])
-                .div(active_per_pair);
+        let loss = sequence_log_probability_margin.map_or(token_loss.clone(), |margin| {
             token_loss
-                + activation::softplus(pair_logit_gap + contrast_margin, 1.0)
+                + activation::softplus(margin.mul_scalar(-1.0) + contrast_margin, 1.0)
                     .mean()
                     .reshape([1])
                     .mul_scalar(pair_weight)
-        } else {
-            token_loss
-        };
+        });
         Some(loss.mul_scalar(weight))
     }
 
@@ -5947,6 +7343,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &negative,
+                        sample.item.document_close_marker(),
                         completion_budget,
                     )
                 else {
@@ -6008,6 +7405,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &entry.key.answer,
+                        sample.item.document_close_marker(),
                         completion_budget,
                     )
                 else {
@@ -6369,11 +7767,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
 
         let rate_ppm = |count: usize| -> usize {
-            if generated_completion_rows == 0 {
-                0
-            } else {
-                count.saturating_mul(1_000_000) / generated_completion_rows
-            }
+            count
+                .saturating_mul(1_000_000)
+                .checked_div(generated_completion_rows)
+                .unwrap_or_default()
         };
         let verifier_rate_ppm = rate_ppm(verifier_match_rows.saturating_add(semantic_match_rows));
         let schema_wrong_rate_ppm = rate_ppm(schema_wrong_rows);
@@ -6510,6 +7907,1144 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         )
     }
 
+    fn ruliad_proof_policy_dagger_loss(
+        &self,
+        policy_batch: &crate::dataset::RuliadPolicyBatch,
+        device: &B::Device,
+        block_size: usize,
+    ) -> Option<Tensor<B, 1>>
+    where
+        B: AutodiffBackend,
+    {
+        let config = self.ruliad_supervision.proof_policy;
+        let weight = self.ruliad_proof_policy_dagger_weight();
+        if weight <= f32::EPSILON || policy_batch.samples.is_empty() || self.pipeline_enabled() {
+            return None;
+        }
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &policy_batch.tokenization,
+            )
+            .ok()?;
+        let completion_budget = config
+            .max_completion_tokens
+            .max(1)
+            .min(block_size.saturating_sub(1).max(1));
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        let effective_mode = config.effective_mode(step_index);
+        let semantic_row_budget = config.semantic_rows_per_update();
+        let base_semantic_row_budget = config.base_semantic_rows_per_update();
+        let batch_plan = RuliadProofPolicyBatchPlan::new(
+            effective_mode,
+            base_semantic_row_budget,
+            config.rollout_steps,
+            config.stratified_difficulty_levels,
+        );
+        let trajectory_budget = batch_plan.trajectory_budget();
+        let sampling_model_started = Instant::now();
+        let sampling_model = (batch_plan.dagger_trajectory_budget > 0).then(|| {
+            self.model
+                .valid()
+                .materialize_random_scaffold_for_inference()
+        });
+        let sampling_model_materialize_ms =
+            sampling_model_started.elapsed().as_micros() as f64 / 1_000.0;
+
+        #[derive(Clone)]
+        enum ExpertRowObjective {
+            PresentationIndex {
+                inputs: Vec<i64>,
+                branch_position: usize,
+                candidate_target_tokens: Vec<i64>,
+                equivalent_target_tokens: Vec<i64>,
+            },
+            SemanticStep {
+                prompt: Vec<i64>,
+                candidate_completions: Vec<Vec<i64>>,
+                equivalent_indices: Vec<usize>,
+            },
+        }
+
+        #[derive(Clone)]
+        struct ExpertRow {
+            objective: ExpertRowObjective,
+            presentation_weight: f32,
+        }
+
+        struct PrefixBranchRow {
+            inputs: Vec<i64>,
+            branch_position: usize,
+            candidate_target_tokens: Vec<i64>,
+            equivalent_target_tokens: Vec<i64>,
+            weight: f32,
+        }
+
+        let mut rows = Vec::<ExpertRow>::new();
+        let mut visited_prompts = HashSet::<Vec<i64>>::new();
+        let mut available_sample_groups = 0usize;
+        let mut sample_groups = 0usize;
+        let mut nonzero_start_trajectories = 0usize;
+        let mut start_step_sum = 0usize;
+        let mut visited_states = 0usize;
+        let mut semantic_state_rows = 0usize;
+        let mut base_semantic_state_rows = 0usize;
+        let mut counterfactual_semantic_state_rows = 0usize;
+        let mut counterfactual_target_shortfall = 0usize;
+        let mut static_expert_rows = 0usize;
+        let mut dagger_expert_rows = 0usize;
+        let mut model_visited_expert_rows = 0usize;
+        let mut model_valid_actions = 0usize;
+        let mut model_invalid_actions = 0usize;
+        let mut model_expert_equivalent_actions = 0usize;
+        let mut model_off_expert_actions = 0usize;
+        let mut repeated_states = 0usize;
+        let mut model_backtracks = 0usize;
+        let mut model_scoring_batches = 0usize;
+        let mut maximum_model_scoring_batch_rows = 0usize;
+        let mut model_scoring_padded_tokens = 0usize;
+        let mut rollout_cpu_prepare_ms = 0.0f64;
+        let mut model_scoring_ms = 0.0f64;
+        let mut difficulty_sample_groups = BTreeMap::<usize, usize>::new();
+        let mut difficulty_visited_states = BTreeMap::<usize, usize>::new();
+        let mut difficulty_expert_rows = BTreeMap::<usize, usize>::new();
+        let mut expert_selected_index_histogram = BTreeMap::<usize, usize>::new();
+        let mut expert_equivalent_index_histogram = BTreeMap::<usize, usize>::new();
+        let mut model_selected_index_histogram = BTreeMap::<usize, usize>::new();
+        let mut candidate_target_tokens = 0usize;
+        let mut equivalent_target_tokens = 0usize;
+        let mut supervised_action_tokens = 0usize;
+        let mut rollout_depth_reached = 0usize;
+        let mut presentation_budget_exhausted = false;
+
+        struct DaggerTrajectory {
+            sample_index: usize,
+            difficulty_level: usize,
+            is_dagger: bool,
+            max_depth: usize,
+            answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+            state: burn_dragon_universality::ruliad::RuliadProofPolicyState,
+        }
+
+        struct DaggerExpansion {
+            trajectory_index: usize,
+            actions: burn_dragon_universality::ruliad::RuliadProofActionSet,
+            presentations: Vec<DaggerScoringPresentation>,
+        }
+
+        struct DaggerScoringPresentation {
+            rotation: usize,
+            prompt: Vec<i64>,
+            candidate_completions: Vec<Vec<i64>>,
+            answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+        }
+
+        struct PreparedExpertState {
+            canonical_prompt: Vec<i64>,
+            presentation_rows: Vec<ExpertRow>,
+            scoring_presentations: Vec<DaggerScoringPresentation>,
+            presentation_selected_indices: Vec<usize>,
+            presentation_equivalent_indices: Vec<Vec<usize>>,
+        }
+
+        let prepare_expert_state = |
+            problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+            actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+            presentation_index: usize,
+            scoring_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+            base_rotations: Option<&[usize]>,
+        | -> Option<PreparedExpertState> {
+            let rotations = crate::train::ruliad_policy::target_group_presentation_rotations(
+                config.candidate_symmetry,
+                actions.selected_index,
+                actions.candidates.len(),
+                presentation_index,
+                base_rotations,
+            )
+            .ok()?;
+            let canonical_prompt = tokenizer
+                .encode_payload(
+                    &burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                        problem, actions,
+                    )
+                    .ok()?,
+                )
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            let presentation_weight = 1.0 / rotations.len().max(1) as f32;
+            let mut presentation_rows = Vec::<ExpertRow>::with_capacity(rotations.len());
+            let mut scoring_presentations =
+                Vec::<DaggerScoringPresentation>::with_capacity(rotations.len());
+            let mut presentation_selected_indices = Vec::<usize>::with_capacity(rotations.len());
+            let mut presentation_equivalent_indices =
+                Vec::<Vec<usize>>::with_capacity(rotations.len());
+            for rotation in rotations {
+                let presented_actions = actions.rotate_left(rotation).ok()?;
+                let prompt_text =
+                    burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                        problem,
+                        &presented_actions,
+                    )
+                    .ok()?;
+                let candidate_completions = (0..presented_actions.candidates.len())
+                    .map(|candidate_index| {
+                        let answer = burn_dragon_universality::ruliad::proof_action_answer(
+                            &presented_actions,
+                            candidate_index,
+                            scoring_contract,
+                        )
+                        .ok()?;
+                        Some(
+                            tokenizer
+                                .encode_payload(&answer)
+                                .into_iter()
+                                .map(i64::from)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                if candidate_completions.iter().any(|completion| {
+                    completion.is_empty() || completion.len() > completion_budget
+                }) {
+                    return None;
+                }
+                let expert_completion = candidate_completions
+                    .get(presented_actions.selected_index)
+                    .cloned()?;
+                if presented_actions.equivalent_indices.is_empty()
+                    || presented_actions
+                        .equivalent_indices
+                        .iter()
+                        .any(|index| *index >= candidate_completions.len())
+                {
+                    return None;
+                }
+                let prompt = tokenizer
+                    .encode_payload(&prompt_text)
+                    .into_iter()
+                    .map(i64::from)
+                    .collect::<Vec<_>>();
+                let prompt = Self::ruliad_trim_prompt_for_completion(
+                    &prompt,
+                    candidate_completions
+                        .iter()
+                        .map(Vec::len)
+                        .max()
+                        .unwrap_or(expert_completion.len()),
+                    block_size,
+                );
+                if prompt.is_empty() {
+                    return None;
+                }
+                let objective = match scoring_contract {
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::PresentationIndex => {
+                        let branch_token_index = crate::train::ruliad_policy::candidate_branch_index(
+                            &candidate_completions,
+                        )
+                        .ok()?;
+                        let equivalent_tokens = presented_actions
+                            .equivalent_indices
+                            .iter()
+                            .filter_map(|candidate_index| candidate_completions.get(*candidate_index))
+                            .filter_map(|completion| completion.get(branch_token_index).copied())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let candidate_tokens = candidate_completions
+                            .iter()
+                            .filter_map(|completion| completion.get(branch_token_index).copied())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        if equivalent_tokens.is_empty()
+                            || candidate_tokens.len() != candidate_completions.len()
+                        {
+                            return None;
+                        }
+                        let (inputs, targets, mask) =
+                            Self::ruliad_policy_row_from_completion_token(
+                                &prompt,
+                                &expert_completion,
+                                branch_token_index,
+                            )?;
+                        let branch_position = mask.iter().position(|value| *value > 0.0)?;
+                        debug_assert_eq!(
+                            targets[branch_position],
+                            expert_completion[branch_token_index]
+                        );
+                        ExpertRowObjective::PresentationIndex {
+                            inputs,
+                            branch_position,
+                            candidate_target_tokens: candidate_tokens,
+                            equivalent_target_tokens: equivalent_tokens,
+                        }
+                    }
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep => {
+                        ExpertRowObjective::SemanticStep {
+                            prompt: prompt.clone(),
+                            candidate_completions: candidate_completions.clone(),
+                            equivalent_indices: presented_actions.equivalent_indices.clone(),
+                        }
+                    }
+                };
+                presentation_selected_indices.push(presented_actions.selected_index);
+                presentation_equivalent_indices
+                    .push(presented_actions.equivalent_indices.clone());
+                presentation_rows.push(ExpertRow {
+                    objective,
+                    presentation_weight,
+                });
+                scoring_presentations.push(DaggerScoringPresentation {
+                    rotation,
+                    prompt,
+                    candidate_completions,
+                    answer_contract: scoring_contract,
+                });
+            }
+            (!presentation_rows.is_empty() && !scoring_presentations.is_empty()).then_some(
+                PreparedExpertState {
+                    canonical_prompt,
+                    presentation_rows,
+                    scoring_presentations,
+                    presentation_selected_indices,
+                    presentation_equivalent_indices,
+                },
+            )
+        };
+
+        let state_prepare_started = Instant::now();
+        let mut trajectories = Vec::<DaggerTrajectory>::new();
+        let mut answer_contract = None;
+        for (sample_index, sample) in policy_batch.samples.iter().enumerate() {
+            let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                problem,
+                certificate,
+                proof_step_index,
+                action_answer_contract,
+                task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+                ..
+            }) = sample.item.spec.as_ref()
+            else {
+                continue;
+            };
+            available_sample_groups = available_sample_groups.saturating_add(1);
+            if trajectories.len() >= trajectory_budget {
+                continue;
+            }
+            let scoring_contract = match config.scoring {
+                crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                    *action_answer_contract
+                }
+                crate::config::RuliadProofPolicyScoring::SemanticEnergy => {
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
+                }
+            };
+            if answer_contract.is_some_and(|contract| contract != scoring_contract) {
+                return None;
+            }
+            answer_contract.get_or_insert(scoring_contract);
+            let difficulty_level = sample.item.difficulty_level.unwrap_or(0);
+            sample_groups = sample_groups.saturating_add(1);
+            *difficulty_sample_groups
+                .entry(difficulty_level)
+                .or_default() += 1;
+            let start_step = proof_step_index.unwrap_or_default();
+            nonzero_start_trajectories =
+                nonzero_start_trajectories.saturating_add(usize::from(start_step > 0));
+            start_step_sum = start_step_sum.saturating_add(start_step);
+            let state =
+                burn_dragon_universality::ruliad::RuliadProofPolicyState::from_certificate_prefix(
+                    problem,
+                    certificate,
+                    start_step,
+                )
+                .ok()?;
+            let trajectory_index = trajectories.len();
+            let (is_dagger, max_depth) = if trajectory_index < batch_plan.static_row_budget {
+                (false, 1)
+            } else {
+                let dagger_index = trajectory_index - batch_plan.static_row_budget;
+                (true, batch_plan.dagger_depth(dagger_index))
+            };
+            trajectories.push(DaggerTrajectory {
+                sample_index,
+                difficulty_level,
+                is_dagger,
+                max_depth,
+                answer_contract: scoring_contract,
+                state,
+            });
+        }
+        let state_prepare_ms = state_prepare_started.elapsed().as_micros() as f64 / 1_000.0;
+
+        for rollout_depth in 0..batch_plan.rollout_steps {
+            if presentation_budget_exhausted
+                || base_semantic_state_rows >= base_semantic_row_budget
+                || trajectories
+                    .iter()
+                    .all(|item| rollout_depth >= item.max_depth || item.state.solved())
+            {
+                break;
+            }
+            let wave_prepare_started = Instant::now();
+            let states_before_wave = base_semantic_state_rows;
+            let mut expansions = Vec::<DaggerExpansion>::new();
+            for (trajectory_index, trajectory) in trajectories.iter_mut().enumerate() {
+                if rollout_depth >= trajectory.max_depth
+                    || trajectory.state.solved()
+                    || base_semantic_state_rows >= base_semantic_row_budget
+                {
+                    continue;
+                }
+                let sample = &policy_batch.samples[trajectory.sample_index];
+                let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                    problem, ..
+                }) = sample.item.spec.as_ref()
+                else {
+                    continue;
+                };
+                let actions = match trajectory.state.action_set(problem, config.candidates) {
+                    Ok(actions) => actions,
+                    Err(_) if trajectory.state.backtrack() => {
+                        model_backtracks = model_backtracks.saturating_add(1);
+                        continue;
+                    }
+                    Err(_) => {
+                        model_invalid_actions = model_invalid_actions.saturating_add(1);
+                        continue;
+                    }
+                };
+                let Some(mut original_state) = prepare_expert_state(
+                    problem,
+                    &actions,
+                    semantic_state_rows,
+                    trajectory.answer_contract,
+                    None,
+                ) else {
+                    model_invalid_actions = model_invalid_actions.saturating_add(1);
+                    continue;
+                };
+                visited_states = visited_states.saturating_add(1);
+                *difficulty_visited_states
+                    .entry(trajectory.difficulty_level)
+                    .or_default() += 1;
+
+                // Counterfactual targets are supervision only. The model rollout below still
+                // scores and applies the original formal transition.
+                let target_group_rotations = original_state
+                    .scoring_presentations
+                    .iter()
+                    .map(|presentation| presentation.rotation)
+                    .collect::<Vec<_>>();
+                let scoring_presentations =
+                    std::mem::take(&mut original_state.scoring_presentations);
+                let mut prepared_states = vec![original_state];
+                let counterfactual_indices =
+                    crate::train::ruliad_policy::counterfactual_candidate_indices(
+                        &actions,
+                        config.counterfactual_targets_per_state,
+                        actions
+                            .selected_index
+                            .saturating_add(base_semantic_state_rows)
+                            .saturating_add(1),
+                    );
+                let mut group_shortfall = config
+                    .counterfactual_targets_per_state
+                    .saturating_sub(counterfactual_indices.len());
+                for candidate_index in counterfactual_indices {
+                    let Some((counterfactual_problem, counterfactual_actions)) =
+                        burn_dragon_universality::ruliad::counterfactual_proof_action_target(
+                            problem,
+                            &actions,
+                            candidate_index,
+                        )
+                        .ok()
+                    else {
+                        group_shortfall = group_shortfall.saturating_add(1);
+                        continue;
+                    };
+                    let Some(counterfactual_state) = prepare_expert_state(
+                        &counterfactual_problem,
+                        &counterfactual_actions,
+                        semantic_state_rows.saturating_add(prepared_states.len()),
+                        trajectory.answer_contract,
+                        Some(&target_group_rotations),
+                    ) else {
+                        group_shortfall = group_shortfall.saturating_add(1);
+                        continue;
+                    };
+                    prepared_states.push(counterfactual_state);
+                }
+                counterfactual_target_shortfall =
+                    counterfactual_target_shortfall.saturating_add(group_shortfall);
+                let complete_target_group = group_shortfall == 0
+                    && prepared_states.len() == config.target_variants_per_state();
+                let presentation_rows = prepared_states
+                    .iter()
+                    .map(|state| state.presentation_rows.len())
+                    .sum::<usize>();
+                if complete_target_group
+                    && rows.len().saturating_add(presentation_rows)
+                        > config.max_presentation_rows_per_update
+                {
+                    presentation_budget_exhausted = true;
+                    break;
+                }
+                let unique_target_group = complete_target_group
+                    && prepared_states
+                        .iter()
+                        .all(|state| !visited_prompts.contains(&state.canonical_prompt));
+                if unique_target_group {
+                    let variants_added = prepared_states.len();
+                    for state in prepared_states {
+                        visited_prompts.insert(state.canonical_prompt);
+                        for selected_index in state.presentation_selected_indices {
+                            *expert_selected_index_histogram
+                                .entry(selected_index)
+                                .or_default() += 1;
+                        }
+                        for equivalent_indices in state.presentation_equivalent_indices {
+                            for candidate_index in equivalent_indices {
+                                *expert_equivalent_index_histogram
+                                    .entry(candidate_index)
+                                    .or_default() += 1;
+                            }
+                        }
+                        for row in &state.presentation_rows {
+                            match &row.objective {
+                                ExpertRowObjective::PresentationIndex {
+                                    candidate_target_tokens: candidate_tokens,
+                                    equivalent_target_tokens: equivalent_tokens,
+                                    ..
+                                } => {
+                                    supervised_action_tokens =
+                                        supervised_action_tokens.saturating_add(1);
+                                    candidate_target_tokens = candidate_target_tokens
+                                        .saturating_add(candidate_tokens.len());
+                                    equivalent_target_tokens = equivalent_target_tokens
+                                        .saturating_add(equivalent_tokens.len());
+                                }
+                                ExpertRowObjective::SemanticStep {
+                                    candidate_completions,
+                                    equivalent_indices,
+                                    ..
+                                } => {
+                                    let candidate_tokens =
+                                        candidate_completions.iter().map(Vec::len).sum::<usize>();
+                                    let equivalent_tokens = equivalent_indices
+                                        .iter()
+                                        .filter_map(|index| candidate_completions.get(*index))
+                                        .map(Vec::len)
+                                        .sum::<usize>();
+                                    supervised_action_tokens =
+                                        supervised_action_tokens.saturating_add(candidate_tokens);
+                                    candidate_target_tokens =
+                                        candidate_target_tokens.saturating_add(candidate_tokens);
+                                    equivalent_target_tokens =
+                                        equivalent_target_tokens.saturating_add(equivalent_tokens);
+                                }
+                            }
+                        }
+                        rows.extend(state.presentation_rows);
+                    }
+                    semantic_state_rows = semantic_state_rows.saturating_add(variants_added);
+                    base_semantic_state_rows = base_semantic_state_rows.saturating_add(1);
+                    counterfactual_semantic_state_rows = counterfactual_semantic_state_rows
+                        .saturating_add(variants_added.saturating_sub(1));
+                    static_expert_rows = static_expert_rows.saturating_add(
+                        variants_added.saturating_mul(usize::from(!trajectory.is_dagger)),
+                    );
+                    dagger_expert_rows = dagger_expert_rows.saturating_add(
+                        variants_added.saturating_mul(usize::from(trajectory.is_dagger)),
+                    );
+                    model_visited_expert_rows = model_visited_expert_rows
+                        .saturating_add(variants_added.saturating_mul(usize::from(
+                            trajectory.is_dagger && rollout_depth > 0,
+                        )));
+                    *difficulty_expert_rows
+                        .entry(trajectory.difficulty_level)
+                        .or_default() += variants_added;
+                }
+                if trajectory.is_dagger && rollout_depth.saturating_add(1) < trajectory.max_depth {
+                    expansions.push(DaggerExpansion {
+                        trajectory_index,
+                        actions,
+                        presentations: scoring_presentations,
+                    });
+                }
+            }
+            // The last supervised wave is already represented in `rows`. Scoring it cannot
+            // produce another training row once the row budget is full, so avoid a synchronized
+            // inference forward that only changes diagnostic terminal state.
+            if presentation_budget_exhausted || base_semantic_state_rows >= base_semantic_row_budget
+            {
+                expansions.clear();
+            }
+            rollout_cpu_prepare_ms += wave_prepare_started.elapsed().as_micros() as f64 / 1_000.0;
+            if base_semantic_state_rows > states_before_wave || !expansions.is_empty() {
+                rollout_depth_reached = rollout_depth_reached.max(rollout_depth.saturating_add(1));
+            }
+            if expansions.is_empty() {
+                break;
+            }
+            let scoring_presentations = expansions
+                .iter()
+                .enumerate()
+                .flat_map(|(expansion_index, expansion)| {
+                    expansion
+                        .presentations
+                        .iter()
+                        .map(move |presentation| (expansion_index, presentation))
+                })
+                .collect::<Vec<_>>();
+            let prompts = scoring_presentations
+                .iter()
+                .map(|(_, presentation)| presentation.prompt.clone())
+                .collect::<Vec<_>>();
+            let candidates = scoring_presentations
+                .iter()
+                .map(|(_, presentation)| presentation.candidate_completions.clone())
+                .collect::<Vec<_>>();
+            model_scoring_batches = model_scoring_batches.saturating_add(1);
+            maximum_model_scoring_batch_rows =
+                maximum_model_scoring_batch_rows.max(scoring_presentations.len());
+            let scoring_contract = scoring_presentations
+                .first()
+                .map(|(_, presentation)| presentation.answer_contract)?;
+            if scoring_presentations
+                .iter()
+                .any(|(_, presentation)| presentation.answer_contract != scoring_contract)
+            {
+                return None;
+            }
+            let scoring_max_len = scoring_presentations
+                .iter()
+                .filter_map(|(_, presentation)| match scoring_contract {
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::PresentationIndex => {
+                        crate::train::ruliad_policy::candidate_branch_index(
+                            &presentation.candidate_completions,
+                        )
+                        .ok()
+                        .map(|prefix_len| presentation.prompt.len().saturating_add(prefix_len))
+                    }
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep => {
+                        presentation
+                            .candidate_completions
+                            .iter()
+                            .map(Vec::len)
+                            .max()
+                            .map(|completion_len| {
+                                presentation
+                                    .prompt
+                                    .len()
+                                    .saturating_add(completion_len)
+                                    .saturating_sub(1)
+                            })
+                    }
+                })
+                .max()
+                .unwrap_or_default();
+            model_scoring_padded_tokens = model_scoring_padded_tokens
+                .saturating_add(scoring_max_len.saturating_mul(scoring_presentations.len()));
+            let model_scoring_started = Instant::now();
+            let score_rows = crate::train::ruliad_policy::proof_action_scores_batch(
+                sampling_model.as_ref()?,
+                &prompts,
+                &candidates,
+                scoring_contract,
+                config.scoring,
+                device,
+            )
+            .ok()?;
+            model_scoring_ms += model_scoring_started.elapsed().as_micros() as f64 / 1_000.0;
+            let mut scores_by_expansion = (0..expansions.len())
+                .map(|_| Vec::<(usize, Vec<f32>)>::new())
+                .collect::<Vec<_>>();
+            for ((expansion_index, presentation), scores) in
+                scoring_presentations.iter().zip(score_rows)
+            {
+                scores_by_expansion[*expansion_index].push((presentation.rotation, scores));
+            }
+            drop(scoring_presentations);
+            for (expansion, presentation_scores) in expansions.into_iter().zip(scores_by_expansion)
+            {
+                let scores = crate::train::ruliad_policy::semantic_action_log_probs(
+                    &presentation_scores,
+                    expansion.actions.candidates.len(),
+                )
+                .ok()?;
+                let Some(candidate_index) =
+                    crate::train::ruliad_policy::best_candidate_index(&scores)
+                else {
+                    model_invalid_actions = model_invalid_actions.saturating_add(1);
+                    continue;
+                };
+                *model_selected_index_histogram
+                    .entry(candidate_index)
+                    .or_default() += 1;
+                if expansion.actions.is_equivalent_index(candidate_index) {
+                    model_expert_equivalent_actions =
+                        model_expert_equivalent_actions.saturating_add(1);
+                } else {
+                    model_off_expert_actions = model_off_expert_actions.saturating_add(1);
+                }
+                match trajectories[expansion.trajectory_index]
+                    .state
+                    .apply(&expansion.actions, candidate_index)
+                {
+                    Ok(repeated) => {
+                        model_valid_actions = model_valid_actions.saturating_add(1);
+                        repeated_states = repeated_states.saturating_add(usize::from(repeated));
+                    }
+                    Err(_) => {
+                        model_invalid_actions = model_invalid_actions.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let solved_proofs = trajectories
+            .iter()
+            .filter(|trajectory| trajectory.state.solved())
+            .count();
+
+        let mut prefix_branch_rows = Vec::<PrefixBranchRow>::new();
+        if config.normalization == crate::config::RuliadProofPolicyNormalization::PrefixConditional
+            && answer_contract
+                == Some(
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+                )
+        {
+            for row in &rows {
+                let ExpertRowObjective::SemanticStep {
+                    prompt,
+                    candidate_completions,
+                    equivalent_indices,
+                } = &row.objective
+                else {
+                    return None;
+                };
+                let branches = crate::train::ruliad_policy::semantic_candidate_trie_branches(
+                    candidate_completions,
+                    equivalent_indices,
+                )
+                .ok()?;
+                let branch_weight = row.presentation_weight / branches.len().max(1) as f32;
+                for branch in branches {
+                    let mut inputs = prompt.clone();
+                    inputs.extend(branch.prefix);
+                    let branch_position = inputs.len().checked_sub(1)?;
+                    prefix_branch_rows.push(PrefixBranchRow {
+                        inputs,
+                        branch_position,
+                        candidate_target_tokens: branch.candidate_tokens,
+                        equivalent_target_tokens: branch.equivalent_tokens,
+                        weight: branch_weight,
+                    });
+                }
+            }
+        }
+        let prefix_candidate_tokens = prefix_branch_rows
+            .iter()
+            .map(|row| row.candidate_target_tokens.len())
+            .sum::<usize>();
+        let prefix_equivalent_tokens = prefix_branch_rows
+            .iter()
+            .map(|row| row.equivalent_target_tokens.len())
+            .sum::<usize>();
+
+        debug_assert!(rows.len() <= config.max_presentation_rows_per_update);
+        self.write_ruliad_proof_policy_dagger_telemetry(RuliadProofPolicyDaggerTelemetry {
+            version: 19,
+            answer_contract: answer_contract.unwrap_or_default().label(),
+            objective: if config.scoring == crate::config::RuliadProofPolicyScoring::SemanticEnergy
+            {
+                if config.counterfactual_targets_per_state > 0 {
+                    "semantic_sequence_energy_counterfactual_v1"
+                } else {
+                    "semantic_sequence_energy_v1"
+                }
+            } else {
+                match config.normalization {
+                    crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
+                        if config.counterfactual_targets_per_state > 0 {
+                            "candidate_normalized_counterfactual_v1"
+                        } else {
+                            "candidate_normalized_equivalent_v1"
+                        }
+                    }
+                    crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
+                        "prefix_conditional_equivalent_v1"
+                    }
+                    crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
+                        "vocabulary_marginal_equivalent_v1"
+                    }
+                }
+            },
+            gradient_scope: match config.gradient_scope {
+                crate::config::RuliadProofPolicyGradientScope::FullModel => "full_model",
+                crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly => "score_head_only",
+                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {
+                    "language_head_only"
+                }
+            },
+            presentation_risk: match config.presentation_risk {
+                crate::config::RuliadProofPolicyPresentationRisk::Mean => "mean",
+                crate::config::RuliadProofPolicyPresentationRisk::Worst => "worst",
+            },
+            configured_mode: match config.mode {
+                crate::config::RuliadProofPolicyTrainingMode::StaticExpert => "static_expert",
+                crate::config::RuliadProofPolicyTrainingMode::Dagger => "dagger",
+                crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger => {
+                    "static_then_paired_dagger"
+                }
+            },
+            mode: match effective_mode {
+                crate::config::RuliadProofPolicyEffectiveMode::StaticExpert => "static_expert",
+                crate::config::RuliadProofPolicyEffectiveMode::Dagger => "dagger",
+                crate::config::RuliadProofPolicyEffectiveMode::PairedDagger => "paired_dagger",
+            },
+            candidate_symmetry: match config.candidate_symmetry {
+                crate::config::RuliadProofPolicyCandidateSymmetry::Canonical => "canonical",
+                crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation => {
+                    "balanced_rotation"
+                }
+                crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => {
+                    "cyclic_orbit_average"
+                }
+            },
+            step_index,
+            skip_reason: rows
+                .is_empty()
+                .then(|| "no_formal_policy_states".to_string()),
+            available_sample_groups,
+            sample_groups,
+            nonzero_start_trajectories,
+            mean_start_step: start_step_sum as f64 / sample_groups.max(1) as f64,
+            visited_states,
+            semantic_state_rows,
+            base_semantic_state_rows,
+            counterfactual_semantic_state_rows,
+            counterfactual_target_shortfall,
+            expert_rows: semantic_state_rows,
+            static_expert_rows,
+            dagger_expert_rows,
+            model_visited_expert_rows,
+            supervised_action_tokens,
+            supervised_presentation_rows: rows.len(),
+            mean_presentations_per_state: rows.len() as f64 / semantic_state_rows.max(1) as f64,
+            model_valid_actions,
+            model_invalid_actions,
+            model_expert_equivalent_actions,
+            model_off_expert_actions,
+            repeated_states,
+            model_backtracks,
+            solved_proofs,
+            model_scoring_batches,
+            maximum_model_scoring_batch_rows,
+            model_scoring_padded_tokens,
+            sampling_model_materialize_ms,
+            state_prepare_ms,
+            rollout_cpu_prepare_ms,
+            model_scoring_ms,
+            difficulty_sample_groups,
+            difficulty_visited_states,
+            difficulty_expert_rows,
+            expert_selected_index_histogram,
+            expert_equivalent_index_histogram,
+            model_selected_index_histogram,
+            candidate_target_tokens,
+            equivalent_target_tokens,
+            mean_candidate_targets_per_row: candidate_target_tokens as f64
+                / rows.len().max(1) as f64,
+            mean_equivalent_targets_per_row: equivalent_target_tokens as f64
+                / rows.len().max(1) as f64,
+            prefix_branch_rows: prefix_branch_rows.len(),
+            prefix_candidate_tokens,
+            prefix_equivalent_tokens,
+            weight,
+            rollout_steps: batch_plan.rollout_steps,
+            rollout_depth_reached,
+            configured_rollout_steps: config.rollout_steps,
+            trajectory_budget,
+            semantic_row_budget,
+            base_semantic_row_budget,
+            configured_counterfactual_targets_per_state: config.counterfactual_targets_per_state,
+            target_variants_per_state: config.target_variants_per_state(),
+            max_rows_per_update: config.max_rows_per_update,
+            max_presentation_rows_per_update: config.max_presentation_rows_per_update,
+        });
+        if rows.is_empty() {
+            return None;
+        }
+        if semantic_state_rows == 0 || !rows.len().is_multiple_of(semantic_state_rows) {
+            return None;
+        }
+        let presentation_group_size = rows.len() / semantic_state_rows;
+        let row_count = rows.len();
+        let row_weights = Tensor::<B, 1>::from_data(
+            TensorData::new(
+                rows.iter()
+                    .map(|row| row.presentation_weight)
+                    .collect::<Vec<_>>(),
+                [row_count],
+            ),
+            device,
+        );
+        match answer_contract? {
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::PresentationIndex => {
+                let max_len = rows
+                    .iter()
+                    .filter_map(|row| match &row.objective {
+                        ExpertRowObjective::PresentationIndex { inputs, .. } => Some(inputs.len()),
+                        ExpertRowObjective::SemanticStep { .. } => None,
+                    })
+                    .max()?
+                    .max(1);
+                let mut input_values = vec![0i64; row_count * max_len];
+                let mut branch_positions = Vec::with_capacity(row_count);
+                for (row_index, row) in rows.iter().enumerate() {
+                    let ExpertRowObjective::PresentationIndex {
+                        inputs,
+                        branch_position,
+                        ..
+                    } = &row.objective
+                    else {
+                        return None;
+                    };
+                    let offset = row_index * max_len;
+                    let len = inputs.len().min(max_len);
+                    input_values[offset..offset + len].copy_from_slice(&inputs[..len]);
+                    branch_positions.push(*branch_position);
+                }
+                let inputs = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(input_values, [row_count, max_len]),
+                    device,
+                );
+                let branch_logits = crate::train::ruliad_policy::logits_at_sequence_positions(
+                    &self.model,
+                    inputs,
+                    &branch_positions,
+                    device,
+                )
+                .ok()?;
+                let [_, vocab] = branch_logits.shape().dims::<2>();
+                let branch_logits = branch_logits.reshape([row_count, 1, vocab]);
+                let mut candidate_mask_values =
+                    vec![0.0f32; row_count.saturating_mul(vocab)];
+                let mut equivalent_mask_values =
+                    vec![0.0f32; row_count.saturating_mul(vocab)];
+                for (row_index, row) in rows.iter().enumerate() {
+                    let ExpertRowObjective::PresentationIndex {
+                        candidate_target_tokens,
+                        equivalent_target_tokens,
+                        ..
+                    } = &row.objective
+                    else {
+                        return None;
+                    };
+                    for token in candidate_target_tokens {
+                        let token = usize::try_from(*token).ok()?;
+                        if token >= vocab {
+                            return None;
+                        }
+                        candidate_mask_values[row_index * vocab + token] = 1.0;
+                    }
+                    for token in equivalent_target_tokens {
+                        let token = usize::try_from(*token).ok()?;
+                        if token >= vocab {
+                            return None;
+                        }
+                        equivalent_mask_values[row_index * vocab + token] = 1.0;
+                    }
+                }
+                let candidate_mask = Tensor::<B, 3>::from_data(
+                    TensorData::new(candidate_mask_values, [row_count, 1, vocab]),
+                    device,
+                );
+                let equivalent_mask = Tensor::<B, 3>::from_data(
+                    TensorData::new(equivalent_mask_values, [row_count, 1, vocab]),
+                    device,
+                );
+                Some(grouped_verifier_equivalent_action_loss(
+                    branch_logits,
+                    candidate_mask,
+                    equivalent_mask,
+                    row_weights,
+                    config.normalization,
+                    config.presentation_risk,
+                    presentation_group_size,
+                    weight,
+                ))
+            }
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep => {
+                if config.normalization
+                    == crate::config::RuliadProofPolicyNormalization::PrefixConditional
+                {
+                    let branch_row_count = prefix_branch_rows.len();
+                    if branch_row_count == 0 {
+                        return None;
+                    }
+                    let max_len = prefix_branch_rows
+                        .iter()
+                        .map(|row| row.inputs.len())
+                        .max()?
+                        .max(1);
+                    let mut input_values = vec![0i64; branch_row_count * max_len];
+                    let mut branch_positions = Vec::with_capacity(branch_row_count);
+                    let branch_weights = prefix_branch_rows
+                        .iter()
+                        .map(|row| row.weight)
+                        .collect::<Vec<_>>();
+                    for (row_index, row) in prefix_branch_rows.iter().enumerate() {
+                        let offset = row_index * max_len;
+                        input_values[offset..offset + row.inputs.len()]
+                            .copy_from_slice(&row.inputs);
+                        branch_positions.push(row.branch_position);
+                    }
+                    let inputs = Tensor::<B, 2, Int>::from_data(
+                        TensorData::new(input_values, [branch_row_count, max_len]),
+                        device,
+                    );
+                    let branch_logits =
+                        crate::train::ruliad_policy::logits_at_sequence_positions(
+                            &self.model,
+                            inputs,
+                            &branch_positions,
+                            device,
+                        )
+                        .ok()?;
+                    let [_, vocab] = branch_logits.shape().dims::<2>();
+                    let mut candidate_mask_values =
+                        vec![0.0f32; branch_row_count.saturating_mul(vocab)];
+                    let mut equivalent_mask_values =
+                        vec![0.0f32; branch_row_count.saturating_mul(vocab)];
+                    for (row_index, row) in prefix_branch_rows.iter().enumerate() {
+                        for token in &row.candidate_target_tokens {
+                            let token = usize::try_from(*token).ok()?;
+                            if token >= vocab {
+                                return None;
+                            }
+                            candidate_mask_values[row_index * vocab + token] = 1.0;
+                        }
+                        for token in &row.equivalent_target_tokens {
+                            let token = usize::try_from(*token).ok()?;
+                            if token >= vocab {
+                                return None;
+                            }
+                            equivalent_mask_values[row_index * vocab + token] = 1.0;
+                        }
+                    }
+                    let candidate_mask = Tensor::<B, 3>::from_data(
+                        TensorData::new(candidate_mask_values, [branch_row_count, 1, vocab]),
+                        device,
+                    );
+                    let equivalent_mask = Tensor::<B, 3>::from_data(
+                        TensorData::new(equivalent_mask_values, [branch_row_count, 1, vocab]),
+                        device,
+                    );
+                    let row_weights = Tensor::<B, 1>::from_data(
+                        TensorData::new(branch_weights, [branch_row_count]),
+                        device,
+                    );
+                    return Some(grouped_verifier_equivalent_action_loss(
+                        branch_logits.reshape([branch_row_count, 1, vocab]),
+                        candidate_mask,
+                        equivalent_mask,
+                        row_weights,
+                        crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                        crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                        1,
+                        weight,
+                    ));
+                }
+                let mut prompts = Vec::with_capacity(row_count);
+                let mut candidates = Vec::with_capacity(row_count);
+                let mut equivalent_indices = Vec::with_capacity(row_count);
+                for row in &rows {
+                    let ExpertRowObjective::SemanticStep {
+                        prompt,
+                        candidate_completions,
+                        equivalent_indices: row_equivalent_indices,
+                    } = &row.objective
+                    else {
+                        return None;
+                    };
+                    prompts.push(prompt.clone());
+                    candidates.push(candidate_completions.clone());
+                    equivalent_indices.push(row_equivalent_indices.clone());
+                }
+                let candidate_count = candidates.first()?.len();
+                if candidate_count < 2
+                    || candidates.iter().any(|group| group.len() != candidate_count)
+                {
+                    return None;
+                }
+                let (mean_log_scores, sum_log_scores, group_sizes) = match config.scoring {
+                    crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                        let scores =
+                            crate::train::ruliad_policy::sequence_completion_score_tensor_with_gradient_scope(
+                                &self.model,
+                                &prompts,
+                                &candidates,
+                                config.gradient_scope,
+                                device,
+                            )
+                            .ok()?;
+                        (
+                            scores.mean_log_scores,
+                            scores.sum_log_scores,
+                            scores.group_sizes,
+                        )
+                    }
+                    crate::config::RuliadProofPolicyScoring::SemanticEnergy => {
+                        let (scores, group_sizes) =
+                            crate::train::ruliad_policy::sequence_energy_score_tensor_with_gradient_scope(
+                                &self.model,
+                                &prompts,
+                                &candidates,
+                                config.gradient_scope,
+                                device,
+                            )
+                            .ok()?;
+                        (scores.clone(), scores, group_sizes)
+                    }
+                };
+                if group_sizes
+                    .iter()
+                    .any(|group_size| *group_size != candidate_count)
+                {
+                    return None;
+                }
+                let mut equivalent_mask_values =
+                    vec![0.0f32; row_count.saturating_mul(candidate_count)];
+                for (row_index, indices) in equivalent_indices.iter().enumerate() {
+                    for index in indices {
+                        if *index >= candidate_count {
+                            return None;
+                        }
+                        equivalent_mask_values[row_index * candidate_count + *index] = 1.0;
+                    }
+                }
+                let equivalent_mask = Tensor::<B, 2>::from_data(
+                    TensorData::new(equivalent_mask_values, [row_count, candidate_count]),
+                    device,
+                );
+                Some(grouped_verifier_equivalent_sequence_loss(
+                    mean_log_scores.reshape([row_count, candidate_count]),
+                    sum_log_scores.reshape([row_count, candidate_count]),
+                    equivalent_mask,
+                    row_weights,
+                    GroupedVerifierSequenceLossConfig {
+                        normalization: config.normalization,
+                        presentation_risk: config.presentation_risk,
+                        presentation_group_size,
+                        weight,
+                    },
+                ))
+            }
+        }
+    }
+
     fn ruliad_verifier_policy_loss(
         &self,
         policy_batch: &crate::dataset::RuliadPolicyBatch,
@@ -6612,6 +9147,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         Self::ruliad_completion_tokens_from_answer(
                             &tokenizer,
                             &negative,
+                            sample.item.document_close_marker(),
                             completion_budget,
                         )
                     else {
@@ -6635,6 +9171,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     Self::ruliad_completion_tokens_from_answer(
                         &tokenizer,
                         &entry.key.answer,
+                        sample.item.document_close_marker(),
                         completion_budget,
                     )
                 else {
@@ -7862,8 +10399,9 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let marginal_probs = (marginal_weight > f32::EPSILON
             || target_coverage_weight > f32::EPSILON)
             .then(|| flat_probs.mean_dim(0));
-        if marginal_weight > f32::EPSILON && target_marginal_entropy_bits > f32::EPSILON {
-            if let Some(loss) = marginal_entropy_floor_loss_from_marginal(
+        if marginal_weight > f32::EPSILON
+            && target_marginal_entropy_bits > f32::EPSILON
+            && let Some(loss) = marginal_entropy_floor_loss_from_marginal(
                 marginal_probs
                     .as_ref()
                     .expect("marginal probabilities")
@@ -7871,12 +10409,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 target_marginal_entropy_bits,
             )
             .map(|loss| loss.mul_scalar(marginal_weight))
-            {
-                total = Some(match total {
-                    Some(accumulated) => accumulated + loss,
-                    None => loss,
-                });
-            }
+        {
+            total = Some(match total {
+                Some(accumulated) => accumulated + loss,
+                None => loss,
+            });
         }
         if target_coverage_weight > f32::EPSILON
             && let Some(loss) = target_marginal_coverage_loss_from_marginal(
@@ -8770,6 +11307,10 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let memory_prof_enabled = prof_enabled && crate::train::profile::memory_enabled();
         let forward_start = prof_enabled.then(Instant::now);
         let clean_inputs = batch.inputs;
+        B::seed(
+            &clean_inputs.device(),
+            stochastic_step_seed(self.stochastic_seed, step_index, STOCHASTIC_STREAM_MAIN),
+        );
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
         let ruliad_policy_batch = batch.ruliad_policy_batch;
@@ -8796,6 +11337,17 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let [_batch_size, block_size] = inputs.shape().dims();
         let tbptt_chunk_size = self.effective_tbptt_chunk_size(block_size);
         let factorized_head = self.model.uses_factorized_language_head();
+        // State inference needs gradients only for recurrent-state leaves. Build
+        // one current-weight detached parameter view per train step and reuse it
+        // across all corrected chunks.
+        let predictive_coding_model_needed = tbptt_chunk_size.is_some_and(|chunk_size| {
+            let chunks_per_step = block_size.div_ceil(chunk_size.max(1));
+            (0..chunks_per_step).any(|chunk_index| {
+                self.predictive_coding_active_for_chunk(step_index, chunk_index, chunks_per_step)
+            })
+        });
+        let predictive_coding_model =
+            predictive_coding_model_needed.then(|| detach_teacher_model(&self.model));
         let recurrent_teacher = self.recurrent_teacher_model();
         let (recurrent_teacher, recurrent_teacher_emits_logits) = match recurrent_teacher {
             Some((teacher, emit_logits)) => (Some(teacher), emit_logits),
@@ -8808,7 +11360,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let probe_summary_event_mask = detail_prof_enabled
             .then(|| summary_event_mask.clone())
             .flatten();
-        let mut step_state = self.load_step_state(reset_stream_state);
+        let mut step_state = self.load_step_state(reset_stream_state, block_size);
         let (loss, probe_hidden, probe_logits, forward_ns) = if self.pipeline_enabled() {
             let forward_start = Instant::now();
             let (loss, hidden, logits) = self.forward_loss_with_pipeline(
@@ -8840,25 +11392,37 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let mut teacher_logits_chunks = Vec::new();
                 let mut total_forward_ns = 0u128;
                 let mut predictive_coding_step_report = PredictiveCodingChunkReport::default();
+                let chunks_per_step = block_size.div_ceil(chunk_size);
                 for (chunk_index, start) in (0..block_size).step_by(chunk_size).enumerate() {
                     let end = (start + chunk_size).min(block_size);
                     let chunk_inputs = Self::slice_tokens(inputs.clone(), batch_size, start, end);
                     let chunk_summary_event_mask = summary_event_mask
                         .clone()
                         .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
-                    if self.predictive_coding_active_for_chunk(step_index, chunk_index) {
+                    if self.predictive_coding_active_for_chunk(
+                        step_index,
+                        chunk_index,
+                        chunks_per_step,
+                    ) && matches!(
+                        self.predictive_coding.observation_contract,
+                        PredictiveCodingObservationContract::OracleNextTokenNegativeControl
+                    ) {
                         let chunk_targets =
                             Self::slice_tokens(targets.clone(), batch_size, start, end);
                         let chunk_loss_mask = loss_mask
                             .clone()
                             .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
-                        let (corrected_state, report) = self.correct_state_with_predictive_coding(
-                            step_state,
-                            chunk_inputs.clone(),
-                            chunk_targets,
-                            chunk_loss_mask,
-                            chunk_summary_event_mask.clone(),
-                        );
+                        let (corrected_state, report) = self
+                            .correct_state_with_oracle_predictive_coding_using_model(
+                                predictive_coding_model
+                                    .as_ref()
+                                    .expect("enabled predictive-coding model"),
+                                step_state,
+                                chunk_inputs.clone(),
+                                chunk_targets,
+                                chunk_loss_mask,
+                                chunk_summary_event_mask.clone(),
+                            );
                         step_state = corrected_state;
                         if self.predictive_coding.sync_diagnostics {
                             report.record();
@@ -8942,6 +11506,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let mut total_loss: Option<Tensor<B, 1>> = None;
                 let mut accumulator = GradientsAccumulator::new();
                 let mut predictive_coding_step_report = PredictiveCodingChunkReport::default();
+                let chunks_per_step = block_size.div_ceil(chunk_size);
 
                 for (chunk_index, start) in (0..block_size).step_by(chunk_size).enumerate() {
                     let end = (start + chunk_size).min(block_size);
@@ -8955,14 +11520,40 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     let chunk_summary_event_mask = summary_event_mask
                         .clone()
                         .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
-                    if self.predictive_coding_active_for_chunk(step_index, chunk_index) {
-                        let (corrected_state, report) = self.correct_state_with_predictive_coding(
-                            step_state,
-                            chunk_inputs.clone(),
-                            chunk_targets.clone(),
-                            chunk_loss_mask.clone(),
-                            chunk_summary_event_mask.clone(),
-                        );
+                    let predictive_coding_active = self.predictive_coding_active_for_chunk(
+                        step_index,
+                        chunk_index,
+                        chunks_per_step,
+                    );
+                    let observed_pc_entry = (predictive_coding_active
+                        && matches!(
+                            self.predictive_coding.observation_contract,
+                            PredictiveCodingObservationContract::ObservedPrefix
+                        ))
+                    .then(|| step_state.detached_clone())
+                    .filter(|state| {
+                        Self::predictive_coding_state_has_latents(
+                            state,
+                            self.predictive_coding.state_scope,
+                        )
+                    });
+                    if predictive_coding_active
+                        && matches!(
+                            self.predictive_coding.observation_contract,
+                            PredictiveCodingObservationContract::OracleNextTokenNegativeControl
+                        )
+                    {
+                        let (corrected_state, report) = self
+                            .correct_state_with_oracle_predictive_coding_using_model(
+                                predictive_coding_model
+                                    .as_ref()
+                                    .expect("enabled predictive-coding model"),
+                                step_state,
+                                chunk_inputs.clone(),
+                                chunk_targets.clone(),
+                                chunk_loss_mask.clone(),
+                                chunk_summary_event_mask.clone(),
+                            );
                         step_state = corrected_state;
                         if self.predictive_coding.sync_diagnostics {
                             report.record();
@@ -8985,7 +11576,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     };
 
                     let chunk_forward_start = Instant::now();
-                    let chunk_loss = if let Some(mask) = chunk_summary_event_mask {
+                    let chunk_loss = if let Some(mask) = chunk_summary_event_mask.clone() {
                         let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
                             chunk_inputs,
                             mask,
@@ -9012,12 +11603,55 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     };
                     let chunk_loss =
                         self.add_latent_rho_memory_auxiliary_loss(chunk_loss, &step_state);
-                    let chunk_loss = self.add_latent_dragon_state_auxiliary_loss(
+                    let mut chunk_loss = self.add_latent_dragon_state_auxiliary_loss(
                         chunk_loss,
                         &step_state,
                         recurrent_teacher_state.as_ref(),
                     );
                     total_forward_ns += chunk_forward_start.elapsed().as_nanos();
+
+                    if let Some(entry_state) = observed_pc_entry {
+                        let (corrected_state, mut report) = self
+                            .correct_state_from_observed_prefix_using_model(
+                                predictive_coding_model
+                                    .as_ref()
+                                    .expect("enabled predictive-coding model"),
+                                entry_state,
+                                chunk_clean_inputs,
+                                chunk_loss_mask,
+                                chunk_summary_event_mask,
+                            );
+                        if report.chunks_corrected > 0 {
+                            if matches!(
+                                self.predictive_coding.parameter_update,
+                                PredictiveCodingParameterUpdate::Optimizer
+                            ) {
+                                let (constraint, components) = self
+                                    .predictive_coding_amortization_constraint(
+                                        &step_state,
+                                        &corrected_state,
+                                    );
+                                report.amortization_components = components;
+                                if let Some(constraint) = constraint {
+                                    if self.predictive_coding.sync_diagnostics {
+                                        report.amortization_loss = Some(scalar_tensor_to_f64(
+                                            constraint.clone().detach().inner(),
+                                        ));
+                                    }
+                                    chunk_loss = chunk_loss + constraint;
+                                }
+                            } else {
+                                // This explicitly non-learning control retains online state
+                                // inference so it remains distinct from the AdamW baseline.
+                                step_state = corrected_state;
+                            }
+                        }
+                        if self.predictive_coding.sync_diagnostics {
+                            report.record();
+                        } else {
+                            predictive_coding_step_report.accumulate_unsynced(report);
+                        }
+                    }
 
                     let chunk_weight = (end - start) as f32 / block_size as f32;
                     let chunk_loss = chunk_loss.mul_scalar(chunk_weight);
@@ -9248,6 +11882,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             );
             (loss, None, None, forward_ns)
         };
+        let auxiliary_objective_start = prof_enabled.then(Instant::now);
         let loss = if let Some(rollout_loss) =
             self.greedy_rollout_unlikelihood_loss(clean_inputs_for_aux)
         {
@@ -9325,6 +11960,34 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         } else {
             loss
         };
+        B::seed(
+            &targets.device(),
+            stochastic_step_seed(
+                self.stochastic_seed,
+                step_index,
+                STOCHASTIC_STREAM_PROOF_POLICY,
+            ),
+        );
+        let proof_policy_start = prof_enabled.then(Instant::now);
+        let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
+            && let Some(proof_policy_loss) =
+                self.ruliad_proof_policy_dagger_loss(policy_batch, &targets.device(), block_size)
+        {
+            loss + proof_policy_loss
+        } else {
+            loss
+        };
+        let proof_policy_ns = proof_policy_start
+            .map(|start| start.elapsed().as_nanos())
+            .unwrap_or_default();
+        B::seed(
+            &targets.device(),
+            stochastic_step_seed(
+                self.stochastic_seed,
+                step_index,
+                STOCHASTIC_STREAM_VERIFIER_POLICY,
+            ),
+        );
         let loss = if let Some(policy_batch) = ruliad_policy_batch.as_deref()
             && let Some(policy_loss) =
                 self.ruliad_verifier_policy_loss(policy_batch, &targets.device(), block_size)
@@ -9333,6 +11996,9 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         } else {
             loss
         };
+        let auxiliary_objective_ns = auxiliary_objective_start
+            .map(|start| start.elapsed().as_nanos())
+            .unwrap_or_default();
         self.store_step_state(step_state);
         let step_memory_after_forward = step_device
             .as_ref()
@@ -9353,6 +12019,10 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             .unwrap_or_default();
 
         if prof_enabled {
+            crate::train::profile::record_auxiliary_objectives(
+                auxiliary_objective_ns,
+                proof_policy_ns,
+            );
             crate::train::profile::record_train_step(forward_ns, loss_backward_ns);
             if let (Some(before), Some(after_forward), Some(device)) = (
                 step_memory_before,
@@ -9603,6 +12273,93 @@ impl<B: BackendTrait> ValidStep for LanguageTrainModel<B> {
 }
 
 impl<B: BackendTrait> LanguageTrainModel<B> {
+    pub(crate) fn sequence_state_diagnostics(
+        state: &ModelState<B>,
+        max_rho_slots: usize,
+    ) -> Option<SequenceStateDiagnostics> {
+        let mut rho_rms: Option<Tensor<B, 1>> = None;
+        let mut slot_variance_ratio: Option<Tensor<B, 1>> = None;
+        let mut slot_redundancy: Option<Tensor<B, 1>> = None;
+        let mut layers = 0usize;
+
+        for rho in state.layers.iter().filter_map(|layer| layer.rho.as_ref()) {
+            let [batch, heads, original_slots, dim] = rho.shape().dims::<4>();
+            if batch == 0 || heads == 0 || original_slots < 2 || dim == 0 {
+                continue;
+            }
+            let rho = Self::sample_rho_slots_with_limit(
+                rho.clone(),
+                original_slots,
+                max_rho_slots.max(2),
+            );
+            let [batch, heads, slots, dim] = rho.shape().dims::<4>();
+            let groups = batch.saturating_mul(heads);
+            let rows = rho.reshape([groups, slots, dim]);
+            let layer_energy = rows.clone().powf_scalar(2.0).mean().reshape([1]);
+            let layer_rms = layer_energy.clone().clamp_min(1.0e-12).sqrt();
+
+            let slot_mean = rows.clone().mean_dim(1);
+            let slot_variance = (rows.clone() - slot_mean.repeat_dim(1, slots))
+                .powf_scalar(2.0)
+                .mean()
+                .reshape([1]);
+            let layer_variance_ratio = slot_variance / layer_energy.clamp_min(1.0e-12);
+
+            let row_mean = rows.clone().mean_dim(2);
+            let centered = rows - row_mean.repeat_dim(2, dim);
+            let row_energy = centered
+                .clone()
+                .powf_scalar(2.0)
+                .sum_dim(2)
+                .clamp_min(1.0e-8);
+            let normalized = centered / row_energy.clone().sqrt().repeat_dim(2, dim);
+            let gram = normalized
+                .clone()
+                .matmul(normalized.clone().swap_dims(1, 2));
+            let total_sq = gram.powf_scalar(2.0).sum().reshape([1]);
+            let diag_sq = normalized
+                .powf_scalar(2.0)
+                .sum_dim(2)
+                .powf_scalar(2.0)
+                .sum()
+                .reshape([1]);
+            let off_diagonal = (groups * slots * slots.saturating_sub(1)).max(1) as f32;
+            let layer_redundancy = (total_sq - diag_sq)
+                .clamp_min(0.0)
+                .div_scalar(off_diagonal)
+                .sqrt();
+
+            rho_rms = Some(match rho_rms {
+                Some(total) => total + layer_rms,
+                None => layer_rms,
+            });
+            slot_variance_ratio = Some(match slot_variance_ratio {
+                Some(total) => total + layer_variance_ratio,
+                None => layer_variance_ratio,
+            });
+            slot_redundancy = Some(match slot_redundancy {
+                Some(total) => total + layer_redundancy,
+                None => layer_redundancy,
+            });
+            layers = layers.saturating_add(1);
+        }
+
+        let scalar = |tensor: Tensor<B, 1>| {
+            tensor
+                .div_scalar(layers.max(1) as f32)
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("sequence-state diagnostic tensor")[0] as f64
+        };
+        Some(SequenceStateDiagnostics {
+            rho_layers: layers,
+            rho_rms: scalar(rho_rms?),
+            rho_slot_variance_ratio: scalar(slot_variance_ratio?),
+            rho_slot_redundancy: scalar(slot_redundancy?),
+        })
+    }
+
     pub(crate) fn step_with_stream_state(
         &self,
         batch: SequenceBatch<B>,
@@ -9760,7 +12517,7 @@ fn lagged_prediction_tensors<B: BackendTrait>(
     batch_size: usize,
     time: usize,
     vocab: usize,
-) -> Option<(Tensor<B, 3>, Tensor<B, 2, Int>, Tensor<B, 2, Int>)> {
+) -> Option<LaggedPredictionTensors<B>> {
     if lag == 0 || time == 0 || lag > time {
         return None;
     }
@@ -10249,6 +13006,81 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn causal_predictive_coding_cadence_uses_post_observation_chunks() {
+        let due = |step, chunk| {
+            predictive_coding_chunk_due(
+                PredictiveCodingObservationContract::ObservedPrefix,
+                step,
+                chunk,
+                4,
+                2,
+            )
+        };
+
+        assert_eq!(
+            (0..4).map(|chunk| due(0, chunk)).collect::<Vec<_>>(),
+            vec![false, true, false, true]
+        );
+        assert_eq!(
+            (0..4).map(|chunk| due(1, chunk)).collect::<Vec<_>>(),
+            vec![false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn causal_predictive_coding_sparse_cadence_crosses_step_boundaries() {
+        let due = |step, chunk| {
+            predictive_coding_chunk_due(
+                PredictiveCodingObservationContract::ObservedPrefix,
+                step,
+                chunk,
+                4,
+                8,
+            )
+        };
+
+        assert!((0..4).all(|chunk| !due(0, chunk)));
+        assert_eq!(
+            (0..4).map(|chunk| due(1, chunk)).collect::<Vec<_>>(),
+            vec![false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn oracle_negative_control_preserves_historical_cadence_phase() {
+        let due = |chunk| {
+            predictive_coding_chunk_due(
+                PredictiveCodingObservationContract::OracleNextTokenNegativeControl,
+                0,
+                chunk,
+                4,
+                2,
+            )
+        };
+
+        assert_eq!(
+            (0..4).map(due).collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn stochastic_step_streams_are_reproducible_and_domain_separated() {
+        let base = 1_337;
+        let main = stochastic_step_seed(base, 19, STOCHASTIC_STREAM_MAIN);
+        assert_eq!(main, stochastic_step_seed(base, 19, STOCHASTIC_STREAM_MAIN));
+        assert_ne!(main, stochastic_step_seed(base, 20, STOCHASTIC_STREAM_MAIN));
+        assert_ne!(
+            main,
+            stochastic_step_seed(base, 19, STOCHASTIC_STREAM_PROOF_POLICY)
+        );
+        assert_ne!(
+            stochastic_step_seed(base, 19, STOCHASTIC_STREAM_PROOF_POLICY),
+            stochastic_step_seed(base, 19, STOCHASTIC_STREAM_VERIFIER_POLICY)
+        );
+    }
+
+    #[test]
     fn streaming_state_is_pipeline_owned_and_clone_shared() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let model_a = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -10285,8 +13117,156 @@ mod objective_step_tests {
             17,
             "Burn learner clones must retain the same pipeline runtime cell"
         );
-        assert_eq!(model_a.load_step_state(true).position, 0);
+        assert_eq!(model_a.load_step_state(true, 4).position, 0);
         assert!(model_a.peek_step_state_for_test().is_none());
+    }
+
+    #[test]
+    fn sequence_state_diagnostics_detect_redundant_rho_slots() {
+        let device = burn::tensor::Device::<TestInnerBackend>::default();
+        let mut state = ModelState::<TestInnerBackend>::new(1);
+        state.layers[0].rho = Some(Tensor::from_data(
+            TensorData::new(
+                vec![1.0f32, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5],
+                [1, 1, 2, 4],
+            ),
+            &device,
+        ));
+
+        let diagnostics =
+            LanguageTrainModel::<TestInnerBackend>::sequence_state_diagnostics(&state, 2)
+                .expect("rho diagnostics");
+        assert_eq!(diagnostics.rho_layers, 1);
+        assert!((diagnostics.rho_rms - 0.790_569_4).abs() < 1.0e-5);
+        assert!(diagnostics.rho_slot_variance_ratio.abs() < 1.0e-6);
+        assert!((diagnostics.rho_slot_redundancy - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn sequence_state_diagnostics_detect_distinct_rho_slots() {
+        let device = burn::tensor::Device::<TestInnerBackend>::default();
+        let mut state = ModelState::<TestInnerBackend>::new(1);
+        state.layers[0].rho = Some(Tensor::from_data(
+            TensorData::new(
+                vec![1.0f32, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -1.0],
+                [1, 1, 2, 4],
+            ),
+            &device,
+        ));
+
+        let diagnostics =
+            LanguageTrainModel::<TestInnerBackend>::sequence_state_diagnostics(&state, 2)
+                .expect("rho diagnostics");
+        assert!(diagnostics.rho_slot_variance_ratio > 0.49);
+        assert!(diagnostics.rho_slot_redundancy < 1.0e-5);
+    }
+
+    #[test]
+    fn terminal_sequence_state_elision_requires_a_stateless_training_contract() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_model_config();
+        config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+
+        let baseline =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device));
+        assert!(
+            !baseline.load_step_state(false, 4).layers[0].retain_terminal_sequence_state,
+            "an unchunked nonpersistent dense-score step should elide unused terminal state"
+        );
+
+        let retained =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_ephemeral_terminal_sequence_state_retention(true);
+        assert!(retained.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let chunked =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_tbptt_chunk_size(Some(2));
+        assert!(chunked.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let persistent =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_tbptt_persist_across_steps(true);
+        assert!(persistent.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut pipeline_config = config.clone();
+        pipeline_config.n_layer = 2;
+        let pipeline =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(pipeline_config, &device))
+                .with_pipeline_plan(Some(tiny_pipeline_plan()));
+        assert!(pipeline.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut predictive_coding = PredictiveCodingConfig::default();
+        predictive_coding.enabled = true;
+        let predictive =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_predictive_coding(predictive_coding);
+        assert!(predictive.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut latent_reasoning = LatentReasoningTrainingConfig::default();
+        latent_reasoning.enabled = true;
+        latent_reasoning.sigreg.target = crate::config::LatentReasoningSigRegTarget::RhoMemorySlots;
+        let rho_regularized =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_latent_reasoning(latent_reasoning);
+        assert!(rho_regularized.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut dragon_state_reasoning = LatentReasoningTrainingConfig::default();
+        dragon_state_reasoning.enabled = true;
+        dragon_state_reasoning.dragon_state.enabled = true;
+        let dragon_state =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(config.clone(), &device))
+                .with_latent_reasoning(dragon_state_reasoning);
+        assert!(dragon_state.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut summary_memory_config = config;
+        summary_memory_config.summary_memory.enabled = true;
+        let summary_memory = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            summary_memory_config,
+            &device,
+        ));
+        assert!(summary_memory.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut reference_config = tiny_model_config();
+        reference_config.sequence_kernel = burn_dragon_core::SequenceKernelConfig::default();
+        let reference =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(reference_config, &device));
+        assert!(reference.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut multi_step_config = tiny_model_config();
+        multi_step_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        multi_step_config.rollout_fast_steps_per_slow_step = 2;
+        let multi_step =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(multi_step_config, &device));
+        assert!(multi_step.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut y_neuron_config = tiny_model_config();
+        y_neuron_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        y_neuron_config.y_neuron_recurrence.enabled = true;
+        let y_neuron =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(y_neuron_config, &device));
+        assert!(y_neuron.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut hierarchical_config = tiny_model_config();
+        hierarchical_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        hierarchical_config.hierarchical_dragon.enabled = true;
+        let hierarchical = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            hierarchical_config,
+            &device,
+        ));
+        assert!(hierarchical.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
+
+        let mut clocked_config = tiny_model_config();
+        clocked_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        clocked_config.clocked_slow_memory.enabled = true;
+        let clocked =
+            LanguageTrainModel::new(DragonModel::<TestBackend>::new(clocked_config, &device));
+        assert!(clocked.load_step_state(false, 4).layers[0].retain_terminal_sequence_state);
     }
 
     fn ruliad_test_score(
@@ -10363,7 +13343,7 @@ mod objective_step_tests {
     }
 
     #[test]
-    fn predictive_coding_corrects_tbptt_state_directly() {
+    fn oracle_predictive_coding_negative_control_corrects_state() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 11);
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
@@ -10373,6 +13353,9 @@ mod objective_step_tests {
         .with_tbptt_chunk_size(Some(2))
         .with_predictive_coding(PredictiveCodingConfig {
             enabled: true,
+            observation_contract:
+                PredictiveCodingObservationContract::OracleNextTokenNegativeControl,
+            allow_oracle_target_leak: true,
             steps: 1,
             step_size: 0.01,
             sync_diagnostics: true,
@@ -10392,7 +13375,7 @@ mod objective_step_tests {
             LanguageTrainModel::<TestBackend>::slice_tokens(batch.inputs, batch_size, 2, 4);
         let second_targets =
             LanguageTrainModel::<TestBackend>::slice_tokens(batch.targets, batch_size, 2, 4);
-        let (_corrected_state, report) = model.correct_state_with_predictive_coding(
+        let (_corrected_state, report) = model.correct_state_with_oracle_predictive_coding(
             state,
             second_inputs,
             second_targets,
@@ -10418,6 +13401,198 @@ mod objective_step_tests {
                 .zip(report.energy_after)
                 .is_some_and(|(before, after)| before.is_finite() && after.is_finite()),
             "PC should record finite before/after energy, report={report:?}"
+        );
+    }
+
+    #[test]
+    fn observed_prefix_predictive_coding_uses_no_future_target() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 13);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_chunk_size(Some(2))
+        .with_predictive_coding(PredictiveCodingConfig {
+            enabled: true,
+            observation_contract: PredictiveCodingObservationContract::ObservedPrefix,
+            steps: 1,
+            step_size: 0.01,
+            sync_diagnostics: true,
+            ..Default::default()
+        });
+        let batch = batch(&device);
+        let [batch_size, _block_size] = batch.inputs.shape().dims();
+        let mut state = model.model.init_state_ephemeral();
+        let first_inputs =
+            LanguageTrainModel::<TestBackend>::slice_tokens(batch.inputs.clone(), batch_size, 0, 2);
+        let _ = model
+            .model
+            .forward_hidden_with_state(first_inputs, &mut state);
+        state.detach_in_place();
+        let observed_inputs =
+            LanguageTrainModel::<TestBackend>::slice_tokens(batch.inputs, batch_size, 2, 4);
+        let (corrected_state, report) =
+            model.correct_state_from_observed_prefix(state, observed_inputs, None, None);
+
+        assert!(report.chunks_corrected > 0, "report={report:?}");
+        assert!(
+            report
+                .energy_before
+                .zip(report.energy_after)
+                .is_some_and(|(before, after)| {
+                    before.is_finite() && after.is_finite() && after <= before + 1.0e-4
+                }),
+            "observed-prefix inference should descend its causal energy: {report:?}"
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::predictive_coding_state_has_latents(
+                &corrected_state,
+                PredictiveCodingStateScope::Core,
+            )
+        );
+    }
+
+    #[test]
+    fn observed_prefix_empty_entry_replays_instead_of_resetting_state() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 17);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_predictive_coding(PredictiveCodingConfig {
+            enabled: true,
+            observation_contract: PredictiveCodingObservationContract::ObservedPrefix,
+            ..Default::default()
+        });
+        let observed_inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [2, 2]),
+            &device,
+        );
+
+        let (replayed, report) = model.correct_state_from_observed_prefix(
+            model.model.init_state_ephemeral(),
+            observed_inputs,
+            None,
+            None,
+        );
+
+        assert_eq!(report.skipped_empty_state, 1);
+        assert_eq!(report.chunks_corrected, 0);
+        assert_eq!(replayed.position, 2);
+        assert!(
+            LanguageTrainModel::<TestBackend>::predictive_coding_state_has_latents(
+                &replayed,
+                PredictiveCodingStateScope::Core,
+            )
+        );
+    }
+
+    #[test]
+    fn predictive_coding_amortization_constraint_detects_state_drift() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 19);
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_predictive_coding(PredictiveCodingConfig {
+            enabled: true,
+            amortization_tolerance: 0.0,
+            ..Default::default()
+        });
+        let mut student = model.model.init_state_ephemeral();
+        let inputs = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0, 1, 2, 3], [2, 2]),
+            &device,
+        );
+        model.model.forward_hidden_with_state(inputs, &mut student);
+        let teacher = student.detached_clone();
+        let (same, components) =
+            model.predictive_coding_amortization_constraint(&student, &teacher);
+        let same = scalar_tensor_to_f64(same.expect("same-state constraint").detach().inner());
+        assert!(components > 0);
+        assert!(same <= 1.0e-8, "same-state constraint={same}");
+
+        let mut drifted = teacher;
+        for layer in &mut drifted.layers {
+            layer.rho = layer.rho.take().map(|rho| rho.add_scalar(1.0).detach());
+            layer.y_neuron_state = layer
+                .y_neuron_state
+                .take()
+                .map(|state| state.add_scalar(1.0).detach());
+        }
+        let (drift, drift_components) =
+            model.predictive_coding_amortization_constraint(&student, &drifted);
+        let drift = scalar_tensor_to_f64(drift.expect("drift constraint").detach().inner());
+        assert_eq!(drift_components, components);
+        assert!(drift > 1.0e-4, "drift constraint={drift}");
+    }
+
+    #[test]
+    fn predictive_coding_amortization_has_finite_zero_error_gradient() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let student = Tensor::<TestBackend, 3>::zeros([2, 2, 4], &device).require_grad();
+        let teacher = Tensor::<TestBackend, 3>::zeros([2, 2, 4], &device);
+        let mut total = None;
+        let mut components = 0;
+        let mut sample_indices = PredictiveCodingSampleIndexCache::new();
+        accumulate_predictive_coding_amortization_constraint(
+            &mut total,
+            &mut components,
+            &Some(student.clone()),
+            &Some(teacher),
+            PredictiveCodingAmortizationConstraint {
+                sample_axis: 2,
+                max_slots: 4,
+                sample_offset: 0,
+                tolerance: 0.0,
+                eps: 1.0e-8,
+            },
+            &mut sample_indices,
+        );
+
+        let grads = total.expect("constraint").backward();
+        let grad = student.grad(&grads).expect("student state gradient");
+        let values = grad
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("gradient values");
+
+        assert_eq!(components, 1);
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().all(|value| value.abs() <= 1.0e-8));
+    }
+
+    #[test]
+    fn observed_prefix_train_step_amortizes_without_online_state_replacement() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 23);
+        crate::train::profile::reset_predictive_coding();
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            tiny_model_config(),
+            &device,
+        ))
+        .with_tbptt_chunk_size(Some(2))
+        .with_predictive_coding(PredictiveCodingConfig {
+            enabled: true,
+            observation_contract: PredictiveCodingObservationContract::ObservedPrefix,
+            parameter_update: PredictiveCodingParameterUpdate::Optimizer,
+            steps: 1,
+            step_size: 0.01,
+            ..Default::default()
+        });
+
+        let loss = scalar_loss(TrainStep::step(&model, batch(&device)));
+        let profile = crate::train::profile::take_predictive_coding();
+
+        assert!(loss.is_finite());
+        assert!(profile.chunks_corrected > 0, "profile={profile:?}");
+        assert!(
+            profile.amortization_components > 0,
+            "causal PC must constrain the ordinary deployment transition: {profile:?}"
         );
     }
 
@@ -10453,6 +13628,109 @@ mod objective_step_tests {
             0,
             "teacher snapshots must not build parameter-gradient graphs"
         );
+    }
+
+    #[test]
+    fn predictive_coding_all_scope_covers_every_slow_state_family() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut state = ModelState::<TestBackend>::new(1);
+        let layer = &mut state.layers[0];
+        layer.slow_rho = Some(Tensor::zeros([1, 1, 2, 2], &device));
+        layer.slow_rho_norm = Some(Tensor::zeros([1, 1, 2], &device));
+        layer.slow_sequence_aux = Some(Tensor::zeros([1, 1, 2, 2], &device));
+        layer.slow_mamba_angle_state = Some(Tensor::zeros([1, 1, 2], &device));
+        layer.slow_mamba_k_state = Some(Tensor::zeros([1, 1, 2], &device));
+        layer.slow_mamba_v_state = Some(Tensor::zeros([1, 1, 2], &device));
+        layer.hierarchical_slow_hidden = Some(Tensor::zeros([1, 1, 2, 2], &device));
+
+        assert!(
+            !LanguageTrainModel::<TestBackend>::predictive_coding_state_has_latents(
+                &state,
+                PredictiveCodingStateScope::Core,
+            )
+        );
+        assert!(
+            LanguageTrainModel::<TestBackend>::predictive_coding_state_has_latents(
+                &state,
+                PredictiveCodingStateScope::All,
+            )
+        );
+
+        let snapshot = predictive_coding_state_snapshot(&state, PredictiveCodingStateScope::All);
+        let names = snapshot
+            .rank3
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(snapshot.rank4.iter().map(|(name, _)| *name))
+            .collect::<HashSet<_>>();
+        for required in [
+            "slow_rho",
+            "slow_sequence_aux",
+            "slow_mamba_angle_state",
+            "slow_mamba_k_state",
+            "slow_mamba_v_state",
+            "hierarchical_slow_hidden",
+        ] {
+            assert!(names.contains(required), "missing state field {required}");
+        }
+
+        assert!(
+            LanguageTrainModel::<TestBackend>::attach_predictive_coding_state_latents(
+                &mut state,
+                PredictiveCodingStateScope::All,
+            )
+        );
+        let layer = &state.layers[0];
+        assert!(layer.slow_rho.as_ref().is_some_and(Tensor::is_require_grad));
+        assert!(
+            layer
+                .slow_mamba_k_state
+                .as_ref()
+                .is_some_and(Tensor::is_require_grad)
+        );
+        assert!(
+            layer
+                .hierarchical_slow_hidden
+                .as_ref()
+                .is_some_and(Tensor::is_require_grad)
+        );
+        assert!(layer.slow_rho_norm.is_none());
+    }
+
+    #[test]
+    fn predictive_coding_rotating_sampler_covers_all_slots() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let tensor = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new((0..10).map(|value| value as f32).collect(), [1, 1, 10]),
+            &device,
+        );
+        let mut cache = PredictiveCodingSampleIndexCache::new();
+        let mut covered = HashSet::new();
+
+        for offset in 0..10 {
+            let (student, teacher) = rotating_sample_state_axis_pair(
+                tensor.clone(),
+                tensor.clone(),
+                2,
+                3,
+                offset,
+                &mut cache,
+            );
+            let student = student
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("sampled student");
+            let teacher = teacher
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("sampled teacher");
+            assert_eq!(student, teacher);
+            covered.extend(student.into_iter().map(|value| value as usize));
+        }
+
+        assert_eq!(covered, (0..10).collect::<HashSet<_>>());
     }
 
     #[test]
@@ -10536,7 +13814,7 @@ mod objective_step_tests {
     fn output_degeneracy_accumulator_ignores_eos_padding_after_payload() {
         let eos_id = 99usize;
         let mut accumulator = OutputDegeneracyAccumulator::new(Some(eos_id as i64));
-        for argmax in (0usize..24).chain(std::iter::repeat(eos_id).take(40)) {
+        for argmax in (0usize..24).chain(std::iter::repeat_n(eos_id, 40)) {
             accumulator.record(OutputDegeneracyStep {
                 argmax,
                 entropy_bits: if argmax == eos_id { 0.01 } else { 2.0 },
@@ -11153,7 +14431,7 @@ mod objective_step_tests {
             .join("events")
             .join("ruliad_answer_contract.jsonl");
         let mut config = tiny_model_config();
-        config.vocab_size = 257;
+        config.vocab_size = 272;
         let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
             .with_ruliad_supervision(RuliadSupervisionConfig {
                 mode: RuliadSupervisionMode::AnswerCompletion,
@@ -11199,11 +14477,11 @@ mod objective_step_tests {
                     prompt_tokens: vec![1, 2, 3],
                 },
             ],
-            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
-                vocab_size: 257,
-                eos_id: None,
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
             },
-            stop_token_id: None,
+            stop_token_id: Some(265),
         };
 
         let loss = model
@@ -11892,21 +15170,19 @@ mod objective_step_tests {
             "schema-collapse negatives should expose sibling normal-form keys: {texts:?}"
         );
         assert!(
-            texts
-                .iter()
-                .any(|answer| *answer == "xlen=44;xalpha=01;xcounts=20,24"),
+            texts.contains(&"xlen=44;xalpha=01;xcounts=20,24"),
             "schema-collapse negatives should include missing-tail-field answers: {texts:?}"
         );
         assert!(
-            texts.iter().any(|answer| *answer == "xlen=44"),
+            texts.contains(&"xlen=44"),
             "schema-collapse negatives should include first-field-only answer collapse: {texts:?}"
         );
         assert!(
-            texts.iter().any(|answer| *answer == "ok=1;l=1;r=1"),
+            texts.contains(&"ok=1;l=1;r=1"),
             "schema-collapse negatives should include the observed ok/l/r cross-contract prototype: {texts:?}"
         );
         assert!(
-            texts.iter().any(|answer| *answer == "acc=1"),
+            texts.contains(&"acc=1"),
             "schema-collapse negatives should include compact cross-contract prototypes: {texts:?}"
         );
         assert!(
@@ -11915,6 +15191,46 @@ mod objective_step_tests {
                 .all(|answer| *answer != "xlen=44;xalpha=01;xcounts=20,24;xedge=01"),
             "schema-collapse negatives must not duplicate the oracle answer: {texts:?}"
         );
+    }
+
+    #[test]
+    fn ruliad_structured_proof_step_negatives_preserve_the_wire_contract() {
+        let answer = "g4|a:r0|f|1.1";
+        let negatives =
+            LanguageTrainModel::<TestBackend>::ruliad_structured_negative_answers_with_templates(
+                answer, 4, 1,
+            );
+
+        assert_eq!(negatives.len(), 5, "{negatives:?}");
+        assert_eq!(
+            negatives
+                .iter()
+                .filter(|(_, kind)| *kind == RuliadStructuredNegativeKind::TemplateCollapse)
+                .count(),
+            1
+        );
+        assert_eq!(
+            negatives
+                .iter()
+                .filter(|(_, kind)| *kind == RuliadStructuredNegativeKind::FieldMutation)
+                .count(),
+            4
+        );
+        assert!(negatives.iter().all(|(candidate, _)| {
+            candidate != answer
+                && burn_dragon_universality::ruliad::wire::decode_model_proof_step(candidate)
+                    .is_some()
+        }));
+        let oracle_fields = answer.split('|').collect::<Vec<_>>();
+        for field_index in 0..oracle_fields.len() {
+            assert!(negatives.iter().any(|(candidate, kind)| {
+                *kind == RuliadStructuredNegativeKind::FieldMutation
+                    && candidate
+                        .split('|')
+                        .nth(field_index)
+                        .is_some_and(|field| field != oracle_fields[field_index])
+            }));
+        }
     }
 
     #[test]
@@ -11937,10 +15253,31 @@ mod objective_step_tests {
         let marked = completion
             .iter()
             .zip(mask.iter())
-            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .filter_map(|(token, active)| active.then_some(*token))
+            .filter_map(char::from_u32)
             .collect::<String>();
 
         assert_eq!(marked, "11717");
+
+        let answer = "g4|a:r0|f|1.1";
+        let completion = tokenizer.encode_payload(&format!("{answer}\n[/R3]"));
+        let mask = LanguageTrainModel::<TestBackend>::ruliad_answer_value_completion_mask(
+            &tokenizer,
+            answer,
+            completion.len(),
+        );
+        let marked = completion
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(token, active)| active.then_some(*token))
+            .filter_map(char::from_u32)
+            .collect::<String>();
+
+        assert_eq!(marked, "4r0f1.1");
+        assert_eq!(
+            LanguageTrainModel::<TestBackend>::ruliad_answer_contract(answer).as_deref(),
+            Some("proof_action_step")
+        );
     }
 
     #[test]
@@ -11963,7 +15300,8 @@ mod objective_step_tests {
         let marked = completion
             .iter()
             .zip(mask.iter())
-            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .filter_map(|(token, active)| active.then_some(*token))
+            .filter_map(char::from_u32)
             .collect::<String>();
 
         assert_eq!(marked, "oklr");
@@ -11989,7 +15327,8 @@ mod objective_step_tests {
         let marked = completion
             .iter()
             .zip(mask.iter())
-            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .filter_map(|(token, active)| active.then_some(*token))
+            .filter_map(char::from_u32)
             .collect::<String>();
 
         assert_eq!(marked, "ok=;l=;r=");
@@ -12015,7 +15354,8 @@ mod objective_step_tests {
         let marked = completion
             .iter()
             .zip(mask.iter())
-            .filter_map(|(token, active)| active.then_some(char::from_u32(*token).unwrap()))
+            .filter_map(|(token, active)| active.then_some(*token))
+            .filter_map(char::from_u32)
             .collect::<String>();
 
         assert_eq!(marked, "xxxx");
@@ -12041,6 +15381,7 @@ mod objective_step_tests {
             &tokenizer,
             &prompt,
             "ok=1;l=17;r=17",
+            burn_dragon_universality::ruliad::RULIAD_V2_DOCUMENT_CLOSE_MARKER,
             32,
             96,
             8,
@@ -12064,6 +15405,59 @@ mod objective_step_tests {
             decoded_targets,
             vec!["1;", "17;", "17\n[/R2]"],
             "schema-forced value rows should target field values and close markers"
+        );
+    }
+
+    #[test]
+    fn ruliad_prompt_schema_value_rows_train_semantic_proof_step_fields() {
+        let tokenizer =
+            burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+                &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                    vocab_size: 257,
+                    eos_id: None,
+                },
+            )
+            .expect("tokenizer");
+        let prompt = tokenizer
+            .encode_payload("?:select;g=3;dst=x;at=1.1\n!:")
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+
+        let rows = LanguageTrainModel::<TestBackend>::ruliad_prompt_schema_value_completion_rows(
+            &tokenizer,
+            &prompt,
+            "g3|a:r0|f|1.1",
+            burn_dragon_universality::ruliad::RULIAD_V2_DOCUMENT_CLOSE_MARKER,
+            32,
+            96,
+            8,
+        );
+
+        assert_eq!(rows.len(), 4);
+        let decoded_targets = rows
+            .iter()
+            .map(|(_inputs, targets, mask, active)| {
+                assert_eq!(*active, mask.iter().filter(|value| **value > 0.0).count());
+                let tokens = targets
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(token, active)| (*active > 0.0).then_some(*token as u32))
+                    .collect::<Vec<_>>();
+                tokenizer.decode_payload(&tokens, true)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(decoded_targets, vec!["3|", "r0|", "f|", "1.1\n[/R2]"]);
+    }
+
+    #[test]
+    fn prompt_schema_row_budget_is_spread_across_samples_first() {
+        let groups = vec![vec!["a0", "a1"], vec!["b0", "b1"], vec!["c0", "c1"]];
+
+        assert_eq!(
+            take_rows_round_robin(&groups, 4),
+            vec![(0, "a0"), (1, "b0"), (2, "c0"), (0, "a1")]
         );
     }
 
@@ -12171,12 +15565,12 @@ mod objective_step_tests {
             oracle_hash: "h0".to_string(),
             sample_index: 43,
             split: burn_dragon_universality::SampleSplit::Train,
-            family: "proof_tree".to_string(),
-            task_kind: "prove_theorem".to_string(),
+            family: "formal_proof".to_string(),
+            task_kind: "select_proof_action".to_string(),
             math_domains: vec!["category".to_string()],
             reasoning_modes: vec!["equational".to_string()],
             prompt: "?:ss\n!:".to_string(),
-            expected_answer: "ok=1;l=17;r=17".to_string(),
+            expected_answer: "g4|a:r0|f|1.1".to_string(),
             difficulty_level: Some(0),
             spec: None,
         };
@@ -12239,8 +15633,8 @@ mod objective_step_tests {
             oracle_hash: "h0".to_string(),
             sample_index: 31,
             split: burn_dragon_universality::SampleSplit::Train,
-            family: "proof_tree".to_string(),
-            task_kind: "prove_theorem".to_string(),
+            family: "formal_proof".to_string(),
+            task_kind: "select_proof_action".to_string(),
             math_domains: vec!["category".to_string(), "formal_proof".to_string()],
             reasoning_modes: vec!["equational".to_string()],
             prompt: "?:ss\n!:".to_string(),
@@ -12452,6 +15846,836 @@ mod objective_step_tests {
     }
 
     #[test]
+    fn ruliad_proof_policy_masks_only_the_action_bearing_token() {
+        let prompt = [1, 2, 3];
+        let completion = [4, 5, 6, 7];
+        let (_, targets, mask) =
+            LanguageTrainModel::<TestBackend>::ruliad_policy_row_from_completion_token(
+                &prompt,
+                &completion,
+                2,
+            )
+            .expect("action-token policy row");
+        assert_eq!(mask.iter().filter(|value| **value > 0.0).count(), 1);
+        assert_eq!(mask[4], 1.0);
+        assert_eq!(targets[4], 6);
+    }
+
+    #[test]
+    fn verifier_equivalent_action_loss_marginalizes_all_valid_tokens() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.0, 0.0, 0.0], [1, 1, 4]),
+            &device,
+        );
+        let one_valid = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 0.0], [1, 1, 4]),
+            &device,
+        );
+        let two_valid = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 0.0, 0.0], [1, 1, 4]),
+            &device,
+        );
+        let candidates = Tensor::<TestBackend, 3>::ones([1, 1, 4], &device);
+
+        let one_loss = tensor_scalar(verifier_equivalent_action_loss(
+            logits.clone(),
+            candidates.clone(),
+            one_valid,
+            crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+            1.0,
+        ));
+        let two_loss = tensor_scalar(verifier_equivalent_action_loss(
+            logits,
+            candidates,
+            two_valid,
+            crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+            1.0,
+        ));
+        assert!((one_loss - 4.0f32.ln()).abs() < 1.0e-5, "{one_loss}");
+        assert!((two_loss - 2.0f32.ln()).abs() < 1.0e-5, "{two_loss}");
+        assert!(two_loss < one_loss);
+    }
+
+    #[test]
+    fn verifier_equivalent_action_loss_ignores_non_candidate_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let candidate_mask = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let equivalent_mask = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let baseline = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let dominant_non_candidate = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.0, 20.0], [1, 1, 3]),
+            &device,
+        );
+
+        let baseline_loss = tensor_scalar(verifier_equivalent_action_loss(
+            baseline,
+            candidate_mask.clone(),
+            equivalent_mask.clone(),
+            crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+            1.0,
+        ));
+        let perturbed_loss = tensor_scalar(verifier_equivalent_action_loss(
+            dominant_non_candidate,
+            candidate_mask,
+            equivalent_mask,
+            crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+            1.0,
+        ));
+        assert!((baseline_loss - 2.0f32.ln()).abs() < 1.0e-5);
+        assert!((perturbed_loss - baseline_loss).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn vocabulary_marginal_action_loss_penalizes_non_candidate_probability() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let candidate_mask = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let equivalent_mask = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let baseline = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.0, 0.0], [1, 1, 3]),
+            &device,
+        );
+        let dominant_non_candidate = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 0.0, 20.0], [1, 1, 3]),
+            &device,
+        );
+
+        let baseline_loss = tensor_scalar(verifier_equivalent_action_loss(
+            baseline,
+            candidate_mask.clone(),
+            equivalent_mask.clone(),
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+            1.0,
+        ));
+        let perturbed_loss = tensor_scalar(verifier_equivalent_action_loss(
+            dominant_non_candidate,
+            candidate_mask,
+            equivalent_mask,
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+            1.0,
+        ));
+        assert!((baseline_loss - 3.0f32.ln()).abs() < 1.0e-5);
+        assert!(perturbed_loss > baseline_loss + 10.0, "{perturbed_loss}");
+    }
+
+    #[test]
+    fn semantic_sequence_policy_loss_marginalizes_verifier_equivalent_actions() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let scores = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(vec![0.4f32.ln(), 0.1f32.ln(), 0.1f32.ln()], [1, 3]),
+            &device,
+        );
+        let equivalent = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 0.0, 1.0], [1, 3]),
+            &device,
+        );
+        let weights = Tensor::<TestBackend, 1>::ones([1], &device);
+        let conditional = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
+            scores.clone(),
+            scores.clone(),
+            equivalent.clone(),
+            weights.clone(),
+            GroupedVerifierSequenceLossConfig {
+                normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                presentation_group_size: 1,
+                weight: 1.0,
+            },
+        ));
+        let marginal = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
+            scores.clone(),
+            scores,
+            equivalent,
+            weights,
+            GroupedVerifierSequenceLossConfig {
+                normalization: crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                presentation_group_size: 1,
+                weight: 1.0,
+            },
+        ));
+        let expected_conditional = -(5.0f32 / 6.0).ln();
+        let expected_marginal = -0.5f32.ln();
+        assert!(
+            (conditional - expected_conditional).abs() < 1.0e-5,
+            "conditional={conditional}"
+        );
+        assert!(
+            (marginal - expected_marginal).abs() < 1.0e-5,
+            "marginal={marginal}"
+        );
+        assert!(marginal > conditional);
+    }
+
+    #[test]
+    fn worst_presentation_risk_targets_each_groups_weakest_orbit_member() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    0.9f32.ln(),
+                    0.1f32.ln(),
+                    0.6f32.ln(),
+                    0.4f32.ln(),
+                    0.8f32.ln(),
+                    0.2f32.ln(),
+                    0.2f32.ln(),
+                    0.8f32.ln(),
+                ],
+                [4, 1, 2],
+            ),
+            &device,
+        );
+        let candidates = Tensor::<TestBackend, 3>::ones([4, 1, 2], &device);
+        let equivalent = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], [4, 1, 2]),
+            &device,
+        );
+        let row_weights =
+            Tensor::<TestBackend, 1>::from_data(TensorData::new(vec![0.5; 4], [4]), &device);
+        let mean = tensor_scalar(grouped_verifier_equivalent_action_loss(
+            logits.clone(),
+            candidates.clone(),
+            equivalent.clone(),
+            row_weights.clone(),
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+            crate::config::RuliadProofPolicyPresentationRisk::Mean,
+            2,
+            1.0,
+        ));
+        let worst = tensor_scalar(grouped_verifier_equivalent_action_loss(
+            logits,
+            candidates,
+            equivalent,
+            row_weights,
+            crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+            crate::config::RuliadProofPolicyPresentationRisk::Worst,
+            2,
+            1.0,
+        ));
+
+        let expected_worst = -(0.6f32.ln() + 0.2f32.ln()) / 2.0;
+        assert!((worst - expected_worst).abs() < 1.0e-5, "{worst}");
+        assert!(worst > mean, "mean={mean} worst={worst}");
+    }
+
+    #[test]
+    fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 29);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_dagger.jsonl");
+        let mut model_config = tiny_model_config();
+        model_config.vocab_size = 272;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                    enabled: true,
+                    mode: crate::config::RuliadProofPolicyTrainingMode::Dagger,
+                    scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                    gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                    normalization:
+                        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
+                    candidate_symmetry:
+                        crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+                    presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                    weight: 1.0,
+                    every_steps: 1,
+                    start_after_steps: 0,
+                    dagger_start_after_steps: 1,
+                    stratified_difficulty_levels: 0,
+                    rollout_steps: 2,
+                    max_rows_per_update: 2,
+                    max_presentation_rows_per_update: 32,
+                    counterfactual_targets_per_state: 0,
+                    candidates: 4,
+                    max_completion_tokens: 16,
+                },
+                ..Default::default()
+            })
+            .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()));
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            29,
+            burn_dragon_universality::ruliad::formal::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal bundle");
+        let proof_step_index = 1.min(bundle.certificate.step_count().saturating_sub(1));
+        assert!(proof_step_index > 0, "fixture needs a nonzero proof step");
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            proof_step_index,
+            4,
+        )
+        .expect("oracle action set");
+        let problem_hash = bundle.problem.canonical_hash().expect("problem hash");
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: problem_hash,
+            sample_index: 29,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "formal_proof".to_string(),
+            task_kind: burn_dragon_universality::RuliadTaskKind::SelectProofAction
+                .label()
+                .to_string(),
+            math_domains: vec!["formal_proof".to_string()],
+            reasoning_modes: vec!["proof_construction".to_string()],
+            prompt: burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                &bundle.problem,
+                &actions,
+            )
+            .expect("policy prompt"),
+            expected_answer: format!("c={}", actions.selected_index),
+            difficulty_level: Some(0),
+            spec: Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                problem: bundle.problem,
+                certificate: bundle.certificate,
+                candidate: None,
+                proof_step_index: Some(proof_step_index),
+                action_presentation_rotation: Some(0),
+                action_answer_contract: Default::default(),
+                task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+            }),
+        };
+        let mut policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            },
+            stop_token_id: Some(271),
+        };
+        policy_batch.samples.push(policy_batch.samples[0].clone());
+
+        let loss = model
+            .ruliad_proof_policy_dagger_loss(&policy_batch, &device, 512)
+            .expect("DAgger expert correction loss");
+        assert!(tensor_scalar(loss).is_finite());
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry line"))
+                .expect("telemetry json");
+        assert_eq!(value["version"], 19);
+        assert_eq!(value["answer_contract"], "presentation_index");
+        assert_eq!(value["objective"], "vocabulary_marginal_equivalent_v1");
+        assert_eq!(value["presentation_risk"], "mean");
+        assert_eq!(value["configured_mode"], "dagger");
+        assert_eq!(value["mode"], "dagger");
+        assert_eq!(value["candidate_symmetry"], "balanced_rotation");
+        assert_eq!(value["available_sample_groups"], 2);
+        assert_eq!(value["sample_groups"], 1);
+        assert_eq!(value["nonzero_start_trajectories"], 1);
+        assert_eq!(value["mean_start_step"], proof_step_index as f64);
+        assert!(value["visited_states"].as_u64().unwrap_or_default() >= 1);
+        assert_eq!(value["semantic_state_rows"], value["expert_rows"]);
+        assert!(value["expert_rows"].as_u64().unwrap_or_default() >= 1);
+        assert_eq!(value["static_expert_rows"], 0);
+        assert!(value["dagger_expert_rows"].as_u64().unwrap_or_default() >= 1);
+        assert_eq!(value["supervised_action_tokens"], value["expert_rows"]);
+        assert_eq!(value["supervised_presentation_rows"], value["expert_rows"]);
+        assert_eq!(value["mean_presentations_per_state"], 1.0);
+        assert!(value["model_scoring_batches"].as_u64().unwrap_or_default() >= 1);
+        assert_eq!(value["maximum_model_scoring_batch_rows"], 1);
+        assert!(
+            value["model_scoring_padded_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(value["sampling_model_materialize_ms"].is_number());
+        assert!(value["state_prepare_ms"].is_number());
+        assert!(value["rollout_cpu_prepare_ms"].is_number());
+        assert!(value["model_scoring_ms"].is_number());
+        assert_eq!(value["trajectory_budget"], 1);
+        assert_eq!(value["semantic_row_budget"], 2);
+        assert_eq!(value["max_rows_per_update"], 2);
+        assert_eq!(value["max_presentation_rows_per_update"], 32);
+        assert!(value["rollout_depth_reached"].as_u64().unwrap_or_default() >= 2);
+        assert!(
+            value["model_visited_expert_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+        assert!(
+            value["equivalent_target_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                >= value["expert_rows"].as_u64().unwrap_or_default()
+        );
+        assert!(
+            value["candidate_target_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                >= value["equivalent_target_tokens"]
+                    .as_u64()
+                    .unwrap_or_default()
+        );
+        assert!(
+            value["mean_candidate_targets_per_row"]
+                .as_f64()
+                .unwrap_or_default()
+                >= value["mean_equivalent_targets_per_row"]
+                    .as_f64()
+                    .unwrap_or_default()
+        );
+        assert!(
+            value["mean_equivalent_targets_per_row"]
+                .as_f64()
+                .unwrap_or_default()
+                >= 1.0
+        );
+        assert!(value["expert_selected_index_histogram"].is_object());
+        assert!(value["expert_equivalent_index_histogram"].is_object());
+        assert!(value["model_selected_index_histogram"].is_object());
+        assert_eq!(value["difficulty_sample_groups"]["0"], 1);
+        assert!(
+            value["difficulty_visited_states"]["0"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+
+        let static_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_static.jsonl");
+        let mut static_model_config = tiny_model_config();
+        static_model_config.vocab_size = 272;
+        let static_model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            static_model_config,
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                candidate_symmetry:
+                    crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                dagger_start_after_steps: 1,
+                stratified_difficulty_levels: 0,
+                rollout_steps: 8,
+                max_rows_per_update: 2,
+                max_presentation_rows_per_update: 8,
+                counterfactual_targets_per_state: 0,
+                candidates: 4,
+                max_completion_tokens: 16,
+            },
+            ..Default::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(static_telemetry_path.clone()));
+        let static_loss = static_model
+            .ruliad_proof_policy_dagger_loss(&policy_batch, &device, 512)
+            .expect("static expert policy loss");
+        assert!(tensor_scalar(static_loss).is_finite());
+        let static_content =
+            std::fs::read_to_string(static_telemetry_path).expect("static telemetry sidecar");
+        let static_value: serde_json::Value = serde_json::from_str(
+            static_content
+                .lines()
+                .next()
+                .expect("static telemetry line"),
+        )
+        .expect("static telemetry json");
+        assert_eq!(static_value["version"], 19);
+        assert_eq!(static_value["answer_contract"], "presentation_index");
+        assert_eq!(static_value["presentation_risk"], "mean");
+        assert_eq!(static_value["configured_mode"], "static_expert");
+        assert_eq!(static_value["mode"], "static_expert");
+        assert_eq!(static_value["candidate_symmetry"], "cyclic_orbit_average");
+        assert_eq!(static_value["rollout_steps"], 1);
+        assert_eq!(static_value["configured_rollout_steps"], 8);
+        assert_eq!(static_value["model_scoring_batches"], 0);
+        assert_eq!(static_value["semantic_row_budget"], 2);
+        assert_eq!(static_value["max_presentation_rows_per_update"], 8);
+        assert!(static_value["expert_rows"].as_u64().unwrap_or_default() >= 1);
+        assert!(
+            static_value["static_expert_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+        assert_eq!(static_value["dagger_expert_rows"], 0);
+        assert!(
+            static_value["supervised_presentation_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                >= static_value["expert_rows"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_mul(2)
+        );
+        assert!(
+            static_value["mean_presentations_per_state"]
+                .as_f64()
+                .unwrap_or_default()
+                >= 2.0
+        );
+        assert!(
+            static_value["supervised_presentation_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                <= 8
+        );
+
+        let semantic_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_semantic.jsonl");
+        let mut semantic_batch = policy_batch.clone();
+        for sample in &mut semantic_batch.samples {
+            let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                action_answer_contract,
+                ..
+            }) = sample.item.spec.as_mut()
+            else {
+                panic!("formal proof fixture");
+            };
+            *action_answer_contract =
+                burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep;
+        }
+        let mut semantic_model_config = tiny_model_config();
+        semantic_model_config.vocab_size = 272;
+        let semantic_model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            semantic_model_config,
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                candidate_symmetry:
+                    crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Worst,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                dagger_start_after_steps: 1,
+                stratified_difficulty_levels: 0,
+                rollout_steps: 1,
+                max_rows_per_update: 1,
+                max_presentation_rows_per_update: 8,
+                counterfactual_targets_per_state: 0,
+                candidates: 4,
+                max_completion_tokens: 128,
+            },
+            ..Default::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(semantic_telemetry_path.clone()));
+        let semantic_loss = semantic_model
+            .ruliad_proof_policy_dagger_loss(&semantic_batch, &device, 512)
+            .expect("semantic proof-step policy loss");
+        assert!(tensor_scalar(semantic_loss.clone()).is_finite());
+        let _semantic_gradients = semantic_loss.backward();
+        let semantic_content =
+            std::fs::read_to_string(semantic_telemetry_path).expect("semantic telemetry sidecar");
+        let semantic_value: serde_json::Value = serde_json::from_str(
+            semantic_content
+                .lines()
+                .next()
+                .expect("semantic telemetry line"),
+        )
+        .expect("semantic telemetry json");
+        assert_eq!(semantic_value["version"], 19);
+        assert_eq!(semantic_value["answer_contract"], "semantic_step");
+        assert_eq!(semantic_value["presentation_risk"], "worst");
+        assert!(
+            semantic_value["supervised_action_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > semantic_value["supervised_presentation_rows"]
+                    .as_u64()
+                    .unwrap_or_default()
+        );
+
+        let energy_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_semantic_energy.jsonl");
+        let mut energy_model_config = tiny_model_config();
+        energy_model_config.vocab_size = 272;
+        energy_model_config.sequence_score_head.enabled = true;
+        let energy_model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            energy_model_config,
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::SemanticEnergy,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                candidate_symmetry:
+                    crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                dagger_start_after_steps: 1,
+                stratified_difficulty_levels: 0,
+                rollout_steps: 1,
+                max_rows_per_update: 2,
+                max_presentation_rows_per_update: 2,
+                counterfactual_targets_per_state: 1,
+                candidates: 4,
+                max_completion_tokens: 128,
+            },
+            ..Default::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(energy_telemetry_path.clone()));
+        let energy_loss = energy_model
+            .ruliad_proof_policy_dagger_loss(&policy_batch, &device, 512)
+            .expect("semantic-energy proof policy loss");
+        assert!(tensor_scalar(energy_loss.clone()).is_finite());
+        let _energy_gradients = energy_loss.backward();
+        let energy_content =
+            std::fs::read_to_string(energy_telemetry_path).expect("energy telemetry sidecar");
+        let energy_value: serde_json::Value = serde_json::from_str(
+            energy_content
+                .lines()
+                .next()
+                .expect("energy telemetry line"),
+        )
+        .expect("energy telemetry json");
+        assert_eq!(energy_value["version"], 19);
+        assert_eq!(energy_value["answer_contract"], "semantic_step");
+        assert_eq!(energy_value["gradient_scope"], "full_model");
+        assert_eq!(
+            energy_value["objective"],
+            "semantic_sequence_energy_counterfactual_v1"
+        );
+        assert_eq!(
+            energy_value["configured_counterfactual_targets_per_state"],
+            1
+        );
+        assert_eq!(energy_value["target_variants_per_state"], 2);
+        assert_eq!(energy_value["base_semantic_row_budget"], 1);
+        assert_eq!(energy_value["base_semantic_state_rows"], 1);
+        assert_eq!(energy_value["counterfactual_semantic_state_rows"], 1);
+        assert_eq!(energy_value["counterfactual_target_shortfall"], 0);
+        assert_eq!(energy_value["semantic_state_rows"], 2);
+
+        let language_head_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_language_head.jsonl");
+        let mut language_head_model_config = tiny_model_config();
+        language_head_model_config.vocab_size = 272;
+        language_head_model_config.tie_input_output_embeddings = false;
+        let language_head_model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            language_head_model_config,
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly,
+                normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+                candidate_symmetry:
+                    crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                dagger_start_after_steps: 1,
+                stratified_difficulty_levels: 0,
+                rollout_steps: 1,
+                max_rows_per_update: 2,
+                max_presentation_rows_per_update: 2,
+                counterfactual_targets_per_state: 1,
+                candidates: 4,
+                max_completion_tokens: 128,
+            },
+            ..Default::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(language_head_telemetry_path.clone()));
+        let language_head_loss = language_head_model
+            .ruliad_proof_policy_dagger_loss(&semantic_batch, &device, 512)
+            .expect("language-head-only counterfactual proof policy loss");
+        assert!(tensor_scalar(language_head_loss.clone()).is_finite());
+        let _language_head_gradients = language_head_loss.backward();
+        let language_head_content = std::fs::read_to_string(language_head_telemetry_path)
+            .expect("language-head telemetry sidecar");
+        let language_head_value: serde_json::Value = serde_json::from_str(
+            language_head_content
+                .lines()
+                .next()
+                .expect("language-head telemetry line"),
+        )
+        .expect("language-head telemetry json");
+        assert_eq!(language_head_value["version"], 19);
+        assert_eq!(language_head_value["answer_contract"], "semantic_step");
+        assert_eq!(language_head_value["gradient_scope"], "language_head_only");
+        assert_eq!(
+            language_head_value["objective"],
+            "candidate_normalized_counterfactual_v1"
+        );
+        assert_eq!(
+            language_head_value["configured_counterfactual_targets_per_state"],
+            1
+        );
+        assert_eq!(language_head_value["target_variants_per_state"], 2);
+        assert_eq!(language_head_value["base_semantic_state_rows"], 1);
+        assert_eq!(language_head_value["counterfactual_semantic_state_rows"], 1);
+        assert_eq!(language_head_value["counterfactual_target_shortfall"], 0);
+
+        let prefix_telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_proof_policy_semantic_prefix.jsonl");
+        let mut prefix_model_config = tiny_model_config();
+        prefix_model_config.vocab_size = 272;
+        let prefix_model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+            prefix_model_config,
+            &device,
+        ))
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
+                candidate_symmetry:
+                    crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                dagger_start_after_steps: 1,
+                stratified_difficulty_levels: 0,
+                rollout_steps: 1,
+                max_rows_per_update: 2,
+                max_presentation_rows_per_update: 2,
+                counterfactual_targets_per_state: 0,
+                candidates: 4,
+                max_completion_tokens: 128,
+            },
+            ..Default::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(prefix_telemetry_path.clone()));
+        let prefix_loss = prefix_model
+            .ruliad_proof_policy_dagger_loss(&semantic_batch, &device, 512)
+            .expect("semantic prefix policy loss");
+        assert!(tensor_scalar(prefix_loss.clone()).is_finite());
+        let _gradients = prefix_loss.backward();
+        let prefix_content =
+            std::fs::read_to_string(prefix_telemetry_path).expect("prefix telemetry sidecar");
+        let prefix_value: serde_json::Value = serde_json::from_str(
+            prefix_content
+                .lines()
+                .next()
+                .expect("prefix telemetry line"),
+        )
+        .expect("prefix telemetry json");
+        assert_eq!(prefix_value["version"], 19);
+        assert_eq!(prefix_value["answer_contract"], "semantic_step");
+        assert_eq!(
+            prefix_value["objective"],
+            "prefix_conditional_equivalent_v1"
+        );
+        assert!(
+            prefix_value["prefix_branch_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            prefix_value["prefix_candidate_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > prefix_value["prefix_equivalent_tokens"]
+                    .as_u64()
+                    .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn ruliad_proof_policy_batch_plan_pairs_expert_and_model_visited_rows() {
+        let plan = RuliadProofPolicyBatchPlan::new(
+            crate::config::RuliadProofPolicyEffectiveMode::PairedDagger,
+            32,
+            4,
+            4,
+        );
+        assert_eq!(plan.static_row_budget, 16);
+        assert_eq!(plan.dagger_row_budget, 16);
+        assert_eq!(plan.dagger_trajectory_budget, 4);
+        assert_eq!(plan.trajectory_budget(), 20);
+        assert_eq!(plan.rollout_steps, 4);
+        assert_eq!(
+            (0..plan.dagger_trajectory_budget)
+                .map(|index| plan.dagger_depth(index))
+                .sum::<usize>(),
+            plan.dagger_row_budget
+        );
+
+        let uneven = RuliadProofPolicyBatchPlan::new(
+            crate::config::RuliadProofPolicyEffectiveMode::PairedDagger,
+            10,
+            4,
+            2,
+        );
+        assert_eq!(uneven.static_row_budget, 5);
+        assert_eq!(uneven.dagger_row_budget, 5);
+        assert_eq!(uneven.dagger_trajectory_budget, 2);
+        assert_eq!(uneven.rollout_steps, 3);
+        assert_eq!(uneven.dagger_depth(0), 3);
+        assert_eq!(uneven.dagger_depth(1), 2);
+
+        let bounded_causal = RuliadProofPolicyBatchPlan::new(
+            crate::config::RuliadProofPolicyEffectiveMode::PairedDagger,
+            4,
+            2,
+            1,
+        );
+        assert_eq!(bounded_causal.static_row_budget, 2);
+        assert_eq!(bounded_causal.dagger_row_budget, 2);
+        assert_eq!(bounded_causal.dagger_trajectory_budget, 1);
+        assert_eq!(bounded_causal.rollout_steps, 2);
+        assert_eq!(bounded_causal.dagger_depth(0), 2);
+    }
+
+    #[test]
     fn ruliad_structured_answer_contrast_loss_scores_oracle_against_field_negatives() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 21);
@@ -12611,6 +16835,7 @@ mod objective_step_tests {
                     field_binding_contrast_every_steps: 2,
                     field_binding_contrast_start_after_steps: 4,
                     field_binding_contrast_margin: 0.25,
+                    field_binding_contrast_pair_weight: 1.0,
                     field_binding_contrast_max_pairs: 4,
                     max_completion_tokens: 24,
                     ..Default::default()
@@ -12621,12 +16846,12 @@ mod objective_step_tests {
             oracle_hash: "h0".to_string(),
             sample_index: 43,
             split: burn_dragon_universality::SampleSplit::Train,
-            family: "proof_tree".to_string(),
-            task_kind: "prove_theorem".to_string(),
+            family: "formal_proof".to_string(),
+            task_kind: "select_proof_action".to_string(),
             math_domains: vec!["category".to_string()],
             reasoning_modes: vec!["equational".to_string()],
             prompt: "?:a\n!:".to_string(),
-            expected_answer: "ok=1;l=17;r=17".to_string(),
+            expected_answer: "g4|a:r0|f|1.1".to_string(),
             difficulty_level: Some(0),
             spec: None,
         };
@@ -12634,12 +16859,12 @@ mod objective_step_tests {
             oracle_hash: "h1".to_string(),
             sample_index: 44,
             split: burn_dragon_universality::SampleSplit::Train,
-            family: "proof_tree".to_string(),
-            task_kind: "prove_theorem".to_string(),
+            family: "formal_proof".to_string(),
+            task_kind: "select_proof_action".to_string(),
             math_domains: vec!["category".to_string()],
             reasoning_modes: vec!["equational".to_string()],
             prompt: "?:b\n!:".to_string(),
-            expected_answer: "ok=1;l=19;r=19".to_string(),
+            expected_answer: "g7|l:3|r|0.2".to_string(),
             difficulty_level: Some(0),
             spec: None,
         };
@@ -12709,7 +16934,8 @@ mod objective_step_tests {
                     weight: 0.0,
                     field_binding_contrast_weight: 0.25,
                     field_binding_contrast_every_steps: 1,
-                    field_binding_contrast_max_pairs: 4,
+                    field_binding_contrast_pair_weight: 1.0,
+                    field_binding_contrast_max_pairs: 2,
                     max_completion_tokens: 24,
                     ..Default::default()
                 },
@@ -12800,7 +17026,13 @@ mod objective_step_tests {
         assert_eq!(lines.len(), 2);
         let active: serde_json::Value =
             serde_json::from_str(lines[0]).expect("active telemetry json");
+        assert_eq!(active["version"], 3);
+        assert_eq!(active["objective"], RULIAD_FIELD_BINDING_OBJECTIVE);
         assert_eq!(active["sample_groups"], 2);
+        assert_eq!(
+            active["oracle_prompt_count"], 2,
+            "the bounded contrast batch should cover both prompts before reusing either"
+        );
         assert!(
             active["prompt_pairs"].as_u64().expect("prompt pairs") >= 2,
             "template hard negatives may add extra field-binding rows"
@@ -12850,6 +17082,22 @@ mod objective_step_tests {
                 .is_finite(),
             "rank telemetry should include a finite margin mean"
         );
+        assert!(
+            active["sequence_rank_metric_pairs"]
+                .as_u64()
+                .expect("sequence rank pairs")
+                >= 2
+        );
+        let positive_sequence_fraction = active["positive_sequence_fraction"]
+            .as_f64()
+            .expect("positive sequence fraction");
+        assert!((0.0..=1.0).contains(&positive_sequence_fraction));
+        assert!(
+            active["sequence_log_probability_margin_mean"]
+                .as_f64()
+                .expect("sequence log-probability margin")
+                .is_finite()
+        );
         let skipped: serde_json::Value =
             serde_json::from_str(lines[1]).expect("skip telemetry json");
         assert_eq!(
@@ -12858,7 +17106,136 @@ mod objective_step_tests {
         );
         assert_eq!(skipped["contrast_pairs"], 0);
         assert_eq!(skipped["rank_metric_tokens"], 0);
+        assert_eq!(skipped["sequence_rank_metric_pairs"], 0);
         assert!(skipped["logit_margin_mean"].is_null());
+    }
+
+    #[test]
+    fn ruliad_field_binding_contrast_never_uses_presented_actions_as_negatives() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 41);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let telemetry_path = dir
+            .path()
+            .join("events")
+            .join("ruliad_field_binding_contrast.jsonl");
+        let mut model_config = tiny_model_config();
+        model_config.vocab_size = 257;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                verifier_reward: crate::config::train::RuliadVerifierRewardConfig {
+                    enabled: true,
+                    weight: 0.0,
+                    field_binding_contrast_weight: 0.25,
+                    field_binding_contrast_every_steps: 1,
+                    field_binding_contrast_max_pairs: 4,
+                    max_completion_tokens: 64,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_field_binding_contrast_telemetry_path(Some(telemetry_path.clone()));
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            41,
+            burn_dragon_universality::ruliad::formal::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal bundle");
+        let proof_step_index = 0;
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            proof_step_index,
+            4,
+        )
+        .expect("oracle action set");
+        let contract = burn_dragon_universality::RuliadProofActionAnswerContract::SemanticStep;
+        let oracle_answer = burn_dragon_universality::ruliad::proof_action_answer(
+            &actions,
+            actions.selected_index,
+            contract,
+        )
+        .expect("oracle answer");
+        let distractor_index = (0..actions.candidates.len())
+            .find(|index| *index != actions.selected_index)
+            .expect("distractor action");
+        let distractor_answer = burn_dragon_universality::ruliad::proof_action_answer(
+            &actions,
+            distractor_index,
+            contract,
+        )
+        .expect("distractor answer");
+        let problem_hash = bundle.problem.canonical_hash().expect("problem hash");
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: problem_hash,
+            sample_index: 41,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "formal_proof".to_string(),
+            task_kind: burn_dragon_universality::RuliadTaskKind::SelectProofAction
+                .label()
+                .to_string(),
+            math_domains: vec!["formal_proof".to_string()],
+            reasoning_modes: vec!["proof_construction".to_string()],
+            prompt: burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                &bundle.problem,
+                &actions,
+            )
+            .expect("policy prompt"),
+            expected_answer: oracle_answer,
+            difficulty_level: Some(0),
+            spec: Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                problem: bundle.problem,
+                certificate: bundle.certificate,
+                candidate: None,
+                proof_step_index: Some(proof_step_index),
+                action_presentation_rotation: Some(0),
+                action_answer_contract: contract,
+                task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+            }),
+        };
+        let mut distractor_item = item.clone();
+        distractor_item.sample_index = 42;
+        distractor_item.expected_answer = distractor_answer;
+        let policy_batch = crate::dataset::RuliadPolicyBatch {
+            samples: vec![
+                crate::dataset::RuliadPolicySample {
+                    item,
+                    prompt_tokens: vec![1, 2, 3],
+                },
+                crate::dataset::RuliadPolicySample {
+                    item: distractor_item,
+                    prompt_tokens: vec![1, 2, 4],
+                },
+            ],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 257,
+                eos_id: None,
+            },
+            stop_token_id: None,
+        };
+
+        assert!(
+            model
+                .ruliad_field_binding_contrast_loss(&policy_batch, &device, 128)
+                .is_none(),
+            "presented distractors must not produce a negative training pair"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).expect("telemetry sidecar");
+        let value: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("telemetry row"))
+                .expect("telemetry json");
+        assert_eq!(value["candidate_pairs"], 0);
+        assert!(
+            value["filtered_presented_action_candidates"]
+                .as_u64()
+                .expect("filtered candidates")
+                >= 2
+        );
     }
 
     #[test]
@@ -13013,7 +17390,7 @@ mod objective_step_tests {
     }
 
     #[test]
-    fn ruliad_field_binding_contrast_prefers_most_discriminative_pairs() {
+    fn ruliad_field_binding_contrast_prioritizes_prompt_coverage_over_global_byte_distance() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 32);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -13083,9 +17460,10 @@ mod objective_step_tests {
 
         assert_eq!(active["contrast_pairs"], 1);
         assert_eq!(
-            active["contrast_discriminative_tokens"], 9,
-            "one-pair field-binding budget should select the strongest value counterfactual"
+            active["contrast_discriminative_tokens"], 1,
+            "the bounded pair should supervise only the causally valid first divergence"
         );
+        assert_eq!(active["oracle_prompt_count"], 1);
     }
 
     #[test]
@@ -13207,16 +17585,16 @@ mod objective_step_tests {
         ));
         assert!(
             replay
-                .candidates_for(
-                    "proof_tree",
-                    "prove_theorem",
-                    "ok;l;r",
-                    "ok=1;l=17;r=17",
-                    2,
-                    4,
-                    1,
-                    1.0,
-                )
+                .candidates_for(RuliadGeneratedAttractorQuery {
+                    family: "proof_tree",
+                    task_kind: "prove_theorem",
+                    expected_contract: "ok;l;r",
+                    expected_answer: "ok=1;l=17;r=17",
+                    min_count: 2,
+                    max_candidates: 4,
+                    min_distinct_answers: 1,
+                    max_dominant_fraction: 1.0,
+                },)
                 .is_empty()
         );
         assert!(replay.record(
@@ -13225,31 +17603,31 @@ mod objective_step_tests {
             2,
             8,
         ));
-        let candidates = replay.candidates_for(
-            "proof_tree",
-            "prove_theorem",
-            "ok;l;r",
-            "ok=1;l=17;r=17",
-            2,
-            4,
-            1,
-            1.0,
-        );
+        let candidates = replay.candidates_for(RuliadGeneratedAttractorQuery {
+            family: "proof_tree",
+            task_kind: "prove_theorem",
+            expected_contract: "ok;l;r",
+            expected_answer: "ok=1;l=17;r=17",
+            min_count: 2,
+            max_candidates: 4,
+            min_distinct_answers: 1,
+            max_dominant_fraction: 1.0,
+        });
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].count, 2);
         assert_eq!(candidates[0].key.answer, "ok=1;l=5;r=5");
         assert!(
             replay
-                .candidates_for(
-                    "proof_tree",
-                    "prove_theorem",
-                    "ok;l;r",
-                    "ok=1;l=5;r=5",
-                    2,
-                    4,
-                    1,
-                    1.0,
-                )
+                .candidates_for(RuliadGeneratedAttractorQuery {
+                    family: "proof_tree",
+                    task_kind: "prove_theorem",
+                    expected_contract: "ok;l;r",
+                    expected_answer: "ok=1;l=5;r=5",
+                    min_count: 2,
+                    max_candidates: 4,
+                    min_distinct_answers: 1,
+                    max_dominant_fraction: 1.0,
+                },)
                 .is_empty()
         );
         let summary = replay.summary(2);
@@ -13297,16 +17675,16 @@ mod objective_step_tests {
         );
         assert!(
             replay
-                .candidates_for(
-                    "proof_tree",
-                    "prove_theorem",
-                    "ok;l;r",
-                    "ok=1;l=17;r=17",
-                    1,
-                    4,
-                    2,
-                    0.5,
-                )
+                .candidates_for(RuliadGeneratedAttractorQuery {
+                    family: "proof_tree",
+                    task_kind: "prove_theorem",
+                    expected_contract: "ok;l;r",
+                    expected_answer: "ok=1;l=17;r=17",
+                    min_count: 1,
+                    max_candidates: 4,
+                    min_distinct_answers: 2,
+                    max_dominant_fraction: 0.5,
+                },)
                 .is_empty()
         );
 
@@ -13321,16 +17699,16 @@ mod objective_step_tests {
         let balanced_summary = replay.summary(1);
         assert_eq!(balanced_summary.dominant_fraction(), 0.5);
         assert_eq!(balanced_summary.diversity_skip_reason(2, 0.5), None);
-        let candidates = replay.candidates_for(
-            "proof_tree",
-            "prove_theorem",
-            "ok;l;r",
-            "ok=1;l=17;r=17",
-            1,
-            4,
-            2,
-            0.5,
-        );
+        let candidates = replay.candidates_for(RuliadGeneratedAttractorQuery {
+            family: "proof_tree",
+            task_kind: "prove_theorem",
+            expected_contract: "ok;l;r",
+            expected_answer: "ok=1;l=17;r=17",
+            min_count: 1,
+            max_candidates: 4,
+            min_distinct_answers: 2,
+            max_dominant_fraction: 0.5,
+        });
         assert_eq!(candidates.len(), 2);
     }
 

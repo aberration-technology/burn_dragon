@@ -10,6 +10,7 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 
 - `crates/burn_dragon_core`: core model, state, and config
 - `crates/burn_dragon_language`: language training + inference adapters
+- `crates/burn_dragon_universality`: verifier-backed formal Ruliad source
 - `crates/burn_dragon_p2p`: p2p runtime, browser ui, deployment, and integration tests
 - `xtask`: build, smoke, deploy, and release helpers
 
@@ -17,6 +18,7 @@ the model shape follows the [dragon hatchling / bdh paper](https://arxiv.org/abs
 
 - model + language code: [crates/burn_dragon_core](crates/burn_dragon_core), [crates/burn_dragon_language](crates/burn_dragon_language)
 - p2p + deployment: [crates/burn_dragon_p2p](crates/burn_dragon_p2p), [crates/burn_dragon_p2p/deploy/README.md](crates/burn_dragon_p2p/deploy/README.md)
+- formal Ruliad design and evidence: [docs/ruliad-r3-formal-report.md](docs/ruliad-r3-formal-report.md)
 - protocol/runtime layer: [`burn_p2p`](https://github.com/aberration-technology/burn_p2p)
 
 ## random scaffold adapters
@@ -54,6 +56,21 @@ synchronized-convergence gate. The implementation, corrected masked objective,
 compact P2P protocol, bandwidth matrix, GPU traces, and remaining WAN/browser
 production gates are documented in the
 [`random-scaffold Dragon report`](docs/random-scaffold-dragon-report.md).
+
+## formal ruliad pretraining
+
+Ruliad R3 lowers equational, category, logic, automata, process-calculus, and
+metagraph problems into one proof IR and deterministic transition kernel. The
+same compact source, target masks, verifier contracts, and curriculum semantics
+run in local, native P2P, and browser-WebGPU training. Difficulty levels are
+materialized lazily without a configured frontier cap, while each realized
+proof remains bounded by explicit resource limits.
+
+The current evidence shows verifier and partial-proof-policy gains, exact
+three-peer protocol replay, and native/browser source parity. It does not yet
+show general mathematical reasoning or long-horizon production readiness. See
+the [formal Ruliad report](docs/ruliad-r3-formal-report.md) for the architecture,
+ablation tables, and remaining promotion gates.
 
 ## quick start
 

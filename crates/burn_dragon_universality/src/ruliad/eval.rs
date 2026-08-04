@@ -13,20 +13,28 @@ use crate::ruliad::config::{
     RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RuliadCorpusConfig,
     RuliadMathDomain, RuliadReasoningMode,
 };
+use crate::ruliad::ir::RuliadComplexityVector;
+use crate::ruliad::kernel::{RuliadKernelLimits, complexity_vector, replay_certificate};
+use crate::ruliad::metrics::ruliad_source_capability_label;
 use crate::ruliad::oracles::{
-    RuliadSampleSpec, is_degenerate_spec, ruliad_categorical_presentation, ruliad_expected_answer,
-    ruliad_prompt_prefix, sample_text, verify_spec,
+    RULIAD_V2_DOCUMENT_CLOSE_MARKER, RULIAD_V3_DOCUMENT_CLOSE_MARKER, RuliadSampleSpec,
+    is_degenerate_spec, ruliad_answer_contract, ruliad_categorical_presentation,
+    ruliad_document_close_marker, ruliad_expected_answer, ruliad_prompt_prefix, sample_text,
+    verify_spec,
 };
 use crate::ruliad::runtime::{OnlineRuliadCorpus, ruliad_serialized_node_count};
 use crate::ruliad::search::RuliadFrontierSampler;
 use crate::ruliad::source_selection::{
     RuliadSourceBucket, plan_epoch_source_buckets, ruliad_source_buckets,
 };
+use crate::ruliad::wire::decode_model_certificate_prefix;
+#[cfg(test)]
+use crate::ruliad::wire::encode_model_certificate;
 use crate::stats::SampleStats;
 
-pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 2;
-pub const RULIAD_EVAL_REPORT_VERSION: u32 = 6;
-pub const RULIAD_REASONING_SCORE_VERSION: u32 = 2;
+pub const RULIAD_DIAGNOSTIC_REPORT_VERSION: u32 = 4;
+pub const RULIAD_EVAL_REPORT_VERSION: u32 = 12;
+pub const RULIAD_REASONING_SCORE_VERSION: u32 = 5;
 
 const MAX_REPORTED_EVAL_FAILURES: usize = 64;
 const SCORE_PPM_DENOMINATOR: usize = 1_000_000;
@@ -48,6 +56,7 @@ pub struct RuliadSourceBucketDiagnostic {
     pub prior: f32,
     pub math_domains: Vec<String>,
     pub reasoning_modes: Vec<String>,
+    pub estimated_complexity: RuliadComplexityVector,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
@@ -107,8 +116,16 @@ pub struct RuliadDiagnosticReport {
     pub token_count_drift_count: usize,
     pub payload_overflow_count: usize,
     pub max_serialized_char_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_serialized_payload_token_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_serialized_payload_token_count: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_serialized_payload_token_count: Option<usize>,
     pub mean_gzip_complexity_ratio: f32,
     pub mean_complexity_score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formal_complexity: Option<RuliadComplexitySummary>,
     pub gate_failures: Vec<String>,
 }
 
@@ -170,6 +187,85 @@ pub struct RuliadEvalItem {
     pub spec: Option<RuliadSampleSpec>,
 }
 
+impl RuliadEvalItem {
+    pub fn document_close_marker(&self) -> &'static str {
+        let prompt = self.prompt.trim_start();
+        if prompt.starts_with("[R2") {
+            RULIAD_V2_DOCUMENT_CLOSE_MARKER
+        } else if prompt.starts_with("[R3") {
+            RULIAD_V3_DOCUMENT_CLOSE_MARKER
+        } else {
+            self.spec
+                .as_ref()
+                .map(ruliad_document_close_marker)
+                .unwrap_or(RULIAD_V2_DOCUMENT_CLOSE_MARKER)
+        }
+    }
+}
+
+fn ruliad_presented_action_set(
+    item: &RuliadEvalItem,
+) -> Option<(
+    crate::ruliad::policy::RuliadProofActionSet,
+    crate::ruliad::config::RuliadProofActionAnswerContract,
+)> {
+    let RuliadSampleSpec::FormalProof {
+        problem,
+        certificate,
+        proof_step_index: Some(step_index),
+        action_presentation_rotation,
+        action_answer_contract,
+        task,
+        ..
+    } = item.spec.as_ref()?
+    else {
+        return None;
+    };
+    if *task != crate::ruliad::config::RuliadTaskKind::SelectProofAction {
+        return None;
+    }
+    let actions = crate::ruliad::policy::oracle_proof_action_set(
+        problem,
+        certificate,
+        *step_index,
+        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+    )
+    .ok()?;
+    let actions = actions
+        .rotate_left(
+            action_presentation_rotation.unwrap_or_default() % actions.candidates.len().max(1),
+        )
+        .ok()?;
+    Some((actions, *action_answer_contract))
+}
+
+/// Return the canonical proof actions actually presented to the model.
+pub fn ruliad_presented_action_answers(item: &RuliadEvalItem) -> Option<Vec<String>> {
+    let (actions, contract) = ruliad_presented_action_set(item)?;
+    (0..actions.candidates.len())
+        .map(|index| crate::ruliad::policy::proof_action_answer(&actions, index, contract).ok())
+        .collect()
+}
+
+/// Return whether an answer names one of the proof actions actually presented to the model.
+///
+/// This is intentionally weaker than verifier correctness: a valid distractor action is still a
+/// presented action. The metric separates prompt-conditioned decoding from globally common,
+/// schema-valid answers that are not available in the current proof state.
+pub fn ruliad_presented_action_match(
+    item: &RuliadEvalItem,
+    actual_answer: Option<&str>,
+) -> Option<bool> {
+    let (actions, contract) = ruliad_presented_action_set(item)?;
+    Some(
+        actual_answer
+            .and_then(|answer| {
+                crate::ruliad::policy::resolve_proof_action_answer(&actions, answer, contract)
+            })
+            .is_some(),
+    )
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuliadCompletionRecord {
     pub oracle_hash: String,
@@ -223,6 +319,34 @@ pub struct RuliadEvalGroupScore {
     pub field_value_distinct_ratio: f32,
     #[serde(default)]
     pub actual_field_value_dominant_fraction: f32,
+    #[serde(default)]
+    pub presented_action_expected_count: usize,
+    #[serde(default)]
+    pub presented_action_match_count: usize,
+    #[serde(default)]
+    pub presented_action_rate: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formal_complexity: Option<RuliadComplexitySummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct RuliadMeanComplexityVector {
+    pub syntax_nodes: f32,
+    pub axiom_count: f32,
+    pub proof_goal_count: f32,
+    pub proof_step_count: f32,
+    pub dependency_depth: f32,
+    pub dependency_width: f32,
+    pub variable_count: f32,
+    pub maximum_term_depth: f32,
+    pub distractor_axiom_count: f32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct RuliadComplexitySummary {
+    pub observed_count: usize,
+    pub mean: RuliadMeanComplexityVector,
+    pub maximum: RuliadComplexityVector,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -285,6 +409,12 @@ pub struct RuliadEvalReport {
     pub field_value_distinct_ratio: f32,
     #[serde(default)]
     pub actual_field_value_dominant_fraction: f32,
+    #[serde(default)]
+    pub presented_action_expected_count: usize,
+    #[serde(default)]
+    pub presented_action_match_count: usize,
+    #[serde(default)]
+    pub presented_action_rate: f32,
     pub mean_certificate_prefix_coverage: f32,
     pub mean_completion_tokens: f32,
     pub canary_count: usize,
@@ -295,6 +425,9 @@ pub struct RuliadEvalReport {
     pub difficulty_scores: Vec<RuliadEvalGroupScore>,
     #[serde(default)]
     pub answer_contract_scores: Vec<RuliadEvalGroupScore>,
+    /// Joint source/task/difficulty/answer-contract groups used for curriculum feedback.
+    #[serde(default)]
+    pub source_scores: Vec<RuliadEvalGroupScore>,
     pub math_domain_scores: Vec<RuliadEvalGroupScore>,
     pub reasoning_mode_scores: Vec<RuliadEvalGroupScore>,
     pub failures: Vec<RuliadEvalFailure>,
@@ -656,6 +789,7 @@ struct DiagnosticSample {
     task_kind: String,
     token_count: usize,
     serialized_char_count: usize,
+    serialized_payload_token_count: Option<usize>,
     stats: SampleStats,
     spec: Option<RuliadSampleSpec>,
     oracle_hash: Option<String>,
@@ -691,6 +825,89 @@ struct EvalAccumulator {
     actual_field_value_count: usize,
     actual_field_values: BTreeSet<String>,
     actual_field_value_counts: BTreeMap<String, usize>,
+    presented_action_expected_count: usize,
+    presented_action_match_count: usize,
+    formal_complexity: ComplexityAccumulator,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComplexityAccumulator {
+    count: usize,
+    sums: [f64; 9],
+    maximum: RuliadComplexityVector,
+}
+
+impl ComplexityAccumulator {
+    fn add(&mut self, value: &RuliadComplexityVector) {
+        self.count = self.count.saturating_add(1);
+        for (sum, coordinate) in self.sums.iter_mut().zip(complexity_coordinates(value)) {
+            *sum += coordinate as f64;
+        }
+        self.maximum.syntax_nodes = self.maximum.syntax_nodes.max(value.syntax_nodes);
+        self.maximum.axiom_count = self.maximum.axiom_count.max(value.axiom_count);
+        self.maximum.proof_goal_count = self.maximum.proof_goal_count.max(value.proof_goal_count);
+        self.maximum.proof_step_count = self.maximum.proof_step_count.max(value.proof_step_count);
+        self.maximum.dependency_depth = self.maximum.dependency_depth.max(value.dependency_depth);
+        self.maximum.dependency_width = self.maximum.dependency_width.max(value.dependency_width);
+        self.maximum.variable_count = self.maximum.variable_count.max(value.variable_count);
+        self.maximum.maximum_term_depth = self
+            .maximum
+            .maximum_term_depth
+            .max(value.maximum_term_depth);
+        self.maximum.distractor_axiom_count = self
+            .maximum
+            .distractor_axiom_count
+            .max(value.distractor_axiom_count);
+    }
+
+    fn finish(self) -> Option<RuliadComplexitySummary> {
+        if self.count == 0 {
+            return None;
+        }
+        let denominator = self.count as f64;
+        let mean = self.sums.map(|sum| (sum / denominator) as f32);
+        Some(RuliadComplexitySummary {
+            observed_count: self.count,
+            mean: RuliadMeanComplexityVector {
+                syntax_nodes: mean[0],
+                axiom_count: mean[1],
+                proof_goal_count: mean[2],
+                proof_step_count: mean[3],
+                dependency_depth: mean[4],
+                dependency_width: mean[5],
+                variable_count: mean[6],
+                maximum_term_depth: mean[7],
+                distractor_axiom_count: mean[8],
+            },
+            maximum: self.maximum,
+        })
+    }
+}
+
+fn complexity_coordinates(value: &RuliadComplexityVector) -> [usize; 9] {
+    [
+        value.syntax_nodes,
+        value.axiom_count,
+        value.proof_goal_count,
+        value.proof_step_count,
+        value.dependency_depth,
+        value.dependency_width,
+        value.variable_count,
+        value.maximum_term_depth,
+        value.distractor_axiom_count,
+    ]
+}
+
+fn formal_complexity(spec: &RuliadSampleSpec) -> Option<RuliadComplexityVector> {
+    let RuliadSampleSpec::FormalProof {
+        problem,
+        certificate,
+        ..
+    } = spec
+    else {
+        return None;
+    };
+    Some(complexity_vector(problem, Some(certificate)))
 }
 
 #[derive(Debug, Clone)]
@@ -701,6 +918,7 @@ struct EvalOutcome {
     missing: bool,
     answer_terminated: bool,
     actual_answer: Option<String>,
+    presented_action_match: Option<bool>,
     reasoning_score: RuliadReasoningScore,
 }
 
@@ -778,6 +996,11 @@ pub fn diagnose_config(
                 task_kind: document.task_kind,
                 token_count: document.token_count,
                 serialized_char_count: document.serialized_preview.len(),
+                serialized_payload_token_count: Some(
+                    corpus
+                        .encode_payload_tokens(&document.serialized_preview)
+                        .len(),
+                ),
                 stats: document.stats,
                 spec: Some(document.spec),
                 oracle_hash: Some(document.oracle_hash),
@@ -912,7 +1135,7 @@ pub fn baseline_completions(
             };
             RuliadCompletionRecord {
                 oracle_hash: item.oracle_hash.clone(),
-                completion: format!("!:{answer}\n[/R2]"),
+                completion: format!("!:{answer}\n{}", item.document_close_marker()),
             }
         })
         .collect()
@@ -944,6 +1167,7 @@ pub fn evaluate_completions(
     let mut task_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut difficulty_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut answer_contract_scores = BTreeMap::<String, EvalAccumulator>::new();
+    let mut source_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut math_domain_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut reasoning_mode_scores = BTreeMap::<String, EvalAccumulator>::new();
     let mut exact_match_count = 0usize;
@@ -972,6 +1196,8 @@ pub fn evaluate_completions(
     let mut actual_field_value_count = 0usize;
     let mut actual_field_values = BTreeSet::new();
     let mut actual_field_value_counts = BTreeMap::new();
+    let mut presented_action_expected_count = 0usize;
+    let mut presented_action_match_count = 0usize;
     let mut certificate_prefix_ppm_sum = 0usize;
     let mut completion_token_sum = 0usize;
     let mut failures = Vec::new();
@@ -1021,6 +1247,11 @@ pub fn evaluate_completions(
             &mut actual_field_values,
             &mut actual_field_value_counts,
         );
+        if let Some(presented_action_match) = outcome.presented_action_match {
+            presented_action_expected_count = presented_action_expected_count.saturating_add(1);
+            presented_action_match_count =
+                presented_action_match_count.saturating_add(usize::from(presented_action_match));
+        }
         certificate_prefix_ppm_sum = certificate_prefix_ppm_sum
             .saturating_add(outcome.reasoning_score.certificate_prefix_ppm);
         completion_token_sum =
@@ -1031,9 +1262,25 @@ pub fn evaluate_completions(
         }
         add_group_score(&mut family_scores, &item.family, item, &outcome);
         add_group_score(&mut task_scores, &item.task_kind, item, &outcome);
+        let answer_contract = item
+            .spec
+            .as_ref()
+            .map(ruliad_answer_contract)
+            .unwrap_or_else(|| expected_answer_contract(&item.expected_answer));
         add_group_score(
             &mut answer_contract_scores,
-            &expected_answer_contract(&item.expected_answer),
+            &answer_contract,
+            item,
+            &outcome,
+        );
+        add_group_score(
+            &mut source_scores,
+            &ruliad_source_capability_label(
+                &item.family,
+                &item.task_kind,
+                item.difficulty_level.unwrap_or(0),
+                &answer_contract,
+            ),
             item,
             &outcome,
         );
@@ -1120,6 +1367,12 @@ pub fn evaluate_completions(
             &actual_field_value_counts,
             actual_field_value_count,
         ),
+        presented_action_expected_count,
+        presented_action_match_count,
+        presented_action_rate: ratio(
+            presented_action_match_count,
+            presented_action_expected_count,
+        ),
         mean_certificate_prefix_coverage: ratio_ppm(certificate_prefix_ppm_sum, items.len()),
         mean_completion_tokens: ratio_f32(completion_token_sum as f32, items.len()),
         canary_count,
@@ -1128,6 +1381,7 @@ pub fn evaluate_completions(
         task_scores: finalize_group_scores(task_scores),
         difficulty_scores: finalize_group_scores(difficulty_scores),
         answer_contract_scores: finalize_group_scores(answer_contract_scores),
+        source_scores: finalize_group_scores(source_scores),
         math_domain_scores: finalize_group_scores(math_domain_scores),
         reasoning_mode_scores: finalize_group_scores(reasoning_mode_scores),
         failures,
@@ -1141,19 +1395,11 @@ pub fn extract_ruliad_answer(completion: &str) -> Option<String> {
 pub fn extract_ruliad_completion(completion: &str) -> RuliadExtractedCompletion {
     let answer_start = completion.find("!:").map(|offset| offset + 2).unwrap_or(0);
     let completion_body = &completion[answer_start..];
-    let answer_terminated =
-        completion_body.contains("[/R2]") || completion_body.contains("[/RTREE]");
+    let (completion_payload, answer_terminated) = completion_before_close_marker(completion_body);
     let mut answer = None;
     let mut certificate_lines = Vec::new();
-    for line in completion_body.lines() {
-        let candidate = line
-            .split("[/R2]")
-            .next()
-            .unwrap_or_default()
-            .split("[/RTREE]")
-            .next()
-            .unwrap_or_default()
-            .trim();
+    for line in completion_payload.lines() {
+        let candidate = line.trim();
         if candidate.is_empty() {
             continue;
         }
@@ -1169,20 +1415,30 @@ pub fn extract_ruliad_completion(completion: &str) -> RuliadExtractedCompletion 
     RuliadExtractedCompletion {
         answer,
         certificate_lines,
-        generated_token_count: completion_body.split_whitespace().count(),
+        generated_token_count: completion_payload.split_whitespace().count(),
         answer_terminated,
         completion_quality_ppm: ruliad_completion_quality_ppm(completion_body),
     }
 }
 
+const RULIAD_SUPPORTED_CLOSE_MARKERS: [&str; 3] = [
+    RULIAD_V3_DOCUMENT_CLOSE_MARKER,
+    RULIAD_V2_DOCUMENT_CLOSE_MARKER,
+    "[/RTREE]",
+];
+
+fn completion_before_close_marker(completion: &str) -> (&str, bool) {
+    let close_offset = RULIAD_SUPPORTED_CLOSE_MARKERS
+        .iter()
+        .filter_map(|marker| completion.find(marker))
+        .min();
+    close_offset
+        .map(|offset| (&completion[..offset], true))
+        .unwrap_or((completion, false))
+}
+
 fn ruliad_completion_quality_ppm(completion_body: &str) -> usize {
-    let body = completion_body
-        .split("[/R2]")
-        .next()
-        .unwrap_or_default()
-        .split("[/RTREE]")
-        .next()
-        .unwrap_or_default();
+    let (body, _) = completion_before_close_marker(completion_body);
     let symbols = body
         .chars()
         .filter(|ch| !ch.is_whitespace())
@@ -1399,6 +1655,9 @@ fn score_answer_fields(
     hash_canary: bool,
     spec: Option<&RuliadSampleSpec>,
 ) -> AnswerFieldScore {
+    if let Some(score) = score_formal_certificate_answer(actual, spec) {
+        return score;
+    }
     if ruliad_answers_semantic_match(expected, actual) {
         let status = if spec.is_some_and(|spec| verify_spec(spec).is_ok_and(|report| report.ok)) {
             RuliadAnswerStatus::VerifierMatch
@@ -1488,6 +1747,237 @@ fn score_answer_fields(
     }
 }
 
+fn score_formal_certificate_answer(
+    actual: &str,
+    spec: Option<&RuliadSampleSpec>,
+) -> Option<AnswerFieldScore> {
+    let Some(RuliadSampleSpec::FormalProof {
+        problem,
+        certificate: oracle_certificate,
+        proof_step_index,
+        action_presentation_rotation,
+        action_answer_contract,
+        task,
+        ..
+    }) = spec
+    else {
+        return None;
+    };
+    if *task == crate::ruliad::config::RuliadTaskKind::AdvanceProof {
+        return Some(score_formal_transition_answer(
+            actual,
+            problem,
+            oracle_certificate,
+            *proof_step_index,
+        ));
+    }
+    if *task == crate::ruliad::config::RuliadTaskKind::SelectProofAction {
+        return Some(score_formal_action_answer(
+            actual,
+            problem,
+            oracle_certificate,
+            *proof_step_index,
+            *action_presentation_rotation,
+            *action_answer_contract,
+        ));
+    }
+    if *task != crate::ruliad::config::RuliadTaskKind::ConstructProof {
+        return None;
+    }
+
+    let required_goal_indices = problem.required_goal_indices();
+    let required_goals = required_goal_indices.len().max(1);
+    let oracle_steps = oracle_certificate
+        .goals
+        .iter()
+        .map(|goal| goal.steps.len())
+        .sum::<usize>();
+    let Ok(problem_hash) = problem.canonical_hash() else {
+        return Some(AnswerFieldScore {
+            status: RuliadAnswerStatus::Malformed,
+            correct_field_count: 0,
+            expected_field_count: required_goals,
+            observed_field_count: 0,
+            partial_progress_ppm: 0,
+        });
+    };
+    let Ok(parsed) = decode_model_certificate_prefix(actual.trim(), problem.version, problem_hash)
+    else {
+        return Some(AnswerFieldScore {
+            status: RuliadAnswerStatus::Malformed,
+            correct_field_count: 0,
+            expected_field_count: required_goals,
+            observed_field_count: 0,
+            partial_progress_ppm: 0,
+        });
+    };
+    let report = replay_certificate(problem, &parsed.certificate, RuliadKernelLimits::default());
+    let expected_work = required_goals.saturating_add(oracle_steps).max(1);
+    let verified_work = report
+        .verified_goals
+        .saturating_add(report.verified_steps)
+        .min(expected_work);
+    Some(AnswerFieldScore {
+        status: if report.accepted && parsed.syntax_complete {
+            RuliadAnswerStatus::VerifierMatch
+        } else if verified_work > 0 {
+            RuliadAnswerStatus::Partial
+        } else if !parsed.syntax_complete && parsed.parsed_steps == 0 {
+            RuliadAnswerStatus::Malformed
+        } else {
+            RuliadAnswerStatus::SchemaValidWrong
+        },
+        correct_field_count: report.verified_goals,
+        expected_field_count: required_goals,
+        observed_field_count: parsed
+            .certificate
+            .goals
+            .iter()
+            .filter(|goal| required_goal_indices.contains(&goal.goal))
+            .count()
+            .min(required_goals),
+        partial_progress_ppm: verified_work.saturating_mul(SCORE_PPM_DENOMINATOR) / expected_work,
+    })
+}
+
+fn score_formal_action_answer(
+    actual: &str,
+    problem: &crate::ruliad::ir::RuliadProofProblem,
+    oracle_certificate: &crate::ruliad::ir::RuliadProofCertificate,
+    proof_step_index: Option<usize>,
+    action_presentation_rotation: Option<usize>,
+    answer_contract: crate::ruliad::config::RuliadProofActionAnswerContract,
+) -> AnswerFieldScore {
+    let malformed = || AnswerFieldScore {
+        status: RuliadAnswerStatus::Malformed,
+        correct_field_count: 0,
+        expected_field_count: 1,
+        observed_field_count: 0,
+        partial_progress_ppm: 0,
+    };
+    let Some(step_index) = proof_step_index else {
+        return malformed();
+    };
+    let Ok(actions) = crate::ruliad::policy::oracle_proof_action_set(
+        problem,
+        oracle_certificate,
+        step_index,
+        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+    ) else {
+        return malformed();
+    };
+    let Ok(actions) = actions.rotate_left(
+        action_presentation_rotation.unwrap_or_default() % actions.candidates.len().max(1),
+    ) else {
+        return malformed();
+    };
+    let syntax_valid = match answer_contract {
+        crate::ruliad::config::RuliadProofActionAnswerContract::PresentationIndex => {
+            crate::ruliad::policy::parse_proof_action_index(actual).is_some()
+        }
+        crate::ruliad::config::RuliadProofActionAnswerContract::SemanticStep => {
+            crate::ruliad::wire::decode_model_proof_step(actual).is_some()
+        }
+    };
+    let Some(candidate_index) =
+        crate::ruliad::policy::resolve_proof_action_answer(&actions, actual, answer_contract)
+    else {
+        if !syntax_valid {
+            return malformed();
+        }
+        return AnswerFieldScore {
+            status: RuliadAnswerStatus::SchemaValidWrong,
+            correct_field_count: 0,
+            expected_field_count: 1,
+            observed_field_count: 1,
+            partial_progress_ppm: 0,
+        };
+    };
+    let equivalent = actions.is_equivalent_index(candidate_index);
+    let progress = actions.candidate_progress_ppm(candidate_index);
+    AnswerFieldScore {
+        status: if equivalent {
+            RuliadAnswerStatus::VerifierMatch
+        } else if progress > 0 {
+            RuliadAnswerStatus::Partial
+        } else {
+            RuliadAnswerStatus::SchemaValidWrong
+        },
+        correct_field_count: usize::from(equivalent),
+        expected_field_count: 1,
+        observed_field_count: 1,
+        partial_progress_ppm: progress,
+    }
+}
+
+fn score_formal_transition_answer(
+    actual: &str,
+    problem: &crate::ruliad::ir::RuliadProofProblem,
+    oracle_certificate: &crate::ruliad::ir::RuliadProofCertificate,
+    proof_step_index: Option<usize>,
+) -> AnswerFieldScore {
+    let malformed = || AnswerFieldScore {
+        status: RuliadAnswerStatus::Malformed,
+        correct_field_count: 0,
+        expected_field_count: 1,
+        observed_field_count: 0,
+        partial_progress_ppm: 0,
+    };
+    let Some(step_index) = proof_step_index else {
+        return malformed();
+    };
+    let Some((expected_goal, _)) = oracle_certificate.step_at(step_index) else {
+        return malformed();
+    };
+    let Ok(problem_hash) = problem.canonical_hash() else {
+        return malformed();
+    };
+    let Ok(parsed) = decode_model_certificate_prefix(actual.trim(), problem.version, problem_hash)
+    else {
+        return malformed();
+    };
+    let parsed_goal = parsed.certificate.goals.first();
+    let actual_step = parsed_goal.and_then(|goal| goal.steps.first());
+    if parsed.parsed_steps == 0 || actual_step.is_none() {
+        return malformed();
+    }
+    if parsed.parsed_steps != 1
+        || parsed.certificate.goals.len() != 1
+        || parsed_goal.is_none_or(|goal| goal.goal != expected_goal)
+    {
+        let observed_expected_step = usize::from(
+            parsed_goal.is_some_and(|goal| goal.goal == expected_goal && !goal.steps.is_empty()),
+        );
+        return AnswerFieldScore {
+            status: RuliadAnswerStatus::SchemaValidWrong,
+            correct_field_count: 0,
+            expected_field_count: 1,
+            observed_field_count: observed_expected_step,
+            partial_progress_ppm: 0,
+        };
+    }
+    let candidate = oracle_certificate
+        .with_step_replaced(step_index, actual_step.expect("checked step").clone())
+        .expect("validated transition index");
+    let report = replay_certificate(problem, &candidate, RuliadKernelLimits::default());
+    let transition_verified = report.verified_steps > step_index;
+    AnswerFieldScore {
+        status: if report.accepted && parsed.syntax_complete {
+            RuliadAnswerStatus::VerifierMatch
+        } else if transition_verified {
+            RuliadAnswerStatus::Partial
+        } else if !parsed.syntax_complete && parsed.parsed_steps == 0 {
+            RuliadAnswerStatus::Malformed
+        } else {
+            RuliadAnswerStatus::SchemaValidWrong
+        },
+        correct_field_count: usize::from(transition_verified),
+        expected_field_count: 1,
+        observed_field_count: 1,
+        partial_progress_ppm: usize::from(transition_verified) * SCORE_PPM_DENOMINATOR,
+    }
+}
+
 fn score_certificate_prefix(expected: &[String], actual: &[String]) -> (usize, usize) {
     if expected.is_empty() {
         return (0, 0);
@@ -1537,9 +2027,9 @@ fn reasoning_score(parts: ReasoningScoreParts) -> RuliadReasoningScore {
     RuliadReasoningScore {
         version: RULIAD_REASONING_SCORE_VERSION,
         status: parts.status,
-        correct_field_count: parts.correct_field_count,
+        correct_field_count: parts.correct_field_count.min(parts.expected_field_count),
         expected_field_count: parts.expected_field_count,
-        observed_field_count: parts.observed_field_count,
+        observed_field_count: parts.observed_field_count.min(parts.expected_field_count),
         partial_progress_ppm: parts.partial_progress_ppm,
         certificate_valid_prefix_steps: parts.certificate_valid_prefix_steps,
         certificate_expected_steps: parts.certificate_expected_steps,
@@ -1670,8 +2160,13 @@ fn diagnose_samples(
     let mut token_count_drift_count = 0usize;
     let mut payload_overflow_count = 0usize;
     let mut max_serialized_char_count = 0usize;
+    let mut serialized_payload_token_count = 0usize;
+    let mut serialized_payload_token_sum = 0usize;
+    let mut min_serialized_payload_token_count = usize::MAX;
+    let mut max_serialized_payload_token_count = 0usize;
     let mut gzip_sum = 0.0f32;
     let mut complexity_sum = 0.0f32;
+    let mut formal_complexity_accumulator = ComplexityAccumulator::default();
 
     for sample in &samples {
         *split_counts
@@ -1692,6 +2187,15 @@ fn diagnose_samples(
             token_count_drift_count += 1;
         }
         max_serialized_char_count = max_serialized_char_count.max(sample.serialized_char_count);
+        if let Some(payload_tokens) = sample.serialized_payload_token_count {
+            serialized_payload_token_count = serialized_payload_token_count.saturating_add(1);
+            serialized_payload_token_sum =
+                serialized_payload_token_sum.saturating_add(payload_tokens);
+            min_serialized_payload_token_count =
+                min_serialized_payload_token_count.min(payload_tokens);
+            max_serialized_payload_token_count =
+                max_serialized_payload_token_count.max(payload_tokens);
+        }
         gzip_sum += sample.stats.gzip_complexity_ratio;
         complexity_sum += sample.stats.complexity_score;
 
@@ -1699,6 +2203,9 @@ fn diagnose_samples(
             missing_ruliad_spec_count += 1;
             continue;
         };
+        if let Some(complexity) = formal_complexity(spec) {
+            formal_complexity_accumulator.add(&complexity);
+        }
         let Some(oracle_hash) = &sample.oracle_hash else {
             missing_oracle_hash_count += 1;
             continue;
@@ -1716,7 +2223,7 @@ fn diagnose_samples(
         answer_slot_count += usize::from(!expected_answer.trim().is_empty());
         if !expected_answer.trim().is_empty() {
             *answer_contract_counts
-                .entry(expected_answer_contract(&expected_answer))
+                .entry(ruliad_answer_contract(spec))
                 .or_insert(0) += 1;
         }
         let text = sample
@@ -1838,8 +2345,15 @@ fn diagnose_samples(
         token_count_drift_count,
         payload_overflow_count,
         max_serialized_char_count,
+        min_serialized_payload_token_count: (serialized_payload_token_count > 0)
+            .then_some(min_serialized_payload_token_count),
+        mean_serialized_payload_token_count: (serialized_payload_token_count > 0)
+            .then_some(serialized_payload_token_sum as f32 / serialized_payload_token_count as f32),
+        max_serialized_payload_token_count: (serialized_payload_token_count > 0)
+            .then_some(max_serialized_payload_token_count),
         mean_gzip_complexity_ratio: ratio_f32(gzip_sum, samples.len()),
         mean_complexity_score: ratio_f32(complexity_sum, samples.len()),
+        formal_complexity: formal_complexity_accumulator.finish(),
         gate_failures,
     }
 }
@@ -1856,6 +2370,7 @@ fn diagnostic_sample_from_record(record: UniversalitySampleRecord) -> Result<Dia
         task_kind: record.task_kind.unwrap_or(record.complexity_band),
         token_count: record.token_count,
         serialized_char_count: record.serialized_char_count,
+        serialized_payload_token_count: None,
         stats: record.stats,
         spec,
         oracle_hash: record.oracle_hash,
@@ -1880,6 +2395,7 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
             missing: true,
             answer_terminated: false,
             actual_answer: None,
+            presented_action_match: ruliad_presented_action_match(item, None),
             reasoning_score,
         };
     };
@@ -1894,12 +2410,14 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
             missing: false,
             answer_terminated,
             actual_answer,
+            presented_action_match: ruliad_presented_action_match(item, None),
             reasoning_score,
         };
     };
     let exact_match = ruliad_answers_exact_match(&item.expected_answer, actual);
     let semantic_match = ruliad_answers_semantic_match(&item.expected_answer, actual);
     let malformed = reasoning_score.status == RuliadAnswerStatus::Malformed;
+    let presented_action_match = ruliad_presented_action_match(item, Some(actual));
     EvalOutcome {
         exact_match,
         semantic_match,
@@ -1907,6 +2425,7 @@ fn score_item(item: &RuliadEvalItem, completion: Option<&str>) -> EvalOutcome {
         missing: false,
         answer_terminated,
         actual_answer,
+        presented_action_match,
         reasoning_score,
     }
 }
@@ -1918,6 +2437,11 @@ fn add_group_score(
     outcome: &EvalOutcome,
 ) {
     let score = scores.entry(label.to_string()).or_default();
+    if let Some(spec) = item.spec.as_ref()
+        && let Some(complexity) = formal_complexity(spec)
+    {
+        score.formal_complexity.add(&complexity);
+    }
     score.count += 1;
     score.exact_match_count += usize::from(outcome.exact_match);
     score.semantic_match_count += usize::from(outcome.semantic_match);
@@ -1940,6 +2464,13 @@ fn add_group_score(
         .answer_field_observed_count
         .saturating_add(outcome.reasoning_score.observed_field_count);
     score.answer_terminated_count += usize::from(outcome.answer_terminated);
+    if let Some(presented_action_match) = outcome.presented_action_match {
+        score.presented_action_expected_count =
+            score.presented_action_expected_count.saturating_add(1);
+        score.presented_action_match_count = score
+            .presented_action_match_count
+            .saturating_add(usize::from(presented_action_match));
+    }
     score.completion_quality_ppm_sum = score
         .completion_quality_ppm_sum
         .saturating_add(outcome.reasoning_score.completion_quality_ppm);
@@ -2028,6 +2559,13 @@ fn finalize_group_scores(scores: BTreeMap<String, EvalAccumulator>) -> Vec<Rulia
                 &score.actual_field_value_counts,
                 score.actual_field_value_count,
             ),
+            presented_action_expected_count: score.presented_action_expected_count,
+            presented_action_match_count: score.presented_action_match_count,
+            presented_action_rate: ratio(
+                score.presented_action_match_count,
+                score.presented_action_expected_count,
+            ),
+            formal_complexity: score.formal_complexity.finish(),
         })
         .collect()
 }
@@ -2110,6 +2648,7 @@ fn source_bucket_diagnostics(buckets: &[RuliadSourceBucket]) -> Vec<RuliadSource
                     .iter()
                     .map(|mode| mode.label().to_string())
                     .collect(),
+                estimated_complexity: bucket.estimated_complexity(),
             }
         })
         .collect()
@@ -2213,6 +2752,7 @@ fn corrupt_answer(answer: &str) -> String {
 fn normalize_answer(value: &str) -> String {
     value
         .trim()
+        .trim_end_matches(RULIAD_V3_DOCUMENT_CLOSE_MARKER)
         .trim_end_matches("[/R2]")
         .trim_end_matches("[/T]")
         .trim_end_matches("[/RTREE]")
@@ -2398,7 +2938,11 @@ mod tests {
     use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
         RuliadDocumentMode, RuliadFamilyConfig, RuliadFamilyKind, RuliadSerializationConfig,
-        RuliadSourceSelectionConfig, RuliadTokenizationConfig, default_ruliad_families,
+        RuliadSourceSelectionConfig, RuliadTaskKind, RuliadTokenizationConfig,
+        default_ruliad_families,
+    };
+    use crate::ruliad::formal::{
+        RuliadFormalGeneratorConfig, corrupt_formal_certificate, generate_formal_bundle,
     };
     use crate::ruliad::generate::generate_ruliad_corpus;
     use tempfile::tempdir;
@@ -2417,6 +2961,7 @@ mod tests {
                 ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: RuliadSourceSelectionConfig::default(),
             families: default_ruliad_families(),
             proof_tasks: None,
@@ -2861,6 +3406,15 @@ mod tests {
         assert_eq!(acc.count, 1);
         assert_eq!(acc.semantic_match_count, 1);
         assert_eq!(acc.actual_answer_distinct_fraction, 1.0);
+        let source_labels = report
+            .source_scores
+            .iter()
+            .map(|score| score.label.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(source_labels.len(), 3);
+        assert!(source_labels.contains("source:proof_tree:prove_theorem@d1#ok,l,r"));
+        assert!(source_labels.contains("source:category:verify_category_law@d1#ok,l,r"));
+        assert!(source_labels.contains("source:automaton:evaluate_automaton@d1#acc"));
     }
 
     #[test]
@@ -3281,6 +3835,11 @@ mod tests {
             task_kind: document.task_kind,
             token_count: document.token_count,
             serialized_char_count: document.serialized_preview.len(),
+            serialized_payload_token_count: Some(
+                corpus
+                    .encode_payload_tokens(&document.serialized_preview)
+                    .len(),
+            ),
             stats: document.stats,
             spec: Some(document.spec),
             oracle_hash: Some(document.oracle_hash),
@@ -3303,5 +3862,275 @@ mod tests {
         );
         assert_eq!(diagnostic.duplicate_oracle_hash_count, 1);
         assert!(!diagnostic.gate_failures.is_empty());
+    }
+
+    #[test]
+    fn formal_answers_replay_the_submitted_certificate() {
+        let bundle =
+            generate_formal_bundle(73, RuliadFormalGeneratorConfig::default()).expect("bundle");
+        let spec = RuliadSampleSpec::FormalProof {
+            problem: bundle.problem.clone(),
+            certificate: bundle.certificate.clone(),
+            candidate: None,
+            proof_step_index: None,
+            action_presentation_rotation: None,
+            action_answer_contract: Default::default(),
+            task: RuliadTaskKind::ConstructProof,
+        };
+        let valid = encode_model_certificate(&bundle.certificate).expect("valid wire");
+        let valid_score = score_ruliad_answer(Some(&spec), &valid, Some(&valid));
+        assert_eq!(valid_score.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(valid_score.partial_progress_ppm, SCORE_PPM_DENOMINATOR);
+
+        let corrupted = corrupt_formal_certificate(&bundle.certificate).expect("corrupt");
+        let corrupted = encode_model_certificate(&corrupted).expect("corrupt wire");
+        let corrupted_score = score_ruliad_answer(Some(&spec), &valid, Some(&corrupted));
+        assert_eq!(corrupted_score.status, RuliadAnswerStatus::Partial);
+        assert!(corrupted_score.partial_progress_ppm > 0);
+        assert!(corrupted_score.partial_progress_ppm < SCORE_PPM_DENOMINATOR);
+
+        let prefix_with_malformed_tail = format!(
+            "{};not-a-proof-step",
+            valid.split(';').take(3).collect::<Vec<_>>().join(";")
+        );
+        let prefix_score =
+            score_ruliad_answer(Some(&spec), &valid, Some(&prefix_with_malformed_tail));
+        assert_eq!(prefix_score.status, RuliadAnswerStatus::Partial);
+        assert!(prefix_score.partial_progress_ppm > 0);
+
+        let malformed_score = score_ruliad_answer(Some(&spec), &valid, Some("not-a-certificate"));
+        assert_eq!(malformed_score.status, RuliadAnswerStatus::Malformed);
+    }
+
+    #[test]
+    fn formal_transition_answers_are_scored_by_full_certificate_replay() {
+        let bundle =
+            generate_formal_bundle(79, RuliadFormalGeneratorConfig::default()).expect("bundle");
+        let step_index = bundle.certificate.step_count() / 2;
+        let expected = bundle
+            .certificate
+            .single_step_at(step_index)
+            .and_then(|certificate| encode_model_certificate(&certificate).ok())
+            .expect("transition answer");
+        let spec = RuliadSampleSpec::FormalProof {
+            problem: bundle.problem,
+            certificate: bundle.certificate,
+            candidate: None,
+            proof_step_index: Some(step_index),
+            action_presentation_rotation: None,
+            action_answer_contract: Default::default(),
+            task: RuliadTaskKind::AdvanceProof,
+        };
+
+        let exact = score_ruliad_answer(Some(&spec), &expected, Some(&expected));
+        assert_eq!(exact.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(exact.partial_progress_ppm, SCORE_PPM_DENOMINATOR);
+        assert_eq!(exact.observed_field_count, 1);
+        assert_eq!(exact.expected_field_count, 1);
+
+        let repeated = format!("{expected};{expected}");
+        let repeated = score_ruliad_answer(Some(&spec), &expected, Some(&repeated));
+        assert_eq!(repeated.status, RuliadAnswerStatus::SchemaValidWrong);
+        assert_eq!(repeated.observed_field_count, 1);
+        assert_eq!(repeated.expected_field_count, 1);
+
+        let malformed = score_ruliad_answer(Some(&spec), &expected, Some("not-a-step"));
+        assert_eq!(malformed.status, RuliadAnswerStatus::Malformed);
+    }
+
+    #[test]
+    fn formal_action_answers_are_scored_by_verifier_equivalent_next_state() {
+        let bundle =
+            generate_formal_bundle(83, RuliadFormalGeneratorConfig::default()).expect("bundle");
+        let step_index = bundle.certificate.step_count() / 2;
+        let actions = crate::ruliad::policy::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            step_index,
+            crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        )
+        .expect("actions");
+        let action_presentation_rotation = 2;
+        let actions = actions
+            .rotate_left(action_presentation_rotation)
+            .expect("presented actions");
+        let expected = format!("c={}", actions.selected_index);
+        let spec = RuliadSampleSpec::FormalProof {
+            problem: bundle.problem,
+            certificate: bundle.certificate,
+            candidate: None,
+            proof_step_index: Some(step_index),
+            action_presentation_rotation: Some(action_presentation_rotation),
+            action_answer_contract: Default::default(),
+            task: RuliadTaskKind::SelectProofAction,
+        };
+
+        let exact = score_ruliad_answer(Some(&spec), &expected, Some(&expected));
+        assert_eq!(exact.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(exact.partial_progress_ppm, SCORE_PPM_DENOMINATOR);
+
+        let wrong_index = actions
+            .candidates
+            .iter()
+            .enumerate()
+            .find_map(|(index, _)| (!actions.is_equivalent_index(index)).then_some(index))
+            .expect("non-equivalent action");
+        let wrong = score_ruliad_answer(Some(&spec), &expected, Some(&format!("c={wrong_index}")));
+        assert_ne!(wrong.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(wrong.observed_field_count, 1);
+
+        let out_of_range = score_ruliad_answer(Some(&spec), &expected, Some("c=99"));
+        assert_eq!(out_of_range.status, RuliadAnswerStatus::SchemaValidWrong);
+        let malformed = score_ruliad_answer(Some(&spec), &expected, Some("choice=0"));
+        assert_eq!(malformed.status, RuliadAnswerStatus::Malformed);
+    }
+
+    #[test]
+    fn semantic_formal_action_contract_rejects_index_shortcuts() {
+        let bundle =
+            generate_formal_bundle(87, RuliadFormalGeneratorConfig::default()).expect("bundle");
+        let step_index = bundle.certificate.step_count() / 2;
+        let rotation = 1;
+        let actions = crate::ruliad::policy::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            step_index,
+            crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        )
+        .and_then(|actions| actions.rotate_left(rotation))
+        .expect("presented actions");
+        let contract = crate::ruliad::config::RuliadProofActionAnswerContract::SemanticStep;
+        let expected =
+            crate::ruliad::policy::proof_action_answer(&actions, actions.selected_index, contract)
+                .expect("semantic action");
+        let spec = RuliadSampleSpec::FormalProof {
+            problem: bundle.problem,
+            certificate: bundle.certificate,
+            candidate: None,
+            proof_step_index: Some(step_index),
+            action_presentation_rotation: Some(rotation),
+            action_answer_contract: contract,
+            task: RuliadTaskKind::SelectProofAction,
+        };
+
+        let item = RuliadEvalItem {
+            oracle_hash: "semantic-action".to_string(),
+            sample_index: 0,
+            split: SampleSplit::Validation,
+            family: RuliadFamilyKind::FormalProof.label().to_string(),
+            task_kind: RuliadTaskKind::SelectProofAction.label().to_string(),
+            math_domains: Vec::new(),
+            reasoning_modes: Vec::new(),
+            prompt: "!:".to_string(),
+            expected_answer: expected.clone(),
+            difficulty_level: Some(3),
+            spec: Some(spec.clone()),
+        };
+
+        let exact = score_ruliad_answer(Some(&spec), &expected, Some(&expected));
+        assert_eq!(exact.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(
+            ruliad_presented_action_match(&item, Some(&expected)),
+            Some(true)
+        );
+        let presented_answers =
+            ruliad_presented_action_answers(&item).expect("presented action answers");
+        assert_eq!(presented_answers.len(), actions.candidates.len());
+        assert!(presented_answers.contains(&expected));
+        let distractor_index = actions
+            .candidates
+            .iter()
+            .enumerate()
+            .find_map(|(index, _)| (!actions.is_equivalent_index(index)).then_some(index))
+            .expect("non-equivalent action");
+        let distractor =
+            crate::ruliad::policy::proof_action_answer(&actions, distractor_index, contract)
+                .expect("distractor action");
+        assert_eq!(
+            ruliad_presented_action_match(&item, Some(&distractor)),
+            Some(true),
+            "a verifier-wrong distractor is still conditioned on the presented menu"
+        );
+        assert_eq!(
+            ruliad_presented_action_match(&item, Some("g999|a:r0|f|1.1")),
+            Some(false),
+            "a schema-valid global answer outside the menu must be visible to telemetry"
+        );
+        assert_eq!(ruliad_presented_action_match(&item, None), Some(false));
+        let shortcut = score_ruliad_answer(
+            Some(&spec),
+            &expected,
+            Some(&format!("c={}", actions.selected_index)),
+        );
+        assert_eq!(shortcut.status, RuliadAnswerStatus::Malformed);
+
+        let report = evaluate_completions(
+            "semantic-action-source",
+            &[item],
+            &[RuliadCompletionRecord {
+                oracle_hash: "semantic-action".to_string(),
+                completion: format!("!:{expected}\n[/R3]"),
+            }],
+        );
+        assert_eq!(report.source_scores.len(), 1);
+        assert_eq!(report.presented_action_expected_count, 1);
+        assert_eq!(report.presented_action_match_count, 1);
+        assert_eq!(report.presented_action_rate, 1.0);
+        assert_eq!(report.source_scores[0].presented_action_rate, 1.0);
+        assert_eq!(
+            report.source_scores[0].label,
+            "source:formal_proof:select_proof_action@d3#proof_action_step"
+        );
+    }
+
+    #[test]
+    fn formal_r3_completion_terminates_extracts_and_replays_end_to_end() {
+        let bundle =
+            generate_formal_bundle(91, RuliadFormalGeneratorConfig::default()).expect("bundle");
+        let spec = RuliadSampleSpec::FormalProof {
+            problem: bundle.problem,
+            certificate: bundle.certificate,
+            candidate: None,
+            proof_step_index: None,
+            action_presentation_rotation: None,
+            action_answer_contract: Default::default(),
+            task: RuliadTaskKind::ConstructProof,
+        };
+        let report = verify_spec(&spec).expect("oracle report");
+        let oracle_hash = report.oracle_hash;
+        let text = sample_text(&spec, &oracle_hash);
+        let expected_answer = ruliad_expected_answer(&spec);
+        let item = RuliadEvalItem {
+            oracle_hash: oracle_hash.clone(),
+            sample_index: 0,
+            split: SampleSplit::Validation,
+            family: RuliadFamilyKind::FormalProof.label().to_string(),
+            task_kind: RuliadTaskKind::ConstructProof.label().to_string(),
+            math_domains: Vec::new(),
+            reasoning_modes: Vec::new(),
+            prompt: ruliad_prompt_prefix(&spec, &oracle_hash),
+            expected_answer,
+            difficulty_level: Some(0),
+            spec: Some(spec),
+        };
+
+        assert!(
+            text.ends_with("[/R3]\n"),
+            "unexpected formal document: {text}"
+        );
+        assert_eq!(item.document_close_marker(), "[/R3]");
+        let completion =
+            baseline_completions(std::slice::from_ref(&item), RuliadEvalBaseline::Oracle)
+                .pop()
+                .expect("completion");
+        let extracted = extract_ruliad_completion(&completion.completion);
+        assert!(extracted.answer_terminated);
+        assert_eq!(
+            extracted.answer.as_deref(),
+            Some(item.expected_answer.as_str())
+        );
+        let score = score_ruliad_item_completion(&item, Some(&completion.completion));
+        assert_eq!(score.status, RuliadAnswerStatus::VerifierMatch);
+        assert_eq!(score.partial_progress_ppm, SCORE_PPM_DENOMINATOR);
     }
 }

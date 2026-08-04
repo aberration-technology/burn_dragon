@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 import sys
 import tempfile
@@ -39,6 +40,11 @@ SUMMARY_COLUMNS = [
     "source_mean_difficulty",
     "source_norm_difficulty",
     "verifier_failures",
+    "ruliad_verifier_accuracy",
+    "ruliad_partial_progress",
+    "capability_allowed_max_difficulty",
+    "output_entropy_bits",
+    "output_distinct_2_fraction",
 ]
 
 EVENT_SUMMARY_COLUMNS = [
@@ -52,6 +58,15 @@ EVENT_SUMMARY_COLUMNS = [
     "status",
     "elapsed_seconds",
     "batch_size",
+    "training_wall_seconds",
+    "wall_tokens_per_second",
+    "model_tokens_per_second",
+    "model_duty_fraction",
+    "train_compute_fraction",
+    "optimizer_fraction",
+    "dataloader_foreground_wait_fraction",
+    "host_sync_points",
+    "train_loss_first",
     "train_loss_last",
     "valid_loss_last",
     "source_loss_last",
@@ -59,6 +74,7 @@ EVENT_SUMMARY_COLUMNS = [
     "source_mean_difficulty_last",
     "source_norm_difficulty_last",
     "source_mastered_probability_last",
+    "source_capability_allowed_max_difficulty_last",
     "source_verifier_failures_last",
     "ruliad_verifier_accuracy_last",
     "ruliad_partial_progress_last",
@@ -72,6 +88,22 @@ EVENT_SUMMARY_COLUMNS = [
     "capacity_scale_count",
     "pc_event_count",
     "pc_ms_mean",
+    "pc_observation_contract_last",
+    "pc_deployment_aligned_last",
+    "pc_amortization_components_last",
+    "pc_amortization_loss_last",
+]
+
+CAPABILITY_COVERAGE_COLUMNS = [
+    "run",
+    "absolute_step",
+    "difficulty_level",
+    "candidate_coverage",
+    "family_coverage",
+    "task_coverage",
+    "contract_coverage",
+    "observed_items",
+    "mastered",
 ]
 
 BUCKET_COLUMNS = [
@@ -94,6 +126,10 @@ BUCKET_COLUMNS = [
 
 GPU_COLUMNS = [
     "file",
+    "trial_key",
+    "arm",
+    "seed",
+    "iters",
     "samples",
     "util_mean",
     "util_p10",
@@ -119,6 +155,7 @@ MANIFEST_COLUMNS = [
     "run_root",
     "run_dir",
     "log_path",
+    "gpu_path",
     "status",
     "elapsed_seconds",
     "peak_used_mb",
@@ -261,6 +298,7 @@ def is_generated_analysis_file(path: Path) -> bool:
         "paired_deltas.csv",
         "event_run_summary.csv",
         "source_bucket_summary.csv",
+        "source_capability_coverage.csv",
         "gpu_summary.csv",
         "manifest_summary.csv",
     }
@@ -288,6 +326,13 @@ def normalize_summary_row(row: dict[str, str]) -> dict[str, Any]:
         "source_mean_difficulty": ["source_mean_difficulty", "src_mean_diff"],
         "source_norm_difficulty": ["source_norm_difficulty", "src_norm_diff"],
         "verifier_failures": ["verifier_failures", "src_verifier_failures"],
+        "ruliad_verifier_accuracy": ["ruliad_verifier_accuracy"],
+        "ruliad_partial_progress": ["ruliad_partial_progress"],
+        "capability_allowed_max_difficulty": [
+            "capability_allowed_max_difficulty"
+        ],
+        "output_entropy_bits": ["output_entropy_bits"],
+        "output_distinct_2_fraction": ["output_distinct_2_fraction"],
     }
     for out_key, in_keys in aliases.items():
         for in_key in in_keys:
@@ -356,12 +401,17 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
     if value is None:
         return
     if split == "train" and name in {"Loss", "Stream Warm Loss"}:
+        if summary.get("train_loss_first", "") == "":
+            summary["train_loss_first"] = value
         summary["train_loss_last"] = value
     elif split == "valid" and name == "Loss":
         summary["valid_loss_last"] = value
     elif split == "valid" and name == "Ruliad Verifier Accuracy":
         summary["ruliad_verifier_accuracy_last"] = value
-    elif split == "valid" and name == "Ruliad Partial Progress":
+    elif split == "valid" and name in {
+        "Ruliad Partial Progress",
+        "Ruliad Mean Partial Progress",
+    }:
         summary["ruliad_partial_progress_last"] = value
     elif split == "valid" and name == "Output Entropy Bits":
         summary["output_entropy_bits_last"] = value
@@ -376,12 +426,21 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
 
 
 def update_source(summary: dict[str, Any], event: dict[str, Any]) -> None:
-    summary["source_loss_last"] = as_float(event.get("loss"))
-    summary["source_entropy_bits_last"] = as_float(event.get("entropy_bits"))
-    summary["source_mean_difficulty_last"] = as_float(event.get("mean_difficulty_level"))
-    summary["source_norm_difficulty_last"] = as_float(event.get("normalized_difficulty_score"))
-    summary["source_mastered_probability_last"] = as_float(event.get("mastered_probability"))
-    summary["source_verifier_failures_last"] = as_float(event.get("verifier_failures"))
+    fields = {
+        "source_loss_last": "loss",
+        "source_entropy_bits_last": "entropy_bits",
+        "source_mean_difficulty_last": "mean_difficulty_level",
+        "source_norm_difficulty_last": "normalized_difficulty_score",
+        "source_mastered_probability_last": "mastered_probability",
+        "source_capability_allowed_max_difficulty_last": (
+            "capability_frontier_allowed_max_difficulty"
+        ),
+        "source_verifier_failures_last": "verifier_failures",
+    }
+    for summary_key, event_key in fields.items():
+        value = as_float(event.get(event_key))
+        if value is not None:
+            summary[summary_key] = value
 
 
 def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
@@ -396,9 +455,31 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def read_stage_profile(log_path: Any) -> dict[str, float]:
+    path = Path(str(log_path or ""))
+    if not path.is_file():
+        return {}
+    last_profile = ""
+    try:
+        with path.open(errors="replace") as handle:
+            for line in handle:
+                if "[stage-profile][training]" in line:
+                    last_profile = line
+    except OSError:
+        return {}
+    if not last_profile:
+        return {}
+    parsed: dict[str, float] = {}
+    for key, raw_value in re.findall(r"([a-zA-Z0-9_]+)=([^\s]+)", last_profile):
+        value = as_float(raw_value)
+        if value is not None:
+            parsed[key] = value
+    return parsed
+
+
 def collect_event_summaries(
     paths: Iterable[Path], manifests: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     summaries: dict[str, dict[str, Any]] = {}
     latest_source_by_run: dict[str, dict[str, Any]] = {}
 
@@ -410,7 +491,18 @@ def collect_event_summaries(
             event_type = event.get("type")
             if path.name == "source_selection.jsonl" or event_type == "source_selection":
                 update_source(summary, event)
-                latest_source_by_run[run] = event
+                if any(
+                    event.get(key)
+                    for key in (
+                        "capability_frontier_coverage",
+                        "difficulty_buckets",
+                        "family_buckets",
+                        "task_buckets",
+                        "contract_buckets",
+                        "top_buckets",
+                    )
+                ):
+                    latest_source_by_run[run] = event
             elif event_type == "metric":
                 update_metric(summary, event)
             elif event_type == "output_degeneracy":
@@ -429,6 +521,18 @@ def collect_event_summaries(
                 summary["capacity_scale_count"] += 1
             elif event_type == "predictive_coding":
                 summary["pc_event_count"] += 1
+                summary["pc_observation_contract_last"] = event.get(
+                    "observation_contract", ""
+                )
+                summary["pc_deployment_aligned_last"] = event.get(
+                    "deployment_aligned", ""
+                )
+                summary["pc_amortization_components_last"] = event.get(
+                    "amortization_components", ""
+                )
+                summary["pc_amortization_loss_last"] = event.get(
+                    "amortization_loss", ""
+                )
                 pc_ms = as_float(event.get("elapsed_ms") or event.get("pc_ms"))
                 if pc_ms is not None:
                     summary["_pc_ms_values"].append(pc_ms)
@@ -451,10 +555,98 @@ def collect_event_summaries(
                 "batch_size",
             ):
                 summary[key] = manifest.get(key, "")
+            profile = read_stage_profile(manifest.get("log_path"))
+            if "total_ns" in profile:
+                summary["training_wall_seconds"] = profile["total_ns"] / 1_000_000_000.0
+            for key in (
+                "wall_tokens_per_second",
+                "model_tokens_per_second",
+                "model_duty_fraction",
+                "train_compute_fraction",
+                "optimizer_fraction",
+                "dataloader_foreground_wait_fraction",
+                "host_sync_points",
+            ):
+                if key in profile:
+                    summary[key] = profile[key]
         rows.append(summary)
 
     bucket_rows = collect_bucket_rows(latest_source_by_run)
-    return sorted(rows, key=lambda row: row["run"]), bucket_rows
+    coverage_rows = collect_capability_coverage_rows(latest_source_by_run)
+    return sorted(rows, key=lambda row: row["run"]), bucket_rows, coverage_rows
+
+
+def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_rows: list[dict[str, Any]] = []
+    for event in rows:
+        if not event.get("arm"):
+            continue
+        row = {key: "" for key in SUMMARY_COLUMNS}
+        row.update(
+            {
+                "run": event.get("run", ""),
+                "iters": as_int(event.get("iters")),
+                "arm": event.get("arm", ""),
+                "seed": as_int(event.get("seed")),
+                "wall_s": as_float(event.get("training_wall_seconds"))
+                or as_float(event.get("elapsed_seconds")),
+                "tok_s": as_float(event.get("wall_tokens_per_second")),
+                "train_first": as_float(event.get("train_loss_first")),
+                "train_last": as_float(event.get("train_loss_last")),
+                "valid_last": as_float(event.get("valid_loss_last")),
+                "pc_ms_mean": as_float(event.get("pc_ms_mean")),
+                "source_loss": as_float(event.get("source_loss_last")),
+                "source_mean_difficulty": as_float(
+                    event.get("source_mean_difficulty_last")
+                ),
+                "source_norm_difficulty": as_float(
+                    event.get("source_norm_difficulty_last")
+                ),
+                "verifier_failures": as_float(
+                    event.get("source_verifier_failures_last")
+                ),
+                "ruliad_verifier_accuracy": as_float(
+                    event.get("ruliad_verifier_accuracy_last")
+                ),
+                "ruliad_partial_progress": as_float(
+                    event.get("ruliad_partial_progress_last")
+                ),
+                "capability_allowed_max_difficulty": as_float(
+                    event.get("source_capability_allowed_max_difficulty_last")
+                ),
+                "output_entropy_bits": as_float(
+                    event.get("output_entropy_bits_last")
+                ),
+                "output_distinct_2_fraction": as_float(
+                    event.get("output_distinct_2_fraction_last")
+                ),
+            }
+        )
+        normalized_rows.append(row)
+    return normalized_rows
+
+
+def merge_summary_rows(
+    legacy_rows: Iterable[dict[str, Any]], event_rows: Iterable[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for row in [*legacy_rows, *event_rows]:
+        key = (row.get("iters"), row.get("arm"), row.get("seed"))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(row)
+            continue
+        for field, value in row.items():
+            if value not in ("", None):
+                existing[field] = value
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            row.get("iters") or -1,
+            str(row.get("arm") or ""),
+            row.get("seed") or -1,
+        ),
+    )
 
 
 def read_manifests(paths: Iterable[Path]) -> list[dict[str, Any]]:
@@ -519,7 +711,38 @@ def collect_bucket_rows(latest_source_by_run: dict[str, dict[str, Any]]) -> list
     return rows
 
 
-def read_gpu_csvs(paths: Iterable[Path]) -> list[dict[str, Any]]:
+def collect_capability_coverage_rows(
+    latest_source_by_run: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run, event in latest_source_by_run.items():
+        for coverage in event.get("capability_frontier_coverage") or []:
+            row = {key: "" for key in CAPABILITY_COVERAGE_COLUMNS}
+            row.update(
+                {
+                    "run": run,
+                    "absolute_step": event.get("absolute_step", ""),
+                    "difficulty_level": coverage.get("difficulty_level", ""),
+                    "candidate_coverage": coverage.get("candidate_coverage", ""),
+                    "family_coverage": coverage.get("family_coverage", ""),
+                    "task_coverage": coverage.get("task_coverage", ""),
+                    "contract_coverage": coverage.get("contract_coverage", ""),
+                    "observed_items": coverage.get("observed_items", ""),
+                    "mastered": coverage.get("mastered", ""),
+                }
+            )
+            rows.append(row)
+    return rows
+
+
+def read_gpu_csvs(
+    paths: Iterable[Path], manifests: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    manifest_by_gpu_path = {
+        str(Path(str(manifest.get("gpu_path")))): manifest
+        for manifest in manifests
+        if manifest.get("gpu_path")
+    }
     rows: list[dict[str, Any]] = []
     for path in paths:
         util: list[float] = []
@@ -534,9 +757,14 @@ def read_gpu_csvs(paths: Iterable[Path]) -> list[dict[str, Any]]:
                 if power_value is not None:
                     power.append(power_value)
         row = {key: "" for key in GPU_COLUMNS}
+        manifest = manifest_by_gpu_path.get(str(path))
         row.update(
             {
                 "file": str(path),
+                "trial_key": manifest.get("trial_key", "") if manifest else "",
+                "arm": manifest.get("arm", "") if manifest else "",
+                "seed": manifest.get("seed", "") if manifest else "",
+                "iters": manifest.get("iters", "") if manifest else "",
                 "samples": max(len(util), len(power)),
                 "util_mean": stats(util).mean,
                 "util_p10": percentile(util, 0.10),
@@ -574,6 +802,11 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "source_loss",
         "source_mean_difficulty",
         "source_norm_difficulty",
+        "ruliad_verifier_accuracy",
+        "ruliad_partial_progress",
+        "capability_allowed_max_difficulty",
+        "output_entropy_bits",
+        "output_distinct_2_fraction",
         "pc_ms_mean",
     ]
     for (iters, arm), group in sorted(groups.items(), key=lambda item: (item[0][0] or -1, str(item[0][1]))):
@@ -591,7 +824,18 @@ def paired_deltas(rows: list[dict[str, Any]], baseline: str, compare: str) -> li
     for row in rows:
         by_key[(row.get("iters"), row.get("seed"))][row.get("arm")] = row
 
-    metrics = ["valid_last", "source_loss", "train_last", "wall_s", "tok_s"]
+    metrics = [
+        "valid_last",
+        "source_loss",
+        "train_last",
+        "wall_s",
+        "tok_s",
+        "ruliad_verifier_accuracy",
+        "ruliad_partial_progress",
+        "capability_allowed_max_difficulty",
+        "output_entropy_bits",
+        "output_distinct_2_fraction",
+    ]
     deltas: dict[tuple[Any, str], list[float]] = defaultdict(list)
     for (iters, _seed), arms in by_key.items():
         if baseline not in arms or compare not in arms:
@@ -634,16 +878,19 @@ def write_markdown(
 
     lines.append("## Fixed-Token Summary")
     lines.append("")
-    lines.append("| Iters | Arm | Seeds | Valid loss | Source loss | Tok/s | PC ms |")
-    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(
+        "| Iters | Arm | Seeds | Valid loss | Verifier acc | Partial progress | Tok/s | PC ms |"
+    )
+    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in summary_rows:
         lines.append(
-            "| {iters} | {arm} | {seeds} | {valid} | {source} | {tok} | {pc} |".format(
+            "| {iters} | {arm} | {seeds} | {valid} | {verifier} | {partial} | {tok} | {pc} |".format(
                 iters=row.get("iters", ""),
                 arm=row.get("arm", ""),
                 seeds=row.get("seeds", ""),
                 valid=fmt_mean_ci(row, "valid_last"),
-                source=fmt_mean_ci(row, "source_loss"),
+                verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
+                partial=fmt_mean_ci(row, "ruliad_partial_progress"),
                 tok=fmt_mean_ci(row, "tok_s"),
                 pc=fmt_mean_ci(row, "pc_ms_mean"),
             )
@@ -688,12 +935,13 @@ def write_markdown(
     if gpu_rows:
         lines.append("## GPU Telemetry")
         lines.append("")
-        lines.append("| File | Samples | Util mean | Util p50 | Power mean | Power p50 |")
-        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+        lines.append("| Arm | Seed | Samples | Util mean | Util p50 | Power mean | Power p50 |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for row in gpu_rows:
             lines.append(
-                "| {file} | {samples} | {util_mean} | {util_p50} | {power_mean} | {power_p50} |".format(
-                    file=Path(str(row.get("file", ""))).name,
+                "| {arm} | {seed} | {samples} | {util_mean} | {util_p50} | {power_mean} | {power_p50} |".format(
+                    arm=row.get("arm", "") or Path(str(row.get("file", ""))).name,
+                    seed=row.get("seed", ""),
                     samples=row.get("samples", ""),
                     util_mean=fmt_scalar(row.get("util_mean")),
                     util_p50=fmt_scalar(row.get("util_p50")),
@@ -727,10 +975,14 @@ def fmt_scalar(value: Any) -> str:
 
 def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) -> None:
     summary_csvs, gpu_csvs, event_jsonls, manifest_jsons = discover_inputs(inputs)
-    summary_rows = read_summary_csvs(summary_csvs)
     manifest_rows = read_manifests(manifest_jsons)
-    event_rows, bucket_rows = collect_event_summaries(event_jsonls, manifest_rows)
-    gpu_rows = read_gpu_csvs(gpu_csvs)
+    event_rows, bucket_rows, coverage_rows = collect_event_summaries(
+        event_jsonls, manifest_rows
+    )
+    summary_rows = merge_summary_rows(
+        read_summary_csvs(summary_csvs), normalize_event_summaries(event_rows)
+    )
+    gpu_rows = read_gpu_csvs(gpu_csvs, manifest_rows)
     grouped_rows = grouped_summary(summary_rows)
     paired_rows = paired_deltas(summary_rows, baseline, compare)
 
@@ -749,6 +1001,11 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
                 "source_loss",
                 "source_mean_difficulty",
                 "source_norm_difficulty",
+                "ruliad_verifier_accuracy",
+                "ruliad_partial_progress",
+                "capability_allowed_max_difficulty",
+                "output_entropy_bits",
+                "output_distinct_2_fraction",
                 "pc_ms_mean",
             ]
             for suffix in ["mean", "ci95"]
@@ -762,6 +1019,11 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
     )
     write_csv(out_dir / "event_run_summary.csv", EVENT_SUMMARY_COLUMNS, event_rows)
     write_csv(out_dir / "source_bucket_summary.csv", BUCKET_COLUMNS, bucket_rows)
+    write_csv(
+        out_dir / "source_capability_coverage.csv",
+        CAPABILITY_COVERAGE_COLUMNS,
+        coverage_rows,
+    )
     write_csv(out_dir / "gpu_summary.csv", GPU_COLUMNS, gpu_rows)
     write_csv(out_dir / "manifest_summary.csv", MANIFEST_COLUMNS, manifest_rows)
     write_markdown(out_dir / "paper_tables.md", grouped_rows, paired_rows, event_rows, gpu_rows)
@@ -800,6 +1062,26 @@ def self_test() -> None:
             + "\n"
             + json.dumps(
                 {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Verifier Accuracy",
+                    "value": 0.25,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Mean Partial Progress",
+                    "value": 0.5,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
                     "type": "source_selection",
                     "run_id": "run-a",
                     "absolute_step": 4,
@@ -808,7 +1090,19 @@ def self_test() -> None:
                     "mean_difficulty_level": 5.0,
                     "normalized_difficulty_score": 0.5,
                     "mastered_probability": 0.2,
+                    "capability_frontier_allowed_max_difficulty": 4,
                     "verifier_failures": 0,
+                    "capability_frontier_coverage": [
+                        {
+                            "difficulty_level": 5,
+                            "candidate_coverage": 0.75,
+                            "family_coverage": 1.0,
+                            "task_coverage": 0.5,
+                            "contract_coverage": 0.25,
+                            "observed_items": 96,
+                            "mastered": False,
+                        }
+                    ],
                     "difficulty_buckets": [
                         {
                             "label": "d5",
@@ -823,9 +1117,34 @@ def self_test() -> None:
                 }
             )
             + "\n"
+            + json.dumps(
+                {
+                    "type": "source_selection",
+                    "run_id": "run-a",
+                    "absolute_step": 5,
+                    "loss": None,
+                    "capability_frontier_allowed_max_difficulty": 5,
+                    "capability_frontier_coverage": [],
+                }
+            )
+            + "\n"
         )
         manifests = root / "manifests"
         manifests.mkdir()
+        log_path = root / "run-a.log"
+        log_path.write_text(
+            "[stage-profile][training] total_ns=2000000000 train_tokens=1024 "
+            "wall_tokens_per_second=512 model_tokens_per_second=640 "
+            "model_duty_fraction=0.8 train_compute_fraction=0.7 "
+            "optimizer_fraction=0.1 dataloader_foreground_wait_fraction=0.01 "
+            "host_sync_points=0\n"
+        )
+        gpu_path = root / "run-a.gpu.csv"
+        gpu_path.write_text(
+            "timestamp,index,utilization_gpu,power_w\n"
+            "2026/01/01 00:00:00,0,80,50\n"
+            "2026/01/01 00:00:01,0,100,60\n"
+        )
         (manifests / "run-a.json").write_text(
             json.dumps(
                 {
@@ -841,7 +1160,8 @@ def self_test() -> None:
                     "overlay": "overlay.toml",
                     "run_root": str(root),
                     "run_dir": str(root / "run-a"),
-                    "log_path": "run-a.log",
+                    "log_path": str(log_path),
+                    "gpu_path": str(gpu_path),
                     "status": "ok",
                     "elapsed_seconds": 1,
                     "peak_used_mb": 10,
@@ -861,6 +1181,19 @@ def self_test() -> None:
         event_rows = list(csv.DictReader((out / "event_run_summary.csv").open()))
         assert event_rows[0]["trial_key"] == "pc-smoke-run-a"
         assert event_rows[0]["arm"] == "adamwpc"
+        assert event_rows[0]["wall_tokens_per_second"] == "512.0"
+        assert event_rows[0]["source_loss_last"] == "0.6"
+        assert event_rows[0]["source_capability_allowed_max_difficulty_last"] == "5.0"
+        normalized = list(csv.DictReader((out / "normalized_summary.csv").open()))
+        event_normalized = next(row for row in normalized if row["run"] == "run-a")
+        assert event_normalized["tok_s"] == "512.0"
+        assert event_normalized["ruliad_verifier_accuracy"] == "0.25"
+        assert event_normalized["ruliad_partial_progress"] == "0.5"
+        coverage = list(csv.DictReader((out / "source_capability_coverage.csv").open()))
+        assert coverage[0]["candidate_coverage"] == "0.75"
+        gpu = list(csv.DictReader((out / "gpu_summary.csv").open()))
+        assert gpu[0]["arm"] == "adamwpc"
+        assert gpu[0]["util_mean"] == "90.0"
         markdown = (out / "paper_tables.md").read_text()
         assert "Fixed-Token Summary" in markdown
         print("self-test ok")

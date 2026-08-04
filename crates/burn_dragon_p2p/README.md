@@ -6,6 +6,7 @@ Current supported experiment families:
 
 - NCA pre-pre-training
 - ClimbMix pre-training
+- verifier-backed formal Ruliad pretraining
 
 The crate is intentionally split into three layers:
 
@@ -265,11 +266,20 @@ Browser-local training supports:
 - HTTP JSON token-window shards
 - HTTP shard manifests with per-shard integrity verification
 - generated NCA corpora
+- generated formal Ruliad corpora
 
 That covers:
 
 - synthetic NCA pre-pre-training
 - shard-backed ClimbMix pre-training
+- structured-symbolic Ruliad proof training with verifier-compatible metadata
+
+Generated Ruliad uses the same semantic contract, deterministic proof source,
+272-token symbolic vocabulary, stream identity, and target-loss masks as the
+native path. The real Chrome/WebGPU gate runs two train and two evaluation
+batches and checks formal-family metadata plus block/TBPTT behavior. AdamW loss
+scalars remain on the GPU through the browser window and are read once at the
+window boundary, avoiding a per-step WebGPU synchronization.
 
 For ClimbMix, the intended browser path is the shard-manifest form. The browser fetches
 `fetch-manifest.json`, selects a bounded per-peer shard subset from the full shard pool,

@@ -12,25 +12,119 @@ technically viable in Dragon training, but the current evidence does not show a 
 advantage over AdamW. The draft should not claim that PC prevents collapse, improves long-run
 continual learning, or should be enabled by default until the experiment matrix below is complete.
 
+### 2026-08 causal-contract correction
+
+The historical runs in this report optimized recurrent state against the same chunk's next-token
+targets before predicting that chunk. Those targets are unavailable at deployment, so the rows
+below are now classified as an **oracle-target negative control**, not evidence for a deployable PC
+inference mechanism. Reproducing that path requires both
+`observation_contract = "oracle_next_token_negative_control"` and
+`allow_oracle_target_leak = true`.
+
+The default `observed_prefix` contract instead uses only transitions within tokens already observed.
+It infers a detached corrected-state teacher, replays the observed chunk from that teacher, and
+constrains the ordinary Dragon transition toward the result. The ordinary state, not the inferred
+teacher, continues into later chunks. This makes training, validation, and deployment use the same
+state-transition path while retaining PC as a causal training signal. The constraint uses a
+scale-symmetric relative MSE, activates only outside the squared relative-RMS
+`amortization_tolerance`, and samples at most
+`amortization_max_state_slots` per recurrent axis.
+
+The prior causal implementation replaced the continuing state with the inferred state. It also
+returned the entering state when the first chunk had no recurrent latents, effectively dropping the
+observed chunk at selected boundaries. Both behaviors are removed. Historical results below predate
+the amortized contract and are not promotion evidence for it.
+
+### 2026-08-04 kernel-path hardening
+
+State inference now runs through a current-weight model view whose parameters have autodiff
+disabled. Recurrent-state tensors remain differentiable, but correction no longer constructs
+parameter adjoints that are discarded immediately afterward. One detached view is built per train
+step and reused by every selected chunk. The `all` state scope is generated from one typed state
+mapper and includes fast state, slow rho/sequence/Mamba state, hierarchical slow hidden state,
+clocked slow state, and summary memory.
+
+Gradient clipping now defaults to `gradient_norm_scope = "per_sample"`. Batch replication therefore
+does not change an individual correction. `global` remains an explicit coupled ablation. Synced
+diagnostics report clipping-group mean, maximum, delta RMS, and clipped fraction with one combined
+readback per state tensor. Amortization slots use a deterministic rotating stratified sample and
+reuse each index tensor across matching layer shapes within a constraint evaluation.
+
+The first per-sample implementation reduced every non-batch axis separately and reached only
+58,488 wall tokens/s on the fixed 1M-class screen. Flattening each tensor to
+`[batch, features]` before one grouped reduction raises that to 66,571 tokens/s; the coupled-global
+control reaches 70,014 tokens/s and AdamW reaches 81,279 tokens/s. The remaining per-sample cost is
+small inside the PC correction itself, while the full correction forward/VJP/replay dominates the
+end-to-end difference.
+
+A matched 128-update 1M-class CUDA trace measures the hardened every-four path against AdamW:
+
+| Metric | AdamW | PC every four | Increment |
+| --- | ---: | ---: | ---: |
+| CUDA launches | 426,540 | 501,509 | +17.6% |
+| GPU kernel work | 2.552 s | 3.320 s | +30.1% |
+| Kernel span | 6.641 s | 7.859 s | +18.3% |
+| H2D copies | 290,589 | 343,022 | +18.0% |
+
+The previous implementation added 33% launches and 44% kernel work on the corresponding screen.
+Parameter detachment removes about 44% of incremental launches, but the remaining energy
+forward/backward and exact corrected-state replay are full model traversals. A fused point update
+cannot remove that dominant cost.
+
+Corrected diagnostics also exposed an algorithmic failure hidden by the old RMS implementation.
+The old metric computed `sqrt(mean(delta^2) + eps)`, which reported a false `1e-4` floor. The
+correct `sqrt(mean(delta^2)).clamp_min(eps)` metric shows that the established
+`step_size = 0.01` path changes state by only `1.0e-8` to `1.8e-8` RMS. Clipping is never active,
+and energy deltas are around floating-point noise. Raw-step screens from 1 through 30,000 descend
+the observed-prefix energy without instability, but this does not repair the learning contract:
+with amortization tolerance set to zero, replay reduces the post-first-correction constraint to
+`1.7e-18` or less. The recurrent transition washes out the corrected entry state before the
+terminal-state teacher is compared to the student.
+
+A three-seed, 128-update tolerance-zero screen confirms that larger corrections do not improve the
+short-run learner:
+
+| Arm | Wall tokens/s | Train loss | Valid loss | Verifier | Partial progress |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **83,118** | **0.2799** | 0.4585 | **0.2188** | **0.4002** |
+| PC every four, step 3,000 | 64,675 | 0.3000 | **0.4583** | 0.1667 | 0.3733 |
+| PC every four, step 10,000 | 64,502 | 0.3000 | **0.4583** | 0.1667 | 0.3733 |
+
+This short matrix is not a quality promotion test, but it is sufficient to reject step-size tuning
+as the missing mechanism. The current observed-prefix implementation is a full-model recurrent
+state smoother and clean-input replay auxiliary. It is not layer-local PC, does not parallelize
+credit assignment across Dragon layers, and must not be described as a backprop replacement.
+
+A bounded 10M-class fused-attention screen (`4x256`, latent 4096, chunk 512) applies one correction
+every four chunks. At batch 16, AdamW reaches 1,499.3 tokens/s and AdamW+PC reaches 1,439.6 tokens/s,
+retaining 96.0% of baseline throughput. A batch-48 recheck reaches 1,514.8 and 1,478.4 tokens/s,
+respectively, retaining 97.6%. Both batch-48 arms have 96% median GPU utilization, so PC does not
+introduce a device-duty stall at this cadence. Absolute throughput remains about 18 times below
+this report's historical 28k-token/s fused-path evidence; AdamW backward alone consumes 101.5
+seconds over the eight-update batch-48 screen. This is a separate shared Dragon backward-path
+regression. These rows establish relative PC cost only and are not production throughput promotion.
+
 ## Abstract Draft
 
-We evaluate predictive coding as a recurrent-state correction mechanism for Dragon TBPTT language
-training. The implementation corrects recurrent latent state before the optimizer step while AdamW
-continues to update model parameters. On the local GB10 CUDA path, the implementation runs in a
-dense regime: the 1M ruliad batch-64 profile sustains roughly 85-89% active GPU utilization at
-about 40-41 W, avoiding the earlier host-synchronization pathology.
+We evaluate causal recurrent-state correction as an amortized teacher for Dragon TBPTT language
+training. In the deployable contract, correction uses only an already-observed prefix and the
+ordinary Dragon state remains the continuation state used by validation and deployment. The
+implementation is backend-resident, avoids discarded parameter adjoints, and adds 2.4% wall cost
+at every-four cadence in the current 10M-class batch-48 screen.
 
-The learning result is mixed. In a three-seed 512-step matrix, AdamW+PC improves mean validation
-loss versus AdamW, but the advantage disappears by 2048 steps while the throughput cost remains
-roughly 29%. A state-only control, where PC corrects recurrent state but parameters are not
-updated, does not learn durable validation behavior. These results support PC as a benchmarkable
-state-inference ablation, not yet as a practical replacement or default companion for AdamW.
+Corrected state-delta telemetry changes the algorithmic conclusion. The established inference step
+is effectively zero, while much larger stable steps are erased by exact prefix replay before the
+terminal teacher state is compared to the student. A tolerance-zero three-seed screen does not
+improve verifier or partial-progress metrics over AdamW. The current mechanism is therefore a
+recurrent denoising/replay auxiliary, not layer-local predictive coding and not a backprop
+replacement. It remains disabled and useful as a reproducible control. A genuine PC follow-up must
+expose layer-local Dragon activities and prediction errors directly.
 
 ## Method
 
 The training path under test is Dragon language modeling with TBPTT. In AdamW+PC mode, PC performs
 one or more recurrent-state correction steps inside each selected TBPTT chunk, then normal gradient
-training updates parameters. The recommended state-correction ablation uses:
+training updates parameters. The established every-two-chunk state-correction arm uses:
 
 ```toml
 [training]
@@ -43,11 +137,18 @@ mode = "recurrent_state"
 state_scope = "core"
 backward_mode = "chunked"
 parameter_update = "optimizer"
+observation_contract = "observed_prefix"
 steps = 1
 step_size = 0.01
+gradient_norm_scope = "per_sample"
 apply_every_chunks = 2
+amortization_tolerance = 0.05
+amortization_max_state_slots = 128
 sync_diagnostics = false
 ```
+
+The every-four variant remains the least expensive recurrent-state control. It is not a promotion
+candidate after the corrected step and replay-effectiveness diagnostics.
 
 The state-only control keeps the same state correction but disables parameter mutation:
 
@@ -57,7 +158,7 @@ enabled = true
 parameter_update = "state_only_control"
 ```
 
-The implementation also exposes a first-class predictive-coding optimizer path:
+The implementation also exposes a coupled conventional parameter-transform control:
 
 ```toml
 [optimizer]
@@ -74,14 +175,68 @@ backward_mode = "chunked"
 parameter_update = "optimizer"
 ```
 
-That optimizer path is validated and smoke-tested, but it is appendix material until it has its own
-controlled matrix. The main scientific claim remains about PC state correction plus AdamW.
+Despite the historical `optimizer.name` spelling, these transforms consume ordinary backpropagated
+parameter gradients; they are not layer-local predictive-coding weight rules. This path is
+validated and smoke-tested, but it is appendix material until it has its own controlled matrix. The
+main scientific claim remains about PC state correction plus AdamW.
 
 Paper-matrix overlays disable adaptive dynamics recovery, continual backprop, and neuron scaling.
 Those systems are important continual-learning machinery, but they would confound an optimizer and
 state-correction ablation by changing the run after collapse, plateau, or capacity events.
 
-## Existing Evidence
+## Causal Amortized Evidence (2026-08-03)
+
+Release CUDA artifacts:
+
+- `target/pc-amortized-relative-mse-128/analysis/`
+- `target/pc-amortized-global-cadence-512x3/analysis-every2/`
+- `target/pc-amortized-global-cadence-512x3/analysis-every4/`
+- `target/pc-amortized-global-cadence-512x3/analysis-every8/`
+
+Matched 512-step conditions use the same profile, batch size 16, TBPTT chunk size 64, three seeds,
+and 2,097,152 training tokens per run. Adaptive dynamics, continual backprop, and neuron scaling
+are disabled in every arm.
+
+| Arm | Seeds | Wall s | Tokens/s | Last train loss | Last valid loss | Verifier accuracy | Partial progress |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | 3 | 20.71 +/- 0.50 | 101,315 +/- 2,500 | 0.2292 +/- 0.0089 | 0.1594 +/- 0.1044 | 0.2604 +/- 0.0408 | 0.3637 +/- 0.1421 |
+| AdamW + PC every 2 chunks | 3 | 37.22 +/- 0.40 | 56,343 +/- 608 | 0.2359 +/- 0.0216 | 0.1021 +/- 0.0101 | 0.2604 +/- 0.0204 | 0.4132 +/- 0.0274 |
+| AdamW + PC every 4 chunks | 3 | 28.99 +/- 0.27 | 72,344 +/- 681 | 0.2907 +/- 0.1196 | 0.1194 +/- 0.0460 | 0.3021 +/- 0.0204 | 0.4141 +/- 0.0589 |
+| AdamW + PC every 8 chunks | 3 | 25.42 +/- 0.57 | 82,520 +/- 1,881 | 0.3231 +/- 0.1814 | 0.1507 +/- 0.1083 | 0.2083 +/- 0.1242 | 0.3168 +/- 0.1675 |
+
+Paired every-four-PC-minus-AdamW deltas:
+
+| Metric | Mean delta | Interpretation |
+| --- | ---: | --- |
+| Last valid loss | -0.0400 +/- 0.1239 | favorable mean, inconclusive with three seeds |
+| Verifier accuracy | +0.0417 +/- 0.0540 | favorable mean, inconclusive with three seeds |
+| Partial progress | +0.0503 +/- 0.1807 | favorable mean, inconclusive with three seeds |
+| Wall time | +8.28 +/- 0.30 s | PC is consistently slower |
+| Tokens/s | -28,971 +/- 1,940 | PC throughput is 71.4% of AdamW |
+
+Every PC run reports `observation_contract=observed_prefix_amortized` and
+`deployment_aligned=true`. The every-two, every-four, and every-eight arms apply 128, 64, and 32
+amortization components per run respectively. The earlier local-chunk sparse-cadence artifact at
+`target/pc-amortized-cadence-direct-512x3/` applied zero components for every-four and every-eight;
+it exposed a cadence phase bug and is explicitly excluded from evidence. Cadence now uses a global
+chunk ordinal and selects an observed chunk rather than resetting at each four-chunk block.
+
+PC's lower throughput is additional model work rather than a host-stall signature. The every-four
+arm reports 66-68% median GPU utilization, dataloader foreground wait below 0.05%, and zero host
+synchronization points in the stage profiler. All 12 runs completed without a fatal gate. Peak host
+memory was 6.58 GB, with at least 118.0 GB available throughout the matrix.
+
+This screen does not establish adaptive curriculum behavior: all arms ended at source mean
+difficulty zero and capability allowed maximum one. It tests the correction contract and early
+optimization only, not whether PC improves an expanding Ruliad frontier or long-run continual
+learning.
+
+The one-seed 128-step chronology/control screen also completes without NaN or CUDA faults. It is
+not promotion evidence, but confirms that `observed_prefix_amortized` reports
+`deployment_aligned=true`, while the explicitly labeled oracle control reports
+`deployment_aligned=false`.
+
+## Historical Oracle-Target Evidence (Not Deployable)
 
 Primary runtime profile:
 
@@ -186,8 +341,8 @@ scripts/pc_paper_experiments.sh \
 Required arms:
 
 - AdamW baseline
-- AdamW+PC recommended: core state, chunked backward, one correction step, `step_size = 0.01`, every other chunk
-- AdamW+PC every chunk: same as recommended but `apply_every_chunks = 1`
+- AdamW+PC established: core state, chunked backward, one correction step, `step_size = 0.01`, every two global chunks
+- AdamW+PC cadence candidate: same settings with `apply_every_chunks = 4`
 
 Required seeds and horizons:
 
@@ -215,7 +370,7 @@ scripts/pc_paper_experiments.sh --matrix wall-clock --wall-clock-seconds 3600
 Required arms:
 
 - AdamW
-- AdamW+PC recommended
+- AdamW+PC every four global chunks
 
 Required seeds:
 
@@ -233,7 +388,7 @@ scripts/pc_paper_experiments.sh --matrix stability --wall-clock-seconds 21600
 Required arms:
 
 - AdamW
-- AdamW+PC recommended
+- AdamW+PC every four global chunks
 
 Required seeds:
 
@@ -267,7 +422,7 @@ scripts/pc_paper_analyze.py \
   target/pc-paper \
   --out-dir target/pc-paper/analysis \
   --baseline adamw \
-  --compare adamwpc
+  --compare adamwpc_every4
 ```
 
 The analyzer writes:
@@ -309,14 +464,14 @@ Statistical rules:
 
 Supported by current evidence:
 
-1. PC recurrent-state correction can run without pathological CPU transfer on the 1M batch-64 CUDA profile.
-2. Core-state, chunked-backward PC is the best current implementation mode.
-3. State-only PC correction is not a viable substitute for parameter optimization.
-4. AdamW+PC gives an early 512-step validation improvement but no replicated 2048-step advantage.
-5. Fixed-small PC ablations require `block_size > tbptt_chunk_size`; otherwise
-   there is no recurrent chunk boundary for PC to correct.
-6. PC can improve plain JEPA TBPTT structure, but delayed NextLat remains the
-   stronger current ruliad stability candidate.
+1. Recurrent-state correction can run without pathological CPU transfer on CUDA.
+2. Detaching model parameters removes a substantial portion of discarded PC backward work.
+3. Per-sample clipping is batch-replication invariant and has an explicit global control.
+4. Every-four correction retains 97.6% of AdamW throughput in the current 10M-class batch-48
+   screen, although the shared backward path has a separate absolute throughput regression.
+5. Raw state correction can descend observed-prefix energy, but replay erases its terminal-state
+   teaching signal to numerical noise after the first selected chunk.
+6. State-only correction is not a viable substitute for parameter optimization.
 
 Not yet supported:
 
@@ -325,6 +480,8 @@ Not yet supported:
 3. PC is worth its throughput cost by default.
 4. The first-class PC optimizer path is competitive with AdamW.
 5. PC is additive with JEPA+NextLat beyond short-run or single-seed evidence.
+6. The current recurrent-state replay path is layer-local PC or parallelizes credit assignment
+   across Dragon layers.
 
 ## Acceptance Gate For An arXiv Submission
 

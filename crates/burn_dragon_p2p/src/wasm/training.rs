@@ -18,7 +18,6 @@ use burn_dragon_eggroll::{
     perturb_module_with_allowed_param_ids,
 };
 use burn_dragon_time::Instant;
-use burn_dragon_universality::{OnlineNcaCorpus, SampleSplit};
 use burn_p2p::{
     ArtifactId, ArtifactKind, COMPACT_UPDATE_PAYLOAD_VERSION, ChunkingScheme,
     CompactScalarEncoding, CompactScalarVector, CompactUpdateBody, CompactUpdatePayload, ContentId,
@@ -46,7 +45,9 @@ use url::Url;
 use crate::auth::{
     browser_github_enrollment_config, fetch_edge_snapshot, load_or_enroll_browser_session,
 };
-use crate::browser_data::deterministic_sample_indices;
+use crate::browser_data::{
+    GeneratedRecordSelection, generated_nca_records, generated_ruliad_records,
+};
 use crate::browser_record::{
     BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_random_scaffold_contract,
     browser_random_scaffold_tensor_digest_from_mutable, browser_record_format_name,
@@ -60,8 +61,10 @@ use crate::capability_state::{
     apply_browser_downgrade_state, clear_browser_downgrade, is_probable_trainer_fit_failure,
     persist_browser_downgrade,
 };
+#[cfg(test)]
+use crate::config::DragonBrowserDatasetSplit;
 use crate::config::{
-    DragonBrowserDatasetSplit, DragonBrowserExecutionBackend, DragonBrowserLiveParticipantConfig,
+    DragonBrowserExecutionBackend, DragonBrowserLiveParticipantConfig,
     DragonBrowserOptimizerConfig, DragonBrowserShardSelectionPolicy, DragonBrowserTokenSource,
     DragonBrowserTrainingConfig, TokenWindowRecord, dragon_model_schema_hash,
 };
@@ -170,8 +173,16 @@ trait BrowserTrainingKernel<B: Backend> {
         None
     }
 
+    async fn finish_loss_observation(&mut self) -> Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
     fn observes_loss(&self) -> bool {
         true
+    }
+
+    fn defers_loss_readback(&self) -> bool {
+        false
     }
 }
 
@@ -180,7 +191,9 @@ where
     DragonModel<B>: AutodiffModule<B>,
 {
     learning_rate: f64,
-    observe_loss: bool,
+    immediate_loss_readback: bool,
+    deferred_loss_sum: Option<Tensor<B, 1>>,
+    deferred_loss_count: usize,
     tbptt_chunk_size: Option<usize>,
     persist_across_steps: bool,
     state: Option<ModelState<B>>,
@@ -194,13 +207,15 @@ where
     fn new(
         learning_rate: f64,
         weight_decay: f32,
-        observe_loss: bool,
+        immediate_loss_readback: bool,
         tbptt_chunk_size: Option<usize>,
         persist_across_steps: bool,
     ) -> Self {
         Self {
             learning_rate,
-            observe_loss,
+            immediate_loss_readback,
+            deferred_loss_sum: None,
+            deferred_loss_count: 0,
             tbptt_chunk_size,
             persist_across_steps,
             state: None,
@@ -228,16 +243,20 @@ where
         let mut accumulator = GradientsAccumulator::new();
         let mut observed_losses = Vec::new();
         visit_browser_next_token_chunks(&model, batch, &mut state, self.tbptt_chunk_size, |loss| {
-            if self.observe_loss {
-                observed_losses.push(loss.clone().detach());
-            }
+            observed_losses.push(loss.clone().detach());
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             accumulator.accumulate(&model, grads);
         });
-        let losses = if observed_losses.is_empty() {
-            Vec::new()
+        let observed_loss = sum_scalar_losses(observed_losses);
+        let losses = if self.immediate_loss_readback {
+            vec![scalar_from_loss_async(observed_loss).await?]
         } else {
-            vec![scalar_from_loss_async(sum_scalar_losses(observed_losses)).await?]
+            self.deferred_loss_sum = Some(match self.deferred_loss_sum.take() {
+                Some(total) => total + observed_loss,
+                None => observed_loss,
+            });
+            self.deferred_loss_count = self.deferred_loss_count.saturating_add(1);
+            Vec::new()
         };
         let grads = accumulator.grads();
         let model = self.optimizer.step(self.learning_rate, model, grads);
@@ -245,8 +264,17 @@ where
         Ok(BrowserKernelStep { model, losses })
     }
 
-    fn observes_loss(&self) -> bool {
-        self.observe_loss
+    async fn finish_loss_observation(&mut self) -> Result<Vec<f64>> {
+        let Some(total) = self.deferred_loss_sum.take() else {
+            return Ok(Vec::new());
+        };
+        let count = std::mem::take(&mut self.deferred_loss_count);
+        ensure!(count > 0, "deferred browser loss has no observations");
+        Ok(vec![scalar_from_loss_async(total).await? / count as f64])
+    }
+
+    fn defers_loss_readback(&self) -> bool {
+        !self.immediate_loss_readback
     }
 }
 
@@ -410,6 +438,7 @@ struct TokenRecordLoadPolicy {
     record_limit: Option<usize>,
     shard_selection_key: Option<String>,
     training_lease: Option<WorkloadTrainingLease>,
+    stream_aligned: bool,
 }
 
 struct LiveBrowserParticipantHandle {
@@ -589,6 +618,7 @@ impl<'a> BrowserTrainingRunContext<'a> {
                 stage,
             )),
             training_lease,
+            stream_aligned: self.config.tbptt_persist_across_steps,
         }
     }
 }
@@ -1152,9 +1182,9 @@ where
         .map_err(anyhow::Error::msg)?;
     let mut kernel = kernel_factory(&model, revision_contract)?;
     let collect_loss_scalars = kernel.observes_loss();
-    if !collect_loss_scalars {
+    if kernel.defers_loss_readback() {
         info!(
-            "browser training loss scalar readback disabled for backend={}; avoiding wasm WebGPU buffer maps during live training",
+            "browser training loss scalar readback deferred for backend={}; aggregating on device for one window-boundary readback",
             context.backend_label,
         );
     }
@@ -1217,6 +1247,10 @@ where
     if train_batch_count == 0 {
         bail!("browser training window completed zero batches");
     }
+    for loss in kernel.finish_loss_observation().await? {
+        train_loss_sum += loss;
+        train_loss_count = train_loss_count.saturating_add(1);
+    }
     let compact_trace = kernel.compact_trace().cloned();
     let training_time_ms = elapsed_ms(training_started_at);
     let train_loss_mean = if train_loss_count > 0 {
@@ -1236,7 +1270,7 @@ where
     let eval_loss = if eval_batches.is_empty() || !collect_loss_scalars {
         None
     } else {
-        let mut total = 0.0;
+        let mut total = None;
         let mut count = 0usize;
         let mut eval_state = None;
         for (batch_index, batch) in eval_batches.into_iter().enumerate() {
@@ -1261,7 +1295,11 @@ where
                 context.config.tbptt_chunk_size,
                 |loss| losses.push(loss),
             );
-            total += scalar_from_loss_async(sum_scalar_losses(losses)).await?;
+            let loss = sum_scalar_losses(losses);
+            total = Some(match total {
+                Some(total) => total + loss,
+                None => loss,
+            });
             store_browser_step_state(
                 &mut eval_state,
                 step_state,
@@ -1269,7 +1307,12 @@ where
             );
             count = count.saturating_add(1);
         }
-        (count > 0).then_some(total / count as f64)
+        match (total, count) {
+            (Some(total), count) if count > 0 => {
+                Some(scalar_from_loss_async(total).await? / count as f64)
+            }
+            _ => None,
+        }
     };
     let eval_time_ms = elapsed_ms(eval_started_at);
     info!(
@@ -1530,9 +1573,35 @@ async fn load_token_records(
             corpus,
             split,
             max_documents,
-        } => {
-            load_generated_nca_records(corpus, split.clone(), *max_documents, block_size, &policy)?
-        }
+        } => generated_nca_records(
+            corpus,
+            *split,
+            block_size,
+            GeneratedRecordSelection {
+                max_documents: *max_documents,
+                record_limit: policy.record_limit,
+                selection_key: policy.shard_selection_key.as_deref(),
+                training_lease: policy.training_lease.as_ref(),
+            },
+        )?,
+        DragonBrowserTokenSource::GeneratedRuliad {
+            corpus,
+            split,
+            max_documents,
+            supervision,
+        } => generated_ruliad_records(
+            corpus,
+            *split,
+            block_size,
+            *supervision,
+            policy.stream_aligned,
+            GeneratedRecordSelection {
+                max_documents: *max_documents,
+                record_limit: policy.record_limit,
+                selection_key: policy.shard_selection_key.as_deref(),
+                training_lease: policy.training_lease.as_ref(),
+            },
+        )?,
     };
     validate_token_records(&records, block_size)?;
     Ok(records)
@@ -1741,67 +1810,6 @@ async fn load_shard_manifest_records(
 
     validate_token_records(&records, request.block_size)?;
     Ok(records)
-}
-
-fn load_generated_nca_records(
-    corpus: &burn_dragon_universality::NcaCorpusConfig,
-    split: DragonBrowserDatasetSplit,
-    max_documents: Option<usize>,
-    block_size: usize,
-    policy: &TokenRecordLoadPolicy,
-) -> Result<Vec<TokenWindowRecord>> {
-    let logical_document_tokens = block_size.saturating_add(1);
-    let runtime = OnlineNcaCorpus::new_with_min_logical_document_tokens(
-        corpus.clone(),
-        Some(logical_document_tokens),
-    )?;
-    let split = match split {
-        DragonBrowserDatasetSplit::Train => SampleSplit::Train,
-        DragonBrowserDatasetSplit::Validation => SampleSplit::Validation,
-    };
-    let sample_indices = deterministic_sample_indices(
-        runtime.sample_count(split),
-        max_documents,
-        policy.shard_selection_key.as_deref(),
-        policy.training_lease.as_ref(),
-    );
-    let record_limit = policy.record_limit.unwrap_or(usize::MAX);
-    let mut records = Vec::new();
-    for sample_index in sample_indices {
-        let tokens = runtime.generate_document_tokens(split, sample_index)?;
-        records.extend(token_windows_from_tokens(&tokens, block_size));
-        if records.len() >= record_limit {
-            records.truncate(record_limit);
-            break;
-        }
-    }
-    Ok(records)
-}
-
-fn token_windows_from_tokens(tokens: &[u32], block_size: usize) -> Vec<TokenWindowRecord> {
-    if tokens.len() <= block_size {
-        return Vec::new();
-    }
-    let max_start = tokens.len() - (block_size + 1);
-    let mut records = Vec::new();
-    let mut start = 0usize;
-    loop {
-        let window = &tokens[start..start + block_size + 1];
-        records.push(TokenWindowRecord {
-            inputs: window[..block_size]
-                .iter()
-                .map(|token| i64::from(*token))
-                .collect(),
-            targets: window[1..].iter().map(|token| i64::from(*token)).collect(),
-            reset_stream_state: start == 0,
-            ..TokenWindowRecord::default()
-        });
-        if start >= max_start {
-            break;
-        }
-        start = start.saturating_add(block_size).min(max_start);
-    }
-    records
 }
 
 fn validate_token_records(records: &[TokenWindowRecord], block_size: usize) -> Result<()> {
@@ -2811,7 +2819,9 @@ mod tests {
     use burn_dragon_core::{DragonConfig, LanguageHeadConfig};
     use burn_dragon_universality::{
         NcaCorpusConfig, NcaFamilyConfig, NcaFamilyKind, NcaSerializationConfig,
-        NcaTokenizationConfig, UsizeRangeConfig,
+        NcaTokenizationConfig, RuliadCorpusConfig, RuliadFormalTaskMixConfig,
+        RuliadSerializationConfig, RuliadSourceSelectionConfig, RuliadTokenizationConfig,
+        UsizeRangeConfig,
     };
     use burn_p2p::{
         ClientPlatform, ClientReleaseManifest, ContentId, DatasetViewId, MicroShardId,
@@ -3097,6 +3107,72 @@ mod tests {
         assert!(result.train_batches >= 1);
         assert!(result.train_examples >= 1);
         assert!(result.train_loss_mean.is_finite());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn browser_training_smoke_generated_ruliad() {
+        use burn_dragon_universality::ruliad::{
+            RuliadTokenSupervisionConfig, RuliadTokenSupervisionMode,
+        };
+
+        #[cfg(feature = "wgpu")]
+        let execution_backend = DragonBrowserExecutionBackend::Wgpu;
+        #[cfg(not(feature = "wgpu"))]
+        let execution_backend = DragonBrowserExecutionBackend::Cpu;
+        let supervision = RuliadTokenSupervisionConfig {
+            mode: RuliadTokenSupervisionMode::TraceAndAnswer,
+            mask_high_entropy_spans: true,
+            ..RuliadTokenSupervisionConfig::default()
+        };
+        let config = DragonBrowserTrainingConfig {
+            experiment_kind: crate::config::DragonExperimentKind::RuliadPretraining,
+            model_config: tiny_model_config(272),
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: Default::default(),
+            execution_backend,
+            block_size: 64,
+            tbptt_chunk_size: Some(64),
+            tbptt_persist_across_steps: true,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 2,
+            max_train_batches: Some(2),
+            max_eval_batches: Some(2),
+            capability_policy: Default::default(),
+            training_lease: None,
+            train_source: DragonBrowserTokenSource::GeneratedRuliad {
+                corpus: Box::new(tiny_ruliad_corpus_config()),
+                split: DragonBrowserDatasetSplit::Train,
+                max_documents: Some(1),
+                supervision,
+            },
+            eval_source: Some(DragonBrowserTokenSource::GeneratedRuliad {
+                corpus: Box::new(tiny_ruliad_corpus_config()),
+                split: DragonBrowserDatasetSplit::Validation,
+                max_documents: Some(1),
+                supervision,
+            }),
+            live_participant: None,
+        };
+        let result = run_browser_training_with_release_manifest(
+            "https://example.invalid",
+            &config,
+            &dummy_release_manifest(),
+        )
+        .await
+        .expect("generated Ruliad browser training should succeed");
+        let expected_backend = match execution_backend.backend_label() {
+            "wgpu" => "burn-webgpu-wasm",
+            _ => "burn-ndarray-wasm",
+        };
+        assert_eq!(result.backend, expected_backend);
+        assert_eq!(result.experiment_kind_label, "Ruliad pre-training");
+        assert_eq!(result.train_batches, 2);
+        assert_eq!(result.train_examples, 4);
+        assert!(result.train_loss_observed);
+        assert!(result.train_loss_mean.is_finite());
+        assert_eq!(result.eval_examples, 4);
+        assert!(result.eval_loss.is_some_and(f64::is_finite));
     }
 
     #[wasm_bindgen_test(async)]
@@ -3646,6 +3722,40 @@ mod tests {
                 temperature: None,
                 rule_filter: None,
             }],
+        }
+    }
+
+    fn tiny_ruliad_corpus_config() -> RuliadCorpusConfig {
+        RuliadCorpusConfig {
+            output_dir: PathBuf::from("wasm-browser-ruliad-smoke"),
+            seed: 17,
+            name: "wasm-browser-ruliad-smoke".into(),
+            train_samples: 2,
+            validation_samples: 1,
+            chunk_token_capacity: 4096,
+            serialization: RuliadSerializationConfig {
+                document_tokens: 2048,
+                preview_samples: 1,
+                ..RuliadSerializationConfig::default()
+            },
+            tokenization: RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            },
+            formal_generalization: Default::default(),
+            source_selection: RuliadSourceSelectionConfig {
+                difficulty_levels: UsizeRangeConfig { min: 0, max: 1 },
+                formal_task_mix: RuliadFormalTaskMixConfig {
+                    advance_proof_weight: 1,
+                    select_proof_action_weight: 0,
+                    construct_proof_weight: 0,
+                    check_proof_weight: 0,
+                },
+                ..RuliadSourceSelectionConfig::default()
+            },
+            families: burn_dragon_universality::ruliad::formal_ruliad_families(),
+            proof_tasks: None,
+            lean_task_limit: None,
         }
     }
 

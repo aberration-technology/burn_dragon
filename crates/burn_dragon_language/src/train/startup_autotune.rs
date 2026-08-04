@@ -148,11 +148,8 @@ where
     let device_target_bytes = (autotune.target_device_memory_mb > 0)
         .then(|| (autotune.target_device_memory_mb as u64) * 1024 * 1024);
     let host_cap_bytes = system_memory_total_bytes.map(|bytes| {
-        ((bytes as f64)
-            * autotune
-                .max_system_memory_fraction
-                .min(0.9)
-                .max(f32::EPSILON) as f64) as u64
+        ((bytes as f64) * autotune.max_system_memory_fraction.clamp(f32::EPSILON, 0.9) as f64)
+            as u64
     });
     let target_bytes = resolve_memory_cap_bytes(
         autotune.target_device_memory_mb,
@@ -467,7 +464,7 @@ fn resolve_memory_cap_bytes(
     system_memory_total_bytes: Option<u64>,
 ) -> Option<u64> {
     let host_cap = system_memory_total_bytes.map(|bytes| {
-        ((bytes as f64) * max_system_memory_fraction.min(0.9).max(f32::EPSILON) as f64) as u64
+        ((bytes as f64) * max_system_memory_fraction.clamp(f32::EPSILON, 0.9) as f64) as u64
     });
     let target_cap =
         (target_device_memory_mb > 0).then(|| (target_device_memory_mb as u64) * 1024 * 1024);
@@ -532,12 +529,8 @@ fn probe_memory_cap_skip_with_snapshot(
         return Some(skip);
     }
 
-    let Some(host_cap_bytes) = host_cap_bytes else {
-        return None;
-    };
-    let Some(snapshot) = snapshot else {
-        return None;
-    };
+    let host_cap_bytes = host_cap_bytes?;
+    let snapshot = snapshot?;
     if snapshot.used_bytes() >= host_cap_bytes {
         return Some(StartupAutotuneProbe {
             batch_size: candidate,
@@ -1235,8 +1228,8 @@ mod tests {
         .expect("projected host usage should skip before probing");
         assert_eq!(skip.status, "predicted_host_memory_cap");
         assert_eq!(skip.batch_size, 8);
-        assert!(skip.host_delta_mb.unwrap() > 120.0);
-        assert!(skip.projected_host_used_mb.unwrap() > 120.0);
+        assert!(skip.host_delta_mb.expect("host delta") > 120.0);
+        assert!(skip.projected_host_used_mb.expect("projected host use") > 120.0);
     }
 
     #[test]

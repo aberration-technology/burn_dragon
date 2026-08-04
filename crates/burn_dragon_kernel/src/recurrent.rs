@@ -158,12 +158,8 @@ where
             || matches_type::<B::FloatTensorPrimitive, WgpuCubeAutodiffTensor>()
             || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>(
             )
-            || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>(
-            )
             || matches_type::<B::FloatTensorPrimitive, CubeTensor<CudaRuntime>>()
             || matches_type::<B::FloatTensorPrimitive, CudaCubeAutodiffTensor>()
-            || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<CudaRuntime>>>(
-            )
             || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<CudaRuntime>>>(
             )
     }
@@ -171,8 +167,6 @@ where
     {
         matches_type::<B::FloatTensorPrimitive, CubeTensor<WgpuRuntime>>()
             || matches_type::<B::FloatTensorPrimitive, WgpuCubeAutodiffTensor>()
-            || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>(
-            )
             || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>(
             )
     }

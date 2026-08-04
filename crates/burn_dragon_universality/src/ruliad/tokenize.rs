@@ -207,6 +207,14 @@ impl RuliadByteTokenizer {
         tokens
     }
 
+    pub fn encode_compact_document(&self, text: &str) -> Vec<u32> {
+        let mut tokens = self.encode_payload(text);
+        if let Some(eos_id) = self.eos_id() {
+            tokens.push(eos_id);
+        }
+        tokens
+    }
+
     fn fill_token(&self) -> u32 {
         match self.mode {
             RuliadTokenizerMode::ByteCompatible { eos_id, .. } => {
@@ -430,7 +438,7 @@ fn structured_symbolic_structural_marker(
     if !at_line_start {
         return match bytes.get(index) {
             Some(b'[') => {
-                if bytes[index..].starts_with(b"[/R2]") {
+                if bytes[index..].starts_with(b"[/R2]") || bytes[index..].starts_with(b"[/R3]") {
                     Some((SymbolicStructuralToken::DocumentEnd, 5))
                 } else if bytes[index..].starts_with(b"[/T]") {
                     Some((SymbolicStructuralToken::TraceEnd, 4))
@@ -451,9 +459,9 @@ fn symbolic_structural_marker(bytes: &[u8]) -> Option<(SymbolicStructuralToken, 
         Some((SymbolicStructuralToken::TraceEnd, 4))
     } else if let Some(consumed) = trace_node_marker_len(bytes) {
         Some((SymbolicStructuralToken::TraceNode, consumed))
-    } else if bytes.starts_with(b"[R2") {
+    } else if bytes.starts_with(b"[R2") || bytes.starts_with(b"[R3") {
         Some((SymbolicStructuralToken::DocumentStart, 3))
-    } else if bytes.starts_with(b"[/R2]") {
+    } else if bytes.starts_with(b"[/R2]") || bytes.starts_with(b"[/R3]") {
         Some((SymbolicStructuralToken::DocumentEnd, 5))
     } else if bytes.starts_with(b"S:") {
         Some((SymbolicStructuralToken::Metadata, 2))
@@ -558,7 +566,7 @@ fn is_symbolic_boilerplate_lexeme(lexeme: &str) -> bool {
     if lexeme.len() == 1 && lexeme.bytes().all(|byte| byte.is_ascii_uppercase()) {
         return true;
     }
-    if lexeme == "R2" {
+    if lexeme == "R2" || lexeme == "R3" {
         return true;
     }
     if is_hash_boilerplate_lexeme(lexeme) {
@@ -653,6 +661,8 @@ fn stable_text_hash(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruliad::formal::{RuliadFormalGeneratorConfig, generate_formal_bundle};
+    use crate::ruliad::wire::encode_model_certificate;
 
     #[test]
     fn byte_tokenizer_emits_exact_document_length() {
@@ -922,5 +932,46 @@ mod tests {
         assert!(decoded.contains("!:ok=1"), "{decoded}");
         assert!(decoded.contains("[/R2]"), "{decoded}");
         assert!(!decoded.contains('x'), "{decoded}");
+    }
+
+    #[test]
+    fn model_certificates_round_trip_exactly_through_structured_tokenizer() {
+        let tokenizer =
+            RuliadByteTokenizer::from_config(&RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            })
+            .expect("tok");
+
+        for seed in 0..64 {
+            let bundle = generate_formal_bundle(seed, RuliadFormalGeneratorConfig::default())
+                .expect("formal bundle");
+            let certificate =
+                encode_model_certificate(&bundle.certificate).expect("model certificate");
+            let tokens = tokenizer.encode_payload(&certificate);
+            let decoded = tokenizer.decode_payload(&tokens, true);
+            assert_eq!(
+                decoded, certificate,
+                "model-facing target must not contain tokenizer-invisible syntax for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn r3_envelope_reuses_version_neutral_structural_tokens() {
+        let tokenizer =
+            RuliadByteTokenizer::from_config(&RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            })
+            .expect("tok");
+        let r2 = tokenizer.encode_payload("[R2 h]\n!:ok=1\n[/R2]");
+        let r3 = tokenizer.encode_payload("[R3 h]\n!:ok=1\n[/R3]");
+        assert_eq!(
+            r2, r3,
+            "wire versions should not consume checkpoint vocabulary"
+        );
+        assert_eq!(r3.iter().filter(|token| **token == 259).count(), 1);
+        assert_eq!(r3.iter().filter(|token| **token == 265).count(), 1);
     }
 }

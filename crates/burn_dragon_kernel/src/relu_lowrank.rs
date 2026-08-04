@@ -724,7 +724,6 @@ where
 {
     matches_type::<B::FloatTensorPrimitive, CubeTensor<WgpuRuntime>>()
         || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>()
-        || matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<WgpuRuntime>>>()
         || matches_type::<B::FloatTensorPrimitive, WgpuCubeAutodiffTensor>()
         || matches_type::<B::FloatTensorPrimitive, WgpuFusionAutodiffTensor<u32>>()
         || matches_type::<B::FloatTensorPrimitive, WgpuFusionAutodiffTensor<u8>>()
@@ -732,6 +731,10 @@ where
             #[cfg(feature = "cuda")]
             {
                 matches_type::<B::FloatTensorPrimitive, CubeTensor<CudaRuntime>>()
+                    || matches_type::<
+                        B::FloatTensorPrimitive,
+                        FusionTensor<FusionCubeRuntime<CudaRuntime>>,
+                    >()
                     || matches_type::<B::FloatTensorPrimitive, CudaCubeAutodiffTensor>()
                     || matches_type::<B::FloatTensorPrimitive, CudaFusionAutodiffTensor<u32>>()
                     || matches_type::<B::FloatTensorPrimitive, CudaFusionAutodiffTensor<u8>>()

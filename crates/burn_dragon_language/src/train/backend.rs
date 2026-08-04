@@ -270,10 +270,12 @@ fn use_event_scheduler_for_training(
     source_selection_uses_live_policy: bool,
 ) -> bool {
     let local_runtime_objectives = training.dynamics.enabled
+        || training.sequence_state_probe.enabled
         || (training.events.source_weighted_validation_batches > 0
             && source_selection_uses_live_policy);
 
-    training.neuron_scaling.enabled
+    !training.validation.execution.is_local()
+        || training.neuron_scaling.enabled
         || training.predictive_coding.enabled
         || (parallel_mode == ParallelismKind::Single && local_runtime_objectives)
 }
@@ -286,7 +288,7 @@ mod tests {
         let profile_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../burn_dragon_p2p/deploy/profiles")
             .join(file_name);
-        crate::config::train::load_training_config(&[profile_path.clone()])
+        crate::config::train::load_training_config(std::slice::from_ref(&profile_path))
             .unwrap_or_else(|err| panic!("load {}: {err}", profile_path.display()))
     }
 
@@ -329,6 +331,34 @@ mod tests {
                 .ruliad_supervision
                 .needs_ruliad_policy_batch()
         );
+    }
+
+    #[test]
+    fn sequence_state_probe_selects_the_event_scheduler() {
+        let training = load_profile("ruliad-r3.stateful-tbptt-block512-reset.toml");
+        assert!(training.training.sequence_state_probe.enabled);
+        assert!(use_event_scheduler_for_training(
+            &training.training,
+            ParallelismKind::Single,
+            false,
+        ));
+    }
+
+    #[test]
+    fn offloaded_duty_profile_uses_external_evaluator_scheduler() {
+        let config = load_profile("ruliad-r3.typed-policy-offloaded-duty-ablation.toml");
+        config
+            .validate()
+            .expect("offloaded duty profile should satisfy the external evaluator contract");
+        assert_eq!(
+            config.training.validation.execution,
+            crate::config::TrainingValidationExecution::ExternalEvaluator
+        );
+        assert!(use_event_scheduler_for_training(
+            &config.training,
+            config.parallel.mode,
+            true,
+        ));
     }
 }
 
@@ -376,6 +406,9 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    if !training.validation.execution.is_local() {
+        return Ok(());
+    }
     let Some(init_checkpoint_path) = training.init_checkpoint_path.as_ref() else {
         return Ok(());
     };
@@ -446,6 +479,9 @@ where
     B: BackendTrait + Clone + 'static,
     B::Device: Clone,
 {
+    if !training.validation.execution.is_local() {
+        return Ok(());
+    }
     let Some(init_checkpoint_path) = training.init_checkpoint_path.as_ref() else {
         return Ok(());
     };
@@ -752,22 +788,57 @@ where
         training.checkpoint_interval_iters,
         schedule.source.as_str()
     );
-    let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> = Arc::new(
-        RandomDataLoader::<B>::new(
-            Arc::clone(&datasets.train),
-            DatasetSplit::Train,
-            &device,
-            steps_per_epoch,
-            Some(total_steps),
+    let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> = if training
+        .sequence_batching
+        .uses_streaming_loader(training.tbptt_persist_across_steps)
+    {
+        Arc::new(
+            StreamingDataLoader::<B>::new(
+                Arc::clone(&datasets.train),
+                DatasetSplit::Train,
+                &device,
+                steps_per_epoch,
+                Some(total_steps),
+                training.min_logical_block_size,
+                training.seed,
+            )
+            .with_initial_consumed_steps(resume_consumed_steps)
+            .with_ruliad_policy_supervision(training.ruliad_supervision)
+            .with_ruliad_policy_stratified_difficulty_levels(
+                training
+                    .ruliad_supervision
+                    .proof_policy
+                    .stratified_difficulty_levels,
+            )
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
         )
-        .with_initial_consumed_steps(resume_consumed_steps)
-        .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
-        .with_summary_event_token_ids(summary_event_token_ids.clone()),
-    );
+    } else {
+        Arc::new(
+            RandomDataLoader::<B>::new(
+                Arc::clone(&datasets.train),
+                DatasetSplit::Train,
+                &device,
+                steps_per_epoch,
+                Some(total_steps),
+            )
+            .with_initial_consumed_steps(resume_consumed_steps)
+            .with_ruliad_policy_supervision(training.ruliad_supervision)
+            .with_ruliad_policy_stratified_difficulty_levels(
+                training
+                    .ruliad_supervision
+                    .proof_policy
+                    .stratified_difficulty_levels,
+            )
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
+        )
+    };
 
     let val_steps_per_epoch = datasets.valid.steps_per_epoch(DatasetSplit::Val);
     let valid_steps =
-        resolve_valid_steps_per_epoch(total_steps, training.log_frequency, val_steps_per_epoch);
+        resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
+    info!(
+        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch}"
+    );
     let valid_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> = Arc::new(
         RandomDataLoader::<B>::new(
             Arc::clone(&datasets.valid),
@@ -776,7 +847,6 @@ where
             valid_steps,
             None,
         )
-        .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
@@ -868,13 +938,10 @@ where
         )
         .with_ruliad_generated_attractor_telemetry_path(ruliad_generated_attractor_telemetry_path)
         .with_tbptt_chunk_size(training.tbptt_chunk_size);
-    let model = Some(prepared_model);
-    let eggroll_chunk_autotune = if let Some(model_ref) = model.as_ref() {
-        autotune_eggroll_population_chunk_size(&resolved_config.optimizer, model_ref, &train_loader)
-            .context("autotune EGGROLL population chunk size")?
-    } else {
-        None
-    };
+    let model = prepared_model;
+    let eggroll_chunk_autotune =
+        autotune_eggroll_population_chunk_size(&resolved_config.optimizer, &model, &train_loader)
+            .context("autotune EGGROLL population chunk size")?;
     if let Some(report) = &eggroll_chunk_autotune {
         resolved_config
             .optimizer
@@ -931,15 +998,13 @@ where
         )?;
         write_training_snapshot(&resolved_config, &run_dir, dataset.tokenizer().as_ref())?;
     }
-    if let Some(model_ref) = model.as_ref() {
-        maybe_write_pre_step_validation_report_forward_only(
-            training,
-            &parallel_runtime,
-            &run_dir,
-            model_ref,
-            &valid_loader,
-        )?;
-    }
+    maybe_write_pre_step_validation_report_forward_only(
+        training,
+        &parallel_runtime,
+        &run_dir,
+        &model,
+        &valid_loader,
+    )?;
     info!("run name: {run_name}");
     if let Some(report) = &startup_autotune {
         info!(
@@ -982,7 +1047,7 @@ where
         );
     }
     info!(
-        "training batching: micro_batch_size={} gradient_accumulation_steps={} effective_batch_size={} tbptt_chunk_size={} tbptt_persist_across_steps={} min_logical_block_size={}",
+        "training batching: micro_batch_size={} gradient_accumulation_steps={} effective_batch_size={} tbptt_chunk_size={} tbptt_persist_across_steps={} sequence_batching={:?} streaming_loader={} min_logical_block_size={}",
         resolved_config.training.batch_size,
         resolved_config.training.gradient_accumulation_steps,
         resolved_config
@@ -995,6 +1060,11 @@ where
             .map(|value| value.to_string())
             .unwrap_or_else(|| "disabled".to_string()),
         resolved_config.training.tbptt_persist_across_steps,
+        resolved_config.training.sequence_batching,
+        resolved_config
+            .training
+            .sequence_batching
+            .uses_streaming_loader(resolved_config.training.tbptt_persist_across_steps),
         resolved_config
             .training
             .min_logical_block_size
@@ -1029,11 +1099,7 @@ where
         summary_event_token_ids,
         epochs: total_epochs,
     };
-    let _model = train_with_eggroll_forward_only(
-        &context,
-        optimizer_cfg,
-        model.expect("model initialized"),
-    )?;
+    let _model = train_with_eggroll_forward_only(&context, optimizer_cfg, model)?;
 
     info!("Training complete on {backend_name} with EGGROLL forward-only backend");
     Ok(())
@@ -1328,40 +1394,57 @@ where
         training.checkpoint_interval_iters,
         schedule.source.as_str()
     );
-    let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> =
-        if training.tbptt_persist_across_steps {
-            Arc::new(
-                StreamingDataLoader::<B>::new(
-                    Arc::clone(&datasets.train),
-                    DatasetSplit::Train,
-                    &device,
-                    steps_per_epoch,
-                    Some(total_steps),
-                    training.min_logical_block_size,
-                    training.seed,
-                )
-                .with_initial_consumed_steps(resume_consumed_steps)
-                .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
-                .with_summary_event_token_ids(summary_event_token_ids.clone()),
+    let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> = if training
+        .sequence_batching
+        .uses_streaming_loader(training.tbptt_persist_across_steps)
+    {
+        Arc::new(
+            StreamingDataLoader::<B>::new(
+                Arc::clone(&datasets.train),
+                DatasetSplit::Train,
+                &device,
+                steps_per_epoch,
+                Some(total_steps),
+                training.min_logical_block_size,
+                training.seed,
             )
-        } else {
-            Arc::new(
-                RandomDataLoader::<B>::new(
-                    Arc::clone(&datasets.train),
-                    DatasetSplit::Train,
-                    &device,
-                    steps_per_epoch,
-                    Some(total_steps),
-                )
-                .with_initial_consumed_steps(resume_consumed_steps)
-                .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
-                .with_summary_event_token_ids(summary_event_token_ids.clone()),
+            .with_initial_consumed_steps(resume_consumed_steps)
+            .with_ruliad_policy_supervision(training.ruliad_supervision)
+            .with_ruliad_policy_stratified_difficulty_levels(
+                training
+                    .ruliad_supervision
+                    .proof_policy
+                    .stratified_difficulty_levels,
             )
-        };
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
+        )
+    } else {
+        Arc::new(
+            RandomDataLoader::<B>::new(
+                Arc::clone(&datasets.train),
+                DatasetSplit::Train,
+                &device,
+                steps_per_epoch,
+                Some(total_steps),
+            )
+            .with_initial_consumed_steps(resume_consumed_steps)
+            .with_ruliad_policy_supervision(training.ruliad_supervision)
+            .with_ruliad_policy_stratified_difficulty_levels(
+                training
+                    .ruliad_supervision
+                    .proof_policy
+                    .stratified_difficulty_levels,
+            )
+            .with_summary_event_token_ids(summary_event_token_ids.clone()),
+        )
+    };
 
     let val_steps_per_epoch = datasets.valid.steps_per_epoch(DatasetSplit::Val);
     let valid_steps =
-        resolve_valid_steps_per_epoch(total_steps, training.log_frequency, val_steps_per_epoch);
+        resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
+    info!(
+        "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch}"
+    );
 
     let valid_device = device.clone();
     let valid_loader: Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>> =
@@ -1373,7 +1456,6 @@ where
                 valid_steps,
                 None,
             )
-            .with_ruliad_policy_batch(training.ruliad_supervision.needs_ruliad_policy_batch())
             .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 
@@ -1473,6 +1555,12 @@ where
                     .join("events")
                     .join("ruliad_verifier_rollout_imitation.jsonl")
             });
+    let ruliad_proof_policy_telemetry_path =
+        training.ruliad_supervision.proof_policy.enabled.then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_proof_policy_dagger.jsonl")
+        });
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_configuration(training, total_steps)
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
@@ -1484,24 +1572,17 @@ where
         )
         .with_ruliad_generated_attractor_telemetry_path(ruliad_generated_attractor_telemetry_path)
         .with_ruliad_verifier_rollout_telemetry_path(ruliad_verifier_rollout_telemetry_path)
+        .with_ruliad_proof_policy_telemetry_path(ruliad_proof_policy_telemetry_path)
         .with_pipeline_plan(pipeline_plan.clone());
-    let mut model = Some(prepared_model);
-    let mut optim = Some(resolve_dragon_language_optimizer::<B>(
-        training,
-        optimizer_cfg,
-        total_steps,
-        fresh_model,
-    )?);
+    let model = prepared_model;
+    let optim =
+        resolve_dragon_language_optimizer::<B>(training, optimizer_cfg, total_steps, fresh_model)?;
     let scheduler_iters = match schedule.source {
         ScheduleSource::Epochs => Some(total_steps),
         ScheduleSource::MaxIters => None,
     };
-    let scheduler = Some(resolve_lr_scheduler(
-        optimizer_cfg,
-        total_steps,
-        scheduler_iters,
-        &model_config,
-    )?);
+    let scheduler =
+        resolve_lr_scheduler(optimizer_cfg, total_steps, scheduler_iters, &model_config)?;
     if parallel_runtime.is_primary() {
         write_latest_run(&run_root, &run_name)?;
         write_run_config(
@@ -1515,15 +1596,13 @@ where
         )?;
         write_training_snapshot(&resolved_config, &run_dir, dataset.tokenizer().as_ref())?;
     }
-    if let Some(model_ref) = model.as_ref() {
-        maybe_write_pre_step_validation_report(
-            training,
-            &parallel_runtime,
-            &run_dir,
-            model_ref,
-            &valid_loader,
-        )?;
-    }
+    maybe_write_pre_step_validation_report(
+        training,
+        &parallel_runtime,
+        &run_dir,
+        &model,
+        &valid_loader,
+    )?;
     info!("run name: {run_name}");
     if let Some(report) = &startup_autotune {
         info!(
@@ -1551,7 +1630,7 @@ where
         );
     }
     info!(
-        "training batching: micro_batch_size={} gradient_accumulation_steps={} effective_batch_size={} tbptt_chunk_size={} tbptt_persist_across_steps={} min_logical_block_size={}",
+        "training batching: micro_batch_size={} gradient_accumulation_steps={} effective_batch_size={} tbptt_chunk_size={} tbptt_persist_across_steps={} sequence_batching={:?} streaming_loader={} min_logical_block_size={}",
         resolved_config.training.batch_size,
         resolved_config.training.gradient_accumulation_steps,
         resolved_config
@@ -1564,6 +1643,11 @@ where
             .map(|value| value.to_string())
             .unwrap_or_else(|| "disabled".to_string()),
         resolved_config.training.tbptt_persist_across_steps,
+        resolved_config.training.sequence_batching,
+        resolved_config
+            .training
+            .sequence_batching
+            .uses_streaming_loader(resolved_config.training.tbptt_persist_across_steps),
         resolved_config
             .training
             .min_logical_block_size
@@ -1614,12 +1698,7 @@ where
         crate::train::profile::reset();
     }
     let train_wall_start = stage_profile.then(Instant::now);
-    let _model = train_with_resolved_scheduler(
-        &context,
-        model.take().expect("model initialized"),
-        optim.take().expect("optimizer initialized"),
-        scheduler.expect("scheduler initialized"),
-    )?;
+    let _model = train_with_resolved_scheduler(&context, model, optim, scheduler)?;
 
     info!("Training complete on {backend_name}");
 
@@ -1629,11 +1708,28 @@ where
         let train_tokens = (snapshot.train_steps as u128)
             .saturating_mul(resolved_config.training.batch_size as u128)
             .saturating_mul(resolved_config.training.block_size as u128);
-        let model_step_ns = snapshot
+        let main_model_step_ns = snapshot
             .forward_ns
             .saturating_add(snapshot.loss_backward_ns);
+        let model_step_ns = main_model_step_ns.saturating_add(snapshot.auxiliary_objective_ns);
+        let train_compute_ns = model_step_ns.saturating_add(snapshot.optimizer_ns);
+        let accounted_ns = train_compute_ns
+            .saturating_add(snapshot.metric_sync_ns)
+            .saturating_add(snapshot.validation_ns)
+            .saturating_add(snapshot.checkpoint_ns)
+            .saturating_add(snapshot.dataloader_foreground_wait_ns);
         let wall_tokens_per_second = tokens_per_second(train_tokens, elapsed_ns);
         let model_tokens_per_second = tokens_per_second(train_tokens, model_step_ns);
+        let main_model_tokens_per_second = tokens_per_second(train_tokens, main_model_step_ns);
+        let model_duty_fraction = fraction(model_step_ns, elapsed_ns);
+        let auxiliary_objective_fraction = fraction(snapshot.auxiliary_objective_ns, elapsed_ns);
+        let proof_policy_fraction = fraction(snapshot.proof_policy_ns, elapsed_ns);
+        let train_compute_fraction = fraction(train_compute_ns, elapsed_ns);
+        let optimizer_fraction = fraction(snapshot.optimizer_ns, elapsed_ns);
+        let metric_sync_fraction = fraction(snapshot.metric_sync_ns, elapsed_ns);
+        let accounted_fraction = fraction(accounted_ns, elapsed_ns);
+        let validation_fraction = fraction(snapshot.validation_ns, elapsed_ns);
+        let checkpoint_fraction = fraction(snapshot.checkpoint_ns, elapsed_ns);
         let dataloader_wall_fraction = if elapsed_ns == 0 {
             0.0
         } else {
@@ -1645,14 +1741,20 @@ where
             snapshot.dataloader_foreground_wait_ns as f64 / elapsed_ns as f64
         };
         info!(
-            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
             snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
             snapshot.forward_ns,
+            snapshot.auxiliary_objective_ns,
+            snapshot.proof_policy_ns,
             snapshot.loss_backward_ns,
+            snapshot.optimizer_ns,
+            snapshot.metric_sync_ns,
+            snapshot.validation_ns,
+            snapshot.checkpoint_ns,
             snapshot.embed_probe_ns,
             snapshot.first_layer_forward_probe_ns,
             snapshot.first_layer_probe_ns,
@@ -1670,14 +1772,20 @@ where
             snapshot.max_step_in_use_after_backward_bytes,
         );
         eprintln!(
-            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} loss_backward_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
+            "[stage-profile][training] total_ns={elapsed_ns} train_tokens={train_tokens} wall_tokens_per_second={wall_tokens_per_second:.3} model_tokens_per_second={model_tokens_per_second:.3} main_model_tokens_per_second={main_model_tokens_per_second:.3} model_duty_fraction={model_duty_fraction:.6} auxiliary_objective_fraction={auxiliary_objective_fraction:.6} proof_policy_fraction={proof_policy_fraction:.6} train_compute_fraction={train_compute_fraction:.6} optimizer_fraction={optimizer_fraction:.6} metric_sync_fraction={metric_sync_fraction:.6} accounted_fraction={accounted_fraction:.6} validation_fraction={validation_fraction:.6} checkpoint_fraction={checkpoint_fraction:.6} dataloader_cpu_thread_fraction={dataloader_wall_fraction:.6} dataloader_foreground_wait_fraction={dataloader_foreground_wait_fraction:.6} dataloader_cpu_ns={} dataloader_foreground_wait_ns={} dataloader_tensor_copy_ns={} dataloader_host_to_device_copy_bytes={} host_sync_points={} forward_ns={} auxiliary_objective_ns={} proof_policy_ns={} loss_backward_ns={} optimizer_ns={} metric_sync_ns={} validation_ns={} checkpoint_ns={} embed_probe_ns={} first_layer_forward_probe_ns={} first_layer_probe_ns={} logits_loss_probe_ns={} hidden_logits_loss_probe_ns={} hidden_model_forward_probe_ns={} hidden_model_probe_ns={} detail_probe_steps={} train_steps={} max_step_reserved_before_bytes={} max_step_in_use_before_bytes={} max_step_reserved_after_forward_bytes={} max_step_in_use_after_forward_bytes={} max_step_reserved_after_backward_bytes={} max_step_in_use_after_backward_bytes={}",
             snapshot.dataloader_cpu_ns,
             snapshot.dataloader_foreground_wait_ns,
             snapshot.dataloader_tensor_copy_ns,
             snapshot.dataloader_host_to_device_copy_bytes,
             snapshot.host_sync_points,
             snapshot.forward_ns,
+            snapshot.auxiliary_objective_ns,
+            snapshot.proof_policy_ns,
             snapshot.loss_backward_ns,
+            snapshot.optimizer_ns,
+            snapshot.metric_sync_ns,
+            snapshot.validation_ns,
+            snapshot.checkpoint_ns,
             snapshot.embed_probe_ns,
             snapshot.first_layer_forward_probe_ns,
             snapshot.first_layer_probe_ns,
@@ -1704,4 +1812,12 @@ fn tokens_per_second(tokens: u128, elapsed_ns: u128) -> f64 {
         return 0.0;
     }
     (tokens as f64) / (elapsed_ns as f64 / 1_000_000_000.0)
+}
+
+fn fraction(part: u128, total: u128) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64
+    }
 }

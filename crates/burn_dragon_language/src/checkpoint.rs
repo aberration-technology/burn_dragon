@@ -638,6 +638,21 @@ pub fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverride
     if let Some(value) = incoming.fused_kernels {
         base.fused_kernels = Some(value);
     }
+    if let Some(value) = incoming.fused_recurrent_kernel {
+        base.fused_recurrent_kernel = Some(value);
+    }
+    if let Some(value) = incoming.fused_rollout_kernel {
+        base.fused_rollout_kernel = Some(value);
+    }
+    if let Some(value) = incoming.fused_projection_executor {
+        base.fused_projection_executor = Some(value);
+    }
+    if let Some(value) = incoming.fused_attention_executor {
+        base.fused_attention_executor = Some(value);
+    }
+    if let Some(value) = incoming.fused_lowrank_grad_input_executor {
+        base.fused_lowrank_grad_input_executor = Some(value);
+    }
     if let Some(value) = incoming.block_size {
         base.block_size = Some(value);
     }

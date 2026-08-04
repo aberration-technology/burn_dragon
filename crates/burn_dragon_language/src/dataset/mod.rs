@@ -10,11 +10,13 @@ use burn::tensor::backend::Backend;
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
 pub use scheduler::{
-    RandomDataLoader, RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, StreamingDataLoader,
-    TokenSequenceDataset, sample_batch_with_shape,
+    RandomDataLoader, RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, SourceSelectedBatch,
+    SourceSelectedStreamBatch, StreamingDataLoader, TokenSequenceDataset, sample_batch_with_shape,
 };
+pub(crate) use universality::ruliad_capability_feedback_from_report;
 pub use universality::{
-    RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, UniversalityDataset,
+    RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, RuliadValidationPromptMode,
+    UniversalityDataset,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +28,7 @@ pub enum DatasetSplit {
 #[derive(Clone)]
 pub enum Dataset {
     HuggingFace(HuggingFaceDataset),
-    Universality(UniversalityDataset),
+    Universality(Box<UniversalityDataset>),
 }
 
 impl Dataset {
@@ -35,7 +37,7 @@ impl Dataset {
     }
 
     pub fn from_universality(dataset: UniversalityDataset) -> Self {
-        Self::Universality(dataset)
+        Self::Universality(Box::new(dataset))
     }
 
     pub fn tokenizer(&self) -> SharedTokenizer {
@@ -88,6 +90,19 @@ impl Dataset {
             Dataset::HuggingFace(_) => None,
             Dataset::Universality(dataset) => {
                 dataset.record_ruliad_capability_feedback_at_step(report, absolute_step)
+            }
+        }
+    }
+
+    pub(crate) fn record_ruliad_capability_feedback_batch_at_step(
+        &self,
+        feedback: &[burn_dragon_universality::RuliadCapabilityFeedback],
+        absolute_step: Option<usize>,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => {
+                dataset.record_ruliad_capability_feedback_batch_at_step(feedback, absolute_step)
             }
         }
     }
@@ -149,6 +164,44 @@ impl Dataset {
             Dataset::Universality(dataset) => {
                 dataset.sample_ruliad_validation_probe_items(epoch_index, absolute_step, max_items)
             }
+        }
+    }
+
+    pub fn sample_ruliad_training_serialization_probe_items(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        max_items: usize,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset
+                .sample_ruliad_training_serialization_probe_items(
+                    epoch_index,
+                    absolute_step,
+                    max_items,
+                ),
+        }
+    }
+
+    pub fn sample_ruliad_validation_probe_items_stratified(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        max_items: usize,
+        task_kind: &str,
+        difficulty_levels: usize,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset
+                .sample_ruliad_validation_probe_items_stratified(
+                    epoch_index,
+                    absolute_step,
+                    max_items,
+                    task_kind,
+                    difficulty_levels,
+                ),
         }
     }
 
@@ -300,7 +353,7 @@ impl TokenSequenceDataset for Dataset {
         absolute_step: usize,
         batch_size: usize,
         block_size: usize,
-    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+    ) -> Option<SourceSelectedBatch> {
         match self {
             Dataset::HuggingFace(dataset) => dataset.source_selected_token_windows_with_loss_masks(
                 split,
@@ -326,6 +379,7 @@ impl TokenSequenceDataset for Dataset {
         epoch_index: usize,
         absolute_step: usize,
         batch_size: usize,
+        stratified_difficulty_levels: usize,
     ) -> Option<RuliadPolicyBatch> {
         match self {
             Dataset::HuggingFace(dataset) => dataset.source_selected_ruliad_policy_batch(
@@ -333,12 +387,14 @@ impl TokenSequenceDataset for Dataset {
                 epoch_index,
                 absolute_step,
                 batch_size,
+                stratified_difficulty_levels,
             ),
             Dataset::Universality(dataset) => dataset.source_selected_ruliad_policy_batch(
                 split,
                 epoch_index,
                 absolute_step,
                 batch_size,
+                stratified_difficulty_levels,
             ),
         }
     }
@@ -380,7 +436,7 @@ impl TokenSequenceDataset for Dataset {
         chunk_index_in_document: usize,
         batch_size: usize,
         block_size: usize,
-    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+    ) -> Option<SourceSelectedStreamBatch> {
         match self {
             Dataset::HuggingFace(dataset) => dataset
                 .source_selected_stream_token_windows_with_loss_masks(
@@ -428,7 +484,9 @@ impl TokenSequenceDataset for Dataset {
     fn uses_target_loss_mask(&self) -> bool {
         match self {
             Dataset::HuggingFace(dataset) => TokenSequenceDataset::uses_target_loss_mask(dataset),
-            Dataset::Universality(dataset) => TokenSequenceDataset::uses_target_loss_mask(dataset),
+            Dataset::Universality(dataset) => {
+                TokenSequenceDataset::uses_target_loss_mask(dataset.as_ref())
+            }
         }
     }
 
@@ -438,7 +496,7 @@ impl TokenSequenceDataset for Dataset {
                 TokenSequenceDataset::target_loss_mask_for_window(dataset, window, mask)
             }
             Dataset::Universality(dataset) => {
-                TokenSequenceDataset::target_loss_mask_for_window(dataset, window, mask)
+                TokenSequenceDataset::target_loss_mask_for_window(dataset.as_ref(), window, mask)
             }
         }
     }
@@ -449,7 +507,7 @@ impl TokenSequenceDataset for Dataset {
                 TokenSequenceDataset::split_offset_and_span(dataset, split)
             }
             Dataset::Universality(dataset) => {
-                TokenSequenceDataset::split_offset_and_span(dataset, split)
+                TokenSequenceDataset::split_offset_and_span(dataset.as_ref(), split)
             }
         }
     }
@@ -457,14 +515,18 @@ impl TokenSequenceDataset for Dataset {
     fn steps_per_epoch(&self, split: DatasetSplit) -> usize {
         match self {
             Dataset::HuggingFace(dataset) => TokenSequenceDataset::steps_per_epoch(dataset, split),
-            Dataset::Universality(dataset) => TokenSequenceDataset::steps_per_epoch(dataset, split),
+            Dataset::Universality(dataset) => {
+                TokenSequenceDataset::steps_per_epoch(dataset.as_ref(), split)
+            }
         }
     }
 
     fn decode(&self, tokens: &[i64]) -> String {
         match self {
             Dataset::HuggingFace(dataset) => TokenSequenceDataset::decode(dataset, tokens),
-            Dataset::Universality(dataset) => TokenSequenceDataset::decode(dataset, tokens),
+            Dataset::Universality(dataset) => {
+                TokenSequenceDataset::decode(dataset.as_ref(), tokens)
+            }
         }
     }
 }

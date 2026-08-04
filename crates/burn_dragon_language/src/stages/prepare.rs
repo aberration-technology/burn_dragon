@@ -17,7 +17,7 @@ use super::{ExperimentStageArtifact, ExperimentStageConfig, ExperimentStageKind}
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreparedUniversalityCorpusConfig {
     Nca(NcaCorpusConfig),
-    Ruliad(RuliadCorpusConfig),
+    Ruliad(Box<RuliadCorpusConfig>),
 }
 
 #[derive(Debug, Clone)]
@@ -190,11 +190,14 @@ fn resolve_relative_to(bundle_config_path: &Path, relative_or_absolute: &Path) -
 
 fn load_universality_corpus_config(path: &Path) -> Result<PreparedUniversalityCorpusConfig> {
     if looks_like_ruliad_config(path)? {
-        return load_ruliad_config(path).map(PreparedUniversalityCorpusConfig::Ruliad);
+        return load_ruliad_config(path)
+            .map(Box::new)
+            .map(PreparedUniversalityCorpusConfig::Ruliad);
     }
     match load_nca_config(path) {
         Ok(config) => Ok(PreparedUniversalityCorpusConfig::Nca(config)),
         Err(nca_error) => load_ruliad_config(path)
+            .map(Box::new)
             .map(PreparedUniversalityCorpusConfig::Ruliad)
             .with_context(|| {
                 format!(

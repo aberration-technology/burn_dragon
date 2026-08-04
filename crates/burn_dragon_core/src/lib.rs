@@ -4,9 +4,9 @@
 
 /// Canonical Burn record schema used by Dragon checkpoints.
 ///
-/// Version 3 includes the random-scaffold contract in the model specification,
-/// so checkpoints cannot silently resume against a different immutable base.
-pub const DRAGON_CHECKPOINT_SCHEMA_VERSION: u16 = 3;
+/// Version 4 adds the optional task-neutral sequence-score head. A checkpoint that contains the
+/// head must not silently resume into a model whose typed candidate scorer is absent.
+pub const DRAGON_CHECKPOINT_SCHEMA_VERSION: u16 = 4;
 
 pub mod constants;
 pub mod experimental;
@@ -34,8 +34,8 @@ pub mod api {
             LanguageHeadConfig, LatentFanoutScheduleConfig, MambaSequenceConfig,
             ManifoldHyperConnectionCoefficientPolicy, ManifoldHyperConnectionsConfig,
             NextLatentTransitionConfig, ResidualConnectorKind, SequenceKernelConfig,
-            SequenceMemorySystem, SequenceTrainingExecutor, SummaryMemoryConfig,
-            YNeuronRecurrenceConfig,
+            SequenceMemorySystem, SequenceScoreHeadConfig, SequenceTrainingExecutor,
+            SummaryMemoryConfig, YNeuronRecurrenceConfig,
         };
         pub use burn_dragon_kernel::api::projection::LowrankGradInputExecutor;
     }
@@ -127,7 +127,7 @@ pub use model::{
     ManifoldHyperConnectionStreamOutput, ManifoldHyperConnectionWidthOutput,
     ManifoldHyperConnections, ManifoldHyperConnectionsConfig, MicroTransformerBlock, ModelState,
     NextLatentTransitionConfig, ResidualConnectorKind, SequenceKernelConfig, SequenceMemorySystem,
-    SequenceTrainingExecutor, SharedLowrankActivationBatchStats,
+    SequenceScoreHeadConfig, SequenceTrainingExecutor, SharedLowrankActivationBatchStats,
     SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
     SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
     SummaryMemoryConfig, YNeuronRecurrenceConfig, build_dragon_random_scaffold_manifest,

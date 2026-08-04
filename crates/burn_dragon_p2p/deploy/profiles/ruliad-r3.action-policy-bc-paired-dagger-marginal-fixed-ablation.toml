@@ -1,0 +1,10 @@
+extends = ["ruliad-r3.action-policy-static-marginal-fixed-ablation.toml"]
+
+# Learn verifier actions on stratified expert states first. After the warmup,
+# every update retains fresh expert states while adding an equal budget of
+# verifier-relabelled model-visited states. This avoids replacing behavior
+# cloning with a drifting on-policy distribution.
+[training.ruliad_supervision.proof_policy]
+mode = "static_then_paired_dagger"
+dagger_start_after_steps = 768
+rollout_steps = 4

@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{CorpusKind, UniversalitySampleRecord, load_manifest};
 use crate::ruliad::config::LeanMode;
+use crate::ruliad::ir::RuliadProofBundle;
+use crate::ruliad::lean::{
+    RuliadLeanPanelReport, RuliadLeanVerificationReport, verify_formal_bundles_with_lean,
+    verify_formal_panel_with_lean,
+};
 use crate::ruliad::oracles::{RuliadSampleSpec, verify_spec};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -16,10 +21,28 @@ pub struct RuliadVerificationReport {
     pub lean_mode: LeanMode,
     pub lean_checked: bool,
     pub lean_ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_report: Option<RuliadLeanVerificationReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_error: Option<String>,
 }
 
 pub fn verify_sample(spec: &RuliadSampleSpec) -> Result<bool> {
     Ok(verify_spec(spec)?.ok)
+}
+
+pub fn verify_formal_panel(
+    seed: u64,
+    difficulty_levels: &[usize],
+    samples_per_domain: usize,
+    lean_project: Option<&Path>,
+) -> Result<RuliadLeanPanelReport> {
+    let project = lean_project
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_lean_project_path);
+    let lake = lake_binary();
+    run_lake_build(&project, &lake)?;
+    verify_formal_panel_with_lean(seed, difficulty_levels, samples_per_domain, &project, &lake)
 }
 
 pub fn verify_manifest(
@@ -40,6 +63,7 @@ pub fn verify_manifest(
     let records = read_sample_records(&sample_records_path)?;
     let mut failed = Vec::new();
     let mut lean_task_seen = false;
+    let mut formal_bundles = Vec::new();
     for record in &records {
         let Some(spec_value) = &record.ruliad_spec else {
             failed.push(format!(
@@ -52,6 +76,17 @@ pub fn verify_manifest(
             .with_context(|| format!("parse sample {} ruliad spec", record.sample_index))?;
         if matches!(spec, RuliadSampleSpec::LeanTask { .. }) {
             lean_task_seen = true;
+        }
+        if let RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            ..
+        } = &spec
+        {
+            formal_bundles.push(RuliadProofBundle {
+                problem: problem.clone(),
+                certificate: certificate.clone(),
+            });
         }
         let report = verify_spec(&spec)?;
         if !report.ok {
@@ -70,19 +105,20 @@ pub fn verify_manifest(
         }
     }
 
-    let (lean_checked, lean_ok) = match lean_mode {
-        LeanMode::Off => (false, true),
-        LeanMode::Optional if !lean_task_seen => (false, true),
-        LeanMode::Optional => match verify_lean_project(lean_project) {
-            Ok(()) => (true, true),
-            Err(_) => (true, false),
+    let lean_input_seen = lean_task_seen || !formal_bundles.is_empty();
+    let (lean_checked, lean_ok, lean_report, lean_error) = match lean_mode {
+        LeanMode::Off => (false, true, None, None),
+        LeanMode::Optional if !lean_input_seen => (false, true, None, None),
+        LeanMode::Optional => match verify_lean_project(lean_project, &formal_bundles) {
+            Ok(report) => (true, true, report, None),
+            Err(error) => (true, false, None, Some(format!("{error:#}"))),
         },
-        LeanMode::Required if !lean_task_seen => (false, true),
-        LeanMode::Required => match verify_lean_project(lean_project) {
-            Ok(()) => (true, true),
+        LeanMode::Required if !lean_input_seen => (false, true, None, None),
+        LeanMode::Required => match verify_lean_project(lean_project, &formal_bundles) {
+            Ok(report) => (true, true, report, None),
             Err(error) => {
                 failed.push(format!("lean verification failed: {error:#}"));
-                (true, false)
+                (true, false, None, Some(format!("{error:#}")))
             }
         },
     };
@@ -94,6 +130,8 @@ pub fn verify_manifest(
         lean_mode,
         lean_checked,
         lean_ok,
+        lean_report,
+        lean_error,
     })
 }
 
@@ -114,11 +152,19 @@ fn read_sample_records(path: &Path) -> Result<Vec<UniversalitySampleRecord>> {
         .collect()
 }
 
-fn verify_lean_project(project: Option<&Path>) -> Result<()> {
+fn verify_lean_project(
+    project: Option<&Path>,
+    formal_bundles: &[RuliadProofBundle],
+) -> Result<Option<RuliadLeanVerificationReport>> {
     let project = project
         .map(Path::to_path_buf)
         .unwrap_or_else(default_lean_project_path);
-    run_lake_build(&project)
+    let lake = lake_binary();
+    run_lake_build(&project, &lake)?;
+    if formal_bundles.is_empty() {
+        return Ok(None);
+    }
+    verify_formal_bundles_with_lean(formal_bundles, &project, &lake).map(Some)
 }
 
 fn default_lean_project_path() -> PathBuf {
@@ -126,19 +172,21 @@ fn default_lean_project_path() -> PathBuf {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn run_lake_build(project: &Path) -> Result<()> {
-    let status = std::process::Command::new(lake_binary())
+fn run_lake_build(project: &Path, lake: &Path) -> Result<()> {
+    let output = std::process::Command::new(lake)
         .arg("build")
         .current_dir(project)
-        .status()
+        .output()
         .with_context(|| format!("failed to launch lake in {}", project.display()))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
         Err(anyhow!(
-            "lake build failed in {} with status {}",
+            "lake build failed in {} with status {}\nstdout:\n{}\nstderr:\n{}",
             project.display(),
-            status
+            output.status,
+            bounded_output(&output.stdout),
+            bounded_output(&output.stderr)
         ))
     }
 }
@@ -170,11 +218,22 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn run_lake_build(project: &Path) -> Result<()> {
+fn run_lake_build(project: &Path, _lake: &Path) -> Result<()> {
     Err(anyhow!(
         "lake build is unavailable for wasm target ({})",
         project.display()
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lake_binary() -> PathBuf {
+    PathBuf::from("lake")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bounded_output(bytes: &[u8]) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]).into_owned()
 }
 
 #[cfg(test)]
@@ -203,6 +262,7 @@ mod tests {
                 ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
             families: vec![RuliadFamilyConfig {
                 kind: RuliadFamilyKind::LeanTask,

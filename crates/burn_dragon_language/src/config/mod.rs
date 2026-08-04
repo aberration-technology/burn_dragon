@@ -4,10 +4,15 @@ pub(crate) mod merge;
 #[cfg(feature = "train")]
 pub mod train;
 
+#[cfg(feature = "train")]
+pub use burn_pc::PcGradientNormScope;
+
 pub use core::{
     ContextStrategyConfig, GenerationConfig, GenerationOutputFormat,
     GenerationTokenizerSourceConfig, ModelOverrides,
 };
+#[cfg(feature = "train")]
+pub(crate) use train::RuliadPolicyBatchCadences;
 #[cfg(feature = "train")]
 pub use train::{
     AutoBatchSizeConfig, CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
@@ -18,11 +23,17 @@ pub use train::{
     LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
     LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LatentStepContractConfig,
     LogitEntropyFloorConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
-    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, RepeatUnlikelihoodConfig, RepromptTruncation,
-    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadSupervisionConfig,
-    RuliadSupervisionMode, RuliadVerifierRewardConfig, RuliadVerifierRewardMode,
-    SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-    TeacherRegularization, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
-    TrainingObjectiveKind, ValidationDatasetConfig, load_training_config,
+    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingObservationContract,
+    PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepeatUnlikelihoodConfig,
+    RepromptTruncation, RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig,
+    RuliadPolicyProbeConfig, RuliadPolicyPromotionGateConfig, RuliadProbeGenerationConfig,
+    RuliadProofPolicyCandidateSymmetry, RuliadProofPolicyEffectiveMode,
+    RuliadProofPolicyGradientScope, RuliadProofPolicyNormalization,
+    RuliadProofPolicyPresentationRisk, RuliadProofPolicyScoring, RuliadProofPolicyTrainingConfig,
+    RuliadProofPolicyTrainingMode, RuliadSupervisionConfig, RuliadSupervisionMode,
+    RuliadVerifierRewardConfig, RuliadVerifierRewardMode, SdftObjectiveConfig,
+    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, SequenceBatchingMode,
+    SequenceStateProbeConfig, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
+    TrainingValidationExecution, ValidationDatasetConfig, load_training_config,
 };

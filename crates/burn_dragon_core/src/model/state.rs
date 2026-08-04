@@ -1,11 +1,14 @@
 use std::mem;
 
-use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::{Int, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct LayerState<B: Backend> {
+    /// Whether the caller carries this state into a later sequence invocation.
     pub persist_sequence_state: bool,
+    /// Whether the executor must materialize state at the end of the current invocation.
+    pub retain_terminal_sequence_state: bool,
     pub rho: Option<Tensor<B, 4>>,
     pub rho_norm: Option<Tensor<B, 3>>,
     pub sequence_aux: Option<Tensor<B, 4>>,
@@ -43,18 +46,27 @@ pub struct LayerVizState<B: Backend> {
 
 impl<B: Backend> ModelState<B> {
     pub fn new(num_layers: usize) -> Self {
-        Self::with_sequence_state_persistence(num_layers, true)
+        Self::with_sequence_state_policy(num_layers, true, true)
     }
 
     pub fn new_ephemeral(num_layers: usize) -> Self {
-        Self::with_sequence_state_persistence(num_layers, false)
+        Self::with_sequence_state_policy(num_layers, false, true)
     }
 
-    fn with_sequence_state_persistence(num_layers: usize, persist_sequence_state: bool) -> Self {
+    pub fn new_stateless(num_layers: usize) -> Self {
+        Self::with_sequence_state_policy(num_layers, false, false)
+    }
+
+    fn with_sequence_state_policy(
+        num_layers: usize,
+        persist_sequence_state: bool,
+        retain_terminal_sequence_state: bool,
+    ) -> Self {
         Self {
             layers: (0..num_layers)
                 .map(|_| LayerState {
                     persist_sequence_state,
+                    retain_terminal_sequence_state,
                     rho: None,
                     rho_norm: None,
                     sequence_aux: None,
@@ -158,6 +170,110 @@ impl<B: Backend> ModelState<B> {
         detached
     }
 
+    /// Repeat every recurrent-state batch row by `copies` while preserving stream position.
+    ///
+    /// This is primarily useful after encoding one shared prefix: downstream branches can carry
+    /// the exact same prefix state without recomputing the prefix for every continuation.
+    pub fn repeat_batch(&self, copies: usize) -> Self {
+        assert!(copies > 0, "model-state batch copies must be non-zero");
+        Self {
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| LayerState {
+                    persist_sequence_state: layer.persist_sequence_state,
+                    retain_terminal_sequence_state: layer.retain_terminal_sequence_state,
+                    rho: repeat_optional_batch(&layer.rho, copies),
+                    rho_norm: repeat_optional_batch(&layer.rho_norm, copies),
+                    sequence_aux: repeat_optional_batch(&layer.sequence_aux, copies),
+                    mamba_angle_state: repeat_optional_batch(&layer.mamba_angle_state, copies),
+                    mamba_k_state: repeat_optional_batch(&layer.mamba_k_state, copies),
+                    mamba_v_state: repeat_optional_batch(&layer.mamba_v_state, copies),
+                    slow_rho: repeat_optional_batch(&layer.slow_rho, copies),
+                    slow_rho_norm: repeat_optional_batch(&layer.slow_rho_norm, copies),
+                    slow_sequence_aux: repeat_optional_batch(&layer.slow_sequence_aux, copies),
+                    slow_mamba_angle_state: repeat_optional_batch(
+                        &layer.slow_mamba_angle_state,
+                        copies,
+                    ),
+                    slow_mamba_k_state: repeat_optional_batch(&layer.slow_mamba_k_state, copies),
+                    slow_mamba_v_state: repeat_optional_batch(&layer.slow_mamba_v_state, copies),
+                    y_neuron_state: repeat_optional_batch(&layer.y_neuron_state, copies),
+                    hierarchical_slow_hidden: repeat_optional_batch(
+                        &layer.hierarchical_slow_hidden,
+                        copies,
+                    ),
+                    clocked_slow_hidden: repeat_optional_batch(&layer.clocked_slow_hidden, copies),
+                    summary_memory_hidden: repeat_optional_batch(
+                        &layer.summary_memory_hidden,
+                        copies,
+                    ),
+                    #[cfg(any(feature = "viz", feature = "probe"))]
+                    viz: layer.viz.as_ref().map(|viz| LayerVizState {
+                        x_neuron_last: viz.x_neuron_last.clone().repeat_dim(0, copies),
+                        y_gate_last: viz.y_gate_last.clone().repeat_dim(0, copies),
+                        y_neuron_last: viz.y_neuron_last.clone().repeat_dim(0, copies),
+                        rho_last: viz.rho_last.clone().repeat_dim(0, copies),
+                    }),
+                })
+                .collect(),
+            position: self.position,
+        }
+    }
+
+    /// Select recurrent-state batch rows while preserving their shared stream position.
+    ///
+    /// Repeated indices are supported, allowing one encoded prefix row to fan out into several
+    /// independently evaluated continuations without re-encoding the prefix.
+    pub fn select_batch(&self, indices: Tensor<B, 1, Int>) -> Self {
+        Self {
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| LayerState {
+                    persist_sequence_state: layer.persist_sequence_state,
+                    retain_terminal_sequence_state: layer.retain_terminal_sequence_state,
+                    rho: select_optional_batch(&layer.rho, &indices),
+                    rho_norm: select_optional_batch(&layer.rho_norm, &indices),
+                    sequence_aux: select_optional_batch(&layer.sequence_aux, &indices),
+                    mamba_angle_state: select_optional_batch(&layer.mamba_angle_state, &indices),
+                    mamba_k_state: select_optional_batch(&layer.mamba_k_state, &indices),
+                    mamba_v_state: select_optional_batch(&layer.mamba_v_state, &indices),
+                    slow_rho: select_optional_batch(&layer.slow_rho, &indices),
+                    slow_rho_norm: select_optional_batch(&layer.slow_rho_norm, &indices),
+                    slow_sequence_aux: select_optional_batch(&layer.slow_sequence_aux, &indices),
+                    slow_mamba_angle_state: select_optional_batch(
+                        &layer.slow_mamba_angle_state,
+                        &indices,
+                    ),
+                    slow_mamba_k_state: select_optional_batch(&layer.slow_mamba_k_state, &indices),
+                    slow_mamba_v_state: select_optional_batch(&layer.slow_mamba_v_state, &indices),
+                    y_neuron_state: select_optional_batch(&layer.y_neuron_state, &indices),
+                    hierarchical_slow_hidden: select_optional_batch(
+                        &layer.hierarchical_slow_hidden,
+                        &indices,
+                    ),
+                    clocked_slow_hidden: select_optional_batch(
+                        &layer.clocked_slow_hidden,
+                        &indices,
+                    ),
+                    summary_memory_hidden: select_optional_batch(
+                        &layer.summary_memory_hidden,
+                        &indices,
+                    ),
+                    #[cfg(any(feature = "viz", feature = "probe"))]
+                    viz: layer.viz.as_ref().map(|viz| LayerVizState {
+                        x_neuron_last: viz.x_neuron_last.clone().select(0, indices.clone()),
+                        y_gate_last: viz.y_gate_last.clone().select(0, indices.clone()),
+                        y_neuron_last: viz.y_neuron_last.clone().select(0, indices.clone()),
+                        rho_last: viz.rho_last.clone().select(0, indices.clone()),
+                    }),
+                })
+                .collect(),
+            position: self.position,
+        }
+    }
+
     #[cfg(any(feature = "viz", feature = "probe"))]
     pub fn take_viz(&mut self) -> Vec<Option<LayerVizState<B>>> {
         self.layers
@@ -174,6 +290,24 @@ impl<B: Backend> ModelState<B> {
     }
 }
 
+fn repeat_optional_batch<B: Backend, const D: usize>(
+    tensor: &Option<Tensor<B, D>>,
+    copies: usize,
+) -> Option<Tensor<B, D>> {
+    tensor
+        .as_ref()
+        .map(|tensor| tensor.clone().repeat_dim(0, copies))
+}
+
+fn select_optional_batch<B: Backend, const D: usize>(
+    tensor: &Option<Tensor<B, D>>,
+    indices: &Tensor<B, 1, Int>,
+) -> Option<Tensor<B, D>> {
+    tensor
+        .as_ref()
+        .map(|tensor| tensor.clone().select(0, indices.clone()))
+}
+
 impl<B: AutodiffBackend> ModelState<B> {
     pub fn inner_cloned(&self) -> ModelState<B::InnerBackend> {
         ModelState {
@@ -182,6 +316,7 @@ impl<B: AutodiffBackend> ModelState<B> {
                 .iter()
                 .map(|layer| LayerState {
                     persist_sequence_state: layer.persist_sequence_state,
+                    retain_terminal_sequence_state: layer.retain_terminal_sequence_state,
                     rho: layer.rho.clone().map(Tensor::inner),
                     rho_norm: layer.rho_norm.clone().map(Tensor::inner),
                     sequence_aux: layer.sequence_aux.clone().map(Tensor::inner),
@@ -221,6 +356,7 @@ impl<B: AutodiffBackend> ModelState<B> {
                 .into_iter()
                 .map(|layer| LayerState {
                     persist_sequence_state: layer.persist_sequence_state,
+                    retain_terminal_sequence_state: layer.retain_terminal_sequence_state,
                     rho: layer.rho.map(Tensor::from_inner),
                     rho_norm: layer.rho_norm.map(Tensor::from_inner),
                     sequence_aux: layer.sequence_aux.map(Tensor::from_inner),

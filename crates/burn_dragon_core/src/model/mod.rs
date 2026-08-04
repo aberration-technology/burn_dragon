@@ -14,6 +14,13 @@ mod sequence;
 mod state;
 mod widen;
 
+use burn::tensor::backend::Backend;
+use burn::tensor::{Element, FloatDType};
+
+pub(crate) fn backend_float_dtype<B: Backend>() -> FloatDType {
+    B::FloatElem::dtype().into()
+}
+
 pub use attention_residual::{
     AttentionResidual, AttentionResidualConfig, BlockAttentionResidual,
     BlockAttentionResidualConfig, BlockAttentionResidualSummaryMode, ResidualConnectorKind,
@@ -23,8 +30,8 @@ pub use config::{
     ClockedSlowMemoryConfig, DragonConfig, DragonRandomScaffoldConfig, FusedAttentionExecutor,
     FusedKernelConfig, FusedProjectionExecutor, HierarchicalDragonConfig,
     HierarchicalDragonSharing, LanguageHeadConfig, LatentFanoutScheduleConfig,
-    LatentReasoningConfig, NextLatentTransitionConfig, SummaryMemoryConfig,
-    YNeuronRecurrenceConfig,
+    LatentReasoningConfig, NextLatentTransitionConfig, SequenceScoreHeadConfig,
+    SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 pub use dragon::{
     DragonModel, LanguageModuleLrScaleTarget, LatentReasoningOutput,

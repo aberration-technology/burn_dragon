@@ -35,6 +35,9 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(language_head) = &overrides.language_head {
         model_config.language_head = language_head.clone();
     }
+    if let Some(sequence_score_head) = overrides.sequence_score_head {
+        model_config.sequence_score_head = sequence_score_head;
+    }
     if let Some(tie_input_output_embeddings) = overrides.tie_input_output_embeddings {
         model_config.tie_input_output_embeddings = tie_input_output_embeddings;
     }
@@ -112,6 +115,25 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     }
     if let Some(enabled) = overrides.fused_kernels {
         model_config.fused_kernels.enabled = enabled;
+    }
+    if let Some(enabled) = overrides.fused_recurrent_kernel {
+        model_config
+            .fused_kernels
+            .set_wgpu_recurrent_kernel(enabled);
+    }
+    if let Some(enabled) = overrides.fused_rollout_kernel {
+        model_config.fused_kernels.set_wgpu_rollout_fused(enabled);
+    }
+    if let Some(executor) = overrides.fused_projection_executor {
+        model_config.fused_kernels.set_projection_executor(executor);
+    }
+    if let Some(executor) = overrides.fused_attention_executor {
+        model_config.fused_kernels.set_attention_executor(executor);
+    }
+    if let Some(executor) = overrides.fused_lowrank_grad_input_executor {
+        model_config
+            .fused_kernels
+            .set_lowrank_grad_input_executor(executor);
     }
     let block = overrides.block_size.unwrap_or(training_block_size).max(1);
     model_config.fused_kernels.set_block_sizes(block, block);
@@ -338,6 +360,40 @@ mod tests {
 
         let config = build_model_config(&overrides, 32);
         assert_eq!(config.rollout_fast_steps_per_slow_step, 8);
+    }
+
+    #[test]
+    fn model_override_applies_backend_neutral_fused_kernel_controls() {
+        let overrides = ModelOverrides {
+            fused_kernels: Some(true),
+            fused_recurrent_kernel: Some(false),
+            fused_rollout_kernel: Some(true),
+            fused_projection_executor: Some(burn_dragon_core::FusedProjectionExecutor::None),
+            fused_attention_executor: Some(
+                burn_dragon_core::FusedAttentionExecutor::AttentionContext,
+            ),
+            fused_lowrank_grad_input_executor: Some(
+                burn_dragon_core::LowrankGradInputExecutor::Direct,
+            ),
+            ..ModelOverrides::default()
+        };
+
+        let config = build_model_config(&overrides, 512);
+        assert!(config.fused_kernels.enabled);
+        assert!(!config.fused_kernels.wgpu_recurrent_kernel);
+        assert!(config.fused_kernels.wgpu_rollout_fused);
+        assert_eq!(
+            config.fused_kernels.projection_executor,
+            burn_dragon_core::FusedProjectionExecutor::None
+        );
+        assert_eq!(
+            config.fused_kernels.attention_executor,
+            burn_dragon_core::FusedAttentionExecutor::AttentionContext
+        );
+        assert_eq!(
+            config.fused_kernels.lowrank_grad_input_executor,
+            burn_dragon_core::LowrankGradInputExecutor::Direct
+        );
     }
 
     #[test]

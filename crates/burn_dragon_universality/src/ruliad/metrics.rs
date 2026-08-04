@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+pub const RULIAD_SOURCE_CAPABILITY_LABEL_PREFIX: &str = "source:";
+
+/// Stable capability-feedback key for one semantic source at one difficulty.
+pub fn ruliad_source_capability_label(
+    family: &str,
+    task_kind: &str,
+    difficulty_level: usize,
+    answer_contract: &str,
+) -> String {
+    format!(
+        "{RULIAD_SOURCE_CAPABILITY_LABEL_PREFIX}{family}:{task_kind}@d{difficulty_level}#{answer_contract}"
+    )
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSampleTelemetry {
     pub oracle_hash: String,
@@ -73,6 +87,10 @@ pub struct RuliadMetricSnapshot {
     #[serde(default)]
     pub capability_lagging_probability: f32,
     #[serde(default)]
+    pub capability_frontier_allowed_max_difficulty: usize,
+    #[serde(default)]
+    pub capability_frontier_coverage: Vec<RuliadCapabilityCoverageMetric>,
+    #[serde(default)]
     pub frontier_extension_count: usize,
     #[serde(default)]
     pub frontier_saturated: bool,
@@ -88,6 +106,17 @@ pub struct RuliadMetricSnapshot {
     pub task_buckets: Vec<RuliadGroupMetric>,
     #[serde(default)]
     pub contract_buckets: Vec<RuliadGroupMetric>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadCapabilityCoverageMetric {
+    pub difficulty_level: usize,
+    pub candidate_coverage: f32,
+    pub family_coverage: f32,
+    pub task_coverage: f32,
+    pub contract_coverage: f32,
+    pub observed_items: usize,
+    pub mastered: bool,
 }
 
 fn default_cost() -> f32 {

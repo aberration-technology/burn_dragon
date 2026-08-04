@@ -25,16 +25,17 @@ use burn_dragon_p2p::capability::DragonCapabilityClass;
 use burn_dragon_p2p::config::{
     DragonAggregationConfig, DragonCapabilityPolicy, DragonExistingShardDatasetConfig,
     DragonManifestSeed, DragonNativeAuthBundle, DragonNativePeerConfig, DragonNativeTarget,
-    DragonPeerNetworkConfig, DragonShardExportConfig, TokenWindowRecord,
+    DragonPeerNetworkConfig, DragonPromotionConfig, DragonPromotionMode, DragonShardExportConfig,
+    TokenWindowRecord,
 };
 use burn_dragon_p2p::experiments::common::DragonBurnProject;
 use burn_dragon_p2p::experiments::common::PreparedNativePeer;
-#[cfg(feature = "cuda")]
-use burn_dragon_p2p::native::prepare_nca_native_cuda;
 use burn_dragon_p2p::native::{
     ManagedRunningNativePeer, NativeCpuBackend, prepare_climbmix_native_cpu,
-    prepare_nca_native_cpu, spawn_prepared_native_peer,
+    prepare_nca_native_cpu, prepare_ruliad_native_cpu, spawn_prepared_native_peer,
 };
+#[cfg(feature = "cuda")]
+use burn_dragon_p2p::native::{prepare_nca_native_cuda, prepare_ruliad_native_cuda};
 use burn_dragon_p2p::profile::{DragonBrowserProfileTokenSource, DragonExperimentProfile};
 use burn_p2p::burn::{
     BurnShardedDataset, BurnShardedDatasetConfig, BurnWorkload, BurnWorkloadAdapter,
@@ -607,6 +608,7 @@ fn ruliad_corpus_config_toml(output_dir: &Path) -> String {
             ..RuliadSerializationConfig::default()
         },
         tokenization: RuliadTokenizationConfig::default(),
+        formal_generalization: Default::default(),
         source_selection: RuliadSourceSelectionConfig {
             enabled: true,
             ..RuliadSourceSelectionConfig::default()
@@ -708,6 +710,7 @@ fn ruliad_parity_corpus_config_toml(
             vocab_size: 272,
             eos_id: Some(271),
         },
+        formal_generalization: Default::default(),
         source_selection: RuliadSourceSelectionConfig {
             enabled: true,
             ..RuliadSourceSelectionConfig::default()
@@ -3348,11 +3351,43 @@ fn ruliad_native_peer_executes_live_source_training_window() {
             None,
         );
 
-        let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+        let prepared =
+            prepare_ruliad_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+        assert_eq!(
+            prepared.experiment_kind,
+            burn_dragon_p2p::config::DragonExperimentKind::RuliadPretraining
+        );
+        assert!(
+            prepared
+                .manifests
+                .training_contract
+                .extensions
+                .contains_key(burn_dragon_p2p::config::DRAGON_RULIAD_SEMANTIC_CONTRACT_EXTENSION)
+        );
+        let wrong_mode = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle()))
+            .err()
+            .expect("Ruliad data must not prepare as an NCA experiment");
+        let wrong_mode = wrong_mode.to_string();
+        assert!(
+            wrong_mode.contains("NCA") || wrong_mode.contains("nca"),
+            "unexpected cross-mode error: {wrong_mode}"
+        );
         assert_eq!(
             prepared.project.data_pipeline_kind(),
             burn_p2p::LeaseDataPipelineKind::IndexedDataset
         );
+        let evaluation_device = prepared.project.runtime_device();
+        let evaluation_model = prepared.project.init_model(&evaluation_device);
+        let evaluation = prepared
+            .project
+            .evaluate(&evaluation_model, burn_p2p::EvalSplit::Validation);
+        assert!(
+            !evaluation
+                .metrics
+                .contains_key("ruliad_evaluation_completed"),
+            "trainer workloads must delegate formal Ruliad evaluation to read-only peers"
+        );
+        assert!(metric_float(&evaluation.metrics, "loss").is_finite());
         let observations = run_training_windows_with_heads(&prepared, 1, "ruliad-live");
         let losses = observations.iter().map(|obs| obs.loss).collect::<Vec<_>>();
         log_loss_series("ruliad_native_live_source_smoke", &losses);
@@ -3364,6 +3399,750 @@ fn ruliad_native_peer_executes_live_source_training_window() {
                 &observation.head.metrics,
             );
         }
+    });
+}
+
+#[derive(Debug)]
+struct RuliadValidatorQuorumGateReport {
+    training_elapsed: Duration,
+    validation_elapsed: Duration,
+    candidate_artifact_bytes: u64,
+    eval_report_json_bytes: usize,
+    eval_samples: u64,
+}
+
+fn assert_ruliad_validator_quorum_gate(report: &RuliadValidatorQuorumGateReport) {
+    assert!(!report.training_elapsed.is_zero());
+    assert!(!report.validation_elapsed.is_zero());
+    assert!(report.candidate_artifact_bytes > 0);
+    assert!(report.eval_report_json_bytes > 0);
+    assert!(report.eval_samples > 0);
+}
+
+fn ruliad_validator_quorum_peer_configs(
+    root: &Path,
+    training_config_path: PathBuf,
+    label: &str,
+) -> (DragonNativePeerConfig, DragonNativePeerConfig) {
+    let trainer_addr = loopback_swarm_address();
+    let commit = format!("ruliad-validator-quorum-{label}");
+    let mut trainer_config = native_smoke_peer_config(
+        root,
+        training_config_path.clone(),
+        &format!("storage-ruliad-trainer-{label}"),
+        &commit,
+        None,
+    );
+    trainer_config.target = Some(DragonNativeTarget::Trainer);
+    trainer_config.manifest.promotion = DragonPromotionConfig {
+        mode: DragonPromotionMode::ValidatorQuorum,
+        validator_quorum: 1,
+    };
+    trainer_config.network =
+        DragonPeerNetworkConfig::default().with_listen_addresses(vec![trainer_addr.clone()]);
+
+    let mut evaluator_config = native_smoke_peer_config(
+        root,
+        training_config_path,
+        &format!("storage-ruliad-evaluator-{label}"),
+        &commit,
+        None,
+    );
+    evaluator_config.target = Some(DragonNativeTarget::Validator);
+    evaluator_config.manifest.promotion = trainer_config.manifest.promotion.clone();
+    evaluator_config.bootstrap_peers = vec![trainer_addr];
+    evaluator_config.network =
+        DragonPeerNetworkConfig::default().with_listen_addresses(vec![loopback_swarm_address()]);
+    (trainer_config, evaluator_config)
+}
+
+fn ruliad_two_validator_quorum_peer_configs(
+    root: &Path,
+    training_config_path: PathBuf,
+) -> (
+    DragonNativePeerConfig,
+    DragonNativePeerConfig,
+    DragonNativePeerConfig,
+) {
+    let trainer_addr = loopback_swarm_address();
+    let evaluator_a_addr = loopback_swarm_address();
+    let promotion = DragonPromotionConfig {
+        mode: DragonPromotionMode::ValidatorQuorum,
+        validator_quorum: 2,
+    };
+    let mut trainer = native_smoke_peer_config(
+        root,
+        training_config_path.clone(),
+        "storage-ruliad-q2-trainer",
+        "ruliad-validator-quorum-q2",
+        None,
+    );
+    trainer.target = Some(DragonNativeTarget::Trainer);
+    trainer.manifest.promotion = promotion.clone();
+    trainer.network =
+        DragonPeerNetworkConfig::default().with_listen_addresses(vec![trainer_addr.clone()]);
+
+    let mut evaluator_a = native_smoke_peer_config(
+        root,
+        training_config_path.clone(),
+        "storage-ruliad-q2-evaluator-a",
+        "ruliad-validator-quorum-q2",
+        None,
+    );
+    evaluator_a.target = Some(DragonNativeTarget::Validator);
+    evaluator_a.manifest.promotion = promotion.clone();
+    evaluator_a.bootstrap_peers = vec![trainer_addr.clone()];
+    evaluator_a.network =
+        DragonPeerNetworkConfig::default().with_listen_addresses(vec![evaluator_a_addr.clone()]);
+
+    let mut evaluator_b = native_smoke_peer_config(
+        root,
+        training_config_path,
+        "storage-ruliad-q2-evaluator-b",
+        "ruliad-validator-quorum-q2",
+        None,
+    );
+    evaluator_b.target = Some(DragonNativeTarget::Validator);
+    evaluator_b.manifest.promotion = promotion;
+    evaluator_b.bootstrap_peers = vec![trainer_addr, evaluator_a_addr];
+    evaluator_b.network =
+        DragonPeerNetworkConfig::default().with_listen_addresses(vec![loopback_swarm_address()]);
+    (trainer, evaluator_a, evaluator_b)
+}
+
+fn exercise_ruliad_validator_quorum<TrainerBackend, EvaluatorBackend>(
+    trainer_prepared: PreparedNativePeer<TrainerBackend>,
+    evaluator_prepared: PreparedNativePeer<EvaluatorBackend>,
+) -> RuliadValidatorQuorumGateReport
+where
+    TrainerBackend: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    TrainerBackend::Device: Clone,
+    EvaluatorBackend: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    EvaluatorBackend::Device: Clone,
+{
+    let experiment_entry = trainer_prepared.manifests.experiment_directory[0].clone();
+    assert_eq!(
+        trainer_prepared.manifests.revision_manifest,
+        evaluator_prepared.manifests.revision_manifest,
+        "trainer and validator backends must share an exact revision contract"
+    );
+    assert_eq!(
+        trainer_prepared.manifests.training_contract,
+        evaluator_prepared.manifests.training_contract,
+        "trainer and validator backends must share an exact training contract"
+    );
+    assert!(!evaluator_prepared.target_decision.can_train);
+    assert_eq!(
+        evaluator_prepared.target_decision.effective_target,
+        DragonNativeTarget::Validator
+    );
+    assert!(
+        evaluator_prepared.manifests.experiment_directory[0]
+            .allowed_roles
+            .contains(&PeerRole::Evaluator)
+    );
+
+    let mut trainer = spawn_prepared_native_peer(trainer_prepared).expect("spawn trainer peer");
+    let mut evaluator =
+        spawn_prepared_native_peer(evaluator_prepared).expect("spawn evaluator peer");
+    let trainer_telemetry = trainer.telemetry();
+    let evaluator_telemetry = evaluator.telemetry();
+    wait_for(
+        Duration::from_secs(20),
+        || trainer_telemetry.snapshot().connected_peers >= 1,
+        "trainer did not connect to evaluator",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || evaluator_telemetry.snapshot().connected_peers >= 1,
+        "evaluator did not connect to trainer",
+    );
+
+    let experiment = trainer.mainnet().experiment(
+        experiment_entry.study_id,
+        experiment_entry.experiment_id,
+        experiment_entry.current_revision_id,
+    );
+    let genesis = trainer
+        .initialize_local_head(&experiment)
+        .expect("initialize trainer genesis");
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            evaluator
+                .sync_experiment_head(&experiment)
+                .expect("validator genesis sync")
+                .is_some_and(|head| head.head_id == genesis.head_id)
+        },
+        "validator did not pin the canonical genesis before candidate validation",
+    );
+    let training_started = Instant::now();
+    let outcome = trainer
+        .train_window_once_with_pinned_head(&experiment, Some(&genesis))
+        .expect("train one exact head");
+    let training_elapsed = training_started.elapsed();
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            let snapshot = evaluator_telemetry.snapshot();
+            snapshot
+                .control_plane
+                .head_announcements
+                .iter()
+                .any(|announcement| announcement.head.head_id == outcome.head.head_id)
+                && snapshot
+                    .control_plane
+                    .update_announcements
+                    .iter()
+                    .any(|announcement| {
+                        announcement.update.delta_artifact_id == outcome.artifact.artifact_id
+                    })
+        },
+        "validator did not observe the trainer candidate",
+    );
+    let validation_started = Instant::now();
+    let validation_deadline = validation_started + Duration::from_secs(20);
+    let validated = loop {
+        if let Some(validated) = evaluator
+            .validate_candidates_once(&experiment)
+            .expect("validator pass")
+        {
+            break validated;
+        }
+        let snapshot = evaluator_telemetry.snapshot();
+        assert!(
+            Instant::now() < validation_deadline,
+            "single-validator quorum did not promote: reductions={} quorums={} merges={} last_error={:?} cohort={:#?} canaries={:#?}",
+            snapshot
+                .control_plane
+                .reduction_certificate_announcements
+                .len(),
+            snapshot.control_plane.validation_quorum_announcements.len(),
+            snapshot.control_plane.merge_announcements.len(),
+            snapshot.last_error,
+            snapshot.latest_cohort_robustness,
+            snapshot.canary_reports,
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let validation_elapsed = validation_started.elapsed();
+    assert_eq!(
+        trainer
+            .materialized_head_tensor_digest(&outcome.head)
+            .expect("trainer tensor digest"),
+        evaluator
+            .materialized_head_tensor_digest(&validated.merged_head)
+            .expect("validator merged-head tensor digest"),
+        "one-candidate promotion must preserve the trainer's exact tensor set"
+    );
+    let evaluator_snapshot = evaluator_telemetry.snapshot();
+    let reduction = evaluator_snapshot
+        .control_plane
+        .reduction_certificate_announcements
+        .iter()
+        .find(|announcement| {
+            announcement
+                .certificate
+                .evaluation
+                .as_ref()
+                .is_some_and(|binding| binding.head_id == validated.merged_head.head_id)
+        })
+        .expect("exact-head validator attestation");
+    let binding = reduction
+        .certificate
+        .evaluation
+        .as_ref()
+        .expect("validator evaluation binding");
+    let report = evaluator
+        .persisted_head_eval_report(
+            &experiment,
+            &binding.head_id,
+            &binding.eval_protocol_id,
+            &binding.eval_report_id,
+        )
+        .expect("load validator head eval report")
+        .expect("persisted validator head eval report");
+    let eval_report_json_bytes = serde_json::to_vec(&report)
+        .expect("serialize persisted validator report")
+        .len();
+    assert_eq!(report.head_id, validated.merged_head.head_id);
+    assert_eq!(report.revision_id, experiment.revision_id);
+    assert_eq!(
+        ContentId::derive(&report).expect("report content id"),
+        binding.eval_report_id
+    );
+    assert_eq!(
+        validated
+            .evaluation
+            .metrics
+            .get("ruliad_evaluation_completed"),
+        Some(&MetricValue::Bool(true))
+    );
+    assert_eq!(
+        report.sample_count,
+        metric_integer(&validated.evaluation.metrics, "ruliad_evaluation_items") as u64
+    );
+    for key in [
+        "ruliad_verifier_accuracy",
+        "ruliad_partial_credit_rate",
+        "ruliad_answer_field_accuracy",
+        "ruliad_mean_completion_quality",
+    ] {
+        assert!(metric_float(&report.metric_values, key).is_finite());
+    }
+    assert!(report.metric_values.keys().any(|key| {
+        key.starts_with("ruliad_difficulty_") && key.ends_with("_verifier_accuracy")
+    }));
+    assert!(
+        report.metric_values.keys().any(|key| {
+            key.starts_with("ruliad_task_") && key.ends_with("_answer_field_accuracy")
+        })
+    );
+    wait_for(
+        Duration::from_secs(10),
+        || {
+            evaluator_telemetry
+                .snapshot()
+                .control_plane
+                .metrics_announcements
+                .iter()
+                .any(|announcement| {
+                    announcement.event.cursors.iter().any(|cursor| {
+                        cursor.revision_id == experiment.revision_id
+                            && cursor.latest_head_id.as_ref()
+                                == Some(&validated.merged_head.head_id)
+                    })
+                })
+        },
+        "evaluator did not announce exact-head formal metrics",
+    );
+
+    shutdown_runtime_peer(evaluator, "ruliad evaluator");
+    shutdown_runtime_peer(trainer, "ruliad evaluator trainer");
+
+    RuliadValidatorQuorumGateReport {
+        training_elapsed,
+        validation_elapsed,
+        candidate_artifact_bytes: outcome.artifact.bytes_len,
+        eval_report_json_bytes,
+        eval_samples: report.sample_count,
+    }
+}
+
+#[derive(Debug)]
+struct RuliadTwoValidatorQuorumGateReport {
+    training_elapsed: Duration,
+    validation_elapsed: Duration,
+    candidate_artifact_bytes: u64,
+    eval_report_json_bytes: [usize; 2],
+    eval_samples: u64,
+}
+
+fn exercise_ruliad_two_validator_quorum<TrainerBackend, EvaluatorABackend, EvaluatorBBackend>(
+    trainer_prepared: PreparedNativePeer<TrainerBackend>,
+    evaluator_a_prepared: PreparedNativePeer<EvaluatorABackend>,
+    evaluator_b_prepared: PreparedNativePeer<EvaluatorBBackend>,
+) -> RuliadTwoValidatorQuorumGateReport
+where
+    TrainerBackend: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    TrainerBackend::Device: Clone,
+    EvaluatorABackend: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    EvaluatorABackend::Device: Clone,
+    EvaluatorBBackend: burn::tensor::backend::AutodiffBackend + Clone + 'static,
+    EvaluatorBBackend::Device: Clone,
+{
+    for evaluator in [
+        &evaluator_a_prepared.manifests,
+        &evaluator_b_prepared.manifests,
+    ] {
+        assert_eq!(
+            trainer_prepared.manifests.revision_manifest, evaluator.revision_manifest,
+            "all validator backends must share the trainer revision"
+        );
+        assert_eq!(
+            trainer_prepared.manifests.training_contract, evaluator.training_contract,
+            "all validator backends must share the trainer contract"
+        );
+    }
+    assert!(!evaluator_a_prepared.target_decision.can_train);
+    assert!(!evaluator_b_prepared.target_decision.can_train);
+
+    let experiment_entry = trainer_prepared.manifests.experiment_directory[0].clone();
+    let mut trainer = spawn_prepared_native_peer(trainer_prepared).expect("spawn q2 trainer");
+    let mut evaluator_a =
+        spawn_prepared_native_peer(evaluator_a_prepared).expect("spawn q2 evaluator a");
+    let mut evaluator_b =
+        spawn_prepared_native_peer(evaluator_b_prepared).expect("spawn q2 evaluator b");
+    let trainer_telemetry = trainer.telemetry();
+    let evaluator_a_telemetry = evaluator_a.telemetry();
+    let evaluator_b_telemetry = evaluator_b.telemetry();
+    wait_for(
+        Duration::from_secs(20),
+        || trainer_telemetry.snapshot().connected_peers >= 2,
+        "q2 trainer did not connect to both validators",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || evaluator_a_telemetry.snapshot().connected_peers >= 2,
+        "q2 evaluator a did not join the full validator topology",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || evaluator_b_telemetry.snapshot().connected_peers >= 2,
+        "q2 evaluator b did not join the full validator topology",
+    );
+
+    let evaluator_a_peer_id = evaluator_a_telemetry
+        .snapshot()
+        .local_peer_id
+        .expect("evaluator a peer id");
+    let evaluator_b_peer_id = evaluator_b_telemetry
+        .snapshot()
+        .local_peer_id
+        .expect("evaluator b peer id");
+    let experiment = trainer.mainnet().experiment(
+        experiment_entry.study_id,
+        experiment_entry.experiment_id,
+        experiment_entry.current_revision_id,
+    );
+    let genesis = trainer
+        .initialize_local_head(&experiment)
+        .expect("initialize q2 trainer genesis");
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            evaluator_a
+                .sync_experiment_head(&experiment)
+                .expect("evaluator a genesis sync")
+                .is_some_and(|head| head.head_id == genesis.head_id)
+        },
+        "evaluator a did not pin q2 genesis",
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            evaluator_b
+                .sync_experiment_head(&experiment)
+                .expect("evaluator b genesis sync")
+                .is_some_and(|head| head.head_id == genesis.head_id)
+        },
+        "evaluator b did not pin q2 genesis",
+    );
+
+    let training_started = Instant::now();
+    let outcome = trainer
+        .train_window_once_with_pinned_head(&experiment, Some(&genesis))
+        .expect("train q2 candidate");
+    let training_elapsed = training_started.elapsed();
+    for (label, telemetry) in [("a", &evaluator_a_telemetry), ("b", &evaluator_b_telemetry)] {
+        wait_for(
+            Duration::from_secs(20),
+            || {
+                let snapshot = telemetry.snapshot();
+                snapshot
+                    .control_plane
+                    .head_announcements
+                    .iter()
+                    .any(|announcement| announcement.head.head_id == outcome.head.head_id)
+                    && snapshot
+                        .control_plane
+                        .update_announcements
+                        .iter()
+                        .any(|announcement| {
+                            announcement.update.delta_artifact_id == outcome.artifact.artifact_id
+                        })
+            },
+            &format!("q2 evaluator {label} did not observe the trainer candidate"),
+        );
+    }
+
+    let validation_started = Instant::now();
+    assert!(
+        evaluator_a
+            .validate_candidates_once(&experiment)
+            .expect("evaluator a validation")
+            .is_none(),
+        "one validator must not satisfy a two-validator promotion quorum"
+    );
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            evaluator_b_telemetry
+                .snapshot()
+                .control_plane
+                .reduction_certificate_announcements
+                .iter()
+                .any(|announcement| {
+                    announcement.certificate.promoter_peer_id == evaluator_a_peer_id
+                })
+        },
+        "evaluator b did not observe evaluator a's reduction",
+    );
+    let _ = evaluator_b
+        .validate_candidates_once(&experiment)
+        .expect("evaluator b validation");
+    wait_for(
+        Duration::from_secs(20),
+        || {
+            [&evaluator_a_telemetry, &evaluator_b_telemetry]
+                .into_iter()
+                .all(|telemetry| {
+                    let snapshot = telemetry.snapshot();
+                    snapshot.control_plane.validation_quorum_announcements.len() == 1
+                        && snapshot.control_plane.merge_announcements.len() == 1
+                })
+        },
+        "q2 validators did not converge on exactly one quorum and promotion",
+    );
+    let validation_elapsed = validation_started.elapsed();
+
+    let evaluator_b_snapshot = evaluator_b_telemetry.snapshot();
+    let quorum = evaluator_b_snapshot
+        .control_plane
+        .validation_quorum_announcements
+        .last()
+        .expect("q2 validation quorum")
+        .certificate
+        .clone();
+    let merge = evaluator_b_snapshot
+        .control_plane
+        .merge_announcements
+        .last()
+        .expect("q2 merge")
+        .certificate
+        .clone();
+    assert_eq!(quorum.validator_quorum, 2);
+    assert_eq!(quorum.attesting_validators.len(), 2);
+    assert_eq!(
+        quorum
+            .attesting_validators
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([evaluator_a_peer_id.clone(), evaluator_b_peer_id.clone()])
+    );
+    assert_eq!(quorum.eval_report_ids.len(), 2);
+    assert_ne!(quorum.eval_report_ids[0], quorum.eval_report_ids[1]);
+    assert_eq!(quorum.merged_head_id, merge.merged_head_id);
+    assert_eq!(
+        quorum.merged_artifact_id.as_ref(),
+        Some(&merge.merged_artifact_id)
+    );
+
+    let promoted_head_deadline = Instant::now() + Duration::from_secs(20);
+    let promoted_head = loop {
+        if let Some(head) = evaluator_b
+            .sync_experiment_head(&experiment)
+            .expect("sync q2 promoted head")
+            && head.head_id == merge.merged_head_id
+        {
+            break head;
+        }
+        assert!(
+            Instant::now() < promoted_head_deadline,
+            "evaluator b did not sync the q2 promoted head"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        trainer
+            .materialized_head_tensor_digest(&outcome.head)
+            .expect("q2 trainer candidate tensor digest"),
+        evaluator_b
+            .materialized_head_tensor_digest(&promoted_head)
+            .expect("q2 promoted tensor digest"),
+        "single-candidate q2 promotion must preserve the exact trainer tensors"
+    );
+
+    let reductions = evaluator_b_snapshot
+        .control_plane
+        .reduction_certificate_announcements
+        .iter()
+        .filter(|announcement| {
+            announcement
+                .certificate
+                .evaluation
+                .as_ref()
+                .is_some_and(|binding| binding.head_id == promoted_head.head_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reductions.len(), 2);
+    let binding_for = |peer_id: &PeerId| {
+        reductions
+            .iter()
+            .find(|announcement| &announcement.certificate.promoter_peer_id == peer_id)
+            .and_then(|announcement| announcement.certificate.evaluation.clone())
+            .expect("exact q2 evaluation binding")
+    };
+    let binding_a = binding_for(&evaluator_a_peer_id);
+    let binding_b = binding_for(&evaluator_b_peer_id);
+    assert_eq!(binding_a.head_id, binding_b.head_id);
+    assert_eq!(binding_a.artifact_id, binding_b.artifact_id);
+    assert_eq!(binding_a.eval_protocol_id, binding_b.eval_protocol_id);
+    assert_ne!(binding_a.eval_report_id, binding_b.eval_report_id);
+    assert!(quorum.eval_report_ids.contains(&binding_a.eval_report_id));
+    assert!(quorum.eval_report_ids.contains(&binding_b.eval_report_id));
+
+    let report_a = evaluator_a
+        .persisted_head_eval_report(
+            &experiment,
+            &binding_a.head_id,
+            &binding_a.eval_protocol_id,
+            &binding_a.eval_report_id,
+        )
+        .expect("load evaluator a report")
+        .expect("persisted evaluator a report");
+    let report_b = evaluator_b
+        .persisted_head_eval_report(
+            &experiment,
+            &binding_b.head_id,
+            &binding_b.eval_protocol_id,
+            &binding_b.eval_report_id,
+        )
+        .expect("load evaluator b report")
+        .expect("persisted evaluator b report");
+    assert_eq!(
+        ContentId::derive(&report_a).expect("evaluator a report id"),
+        binding_a.eval_report_id
+    );
+    assert_eq!(
+        ContentId::derive(&report_b).expect("evaluator b report id"),
+        binding_b.eval_report_id
+    );
+    assert_eq!(report_a.sample_count, report_b.sample_count);
+    for key in [
+        "ruliad_verifier_accuracy",
+        "ruliad_partial_credit_rate",
+        "ruliad_answer_field_accuracy",
+        "ruliad_mean_completion_quality",
+    ] {
+        let a = metric_float(&report_a.metric_values, key);
+        let b = metric_float(&report_b.metric_values, key);
+        assert!(a.is_finite() && b.is_finite());
+        assert!(
+            (a - b).abs() <= 1.0e-6,
+            "q2 evaluators disagreed on {key}: a={a} b={b}"
+        );
+    }
+
+    let eval_report_json_bytes = [
+        serde_json::to_vec(&report_a)
+            .expect("serialize evaluator a report")
+            .len(),
+        serde_json::to_vec(&report_b)
+            .expect("serialize evaluator b report")
+            .len(),
+    ];
+    let eval_samples = report_a.sample_count;
+    shutdown_runtime_peer(evaluator_b, "ruliad q2 evaluator b");
+    shutdown_runtime_peer(evaluator_a, "ruliad q2 evaluator a");
+    shutdown_runtime_peer(trainer, "ruliad q2 trainer");
+    RuliadTwoValidatorQuorumGateReport {
+        training_elapsed,
+        validation_elapsed,
+        candidate_artifact_bytes: outcome.artifact.bytes_len,
+        eval_report_json_bytes,
+        eval_samples,
+    }
+}
+
+#[test]
+fn ruliad_read_only_validator_evaluates_exact_trainer_head() {
+    run_with_large_stack("ruliad-read-only-evaluator", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+        let training_config_path =
+            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let (trainer_config, evaluator_config) =
+            ruliad_validator_quorum_peer_configs(root.path(), training_config_path, "cpu-cpu");
+
+        let trainer_prepared =
+            prepare_ruliad_native_cpu(&trainer_config, Some(&dummy_auth_bundle()))
+                .expect("trainer");
+        let evaluator_prepared =
+            prepare_ruliad_native_cpu(&evaluator_config, Some(&dummy_auth_bundle()))
+                .expect("read-only evaluator");
+        let report = exercise_ruliad_validator_quorum(trainer_prepared, evaluator_prepared);
+        assert_ruliad_validator_quorum_gate(&report);
+        eprintln!("ruliad_cpu_validator_quorum={report:?}");
+    });
+}
+
+#[test]
+fn ruliad_two_validators_require_distinct_exact_reports() {
+    run_with_large_stack("ruliad-two-validator-quorum", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+        let training_config_path = write_ruliad_smoke_training_config(root.path(), SMALL_SPEC);
+        let (trainer_config, evaluator_a_config, evaluator_b_config) =
+            ruliad_two_validator_quorum_peer_configs(root.path(), training_config_path);
+        let trainer = prepare_ruliad_native_cpu(&trainer_config, Some(&dummy_auth_bundle()))
+            .expect("q2 trainer");
+        let evaluator_a =
+            prepare_ruliad_native_cpu(&evaluator_a_config, Some(&dummy_auth_bundle()))
+                .expect("q2 evaluator a");
+        let evaluator_b =
+            prepare_ruliad_native_cpu(&evaluator_b_config, Some(&dummy_auth_bundle()))
+                .expect("q2 evaluator b");
+        let report = exercise_ruliad_two_validator_quorum(trainer, evaluator_a, evaluator_b);
+        assert!(!report.training_elapsed.is_zero());
+        assert!(!report.validation_elapsed.is_zero());
+        assert!(report.candidate_artifact_bytes > 0);
+        assert!(
+            report
+                .eval_report_json_bytes
+                .into_iter()
+                .all(|bytes| bytes > 0)
+        );
+        assert!(report.eval_samples > 0);
+        eprintln!("ruliad_two_validator_quorum={report:?}");
+    });
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA GPU and NVIDIA driver devices"]
+fn ruliad_cuda_trainer_cpu_validator_promotes_exact_head() {
+    if !Path::new("/dev/nvidiactl").exists() || !Path::new("/dev/nvidia0").exists() {
+        eprintln!(
+            "skipping heterogeneous Ruliad gate because NVIDIA driver devices are not visible"
+        );
+        return;
+    }
+
+    run_with_large_stack("ruliad-cuda-trainer-cpu-validator", || {
+        let _guard = native_swarm_test_guard();
+        let root = tempdir().expect("root");
+        let training_config_path =
+            write_ruliad_smoke_training_config(root.path(), MATCHED_512_SMALL_SPEC);
+        let (mut trainer_config, mut evaluator_config) =
+            ruliad_validator_quorum_peer_configs(root.path(), training_config_path, "cuda-cpu");
+        trainer_config.enabled_features_label = Some("native,cuda".into());
+        evaluator_config.enabled_features_label = Some("native,cpu".into());
+
+        let trainer_prepared =
+            prepare_ruliad_native_cuda(&trainer_config, Some(&dummy_auth_bundle()))
+                .expect("CUDA trainer");
+        let evaluator_prepared =
+            prepare_ruliad_native_cpu(&evaluator_config, Some(&dummy_auth_bundle()))
+                .expect("CPU read-only evaluator");
+        assert_eq!(trainer_prepared.backend_label, "cuda");
+        assert_eq!(evaluator_prepared.backend_label, "cpu");
+        assert_ne!(
+            trainer_prepared
+                .manifests
+                .release_manifest
+                .target_artifact_hash,
+            evaluator_prepared
+                .manifests
+                .release_manifest
+                .target_artifact_hash,
+            "heterogeneous peers must retain distinct signed release artifacts"
+        );
+
+        let report = exercise_ruliad_validator_quorum(trainer_prepared, evaluator_prepared);
+        assert_ruliad_validator_quorum_gate(&report);
+        eprintln!("ruliad_cuda_cpu_validator_quorum={report:?}");
     });
 }
 
@@ -3692,9 +4471,14 @@ fn nca_native_runtime_cluster_smoke_converges_and_merges_heads_impl() {
             .contains(&PeerRole::TrainerCpu)
     );
     assert!(
-        !experiment_entry
+        experiment_entry
             .allowed_roles
             .contains(&PeerRole::Validator)
+    );
+    assert!(
+        experiment_entry
+            .allowed_roles
+            .contains(&PeerRole::Evaluator)
     );
 
     let trainer_b_prepared = prepare_nca_native_cpu(
@@ -4349,7 +5133,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 }),
             };
 
-        let unsigned_seed_prepared = prepare_nca_native_cpu(
+        let unsigned_seed_prepared = prepare_ruliad_native_cpu(
             &make_trainer_config("seed", true),
             Some(&dummy_auth_bundle()),
         )
@@ -4375,7 +5159,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             config
         };
         let seed_prepared = if signed_setup.is_some() {
-            prepare_nca_native_cpu(
+            prepare_ruliad_native_cpu(
                 &apply_signed_setup(make_trainer_config("seed", false)),
                 Some(&dummy_auth_bundle()),
             )
@@ -4394,7 +5178,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 .map(|training_config_path| {
                     let mut config = make_trainer_config("synchronized-reference", false);
                     config.training_config_paths = vec![training_config_path.clone()];
-                    let prepared = prepare_nca_native_cpu(&config, Some(&dummy_auth_bundle()))
+                    let prepared = prepare_ruliad_native_cpu(&config, Some(&dummy_auth_bundle()))
                         .expect("prepare synchronized reference");
                     BurnWorkloadAdapter::try_new(
                         prepared.project,
@@ -4403,12 +5187,12 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     .expect("build synchronized reference adapter")
                 });
         let experiment_entry = seed_prepared.manifests.experiment_directory[0].clone();
-        let trainer_b_prepared = prepare_nca_native_cpu(
+        let trainer_b_prepared = prepare_ruliad_native_cpu(
             &apply_signed_setup(make_trainer_config("trainer-b", false)),
             Some(&dummy_auth_bundle()),
         )
         .expect("prepare parity trainer b");
-        let trainer_c_prepared = prepare_nca_native_cpu(
+        let trainer_c_prepared = prepare_ruliad_native_cpu(
             &apply_signed_setup(make_trainer_config("trainer-c", false)),
             Some(&dummy_auth_bundle()),
         )
@@ -4464,13 +5248,15 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
         let reference_registration = reference_project
             .dataset_registration()
             .expect("reference registration");
+        let reference_partitioning = reference_registration
+            .view
+            .metadata
+            .get("partitioning")
+            .expect("ruliad parity partitioning contract")
+            .clone();
         assert_eq!(
-            reference_registration
-                .view
-                .metadata
-                .get("partitioning")
-                .map(String::as_str),
-            Some("dragon-bounded-stream-segment-balanced-v2")
+            reference_partitioning,
+            "dragon-bounded-stream-segment-balanced-v3-target-masks"
         );
         let reference_microshard_plan = reference_project
             .microshard_plan(&reference_registration)
@@ -5510,7 +6296,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 "peer_local_steps_per_round": peer_local_steps,
                 "records_per_round": records_per_round,
                 "exported_records": exported_records,
-                "micro_epoch_selection": "window-rotating-bounded-stream-segments-v2",
+                "micro_epoch_selection": reference_partitioning,
                 "aggregate_peer_local_steps": peer_local_steps
                     .saturating_mul(3)
                     .saturating_mul(rounds),
@@ -5771,7 +6557,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 }),
             };
 
-        let seed_prepared = prepare_nca_native_cpu(
+        let seed_prepared = prepare_ruliad_native_cpu(
             &make_trainer_config("seed", true),
             Some(&dummy_auth_bundle()),
         )
@@ -5784,7 +6570,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         let synchronized_project = {
             let mut config = make_trainer_config("synchronized-reference", false);
             config.training_config_paths = vec![synchronized_training_config_path];
-            let prepared = prepare_nca_native_cpu(&config, Some(&dummy_auth_bundle()))
+            let prepared = prepare_ruliad_native_cpu(&config, Some(&dummy_auth_bundle()))
                 .expect("prepare DiLoCo synchronized reference");
             BurnWorkloadAdapter::try_new(prepared.project, prepared.manifests.workload_config)
                 .expect("build DiLoCo synchronized reference adapter")
@@ -5812,12 +6598,12 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 .scheduler_state_policy,
             SchedulerStatePolicy::PeerLocalPersistent
         );
-        let trainer_b_prepared = prepare_nca_native_cpu(
+        let trainer_b_prepared = prepare_ruliad_native_cpu(
             &make_trainer_config("trainer-b", false),
             Some(&dummy_auth_bundle()),
         )
         .expect("prepare DiLoCo trainer b");
-        let trainer_c_prepared = prepare_nca_native_cpu(
+        let trainer_c_prepared = prepare_ruliad_native_cpu(
             &make_trainer_config("trainer-c", false),
             Some(&dummy_auth_bundle()),
         )
@@ -6691,7 +7477,8 @@ fn nca_bootstrap_only_topology_supports_diffusion_and_read_only_browser_roles() 
         );
         assert!(trainer_prepared.target_decision.can_train);
         let entry = &trainer_prepared.manifests.experiment_directory[0];
-        assert!(!entry.allowed_roles.contains(&PeerRole::Validator));
+        assert!(entry.allowed_roles.contains(&PeerRole::Validator));
+        assert!(entry.allowed_roles.contains(&PeerRole::Evaluator));
         assert!(entry.allowed_roles.contains(&PeerRole::BrowserObserver));
         assert!(entry.allowed_roles.contains(&PeerRole::BrowserVerifier));
         assert!(entry.allowed_roles.contains(&PeerRole::Archive));
@@ -6851,9 +7638,14 @@ fn nca_bootstrap_only_topology_diffusion_converges_across_trainers() {
                 .contains(&PeerRole::TrainerCpu)
         );
         assert!(
-            !experiment_entry
+            experiment_entry
                 .allowed_roles
                 .contains(&PeerRole::Validator)
+        );
+        assert!(
+            experiment_entry
+                .allowed_roles
+                .contains(&PeerRole::Evaluator)
         );
         assert!(
             experiment_entry
@@ -8298,7 +9090,8 @@ fn ruliad_native_peer_small_model_converges_over_more_windows() {
             None,
         );
 
-        let prepared = prepare_nca_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
+        let prepared =
+            prepare_ruliad_native_cpu(&native, Some(&dummy_auth_bundle())).expect("peer");
         let max_elapsed = positive_env_duration(RULIAD_CONVERGENCE_MAX_SECONDS_ENV);
         let windows = positive_env_usize(RULIAD_CONVERGENCE_WINDOWS_ENV, 1);
         let observations = run_training_windows_with_heads_until(
@@ -8390,7 +9183,7 @@ fn nca_vs_ruliad_small_model_convergence_report() {
 
         let nca =
             prepare_nca_native_cpu(&nca_native, Some(&dummy_auth_bundle())).expect("nca peer");
-        let ruliad = prepare_nca_native_cpu(&ruliad_native, Some(&dummy_auth_bundle()))
+        let ruliad = prepare_ruliad_native_cpu(&ruliad_native, Some(&dummy_auth_bundle()))
             .expect("ruliad peer");
         let nca_observations = run_training_windows_with_heads(&nca, 4, "nca-report");
         let ruliad_observations = run_training_windows_with_heads(&ruliad, 4, "ruliad-report");

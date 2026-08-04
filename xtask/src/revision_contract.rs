@@ -25,6 +25,9 @@ pub struct RevisionContractBuildSpec {
     pub initialization_algorithm: String,
     #[serde(default)]
     pub initialization_seed: Option<u64>,
+    /// Whether peers download the complete head or reconstruct immutable tensors.
+    #[serde(default)]
+    pub materialization: burn_p2p::GenesisMaterialization,
     pub authority_epoch: u64,
     pub created_at: DateTime<Utc>,
     pub protocol_version: Version,
@@ -271,6 +274,7 @@ fn build_signed_bundle(
         tensor_digest: spec.tensor_digest,
         initialization_algorithm: spec.initialization_algorithm,
         initialization_seed: spec.initialization_seed,
+        materialization: spec.materialization,
         authority_epoch: spec.authority_epoch,
         created_at: spec.created_at,
     };

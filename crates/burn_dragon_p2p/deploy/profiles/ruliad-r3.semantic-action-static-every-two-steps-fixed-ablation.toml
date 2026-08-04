@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.semantic-action-static-fixed-ablation.toml"]
+
+# Midpoint cadence for the verifier-policy density sweep: four semantic states per language-model
+# update on average, versus two in the baseline and eight in the every-step arm.
+[training.ruliad_supervision.proof_policy]
+every_steps = 2
+start_after_steps = 0

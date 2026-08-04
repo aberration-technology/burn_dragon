@@ -1,0 +1,11 @@
+extends = ["ruliad-r3.typed-policy-offloaded-duty-ablation.toml"]
+
+# Isolates the custom dense-causal attention forward/backward path from the
+# low-rank projection kernels for numerical and throughput comparison.
+[model]
+fused_kernels = true
+fused_recurrent_kernel = false
+fused_rollout_kernel = true
+fused_projection_executor = "none"
+fused_attention_executor = "attention_context"
+fused_lowrank_grad_input_executor = "auto"

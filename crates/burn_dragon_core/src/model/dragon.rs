@@ -20,9 +20,9 @@ pub use interpretability::{
     TensorStateSummaryDiagnostics, compare_model_states, summarize_model_state,
 };
 
-use burn::module::{Module, Param};
+use burn::module::{AutodiffModule, Module, Param};
 use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
-use burn::tensor::backend::Backend;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData, activation};
 use burn_dragon_kernel::api::attention::{
     supports_dense_causal_attention_backend, try_fused_dense_causal_attention_wgpu,
@@ -38,6 +38,7 @@ use burn_dragon_time::Instant;
 use burn_gdn::{GatedDeltaNet2Executor, GatedDeltaNet2Memory, try_gdn2_chunk_wy};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -67,17 +68,16 @@ use super::init::{DragonFiringTargetKind, DragonInitializer, DragonProjectionRol
 use super::norm::DragonNorm;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::LowRankResidualOutput;
-#[cfg(any(feature = "viz", feature = "probe"))]
-use super::residual_stream::lowrank_residual_step_branch_thresholds_relu_native;
 use super::residual_stream::lowrank_residual_step_next_branch_thresholds;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds;
 #[cfg(any(feature = "viz", feature = "probe"))]
-use super::residual_stream::{decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat};
+use super::residual_stream::{
+    decode_y_neuron_tail, lowrank_residual_step_branch_thresholds_relu_native,
+};
 #[cfg(not(any(feature = "viz", feature = "probe")))]
 use super::residual_stream::{
-    decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat,
-    lowrank_residual_step_next_branch_thresholds_relu_native,
+    decode_y_neuron_tail, lowrank_residual_step_next_branch_thresholds_relu_native,
 };
 use super::scaffold::{
     DragonRandomScaffoldAdapters, DragonRandomScaffoldReport, build_report, fast_scaffold_paths,
@@ -88,7 +88,8 @@ use super::sequence::gdn2::{
     gated_deltanet2_reference, l2_normalize_last,
 };
 use super::sequence::linear::{
-    expand_attention_values_to_heads, recurrent_attention_dense_score_final_rho_reference,
+    expand_attention_values_to_heads, recurrent_attention_dense_score_context_reference,
+    recurrent_attention_dense_score_final_rho_reference,
     recurrent_attention_dense_score_initial_context_reference,
     recurrent_attention_dense_score_reference, recurrent_attention_reference,
 };
@@ -108,6 +109,88 @@ use super::widen::{
     widen_3d_last_dim_prefix_zero_tail,
 };
 use super::{ManifoldHyperConnections, mhc_merge_with_coefficients, mhc_split_with_coefficients};
+
+#[derive(Module, Debug)]
+struct SequenceScoreHead<B: Backend> {
+    query: Linear<B>,
+    candidate: Linear<B>,
+    score: Linear<B>,
+}
+
+impl<B: Backend> SequenceScoreHead<B> {
+    fn deterministic_linear(
+        input_dim: usize,
+        output_dim: usize,
+        seed: u64,
+        device: &B::Device,
+    ) -> Linear<B> {
+        let bound = (1.0 / input_dim.max(1) as f32).sqrt();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let weights = (0..input_dim.saturating_mul(output_dim))
+            .map(|_| rng.gen_range(-bound..bound))
+            .collect::<Vec<_>>();
+        let biases = (0..output_dim)
+            .map(|_| rng.gen_range(-bound..bound))
+            .collect::<Vec<_>>();
+        Linear {
+            weight: Param::from_tensor(Tensor::from_data(
+                TensorData::new(weights, [input_dim, output_dim]),
+                device,
+            )),
+            bias: Some(Param::from_tensor(Tensor::from_data(
+                TensorData::new(biases, [output_dim]),
+                device,
+            ))),
+        }
+    }
+
+    fn new(input_dim: usize, projection_dim: usize, device: &B::Device) -> Self {
+        assert!(
+            projection_dim > 0,
+            "sequence score projection_dim must be positive"
+        );
+        Self {
+            // Optional heads must not advance the backend-global RNG or alter initialization and
+            // dropout streams in matched baseline runs. Independent host RNGs preserve ordinary
+            // fan-in initialization while keeping the shared Dragon parameter contract invariant.
+            query: Self::deterministic_linear(
+                input_dim,
+                projection_dim,
+                0x7175_6572_795f_6b31,
+                device,
+            ),
+            candidate: Self::deterministic_linear(
+                input_dim,
+                projection_dim,
+                0x6361_6e64_5f6b_6579,
+                device,
+            ),
+            score: Self::deterministic_linear(projection_dim, 1, 0x7363_6f72_655f_7631, device),
+        }
+    }
+
+    fn forward_candidate(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.score.forward(self.candidate.forward(hidden))
+    }
+
+    fn forward_pair(
+        &self,
+        prompt_hidden: Tensor<B, 3>,
+        terminal_hidden: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        let query = self.query.forward(prompt_hidden);
+        let candidate = self.candidate.forward(terminal_hidden);
+        self.score.forward(query * candidate)
+    }
+
+    fn value_clone(&self) -> Self {
+        Self {
+            query: clone_linear_value(&self.query),
+            candidate: clone_linear_value(&self.candidate),
+            score: clone_linear_value(&self.score),
+        }
+    }
+}
 
 #[derive(Module, Debug)]
 pub struct DragonModel<B: Backend> {
@@ -164,6 +247,7 @@ pub struct DragonModel<B: Backend> {
     lm_head: Option<Param<Tensor<B, 2>>>,
     nca_factorized_lm_head: Option<Param<Tensor<B, 2>>>,
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
+    sequence_score_head: Option<SequenceScoreHead<B>>,
     latent_refiner_in: Option<Linear<B>>,
     latent_refiner_out: Option<Linear<B>>,
     latent_refiner_gate: Option<Param<Tensor<B, 1>>>,
@@ -835,6 +919,13 @@ impl<B: Backend> DragonModel<B> {
                 ))
             })
         });
+        let sequence_score_head = config.sequence_score_head.enabled.then(|| {
+            SequenceScoreHead::new(
+                config.n_embd,
+                config.sequence_score_head.projection_dim,
+                device,
+            )
+        });
         let latent_reasoning = config.latent_reasoning.clone();
         let latent_refiner_hidden =
             config.n_embd * latent_reasoning.refiner_hidden_multiplier.max(1);
@@ -962,6 +1053,7 @@ impl<B: Backend> DragonModel<B> {
             lm_head,
             nca_factorized_lm_head,
             nca_special_lm_head,
+            sequence_score_head,
             latent_refiner_in,
             latent_refiner_out,
             latent_refiner_gate,
@@ -1155,6 +1247,17 @@ impl<B: Backend> DragonModel<B> {
             && self.language_head.uses_flat_token_logits()
     }
 
+    /// Reports whether one sequence invocation can omit terminal recurrent-state materialization.
+    pub fn supports_terminal_sequence_state_elision(&self) -> bool {
+        self.sequence_kernel.memory_system == SequenceMemorySystem::LinearAttention
+            && self.sequence_kernel.executor == SequenceTrainingExecutor::DenseScoreShortContext
+            && self.rollout_fast_steps_per_slow_step == 1
+            && !self.y_neuron_recurrence.enabled
+            && !self.hierarchical_dragon.enabled
+            && !self.clocked_slow_memory.enabled
+            && !self.summary_memory.enabled
+    }
+
     pub fn widen_latent_total(
         &self,
         target_config: DragonConfig,
@@ -1294,6 +1397,10 @@ impl<B: Backend> DragonModel<B> {
             .nca_special_lm_head
             .as_ref()
             .map(|head| Param::from_tensor(head.val()));
+        widened.sequence_score_head = self
+            .sequence_score_head
+            .as_ref()
+            .map(SequenceScoreHead::value_clone);
         widened.latent_refiner_in = self.latent_refiner_in.as_ref().map(clone_linear_value);
         widened.latent_refiner_out = self.latent_refiner_out.as_ref().map(clone_linear_value);
         widened.latent_refiner_gate = self
@@ -1704,6 +1811,10 @@ impl<B: Backend> DragonModel<B> {
         ModelState::new_ephemeral(self.n_layer)
     }
 
+    pub fn init_state_stateless(&self) -> ModelState<B> {
+        ModelState::new_stateless(self.n_layer)
+    }
+
     fn layer_latent_total(&self, layer_idx: usize) -> usize {
         self.layer_latent_totals
             .get(layer_idx)
@@ -1720,7 +1831,7 @@ impl<B: Backend> DragonModel<B> {
     }
 
     fn write_linear_attention_rho_state(&self, layer_state: &mut LayerState<B>, rho: Tensor<B, 4>) {
-        layer_state.rho = Some(rho);
+        layer_state.rho = layer_state.retain_terminal_sequence_state.then_some(rho);
         layer_state.rho_norm = None;
         layer_state.sequence_aux = None;
     }
@@ -2490,25 +2601,12 @@ impl<B: Backend> DragonModel<B> {
         );
         assert_eq!(decoder_dim, self.n_embd, "population decoder dim mismatch");
 
-        if decode_y_neuron_tail_uses_legacy_flat() {
-            let mixed = y_neuron
-                .reshape([population, per_population_batch, heads, time, latent])
-                .swap_dims(2, 3)
-                .reshape([population, per_population_batch * time, heads * latent]);
-            return mixed
-                .matmul(decoder)
-                .reshape([population, per_population_batch, time, self.n_embd])
-                .reshape([flat_batch, 1, time, self.n_embd]);
-        }
-
-        let y_by_head = y_neuron
+        let mixed = y_neuron
             .reshape([population, per_population_batch, heads, time, latent])
-            .swap_dims(1, 2)
-            .reshape([population, heads, per_population_batch * time, latent]);
-        let decoder_by_head = decoder.reshape([population, heads, latent, self.n_embd]);
-        y_by_head
-            .matmul(decoder_by_head)
-            .sum_dim(1)
+            .swap_dims(2, 3)
+            .reshape([population, per_population_batch * time, heads * latent]);
+        mixed
+            .matmul(decoder)
             .reshape([population, per_population_batch, time, self.n_embd])
             .reshape([flat_batch, 1, time, self.n_embd])
     }
@@ -3894,6 +3992,37 @@ impl<B: Backend> DragonModel<B> {
             .map(|head| head.forward(hidden))
     }
 
+    pub fn sequence_score_head_enabled(&self) -> bool {
+        self.sequence_score_head.is_some()
+    }
+
+    /// Score complete sequence representations without projecting through the vocabulary head.
+    pub fn sequence_scores_from_hidden(&self, hidden: Tensor<B, 3>) -> Option<Tensor<B, 3>> {
+        self.sequence_score_head
+            .as_ref()
+            .map(|head| head.forward_candidate(hidden))
+    }
+
+    /// Score prompt-candidate compatibility in a learned low-rank query-key space.
+    ///
+    /// A terminal-only linear score can rank candidate surface forms but cannot represent a
+    /// changed preference when the candidate set is fixed and only the requested target changes.
+    /// Independent prompt and candidate projections form a general low-rank bilinear map. This
+    /// keeps prompt conditioning in the score contract without adding task-specific outputs or
+    /// changing the Dragon backbone width.
+    pub fn sequence_scores_from_hidden_pair(
+        &self,
+        prompt_hidden: Tensor<B, 3>,
+        terminal_hidden: Tensor<B, 3>,
+    ) -> Option<Tensor<B, 3>> {
+        if prompt_hidden.shape() != terminal_hidden.shape() {
+            return None;
+        }
+        self.sequence_score_head
+            .as_ref()
+            .map(|head| head.forward_pair(prompt_hidden, terminal_hidden))
+    }
+
     fn project_hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         assert!(
             self.language_head.uses_flat_token_logits(),
@@ -4097,6 +4226,22 @@ impl<B: Backend> DragonModel<B> {
     }
 }
 
+impl<B: AutodiffBackend> DragonModel<B> {
+    /// Run a read-only auxiliary backbone pass without building an autodiff graph or sampling
+    /// training-time dropout.
+    ///
+    /// `Tensor::inner` and `Tensor::from_inner` preserve the backend allocation, so CUDA callers do
+    /// not cross the host boundary. The returned tensor is a detached feature view suitable for a
+    /// task head whose parameters remain on the autodiff model.
+    pub fn forward_hidden_deterministic_auxiliary(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.valid().forward_hidden(tokens.inner());
+        Tensor::from_inner(hidden)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4148,6 +4293,64 @@ mod tests {
             .zip(rhs)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn optional_sequence_score_head_preserves_shared_initialization_and_backend_rng() {
+        const ISOLATED_ENV: &str = "BURN_DRAGON_ISOLATED_SCORE_HEAD_RNG_TEST";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            // NdArray's RNG is process-global, so a seed-sequence assertion must not share a
+            // process with parallel tests that initialize unrelated models.
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current core test executable"),
+            )
+            .arg("model::dragon::tests::optional_sequence_score_head_preserves_shared_initialization_and_backend_rng")
+            .arg("--exact")
+            .env(ISOLATED_ENV, "1")
+            .status()
+            .expect("run isolated score-head RNG test");
+            assert!(status.success(), "isolated score-head RNG test failed");
+            return;
+        }
+
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        TestBackend::seed(&device, 4_211);
+        let without_head = DragonModel::<TestBackend>::new(config.clone(), &device);
+        let without_head_logits = tensor_values(without_head.forward(tokens.clone()));
+        let without_head_rng = tensor_values(Tensor::<TestBackend, 1>::random(
+            [16],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+
+        TestBackend::seed(&device, 4_211);
+        config.sequence_score_head.enabled = true;
+        let with_head = DragonModel::<TestBackend>::new(config, &device);
+        let with_head_logits = tensor_values(with_head.forward(tokens));
+        let with_head_rng = tensor_values(Tensor::<TestBackend, 1>::random(
+            [16],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+
+        assert_eq!(
+            max_abs_diff(without_head_logits, with_head_logits),
+            0.0,
+            "optional score head perturbed shared Dragon initialization"
+        );
+        assert_eq!(
+            max_abs_diff(without_head_rng, with_head_rng),
+            0.0,
+            "optional score head advanced the backend-global RNG"
+        );
     }
 
     fn tiny_random_scaffold_config(seed: u64) -> DragonConfig {

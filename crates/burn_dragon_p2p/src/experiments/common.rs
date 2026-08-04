@@ -22,7 +22,9 @@ use burn_dragon_language::train::utils::prepare_datasets;
 use burn_dragon_language::train::{
     LanguageOptimizer, resolve_dragon_language_optimizer, validate_dragon_continual_backprop,
 };
-use burn_dragon_language::{DatasetConfig, DragonConfig, DragonModel, TrainingConfig};
+use burn_dragon_language::{
+    DatasetConfig, DragonConfig, DragonModel, TrainingConfig, TrainingHyperparameters,
+};
 use burn_dragon_train::train::constants::ValidBackend;
 use burn_dragon_train::train::metrics::{
     LanguageModelOutput, LanguageModelTrainItem, LossValue, ScalarValue,
@@ -69,6 +71,10 @@ pub type DragonLearningComponents<B> =
     LearningComponentsMarker<B, ResolvedLrScheduler, LanguageTrainModel<B>, LanguageOptimizer<B>>;
 
 type DragonLearnerProjectBuilder<B> = BurnLearnerProjectBuilder<DragonLearningComponents<B>>;
+type DragonValidationSource<B> = (
+    BurnValidationLoader<DragonLearningComponents<B>>,
+    Arc<Dataset>,
+);
 
 pub type DragonProjectFamily<B> = SingleWorkloadProjectFamily<
     BurnWorkloadAdapter<BurnLearnerProject<DragonLearningComponents<B>>>,
@@ -715,7 +721,7 @@ fn ensure_supported_training_mode(
         )
         | (
             burn_dragon_language::DatasetSourceConfig::UniversalityRuliad { .. },
-            DragonExperimentKind::NcaPrepretraining,
+            DragonExperimentKind::RuliadPretraining,
         )
         | (
             burn_dragon_language::DatasetSourceConfig::NemotronClimbMix { .. },
@@ -723,7 +729,13 @@ fn ensure_supported_training_mode(
         ) => {}
         (source, DragonExperimentKind::NcaPrepretraining) => {
             bail!(
-                "NCA p2p peers require universality datasets, found {:?}",
+                "NCA p2p peers require universality_nca data, found {:?}",
+                source
+            )
+        }
+        (source, DragonExperimentKind::RuliadPretraining) => {
+            bail!(
+                "Ruliad p2p peers require universality_ruliad data, found {:?}",
                 source
             )
         }
@@ -875,11 +887,174 @@ fn insert_ruliad_source_selection_metrics(
     );
 }
 
+#[derive(Clone)]
+struct RuliadP2pEvaluationContext<D> {
+    dataset: Arc<Dataset>,
+    training: TrainingHyperparameters,
+    device: D,
+}
+
+fn ruliad_p2p_evaluation_context<D: Clone>(
+    dataset: Arc<Dataset>,
+    config: &TrainingConfig,
+    device: &D,
+    formal_evaluation_enabled: bool,
+) -> Option<RuliadP2pEvaluationContext<D>> {
+    if !formal_evaluation_enabled {
+        return None;
+    }
+    let item_count = config.training.events.ruliad_correctness_probe_items;
+    if item_count == 0
+        || dataset
+            .sample_ruliad_validation_probe_items(0, 0, 1)
+            .is_empty()
+    {
+        return None;
+    }
+    Some(RuliadP2pEvaluationContext {
+        dataset,
+        training: config.training.clone(),
+        device: device.clone(),
+    })
+}
+
+fn metric_key_component(label: &str) -> String {
+    let mut normalized = String::with_capacity(label.len());
+    let mut separator = false;
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !normalized.is_empty() {
+            normalized.push('_');
+            separator = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn insert_ruliad_eval_group_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    scope: &str,
+    groups: &[burn_dragon_universality::RuliadEvalGroupScore],
+) {
+    for group in groups {
+        let label = metric_key_component(&group.label);
+        if label.is_empty() {
+            continue;
+        }
+        let prefix = format!("ruliad_{scope}_{label}");
+        metrics.insert(
+            format!("{prefix}_items"),
+            MetricValue::Integer(group.count as i64),
+        );
+        metrics.insert(
+            format!("{prefix}_verifier_accuracy"),
+            MetricValue::Float(group.verifier_accuracy as f64),
+        );
+        metrics.insert(
+            format!("{prefix}_partial_credit_rate"),
+            MetricValue::Float(group.partial_credit_rate as f64),
+        );
+        metrics.insert(
+            format!("{prefix}_answer_field_accuracy"),
+            MetricValue::Float(group.answer_field_accuracy as f64),
+        );
+        metrics.insert(
+            format!("{prefix}_completion_quality"),
+            MetricValue::Float(group.mean_completion_quality as f64),
+        );
+    }
+}
+
+fn insert_ruliad_model_evaluation_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    evaluation: &burn_dragon_language::train::schedule::RuliadModelEvaluation,
+) {
+    let report = &evaluation.report;
+    let item_count = report.item_count.max(1) as f64;
+    for (key, value) in [
+        ("ruliad_exact_accuracy", report.exact_accuracy as f64),
+        ("ruliad_semantic_accuracy", report.semantic_accuracy as f64),
+        ("ruliad_verifier_accuracy", report.verifier_accuracy as f64),
+        (
+            "ruliad_partial_credit_rate",
+            report.partial_credit_rate as f64,
+        ),
+        (
+            "ruliad_mean_partial_progress",
+            report.mean_partial_progress as f64,
+        ),
+        (
+            "ruliad_answer_field_accuracy",
+            report.answer_field_accuracy as f64,
+        ),
+        (
+            "ruliad_answer_field_coverage",
+            report.answer_field_coverage as f64,
+        ),
+        (
+            "ruliad_answer_termination_rate",
+            report.answer_termination_rate as f64,
+        ),
+        (
+            "ruliad_mean_completion_quality",
+            report.mean_completion_quality as f64,
+        ),
+        (
+            "ruliad_actual_answer_distinct_fraction",
+            report.actual_answer_distinct_fraction as f64,
+        ),
+        (
+            "ruliad_actual_answer_dominant_fraction",
+            report.actual_answer_dominant_fraction as f64,
+        ),
+        (
+            "ruliad_malformed_completion_rate",
+            report.malformed_completion_count as f64 / item_count,
+        ),
+        (
+            "ruliad_missing_completion_rate",
+            report.missing_completion_count as f64 / item_count,
+        ),
+        ("ruliad_probe_elapsed_ms", evaluation.elapsed_ms),
+        (
+            "ruliad_probe_generation_mean_batch_rows",
+            evaluation.generation_mean_batch_rows,
+        ),
+        (
+            "ruliad_probe_generation_batched_row_fraction",
+            evaluation.generation_batched_row_fraction,
+        ),
+    ] {
+        metrics.insert(key.into(), MetricValue::Float(value));
+    }
+    for (key, value) in [
+        ("ruliad_evaluation_items", evaluation.item_count),
+        (
+            "ruliad_probe_generation_maximum_batch_rows",
+            evaluation.generation_maximum_batch_rows,
+        ),
+        (
+            "ruliad_probe_generation_maximum_in_flight_rows",
+            evaluation.generation_maximum_in_flight_rows,
+        ),
+    ] {
+        metrics.insert(key.into(), MetricValue::Integer(value as i64));
+    }
+    insert_ruliad_eval_group_metrics(metrics, "difficulty", &report.difficulty_scores);
+    insert_ruliad_eval_group_metrics(metrics, "task", &report.task_scores);
+}
+
 fn language_evaluate<B>(
     model: &LanguageTrainModel<ValidBackend<B>>,
     validation_loader: BurnValidationLoader<DragonLearningComponents<B>>,
     max_batches: Option<usize>,
-    _split: EvalSplit,
+    ruliad: Option<RuliadP2pEvaluationContext<B::Device>>,
+    split: EvalSplit,
 ) -> MetricReport
 where
     B: AutodiffBackend + Clone + 'static,
@@ -894,21 +1069,65 @@ where
         total += mean_loss_from_valid_output(model.step(item));
         count += 1;
     }
+    let mut metrics = std::collections::BTreeMap::from([
+        (
+            "loss".into(),
+            MetricValue::Float(if count == 0 {
+                0.0
+            } else {
+                total / count as f64
+            }),
+        ),
+        (
+            "evaluation_batches".into(),
+            MetricValue::Integer(count as i64),
+        ),
+    ]);
+    if !matches!(split, EvalSplit::Train)
+        && let Some(ruliad) = ruliad
+    {
+        match burn_dragon_language::train::schedule::evaluate_ruliad_model_free_run(
+            &ruliad.dataset,
+            model,
+            &ruliad.training,
+            0,
+            0,
+            ruliad.training.events.ruliad_correctness_probe_items,
+            ruliad.training.batch_size,
+            "burn_dragon_p2p_ruliad_validation_v1",
+            &ruliad.device,
+        ) {
+            Ok(Some(evaluation)) => {
+                metrics.insert(
+                    "ruliad_evaluation_completed".into(),
+                    MetricValue::Bool(true),
+                );
+                insert_ruliad_model_evaluation_metrics(&mut metrics, &evaluation);
+            }
+            Ok(None) => {
+                metrics.insert(
+                    "ruliad_evaluation_completed".into(),
+                    MetricValue::Bool(false),
+                );
+                metrics.insert(
+                    "ruliad_evaluation_error".into(),
+                    MetricValue::Text("formal validation panel is empty".into()),
+                );
+            }
+            Err(error) => {
+                metrics.insert(
+                    "ruliad_evaluation_completed".into(),
+                    MetricValue::Bool(false),
+                );
+                metrics.insert(
+                    "ruliad_evaluation_error".into(),
+                    MetricValue::Text(error.to_string()),
+                );
+            }
+        }
+    }
     MetricReport {
-        metrics: std::collections::BTreeMap::from([
-            (
-                "loss".into(),
-                MetricValue::Float(if count == 0 {
-                    0.0
-                } else {
-                    total / count as f64
-                }),
-            ),
-            (
-                "evaluation_batches".into(),
-                MetricValue::Integer(count as i64),
-            ),
-        ]),
+        metrics,
         captured_at: chrono::Utc::now(),
     }
 }
@@ -925,7 +1144,11 @@ where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
-    if config.training.tbptt_persist_across_steps {
+    if config
+        .training
+        .sequence_batching
+        .uses_streaming_loader(config.training.tbptt_persist_across_steps)
+    {
         Arc::new(
             StreamingDataLoader::<B>::new(
                 Arc::clone(&datasets.train),
@@ -1296,7 +1519,7 @@ fn prepare_validation_loader_only<B>(
     device: &burn::tensor::Device<ValidBackend<B>>,
     base_tokenizer: &dyn Tokenizer,
     summary_event_token_ids: Option<Vec<u32>>,
-) -> Result<Option<BurnValidationLoader<DragonLearningComponents<B>>>>
+) -> Result<Option<DragonValidationSource<B>>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
@@ -1318,10 +1541,10 @@ where
         prepared.valid.tokenizer().as_ref(),
         config.dataset.tokenizer.kind_name(),
     )?;
-    Ok(Some(build_valid_loader_for_dataset::<B>(
-        prepared.valid,
-        device,
-        summary_event_token_ids,
+    let dataset = prepared.valid;
+    Ok(Some((
+        build_valid_loader_for_dataset::<B>(Arc::clone(&dataset), device, summary_event_token_ids),
+        dataset,
     )))
 }
 
@@ -1365,6 +1588,10 @@ where
     let model_config = capability_assessment.model_config.clone();
     let footprint = capability_assessment.footprint.clone();
     let target_decision = capability_assessment.target_decision.clone();
+    let formal_evaluation_enabled = matches!(
+        target_decision.effective_target,
+        crate::config::DragonNativeTarget::Validator
+    );
 
     let (project, dataset_view_id, random_scaffold) = if let Some(existing_shards) =
         use_existing_shards
@@ -1425,7 +1652,7 @@ where
             insert_train_loss_metrics(metrics, step_index, mean_loss_from_train_output_ref(output));
             Ok(())
         });
-        if let Some(validation_loader) = prepare_validation_loader_only::<B>(
+        if let Some((validation_loader, validation_dataset)) = prepare_validation_loader_only::<B>(
             &config,
             &device,
             tokenizer.as_ref(),
@@ -1433,6 +1660,12 @@ where
         )? {
             let validation_for_eval = validation_loader.clone();
             let max_eval_batches = native.training_overrides.max_eval_batches;
+            let ruliad_evaluation = ruliad_p2p_evaluation_context(
+                validation_dataset,
+                &config,
+                &device,
+                formal_evaluation_enabled,
+            );
             builder = builder
                 .with_validation_loader(validation_loader)
                 .with_evaluate(move |model, split| {
@@ -1440,6 +1673,7 @@ where
                         model,
                         validation_for_eval.clone(),
                         max_eval_batches,
+                        ruliad_evaluation.clone(),
                         split,
                     )
                 });
@@ -1498,6 +1732,12 @@ where
             dragon_model_schema_hash(&model_config),
         )?;
         let validation_for_eval = validation_loader.clone();
+        let ruliad_evaluation = ruliad_p2p_evaluation_context(
+            Arc::clone(&datasets.valid),
+            &config,
+            &device,
+            formal_evaluation_enabled,
+        );
         let max_eval_batches = native.training_overrides.max_eval_batches;
         let backend_label_owned = backend_label.to_owned();
         let estimated_tokens_per_second = footprint.estimated_tokens_per_second;
@@ -1521,7 +1761,13 @@ where
             }
         })
         .with_evaluate(move |model, split| {
-            language_evaluate::<B>(model, validation_for_eval.clone(), max_eval_batches, split)
+            language_evaluate::<B>(
+                model,
+                validation_for_eval.clone(),
+                max_eval_batches,
+                ruliad_evaluation.clone(),
+                split,
+            )
         })
         .with_step_metrics(move |step_index, output, metrics| {
             let train_loss = mean_loss_from_train_output_ref(output);
@@ -1867,5 +2113,70 @@ mod tests {
             metrics.get("train_loss_last"),
             Some(&MetricValue::Float(4.0))
         );
+    }
+
+    #[test]
+    fn metric_key_components_are_stable_and_path_safe() {
+        assert_eq!(
+            metric_key_component("Formal Proof / Select-Action:d=17"),
+            "formal_proof_select_action_d_17"
+        );
+        assert_eq!(metric_key_component("___"), "");
+    }
+
+    #[test]
+    fn p2p_ruliad_metrics_preserve_verifier_and_generation_evidence() {
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: "metric-fixture".into(),
+            sample_index: 0,
+            split: burn_dragon_universality::SampleSplit::Validation,
+            family: "formal_proof".into(),
+            task_kind: "select_proof_action".into(),
+            math_domains: vec!["category_theory".into()],
+            reasoning_modes: vec!["equational_reasoning".into()],
+            prompt: "[R3 metric-fixture v1 P/thm/proof]\nA:ok,l,r\n!:".into(),
+            expected_answer: "ok=1;l=2;r=2".into(),
+            difficulty_level: Some(17),
+            spec: None,
+        };
+        let completion = burn_dragon_universality::RuliadCompletionRecord {
+            oracle_hash: "metric-fixture".into(),
+            completion: "!:ok=1;l=2;r=2\n[/R3]\n".into(),
+        };
+        let report = burn_dragon_universality::evaluate_completions(
+            "p2p-metric-fixture",
+            &[item],
+            &[completion],
+        );
+        let evaluation = burn_dragon_language::train::schedule::RuliadModelEvaluation {
+            report: report.clone(),
+            item_count: 1,
+            elapsed_ms: 12.5,
+            generation_mean_batch_rows: 4.0,
+            generation_maximum_batch_rows: 8,
+            generation_maximum_in_flight_rows: 4,
+            generation_batched_row_fraction: 1.0,
+        };
+        let mut metrics = BTreeMap::new();
+        insert_ruliad_model_evaluation_metrics(&mut metrics, &evaluation);
+
+        assert_eq!(
+            metrics.get("ruliad_semantic_accuracy"),
+            Some(&MetricValue::Float(report.semantic_accuracy as f64))
+        );
+        assert_eq!(
+            metrics.get("ruliad_verifier_accuracy"),
+            Some(&MetricValue::Float(report.verifier_accuracy as f64))
+        );
+        assert_eq!(
+            metrics.get("ruliad_probe_generation_maximum_batch_rows"),
+            Some(&MetricValue::Integer(8))
+        );
+        assert!(metrics.keys().any(|key| {
+            key.starts_with("ruliad_difficulty_") && key.ends_with("_verifier_accuracy")
+        }));
+        assert!(metrics.keys().any(|key| {
+            key.starts_with("ruliad_task_") && key.ends_with("_answer_field_accuracy")
+        }));
     }
 }

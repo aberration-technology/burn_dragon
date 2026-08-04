@@ -1115,6 +1115,7 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
                     "prompt_pairs": 4,
                     "contrast_pairs": 4,
                     "candidate_pairs": 7,
+                    "filtered_presented_action_candidates": 3,
                     "contrast_discriminative_tokens": 19,
                     "negative_pool_size": 12,
                     "replay_pool_size": 8,
@@ -1126,6 +1127,10 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
                     "margin_satisfied_token_fraction": 0.4,
                     "exact_pair_rank_fraction": 0.5,
                     "exact_pair_margin_fraction": 0.25,
+                    "sequence_rank_metric_pairs": 2,
+                    "sequence_log_probability_margin_mean": 0.75,
+                    "positive_sequence_fraction": 0.5,
+                    "sequence_margin_satisfied_fraction": 0.25,
                     "field_binding_contrast_weight": 0.1,
                     "field_binding_contrast_margin": 0.25,
                 },
@@ -1134,6 +1139,7 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
                     "prompt_pairs": 6,
                     "contrast_pairs": 6,
                     "candidate_pairs": 9,
+                    "filtered_presented_action_candidates": 5,
                     "contrast_discriminative_tokens": 31,
                     "negative_pool_size": 16,
                     "replay_pool_size": 12,
@@ -1145,6 +1151,10 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
                     "margin_satisfied_token_fraction": 0.2,
                     "exact_pair_rank_fraction": 0.25,
                     "exact_pair_margin_fraction": 0.0,
+                    "sequence_rank_metric_pairs": 4,
+                    "sequence_log_probability_margin_mean": 1.5,
+                    "positive_sequence_fraction": 0.75,
+                    "sequence_margin_satisfied_fraction": 0.5,
                     "field_binding_contrast_weight": 0.2,
                     "field_binding_contrast_margin": 0.5,
                 },
@@ -1159,6 +1169,9 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
         self.assertEqual(summary["field_binding_prompt_pairs"], 10)
         self.assertEqual(summary["field_binding_contrast_pairs"], 10)
         self.assertEqual(summary["field_binding_candidate_pairs"], 16)
+        self.assertEqual(
+            summary["field_binding_filtered_presented_action_candidates"], 8
+        )
         self.assertEqual(summary["field_binding_discriminative_tokens"], 50)
         self.assertEqual(summary["field_binding_negative_pool_size"], 16)
         self.assertEqual(summary["field_binding_replay_pool_size"], 12)
@@ -1170,6 +1183,16 @@ class StructuredContrastTelemetryTests(unittest.TestCase):
         self.assertAlmostEqual(summary["field_binding_margin_satisfied_token_fraction"], 0.25)
         self.assertAlmostEqual(summary["field_binding_exact_pair_rank_fraction"], 1.0 / 3.0)
         self.assertAlmostEqual(summary["field_binding_exact_pair_margin_fraction"], 1.0 / 12.0)
+        self.assertEqual(summary["field_binding_sequence_rank_metric_pairs"], 6)
+        self.assertAlmostEqual(
+            summary["field_binding_sequence_log_probability_margin_mean"], 1.25
+        )
+        self.assertAlmostEqual(
+            summary["field_binding_positive_sequence_fraction"], 2.0 / 3.0
+        )
+        self.assertAlmostEqual(
+            summary["field_binding_sequence_margin_satisfied_fraction"], 5.0 / 12.0
+        )
         self.assertEqual(summary["field_binding_weight"], 0.2)
         self.assertEqual(summary["field_binding_margin"], 0.5)
 
@@ -1952,6 +1975,51 @@ class PromotionGateTests(unittest.TestCase):
         self.assertEqual(candidate_row["decision"], "reject")
         self.assertIn("field_binding_positive_rank_weak", candidate_row["fail_reasons"])
         self.assertIn("field_binding_pair_rank_weak", candidate_row["fail_reasons"])
+
+    def test_field_binding_sequence_rank_metrics_are_required_when_enabled(self) -> None:
+        args = promotion_args()
+        candidate = {
+            **healthy_arm_row("candidate"),
+            "field_binding_config_weight_mean": 0.01,
+            "field_binding_config_pair_weight_mean": 1.0,
+            "field_binding_config_expected_update_steps_mean": 4,
+            "field_binding_config_expected_rank_metric_steps_mean": 2,
+            "field_binding_contrast_pairs_mean": 8,
+            "field_binding_rank_metric_tokens_mean": 8,
+            "field_binding_positive_token_fraction_mean": 1.0,
+            "field_binding_exact_pair_rank_fraction_mean": 1.0,
+            "field_binding_sequence_rank_metric_pairs_mean": 0,
+        }
+
+        gated = ANALYZE.add_gate_decisions([healthy_arm_row("baseline"), candidate], args)
+        candidate_row = next(row for row in gated if row["arm"] == "candidate")
+
+        self.assertEqual(candidate_row["decision"], "reject")
+        self.assertIn(
+            "field_binding_sequence_rank_metrics_missing", candidate_row["fail_reasons"]
+        )
+
+    def test_field_binding_weak_sequence_rank_rejects_candidate(self) -> None:
+        args = promotion_args()
+        candidate = {
+            **healthy_arm_row("candidate"),
+            "field_binding_config_weight_mean": 0.01,
+            "field_binding_config_pair_weight_mean": 1.0,
+            "field_binding_config_expected_update_steps_mean": 4,
+            "field_binding_config_expected_rank_metric_steps_mean": 2,
+            "field_binding_contrast_pairs_mean": 8,
+            "field_binding_rank_metric_tokens_mean": 8,
+            "field_binding_positive_token_fraction_mean": 1.0,
+            "field_binding_exact_pair_rank_fraction_mean": 1.0,
+            "field_binding_sequence_rank_metric_pairs_mean": 8,
+            "field_binding_positive_sequence_fraction_mean": 0.25,
+        }
+
+        gated = ANALYZE.add_gate_decisions([healthy_arm_row("baseline"), candidate], args)
+        candidate_row = next(row for row in gated if row["arm"] == "candidate")
+
+        self.assertEqual(candidate_row["decision"], "reject")
+        self.assertIn("field_binding_sequence_rank_weak", candidate_row["fail_reasons"])
 
     def test_generated_attractor_replay_inactive_rejects_candidate(self) -> None:
         args = promotion_args()

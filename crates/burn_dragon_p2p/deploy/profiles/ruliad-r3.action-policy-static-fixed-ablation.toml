@@ -1,0 +1,16 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# Low-overhead verifier-candidate supervision at source-selected certificate
+# states. This uses the same candidate-normalized equivalence contract as the
+# constrained decoder, without rolling the current model through extra states.
+[training.ruliad_supervision.proof_policy]
+enabled = true
+mode = "static_expert"
+weight = 0.25
+every_steps = 16
+start_after_steps = 512
+stratified_difficulty_levels = 4
+rollout_steps = 8
+max_rows_per_update = 32
+candidates = 4
+max_completion_tokens = 16

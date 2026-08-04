@@ -8,7 +8,13 @@ pub struct TrainProfileSnapshot {
     pub dataloader_host_to_device_copy_bytes: u128,
     pub host_sync_points: u64,
     pub forward_ns: u128,
+    pub auxiliary_objective_ns: u128,
+    pub proof_policy_ns: u128,
     pub loss_backward_ns: u128,
+    pub optimizer_ns: u128,
+    pub metric_sync_ns: u128,
+    pub validation_ns: u128,
+    pub checkpoint_ns: u128,
     pub embed_probe_ns: u128,
     pub first_layer_forward_probe_ns: u128,
     pub first_layer_probe_ns: u128,
@@ -41,6 +47,11 @@ pub(crate) struct PredictiveCodingProfileSnapshot {
     pub grad_norm_samples: usize,
     pub delta_rms_sum: f64,
     pub delta_rms_samples: usize,
+    pub clip_fraction_sum: f64,
+    pub clip_fraction_samples: usize,
+    pub amortization_components: usize,
+    pub amortization_loss_sum: f64,
+    pub amortization_loss_samples: usize,
     pub elapsed_ns: u128,
 }
 
@@ -103,6 +114,16 @@ impl PredictiveCodingProfileSnapshot {
         (self.delta_rms_samples > 0).then(|| self.delta_rms_sum / self.delta_rms_samples as f64)
     }
 
+    pub(crate) fn clip_fraction_mean(self) -> Option<f64> {
+        (self.clip_fraction_samples > 0)
+            .then(|| self.clip_fraction_sum / self.clip_fraction_samples as f64)
+    }
+
+    pub(crate) fn amortization_loss_mean(self) -> Option<f64> {
+        (self.amortization_loss_samples > 0)
+            .then(|| self.amortization_loss_sum / self.amortization_loss_samples as f64)
+    }
+
     pub(crate) fn elapsed_ms(self) -> f64 {
         self.elapsed_ns as f64 / 1_000_000.0
     }
@@ -116,7 +137,13 @@ struct TrainProfileState {
     dataloader_host_to_device_copy_bytes: u128,
     host_sync_points: u64,
     forward_ns: u128,
+    auxiliary_objective_ns: u128,
+    proof_policy_ns: u128,
     loss_backward_ns: u128,
+    optimizer_ns: u128,
+    metric_sync_ns: u128,
+    validation_ns: u128,
+    checkpoint_ns: u128,
     embed_probe_ns: u128,
     first_layer_forward_probe_ns: u128,
     first_layer_probe_ns: u128,
@@ -229,7 +256,13 @@ pub fn snapshot() -> TrainProfileSnapshot {
             dataloader_host_to_device_copy_bytes: profile.dataloader_host_to_device_copy_bytes,
             host_sync_points: profile.host_sync_points,
             forward_ns: profile.forward_ns,
+            auxiliary_objective_ns: profile.auxiliary_objective_ns,
+            proof_policy_ns: profile.proof_policy_ns,
             loss_backward_ns: profile.loss_backward_ns,
+            optimizer_ns: profile.optimizer_ns,
+            metric_sync_ns: profile.metric_sync_ns,
+            validation_ns: profile.validation_ns,
+            checkpoint_ns: profile.checkpoint_ns,
             embed_probe_ns: profile.embed_probe_ns,
             first_layer_forward_probe_ns: profile.first_layer_forward_probe_ns,
             first_layer_probe_ns: profile.first_layer_probe_ns,
@@ -250,24 +283,47 @@ pub fn snapshot() -> TrainProfileSnapshot {
     TrainProfileSnapshot::default()
 }
 
-pub(crate) fn record_predictive_coding(
-    chunks_seen: usize,
-    chunks_corrected: usize,
-    inference_steps: usize,
-    skipped_empty_state: usize,
-    energy_before: Option<f64>,
-    energy_after: Option<f64>,
-    grad_norm_mean: Option<f64>,
-    grad_norm_max: Option<f64>,
-    delta_rms_mean: Option<f64>,
-    elapsed_ns: u128,
-) {
+pub(crate) struct PredictiveCodingProfileRecord {
+    pub chunks_seen: usize,
+    pub chunks_corrected: usize,
+    pub inference_steps: usize,
+    pub skipped_empty_state: usize,
+    pub energy_before: Option<f64>,
+    pub energy_after: Option<f64>,
+    pub grad_norm_mean: Option<f64>,
+    pub grad_norm_max: Option<f64>,
+    pub delta_rms_mean: Option<f64>,
+    pub clip_fraction_mean: Option<f64>,
+    pub amortization_components: usize,
+    pub amortization_loss: Option<f64>,
+    pub elapsed_ns: u128,
+}
+
+pub(crate) fn record_predictive_coding(sample: PredictiveCodingProfileRecord) {
+    let PredictiveCodingProfileRecord {
+        chunks_seen,
+        chunks_corrected,
+        inference_steps,
+        skipped_empty_state,
+        energy_before,
+        energy_after,
+        grad_norm_mean,
+        grad_norm_max,
+        delta_rms_mean,
+        clip_fraction_mean,
+        amortization_components,
+        amortization_loss,
+        elapsed_ns,
+    } = sample;
     record(|profile| {
         let pc = &mut profile.predictive_coding;
         pc.chunks_seen = pc.chunks_seen.saturating_add(chunks_seen);
         pc.chunks_corrected = pc.chunks_corrected.saturating_add(chunks_corrected);
         pc.inference_steps = pc.inference_steps.saturating_add(inference_steps);
         pc.skipped_empty_state = pc.skipped_empty_state.saturating_add(skipped_empty_state);
+        pc.amortization_components = pc
+            .amortization_components
+            .saturating_add(amortization_components);
         pc.elapsed_ns = pc.elapsed_ns.saturating_add(elapsed_ns);
         if let (Some(before), Some(after)) = (energy_before, energy_after)
             && before.is_finite()
@@ -294,6 +350,18 @@ pub(crate) fn record_predictive_coding(
         {
             pc.delta_rms_sum += delta_rms_mean;
             pc.delta_rms_samples = pc.delta_rms_samples.saturating_add(1);
+        }
+        if let Some(clip_fraction_mean) = clip_fraction_mean
+            && clip_fraction_mean.is_finite()
+        {
+            pc.clip_fraction_sum += clip_fraction_mean;
+            pc.clip_fraction_samples = pc.clip_fraction_samples.saturating_add(1);
+        }
+        if let Some(amortization_loss) = amortization_loss
+            && amortization_loss.is_finite()
+        {
+            pc.amortization_loss_sum += amortization_loss;
+            pc.amortization_loss_samples = pc.amortization_loss_samples.saturating_add(1);
         }
     });
 }
@@ -363,6 +431,37 @@ pub fn record_train_step(forward_ns: u128, loss_backward_ns: u128) {
     });
 }
 
+pub fn record_auxiliary_objectives(elapsed_ns: u128, proof_policy_ns: u128) {
+    record(|profile| {
+        profile.auxiliary_objective_ns = profile.auxiliary_objective_ns.saturating_add(elapsed_ns);
+        profile.proof_policy_ns = profile.proof_policy_ns.saturating_add(proof_policy_ns);
+    });
+}
+
+pub fn record_optimizer(elapsed_ns: u128) {
+    record(|profile| {
+        profile.optimizer_ns = profile.optimizer_ns.saturating_add(elapsed_ns);
+    });
+}
+
+pub fn record_metric_sync(elapsed_ns: u128) {
+    record(|profile| {
+        profile.metric_sync_ns = profile.metric_sync_ns.saturating_add(elapsed_ns);
+    });
+}
+
+pub fn record_validation(elapsed_ns: u128) {
+    record(|profile| {
+        profile.validation_ns = profile.validation_ns.saturating_add(elapsed_ns);
+    });
+}
+
+pub fn record_checkpoint(elapsed_ns: u128) {
+    record(|profile| {
+        profile.checkpoint_ns = profile.checkpoint_ns.saturating_add(elapsed_ns);
+    });
+}
+
 pub fn record_train_step_memory(
     before_reserved_bytes: u64,
     before_in_use_bytes: u64,
@@ -428,7 +527,7 @@ pub fn record_detail_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::detail_due_for;
+    use super::{detail_due_for, record_auxiliary_objectives, reset, snapshot};
 
     #[test]
     fn detail_due_respects_interval_and_max_steps() {
@@ -437,5 +536,16 @@ mod tests {
         assert!(detail_due_for(64, 64, None));
         assert!(!detail_due_for(64, 64, Some(64)));
         assert!(detail_due_for(63, 1, Some(64)));
+    }
+
+    #[test]
+    fn auxiliary_objective_profile_tracks_total_and_proof_policy_time() {
+        reset();
+        record_auxiliary_objectives(17, 11);
+        record_auxiliary_objectives(5, 0);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.auxiliary_objective_ns, 22);
+        assert_eq!(snapshot.proof_policy_ns, 11);
+        reset();
     }
 }

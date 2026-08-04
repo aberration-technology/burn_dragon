@@ -25,7 +25,10 @@ theorem simulation_composition
     (hg : Commutes stepB stepC g) :
     Commutes stepA stepC (fun x => g (f x)) := by
   intro x
-  rw [hf x, hg (f x)]
+  change g (f (stepA x)) = stepC (g (f x))
+  calc
+    g (f (stepA x)) = g (stepB (f x)) := congrArg g (hf x)
+    _ = stepC (g (f x)) := hg (f x)
 
 theorem finite_trajectory_preservation
     {A : Type u} {B : Type v}

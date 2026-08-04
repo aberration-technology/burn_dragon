@@ -323,6 +323,8 @@ fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparam
         block_size: 4,
         tbptt_chunk_size: None,
         tbptt_persist_across_steps: false,
+        sequence_batching: Default::default(),
+        retain_ephemeral_terminal_sequence_state: false,
         min_logical_block_size: None,
         batch_size: 2,
         seed: 1337,
@@ -348,12 +350,16 @@ fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparam
         predictive_coding: Default::default(),
         latent_reasoning: Default::default(),
         ruliad_supervision: Default::default(),
+        ruliad_probe_generation: Default::default(),
+        ruliad_policy_probe: Default::default(),
         module_lr_scales: Vec::new(),
         context_strategy: ContextStrategyConfig::Infinite,
         sequence_kernel_override: None,
         objective: Default::default(),
         gdpo: None,
         events: Default::default(),
+        validation: Default::default(),
+        sequence_state_probe: Default::default(),
         gates: Default::default(),
         dynamics: Default::default(),
         neuron_scaling: Default::default(),
@@ -435,7 +441,7 @@ fn mean_loss_on_batches<B: BackendTrait>(
     sum / count as f32
 }
 
-fn build_env<'a>(
+struct AdamwDynamicsEnvironment<'a> {
     run_dir: &'a Path,
     run_name: &'a str,
     training: &'a TrainingHyperparameters,
@@ -444,9 +450,23 @@ fn build_env<'a>(
     parallel_config: &'a ParallelConfig,
     device: &'a burn::tensor::Device<OptimizerDynamicsBackend>,
     devices: &'a [burn::tensor::Device<OptimizerDynamicsBackend>],
+}
+
+fn build_env<'a>(
+    environment: AdamwDynamicsEnvironment<'a>,
     train_batches: Vec<SequenceBatch<OptimizerDynamicsBackend>>,
     valid_batches: Vec<SequenceBatch<OptimizerDynamicsValidBackend>>,
 ) -> TrainEnvironment<'a, OptimizerDynamicsBackend> {
+    let AdamwDynamicsEnvironment {
+        run_dir,
+        run_name,
+        training,
+        model_config,
+        parallel_runtime,
+        parallel_config,
+        device,
+        devices,
+    } = environment;
     let total_steps = training
         .epochs
         .unwrap_or(1)
@@ -576,21 +596,23 @@ pub fn run_optimizer_dynamics(
         OptimizerDynamicsKind::AdamW => {
             let device = burn::tensor::Device::<OptimizerDynamicsBackend>::default();
             let valid_device = burn::tensor::Device::<OptimizerDynamicsValidBackend>::default();
-            let devices = vec![device.clone()];
+            let devices = vec![device];
             OptimizerDynamicsBackend::seed(&device, config.seed);
             let base_model =
                 DragonModel::<OptimizerDynamicsBackend>::new(model_config.clone(), &device);
             let initial_train_loss = mean_loss_on_batches(&base_model, train_batches(&device));
             let initial_loss = probe_loss(&base_model.clone().valid());
             let env = build_env(
-                run_dir,
-                "optimizer-dynamics-adamw",
-                &training,
-                &model_config,
-                &parallel_runtime,
-                &parallel_config,
-                &device,
-                &devices,
+                AdamwDynamicsEnvironment {
+                    run_dir,
+                    run_name: "optimizer-dynamics-adamw",
+                    training: &training,
+                    model_config: &model_config,
+                    parallel_runtime: &parallel_runtime,
+                    parallel_config: &parallel_config,
+                    device: &device,
+                    devices: &devices,
+                },
                 train_batches(&device),
                 valid_batches(&valid_device),
             );

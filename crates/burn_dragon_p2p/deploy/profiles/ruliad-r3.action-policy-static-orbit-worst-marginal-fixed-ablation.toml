@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-static-orbit-marginal-fixed-ablation.toml"]
+
+# Distributionally robust finite-group risk. The matched mean-orbit control
+# minimizes expected presentation loss; this arm minimizes each proof state's
+# worst cyclic presentation without introducing another scalar loss weight.
+[training.ruliad_supervision.proof_policy]
+presentation_risk = "worst"

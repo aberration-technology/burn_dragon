@@ -3752,6 +3752,7 @@ mod tests {
                     select_proof_action_weight: 0,
                     construct_proof_weight: 0,
                     check_proof_weight: 0,
+                    ..RuliadFormalTaskMixConfig::default()
                 },
                 ..RuliadSourceSelectionConfig::default()
             },

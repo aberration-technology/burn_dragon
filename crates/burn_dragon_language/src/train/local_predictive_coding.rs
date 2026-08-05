@@ -34,9 +34,9 @@ pub struct LocalPredictiveCodingDerivatives<B: AutodiffBackend> {
 }
 
 #[derive(Debug, Default)]
-struct LocalPredictiveCodingContextMasks<B: Backend> {
-    neuron: Option<Tensor<B, 4>>,
-    activity: Option<Tensor<B, 4>>,
+pub(super) struct LocalPredictiveCodingContextMasks<B: Backend> {
+    pub(super) neuron: Option<Tensor<B, 4>>,
+    pub(super) activity: Option<Tensor<B, 4>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
@@ -677,7 +677,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn local_predictive_coding_train_step_with_state_and_context_masks<B: AutodiffBackend>(
+pub(super) fn local_predictive_coding_train_step_with_state_and_context_masks<B: AutodiffBackend>(
     model: &DragonModel<B>,
     inputs: Tensor<B, 2, Int>,
     targets: Tensor<B, 2, Int>,

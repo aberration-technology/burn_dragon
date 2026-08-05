@@ -2730,6 +2730,85 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .expect("streaming TBPTT state lock poisoned") = Some(Box::new(state));
     }
 
+    pub(crate) fn streaming_state_for_checkpoint(&self) -> Option<ModelState<B>> {
+        self.streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned")
+            .as_ref()
+            .and_then(|state| state.downcast_ref::<ModelState<B>>().cloned())
+            .map(|mut state| {
+                state.detach_in_place();
+                state
+            })
+    }
+
+    pub(crate) fn gradient_scale_step_for_checkpoint(&self) -> usize {
+        self.gradient_scale_step.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn restore_gradient_scale_step_from_checkpoint(&self, step: usize) {
+        self.gradient_scale_step.store(step, Ordering::Relaxed);
+    }
+
+    pub(crate) fn teacher_model_for_checkpoint(&self) -> Option<(DragonModel<B>, usize)> {
+        self.teacher_model.as_ref()?;
+        let runtime = self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned");
+        let runtime = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.downcast_ref::<TeacherModelRuntime<B>>());
+        Some(runtime.map_or_else(
+            || {
+                (
+                    self.teacher_model
+                        .clone()
+                        .expect("checked teacher model presence"),
+                    0,
+                )
+            },
+            |runtime| (runtime.model.clone(), runtime.update_count),
+        ))
+    }
+
+    pub(crate) fn restore_teacher_model_from_checkpoint(
+        &self,
+        model: DragonModel<B>,
+        update_count: usize,
+    ) {
+        *self
+            .teacher_runtime
+            .inner
+            .lock()
+            .expect("teacher model runtime lock poisoned") = Some(Box::new(TeacherModelRuntime {
+            model,
+            update_count,
+        }));
+    }
+
+    pub(crate) fn restore_streaming_state_from_checkpoint(
+        &self,
+        mut state: ModelState<B>,
+    ) -> Result<(), String> {
+        let expected_layers = self.model.init_state().layers.len();
+        if state.layers.len() != expected_layers {
+            return Err(format!(
+                "runtime-state checkpoint has {} layers, expected {expected_layers}",
+                state.layers.len()
+            ));
+        }
+        state.detach_in_place();
+        *self
+            .streaming_state
+            .inner
+            .lock()
+            .expect("streaming TBPTT state lock poisoned") = Some(Box::new(state));
+        Ok(())
+    }
+
     #[cfg(test)]
     fn peek_step_state_for_test(&self) -> Option<ModelState<B>> {
         self.streaming_state
@@ -2740,7 +2819,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .and_then(|state| state.downcast_ref::<ModelState<B>>().cloned())
     }
 
-    fn slice_tokens(
+    pub(crate) fn slice_tokens(
         tensor: Tensor<B, 2, Int>,
         batch_size: usize,
         start: usize,
@@ -2971,6 +3050,41 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         (loss_value.value(), stats)
     }
 
+    pub(crate) fn validation_loss_and_output_degeneracy_with_subnetwork_masks(
+        &self,
+        batch: SequenceBatch<B>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+    ) -> (Tensor<B, 1>, Option<OutputDegeneracyStats>)
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        let logits = self
+            .model
+            .predictive_coding_forward_with_subnetwork_masks(
+                batch.inputs.clone(),
+                neuron_mask.clone(),
+                activity_mask.clone(),
+            )
+            .expect("validated predictive context masks");
+        let loss = masked_token_mean(
+            self.model
+                .language_token_losses_from_logits(logits, batch.targets.clone()),
+            batch.loss_mask.clone(),
+        );
+        let stats = self.output_degeneracy_for_batch_with_subnetwork_masks(
+            batch,
+            probe_tokens,
+            eos_id,
+            neuron_mask,
+            activity_mask,
+        );
+        (loss, stats)
+    }
+
     pub(crate) fn latent_reasoning_step_diagnostics(
         &self,
         batch: SequenceBatch<B>,
@@ -3111,6 +3225,40 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         probe_tokens: usize,
         eos_id: Option<i64>,
     ) -> Option<OutputDegeneracyStats> {
+        self.output_degeneracy_for_batch_impl(batch, probe_tokens, eos_id, None)
+    }
+
+    fn output_degeneracy_for_batch_with_subnetwork_masks(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> Option<OutputDegeneracyStats>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        self.output_degeneracy_for_batch_impl(
+            batch,
+            probe_tokens,
+            eos_id,
+            Some((neuron_mask, activity_mask)),
+        )
+    }
+
+    fn output_degeneracy_for_batch_impl(
+        &self,
+        batch: SequenceBatch<B>,
+        probe_tokens: usize,
+        eos_id: Option<i64>,
+        context_masks: Option<(Tensor<B, 4>, Tensor<B, 4>)>,
+    ) -> Option<OutputDegeneracyStats>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
         if probe_tokens == 0
             || self.pipeline_enabled()
             || self.model.uses_factorized_language_head()
@@ -3148,7 +3296,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 ])
             });
             let mut state = self.model.init_state();
-            let logits = if let Some(mask) = summary_event_mask {
+            let logits = if let Some((neuron_mask, activity_mask)) = context_masks.as_ref() {
+                self.model
+                    .predictive_coding_forward_with_subnetwork_masks_and_state(
+                        inputs,
+                        neuron_mask.clone(),
+                        activity_mask.clone(),
+                        &mut state,
+                    )
+                    .expect("validated predictive context masks")
+            } else if let Some(mask) = summary_event_mask {
                 self.model
                     .forward_with_state_and_summary_event_mask(inputs, mask, &mut state)
             } else {
@@ -3168,7 +3325,18 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 accumulator.record_generated_token(next);
                 let next_tensor =
                     Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), &device);
-                let logits = self.model.forward_with_state(next_tensor, &mut state);
+                let logits = match context_masks.as_ref() {
+                    Some((neuron_mask, activity_mask)) => self
+                        .model
+                        .predictive_coding_forward_with_subnetwork_masks_and_state(
+                            next_tensor,
+                            neuron_mask.clone(),
+                            activity_mask.clone(),
+                            &mut state,
+                        )
+                        .expect("validated predictive context masks"),
+                    None => self.model.forward_with_state(next_tensor, &mut state),
+                };
                 let [_, time, vocab] = logits.shape().dims::<3>();
                 if time == 0 || vocab == 0 {
                     break;
@@ -11358,6 +11526,170 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     }
 }
 
+pub(crate) struct PredictiveContextTrainStep<B: AutodiffBackend> {
+    pub output: TrainOutput<LanguageModelTrainItem<B>>,
+    pub terminal_state: Option<ModelState<B>>,
+}
+
+impl<B: AutodiffBackend> LanguageTrainModel<B> {
+    pub(crate) fn predictive_context_probe_loss(
+        &self,
+        batch: &SequenceBatch<B>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+        probe_tokens: usize,
+    ) -> Tensor<B::InnerBackend, 1>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        let [batch_size, block_size] = batch.inputs.shape().dims();
+        let time = probe_tokens.min(block_size).max(1);
+        let inputs = Self::slice_tokens(batch.inputs.clone(), batch_size, 0, time).inner();
+        let targets = Self::slice_tokens(batch.targets.clone(), batch_size, 0, time).inner();
+        let loss_mask = batch
+            .loss_mask
+            .clone()
+            .map(|mask| Self::slice_tokens(mask, batch_size, 0, time).inner());
+        let plain = self.model.valid();
+        let logits = plain
+            .predictive_coding_forward_with_subnetwork_masks(
+                inputs,
+                neuron_mask.inner(),
+                activity_mask.inner(),
+            )
+            .expect("validated predictive context masks");
+        burn_dragon_core::objective::masked_token_mean(
+            plain.language_token_losses_from_logits(logits, targets),
+            loss_mask,
+        )
+    }
+
+    pub(crate) fn predictive_context_train_step(
+        &self,
+        batch: SequenceBatch<B>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+        initial_state: Option<ModelState<B>>,
+    ) -> PredictiveContextTrainStep<B>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        let step_index = self.gradient_scale_step.load(Ordering::Relaxed);
+        B::seed(
+            &batch.inputs.device(),
+            stochastic_step_seed(self.stochastic_seed, step_index, STOCHASTIC_STREAM_MAIN),
+        );
+        let [batch_size, block_size] = batch.inputs.shape().dims::<2>();
+        let chunk_size = self.effective_tbptt_chunk_size(block_size);
+        if chunk_size.is_none() {
+            let initial_state = if self.tbptt_persist_across_steps {
+                Some(initial_state.unwrap_or_else(|| self.model.init_state()))
+            } else {
+                initial_state
+            };
+            let step = super::local_predictive_coding::local_predictive_coding_train_step_with_state_and_context_masks(
+                &self.model,
+                batch.inputs,
+                batch.targets,
+                batch.loss_mask,
+                initial_state,
+                super::local_predictive_coding::LocalPredictiveCodingContextMasks {
+                    neuron: Some(neuron_mask),
+                    activity: Some(activity_mask),
+                },
+                &self.local_predictive_coding,
+                &self.local_predictive_coding_profile,
+            );
+            debug_assert_eq!(step.report.global_backward_calls, 0);
+            if crate::train::profile::enabled() {
+                crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+            }
+            return PredictiveContextTrainStep {
+                output: TrainOutput {
+                    grads: self.apply_gradient_scale_schedule(step.grads),
+                    item: LanguageModelTrainItem::new(step.loss),
+                },
+                terminal_state: self
+                    .tbptt_persist_across_steps
+                    .then_some(step.terminal_state),
+            };
+        }
+
+        let mut state = initial_state.unwrap_or_else(|| self.model.init_state());
+        let mut accumulator = GradientsAccumulator::new();
+        let mut total_loss: Option<Tensor<B, 1>> = None;
+        let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
+        let mut total_elapsed_ns = 0u128;
+        let chunk_size = chunk_size.expect("checked predictive context chunk size");
+        for start in (0..block_size).step_by(chunk_size) {
+            let end = (start + chunk_size).min(block_size);
+            let chunk_inputs = Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
+            let chunk_targets = Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+            let chunk_loss_mask = batch
+                .loss_mask
+                .clone()
+                .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+            let mut step = super::local_predictive_coding::local_predictive_coding_train_step_with_state_and_context_masks(
+                &self.model,
+                chunk_inputs,
+                chunk_targets,
+                chunk_loss_mask,
+                Some(state),
+                super::local_predictive_coding::LocalPredictiveCodingContextMasks {
+                    neuron: Some(neuron_mask.clone()),
+                    activity: Some(activity_mask.clone()),
+                },
+                &self.local_predictive_coding,
+                &self.local_predictive_coding_profile,
+            );
+            debug_assert_eq!(step.report.global_backward_calls, 0);
+            state = step.terminal_state;
+            let supervised_tokens = step.supervised_tokens;
+            rescale_gradients_by_device_scalar::<B, _>(
+                self,
+                &mut step.grads,
+                supervised_tokens.clone().inner(),
+                false,
+            );
+            accumulator.accumulate(self, step.grads);
+            let weighted_loss = step.loss * supervised_tokens.clone();
+            total_loss = Some(match total_loss {
+                Some(accumulated) => accumulated + weighted_loss,
+                None => weighted_loss,
+            });
+            total_supervised_tokens = Some(match total_supervised_tokens {
+                Some(accumulated) => accumulated + supervised_tokens,
+                None => supervised_tokens,
+            });
+            total_elapsed_ns = total_elapsed_ns.saturating_add(step.report.elapsed_ns);
+        }
+        if crate::train::profile::enabled() {
+            crate::train::profile::record_local_learning_step(total_elapsed_ns);
+        }
+        let supervised_tokens = total_supervised_tokens
+            .expect("predictive context TBPTT requires at least one chunk")
+            .clamp_min(1.0);
+        let mut grads = accumulator.grads();
+        rescale_gradients_by_device_scalar::<B, _>(
+            self,
+            &mut grads,
+            supervised_tokens.clone().inner(),
+            true,
+        );
+        let loss = total_loss.expect("predictive context TBPTT requires at least one chunk")
+            / supervised_tokens;
+        PredictiveContextTrainStep {
+            output: TrainOutput {
+                grads: self.apply_gradient_scale_schedule(grads),
+                item: LanguageModelTrainItem::new(loss),
+            },
+            terminal_state: self.tbptt_persist_across_steps.then_some(state),
+        }
+    }
+}
+
 impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
     type Input = SequenceBatch<B>;
     type Output = LanguageModelTrainItem<B>;
@@ -12595,6 +12927,61 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let loss = self.language_loss_from_hidden(hidden, batch.targets, loss_mask);
         LanguageModelOutput::new(loss)
     }
+
+    pub(crate) fn step_with_predictive_context_stream_state(
+        &self,
+        batch: SequenceBatch<B>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+        state: &mut ModelState<B>,
+    ) -> LanguageModelOutput<B>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        if batch.reset_stream_state {
+            *state = self.model.init_state();
+        }
+        debug_assert!(
+            batch.summary_event_mask.is_none(),
+            "analytic predictive coding rejects summary memory"
+        );
+        let [batch_size, block_size] = batch.inputs.shape().dims::<2>();
+        let chunk_size = self
+            .effective_tbptt_chunk_size(block_size)
+            .unwrap_or(block_size)
+            .max(1);
+        let mut loss: Option<Tensor<B, 1>> = None;
+        for start in (0..block_size).step_by(chunk_size) {
+            let end = (start + chunk_size).min(block_size);
+            let inputs = Self::slice_tokens(batch.inputs.clone(), batch_size, start, end);
+            let targets = Self::slice_tokens(batch.targets.clone(), batch_size, start, end);
+            let loss_mask = batch
+                .loss_mask
+                .clone()
+                .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+            let logits = self
+                .model
+                .predictive_coding_forward_with_subnetwork_masks_and_state(
+                    inputs,
+                    neuron_mask.clone(),
+                    activity_mask.clone(),
+                    state,
+                )
+                .expect("validated predictive context masks");
+            let chunk_loss = masked_token_mean(
+                self.model
+                    .language_token_losses_from_logits(logits, targets),
+                loss_mask,
+            )
+            .mul_scalar((end - start) as f32 / block_size.max(1) as f32);
+            loss = Some(match loss {
+                Some(total) => total + chunk_loss,
+                None => chunk_loss,
+            });
+        }
+        LanguageModelOutput::new(loss.expect("streaming context batch must contain tokens"))
+    }
 }
 
 fn output_degeneracy_from_logits<B: BackendTrait>(
@@ -13633,6 +14020,54 @@ mod objective_step_tests {
             ),
             None,
         )
+    }
+
+    #[test]
+    fn all_active_context_stream_validation_matches_dense_tbptt() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 7_311);
+        let mut config = tiny_model_config();
+        config.sequence_kernel.executor =
+            burn_dragon_core::SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_tbptt_chunk_size(Some(2));
+        model
+            .model
+            .predictive_coding_support()
+            .expect("PC-compatible test model");
+        let mut dense_state = model.model.init_state();
+        let mut context_state = model.model.init_state();
+        let dense = model.step_with_stream_state(batch(&device), &mut dense_state);
+        let routed = model.step_with_predictive_context_stream_state(
+            batch(&device),
+            Tensor::ones([1, 1, 1, 8], &device),
+            Tensor::ones([1, 1, 1, 8], &device),
+            &mut context_state,
+        );
+        let dense_loss: LossValue<TestBackend> = dense.adapt();
+        let routed_loss: LossValue<TestBackend> = routed.adapt();
+        let loss_diff = (dense_loss.value() - routed_loss.value())
+            .abs()
+            .max()
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("loss difference")[0];
+        assert!(
+            loss_diff < 1.0e-5,
+            "routed stream loss mismatch: {loss_diff}"
+        );
+        assert_eq!(dense_state.position, context_state.position);
+        let rho_diff = (dense_state.layers[0].rho.clone().expect("dense rho")
+            - context_state.layers[0].rho.clone().expect("context rho"))
+        .abs()
+        .max()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("rho difference")[0];
+        assert!(rho_diff < 1.0e-5, "routed stream rho mismatch: {rho_diff}");
     }
 
     fn scalar_loss(output: TrainOutput<LanguageModelTrainItem<TestBackend>>) -> f32 {

@@ -213,11 +213,64 @@ Raw follow-up artifacts are
 is `target/pc-remaining-blockers/cuda-routed-confirmed-schema6-seed17.json`; production smoke events
 are under `runs/one-steel`, `runs/roasted-slope`, and `runs/odd-push`.
 
-The remaining promotion boundary is architectural: the normal Ruliad loader does not yet own a
+At the time of that matrix, the remaining promotion boundary was architectural: the normal Ruliad loader did not yet own a
 run-scoped context/subnetwork bank or context-scoped optimizer collection. Adding routing there
 without those two pieces would reproduce neither the controlled retention mechanism nor its
 checkpoint semantics. Until that integration receives a Ruliad holdout matrix, the predictive bank
-is a tested generic primitive and benchmark integration, not a default production policy.
+was a tested generic primitive and benchmark integration, not a default production policy. The
+follow-up below closes the lifecycle integration while retaining the quality promotion gate.
+
+### 2026-08-05 production routing and exact-resume follow-up
+
+The local language pipeline now owns the complete routed-learning state that was missing above.
+The router, selected sparse masks, per-context AdamW moments, per-context recurrent TBPTT state,
+source selector, stochastic schedule counter, stability controller, and `burn_ecs` run state are
+all checkpointed. Validation uses the selected context without mutating calibration, reports both
+source-weighted and stream-warm metrics, and keeps the same context-local recurrent state contract
+as training. Gradient accumulation rejects routed execution rather than silently sharing one
+context optimizer across an ambiguous accumulation window.
+
+The bounded release-CUDA confirmation uses 888,194 parameters, four shared Dragon layer uses,
+embedding 96, four heads, latent width 3,072, batch 16, block 16, 128 updates per task, four
+holdout batches per task, and seeds 17/29/43. It is deliberately shorter than the earlier
+batch-32/block-128 descriptor-control matrix: its purpose is to verify the production router and
+lifecycle implementation under three independent trajectories.
+
+| Learner | Seeds | Acq | Contexts | Selector | Final accuracy | Mean forgetting | Max forgetting | Tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Routed AdamW/backprop | 3 | 3/3 | 4 | 1.000 | 0.98134 | 0.00868 | 0.02257 | **23,127** |
+| Routed fixed prediction | 3 | 3/3 | 4 | 1.000 | **0.98958** | **0.00540** | **0.01505** | 18,094 |
+
+The paired fixed-prediction deltas are `+0.00825` final accuracy and `-0.00328` mean forgetting.
+Every arm discovers exactly four contexts and passes every acquisition gate. Fixed prediction
+makes zero global backward calls and 3,072 explicit local VJPs per run; backprop makes 512 global
+backward calls. Fixed prediction retains 78.3% of matched throughput. The direction is promising,
+but three ceiling-adjacent seeds on a modular recurrence stream are not evidence of intrinsic PC
+superiority or long-horizon Ruliad promotion. A 25,730-parameter, 64-update negative control only
+found three contexts and failed to learn durable validation behavior, establishing a minimum
+capacity/horizon boundary rather than a favorable result.
+
+Exact resume was tested independently with the same 888,194-parameter production profile. A fresh
+four-step run was captured after epoch two, then epochs three and four were replayed in a separate
+process. The final model, global optimizer, routing bank, context recurrent states, dynamics,
+model/config contract, scheduler, stochastic runtime state, source selector, stability state, and
+ECS gate/dashboard state all matched byte-for-byte. All 50 post-resume training events also matched
+in content and order after removing only run identity and elapsed wall time. Burn's binary context-
+optimizer recorder embeds process-local parameter IDs, so those bytes are not canonical across
+processes; identical model updates after two resumed optimizer steps provide the semantic parity
+check for that state.
+
+The generic P2P stack now has a signed `ContextSparseDelta` codec that binds family, slot,
+generation, and dynamic parameter catalog in both envelope and body, rejects stale-generation
+aggregation, and compiles on native and WASM. This is protocol readiness, not decentralized-PC
+promotion. Dragon will only enable that codec in a distributed training revision after a longer
+fixed-holdout Ruliad matrix clears quality, retention, restart, and bandwidth gates.
+
+The committed machine-readable summary is
+`docs/experiments/predictive-context-routing-20260805.json`; the full local matrix is
+`target/pc-context-routing-1m-three-seed-20260805.json`, and the exact replay pair is under
+`target/resume-capture/context-resume-parity-1m-v5-20260805/` and
+`target/context-resume-parity-1m-v5-20260805/`.
 
 ### 2026-08-04 canonical local-factor implementation
 

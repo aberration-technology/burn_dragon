@@ -48,7 +48,7 @@ pub(crate) use tracing::info;
 #[cfg(all(feature = "cuda", test))]
 pub(crate) use burn_cuda::Cuda;
 
-pub(crate) use serde::Serialize;
+pub(crate) use serde::{Deserialize, Serialize};
 
 pub(crate) use crate::config::{
     CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig, DragonStateConsistencyConfig,

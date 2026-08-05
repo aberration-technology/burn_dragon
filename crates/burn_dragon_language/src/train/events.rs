@@ -1,6 +1,8 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use burn_dragon_train::train::events::{
     BurnInterrupterControl, DynamicsEquilibriumPlugin, ModelCapacityConfig, ModelCapacityState,
     PredictiveCodingSample, TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext,
@@ -11,7 +13,8 @@ use burn_ecs::prelude::{
     App, Component, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Query, Res,
     SourceSelectionBucketMetric, SourceSelectionCapabilityCoverageMetric,
     SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt, TrainingMetricSample,
-    TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry, TrainingSet, Update,
+    TrainingMetricSplit, TrainingPlugins, TrainingRunCheckpointExt, TrainingRunId,
+    TrainingRunRegistry, TrainingRunStateCheckpoint, TrainingSet, Update,
 };
 
 use crate::config::{LocalPredictiveCodingSolver, TrainingAlgorithm, TrainingHyperparameters};
@@ -37,6 +40,88 @@ impl RuliadSourceSelectionConfig {
 pub struct TrainingEventHandles {
     pub interrupter: burn_train::Interrupter,
     pub metric_logger: TrainingEventMetricLogger,
+}
+
+const TRAINING_ECS_STATE_PREFIX: &str = "training-ecs-state";
+
+pub(crate) fn training_event_state_checkpoint_path(run_dir: &Path, epoch: usize) -> PathBuf {
+    run_dir
+        .join("checkpoint")
+        .join(format!("{TRAINING_ECS_STATE_PREFIX}-{epoch}.json"))
+}
+
+fn load_training_event_state_checkpoint(
+    run_name: &str,
+    run_dir: &Path,
+    training: &TrainingHyperparameters,
+) -> Result<Option<TrainingRunStateCheckpoint>> {
+    if !matches!(
+        training.launch_mode,
+        burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+    ) {
+        return Ok(None);
+    }
+    let (_, epoch) = crate::checkpoint::resolve_checkpoint_base(
+        &run_dir.join("checkpoint"),
+        training.resume_checkpoint_epoch,
+    )?;
+    let path = training_event_state_checkpoint_path(run_dir, epoch);
+    if !path.is_file() {
+        return Err(anyhow!(
+            "exact resume requires training ECS state checkpoint {}",
+            path.display()
+        ));
+    }
+    let checkpoint: TrainingRunStateCheckpoint = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if checkpoint.run_id.as_str() != run_name {
+        return Err(anyhow!(
+            "training ECS checkpoint {} belongs to run {}, expected {}",
+            path.display(),
+            checkpoint.run_id,
+            run_name
+        ));
+    }
+    Ok(Some(checkpoint))
+}
+
+pub(crate) fn save_training_event_state_checkpoint(
+    handles: &TrainingEventHandles,
+    run_name: &str,
+    run_dir: &Path,
+    epoch: usize,
+) -> Result<()> {
+    let checkpoint = handles.metric_logger.bus().snapshot_run_state(run_name)?;
+    let path = training_event_state_checkpoint_path(run_dir, epoch);
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&checkpoint).context("serialize training ECS state")?,
+    )
+    .with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("replace {} from {}", path.display(), temporary.display()))
+}
+
+/// Run-scoped observable state for predictive-context routing.
+///
+/// GPU masks, recurrent tensors, and optimizers remain owned by the training thread. This ECS
+/// component is the control-plane projection used by dashboards, gates, and external observers,
+/// so multiple runs can coexist without sharing context lifecycle state.
+#[derive(Clone, Component, Debug, Default, PartialEq)]
+pub struct PredictiveContextRoutingTelemetryState {
+    pub current_context: usize,
+    pub current_generation: u64,
+    pub known_contexts: usize,
+    pub probes: u64,
+    pub creations: u64,
+    pub replacements: u64,
+    pub novelty_deferrals: u64,
+    pub probe_tokens: u64,
+    pub selected_loss: Option<f64>,
+    pub last_absolute_step: usize,
 }
 
 #[derive(Clone, Component)]
@@ -151,6 +236,8 @@ pub fn build_training_event_handles_with_local_predictive_coding(
         capacity,
     };
     let dynamics_enabled = training.dynamics.enabled;
+    let context_routing_enabled = training.predictive_context_routing.enabled;
+    let restored_event_state = load_training_event_state_checkpoint(run_name, run_dir, training)?;
     let event_thread = TrainingRuntimeThread::spawn(
         move || {
             let mut app = App::new();
@@ -162,6 +249,9 @@ pub fn build_training_event_handles_with_local_predictive_coding(
             if local_predictive_coding.is_some() {
                 app.add_plugins(DragonLocalPredictiveCodingTelemetryPlugin);
             }
+            if context_routing_enabled {
+                app.add_plugins(DragonPredictiveContextRoutingTelemetryPlugin);
+            }
             if neuron_scaling.is_some() {
                 app.add_plugins(DragonNeuronScalingPlugin);
             }
@@ -172,6 +262,9 @@ pub fn build_training_event_handles_with_local_predictive_coding(
                 }
             }
             let run_entity = app.try_add_training_run_with(run, options)?;
+            if let Some(checkpoint) = restored_event_state {
+                app.restore_training_run_state(checkpoint)?;
+            }
             if let Some(source_selection) = source_selection {
                 app.world_mut()
                     .entity_mut(run_entity)
@@ -181,6 +274,11 @@ pub fn build_training_event_handles_with_local_predictive_coding(
                 app.world_mut()
                     .entity_mut(run_entity)
                     .insert(local_predictive_coding);
+            }
+            if context_routing_enabled {
+                app.world_mut()
+                    .entity_mut(run_entity)
+                    .insert(PredictiveContextRoutingTelemetryState::default());
             }
             if let Some((config, (_, request_slot))) = neuron_scaling {
                 app.world_mut().entity_mut(run_entity).insert(
@@ -203,6 +301,67 @@ pub fn build_training_event_handles_with_local_predictive_coding(
         interrupter,
         metric_logger,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DragonPredictiveContextRoutingTelemetryPlugin;
+
+impl Plugin for DragonPredictiveContextRoutingTelemetryPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            record_predictive_context_routing_from_metrics.in_set(TrainingSet::Telemetry),
+        );
+    }
+}
+
+fn record_predictive_context_routing_from_metrics(
+    mut metrics: MessageReader<TrainingMetricSample>,
+    registry: Res<TrainingRunRegistry>,
+    mut runs: Query<&mut PredictiveContextRoutingTelemetryState>,
+) {
+    for sample in metrics.read() {
+        if sample.split != TrainingMetricSplit::Train
+            || !sample.name.starts_with("Predictive Context ")
+        {
+            continue;
+        }
+        let Some(mut state) = registry.get_query_mut(&sample.run_id, &mut runs) else {
+            continue;
+        };
+        apply_predictive_context_routing_metric(&mut state, sample);
+    }
+}
+
+fn apply_predictive_context_routing_metric(
+    state: &mut PredictiveContextRoutingTelemetryState,
+    sample: &TrainingMetricSample,
+) {
+    state.last_absolute_step = sample.absolute_step;
+    match sample.name.as_str() {
+        "Predictive Context Index" => state.current_context = sample.value.max(0.0) as usize,
+        "Predictive Context Generation" => {
+            state.current_generation = sample.value.max(0.0) as u64;
+        }
+        "Predictive Context Count" => state.known_contexts = sample.value.max(0.0) as usize,
+        "Predictive Context Created" if sample.value > 0.5 => {
+            state.creations = state.creations.saturating_add(1);
+        }
+        "Predictive Context Replaced" if sample.value > 0.5 => {
+            state.replacements = state.replacements.saturating_add(1);
+        }
+        "Predictive Context Novelty Deferred" if sample.value > 0.5 => {
+            state.novelty_deferrals = state.novelty_deferrals.saturating_add(1);
+        }
+        "Predictive Context Probe Tokens" => {
+            state.probes = state.probes.saturating_add(1);
+            state.probe_tokens = state
+                .probe_tokens
+                .saturating_add(sample.value.max(0.0) as u64);
+        }
+        "Predictive Context Selected Loss" => state.selected_loss = Some(sample.value),
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -484,5 +643,42 @@ mod tests {
             local_predictive_coding_event_contract(LocalPredictiveCodingSolver::FixedPrediction),
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
         );
+    }
+
+    #[test]
+    fn predictive_context_metrics_update_entity_scoped_lifecycle_state() {
+        let mut state = PredictiveContextRoutingTelemetryState::default();
+        let sample = |name: &str, value: f64, absolute_step: usize| TrainingMetricSample {
+            run_id: "run-a".into(),
+            split: TrainingMetricSplit::Train,
+            epoch: 2,
+            step_in_epoch: 3,
+            absolute_step,
+            name: name.to_string(),
+            value,
+            running_value: value,
+        };
+        for metric in [
+            sample("Predictive Context Index", 3.0, 11),
+            sample("Predictive Context Generation", 2.0, 11),
+            sample("Predictive Context Count", 4.0, 11),
+            sample("Predictive Context Created", 1.0, 11),
+            sample("Predictive Context Replaced", 1.0, 11),
+            sample("Predictive Context Novelty Deferred", 1.0, 11),
+            sample("Predictive Context Probe Tokens", 128.0, 11),
+            sample("Predictive Context Selected Loss", 0.75, 11),
+        ] {
+            apply_predictive_context_routing_metric(&mut state, &metric);
+        }
+        assert_eq!(state.current_context, 3);
+        assert_eq!(state.current_generation, 2);
+        assert_eq!(state.known_contexts, 4);
+        assert_eq!(state.probes, 1);
+        assert_eq!(state.creations, 1);
+        assert_eq!(state.replacements, 1);
+        assert_eq!(state.novelty_deferrals, 1);
+        assert_eq!(state.probe_tokens, 128);
+        assert_eq!(state.selected_loss, Some(0.75));
+        assert_eq!(state.last_absolute_step, 11);
     }
 }

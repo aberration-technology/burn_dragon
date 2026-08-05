@@ -16,13 +16,17 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 use crate::ruliad::formal::{
     RuliadFormalGenerationSplit, RuliadFormalGeneratorConfig, generate_formal_bundle,
 };
+#[cfg(any(test, not(target_arch = "wasm32")))]
+use crate::ruliad::ir::RuliadFormalDomain;
 use crate::ruliad::ir::{
-    RuliadFormalDomain, RuliadProofBundle, RuliadProofCertificate, RuliadProofProblem,
-    RuliadProofSource, RuliadProofStep, RuliadRewriteDirection, RuliadTerm,
+    RuliadProofBundle, RuliadProofCertificate, RuliadProofProblem, RuliadProofSource,
+    RuliadProofStep, RuliadRewriteDirection, RuliadTerm,
 };
+#[cfg(any(test, not(target_arch = "wasm32")))]
 use crate::ruliad::rng::SplitMix64;
 
 pub const RULIAD_LEAN_CHECKER_VERSION: u32 = 1;
@@ -54,6 +58,7 @@ pub struct RuliadLeanPanelReport {
     pub verification: RuliadLeanVerificationReport,
 }
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn formal_verification_panel(
     seed: u64,
     difficulty_levels: &[usize],

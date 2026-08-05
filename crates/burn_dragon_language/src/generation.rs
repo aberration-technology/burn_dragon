@@ -958,6 +958,139 @@ pub fn generate_tokens<B: Backend>(
     generate_tokens_with_optional_seed(model, prompt_tokens, device, settings, None, &mut on_token)
 }
 
+/// Generate a greedy continuation through one predictive-context subnetwork.
+///
+/// Routed predictive coding has a distinct recurrent state and fixed neuron/activity masks for
+/// each context. Keeping this path explicit prevents verifier probes from accidentally evaluating
+/// the dense model while training updates only the selected subnetwork.
+pub(crate) fn generate_greedy_tokens_with_subnetwork_masks<B: Backend>(
+    model: &DragonModel<B>,
+    prompt_tokens: Vec<i64>,
+    device: &B::Device,
+    settings: GenerationSettings,
+    neuron_mask: Tensor<B, 4>,
+    activity_mask: Tensor<B, 4>,
+) -> Result<Vec<i64>>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    if prompt_tokens.is_empty() {
+        return Err(anyhow!("prompt must contain at least one token"));
+    }
+    if settings.top_k != Some(1) {
+        return Err(anyhow!(
+            "predictive-context verifier generation currently requires greedy top_k=1"
+        ));
+    }
+
+    let prompt_len = prompt_tokens.len();
+    let prompt_tensor = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(prompt_tokens.clone(), [1, prompt_len]),
+        device,
+    );
+    let prof_enabled = generation_profile_enabled();
+    if prof_enabled {
+        generation_profile_record(|profile| {
+            profile.prefill_tokens = profile.prefill_tokens.saturating_add(prompt_len as u64);
+            profile.host_to_device_copy_bytes = profile
+                .host_to_device_copy_bytes
+                .saturating_add((prompt_len.saturating_mul(size_of::<i64>())) as u128);
+        });
+    }
+    let mut state = model.init_state();
+    let prefill_start = prof_enabled.then(Instant::now);
+    let logits = model
+        .predictive_coding_forward_with_subnetwork_masks_and_state(
+            prompt_tensor,
+            neuron_mask.clone(),
+            activity_mask.clone(),
+            &mut state,
+        )
+        .map_err(anyhow::Error::msg)?;
+    if let Some(start) = prefill_start {
+        generation_profile_record(|profile| {
+            profile.prefill_forward_ns = profile
+                .prefill_forward_ns
+                .saturating_add(start.elapsed().as_nanos());
+        });
+    }
+    let [_, time, vocab] = logits.shape().dims::<3>();
+    let mut last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+    let mut full_tokens = prompt_tokens;
+    let mut generated = 0usize;
+
+    if let ContextStrategy::Sliding { window } = settings.strategy
+        && window > 0
+        && state.position > window
+    {
+        state.trim(window);
+    }
+
+    while settings.max_new_tokens.is_none_or(|max| generated < max) {
+        let host_start = prof_enabled.then(Instant::now);
+        let next = sample_argmax_token(last_logits.div_scalar(settings.temperature))?;
+        if let Some(start) = host_start {
+            generation_profile_record(|profile| {
+                profile.sample_host_transfer_ns = profile
+                    .sample_host_transfer_ns
+                    .saturating_add(start.elapsed().as_nanos());
+                profile.host_sync_points = profile.host_sync_points.saturating_add(1);
+                profile.device_to_host_copy_bytes = profile
+                    .device_to_host_copy_bytes
+                    .saturating_add(size_of::<i64>() as u128);
+            });
+        }
+        full_tokens.push(next);
+        generated = generated.saturating_add(1);
+        if settings.stop_on_token == Some(next) {
+            break;
+        }
+
+        let copy_start = prof_enabled.then(Instant::now);
+        let next_tensor =
+            Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), device);
+        if let Some(start) = copy_start {
+            generation_profile_record(|profile| {
+                profile.token_tensor_copy_ns = profile
+                    .token_tensor_copy_ns
+                    .saturating_add(start.elapsed().as_nanos());
+                profile.host_to_device_copy_bytes = profile
+                    .host_to_device_copy_bytes
+                    .saturating_add(size_of::<i64>() as u128);
+            });
+        }
+        let forward_start = prof_enabled.then(Instant::now);
+        let logits = model
+            .predictive_coding_forward_with_subnetwork_masks_and_state(
+                next_tensor,
+                neuron_mask.clone(),
+                activity_mask.clone(),
+                &mut state,
+            )
+            .map_err(anyhow::Error::msg)?;
+        if let Some(start) = forward_start {
+            generation_profile_record(|profile| {
+                profile.token_forward_ns = profile
+                    .token_forward_ns
+                    .saturating_add(start.elapsed().as_nanos());
+                profile.token_steps = profile.token_steps.saturating_add(1);
+            });
+        }
+        let [_, time, vocab] = logits.shape().dims::<3>();
+        last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+
+        if let ContextStrategy::Sliding { window } = settings.strategy
+            && window > 0
+            && state.position > window
+        {
+            state.trim(window);
+        }
+    }
+
+    Ok(full_tokens)
+}
+
 pub fn generate_tokens_seeded<B: Backend>(
     model: &DragonModel<B>,
     prompt_tokens: Vec<i64>,
@@ -1206,18 +1339,19 @@ mod tests {
 
     fn test_model(device: &burn::tensor::Device<TestBackend>) -> DragonModel<TestBackend> {
         TestBackend::seed(device, 9_171);
-        DragonModel::new(
-            burn_dragon_core::DragonConfig {
-                n_layer: 2,
-                n_embd: 16,
-                n_head: 2,
-                mlp_internal_dim_multiplier: 2,
-                vocab_size: 32,
-                dropout: 0.0,
-                ..Default::default()
-            },
-            device,
-        )
+        let mut config = burn_dragon_core::DragonConfig {
+            n_layer: 2,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        config.sequence_kernel.executor =
+            burn_dragon_core::SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        DragonModel::new(config, device)
     }
 
     fn serial_greedy(
@@ -1342,5 +1476,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn all_active_predictive_context_generation_matches_dense_greedy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = test_model(&device);
+        model
+            .predictive_coding_support()
+            .expect("PC-compatible model");
+        let prompt = vec![1, 7, 3, 9];
+        let settings = GenerationSettings {
+            max_new_tokens: Some(6),
+            temperature: 1.0,
+            top_k: Some(1),
+            strategy: ContextStrategy::Infinite,
+            stop_on_token: None,
+        };
+        let expected = generate_tokens(&model, prompt.clone(), &device, settings, None)
+            .expect("dense greedy generation");
+        let neuron_mask = Tensor::<TestBackend, 4>::ones([1, 2, 1, 16], &device);
+        let activity_mask = Tensor::<TestBackend, 4>::ones([1, 1, 1, 16], &device);
+        let actual = generate_greedy_tokens_with_subnetwork_masks(
+            &model,
+            prompt,
+            &device,
+            settings,
+            neuron_mask,
+            activity_mask,
+        )
+        .expect("context greedy generation");
+        assert_eq!(actual, expected);
     }
 }

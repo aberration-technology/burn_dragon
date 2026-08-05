@@ -172,6 +172,57 @@ fn resolve_resume_checkpoint_epoch(
     Ok(Some(epoch))
 }
 
+fn configure_resume_source_selection_state(
+    config: &mut TrainingConfig,
+    dataset: &Dataset,
+    run_dir: &Path,
+    resume_checkpoint_epoch: Option<usize>,
+) -> Result<bool> {
+    let Some(epoch) = resume_checkpoint_epoch else {
+        return Ok(false);
+    };
+    if !dataset.uses_live_source_selection() {
+        return Ok(false);
+    }
+    let checkpoint_path = run_dir
+        .join("checkpoint")
+        .join(format!("source-selection-state-{epoch}.json"));
+    if !checkpoint_path.is_file() {
+        if matches!(
+            config.training.launch_mode,
+            burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+        ) {
+            return Err(anyhow!(
+                "exact resume of live source selection requires {}",
+                checkpoint_path.display()
+            ));
+        }
+        warn!(
+            "resume checkpoint {epoch} has no source-selection state at {}; live curriculum will use configured initialization",
+            checkpoint_path.display()
+        );
+        return Ok(false);
+    }
+    config.training.source_selection_state_path = Some(checkpoint_path.clone());
+    info!(
+        "resume source-selection state: epoch={epoch} path={}",
+        checkpoint_path.display()
+    );
+    Ok(true)
+}
+
+fn validate_resolved_context_routing_batching(config: &TrainingConfig) -> Result<()> {
+    if config.training.predictive_context_routing.enabled
+        && config.training.gradient_accumulation_steps != 1
+    {
+        return Err(anyhow!(
+            "startup batching resolved gradient_accumulation_steps={} for predictive context routing; routed gradients must not cross context-owned optimizer steps",
+            config.training.gradient_accumulation_steps
+        ));
+    }
+    Ok(())
+}
+
 fn initialize_model_from_checkpoint<B: BackendTrait>(
     resolved_config: &TrainingConfig,
     training: &TrainingHyperparameters,
@@ -271,6 +322,9 @@ fn use_event_scheduler_for_training(
 ) -> bool {
     let local_runtime_objectives = training.dynamics.enabled
         || training.sequence_state_probe.enabled
+        || training.predictive_context_routing.enabled
+        || (matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding)
+            && training.tbptt_persist_across_steps)
         || (training.events.source_weighted_validation_batches > 0
             && source_selection_uses_live_policy);
 
@@ -644,6 +698,17 @@ where
     );
 
     let mut resolved_config = config.clone();
+    let run_root = resolve_run_root();
+    let (run_dir, run_name) =
+        resolve_run_artifacts(&parallel_runtime, &run_root, &resolved_config.training)?;
+    let resume_checkpoint_epoch =
+        resolve_resume_checkpoint_epoch(&resolved_config.training, &run_dir)?;
+    let resume_source_selection = configure_resume_source_selection_state(
+        &mut resolved_config,
+        &dataset,
+        &run_dir,
+        resume_checkpoint_epoch,
+    )?;
     let startup_autotune = resolve_startup_batch_size_forward_only::<B>(
         &resolved_config,
         &dataset,
@@ -670,8 +735,11 @@ where
         .optimizer
         .apply_auto_eggroll_population(resolved_config.training.batch_size);
     resolved_config.optimizer.apply_effective_eggroll_config();
+    validate_resolved_context_routing_batching(&resolved_config)?;
 
-    let datasets = if resolved_config.training.batch_size == config.training.batch_size {
+    let datasets = if resolved_config.training.batch_size == config.training.batch_size
+        && !resume_source_selection
+    {
         crate::train::utils::PreparedDatasets {
             train: Arc::clone(&dataset),
             valid: Arc::clone(&dataset),
@@ -786,9 +854,6 @@ where
     let steps_per_epoch = schedule.steps_per_epoch;
     let total_epochs = schedule.total_epochs;
     let total_steps = schedule.total_steps;
-    let run_root = resolve_run_root();
-    let (run_dir, run_name) = resolve_run_artifacts(&parallel_runtime, &run_root, training)?;
-    let resume_checkpoint_epoch = resolve_resume_checkpoint_epoch(training, &run_dir)?;
     let resume_consumed_steps = resume_checkpoint_epoch
         .unwrap_or_default()
         .saturating_mul(steps_per_epoch);
@@ -1154,6 +1219,17 @@ where
     info!("resolved training devices: {}", devices.len());
 
     let mut resolved_config = config.clone();
+    let run_root = resolve_run_root();
+    let (run_dir, run_name) =
+        resolve_run_artifacts(&parallel_runtime, &run_root, &resolved_config.training)?;
+    let resume_checkpoint_epoch =
+        resolve_resume_checkpoint_epoch(&resolved_config.training, &run_dir)?;
+    let resume_source_selection = configure_resume_source_selection_state(
+        &mut resolved_config,
+        &dataset,
+        &run_dir,
+        resume_checkpoint_epoch,
+    )?;
     let startup_autotune =
         resolve_startup_batch_size::<B>(&resolved_config, &dataset, backend_name, &device)?;
     if let Some(report) = &startup_autotune {
@@ -1171,8 +1247,11 @@ where
     if matches!(resolved_config.optimizer.name, OptimizerKind::Eggroll) {
         resolved_config.optimizer.apply_effective_eggroll_config();
     }
+    validate_resolved_context_routing_batching(&resolved_config)?;
 
-    let datasets = if resolved_config.training.batch_size == config.training.batch_size {
+    let datasets = if resolved_config.training.batch_size == config.training.batch_size
+        && !resume_source_selection
+    {
         crate::train::utils::PreparedDatasets {
             train: Arc::clone(&dataset),
             valid: Arc::clone(&dataset),
@@ -1404,9 +1483,6 @@ where
     let steps_per_epoch = schedule.steps_per_epoch;
     let total_epochs = schedule.total_epochs;
     let total_steps = schedule.total_steps;
-    let run_root = resolve_run_root();
-    let (run_dir, run_name) = resolve_run_artifacts(&parallel_runtime, &run_root, training)?;
-    let resume_checkpoint_epoch = resolve_resume_checkpoint_epoch(training, &run_dir)?;
     let resume_consumed_steps = resume_checkpoint_epoch
         .unwrap_or_default()
         .saturating_mul(steps_per_epoch);

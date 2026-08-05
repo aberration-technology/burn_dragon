@@ -661,6 +661,7 @@ where
         window_id: context.window_id,
         lease_id: context.lease_id.clone(),
         codec: context.contract.update_codec.clone(),
+        routing_context: None,
         artifact: artifact.clone(),
         decoded_tensor_digest: Some(decoded_tensor_digest),
         claimed_norm_stats: Some(norm_stats),

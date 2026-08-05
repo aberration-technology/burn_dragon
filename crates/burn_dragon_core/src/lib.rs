@@ -123,7 +123,7 @@ pub use model::{
     GatedDeltaNet2GateMode, GatedDeltaNet2Implementation, GatedDeltaNet2StatePrecision, HaltHead,
     HierarchicalDragonConfig, HierarchicalDragonSharing, LanguageHeadConfig,
     LanguageMhcLayerDiagnostics, LanguagePipelineState, LatentFanoutScheduleConfig,
-    LatentReasoningConfig, LatentReasoningOutput, LogitsProjectionProfileSnapshot,
+    LatentReasoningConfig, LatentReasoningOutput, LayerState, LogitsProjectionProfileSnapshot,
     LowRankResidualMemoryProfileSnapshot, LowRankResidualMemoryStageSnapshot,
     LowRankResidualOutput, LowRankResidualProfileSnapshot, MambaSequenceConfig,
     ManifoldHyperConnectionCoefficientPolicy, ManifoldHyperConnectionCoefficients,

@@ -692,6 +692,15 @@ pub fn write_run_config(
     let payload =
         serde_json::to_string_pretty(&output).context("failed to serialize web config")?;
     let path = run_dir.join("config.json");
-    fs::write(&path, payload).with_context(|| format!("failed to write {}", path.display()))?;
+    if !path.is_file() {
+        fs::write(&path, payload).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    super::manifest::write_experiment_manifest(
+        config,
+        model_config,
+        run_dir,
+        run_name,
+        backend_name,
+    )?;
     Ok(())
 }

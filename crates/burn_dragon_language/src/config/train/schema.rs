@@ -638,6 +638,59 @@ impl Default for LocalPredictiveCodingConfig {
     }
 }
 
+fn default_predictive_context_probe_every_steps() -> usize {
+    8
+}
+
+fn default_predictive_context_probe_tokens() -> usize {
+    16
+}
+
+fn default_predictive_context_novelty_confirmations() -> u64 {
+    3
+}
+
+fn default_predictive_context_active_fraction() -> f32 {
+    0.25
+}
+
+/// Run-scoped causal context discovery and sparse subnetwork routing.
+///
+/// Contexts own optimizer moments and recurrent stream state. Model weights
+/// remain one shared Dragon parameter set; deterministic sparse masks isolate
+/// the selected low-rank and residual channels.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PredictiveContextRoutingConfig {
+    pub enabled: bool,
+    #[serde(default = "default_predictive_context_probe_every_steps")]
+    pub probe_every_steps: usize,
+    #[serde(default = "default_predictive_context_probe_tokens")]
+    pub probe_tokens: usize,
+    #[serde(default = "default_predictive_context_novelty_confirmations")]
+    pub novelty_confirmations: u64,
+    #[serde(default = "default_predictive_context_active_fraction")]
+    pub active_fraction: f32,
+    pub bank: burn_pc::PredictiveContextBankConfig,
+}
+
+impl Default for PredictiveContextRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_every_steps: default_predictive_context_probe_every_steps(),
+            probe_tokens: default_predictive_context_probe_tokens(),
+            novelty_confirmations: default_predictive_context_novelty_confirmations(),
+            active_fraction: default_predictive_context_active_fraction(),
+            bank: burn_pc::PredictiveContextBankConfig {
+                max_contexts: 8,
+                capacity_policy: burn_pc::PredictiveContextCapacityPolicy::ReplaceLeastRecentlyUsed,
+                ..burn_pc::PredictiveContextBankConfig::default()
+            },
+        }
+    }
+}
+
 fn default_predictive_coding_step_size() -> f32 {
     0.03
 }
@@ -1216,6 +1269,8 @@ pub struct TrainingHyperparameters {
     pub predictive_coding: PredictiveCodingConfig,
     #[serde(default)]
     pub local_predictive_coding: LocalPredictiveCodingConfig,
+    #[serde(default)]
+    pub predictive_context_routing: PredictiveContextRoutingConfig,
     #[serde(default)]
     pub latent_reasoning: LatentReasoningTrainingConfig,
     #[serde(default)]

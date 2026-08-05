@@ -25,7 +25,7 @@ describe the public training network as adversarially production-ready.
 | initial weights | signed full-head genesis, content-addressed artifact verification, and canonical decoded-tensor verification on native and browser loaders | clean-storage staging canary using the production artifact |
 | native training | one-shot/continuous windows, a protocol-aware managed trainer daemon, head reconcile, TBPTT state, capability downgrade/upgrade, exact three-peer candidate/root replay, corrected formal-Ruliad convergence parity, and three-seed DiLoCo parity | run a 24-hour restart and partition soak |
 | browser training | ArtifactWindows WebGPU AdamW and forward-only seeded-fitness paths, real Chrome/WebGPU generated NCA and formal-Ruliad windows, clean no-WebGPU downgrade, and fail-closed DiLoCo selection | deployed Pages/edge/WebGPU training canary against a signed production contract; implement browser DiLoCo before claiming mixed-protocol trainer parity |
-| compact updates | bounded seeded-fitness publication, deterministic reconstruction, authenticated lease recovery, and independent sampled fitness replay | untrusted multi-validator quorum and quarantine drill |
+| compact updates | bounded seeded-fitness publication, deterministic reconstruction, authenticated lease recovery, independent sampled fitness replay, and a generation-bound context-sparse codec | untrusted multi-validator quorum and quarantine drill; activate routed-PC only after its local Ruliad quality gate |
 | capability policy | conservative preflight, persistent downgrade, revisioned live roles, memory-headroom re-probe, success hysteresis, and bounded backoff | device-loss/recreation drill on each supported GPU backend |
 | read-only peers | observer/verifier scopes, projections, role replacement rather than stale-role union, retrospective diffusion evaluation, pre-promotion validator-quorum evaluation bound to the exact head/artifact/protocol/report, a real two-validator Ruliad quorum, a CUDA-trainer/CPU-validator promotion gate, and a concurrent 10M CUDA/CPU-peer duty stress | network-coupled large-model/WAN evaluator soak, untrusted disagreement/quarantine drill, and public UI authorization drill |
 | ECS integration | run-scoped lifecycle, capability, window, reconcile, and bounded ingress state | sustained multi-run ingress soak |
@@ -36,6 +36,17 @@ Unit tests prove contract mechanics and deterministic behavior. The release
 matrix provides bounded local convergence evidence; it does not prove
 long-horizon convergence, Byzantine robustness, or acceptable production
 economics.
+
+The context-sparse codec is currently a protocol capability, not an advertised
+distributed learning mode. It signs the dynamic context family, slot,
+generation, and parameter catalog; native and browser builds share the same
+decoder and stale-generation rejection. Dragon's local routed fixed-prediction
+pipeline now checkpoints its context bank, optimizer moments, recurrent state,
+curriculum, and ECS gate state exactly. A three-seed 888,194-parameter CUDA
+control reaches convergence/retention parity with matched routed AdamW while
+retaining 78.3% throughput. A longer fixed-holdout Ruliad matrix, restart soak,
+and measured wire-volume comparison are still required before a revision may
+select this codec for decentralized training.
 
 ## one revision, heterogeneous execution
 

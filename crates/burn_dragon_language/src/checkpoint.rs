@@ -172,6 +172,10 @@ pub fn write_training_snapshot(
         snapshot.dataset.tokenizer.vocab_path = Some(PathBuf::from(TOKENIZER_SNAPSHOT_FILE_NAME));
     }
 
+    let canonical_path = training_snapshot_path(run_dir);
+    if canonical_path.is_file() {
+        return Ok(());
+    }
     write_json_snapshot(run_dir, TRAINING_SNAPSHOT_FILE_NAME, &snapshot)
 }
 

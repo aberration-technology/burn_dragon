@@ -896,6 +896,50 @@ where
         )
     }
 
+    /// Forward one context-selected subnetwork while carrying its recurrent
+    /// linear-attention state. This is the inference counterpart of the local
+    /// PC/TBPTT path and is used by routed validation and generation.
+    pub fn predictive_coding_forward_with_subnetwork_masks_and_state(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+        state: &mut ModelState<B>,
+    ) -> Result<Tensor<B, 3>, String> {
+        self.predictive_coding_support()?;
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)?;
+        self.predictive_coding_validate_activity_mask(&activity_mask)?;
+        if state.layers.len() != self.predictive_coding_layer_count() {
+            return Err(format!(
+                "predictive-coding state has {} layers, expected {}",
+                state.layers.len(),
+                self.predictive_coding_layer_count()
+            ));
+        }
+        let [batch, time] = tokens.shape().dims::<2>();
+        let mut activity = self
+            .predictive_coding_initial_activity_with_activity_mask(tokens, activity_mask.clone());
+        for layer_index in 0..self.predictive_coding_layer_count() {
+            let trace = self.predictive_coding_forward_layer_with_recurrent_state(
+                activity,
+                layer_index,
+                state.layers[layer_index].rho.take(),
+                Some(neuron_mask.clone()),
+                Some(activity_mask.clone()),
+            )?;
+            state.layers[layer_index].rho = Some(self.predictive_coding_terminal_rho(&trace));
+            activity = trace.next * activity_mask.clone();
+        }
+        state.position = state.position.saturating_add(time);
+        let hidden = self.predictive_coding_hidden_from_activity(activity);
+        let head = self.predictive_coding_head_weight()?;
+        let vocab = head.shape().dims::<2>()[1];
+        Ok(hidden
+            .reshape([batch * time, self.n_embd])
+            .matmul(head)
+            .reshape([batch, time, vocab]))
+    }
+
     fn predictive_coding_forward_with_context_masks(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -1121,6 +1165,85 @@ mod tests {
             expected.current().clone().reshape([1, 4, 8]),
         );
         assert!(diff < 1.0e-5, "PC factor forward mismatch: {diff}");
+    }
+
+    #[test]
+    fn context_masked_recurrent_forward_matches_one_shot_forward() {
+        let device = Default::default();
+        let model = DragonModel::<TestBackend>::new(config(), &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let neuron_mask = Tensor::<TestBackend, 4>::ones([1, 2, 1, 8], &device);
+        let activity_mask = Tensor::<TestBackend, 4>::ones([1, 1, 1, 8], &device);
+        let expected = model
+            .predictive_coding_forward_with_subnetwork_masks(
+                tokens.clone(),
+                neuron_mask.clone(),
+                activity_mask.clone(),
+            )
+            .expect("one-shot context forward");
+        let mut state = model.init_state();
+        let first = model
+            .predictive_coding_forward_with_subnetwork_masks_and_state(
+                tokens.clone().slice([0..1, 0..2]),
+                neuron_mask.clone(),
+                activity_mask.clone(),
+                &mut state,
+            )
+            .expect("first recurrent context chunk");
+        let second = model
+            .predictive_coding_forward_with_subnetwork_masks_and_state(
+                tokens.slice([0..1, 2..4]),
+                neuron_mask,
+                activity_mask,
+                &mut state,
+            )
+            .expect("second recurrent context chunk");
+        let actual = Tensor::cat(vec![first, second], 1);
+        let diff = max_abs_diff(expected, actual);
+        assert!(diff < 1.0e-5, "recurrent context forward mismatch: {diff}");
+        assert_eq!(state.position, 4);
+        assert!(state.layers[0].rho.is_some());
+    }
+
+    #[test]
+    fn context_masked_layer_vjp_accepts_independent_head_masks() {
+        let device = Default::default();
+        let model = DragonModel::<TestBackend>::new(config(), &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let activity = model.predictive_coding_initial_activity(tokens);
+        let neuron_mask = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                vec![
+                    1.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                    1.0,
+                ],
+                [1, 2, 1, 8],
+            ),
+            &device,
+        );
+        let activity_mask = Tensor::<TestBackend, 4>::ones([1, 1, 1, 8], &device);
+        let trace = model.predictive_coding_forward_layer_with_subnetwork_masks(
+            activity,
+            0,
+            neuron_mask.clone(),
+            activity_mask.clone(),
+        );
+        let vjp = model.predictive_coding_layer_vjp_with_subnetwork_masks(
+            0,
+            &trace,
+            Tensor::ones([1, 1, 4, 8], &device),
+            neuron_mask,
+            activity_mask,
+        );
+        assert_eq!(vjp.grad_encoder.shape().dims::<3>(), [2, 8, 8]);
+        assert_eq!(vjp.grad_encoder_v.shape().dims::<3>(), [2, 8, 8]);
+        assert_eq!(vjp.grad_input.shape().dims::<4>(), [1, 1, 4, 8]);
     }
 
     #[test]

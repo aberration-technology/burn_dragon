@@ -3708,6 +3708,83 @@ impl TrainingConfig {
                 "training.algorithm=predictive_coding currently requires linear_attention, dense_score_short_context, and ALiBi"
             ));
         }
+        self.validate_predictive_context_routing()?;
+        Ok(())
+    }
+
+    fn validate_predictive_context_routing(&self) -> Result<()> {
+        let routing = &self.training.predictive_context_routing;
+        if !routing.enabled {
+            return Ok(());
+        }
+        routing.bank.validate().map_err(anyhow::Error::msg)?;
+        if routing.probe_every_steps == 0 {
+            return Err(anyhow!(
+                "training.predictive_context_routing.probe_every_steps must be > 0"
+            ));
+        }
+        if routing.probe_tokens == 0 {
+            return Err(anyhow!(
+                "training.predictive_context_routing.probe_tokens must be > 0"
+            ));
+        }
+        if routing.novelty_confirmations == 0 {
+            return Err(anyhow!(
+                "training.predictive_context_routing.novelty_confirmations must be > 0"
+            ));
+        }
+        if !(0.0..=1.0).contains(&routing.active_fraction)
+            || routing.active_fraction <= f32::EPSILON
+            || !routing.active_fraction.is_finite()
+        {
+            return Err(anyhow!(
+                "training.predictive_context_routing.active_fraction must be finite and in (0, 1]"
+            ));
+        }
+        if !matches!(
+            self.training.local_predictive_coding.solver,
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction
+        ) {
+            return Err(anyhow!(
+                "training.predictive_context_routing currently requires local_predictive_coding.solver=fixed_prediction"
+            ));
+        }
+        if self.training.dynamics.enabled
+            || self.training.neuron_scaling.enabled
+            || self.training.continual_backprop.enabled
+        {
+            return Err(anyhow!(
+                "training.predictive_context_routing owns bounded context optimizer/state lifecycles and cannot be combined with dynamics, neuron_scaling, or continual_backprop"
+            ));
+        }
+        if self.training.gradient_accumulation_steps != 1
+            || self
+                .training
+                .target_effective_batch_size
+                .is_some_and(|target| target > self.training.batch_size)
+        {
+            return Err(anyhow!(
+                "training.predictive_context_routing requires one microbatch per optimizer step; set gradient_accumulation_steps=1 and target_effective_batch_size <= batch_size"
+            ));
+        }
+        if !matches!(
+            self.training.validation.sampling,
+            crate::config::TrainingValidationSampling::FixedHoldout
+        ) {
+            return Err(anyhow!(
+                "training.predictive_context_routing requires fixed_holdout validation"
+            ));
+        }
+        if self.training.ruliad_policy_probe.enabled {
+            return Err(anyhow!(
+                "training.predictive_context_routing does not yet support hidden-state Ruliad policy probes; disable training.ruliad_policy_probe so validation cannot bypass the selected subnetwork"
+            ));
+        }
+        if self.training.events.ruliad_contract_probe_enabled {
+            return Err(anyhow!(
+                "training.predictive_context_routing does not yet support constrained Ruliad contract decoding; disable training.events.ruliad_contract_probe_enabled so validation cannot bypass the selected subnetwork"
+            ));
+        }
         Ok(())
     }
 }
@@ -4392,6 +4469,61 @@ start_policy = "capability_gate"
         config
             .validate()
             .expect("fixed-prediction local PC contract should validate");
+    }
+
+    #[test]
+    fn predictive_context_routing_requires_fixed_prediction_and_validates_bounded_bank() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        config.training.predictive_context_routing.enabled = true;
+        config.training.dynamics.enabled = false;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config
+            .validate()
+            .expect("bounded predictive context routing contract should validate");
+
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium;
+        assert!(
+            config
+                .validate()
+                .expect_err("non-triangular context learner must fail closed")
+                .to_string()
+                .contains("solver=fixed_prediction")
+        );
+
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        config.training.ruliad_policy_probe.enabled = true;
+        assert!(
+            config
+                .validate()
+                .expect_err("routed hidden-state policy probe must fail closed")
+                .to_string()
+                .contains("hidden-state Ruliad policy probes")
+        );
+        config.training.ruliad_policy_probe.enabled = false;
+        config.training.events.ruliad_contract_probe_enabled = true;
+        assert!(
+            config
+                .validate()
+                .expect_err("routed constrained decoder must fail closed")
+                .to_string()
+                .contains("constrained Ruliad contract decoding")
+        );
+        config.training.events.ruliad_contract_probe_enabled = false;
+        config.training.gradient_accumulation_steps = 2;
+        assert!(
+            config
+                .validate()
+                .expect_err("cross-context gradient accumulation must fail closed")
+                .to_string()
+                .contains("gradient_accumulation_steps=1")
+        );
     }
 
     #[test]

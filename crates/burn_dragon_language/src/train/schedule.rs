@@ -1,6 +1,9 @@
 use crate::dataset::scheduler::TokenSequenceDataset;
 use crate::train::dynamics::{ActiveDynamicsControl, DragonDynamicsControlSlot};
 use crate::train::prelude::*;
+use crate::train::runtime_checkpoint::{
+    load_runtime_state_checkpoint, save_runtime_state_checkpoint,
+};
 use crate::train::utils::log_theoretical_profile;
 #[cfg(feature = "ddp")]
 use burn::tensor::TensorPrimitive;
@@ -60,7 +63,7 @@ struct TrainingEventContext<'a> {
     bus: &'a TrainingEventBus,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 struct ContinualLearningStabilityState {
     best_valid_loss: Option<f64>,
     best_checkpoint_epoch: Option<usize>,
@@ -86,6 +89,15 @@ struct DynamicValidationReport {
     ruliad_eval_report: Option<burn_dragon_universality::RuliadEvalReport>,
 }
 
+struct DynamicValidation<'a, 'env, B: AutodiffBackend> {
+    env: &'a TrainEnvironment<'env, B>,
+    valid_loader: &'a Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
+    model: &'a LanguageTrainModel<B>,
+    batch_size: usize,
+    bus: &'a TrainingEventBus,
+    context_routing: Option<&'a crate::train::PredictiveContextRoutingRuntime<B>>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StreamWarmValidationReport {
     warm_loss: Option<f64>,
@@ -104,7 +116,7 @@ impl DynamicValidationReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct RuliadCompetenceKey {
     verifier_ppm: u32,
     semantic_ppm: u32,
@@ -2312,8 +2324,27 @@ where
     let mut last_cbp_telemetry_step = 0usize;
     let mut best_valid_loss: Option<f64> = None;
     let mut best_valid_epoch: Option<usize> = None;
+    let mut context_routing = env
+        .training
+        .predictive_context_routing
+        .enabled
+        .then(|| {
+            crate::train::PredictiveContextRoutingRuntime::new(
+                env.training.predictive_context_routing.clone(),
+                &current_model_config,
+                env.training.seed,
+                env.device,
+                optimizer.clone(),
+                env.run_dir.join("checkpoint"),
+            )
+        })
+        .transpose()?;
 
     if let Some(epoch) = env.resume_checkpoint_epoch {
+        let require_exact = matches!(
+            env.training.launch_mode,
+            burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+        );
         let (loaded_model, loaded_model_config) = load_dragon_training_state_checkpoint(
             env.run_dir,
             epoch,
@@ -2324,6 +2355,19 @@ where
             &mut dynamics_control,
         )?;
         model.model = loaded_model;
+        let runtime_restored = load_runtime_state_checkpoint(
+            env.run_dir,
+            epoch,
+            &model,
+            env.device,
+            require_exact,
+            env.training.predictive_context_routing.enabled,
+        )?;
+        let context_routing_restored = if let Some(routing) = context_routing.as_mut() {
+            routing.restore_checkpoint(env.run_dir, epoch, require_exact)?
+        } else {
+            false
+        };
         if let Some(loaded_model_config) = loaded_model_config {
             current_model_config = loaded_model_config;
         }
@@ -2332,13 +2376,23 @@ where
             env.device,
         ));
         let historical_best = historical_best_validation(env.run_dir, epoch);
-        best_valid_loss = historical_best.best_loss;
-        best_valid_epoch = historical_best.best_checkpoint_epoch;
-        stability.best_valid_loss = historical_best.best_loss;
-        stability.best_checkpoint_epoch = historical_best.best_checkpoint_epoch;
+        if let Some(restored) =
+            load_continual_learning_stability_checkpoint(env.run_dir, epoch, require_exact)?
+        {
+            stability = restored;
+            best_valid_loss = stability.best_valid_loss.or(historical_best.best_loss);
+            best_valid_epoch = stability
+                .best_checkpoint_epoch
+                .or(historical_best.best_checkpoint_epoch);
+        } else {
+            best_valid_loss = historical_best.best_loss;
+            best_valid_epoch = historical_best.best_checkpoint_epoch;
+            stability.best_valid_loss = historical_best.best_loss;
+            stability.best_checkpoint_epoch = historical_best.best_checkpoint_epoch;
+        }
         info!(
-            "resumed dynamic training checkpoint epoch={} historical_best_valid_loss={:?} historical_best_checkpoint_epoch={:?}",
-            epoch, best_valid_loss, best_valid_epoch
+            "resumed dynamic training checkpoint epoch={} runtime_state_restored={} context_routing_restored={} historical_best_valid_loss={:?} historical_best_checkpoint_epoch={:?}",
+            epoch, runtime_restored, context_routing_restored, best_valid_loss, best_valid_epoch
         );
     }
 
@@ -2393,7 +2447,27 @@ where
             }
 
             model.set_recovery_auxiliary_active(dynamics_control.recovery_auxiliary_active());
-            let item = burn_train::TrainStep::step(&model, item);
+            let reset_stream_state = item.reset_stream_state;
+            let (item, selected_context) = if let Some(routing) = context_routing.as_mut() {
+                let decision = routing.route(&model, &item, absolute_step)?;
+                let masks = routing.masks(decision.identity)?;
+                let state = routing.take_stream_state(decision.identity, reset_stream_state)?;
+                let step =
+                    model.predictive_context_train_step(item, masks.neuron, masks.activity, state);
+                routing.store_stream_state(decision.identity, step.terminal_state)?;
+                emit_predictive_context_routing_metrics(
+                    env,
+                    epoch,
+                    iteration,
+                    absolute_step,
+                    routing.known_contexts(),
+                    &decision,
+                    &bus,
+                );
+                (step.output, Some(decision.identity))
+            } else {
+                (burn_train::TrainStep::step(&model, item), None)
+            };
             let source_selection_due = source_selection_telemetry_due(env, absolute_step);
             let log_train_metrics = iteration.is_multiple_of(env.training.log_frequency.max(1))
                 || iteration == steps_per_epoch;
@@ -2435,7 +2509,13 @@ where
                 let grads = accumulator.grads();
                 let optimizer_started =
                     crate::train::profile::enabled().then(burn_dragon_time::Instant::now);
-                model = optimizer.step(lr, model, grads);
+                model = if let (Some(routing), Some(identity)) =
+                    (context_routing.as_mut(), selected_context)
+                {
+                    routing.optimizer_mut(identity)?.step(lr, model, grads)
+                } else {
+                    optimizer.step(lr, model, grads)
+                };
                 if let Some(started) = optimizer_started {
                     crate::train::profile::record_optimizer(started.elapsed().as_nanos());
                 }
@@ -2527,7 +2607,14 @@ where
             let grads = accumulator.grads();
             let optimizer_started =
                 crate::train::profile::enabled().then(burn_dragon_time::Instant::now);
-            model = optimizer.step(lr, model, grads);
+            model = if let Some(routing) = context_routing.as_mut() {
+                let identity = routing.current_identity().ok_or_else(|| {
+                    anyhow!("predictive context gradient remainder has no selected context")
+                })?;
+                routing.optimizer_mut(identity)?.step(lr, model, grads)
+            } else {
+                optimizer.step(lr, model, grads)
+            };
             if let Some(started) = optimizer_started {
                 crate::train::profile::record_optimizer(started.elapsed().as_nanos());
             }
@@ -2542,6 +2629,9 @@ where
             );
         }
         drop(iterator);
+        // Preserve causal ordering across independently typed ECS messages at
+        // the epoch boundary without adding a barrier to the per-step path.
+        let _ = bus.flush();
         let _ = bus.send_epoch_summary(TrainingEpochSummary {
             run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Train,
@@ -2560,13 +2650,15 @@ where
                 &scheduler,
                 &dynamics_control,
             )?;
+            if let Some(routing) = context_routing.as_ref() {
+                routing.save_checkpoint(env.run_dir, epoch)?;
+            }
             save_source_selection_state_checkpoint(
                 env.run_dir,
                 epoch,
                 absolute_step,
                 env.source_selection_dataset.as_ref(),
             )?;
-            prune_dragon_model_checkpoints(env.run_dir, epoch, &[None, None])?;
             let _ = bus.send_checkpoint(CheckpointEvent {
                 run_id: env.run_name.to_string().into(),
                 checkpoint_id: format!("model-{epoch}"),
@@ -2575,6 +2667,14 @@ where
                 promoted: false,
             });
             let _ = bus.flush();
+            save_continual_learning_stability_checkpoint(env.run_dir, epoch, &stability)?;
+            crate::train::events::save_training_event_state_checkpoint(
+                &event_handles,
+                env.run_name,
+                env.run_dir,
+                epoch,
+            )?;
+            prune_dragon_model_checkpoints(env.run_dir, epoch, &[None, None])?;
             crate::train::profile::record_checkpoint(checkpoint_started.elapsed().as_nanos());
             info!(
                 "validation deferred to external evaluator epoch={epoch}; candidate checkpoint is unpromoted"
@@ -2585,13 +2685,16 @@ where
         let validation_started = burn_dragon_time::Instant::now();
         let absolute_step = epoch_end_absolute_step(epoch, steps_per_epoch, iteration);
         let validation = run_dynamic_validation(
-            env,
-            &active_valid_loader,
-            &model,
+            DynamicValidation {
+                env,
+                valid_loader: &active_valid_loader,
+                model: &model,
+                batch_size: active_batch_size,
+                bus: &bus,
+                context_routing: context_routing.as_ref(),
+            },
             epoch,
             absolute_step,
-            active_batch_size,
-            &bus,
         )?;
         crate::train::profile::record_validation(validation_started.elapsed().as_nanos());
         let valid_loss = validation.primary_loss();
@@ -2639,6 +2742,9 @@ where
             &scheduler,
             &dynamics_control,
         )?;
+        if let Some(routing) = context_routing.as_ref() {
+            routing.save_checkpoint(env.run_dir, epoch)?;
+        }
         save_source_selection_state_checkpoint(
             env.run_dir,
             epoch,
@@ -2646,11 +2752,6 @@ where
             env.source_selection_dataset.as_ref(),
         )?;
         update_ruliad_recovery_checkpoint(env, &validation, epoch, &mut stability);
-        prune_dragon_model_checkpoints(
-            env.run_dir,
-            epoch,
-            &[best_valid_epoch, stability.best_ruliad_checkpoint_epoch],
-        )?;
         apply_continual_learning_stability_policy(
             env,
             validation,
@@ -2667,6 +2768,18 @@ where
             promoted: checkpoint_promoted,
         });
         let _ = bus.flush();
+        save_continual_learning_stability_checkpoint(env.run_dir, epoch, &stability)?;
+        crate::train::events::save_training_event_state_checkpoint(
+            &event_handles,
+            env.run_name,
+            env.run_dir,
+            epoch,
+        )?;
+        prune_dragon_model_checkpoints(
+            env.run_dir,
+            epoch,
+            &[best_valid_epoch, stability.best_ruliad_checkpoint_epoch],
+        )?;
         crate::train::profile::record_checkpoint(checkpoint_started.elapsed().as_nanos());
         if handle_post_validation_dynamics_control(
             env,
@@ -2767,18 +2880,22 @@ where
 }
 
 fn run_dynamic_validation<B>(
-    env: &TrainEnvironment<'_, B>,
-    valid_loader: &Arc<dyn DataLoader<ValidBackend<B>, SequenceBatch<ValidBackend<B>>>>,
-    model: &LanguageTrainModel<B>,
+    validation: DynamicValidation<'_, '_, B>,
     epoch: usize,
     training_absolute_step: usize,
-    batch_size: usize,
-    bus: &TrainingEventBus,
 ) -> Result<DynamicValidationReport>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    let DynamicValidation {
+        env,
+        valid_loader,
+        model,
+        batch_size,
+        bus,
+        context_routing,
+    } = validation;
     let steps_per_epoch = env.train_loader.num_items().max(1);
     let valid_model = model.valid().materialize_random_scaffold_for_inference();
     let iterator = valid_loader.iter();
@@ -2789,11 +2906,35 @@ where
     let probe_enabled = epoch.is_multiple_of(env.training.events.degeneracy_probe_every_epochs);
     let probe_absolute_step = training_absolute_step;
     for item in iterator {
-        let eval_sweep_enabled = !latent_eval_sweep_emitted
+        let eval_sweep_enabled = context_routing.is_none()
+            && !latent_eval_sweep_emitted
             && !latent_eval_step_sweep_for_model(env.training, &valid_model).is_empty();
         let degeneracy_probe_enabled = probe_enabled && output_degeneracy.is_none();
         let item_for_eval_sweep = item.clone();
-        let (loss_tensor, degeneracy) = if degeneracy_probe_enabled {
+        let (loss_tensor, degeneracy) = if let Some(routing) = context_routing {
+            let probe_tokens = if degeneracy_probe_enabled {
+                env.training.events.degeneracy_probe_tokens
+            } else {
+                0
+            };
+            let (loss, identity, degeneracy) = routing.validation_loss(
+                &valid_model,
+                item,
+                probe_tokens,
+                dataset_eos_id(env.source_selection_dataset.as_ref()),
+            )?;
+            let _ = bus.send_metric_sample(TrainingMetricSample {
+                run_id: env.run_name.to_string().into(),
+                split: TrainingMetricSplit::Valid,
+                epoch,
+                step_in_epoch: count.saturating_add(1),
+                absolute_step: probe_absolute_step,
+                name: "Predictive Context Index".to_string(),
+                value: identity.context_index as f64,
+                running_value: identity.context_index as f64,
+            });
+            (loss, degeneracy)
+        } else if degeneracy_probe_enabled {
             valid_model.validation_loss_and_output_degeneracy(
                 item,
                 env.training.events.degeneracy_probe_tokens,
@@ -2876,9 +3017,16 @@ where
             running_value: mean,
         });
     }
-    let source_weighted_loss =
-        run_source_weighted_validation(env, &valid_model, epoch, steps_per_epoch, batch_size, bus)?;
-    let ruliad_eval_report = run_ruliad_correctness_validation(RuliadCorrectnessValidation {
+    let source_weighted_loss = run_source_weighted_validation(
+        env,
+        &valid_model,
+        epoch,
+        steps_per_epoch,
+        batch_size,
+        bus,
+        context_routing,
+    )?;
+    let correctness_request = RuliadCorrectnessValidation {
         run_name: env.run_name,
         run_dir: env.run_dir,
         training: env.training,
@@ -2895,7 +3043,13 @@ where
             absolute_step: training_absolute_step,
             bus,
         },
-    })?;
+    };
+    let ruliad_eval_report = if let Some(routing) = context_routing {
+        let router = routing.validation_router();
+        run_routed_ruliad_correctness_validation(correctness_request, &router)?
+    } else {
+        run_ruliad_correctness_validation(correctness_request)?
+    };
     if let Some(report) = ruliad_eval_report.as_ref() {
         let capability_gate = emit_ruliad_capability_gate_metrics(
             env.run_name,
@@ -2919,6 +3073,7 @@ where
                 steps_per_epoch,
                 batch_size,
                 bus,
+                context_routing,
             )?)
         } else {
             None
@@ -2996,6 +3151,7 @@ fn run_stream_warm_validation<B>(
     steps_per_epoch: usize,
     batch_size: usize,
     bus: &TrainingEventBus,
+    context_routing: Option<&crate::train::PredictiveContextRoutingRuntime<B>>,
 ) -> Result<StreamWarmValidationReport>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -3023,6 +3179,15 @@ where
     .with_summary_event_token_ids(env.summary_event_token_ids.clone());
     let valid_model = model.valid().materialize_random_scaffold_for_inference();
     let mut state = valid_model.model.init_state();
+    let context_router = context_routing.map(|routing| routing.validation_router());
+    let mut context_states = context_router
+        .as_ref()
+        .map(|router| {
+            (0..router.known_contexts())
+                .map(|_| valid_model.model.init_state())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let iterator = loader.iter();
     let mut total = 0.0;
     let mut count = 0usize;
@@ -3034,7 +3199,21 @@ where
         let paired_item =
             (probe.enabled && !item.reset_stream_state && paired_count < probe.paired_batches)
                 .then(|| item.clone());
-        let output = valid_model.step_with_stream_state(item, &mut state);
+        let (output, selected_route) = if let Some(router) = context_router.as_ref() {
+            let route = router.select_batch(&valid_model, &item)?;
+            let route_state = context_states
+                .get_mut(route.identity.context_index)
+                .ok_or_else(|| anyhow!("routed validation selected missing context state"))?;
+            let output = valid_model.step_with_predictive_context_stream_state(
+                item,
+                route.masks.neuron.clone(),
+                route.masks.activity.clone(),
+                route_state,
+            );
+            (output, Some(route))
+        } else {
+            (valid_model.step_with_stream_state(item, &mut state), None)
+        };
         let loss_value: LossValue<ValidBackend<B>> = output.adapt();
         let loss = mean_scalar_from_loss(loss_value.value());
         count += 1;
@@ -3053,7 +3232,17 @@ where
             running_value: total / count as f64,
         });
         if let Some(cold_item) = paired_item {
-            let cold_output = valid_model.step(cold_item);
+            let cold_output = if let Some(route) = selected_route {
+                let mut cold_state = valid_model.model.init_state();
+                valid_model.step_with_predictive_context_stream_state(
+                    cold_item,
+                    route.masks.neuron,
+                    route.masks.activity,
+                    &mut cold_state,
+                )
+            } else {
+                valid_model.step(cold_item)
+            };
             let cold_loss_value: LossValue<ValidBackend<B>> = cold_output.adapt();
             let cold_loss = mean_scalar_from_loss(cold_loss_value.value());
             paired_warm_total += loss;
@@ -3103,12 +3292,46 @@ where
             });
         }
     }
-    if probe.enabled
-        && let Some(diagnostics) = LanguageTrainModel::<ValidBackend<B>>::sequence_state_diagnostics(
+    let diagnostics = if !probe.enabled {
+        None
+    } else if context_router.is_some() {
+        let diagnostics = context_states
+            .iter()
+            .filter_map(|state| {
+                LanguageTrainModel::<ValidBackend<B>>::sequence_state_diagnostics(
+                    state,
+                    probe.max_rho_slots,
+                )
+            })
+            .collect::<Vec<_>>();
+        (!diagnostics.is_empty()).then(|| {
+            let count = diagnostics.len() as f64;
+            crate::train::steps::SequenceStateDiagnostics {
+                rho_layers: diagnostics
+                    .iter()
+                    .map(|item| item.rho_layers)
+                    .max()
+                    .unwrap_or_default(),
+                rho_rms: diagnostics.iter().map(|item| item.rho_rms).sum::<f64>() / count,
+                rho_slot_variance_ratio: diagnostics
+                    .iter()
+                    .map(|item| item.rho_slot_variance_ratio)
+                    .sum::<f64>()
+                    / count,
+                rho_slot_redundancy: diagnostics
+                    .iter()
+                    .map(|item| item.rho_slot_redundancy)
+                    .sum::<f64>()
+                    / count,
+            }
+        })
+    } else {
+        LanguageTrainModel::<ValidBackend<B>>::sequence_state_diagnostics(
             &state,
             probe.max_rho_slots,
         )
-    {
+    };
+    if let Some(diagnostics) = diagnostics {
         for (name, value) in [
             (METRIC_RHO_RMS, diagnostics.rho_rms),
             (
@@ -3566,6 +3789,7 @@ fn run_source_weighted_validation<B>(
     steps_per_epoch: usize,
     batch_size: usize,
     bus: &TrainingEventBus,
+    context_routing: Option<&crate::train::PredictiveContextRoutingRuntime<B>>,
 ) -> Result<Option<f64>>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -3596,9 +3820,14 @@ where
         ) else {
             break;
         };
-        let output = valid_model.step(batch);
-        let loss_value: LossValue<ValidBackend<B>> = output.adapt();
-        let loss = mean_scalar_from_loss(loss_value.value());
+        let loss = if let Some(routing) = context_routing {
+            let (loss, _, _) = routing.validation_loss(valid_model, batch, 0, None)?;
+            mean_scalar_from_loss(loss)
+        } else {
+            let output = valid_model.step(batch);
+            let loss_value: LossValue<ValidBackend<B>> = output.adapt();
+            mean_scalar_from_loss(loss_value.value())
+        };
         count += 1;
         total += loss;
         let _ = bus.send_metric_sample(TrainingMetricSample {
@@ -3866,6 +4095,133 @@ where
         }
     }
     Ok(Some(base_report))
+}
+
+fn run_routed_ruliad_correctness_validation<B>(
+    request: RuliadCorrectnessValidation<'_, B>,
+    router: &crate::train::PredictiveContextValidationRouter<B>,
+) -> Result<Option<burn_dragon_universality::RuliadEvalReport>>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let RuliadCorrectnessValidation {
+        run_name,
+        run_dir,
+        training,
+        dataset,
+        model,
+        training_batch_size,
+        device,
+        output_degeneracy,
+        event:
+            TrainingEventContext {
+                epoch,
+                absolute_step,
+                bus,
+            },
+    } = request;
+    let requested_items = training.events.ruliad_correctness_probe_items;
+    if requested_items == 0 || training.events.ruliad_correctness_probe_tokens == 0 {
+        return Ok(None);
+    }
+    let every = training.events.ruliad_correctness_probe_every_epochs.max(1);
+    if !epoch.is_multiple_of(every) || model.model.uses_factorized_language_head() {
+        return Ok(None);
+    }
+    let Some(dataset) = dataset else {
+        return Ok(None);
+    };
+    let probe_items =
+        dataset.sample_ruliad_validation_probe_items(epoch, absolute_step, requested_items);
+    if probe_items.is_empty() {
+        return Ok(None);
+    }
+
+    if training.sequence_state_probe.enabled {
+        let serialization_items = dataset.sample_ruliad_training_serialization_probe_items(
+            epoch,
+            absolute_step,
+            requested_items,
+        );
+        if !serialization_items.is_empty() && serialization_items != probe_items {
+            let _ = evaluate_ruliad_correctness_validation_for_items_core(
+                Some(run_name),
+                Some(run_dir),
+                dataset,
+                model,
+                epoch,
+                absolute_step,
+                device,
+                training,
+                &serialization_items,
+                training_batch_size,
+                "ruliad_training_serialization_probe",
+                Some("ruliad_correctness_training_serialization"),
+                Some("Ruliad Training Serialization"),
+                None,
+                Some(bus),
+                RuliadProbeDecodeMode::FreeRun,
+                Some(router),
+            )?;
+        }
+    }
+
+    let base = evaluate_ruliad_correctness_validation_for_items_core(
+        Some(run_name),
+        Some(run_dir),
+        dataset,
+        model,
+        epoch,
+        absolute_step,
+        device,
+        training,
+        &probe_items,
+        training_batch_size,
+        "ruliad_validation_probe",
+        Some("ruliad_correctness"),
+        None,
+        output_degeneracy,
+        Some(bus),
+        RuliadProbeDecodeMode::FreeRun,
+        Some(router),
+    )?;
+    if training.sequence_state_probe.enabled
+        && dataset.sample_ruliad_training_serialization_probe_items(
+            epoch,
+            absolute_step,
+            requested_items,
+        ) == probe_items
+    {
+        emit_reused_ruliad_correctness_validation(
+            run_name,
+            epoch,
+            absolute_step,
+            &base.report,
+            output_degeneracy,
+            bus,
+        );
+    }
+    if training.events.source_selection_capability_feedback {
+        emit_source_selection_capability_feedback_batch(
+            run_name,
+            Some(dataset),
+            absolute_step,
+            &crate::dataset::ruliad_capability_feedback_from_report(&base.report),
+            bus,
+        );
+    }
+    let _ = bus.send_metric_sample(TrainingMetricSample {
+        run_id: run_name.to_string().into(),
+        split: TrainingMetricSplit::Valid,
+        epoch,
+        step_in_epoch: 0,
+        absolute_step,
+        name: "Ruliad Correctness Routed Subnetwork".to_string(),
+        value: 1.0,
+        running_value: 1.0,
+    });
+    Ok(Some(base.report))
 }
 
 fn emit_reused_ruliad_correctness_validation(
@@ -6064,6 +6420,7 @@ struct RuliadProbeGenerator<'a, B: BackendTrait> {
     device: &'a B::Device,
     close_token_id: Option<i64>,
     decode_mode: RuliadProbeDecodeMode,
+    context_router: Option<&'a crate::train::PredictiveContextValidationRouter<B>>,
 }
 
 impl<B> RuliadProbeGenerator<'_, B>
@@ -6090,13 +6447,25 @@ where
         let prompt_len = probe.prompt_tokens.len();
         match self.decode_mode {
             RuliadProbeDecodeMode::FreeRun => {
-                let full_tokens = crate::generation::generate_tokens(
-                    &self.model.model,
-                    probe.prompt_tokens.clone(),
-                    self.device,
-                    generation_settings,
-                    None,
-                )?;
+                let full_tokens = if let Some(router) = self.context_router {
+                    let route = router.select(self.model, &probe.prompt_tokens)?;
+                    crate::generation::generate_greedy_tokens_with_subnetwork_masks(
+                        &self.model.model,
+                        probe.prompt_tokens.clone(),
+                        self.device,
+                        generation_settings,
+                        route.masks.neuron,
+                        route.masks.activity,
+                    )?
+                } else {
+                    crate::generation::generate_tokens(
+                        &self.model.model,
+                        probe.prompt_tokens.clone(),
+                        self.device,
+                        generation_settings,
+                        None,
+                    )?
+                };
                 Ok(full_tokens
                     .get(prompt_len..)
                     .map(|tokens| tokens.to_vec())
@@ -6145,7 +6514,9 @@ where
         .collect::<Vec<_>>();
     let work = ruliad_probe_generation_work(
         &prompt_lengths,
-        config.enabled && generator.decode_mode == RuliadProbeDecodeMode::FreeRun,
+        config.enabled
+            && generator.decode_mode == RuliadProbeDecodeMode::FreeRun
+            && generator.context_router.is_none(),
         config.max_batch_rows.min(training_batch_size.max(1)),
         config.minimum_batch_rows,
         config.maximum_prompt_position_span,
@@ -6406,6 +6777,7 @@ where
         None,
         None,
         RuliadProbeDecodeMode::FreeRun,
+        None,
     )?;
     Ok(Some(RuliadModelEvaluation {
         report: evaluation.report,
@@ -6461,6 +6833,7 @@ where
         output_degeneracy,
         Some(bus),
         decode_mode,
+        None,
     )?
     .report)
 }
@@ -6490,6 +6863,7 @@ fn evaluate_ruliad_correctness_validation_for_items_core<B>(
     output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
     bus: Option<&TrainingEventBus>,
     decode_mode: RuliadProbeDecodeMode,
+    context_router: Option<&crate::train::PredictiveContextValidationRouter<B>>,
 ) -> Result<RuliadCorrectnessEvaluation>
 where
     B: BackendTrait + Clone + 'static,
@@ -6526,6 +6900,7 @@ where
         device,
         close_token_id,
         decode_mode,
+        context_router,
     };
     let (generated_rows, generation_stats) = generate_ruliad_probe_rows(
         &generator,
@@ -8363,6 +8738,71 @@ fn emit_continual_backprop_telemetry<B>(
     });
 }
 
+fn emit_predictive_context_routing_metrics<B>(
+    env: &TrainEnvironment<'_, B>,
+    epoch: usize,
+    step_in_epoch: usize,
+    absolute_step: usize,
+    known_contexts: usize,
+    decision: &crate::train::PredictiveContextRoutingDecision,
+    bus: &TrainingEventBus,
+) where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    if !decision.probed && !decision.created && decision.replaced.is_none() {
+        return;
+    }
+    let metrics = [
+        (
+            "Predictive Context Index",
+            decision.identity.context_index as f64,
+        ),
+        (
+            "Predictive Context Generation",
+            decision.identity.generation as f64,
+        ),
+        ("Predictive Context Count", known_contexts as f64),
+        ("Predictive Context Created", f64::from(decision.created)),
+        (
+            "Predictive Context Replaced",
+            f64::from(decision.replaced.is_some()),
+        ),
+        (
+            "Predictive Context Novelty Deferred",
+            f64::from(decision.novelty_deferred),
+        ),
+        (
+            "Predictive Context Probe Tokens",
+            decision.probe_tokens as f64,
+        ),
+    ];
+    for (name, value) in metrics {
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string().into(),
+            split: TrainingMetricSplit::Train,
+            epoch,
+            step_in_epoch,
+            absolute_step,
+            name: name.to_string(),
+            value,
+            running_value: value,
+        });
+    }
+    if let Some(loss) = decision.selected_loss {
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string().into(),
+            split: TrainingMetricSplit::Train,
+            epoch,
+            step_in_epoch,
+            absolute_step,
+            name: "Predictive Context Selected Loss".to_string(),
+            value: loss,
+            running_value: loss,
+        });
+    }
+}
+
 fn emit_predictive_coding_telemetry<B>(
     env: &TrainEnvironment<'_, B>,
     epoch: usize,
@@ -8652,6 +9092,14 @@ where
             )
         })?;
         model.model = rollback_model;
+        load_runtime_state_checkpoint(
+            env.run_dir,
+            rollback_epoch,
+            model,
+            env.device,
+            false,
+            false,
+        )?;
         if let Some(rollback_config) = rollback_config {
             *current_model_config = rollback_config;
         }
@@ -9329,6 +9777,7 @@ where
     S: LrScheduler + Clone + 'static,
 {
     save_dragon_model_checkpoint(run_dir, epoch, &model.model)?;
+    save_runtime_state_checkpoint(run_dir, epoch, model)?;
     let checkpoint_dir = run_dir.join("checkpoint");
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     FileCheckpointer::new(recorder.clone(), &checkpoint_dir, "optimizer")
@@ -9368,6 +9817,48 @@ fn source_selection_state_checkpoint_path(run_dir: &Path, epoch: usize) -> PathB
         .join(format!("source-selection-state-{epoch}.json"))
 }
 
+fn continual_learning_stability_checkpoint_path(run_dir: &Path, epoch: usize) -> PathBuf {
+    run_dir
+        .join("checkpoint")
+        .join(format!("stability-{epoch}.json"))
+}
+
+fn save_continual_learning_stability_checkpoint(
+    run_dir: &Path,
+    epoch: usize,
+    state: &ContinualLearningStabilityState,
+) -> Result<()> {
+    let path = continual_learning_stability_checkpoint_path(run_dir, epoch);
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(state).context("serialize continual-learning stability state")?,
+    )
+    .with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("replace {} from {}", path.display(), temporary.display()))
+}
+
+fn load_continual_learning_stability_checkpoint(
+    run_dir: &Path,
+    epoch: usize,
+    require_exact: bool,
+) -> Result<Option<ContinualLearningStabilityState>> {
+    let path = continual_learning_stability_checkpoint_path(run_dir, epoch);
+    if !path.is_file() {
+        if require_exact {
+            return Err(anyhow!(
+                "exact resume requires continual-learning stability checkpoint {}",
+                path.display()
+            ));
+        }
+        return Ok(None);
+    }
+    serde_json::from_slice(&fs::read(&path).with_context(|| format!("read {}", path.display()))?)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
 fn save_source_selection_state_checkpoint(
     run_dir: &Path,
     epoch: usize,
@@ -9398,7 +9889,13 @@ fn checkpoint_artifact_epoch(name: &str) -> Option<usize> {
         ("scheduler-", ".bin"),
         ("dynamics-", ".json"),
         ("model-config-", ".json"),
+        ("runtime-state-", ".bin"),
+        ("teacher-model-", ".bin"),
+        ("context-routing-", ".json"),
+        ("context-stream-states-", ".bin"),
         ("source-selection-state-", ".json"),
+        ("stability-", ".json"),
+        ("training-ecs-state-", ".json"),
     ] {
         if let Some(epoch) = name
             .strip_prefix(prefix)
@@ -9407,6 +9904,11 @@ fn checkpoint_artifact_epoch(name: &str) -> Option<usize> {
         {
             return Some(epoch);
         }
+    }
+    if let Some((prefix, epoch)) = name.strip_suffix(".bin")?.rsplit_once('-')
+        && prefix.starts_with("context-optimizer-")
+    {
+        return epoch.parse().ok();
     }
     None
 }
@@ -13766,7 +14268,12 @@ mod tests {
             )
             .expect("write dynamic checkpoint record");
         }
-        for prefix in ["dynamics", "model-config"] {
+        for prefix in [
+            "dynamics",
+            "model-config",
+            "stability",
+            "training-ecs-state",
+        ] {
             fs::write(
                 checkpoint_dir.join(format!("{prefix}-{epoch}.json")),
                 format!(r#"{{"epoch":{epoch}}}"#),
@@ -13790,6 +14297,33 @@ mod tests {
         ));
         content.push('\n');
         fs::write(path, content).expect("append validation event");
+    }
+
+    #[test]
+    fn continual_learning_stability_checkpoint_roundtrips_and_exact_resume_fails_closed() {
+        let directory = tempfile::tempdir().expect("temporary run directory");
+        fs::create_dir_all(directory.path().join("checkpoint")).expect("checkpoint directory");
+        let state = ContinualLearningStabilityState {
+            best_valid_loss: Some(0.75),
+            best_checkpoint_epoch: Some(3),
+            consecutive_validation_regressions: 2,
+            consecutive_output_degeneracy: 1,
+            ..ContinualLearningStabilityState::default()
+        };
+        save_continual_learning_stability_checkpoint(directory.path(), 4, &state)
+            .expect("save stability state");
+
+        assert_eq!(
+            load_continual_learning_stability_checkpoint(directory.path(), 4, true)
+                .expect("load stability state"),
+            Some(state)
+        );
+        assert!(
+            load_continual_learning_stability_checkpoint(directory.path(), 5, true)
+                .expect_err("exact resume must require stability state")
+                .to_string()
+                .contains("exact resume requires continual-learning stability checkpoint")
+        );
     }
 
     #[test]
@@ -13895,6 +14429,8 @@ mod tests {
                 format!("dynamics-{kept_epoch}.json"),
                 format!("model-config-{kept_epoch}.json"),
                 format!("source-selection-state-{kept_epoch}.json"),
+                format!("stability-{kept_epoch}.json"),
+                format!("training-ecs-state-{kept_epoch}.json"),
             ] {
                 assert!(
                     checkpoint_dir.join(file).is_file(),
@@ -13910,6 +14446,8 @@ mod tests {
                 format!("dynamics-{pruned_epoch}.json"),
                 format!("model-config-{pruned_epoch}.json"),
                 format!("source-selection-state-{pruned_epoch}.json"),
+                format!("stability-{pruned_epoch}.json"),
+                format!("training-ecs-state-{pruned_epoch}.json"),
             ] {
                 assert!(
                     !checkpoint_dir.join(file).exists(),
@@ -14196,6 +14734,7 @@ mod tests {
             dynamics_anchor: Default::default(),
             predictive_coding: Default::default(),
             local_predictive_coding: Default::default(),
+            predictive_context_routing: Default::default(),
             latent_reasoning: Default::default(),
             ruliad_supervision: Default::default(),
             ruliad_probe_generation: Default::default(),

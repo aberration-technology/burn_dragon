@@ -424,13 +424,22 @@ fn relu_lowrank_linearized_output<B: BackendTrait>(
 where
     B::FloatTensorPrimitive: 'static,
 {
-    let shape = LowrankProjectionShape::from_tensors(
-        input,
-        weight,
-        threshold,
-        sparse_mask.as_ref(),
-        grad_input_executor,
-    )?;
+    // The forward fusion kernel currently accepts only one mask shared across
+    // heads. Plain-backend VJPs also support a per-head mask because masking is
+    // applied to the already materialized projected gradient and therefore
+    // needs no special kernel indexing.
+    let shape =
+        LowrankProjectionShape::from_tensors(input, weight, threshold, None, grad_input_executor)?;
+    if let Some(mask) = sparse_mask.as_ref() {
+        let [mask_batch, mask_heads, mask_time, mask_latent] = mask.shape().dims::<4>();
+        if mask_batch != 1
+            || (mask_heads != 1 && mask_heads != shape.heads)
+            || mask_time != 1
+            || mask_latent != shape.latent
+        {
+            return None;
+        }
+    }
     if shape.weight_batch != 1
         || grad_output.shape().dims::<4>() != [shape.batch, shape.heads, shape.time, shape.latent]
     {

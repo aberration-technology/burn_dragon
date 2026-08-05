@@ -350,6 +350,7 @@ fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparam
         dynamics_anchor: Default::default(),
         predictive_coding: Default::default(),
         local_predictive_coding: Default::default(),
+        predictive_context_routing: Default::default(),
         latent_reasoning: Default::default(),
         ruliad_supervision: Default::default(),
         ruliad_probe_generation: Default::default(),

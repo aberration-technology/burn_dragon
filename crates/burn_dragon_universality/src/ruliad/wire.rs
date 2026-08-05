@@ -183,12 +183,11 @@ fn decode_model_certificate_step(line: &str) -> Option<(usize, RuliadProofStep)>
     }
     let source = if let Some(id) = source.strip_prefix("a:") {
         RuliadProofSource::Axiom { id: id.to_string() }
-    } else if let Some(goal) = source.strip_prefix("l:") {
+    } else {
+        let goal = source.strip_prefix("l:")?;
         RuliadProofSource::Lemma {
             goal: goal.parse().ok()?,
         }
-    } else {
-        return None;
     };
     let direction = match direction {
         "f" => RuliadRewriteDirection::Forward,

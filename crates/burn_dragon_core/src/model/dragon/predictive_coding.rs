@@ -3,7 +3,7 @@ use crate::model::norm::DragonNormVjp;
 use crate::model::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds_relu_native;
 use burn::module::ParamId;
 use burn::tensor::TensorPrimitive;
-use burn_dragon_kernel::api::attention::dense_causal_attention_vjp;
+use burn_dragon_kernel::api::attention::dense_causal_attention_vjp_with_initial_rho;
 use burn_dragon_kernel::api::projection::{relu_lowrank_input_vjp, relu_lowrank_vjp};
 
 /// Exact subset of Dragon currently covered by the plain-backend local VJPs.
@@ -32,7 +32,12 @@ pub struct DragonPredictiveCodingParameterIds {
 #[derive(Debug, Clone)]
 pub struct DragonPredictiveCodingLayerTrace<B: Backend> {
     pub input: Tensor<B, 4>,
+    /// Clamped rho entering this layer factor. `None` is the all-zero initial
+    /// state used by a stateless block.
+    pub initial_rho: Option<Tensor<B, 4>>,
+    pub attention_pre_norm: Tensor<B, 4>,
     pub attention_readout: Tensor<B, 4>,
+    pub residual_pre_norm: Tensor<B, 4>,
     pub residual_delta: Tensor<B, 4>,
     pub x_neuron: Tensor<B, 4>,
     pub y_gate: Tensor<B, 4>,
@@ -66,6 +71,10 @@ pub struct DragonPredictiveCodingHeadVjp<B: Backend> {
     pub loss: Tensor<B, 1>,
     pub grad_hidden: Tensor<B, 3>,
     pub grad_lm_head: Tensor<B, 2>,
+    /// Raw number of supervised tokens before denominator clamping. This lets
+    /// truncated factors aggregate masked document losses exactly without a
+    /// device-to-host synchronization.
+    pub supervised_tokens: Tensor<B, 1>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,18 +197,56 @@ where
         current
     }
 
+    pub fn predictive_coding_initial_activity_with_activity_mask(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        activity_mask: Tensor<B, 4>,
+    ) -> Tensor<B, 4> {
+        self.predictive_coding_support()
+            .expect("unsupported Dragon predictive-coding architecture");
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        let [batch, time] = tokens.shape().dims::<2>();
+        let embedded = self
+            .embed
+            .forward(tokens)
+            .reshape([batch, 1, time, self.n_embd]);
+        self.predictive_coding_masked_norm(embedded, Some(&activity_mask))
+    }
+
     pub fn predictive_coding_initial_vjp(
         &self,
         tokens: Tensor<B, 2, Int>,
         grad_activity: Tensor<B, 4>,
     ) -> DragonPredictiveCodingInitialVjp<B> {
+        self.predictive_coding_initial_vjp_impl(tokens, grad_activity, None)
+    }
+
+    pub fn predictive_coding_initial_vjp_with_activity_mask(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        grad_activity: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingInitialVjp<B> {
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        self.predictive_coding_initial_vjp_impl(tokens, grad_activity, Some(activity_mask))
+    }
+
+    fn predictive_coding_initial_vjp_impl(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        grad_activity: Tensor<B, 4>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> DragonPredictiveCodingInitialVjp<B> {
         self.predictive_coding_support()
             .expect("unsupported Dragon predictive-coding architecture");
         let [batch, time] = tokens.shape().dims::<2>();
         let embedded = self.embed.forward(tokens.clone());
-        let norm_vjp = self.norm.vjp_with_parameters(
+        let norm_vjp = self.predictive_coding_masked_norm_vjp(
             embedded.reshape([batch, 1, time, self.n_embd]),
             grad_activity,
+            activity_mask.as_ref(),
         );
         let grad_embedded = norm_vjp.grad_input.reshape([batch, time, self.n_embd]);
         let grad_embedding =
@@ -221,6 +268,7 @@ where
         &self,
         query: Tensor<B, 4>,
         value: Tensor<B, 4>,
+        initial_rho: Option<Tensor<B, 4>>,
     ) -> Tensor<B, 4> {
         let decay = self
             .attention
@@ -231,15 +279,247 @@ where
             && supports_dense_causal_attention_backend::<B>()
             && let Some(output) = try_fused_dense_causal_attention_wgpu(&query, &value, &decay)
         {
-            return output;
+            return match initial_rho {
+                Some(rho) => {
+                    let value_dim = value.shape().dims::<4>()[3];
+                    output
+                        + self.recurrent_attention_dense_score_initial_context_reference(
+                            query,
+                            Some(rho),
+                            Some(decay),
+                            value_dim,
+                        )
+                }
+                None => output,
+            };
         }
-        self.recurrent_attention_dense_score_context_reference(query, value, None, Some(decay))
+        self.recurrent_attention_dense_score_context_reference(
+            query,
+            value,
+            initial_rho,
+            Some(decay),
+        )
+    }
+
+    pub fn predictive_coding_terminal_rho(
+        &self,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+    ) -> Tensor<B, 4> {
+        let decay = self
+            .attention
+            .alibi_decay()
+            .expect("validated local PC ALiBi decay");
+        self.recurrent_attention_dense_score_final_rho_reference(
+            trace.x_neuron.clone(),
+            trace.input.clone(),
+            trace.initial_rho.clone(),
+            Some(decay),
+        )
+    }
+
+    pub fn predictive_coding_neuron_dim_per_head(&self) -> Result<usize, String> {
+        self.predictive_coding_support()?;
+        Ok(self.latent_per_head_capacity())
+    }
+
+    pub fn predictive_coding_validate_neuron_mask(
+        &self,
+        neuron_mask: &Tensor<B, 4>,
+    ) -> Result<(), String> {
+        let [batch, heads, time, latent] = neuron_mask.shape().dims::<4>();
+        let expected_latent = self.latent_per_head_capacity();
+        if batch != 1
+            || (heads != 1 && heads != self.n_head)
+            || time != 1
+            || latent != expected_latent
+        {
+            return Err(format!(
+                "predictive-coding neuron mask must have shape [1, 1|{}, 1, {expected_latent}], got {:?}",
+                self.n_head,
+                neuron_mask.shape()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn predictive_coding_validate_activity_mask(
+        &self,
+        activity_mask: &Tensor<B, 4>,
+    ) -> Result<(), String> {
+        let [batch, streams, time, dim] = activity_mask.shape().dims::<4>();
+        if batch != 1 || streams != 1 || time != 1 || dim != self.n_embd {
+            return Err(format!(
+                "predictive-coding activity mask must have shape [1, 1, 1, {}], got {:?}",
+                self.n_embd,
+                activity_mask.shape()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn predictive_coding_validate_rho_state(
+        &self,
+        rho: &Tensor<B, 4>,
+        batch: usize,
+    ) -> Result<(), String> {
+        let expected = [
+            batch,
+            self.n_head,
+            self.latent_per_head_capacity(),
+            self.n_embd,
+        ];
+        if rho.shape().dims::<4>() != expected {
+            return Err(format!(
+                "predictive-coding rho must have shape {expected:?}, got {:?}",
+                rho.shape()
+            ));
+        }
+        Ok(())
+    }
+
+    fn predictive_coding_neuron_mask(
+        &self,
+        latent: usize,
+        device: &B::Device,
+        context_mask: Option<Tensor<B, 4>>,
+    ) -> Option<Tensor<B, 4>> {
+        let latent_pattern = &self.kernel.block_sparse.latent;
+        let configured = (self.kernel.enabled && latent_pattern.is_sparse())
+            .then(|| latent_pattern.mask::<B>(latent, device));
+        match (configured, context_mask) {
+            (Some(configured), Some(context)) => Some(configured * context),
+            (Some(configured), None) => Some(configured),
+            (None, context) => context,
+        }
+    }
+
+    fn predictive_coding_masked_norm(
+        &self,
+        input: Tensor<B, 4>,
+        activity_mask: Option<&Tensor<B, 4>>,
+    ) -> Tensor<B, 4> {
+        match activity_mask {
+            Some(mask) => self.norm.forward(input * mask.clone()) * mask.clone(),
+            None => self.norm.forward(input),
+        }
+    }
+
+    fn predictive_coding_masked_norm_vjp(
+        &self,
+        input: Tensor<B, 4>,
+        grad_output: Tensor<B, 4>,
+        activity_mask: Option<&Tensor<B, 4>>,
+    ) -> DragonNormVjp<B, 4> {
+        match activity_mask {
+            Some(mask) => {
+                let vjp = self
+                    .norm
+                    .vjp_with_parameters(input * mask.clone(), grad_output * mask.clone());
+                DragonNormVjp {
+                    grad_input: vjp.grad_input * mask.clone(),
+                    ..vjp
+                }
+            }
+            None => self.norm.vjp_with_parameters(input, grad_output),
+        }
+    }
+
+    fn predictive_coding_masked_norm_input_vjp(
+        &self,
+        input: Tensor<B, 4>,
+        grad_output: Tensor<B, 4>,
+        activity_mask: Option<&Tensor<B, 4>>,
+    ) -> Tensor<B, 4> {
+        match activity_mask {
+            Some(mask) => {
+                self.norm
+                    .vjp_input(input * mask.clone(), grad_output * mask.clone())
+                    * mask.clone()
+            }
+            None => self.norm.vjp_input(input, grad_output),
+        }
     }
 
     pub fn predictive_coding_forward_layer(
         &self,
         input: Tensor<B, 4>,
         layer_index: usize,
+    ) -> DragonPredictiveCodingLayerTrace<B> {
+        self.predictive_coding_forward_layer_impl(input, layer_index, None, None, None)
+    }
+
+    pub fn predictive_coding_forward_layer_with_neuron_mask(
+        &self,
+        input: Tensor<B, 4>,
+        layer_index: usize,
+        neuron_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingLayerTrace<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_forward_layer_impl(input, layer_index, None, Some(neuron_mask), None)
+    }
+
+    pub fn predictive_coding_forward_layer_with_subnetwork_masks(
+        &self,
+        input: Tensor<B, 4>,
+        layer_index: usize,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingLayerTrace<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        self.predictive_coding_forward_layer_impl(
+            input,
+            layer_index,
+            None,
+            Some(neuron_mask),
+            Some(activity_mask),
+        )
+    }
+
+    /// Evaluate one local Dragon factor with a detached incoming rho state and
+    /// optional context masks. This is the recurrent/TBPTT integration point;
+    /// callers intentionally decide whether to propagate or truncate the
+    /// returned state's derivative.
+    pub fn predictive_coding_forward_layer_with_recurrent_state(
+        &self,
+        input: Tensor<B, 4>,
+        layer_index: usize,
+        initial_rho: Option<Tensor<B, 4>>,
+        neuron_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> Result<DragonPredictiveCodingLayerTrace<B>, String> {
+        if let Some(mask) = neuron_mask.as_ref() {
+            self.predictive_coding_validate_neuron_mask(mask)?;
+        }
+        if let Some(mask) = activity_mask.as_ref() {
+            self.predictive_coding_validate_activity_mask(mask)?;
+            if neuron_mask.is_none() {
+                return Err("activity mask requires a neuron mask".to_string());
+            }
+        }
+        if let Some(rho) = initial_rho.as_ref() {
+            let input_batch = input.shape().dims::<4>()[0];
+            self.predictive_coding_validate_rho_state(rho, input_batch)?;
+        }
+        Ok(self.predictive_coding_forward_layer_impl(
+            input,
+            layer_index,
+            initial_rho,
+            neuron_mask,
+            activity_mask,
+        ))
+    }
+
+    fn predictive_coding_forward_layer_impl(
+        &self,
+        input: Tensor<B, 4>,
+        layer_index: usize,
+        initial_rho: Option<Tensor<B, 4>>,
+        context_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
     ) -> DragonPredictiveCodingLayerTrace<B> {
         self.predictive_coding_support()
             .expect("unsupported Dragon predictive-coding architecture");
@@ -249,8 +529,7 @@ where
         );
         let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_index);
         let latent_pattern = &self.kernel.block_sparse.latent;
-        let sparse_mask = (self.kernel.enabled && latent_pattern.is_sparse())
-            .then(|| latent_pattern.mask::<B>(latent, &input.device()));
+        let sparse_mask = self.predictive_coding_neuron_mask(latent, &input.device(), context_mask);
         let output = lowrank_residual_step_with_metrics_branch_thresholds_relu_native(
             input.clone(),
             encoder,
@@ -265,15 +544,24 @@ where
             latent_pattern,
             self.kernel.lowrank_grad_input_executor,
             sparse_mask,
-            |query, value| self.predictive_coding_dense_attention(query, value),
+            |query, value| {
+                self.predictive_coding_dense_attention(query, value, initial_rho.clone())
+            },
             activation::relu,
-            |values| self.norm.forward(values),
+            |values| self.predictive_coding_masked_norm(values, activity_mask.as_ref()),
         );
         DragonPredictiveCodingLayerTrace {
             input,
+            initial_rho,
+            attention_pre_norm: output
+                .attention_pre_norm
+                .expect("full low-rank output retains pre-normalization attention"),
             attention_readout: output
                 .attention_readout
                 .expect("full low-rank output retains attention readout"),
+            residual_pre_norm: output
+                .residual_pre_norm
+                .expect("full low-rank output retains pre-normalization residual"),
             residual_delta: output
                 .residual_delta
                 .expect("full low-rank output retains residual delta"),
@@ -290,12 +578,61 @@ where
         trace: &DragonPredictiveCodingLayerTrace<B>,
         grad_next: Tensor<B, 4>,
     ) -> DragonPredictiveCodingLayerVjp<B> {
+        self.predictive_coding_layer_vjp_impl(layer_index, trace, grad_next, None, None)
+    }
+
+    pub fn predictive_coding_layer_vjp_with_neuron_mask(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingLayerVjp<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_layer_vjp_impl(
+            layer_index,
+            trace,
+            grad_next,
+            Some(neuron_mask),
+            None,
+        )
+    }
+
+    pub fn predictive_coding_layer_vjp_with_subnetwork_masks(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingLayerVjp<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        self.predictive_coding_layer_vjp_impl(
+            layer_index,
+            trace,
+            grad_next,
+            Some(neuron_mask),
+            Some(activity_mask),
+        )
+    }
+
+    fn predictive_coding_layer_vjp_impl(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        context_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> DragonPredictiveCodingLayerVjp<B> {
         self.predictive_coding_support()
             .expect("unsupported Dragon predictive-coding architecture");
         let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_index);
-        let latent_pattern = &self.kernel.block_sparse.latent;
-        let sparse_mask = (self.kernel.enabled && latent_pattern.is_sparse())
-            .then(|| latent_pattern.mask::<B>(latent, &trace.input.device()));
+        let sparse_mask =
+            self.predictive_coding_neuron_mask(latent, &trace.input.device(), context_mask);
 
         let residual_sum = trace.input.clone() + trace.residual_delta.clone();
         let DragonNormVjp {
@@ -304,17 +641,18 @@ where
             grad_beta: residual_beta,
             grad_alpha: residual_alpha,
             grad_shift: residual_shift,
-        } = self.norm.vjp_with_parameters(residual_sum, grad_next);
-        let mlp_raw = decode_y_neuron_tail(trace.y_neuron.clone(), decoder.clone());
+        } = self.predictive_coding_masked_norm_vjp(residual_sum, grad_next, activity_mask.as_ref());
         let DragonNormVjp {
             grad_input: grad_mlp_raw,
             grad_gamma: mlp_gamma,
             grad_beta: mlp_beta,
             grad_alpha: mlp_alpha,
             grad_shift: mlp_shift,
-        } = self
-            .norm
-            .vjp_with_parameters(mlp_raw, grad_residual_sum.clone());
+        } = self.predictive_coding_masked_norm_vjp(
+            trace.residual_pre_norm.clone(),
+            grad_residual_sum.clone(),
+            activity_mask.as_ref(),
+        );
 
         let [batch, heads, time, latent] = trace.y_neuron.shape().dims::<4>();
         let dim = trace.input.shape().dims::<4>()[3];
@@ -342,26 +680,27 @@ where
         )
         .expect("validated local PC y-projection VJP");
 
-        let raw_attention =
-            self.predictive_coding_dense_attention(trace.x_neuron.clone(), trace.input.clone());
         let DragonNormVjp {
             grad_input: grad_raw_attention,
             grad_gamma: attention_gamma,
             grad_beta: attention_beta,
             grad_alpha: attention_alpha,
             grad_shift: attention_shift,
-        } = self
-            .norm
-            .vjp_with_parameters(raw_attention, y_vjp.grad_input);
+        } = self.predictive_coding_masked_norm_vjp(
+            trace.attention_pre_norm.clone(),
+            y_vjp.grad_input,
+            activity_mask.as_ref(),
+        );
         let decay = self
             .attention
             .alibi_decay()
             .expect("validated local PC ALiBi decay");
-        let attention_vjp = dense_causal_attention_vjp(
+        let attention_vjp = dense_causal_attention_vjp_with_initial_rho(
             grad_raw_attention,
             trace.x_neuron.clone(),
             trace.input.clone(),
             decay,
+            trace.initial_rho.clone(),
         );
         let grad_x = grad_x_from_product + attention_vjp.grad_query;
         let x_vjp = relu_lowrank_vjp(
@@ -405,17 +744,73 @@ where
         trace: &DragonPredictiveCodingLayerTrace<B>,
         grad_next: Tensor<B, 4>,
     ) -> Tensor<B, 4> {
+        self.predictive_coding_layer_activity_vjp_impl(layer_index, trace, grad_next, None, None)
+    }
+
+    pub fn predictive_coding_layer_activity_vjp_with_neuron_mask(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+    ) -> Tensor<B, 4> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_layer_activity_vjp_impl(
+            layer_index,
+            trace,
+            grad_next,
+            Some(neuron_mask),
+            None,
+        )
+    }
+
+    pub fn predictive_coding_layer_activity_vjp_with_subnetwork_masks(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> Tensor<B, 4> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        self.predictive_coding_layer_activity_vjp_impl(
+            layer_index,
+            trace,
+            grad_next,
+            Some(neuron_mask),
+            Some(activity_mask),
+        )
+    }
+
+    fn predictive_coding_layer_activity_vjp_impl(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        context_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> Tensor<B, 4> {
         self.predictive_coding_support()
             .expect("unsupported Dragon predictive-coding architecture");
         let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_index);
-        let latent_pattern = &self.kernel.block_sparse.latent;
-        let sparse_mask = (self.kernel.enabled && latent_pattern.is_sparse())
-            .then(|| latent_pattern.mask::<B>(latent, &trace.input.device()));
+        let sparse_mask =
+            self.predictive_coding_neuron_mask(latent, &trace.input.device(), context_mask);
 
         let residual_sum = trace.input.clone() + trace.residual_delta.clone();
-        let grad_residual_sum = self.norm.vjp_input(residual_sum, grad_next);
-        let mlp_raw = decode_y_neuron_tail(trace.y_neuron.clone(), decoder.clone());
-        let grad_mlp_raw = self.norm.vjp_input(mlp_raw, grad_residual_sum.clone());
+        let grad_residual_sum = self.predictive_coding_masked_norm_input_vjp(
+            residual_sum,
+            grad_next,
+            activity_mask.as_ref(),
+        );
+        let grad_mlp_raw = self.predictive_coding_masked_norm_input_vjp(
+            trace.residual_pre_norm.clone(),
+            grad_residual_sum.clone(),
+            activity_mask.as_ref(),
+        );
 
         let [batch, heads, time, latent] = trace.y_neuron.shape().dims::<4>();
         let dim = trace.input.shape().dims::<4>()[3];
@@ -436,18 +831,21 @@ where
         )
         .expect("validated local PC y-projection input VJP");
 
-        let raw_attention =
-            self.predictive_coding_dense_attention(trace.x_neuron.clone(), trace.input.clone());
-        let grad_raw_attention = self.norm.vjp_input(raw_attention, grad_attention_readout);
+        let grad_raw_attention = self.predictive_coding_masked_norm_input_vjp(
+            trace.attention_pre_norm.clone(),
+            grad_attention_readout,
+            activity_mask.as_ref(),
+        );
         let decay = self
             .attention
             .alibi_decay()
             .expect("validated local PC ALiBi decay");
-        let attention_vjp = dense_causal_attention_vjp(
+        let attention_vjp = dense_causal_attention_vjp_with_initial_rho(
             grad_raw_attention,
             trace.x_neuron.clone(),
             trace.input.clone(),
             decay,
+            trace.initial_rho.clone(),
         );
         let grad_x = grad_x_from_product + attention_vjp.grad_query;
         let grad_projection_input = relu_lowrank_input_vjp(
@@ -465,6 +863,92 @@ where
 
     pub fn predictive_coding_hidden_from_activity(&self, activity: Tensor<B, 4>) -> Tensor<B, 3> {
         self.collapse_language_streams(activity)
+    }
+
+    /// Forward the analytic-PC-compatible Dragon architecture while applying
+    /// a fixed context competition mask to every layer's neuron channels.
+    ///
+    /// A `[1, 1|n_head, 1, latent_per_head]` binary mask is the fixed context-
+    /// competition upper bound used by continual-learning experiments. The operation
+    /// remains ordinarily differentiable when `B` is an autodiff backend.
+    pub fn predictive_coding_forward_with_neuron_mask(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        neuron_mask: Tensor<B, 4>,
+    ) -> Result<Tensor<B, 3>, String> {
+        self.predictive_coding_forward_with_context_masks(tokens, Some(neuron_mask), None)
+    }
+
+    /// Forward an oracle context-selected Dragon subnetwork. Neuron masks
+    /// select rho channels inside each low-rank factor; activity masks select
+    /// residual-state channels, including the embedding and language-head
+    /// interfaces.
+    pub fn predictive_coding_forward_with_subnetwork_masks(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> Result<Tensor<B, 3>, String> {
+        self.predictive_coding_forward_with_context_masks(
+            tokens,
+            Some(neuron_mask),
+            Some(activity_mask),
+        )
+    }
+
+    fn predictive_coding_forward_with_context_masks(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        neuron_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> Result<Tensor<B, 3>, String> {
+        self.predictive_coding_support()?;
+        if let Some(mask) = neuron_mask.as_ref() {
+            self.predictive_coding_validate_neuron_mask(mask)?;
+        }
+        if let Some(mask) = activity_mask.as_ref() {
+            self.predictive_coding_validate_activity_mask(mask)?;
+        }
+        let [batch, time] = tokens.shape().dims::<2>();
+        let mut activity = match activity_mask.as_ref() {
+            Some(mask) => {
+                self.predictive_coding_initial_activity_with_activity_mask(tokens, mask.clone())
+            }
+            None => self.predictive_coding_initial_activity(tokens),
+        };
+        for layer in 0..self.predictive_coding_layer_count() {
+            activity = match (neuron_mask.as_ref(), activity_mask.as_ref()) {
+                (Some(neuron_mask), Some(activity_mask)) => {
+                    self.predictive_coding_forward_layer_with_subnetwork_masks(
+                        activity,
+                        layer,
+                        neuron_mask.clone(),
+                        activity_mask.clone(),
+                    )
+                    .next
+                }
+                (Some(mask), None) => {
+                    self.predictive_coding_forward_layer_with_neuron_mask(
+                        activity,
+                        layer,
+                        mask.clone(),
+                    )
+                    .next
+                }
+                (None, None) => self.predictive_coding_forward_layer(activity, layer).next,
+                (None, Some(_)) => unreachable!("activity mask requires a neuron mask"),
+            };
+            if let Some(mask) = activity_mask.as_ref() {
+                activity = activity * mask.clone();
+            }
+        }
+        let hidden = self.predictive_coding_hidden_from_activity(activity);
+        let head = self.predictive_coding_head_weight()?;
+        let vocab = head.shape().dims::<2>()[1];
+        Ok(hidden
+            .reshape([batch * time, self.n_embd])
+            .matmul(head)
+            .reshape([batch, time, vocab]))
     }
 
     pub fn predictive_coding_head_weight(&self) -> Result<Tensor<B, 2>, String> {
@@ -499,7 +983,8 @@ where
             || Tensor::<B, 2>::ones([batch, time], &hidden.device()),
             |mask| mask.float(),
         );
-        let denominator = mask.clone().sum().clamp_min(1.0);
+        let supervised_tokens = mask.clone().sum();
+        let denominator = supervised_tokens.clone().clamp_min(1.0);
         let loss = (selected.mul_scalar(-1.0) * mask.clone())
             .sum()
             .div(denominator.clone())
@@ -521,6 +1006,7 @@ where
             loss,
             grad_hidden,
             grad_lm_head,
+            supervised_tokens: supervised_tokens.reshape([1]),
         }
     }
 

@@ -371,6 +371,40 @@ fn scale_gradients_by_schedule<B, M>(
     }
 }
 
+fn rescale_gradients_by_device_scalar<B, M>(
+    module: &M,
+    grads: &mut GradientsParams,
+    scalar: Tensor<B::InnerBackend, 1>,
+    divide: bool,
+) where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    struct DeviceScalarGradientVisitor<'a, B: AutodiffBackend> {
+        grads: &'a mut GradientsParams,
+        scalar: Tensor<B::InnerBackend, 1>,
+        divide: bool,
+    }
+    impl<B: AutodiffBackend> burn::module::ModuleVisitor<B> for DeviceScalarGradientVisitor<'_, B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id) {
+                let scalar = self.scalar.clone().reshape([1; D]);
+                let grad = if self.divide {
+                    grad / scalar
+                } else {
+                    grad * scalar
+                };
+                self.grads.register(param.id, grad);
+            }
+        }
+    }
+    module.visit(&mut DeviceScalarGradientVisitor::<B> {
+        grads,
+        scalar,
+        divide,
+    });
+}
+
 #[derive(Default)]
 struct ParamIdCollector {
     ids: HashSet<burn::module::ParamId>,
@@ -11342,21 +11376,90 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
         if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
-            let step = super::local_predictive_coding::local_predictive_coding_train_step(
-                &self.model,
-                clean_inputs,
-                targets,
-                loss_mask,
-                &self.local_predictive_coding,
-                &self.local_predictive_coding_profile,
-            );
-            debug_assert_eq!(step.report.global_backward_calls, 0);
-            if prof_enabled {
-                crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+            let [batch_size, block_size] = clean_inputs.shape().dims::<2>();
+            let chunk_size = self.effective_tbptt_chunk_size(block_size);
+            if chunk_size.is_none() && !self.tbptt_persist_across_steps {
+                let step = super::local_predictive_coding::local_predictive_coding_train_step(
+                    &self.model,
+                    clean_inputs,
+                    targets,
+                    loss_mask,
+                    &self.local_predictive_coding,
+                    &self.local_predictive_coding_profile,
+                );
+                debug_assert_eq!(step.report.global_backward_calls, 0);
+                if prof_enabled {
+                    crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+                }
+                return TrainOutput {
+                    grads: self.apply_gradient_scale_schedule(step.grads),
+                    item: LanguageModelTrainItem::new(step.loss),
+                };
             }
+
+            let mut state = self.load_step_state(batch.reset_stream_state, block_size);
+            let mut accumulator = GradientsAccumulator::new();
+            let mut total_loss: Option<Tensor<B, 1>> = None;
+            let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
+            let mut total_elapsed_ns = 0u128;
+            let chunk_size = chunk_size.unwrap_or(block_size);
+            for start in (0..block_size).step_by(chunk_size) {
+                let end = (start + chunk_size).min(block_size);
+                let chunk_inputs = Self::slice_tokens(clean_inputs.clone(), batch_size, start, end);
+                let chunk_targets = Self::slice_tokens(targets.clone(), batch_size, start, end);
+                let chunk_loss_mask = loss_mask
+                    .clone()
+                    .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+                let mut step =
+                    super::local_predictive_coding::local_predictive_coding_train_step_with_state(
+                        &self.model,
+                        chunk_inputs,
+                        chunk_targets,
+                        chunk_loss_mask,
+                        state,
+                        &self.local_predictive_coding,
+                        &self.local_predictive_coding_profile,
+                    );
+                debug_assert_eq!(step.report.global_backward_calls, 0);
+                state = step.terminal_state;
+                let supervised_tokens = step.supervised_tokens;
+                rescale_gradients_by_device_scalar::<B, _>(
+                    self,
+                    &mut step.grads,
+                    supervised_tokens.clone().inner(),
+                    false,
+                );
+                accumulator.accumulate(self, step.grads);
+                let weighted_loss = step.loss * supervised_tokens.clone();
+                total_loss = Some(match total_loss {
+                    Some(accumulated) => accumulated + weighted_loss,
+                    None => weighted_loss,
+                });
+                total_supervised_tokens = Some(match total_supervised_tokens {
+                    Some(accumulated) => accumulated + supervised_tokens,
+                    None => supervised_tokens,
+                });
+                total_elapsed_ns = total_elapsed_ns.saturating_add(step.report.elapsed_ns);
+            }
+            self.store_step_state(state);
+            if prof_enabled {
+                crate::train::profile::record_local_learning_step(total_elapsed_ns);
+            }
+            let supervised_tokens = total_supervised_tokens
+                .expect("local PC TBPTT requires at least one chunk")
+                .clamp_min(1.0);
+            let mut grads = accumulator.grads();
+            rescale_gradients_by_device_scalar::<B, _>(
+                self,
+                &mut grads,
+                supervised_tokens.clone().inner(),
+                true,
+            );
+            let loss =
+                total_loss.expect("local PC TBPTT requires at least one chunk") / supervised_tokens;
             return TrainOutput {
-                grads: self.apply_gradient_scale_schedule(step.grads),
-                item: LanguageModelTrainItem::new(step.loss),
+                grads: self.apply_gradient_scale_schedule(grads),
+                item: LanguageModelTrainItem::new(loss),
             };
         }
         let ruliad_policy_batch = batch.ruliad_policy_batch;
@@ -13165,6 +13268,148 @@ mod objective_step_tests {
         );
         assert_eq!(model_a.load_step_state(true, 4).position, 0);
         assert!(model_a.peek_step_state_for_test().is_none());
+    }
+
+    #[test]
+    fn local_predictive_coding_tbptt_carries_and_resets_rho_state() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_model_config();
+        config.n_layer = 2;
+        config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                ..LocalPredictiveCodingConfig::default()
+            })
+            .with_tbptt_chunk_size(Some(2))
+            .with_tbptt_persist_across_steps(true);
+        let batch = |reset_stream_state| SequenceBatch {
+            inputs: Tensor::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
+                &device,
+            ),
+            targets: Tensor::from_data(
+                TensorData::new(vec![2_i64, 3, 4, 5, 6, 7, 8, 9], [1, 8]),
+                &device,
+            ),
+            loss_mask: None,
+            summary_event_mask: None,
+            ruliad_policy_batch: None,
+            reset_stream_state,
+        };
+
+        let first = burn_train::TrainStep::step(&model, batch(true));
+        assert_eq!(first.grads.len(), 9);
+        let first_state = model
+            .peek_step_state_for_test()
+            .expect("persistent local PC state after first step");
+        assert_eq!(first_state.position, 8);
+        assert!(first_state.layers.iter().all(|layer| layer.rho.is_some()));
+
+        let second = burn_train::TrainStep::step(&model, batch(false));
+        assert_eq!(second.grads.len(), 9);
+        assert_eq!(
+            model
+                .peek_step_state_for_test()
+                .expect("persistent local PC state after second step")
+                .position,
+            16
+        );
+
+        let reset = burn_train::TrainStep::step(&model, batch(true));
+        assert_eq!(reset.grads.len(), 9);
+        assert_eq!(
+            model
+                .peek_step_state_for_test()
+                .expect("reset local PC state")
+                .position,
+            8
+        );
+    }
+
+    #[test]
+    fn local_predictive_coding_tbptt_uses_supervised_token_loss_weighting() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 71);
+        let mut config = tiny_model_config();
+        config.n_layer = 2;
+        config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let base = DragonModel::<TestBackend>::new(config, &device);
+        let make_model = |model| {
+            LanguageTrainModel::new(model)
+                .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+                .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                    solver: LocalPredictiveCodingSolver::FixedPrediction,
+                    ..LocalPredictiveCodingConfig::default()
+                })
+        };
+        let chunked = make_model(base).with_tbptt_chunk_size(Some(2));
+        let batch = || SequenceBatch {
+            inputs: Tensor::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
+                &device,
+            ),
+            targets: Tensor::from_data(
+                TensorData::new(vec![2_i64, 3, 4, 5, 6, 7, 8, 9], [1, 8]),
+                &device,
+            ),
+            loss_mask: Some(Tensor::from_data(
+                TensorData::new(vec![1_i64, 0, 0, 0, 1, 1, 1, 1], [1, 8]),
+                &device,
+            )),
+            summary_event_mask: None,
+            ruliad_policy_batch: None,
+            reset_stream_state: true,
+        };
+
+        let source = batch();
+        let mut state = chunked.model.init_state_ephemeral();
+        let mut weighted_loss = 0.0_f32;
+        let mut supervised_tokens = 0.0_f32;
+        let config = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::FixedPrediction,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        for start in (0..8).step_by(2) {
+            let end = start + 2;
+            let step = crate::train::local_predictive_coding_derivatives_with_state(
+                &chunked.model,
+                LanguageTrainModel::<TestBackend>::slice_tokens(
+                    source.inputs.clone(),
+                    1,
+                    start,
+                    end,
+                ),
+                LanguageTrainModel::<TestBackend>::slice_tokens(
+                    source.targets.clone(),
+                    1,
+                    start,
+                    end,
+                ),
+                source.loss_mask.clone().map(|mask| {
+                    LanguageTrainModel::<TestBackend>::slice_tokens(mask, 1, start, end)
+                }),
+                state,
+                &config,
+            )
+            .expect("manual recurrent local-PC factor");
+            let chunk_loss = burn_pc::diagnostic_scalar_f32(step.loss.inner());
+            let chunk_tokens = burn_pc::diagnostic_scalar_f32(step.supervised_tokens.inner());
+            weighted_loss += chunk_loss * chunk_tokens;
+            supervised_tokens += chunk_tokens;
+            state = step.terminal_state;
+        }
+        let expected_loss = weighted_loss / supervised_tokens.max(1.0);
+        let chunked_loss = scalar_loss(burn_train::TrainStep::step(&chunked, batch()));
+        assert!(
+            (expected_loss - chunked_loss).abs() < 1.0e-5,
+            "expected={expected_loss} chunked={chunked_loss}"
+        );
     }
 
     #[test]

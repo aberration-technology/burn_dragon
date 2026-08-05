@@ -1,18 +1,223 @@
 # Predictive Coding in Dragon Training
 
-Date: 2026-08-04
+Date: 2026-08-05
 
 ## Status
 
 This document records two separate mechanisms: canonical layer-local predictive coding and the
-older recurrent-state correction auxiliary. It is **not a promotion paper**. The layer-local path
-now has a controlled, reproducible three-seed screen, but it does not yet match AdamW quality or
-throughput. AdamW remains the default training algorithm.
+older recurrent-state correction auxiliary. AdamW remains the default training algorithm. Plain
+prospective layer-local PC still trails AdamW quality and throughput; fixed prediction reaches
+backpropagation-equivalent convergence without a global backward call but is slower. Exact local
+factors now accept detached recurrent rho state and run through the production TBPTT state path.
 
-The correct framing is a neutral result. Dragon can now train by local factor VJPs without a global
-autodiff graph or global backward pass. That establishes the intended learning contract, not a
-quality win. Neither PC implementation has shown that it prevents collapse, improves long-run
-continual learning, or should replace AdamW.
+The current positive continual-learning result belongs to a complementary system, not the PC
+derivative alone. Task-ID-free context selection, balanced sparse routing, and context-scoped
+optimizer state nearly eliminate forgetting for both backpropagation and fixed-prediction PC. That
+controlled result is recorded below; production and Ruliad promotion remain open.
+The family-aware selector used by the original result has now been replaced in the follow-up
+benchmark by causal predictive-loss discovery with sequential novelty confirmation. That result is
+also controlled benchmark evidence, not yet an automatic production Ruliad router.
+
+## 2026-08-04 Lifelong Context-Routing Result
+
+The prior status remains correct for **plain** predictive coding. A new controlled result supports
+a narrower system-level claim: fixed-prediction local learning combined with task-ID-free context
+selection, balanced sparse subnetworks, and context-scoped optimizer state is a materially stronger
+continual learner than an ordinary dense AdamW model. It does not show that predictive-coding
+derivatives outperform backpropagation when both use the same routing system.
+
+This distinction matches the source research. [Lifelong Neural Predictive
+Coding](https://proceedings.neurips.cc/paper_files/paper/2022/file/26f5a4e26c13d1e0a47f46790c999361-Paper-Conference.pdf)
+attributes retention to a complementary system: a task selector drives lateral competition in the
+generative circuit, reducing representational overlap. Its
+[supplement](https://proceedings.neurips.cc/paper_files/paper/2022/file/26f5a4e26c13d1e0a47f46790c999361-Supplemental-Conference.pdf)
+states explicitly that resistance to forgetting comes from the interaction between selector and
+generative circuit, not from predictive coding in isolation.
+
+The controlled benchmark is `pc_lifelong_stream`. It presents four context-identifiable modular
+recurrence laws sequentially. Each law has disjoint train and holdout initial conditions, while all
+laws use the same initial-condition seeds. There is no task marker. The context selector receives a
+unit-normalized modular-transition consistency sketch computed from the first 16 observed tokens;
+supervision starts only after that support prefix is causally available. The selector never receives
+the hidden benchmark task enum. Cosine novelty creates contexts online, holdout selection must recover
+the learned context, and a usage-balanced mask allocator minimizes channel reuse. At active fraction
+0.25, four contexts partition residual and neuron channels without overlap. Every arm uses the same
+model initialization, examples, token budget, and evaluation matrix.
+
+The release-CUDA matrix used NVIDIA GB10, 888,194 parameters, four shared Dragon layer uses,
+embedding 96, four heads, latent width 3,072, batch 32, block 128, 128 updates per task, 2,097,152
+train tokens per run, four holdout batches per task, and five seeds. `Acq` is the number of seeds that
+passed every task's acquisition gate. A gate first requires the matched backprop baseline itself to
+reduce loss by at least 0.5 and gain at least 0.25 accuracy, then requires the candidate to retain at
+least 90% of that loss reduction and stay within 0.05 accuracy gain. Across the matrix, the weakest
+baseline task reduced loss by 2.414 and gained 0.802 accuracy.
+
+| Learner | Routing / optimizer state | Acq | Final accuracy | BWT | Mean forgetting | Tokens/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Backprop + AdamW | Dense / shared | 5/5 | 0.3849 +/- 0.0214 | -0.8198 +/- 0.0282 | 0.8198 +/- 0.0282 | 66,316 +/- 1,507 |
+| Fixed-prediction PC | Dense / shared | 5/5 | 0.3963 +/- 0.0080 | -0.8050 +/- 0.0107 | 0.8050 +/- 0.0107 | 41,905 +/- 615 |
+| Backprop + AdamW | Selected sparse / context-scoped | 5/5 | 0.9935 +/- 0.0134 | +0.0015 +/- 0.0034 | **0.0000 +/- 0.0000** | **70,375 +/- 1,541** |
+| Fixed-prediction PC | Selected sparse / context-scoped | 5/5 | **0.9984 +/- 0.0027** | -0.0005 +/- 0.0012 | 0.0005 +/- 0.0012 | 40,624 +/- 665 |
+
+Against dense AdamW, the complete fixed-PC system improves final accuracy by
+`+0.6135 +/- 0.0235`, BWT by `+0.8193 +/- 0.0278`, and mean forgetting by
+`-0.8193 +/- 0.0278`; every paired seed has the same direction. Selector accuracy is 1.0, and exactly
+four contexts are created, in every routed run. Fixed-PC makes zero global backward calls. It retains
+61.3% of dense-AdamW throughput and 57.7% of matched routed-AdamW throughput. Direct sampling during
+the arms showed 90-91% GPU utilization and roughly 40-42 W, while host/shared memory remained about
+7.6 GiB. The throughput gap is repeated local device work, not a host or data-generation stall.
+The paired 95% confidence intervals are `[+0.5843, +0.6426]` for final accuracy,
+`[+0.7848, +0.8537]` for BWT, and `[-0.8537, -0.7848]` for forgetting.
+
+The matched routed-AdamW control is important. Routed fixed-PC minus routed backprop is
+`+0.0048 +/- 0.0146` final accuracy, `-0.0021 +/- 0.0033` BWT, and
+`+0.0005 +/- 0.0012` forgetting: statistical parity at this sample size and ceiling, not PC
+superiority. Routed backprop is 1.73x faster. Fixed prediction is backpropagation-equivalent local
+error transport, so parity is the expected result. Dense fixed-PC also has only a small,
+high-variance advantage over dense backprop (`+0.0113 +/- 0.0182` accuracy). The benchmark supports
+the paper's complementary-system claim, not a claim that its PC derivative is intrinsically better
+than AdamW/backpropagation.
+The matched routed 95% confidence intervals all cross zero: `[-0.0132, +0.0229]` accuracy,
+`[-0.0062, +0.0021]` BWT, and `[-0.0009, +0.0020]` forgetting.
+
+A prospective reverse-Gauss-Seidel smoke at half the token budget provides the negative control. It
+kept energy monotone and used zero global backward calls, but failed acquisition: final accuracy was
+0.7325 versus 0.9944 for matched backprop, at 11,416 versus 71,781 tokens/s. Prospective equilibrium
+learning therefore remains experimental.
+
+### 2026-08-05 feedback-transport and batching screen
+
+Four follow-up implementations were screened against the same numerical and acquisition contracts.
+None passed, and all corresponding solver/configuration branches were removed rather than retained
+as dormant production surface.
+
+An identity direct-feedback arm broadcast the terminal residual-stream error to every shared layer
+use. On the full 937,154-parameter CUDA fidelity geometry, its global cosine with exact backprop was
+only `0.6608`, with norm ratio `1.0411` and relative L2 error `0.8414`. The embedding cosine was
+`0.2097`. Dragon's equal residual widths make the broadcast shape-valid, but they do not make the
+sample-, token-, and activation-dependent layer Jacobians identity maps.
+
+A bounded exact-transport arm then applied the true local activity Jacobian through the last `k`
+layer uses and broadcast the resulting shared residual error below that boundary:
+
+| Exact transport depth | Global cosine | PC/reference norm | Relative L2 |
+| ---: | ---: | ---: | ---: |
+| 0 | 0.6608 | 1.0411 | 0.8414 |
+| 1 | 0.8704 | 0.9308 | 0.4959 |
+| 2 | 0.9572 | 0.9456 | 0.2898 |
+| 3 | 0.9893 | 0.9799 | 0.1461 |
+| 4 | 0.9999997 | 1.0000 | 0.00083 |
+
+The fidelity frontier is smooth, but the intermediate point is not an efficient learner. In a
+matched one-seed, 128-update-per-task CUDA run, exact depth two reached final accuracy `0.3915`, BWT
+`-0.8114`, and 29,800 tokens/s. Matched backprop reached `0.3970`, `-0.8040`, and 68,633 tokens/s;
+fixed prediction reached `0.3996`, `-0.8006`, and 43,179 tokens/s. Depth two failed the acquisition
+gate on task D with an accuracy-gain delta of `-0.0660`. Device sampling remained dense at 91-95%
+SM utilization, so the deficit was extra local Jacobian work rather than a host stall.
+
+A learned amortized-feedback arm maintained one residual-width matrix per shared layer use and
+updated it from periodic exact-Jacobian calibration samples. Learning-rate screens at `1e-6`,
+`0.01`, and `0.25` all failed acquisition on the bounded CPU benchmark, with final accuracy between
+`0.153` and `0.174`. A single sample-independent linear map cannot track the changing attention,
+ReLU, normalization, token, and context Jacobians in this Dragon factor. A future learned transport
+must be sample-conditioned and nonlinear; retaining this matrix state would only create misleading
+checkpoint and run-lifecycle complexity.
+
+Finally, fixed prediction was rewritten as a reverse activity-only wave followed by one batched
+shared-parameter VJP. CUDA fidelity remained exact (`0.9999997` cosine and `0.00083` relative L2),
+but steady-state throughput fell to 25,463 tokens/s because the second factor pass duplicated most
+of the local Jacobian work. Reduction-order drift also moved task-D acquisition just outside the
+configured tolerance (`-0.0543`). The serial full-VJP reverse wave was restored.
+
+The first context-selector follow-up also failed: a generic token-transition hash sketch did not
+provide a stable novelty margin. That negative result is retained as evidence against fixed random
+descriptors, but it has been superseded by the causal predictive-loss selector described below.
+
+**Decision:** the supported local-PC solver surface remains synchronous equilibrium,
+reverse-Gauss-Seidel, and fixed prediction. Fixed prediction is the numerical/convergence control;
+the other two are research controls. No tested PC derivative beats matched backpropagation on both
+quality and throughput, and there is no state-of-the-art claim.
+
+Raw feedback-screen reports are under `target/pc-feedback-screen-20260805/`.
+
+Raw reports are under `target/pc-lifelong-task-id-free-1m-cuda-20260804/analysis/`. This is controlled
+benchmark evidence, not yet a production or Ruliad promotion. The benchmark uses a family-aware but
+task-ID-free transition sketch and a fixed four-context capacity; it is retained only as the
+descriptor control for the causal follow-up below. The final schema-v2 files are `dense-five-seed-v2.json`,
+`routed-five-seed-v2.json`, and `reverse-seed-17-smoke-v2.json`.
+
+### 2026-08-05 causal predictive context and recurrent-factor follow-up
+
+`burn_pc` now provides a model-agnostic, serializable `PredictiveContextBank` and
+`PredictiveContextNoveltyGate`. Dragon scores only the causally visible prefix under every known
+subnetwork. Minimum absolute next-token loss chooses the expert. Per-expert EMA mean and variance
+define novelty envelopes; calibrated z-scores are diagnostic rather than routing scores. A new
+context requires three consecutive all-expert rejections, preventing one transient loss spike from
+allocating permanent model capacity. Selection is read-only until the caller explicitly observes a
+training decision, so holdout evaluation cannot mutate calibration or confirmation state.
+
+The hot routing probe batches all expert losses into one backend-to-host read. With the default
+eight-update cadence, routing remains a small periodic side path rather than part of every model
+step. The benchmark buffers pending confirmation probes at a true boundary and performs no
+parameter update against their fallback expert. Committed routing accuracy is therefore reported
+separately from discovery delay. A host-side Criterion microbenchmark measures context-bank
+selection at about 32 ns for eight experts and 199 ns for 64 experts; model prefix scoring and its
+single scalar readback, not bank selection, dominate routing cost.
+
+The release-CUDA follow-up uses the same GB10, 888,194-parameter, four-layer-use geometry as the
+original controlled matrix: embedding 96, four heads, latent width 3,072, batch 32, block 128, 128
+updates per task, four holdout batches, and 2,097,152 training tokens per arm. Four contexts use a
+0.25 active fraction, giving zero pairwise overlap in both residual and neuron masks.
+
+| Learner | Seeds | Acq | Contexts | Final accuracy | BWT | Mean forgetting | Tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Backprop + AdamW | 3 | 3/3 | 4/4 | 0.9849 +/- 0.0624 | +0.00004 +/- 0.00017 | 0.00238 +/- 0.01025 | 71,900 +/- 3,822 |
+| Fixed-prediction PC | 3 | 3/3 | 4/4 | 0.9979 +/- 0.0089 | 0.00000 +/- 0.00000 | 0.00000 +/- 0.00000 | 42,574 +/- 660 |
+
+Every arm discovers exactly four contexts, passes all four acquisition gates, and avoids duplicate
+allocation. The legacy schema counted deferred discovery decisions as selector errors. The
+finalized schema-6 rerun reports 123 committed decisions at `123/123 = 1.0` accuracy and seven
+deferred probes per arm. Fixed prediction retains 59.2% of matched Backpropagation throughput.
+During direct sampling both learners sustain roughly 89-91% GPU utilization at 40-43 W with
+7.5-8.0 GiB host memory in use. The quality result supports causal context discovery and
+sparse/context-scoped retention, not intrinsic PC superiority: the paired quality difference is at
+a ceiling and Backpropagation remains 1.69x faster.
+
+Local PC also now accepts one detached incoming rho per shared layer use. The analytic dense causal
+attention VJP includes exact query, value, ALiBi-decay, and incoming-state terms. The terminal rho is
+the ordinary feed-forward continuation state; activity inference remains transient. Production
+`TrainStep` slices the block at `tbptt_chunk_size`, carries rho between factors and optionally across
+batches, aggregates shared derivatives, and honors stream reset. Masked document chunks are weighted
+by their raw supervised-token count entirely on device, including zero-supervision chunks. The
+recurrent forward reuses the fused dense-attention kernel and adds only the incoming-rho context plus
+the terminal-state reduction.
+
+Numerical gates pass on NdArray: the stateful attention VJP matches autodiff for query, value, decay,
+and incoming rho; recurrent fixed-prediction gradients have cosine above 0.99999 and relative L2
+below `1e-4` against a detached-TBPTT reference; terminal rho matches ordinary Dragon state; and
+chunked masked loss matches the full-block loss. The canonical profile composition is
+`local-pc-smoke.toml + pc-fixed-prediction.overlay.toml + pc-recurrent-tbptt.overlay.toml`.
+
+The release-CUDA production path also completed an eight-step recurrent smoke with a complete
+model, optimizer, and scheduler checkpoint triplet. Every optimizer step reported four chunks corrected,
+16 local VJPs, no global autodiff graph, and zero global backward calls; mean validation CE was
+5.495 after the intentionally short run. In a matched 32-step wiring comparison on the same tiny
+profile, stateless and recurrent runs completed in 3.75 s and 3.88 s wall time. Steady local-PC
+correction time was 6.29 ms for one full-block factor versus 24.97 ms for four recurrent factors;
+validation CE was 4.549 versus 4.581. This verifies production execution and quantifies chunking
+cost, but is too short and too small to establish a recurrent-quality advantage.
+
+Raw follow-up artifacts are
+`target/pc-remaining-blockers/cuda-routed-confirmed-seed17.json` and
+`target/pc-remaining-blockers/cuda-routed-confirmed-three-seed.json`. The corrected schema-6 control
+is `target/pc-remaining-blockers/cuda-routed-confirmed-schema6-seed17.json`; production smoke events
+are under `runs/one-steel`, `runs/roasted-slope`, and `runs/odd-push`.
+
+The remaining promotion boundary is architectural: the normal Ruliad loader does not yet own a
+run-scoped context/subnetwork bank or context-scoped optimizer collection. Adding routing there
+without those two pieces would reproduce neither the controlled retention mechanism nor its
+checkpoint semantics. Until that integration receives a Ruliad holdout matrix, the predictive bank
+is a tested generic primitive and benchmark integration, not a default production policy.
 
 ### 2026-08-04 canonical local-factor implementation
 
@@ -76,11 +281,12 @@ The exported train-loss metric is the ordinary feed-forward token cross entropy 
 activity relaxation; post-inference energy is reported separately when synchronized diagnostics are
 enabled. This keeps train-loss comparisons with the backpropagation baseline meaningful.
 
-This first exact implementation is deliberately fail-closed. It supports the flat, untied standard
+This exact implementation is deliberately fail-closed. It supports the flat, untied standard
 language head; vanilla residual stream; dense short-context linear attention with ALiBi; uniform
-full latent fanout; one rollout; and no dropout, random scaffold, hierarchy, slow memory, summary
-memory, latent-reasoning recurrence, or TBPTT. Unsupported combinations fail configuration
-validation instead of silently falling back to global backprop.
+full latent fanout; one rollout; no dropout, random scaffold, hierarchy, slow memory, summary
+memory, or latent-reasoning recurrence; and detached recurrent rho factors through TBPTT.
+Unsupported combinations fail configuration validation instead of silently falling back to global
+backprop.
 
 The historical `[training.predictive_coding]` configuration below is a different mechanism: it
 corrects recurrent state as an auxiliary inside ordinary global-backprop training. It remains
@@ -713,16 +919,32 @@ Supported by current evidence:
 5. Raw state correction can descend observed-prefix energy, but replay erases its terminal-state
    teaching signal to numerical noise after the first selected chunk.
 6. State-only correction is not a viable substitute for parameter optimization.
+7. In the controlled task-ID-free recurrence stream, fixed-prediction PC plus selected sparse routing
+   and context-scoped optimizer state is a substantially stronger continual-learning system than
+   ordinary dense AdamW across five paired seeds.
+8. The same routing and optimizer-state isolation nearly eliminate forgetting under both
+   fixed-prediction PC and backpropagation; their matched quality is at parity, while backpropagation
+   remains substantially faster.
+9. A causal predictive-loss selector with sequential novelty confirmation discovers all four
+   contexts without duplicates across three paired CUDA seeds and preserves the routed retention
+   result without a family-specific descriptor.
+10. Exact local-PC factors carry detached linear-attention rho through TBPTT and match the
+    corresponding stateful autodiff/numerical contracts.
 
 Not yet supported:
 
-1. PC improves long-run continual learning.
+1. PC derivatives intrinsically improve long-run continual learning over a matched backpropagation
+   learner.
 2. PC prevents output degeneracy or collapse.
 3. PC is worth its throughput cost by default.
 4. The first-class PC optimizer path is competitive with AdamW.
 5. PC is additive with JEPA+NextLat beyond short-run or single-seed evidence.
-6. The current recurrent-state replay path is layer-local PC or parallelizes credit assignment
-   across Dragon layers.
+6. The historical recurrent-state replay auxiliary is layer-local PC or parallelizes credit
+   assignment across Dragon layers.
+7. The predictive context bank is ready as a default Ruliad routing policy; production still lacks
+   run-scoped subnetwork/optimizer checkpoint integration and a Ruliad holdout promotion matrix.
+8. Fixed-prediction PC exceeds matched Backpropagation throughput or establishes a quality advantage
+   away from the controlled benchmark's ceiling.
 
 ## Acceptance Gate For An arXiv Submission
 

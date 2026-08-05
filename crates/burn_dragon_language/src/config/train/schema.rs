@@ -592,6 +592,11 @@ pub enum LocalPredictiveCodingSolver {
     /// depth graph over repeated inference rounds.
     #[default]
     SynchronousEquilibrium,
+    /// Reverse block Gauss-Seidel activity relaxation. Each sweep updates
+    /// activities from the terminal factor toward the clamped input, so an
+    /// already-updated child error can influence every shallower activity in
+    /// the same sweep while parameter learning remains factor-local.
+    ReverseGaussSeidel,
     /// Solve the fixed-prediction triangular error system with one reverse
     /// local-VJP wave. This is a backprop-equivalent PC control, but it never
     /// creates a global autodiff graph or calls global backward.

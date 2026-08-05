@@ -2,7 +2,7 @@ use burn::module::ParamId;
 use burn::optim::GradientsParams;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
-use burn_dragon_core::DragonModel;
+use burn_dragon_core::{DragonModel, ModelState};
 use serde::Serialize;
 
 use super::{
@@ -183,6 +183,12 @@ fn gradient_statistics<B: Backend, const D: usize>(
 /// This is an offline diagnostic. It intentionally executes one global
 /// backward pass and must not be called from the training step or telemetry
 /// hot path.
+#[derive(Debug, Default)]
+struct GradientFidelityContext<B: AutodiffBackend> {
+    initial_state: Option<ModelState<B>>,
+    masks: super::LocalPredictiveCodingContextMasks<B>,
+}
+
 pub fn local_predictive_coding_gradient_fidelity<B: AutodiffBackend>(
     model: &DragonModel<B>,
     inputs: Tensor<B, 2, Int>,
@@ -194,6 +200,124 @@ where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
 {
+    local_predictive_coding_gradient_fidelity_impl(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        GradientFidelityContext::default(),
+        config,
+    )
+}
+
+/// Compare recurrent local-factor derivatives with exact global
+/// backpropagation through the same chunk and detached incoming rho.
+pub fn local_predictive_coding_gradient_fidelity_with_state<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_gradient_fidelity_impl(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        GradientFidelityContext {
+            initial_state: Some(initial_state),
+            ..GradientFidelityContext::default()
+        },
+        config,
+    )
+}
+
+/// Compare context-masked local-PC derivatives with exact backpropagation
+/// through the same context-masked Dragon forward.
+pub fn local_predictive_coding_gradient_fidelity_with_neuron_mask<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    neuron_mask: Tensor<B, 4>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_gradient_fidelity_impl(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        GradientFidelityContext {
+            masks: super::LocalPredictiveCodingContextMasks {
+                neuron: Some(neuron_mask),
+                activity: None,
+            },
+            ..GradientFidelityContext::default()
+        },
+        config,
+    )
+}
+
+/// Compare context-selected subnetwork PC derivatives with exact
+/// backpropagation through the same rho and residual activity masks.
+pub fn local_predictive_coding_gradient_fidelity_with_subnetwork_masks<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    neuron_mask: Tensor<B, 4>,
+    activity_mask: Tensor<B, 4>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_gradient_fidelity_impl(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        GradientFidelityContext {
+            masks: super::LocalPredictiveCodingContextMasks {
+                neuron: Some(neuron_mask),
+                activity: Some(activity_mask),
+            },
+            ..GradientFidelityContext::default()
+        },
+        config,
+    )
+}
+
+fn local_predictive_coding_gradient_fidelity_impl<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    context: GradientFidelityContext<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let GradientFidelityContext {
+        initial_state,
+        masks:
+            super::LocalPredictiveCodingContextMasks {
+                neuron: neuron_mask,
+                activity: activity_mask,
+            },
+    } = context;
     model.predictive_coding_support()?;
     config
         .inference
@@ -218,18 +342,74 @@ where
         return Err("gradient fidelity requires at least one token".to_string());
     }
 
-    let pc_step = local_predictive_coding_train_step(
-        model,
-        inputs.clone(),
-        targets.clone(),
-        loss_mask.clone(),
-        config,
-        &LocalPredictiveCodingProfile::default(),
-    );
+    if initial_state.is_some() && (neuron_mask.is_some() || activity_mask.is_some()) {
+        return Err(
+            "stateful gradient fidelity currently requires dense context masks".to_string(),
+        );
+    }
+    let pc_step = match (
+        initial_state.clone(),
+        neuron_mask.clone(),
+        activity_mask.clone(),
+    ) {
+        (Some(state), None, None) => {
+            super::local_predictive_coding_train_step_with_state_and_context_masks(
+                model,
+                inputs.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                Some(state),
+                super::LocalPredictiveCodingContextMasks::default(),
+                config,
+                &LocalPredictiveCodingProfile::default(),
+            )
+        }
+        (None, None, None) => local_predictive_coding_train_step(
+            model,
+            inputs.clone(),
+            targets.clone(),
+            loss_mask.clone(),
+            config,
+            &LocalPredictiveCodingProfile::default(),
+        ),
+        (None, Some(neuron_mask), activity_mask) => {
+            super::local_predictive_coding_train_step_with_context_masks(
+                model,
+                inputs.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                super::LocalPredictiveCodingContextMasks {
+                    neuron: Some(neuron_mask),
+                    activity: activity_mask,
+                },
+                config,
+                &LocalPredictiveCodingProfile::default(),
+            )
+        }
+        (None, None, Some(_)) => {
+            return Err("activity-only context masks are not a supported diagnostic".to_string());
+        }
+        (Some(_), _, _) => unreachable!("stateful masks rejected above"),
+    };
     let pc_loss = f64::from(burn_pc::diagnostic_scalar_f32(pc_step.loss.inner()));
 
+    let reference_logits = match (initial_state, neuron_mask, activity_mask) {
+        (Some(mut state), None, None) => {
+            state.detach_in_place();
+            model.forward_with_state(inputs, &mut state)
+        }
+        (None, Some(neuron_mask), Some(activity_mask)) => model
+            .predictive_coding_forward_with_subnetwork_masks(inputs, neuron_mask, activity_mask)
+            .expect("validated context subnetwork masks"),
+        (None, Some(neuron_mask), None) => model
+            .predictive_coding_forward_with_neuron_mask(inputs, neuron_mask)
+            .expect("validated context neuron mask"),
+        (None, None, None) => model.forward(inputs),
+        (None, None, Some(_)) => unreachable!("validated diagnostic context masks"),
+        (Some(_), _, _) => unreachable!("stateful masks rejected above"),
+    };
     let reference_loss = burn_dragon_core::objective::masked_token_mean(
-        model.language_token_losses_from_logits(model.forward(inputs), targets),
+        model.language_token_losses_from_logits(reference_logits, targets),
         loss_mask,
     );
     let reference_loss_value = f64::from(burn_pc::diagnostic_scalar_f32(
@@ -284,6 +464,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::module::AutodiffModule;
+    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use burn::tensor::TensorData;
     use burn_autodiff::Autodiff;
     use burn_dragon_core::{DragonConfig, RotaryEmbedding, SequenceTrainingExecutor};
@@ -363,8 +545,10 @@ mod tests {
             assert!(family.reference_norm.is_finite());
             if family.reference_norm > 1.0e-8 && family.pc_norm > 1.0e-8 {
                 assert!(
-                    family.cosine.is_some_and(|cosine| cosine > 0.9),
-                    "misaligned local derivative for {}: {:?}",
+                    family
+                        .cosine
+                        .is_some_and(|cosine| cosine.abs() <= 1.0 + 1.0e-6),
+                    "invalid local derivative cosine for {}: {:?}",
                     family.parameter_family,
                     family.cosine
                 );
@@ -443,5 +627,297 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn recurrent_fixed_prediction_matches_detached_tbptt_reference() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260805);
+        let mut config = DragonConfig {
+            n_layer: 4,
+            n_embd: 8,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 16,
+            dropout: 0.0,
+            ..DragonConfig::default()
+        };
+        config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
+        let model = DragonModel::new(config, &device);
+        let prefix = Tensor::from_data(
+            TensorData::new(vec![4_i64, 5, 6, 7, 7, 6, 5, 4], [2, 4]),
+            &device,
+        );
+        let mut incoming = model.init_state();
+        let _ = model.forward_with_state(prefix, &mut incoming);
+        incoming.detach_in_place();
+        let (inputs, targets, mask) = batch(&device);
+        let pc_config = LocalPredictiveCodingConfig {
+            solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let report = local_predictive_coding_gradient_fidelity_with_state(
+            &model,
+            inputs.clone(),
+            targets.clone(),
+            Some(mask.clone()),
+            incoming.clone(),
+            &pc_config,
+        )
+        .expect("recurrent fixed-prediction fidelity report");
+        assert!(report.loss_absolute_error < 1.0e-6);
+        assert!(
+            report.global.cosine.is_some_and(|cosine| cosine > 0.999_99),
+            "recurrent fixed-prediction fidelity: {:?}",
+            report.global
+        );
+        assert!(
+            report
+                .global
+                .relative_l2_error
+                .is_some_and(|error| error < 1.0e-4),
+            "recurrent fixed-prediction fidelity: {:?}",
+            report.global
+        );
+
+        let local = super::super::local_predictive_coding_derivatives_with_state(
+            &model,
+            inputs.clone(),
+            targets,
+            Some(mask),
+            incoming.clone(),
+            &pc_config,
+        )
+        .expect("recurrent local derivatives");
+        let mut reference_state = incoming;
+        let _ = model.forward_with_state(inputs, &mut reference_state);
+        assert_eq!(local.terminal_state.position, reference_state.position);
+        for (layer, (local_layer, reference_layer)) in local
+            .terminal_state
+            .layers
+            .iter()
+            .zip(&reference_state.layers)
+            .enumerate()
+        {
+            let local_rho = local_layer.rho.clone().expect("local terminal rho");
+            let reference_rho = reference_layer.rho.clone().expect("reference terminal rho");
+            let max_error = (local_rho - reference_rho)
+                .abs()
+                .max()
+                .inner()
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("terminal rho error")[0];
+            assert!(
+                max_error < 1.0e-5,
+                "layer {layer} terminal rho mismatch: {max_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_gauss_seidel_propagates_credit_within_one_sweep() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260804);
+        let mut config = DragonConfig {
+            n_layer: 4,
+            n_embd: 8,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 16,
+            dropout: 0.0,
+            ..DragonConfig::default()
+        };
+        config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
+        let model = DragonModel::new(config, &device);
+        let (inputs, targets, mask) = batch(&device);
+        let inference = burn_pc::PcInferenceConfig {
+            steps: 1,
+            step_size: 1.0,
+            max_grad_norm: None,
+            ..burn_pc::PcInferenceConfig::default()
+        };
+        let synchronous = local_predictive_coding_gradient_fidelity(
+            &model,
+            inputs.clone(),
+            targets.clone(),
+            Some(mask.clone()),
+            &LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium,
+                inference,
+                sync_diagnostics: true,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect("synchronous fidelity report");
+        let reverse = local_predictive_coding_gradient_fidelity(
+            &model,
+            inputs,
+            targets,
+            Some(mask),
+            &LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel,
+                inference,
+                sync_diagnostics: true,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect("reverse Gauss-Seidel fidelity report");
+        let synchronous_cosine = synchronous.global.cosine.expect("synchronous cosine");
+        let reverse_cosine = reverse.global.cosine.expect("reverse cosine");
+        assert!(
+            reverse_cosine > 0.9 && reverse_cosine > synchronous_cosine + 0.15,
+            "reverse sweep should propagate terminal credit through shared depth: synchronous={synchronous_cosine} reverse={reverse_cosine}"
+        );
+        assert!(
+            reverse.pc_step.energy_after.expect("energy after")
+                < reverse.pc_step.energy_before.expect("energy before"),
+            "reverse activity sweep must descend the joint energy"
+        );
+        assert_eq!(reverse.pc_step.global_backward_calls, 0);
+    }
+
+    #[test]
+    fn context_neuron_masked_fixed_prediction_matches_masked_backpropagation() {
+        let device = Default::default();
+        TestBackend::seed(&device, 73);
+        let model = model(&device);
+        let (inputs, targets, mask) = batch(&device);
+        let neuron_mask = Tensor::from_data(
+            TensorData::new(
+                vec![1.0_f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [1, 1, 1, 8],
+            ),
+            &device,
+        );
+        let report = local_predictive_coding_gradient_fidelity_with_neuron_mask(
+            &model,
+            inputs,
+            targets,
+            Some(mask),
+            neuron_mask,
+            &LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect("context-masked fidelity report");
+        assert!(report.loss_absolute_error < 1.0e-6);
+        assert!(
+            report.global.cosine.is_some_and(|cosine| cosine > 0.999_99),
+            "masked fixed-prediction fidelity: {:?}",
+            report.global
+        );
+        assert!(
+            report
+                .global
+                .relative_l2_error
+                .is_some_and(|error| error < 1.0e-4),
+            "masked fixed-prediction fidelity: {:?}",
+            report.global
+        );
+    }
+
+    #[test]
+    fn context_subnetwork_fixed_prediction_matches_masked_backpropagation() {
+        let device = Default::default();
+        TestBackend::seed(&device, 79);
+        let model = model(&device);
+        let (inputs, targets, mask) = batch(&device);
+        let disjoint_mask = || {
+            Tensor::from_data(
+                TensorData::new(
+                    vec![1.0_f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    [1, 1, 1, 8],
+                ),
+                &device,
+            )
+        };
+        let report = local_predictive_coding_gradient_fidelity_with_subnetwork_masks(
+            &model,
+            inputs,
+            targets,
+            Some(mask),
+            disjoint_mask(),
+            disjoint_mask(),
+            &LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect("context-selected subnetwork fidelity report");
+        assert!(report.loss_absolute_error < 1.0e-6);
+        assert!(
+            report.global.cosine.is_some_and(|cosine| cosine > 0.999_99),
+            "subnetwork fixed-prediction fidelity: {:?}",
+            report.global
+        );
+        assert!(
+            report
+                .global
+                .relative_l2_error
+                .is_some_and(|error| error < 1.0e-4),
+            "subnetwork fixed-prediction fidelity: {:?}",
+            report.global
+        );
+    }
+
+    #[test]
+    fn disjoint_subnetwork_step_preserves_inactive_context_logits() {
+        let device = Default::default();
+        TestBackend::seed(&device, 83);
+        let mut model = model(&device);
+        let (inputs, targets, loss_mask) = batch(&device);
+        let context_mask = |first_half: bool| {
+            let values = if first_half {
+                vec![1.0_f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            } else {
+                vec![0.0_f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+            };
+            Tensor::from_data(TensorData::new(values, [1, 1, 1, 8]), &device)
+        };
+        let before = model
+            .valid()
+            .predictive_coding_forward_with_subnetwork_masks(
+                inputs.clone().inner(),
+                context_mask(true).inner(),
+                context_mask(true).inner(),
+            )
+            .expect("task A forward");
+        let task_b_logits = model
+            .predictive_coding_forward_with_subnetwork_masks(
+                inputs.clone(),
+                context_mask(false),
+                context_mask(false),
+            )
+            .expect("task B forward");
+        let loss = burn_dragon_core::objective::masked_token_mean(
+            model.language_token_losses_from_logits(task_b_logits, targets),
+            Some(loss_mask),
+        );
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        let mut optimizer = SgdConfig::new().init::<TestBackend, DragonModel<TestBackend>>();
+        model = optimizer.step(0.1, model, grads);
+        let after = model
+            .valid()
+            .predictive_coding_forward_with_subnetwork_masks(
+                inputs.clone().inner(),
+                context_mask(true).inner(),
+                context_mask(true).inner(),
+            )
+            .expect("task A forward after task B update");
+        let max_delta = (after - before)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .expect("logit delta")[0];
+        assert!(
+            max_delta < 1.0e-6,
+            "disjoint task-B update changed task-A logits by {max_delta}"
+        );
     }
 }

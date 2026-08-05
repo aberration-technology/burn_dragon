@@ -52,6 +52,10 @@ fn local_predictive_coding_event_contract(
         LocalPredictiveCodingSolver::SynchronousEquilibrium => {
             ("local_factor_vjp_v1", "equilibrium_layer_activities")
         }
+        LocalPredictiveCodingSolver::ReverseGaussSeidel => (
+            "local_prospective_gauss_seidel_v1",
+            "settled_layer_activities",
+        ),
         LocalPredictiveCodingSolver::FixedPrediction => {
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
         }

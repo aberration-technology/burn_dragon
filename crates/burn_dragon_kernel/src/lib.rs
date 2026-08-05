@@ -40,8 +40,8 @@ pub mod kernels {
     pub mod attention {
         pub use crate::dense_causal_attention::{
             CompiledDenseCausalAttentionPlan, DenseCausalAttentionVjp, dense_causal_attention_vjp,
-            supports_dense_causal_attention_backend, try_fused_dense_causal_attention_wgpu,
-            try_fused_dense_causal_attention_wgpu_with_plan,
+            dense_causal_attention_vjp_with_initial_rho, supports_dense_causal_attention_backend,
+            try_fused_dense_causal_attention_wgpu, try_fused_dense_causal_attention_wgpu_with_plan,
         };
     }
 

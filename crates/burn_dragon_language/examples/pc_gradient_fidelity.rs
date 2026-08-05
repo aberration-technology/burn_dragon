@@ -142,10 +142,11 @@ fn parse_args() -> Result<Args> {
                     "synchronous_equilibrium" => {
                         LocalPredictiveCodingSolver::SynchronousEquilibrium
                     }
+                    "reverse_gauss_seidel" => LocalPredictiveCodingSolver::ReverseGaussSeidel,
                     "fixed_prediction" => LocalPredictiveCodingSolver::FixedPrediction,
                     value => {
                         return Err(anyhow!(
-                            "unsupported --solver {value}; expected synchronous_equilibrium or fixed_prediction"
+                            "unsupported --solver {value}; expected synchronous_equilibrium, reverse_gauss_seidel, or fixed_prediction"
                         ));
                     }
                 }
@@ -187,7 +188,7 @@ fn parse_args() -> Result<Args> {
             "--mask-period" => parsed.mask_period = parse_value(&mut args, "--mask-period")?,
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--solver <synchronous_equilibrium|fixed_prediction>] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
+                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--solver <synchronous_equilibrium|reverse_gauss_seidel|fixed_prediction>] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
                 );
                 std::process::exit(0);
             }
@@ -287,7 +288,8 @@ where
     let batch = deterministic_batch::<B>(args, &device);
 
     let settings = match args.solver {
-        LocalPredictiveCodingSolver::SynchronousEquilibrium => args
+        LocalPredictiveCodingSolver::SynchronousEquilibrium
+        | LocalPredictiveCodingSolver::ReverseGaussSeidel => args
             .inference_steps
             .iter()
             .flat_map(|&steps| {

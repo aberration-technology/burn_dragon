@@ -4,6 +4,7 @@ mod prelude;
 
 pub mod backend;
 mod continual_backprop;
+mod continual_benchmark;
 mod dynamics;
 pub mod events;
 mod local_predictive_coding;
@@ -25,6 +26,8 @@ pub mod utils;
 pub use backend::*;
 #[allow(unused_imports)]
 pub use continual_backprop::*;
+#[allow(unused_imports)]
+pub use continual_benchmark::*;
 #[allow(unused_imports)]
 pub use dynamics::*;
 #[allow(unused_imports)]

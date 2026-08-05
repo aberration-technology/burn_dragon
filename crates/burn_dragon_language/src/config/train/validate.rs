@@ -3632,11 +3632,6 @@ impl TrainingConfig {
                 "training.algorithm=predictive_coding currently requires the next-token objective"
             ));
         }
-        if self.training.tbptt_chunk_size.is_some() || self.training.tbptt_persist_across_steps {
-            return Err(anyhow!(
-                "training.algorithm=predictive_coding currently uses one local factor graph per full block and does not support TBPTT state persistence"
-            ));
-        }
         if self.parallel.mode != ParallelismKind::Single || self.parallel.pipeline.enabled {
             return Err(anyhow!(
                 "training.algorithm=predictive_coding currently requires local single-process execution"
@@ -4367,6 +4362,21 @@ start_policy = "capability_gate"
             config.resolved_training_algorithm(),
             TrainingAlgorithm::PredictiveCoding
         );
+    }
+
+    #[test]
+    fn local_predictive_coding_validates_recurrent_tbptt_contract() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.tbptt_chunk_size = Some(4);
+        config.training.tbptt_persist_across_steps = true;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+
+        config
+            .validate()
+            .expect("local predictive coding should support detached recurrent TBPTT factors");
     }
 
     #[test]
@@ -6733,6 +6743,27 @@ start_policy = "capability_gate"
         config
             .validate()
             .expect("validate fixed-prediction PC overlay");
+        assert_eq!(
+            config.training.local_predictive_coding.solver,
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction
+        );
+    }
+
+    #[test]
+    fn local_recurrent_predictive_coding_overlay_loads_and_validates() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let paths = [
+            root.join("local-pc-smoke.toml"),
+            root.join("pc-fixed-prediction.overlay.toml"),
+            root.join("pc-recurrent-tbptt.overlay.toml"),
+        ];
+        let config = load_training_config(&paths).expect("load recurrent local-PC overlays");
+        config
+            .validate()
+            .expect("validate recurrent local-PC overlays");
+        assert_eq!(config.training.tbptt_chunk_size, Some(8));
+        assert!(config.training.tbptt_persist_across_steps);
         assert_eq!(
             config.training.local_predictive_coding.solver,
             crate::config::LocalPredictiveCodingSolver::FixedPrediction

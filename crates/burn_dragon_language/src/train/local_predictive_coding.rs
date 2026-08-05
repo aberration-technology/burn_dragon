@@ -6,7 +6,7 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
 use burn_dragon_core::{
     DragonModel, DragonPredictiveCodingLayerTrace, DragonPredictiveCodingLayerVjp,
-    DragonPredictiveCodingParameterIds,
+    DragonPredictiveCodingParameterIds, ModelState,
 };
 use burn_dragon_time::Instant;
 
@@ -18,10 +18,25 @@ mod diagnostics;
 pub use diagnostics::*;
 
 #[derive(Debug)]
-pub(crate) struct LocalPredictiveCodingTrainStep<B: AutodiffBackend> {
+pub struct LocalPredictiveCodingDerivatives<B: AutodiffBackend> {
+    /// Factor-local parameter derivatives on the backend's plain tensor type.
     pub grads: GradientsParams,
+    /// Feed-forward masked next-token loss before activity inference.
     pub loss: Tensor<B, 1>,
+    /// Raw supervised-token count for exact device-resident aggregation across
+    /// truncated factors. It may be zero for an entirely masked chunk.
+    pub supervised_tokens: Tensor<B, 1>,
+    /// Detached recurrent state after the feed-forward factor initialization.
+    /// Local activity inference is transient and never mutates this causal
+    /// stream state.
+    pub terminal_state: ModelState<B>,
     pub report: LocalPredictiveCodingStepReport,
+}
+
+#[derive(Debug, Default)]
+struct LocalPredictiveCodingContextMasks<B: Backend> {
+    neuron: Option<Tensor<B, 4>>,
+    activity: Option<Tensor<B, 4>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
@@ -182,19 +197,126 @@ fn prediction_energy<B: Backend>(
         .reshape([1])
 }
 
+fn apply_activity_mask<B: Backend>(
+    activity: Tensor<B, 4>,
+    activity_mask: Option<&Tensor<B, 4>>,
+) -> Tensor<B, 4> {
+    match activity_mask {
+        Some(mask) => activity * mask.clone(),
+        None => activity,
+    }
+}
+
 fn forward_trace_batch<B: Backend>(
     model: &DragonModel<B>,
     activities: &[Tensor<B, 4>],
+    initial_rhos: &[Option<Tensor<B, 4>>],
+    neuron_mask: Option<&Tensor<B, 4>>,
+    activity_mask: Option<&Tensor<B, 4>>,
 ) -> DragonPredictiveCodingLayerTrace<B>
 where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
 {
     let layers = model.predictive_coding_layer_count();
-    model.predictive_coding_forward_layer(
-        Tensor::cat(activities.iter().take(layers).cloned().collect(), 0),
-        0,
-    )
+    assert_eq!(
+        initial_rhos.len(),
+        layers,
+        "one recurrent state is required per local factor"
+    );
+    let inputs = Tensor::cat(activities.iter().take(layers).cloned().collect(), 0);
+    let initial_rho = if initial_rhos.iter().all(Option::is_some) {
+        Some(Tensor::cat(
+            initial_rhos
+                .iter()
+                .map(|rho| rho.clone().expect("checked recurrent state presence"))
+                .collect(),
+            0,
+        ))
+    } else {
+        assert!(
+            initial_rhos.iter().all(Option::is_none),
+            "batched local factors must agree on recurrent-state presence"
+        );
+        None
+    };
+    let mut trace = model
+        .predictive_coding_forward_layer_with_recurrent_state(
+            inputs,
+            0,
+            initial_rho,
+            neuron_mask.cloned(),
+            activity_mask.cloned(),
+        )
+        .expect("validated batched recurrent local factors");
+    trace.next = apply_activity_mask(trace.next, activity_mask);
+    trace
+}
+
+fn layer_parameter_vjp<B: Backend>(
+    model: &DragonModel<B>,
+    layer: usize,
+    trace: &DragonPredictiveCodingLayerTrace<B>,
+    grad_next: Tensor<B, 4>,
+    neuron_mask: Option<&Tensor<B, 4>>,
+    activity_mask: Option<&Tensor<B, 4>>,
+) -> DragonPredictiveCodingLayerVjp<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let grad_next = apply_activity_mask(grad_next, activity_mask);
+    match (neuron_mask, activity_mask) {
+        (Some(neuron_mask), Some(activity_mask)) => model
+            .predictive_coding_layer_vjp_with_subnetwork_masks(
+                layer,
+                trace,
+                grad_next,
+                neuron_mask.clone(),
+                activity_mask.clone(),
+            ),
+        (Some(neuron_mask), None) => model.predictive_coding_layer_vjp_with_neuron_mask(
+            layer,
+            trace,
+            grad_next,
+            neuron_mask.clone(),
+        ),
+        (None, None) => model.predictive_coding_layer_vjp(layer, trace, grad_next),
+        (None, Some(_)) => unreachable!("activity mask requires a neuron mask"),
+    }
+}
+
+fn layer_activity_vjp<B: Backend>(
+    model: &DragonModel<B>,
+    layer: usize,
+    trace: &DragonPredictiveCodingLayerTrace<B>,
+    grad_next: Tensor<B, 4>,
+    neuron_mask: Option<&Tensor<B, 4>>,
+    activity_mask: Option<&Tensor<B, 4>>,
+) -> Tensor<B, 4>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let grad_next = apply_activity_mask(grad_next, activity_mask);
+    match (neuron_mask, activity_mask) {
+        (Some(neuron_mask), Some(activity_mask)) => model
+            .predictive_coding_layer_activity_vjp_with_subnetwork_masks(
+                layer,
+                trace,
+                grad_next,
+                neuron_mask.clone(),
+                activity_mask.clone(),
+            ),
+        (Some(neuron_mask), None) => model.predictive_coding_layer_activity_vjp_with_neuron_mask(
+            layer,
+            trace,
+            grad_next,
+            neuron_mask.clone(),
+        ),
+        (None, None) => model.predictive_coding_layer_activity_vjp(layer, trace, grad_next),
+        (None, Some(_)) => unreachable!("activity mask requires a neuron mask"),
+    }
 }
 
 fn slice_batch<B: Backend>(tensor: Tensor<B, 4>, start: usize, end: usize) -> Tensor<B, 4> {
@@ -209,7 +331,13 @@ fn slice_trace_batch<B: Backend>(
 ) -> DragonPredictiveCodingLayerTrace<B> {
     DragonPredictiveCodingLayerTrace {
         input: slice_batch(trace.input.clone(), start, end),
+        initial_rho: trace
+            .initial_rho
+            .clone()
+            .map(|rho| slice_batch(rho, start, end)),
+        attention_pre_norm: slice_batch(trace.attention_pre_norm.clone(), start, end),
         attention_readout: slice_batch(trace.attention_readout.clone(), start, end),
+        residual_pre_norm: slice_batch(trace.residual_pre_norm.clone(), start, end),
         residual_delta: slice_batch(trace.residual_delta.clone(), start, end),
         x_neuron: slice_batch(trace.x_neuron.clone(), start, end),
         y_gate: slice_batch(trace.y_gate.clone(), start, end),
@@ -222,12 +350,42 @@ fn concatenate_traces<B: Backend>(
     traces: &[DragonPredictiveCodingLayerTrace<B>],
 ) -> DragonPredictiveCodingLayerTrace<B> {
     assert!(!traces.is_empty(), "PC trace list must not be empty");
+    let initial_rho = if traces.iter().all(|trace| trace.initial_rho.is_some()) {
+        Some(Tensor::cat(
+            traces
+                .iter()
+                .map(|trace| trace.initial_rho.clone().expect("checked rho presence"))
+                .collect(),
+            0,
+        ))
+    } else {
+        assert!(
+            traces.iter().all(|trace| trace.initial_rho.is_none()),
+            "batched PC traces must agree on recurrent-state presence"
+        );
+        None
+    };
     DragonPredictiveCodingLayerTrace {
         input: Tensor::cat(traces.iter().map(|trace| trace.input.clone()).collect(), 0),
+        initial_rho,
+        attention_pre_norm: Tensor::cat(
+            traces
+                .iter()
+                .map(|trace| trace.attention_pre_norm.clone())
+                .collect(),
+            0,
+        ),
         attention_readout: Tensor::cat(
             traces
                 .iter()
                 .map(|trace| trace.attention_readout.clone())
+                .collect(),
+            0,
+        ),
+        residual_pre_norm: Tensor::cat(
+            traces
+                .iter()
+                .map(|trace| trace.residual_pre_norm.clone())
                 .collect(),
             0,
         ),
@@ -296,6 +454,9 @@ struct FixedPredictionContext<B: Backend> {
     loss_mask: Option<Tensor<B, 2, Int>>,
     activities: Vec<Tensor<B, 4>>,
     traces: Vec<DragonPredictiveCodingLayerTrace<B>>,
+    neuron_mask: Option<Tensor<B, 4>>,
+    activity_mask: Option<Tensor<B, 4>>,
+    terminal_state: ModelState<B>,
     factors: usize,
     scale: f32,
 }
@@ -305,7 +466,7 @@ fn fixed_prediction_train_step<B: AutodiffBackend>(
     context: FixedPredictionContext<B::InnerBackend>,
     started: Instant,
     profile: &LocalPredictiveCodingProfile,
-) -> LocalPredictiveCodingTrainStep<B>
+) -> LocalPredictiveCodingDerivatives<B>
 where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
@@ -317,6 +478,9 @@ where
         loss_mask,
         activities,
         traces,
+        neuron_mask,
+        activity_mask,
+        terminal_state,
         factors,
         scale,
     } = context;
@@ -331,7 +495,14 @@ where
 
     let mut shared: Option<SharedParameterVjp<B::InnerBackend>> = None;
     for (layer, trace) in traces.into_iter().enumerate().rev() {
-        let vjp = plain.predictive_coding_layer_vjp(layer, &trace, grad_activity);
+        let vjp = layer_parameter_vjp(
+            plain,
+            layer,
+            &trace,
+            grad_activity,
+            neuron_mask.as_ref(),
+            activity_mask.as_ref(),
+        );
         grad_activity = match shared.as_mut() {
             Some(shared) => shared.accumulate_layer(vjp),
             None => {
@@ -342,7 +513,15 @@ where
         };
     }
     let shared = shared.expect("validated PC model has at least one layer");
-    let initial_vjp = plain.predictive_coding_initial_vjp(inputs, grad_activity);
+    let grad_activity = apply_activity_mask(grad_activity, activity_mask.as_ref());
+    let initial_vjp = match activity_mask.as_ref() {
+        Some(mask) => plain.predictive_coding_initial_vjp_with_activity_mask(
+            inputs,
+            grad_activity,
+            mask.clone(),
+        ),
+        None => plain.predictive_coding_initial_vjp(inputs, grad_activity),
+    };
     let mut grads = GradientsParams::new();
     grads.register(parameter_ids.embedding, initial_vjp.grad_embedding);
     grads.register(parameter_ids.encoder, shared.grad_encoder);
@@ -381,9 +560,11 @@ where
         elapsed_ns: started.elapsed().as_nanos(),
     };
     profile.record(report);
-    LocalPredictiveCodingTrainStep {
+    LocalPredictiveCodingDerivatives {
         grads,
         loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.supervised_tokens),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
         report,
     }
 }
@@ -391,15 +572,18 @@ where
 fn total_energy<B: Backend>(
     model: &DragonModel<B>,
     activities: &[Tensor<B, 4>],
+    initial_rhos: &[Option<Tensor<B, 4>>],
     targets: Tensor<B, 2, Int>,
     loss_mask: Option<Tensor<B, 2, Int>>,
     config: &LocalPredictiveCodingConfig,
+    context_masks: (Option<&Tensor<B, 4>>, Option<&Tensor<B, 4>>),
 ) -> Tensor<B, 1>
 where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
 {
-    let trace = forward_trace_batch(model, activities);
+    let (neuron_mask, activity_mask) = context_masks;
+    let trace = forward_trace_batch(model, activities, initial_rhos, neuron_mask, activity_mask);
     let predicted = trace.next;
     let inferred = Tensor::cat(activities.iter().skip(1).cloned().collect(), 0);
     let hidden = model.predictive_coding_hidden_from_activity(
@@ -426,7 +610,83 @@ pub(crate) fn local_predictive_coding_train_step<B: AutodiffBackend>(
     loss_mask: Option<Tensor<B, 2, Int>>,
     config: &LocalPredictiveCodingConfig,
     profile: &LocalPredictiveCodingProfile,
-) -> LocalPredictiveCodingTrainStep<B>
+) -> LocalPredictiveCodingDerivatives<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_train_step_with_context_masks(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        LocalPredictiveCodingContextMasks::default(),
+        config,
+        profile,
+    )
+}
+
+pub(crate) fn local_predictive_coding_train_step_with_state<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    config: &LocalPredictiveCodingConfig,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingDerivatives<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_train_step_with_state_and_context_masks(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        Some(initial_state),
+        LocalPredictiveCodingContextMasks::default(),
+        config,
+        profile,
+    )
+}
+
+fn local_predictive_coding_train_step_with_context_masks<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    context_masks: LocalPredictiveCodingContextMasks<B>,
+    config: &LocalPredictiveCodingConfig,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingDerivatives<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    local_predictive_coding_train_step_with_state_and_context_masks(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        None,
+        context_masks,
+        config,
+        profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_predictive_coding_train_step_with_state_and_context_masks<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: Option<ModelState<B>>,
+    context_masks: LocalPredictiveCodingContextMasks<B>,
+    config: &LocalPredictiveCodingConfig,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingDerivatives<B>
 where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
@@ -439,10 +699,25 @@ where
     plain
         .predictive_coding_support()
         .expect("validated plain local predictive-coding model");
+    let mut terminal_state = initial_state
+        .map(|state| state.inner_cloned())
+        .unwrap_or_else(|| plain.init_state_ephemeral());
+    assert_eq!(
+        terminal_state.layers.len(),
+        plain.predictive_coding_layer_count(),
+        "local PC recurrent-state layer count must match the model"
+    );
+    let block_time = inputs.shape().dims::<2>()[1];
     let inputs = inputs.inner();
     let targets = targets.inner();
     let loss_mask = loss_mask.map(Tensor::inner);
-    let initial = plain.predictive_coding_initial_activity(inputs.clone());
+    let neuron_mask = context_masks.neuron.map(Tensor::inner);
+    let activity_mask = context_masks.activity.map(Tensor::inner);
+    let initial = match activity_mask.as_ref() {
+        Some(mask) => plain
+            .predictive_coding_initial_activity_with_activity_mask(inputs.clone(), mask.clone()),
+        None => plain.predictive_coding_initial_activity(inputs.clone()),
+    };
     let layers = plain.predictive_coding_layer_count();
     let graph = dragon_predictive_coding_graph(layers);
     debug_assert!(graph.validate().is_ok());
@@ -453,10 +728,24 @@ where
     let mut feedforward_traces = Vec::with_capacity(layers);
     activities.push(initial);
     for layer in 0..layers {
-        let trace = plain.predictive_coding_forward_layer(activities[layer].clone(), layer);
+        let mut trace = plain
+            .predictive_coding_forward_layer_with_recurrent_state(
+                activities[layer].clone(),
+                layer,
+                terminal_state.layers[layer].rho.clone(),
+                neuron_mask.clone(),
+                activity_mask.clone(),
+            )
+            .expect("validated recurrent local PC layer factor");
+        terminal_state.layers[layer].rho = Some(plain.predictive_coding_terminal_rho(&trace));
+        terminal_state.layers[layer].rho_norm = None;
+        terminal_state.layers[layer].sequence_aux = None;
+        trace.next = apply_activity_mask(trace.next, activity_mask.as_ref());
         activities.push(trace.next.clone().detach());
         feedforward_traces.push(trace);
     }
+    terminal_state.position = terminal_state.position.saturating_add(block_time);
+    terminal_state.detach_in_place();
 
     if matches!(config.solver, LocalPredictiveCodingSolver::FixedPrediction) {
         return fixed_prediction_train_step::<B>(
@@ -468,6 +757,9 @@ where
                 loss_mask,
                 activities,
                 traces: feedforward_traces,
+                neuron_mask,
+                activity_mask,
+                terminal_state,
                 factors,
                 scale,
             },
@@ -475,14 +767,19 @@ where
             profile,
         );
     }
-
+    let factor_initial_rhos = feedforward_traces
+        .iter()
+        .map(|trace| trace.initial_rho.clone())
+        .collect::<Vec<_>>();
     let energy_before = config.sync_diagnostics.then(|| {
         burn_pc::diagnostic_scalar_f32(total_energy(
             &plain,
             &activities,
+            &factor_initial_rhos,
             targets.clone(),
             loss_mask.clone(),
             config,
+            (neuron_mask.as_ref(), activity_mask.as_ref()),
         )) as f64
     });
 
@@ -490,63 +787,155 @@ where
     let mut feedforward_loss = None;
     let mut feedforward_trace = Some(concatenate_traces(&feedforward_traces));
     drop(feedforward_traces);
-    for _ in 0..config.inference.steps {
-        let trace = feedforward_trace
-            .take()
-            .unwrap_or_else(|| forward_trace_batch(&plain, &activities));
-        let terminal_hidden = plain.predictive_coding_hidden_from_activity(
-            activities.last().expect("terminal PC activity").clone(),
-        );
-        let terminal = plain.predictive_coding_head_activity_vjp(
-            terminal_hidden,
-            targets.clone(),
-            loss_mask.clone(),
-        );
-        if feedforward_loss.is_none() {
-            feedforward_loss = Some(terminal.loss.clone());
-        }
-        local_vjp_calls = local_vjp_calls.saturating_add(1);
-        let terminal_grad = (terminal.grad_hidden * terminal.normalization.reshape([1, 1, 1]))
-            .reshape(activities.last().expect("terminal PC activity").shape());
-        let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
-        let inferred = Tensor::cat(activities.iter().skip(1).cloned().collect(), 0);
-        let errors = prediction_error(
-            trace.next.clone(),
-            inferred,
-            config.prediction_precision,
-            scale,
-        );
-        let internal_child_grads = (layers > 1).then(|| {
-            plain.predictive_coding_layer_activity_vjp(
-                0,
-                &slice_trace_batch(&trace, batch, layers * batch),
-                slice_batch(errors.clone(), batch, layers * batch),
-            )
-        });
-        local_vjp_calls = local_vjp_calls.saturating_add(layers.saturating_sub(1));
+    match config.solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium => {
+            for _ in 0..config.inference.steps {
+                let trace = feedforward_trace.take().unwrap_or_else(|| {
+                    forward_trace_batch(
+                        &plain,
+                        &activities,
+                        &factor_initial_rhos,
+                        neuron_mask.as_ref(),
+                        activity_mask.as_ref(),
+                    )
+                });
+                let terminal_hidden = plain.predictive_coding_hidden_from_activity(
+                    activities.last().expect("terminal PC activity").clone(),
+                );
+                let terminal = plain.predictive_coding_head_activity_vjp(
+                    terminal_hidden,
+                    targets.clone(),
+                    loss_mask.clone(),
+                );
+                if feedforward_loss.is_none() {
+                    feedforward_loss = Some(terminal.loss.clone());
+                }
+                local_vjp_calls = local_vjp_calls.saturating_add(1);
+                let terminal_grad = (terminal.grad_hidden
+                    * terminal.normalization.reshape([1, 1, 1]))
+                .reshape(activities.last().expect("terminal PC activity").shape());
+                let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
+                let inferred = Tensor::cat(activities.iter().skip(1).cloned().collect(), 0);
+                let errors = prediction_error(
+                    trace.next.clone(),
+                    inferred,
+                    config.prediction_precision,
+                    scale,
+                );
+                let internal_child_grads = (layers > 1).then(|| {
+                    layer_activity_vjp(
+                        &plain,
+                        0,
+                        &slice_trace_batch(&trace, batch, layers * batch),
+                        slice_batch(errors.clone(), batch, layers * batch),
+                        neuron_mask.as_ref(),
+                        activity_mask.as_ref(),
+                    )
+                });
+                local_vjp_calls = local_vjp_calls.saturating_add(layers.saturating_sub(1));
 
-        let mut updates = Vec::with_capacity(layers);
-        for (activity_index, activity) in activities.iter().enumerate().take(layers + 1).skip(1) {
-            let own_offset = (activity_index - 1) * batch;
-            let own = slice_batch(errors.clone(), own_offset, own_offset + batch).mul_scalar(-1.0);
-            let child = if activity_index == layers {
-                terminal_grad.clone().mul_scalar(scale)
-            } else {
-                let offset = (activity_index - 1) * batch;
-                internal_child_grads
-                    .as_ref()
-                    .expect("non-terminal PC activity has a child factor")
-                    .clone()
-                    .slice([offset..offset + batch, 0..streams, 0..time, 0..dim])
-            };
-            updates.push(burn_pc::pc_sgd_update(
-                activity.clone(),
-                own + child,
-                &config.inference,
-            ));
+                let mut updates = Vec::with_capacity(layers);
+                for (activity_index, activity) in
+                    activities.iter().enumerate().take(layers + 1).skip(1)
+                {
+                    let own_offset = (activity_index - 1) * batch;
+                    let own = slice_batch(errors.clone(), own_offset, own_offset + batch)
+                        .mul_scalar(-1.0);
+                    let child = if activity_index == layers {
+                        terminal_grad.clone().mul_scalar(scale)
+                    } else {
+                        let offset = (activity_index - 1) * batch;
+                        internal_child_grads
+                            .as_ref()
+                            .expect("non-terminal PC activity has a child factor")
+                            .clone()
+                            .slice([offset..offset + batch, 0..streams, 0..time, 0..dim])
+                    };
+                    updates.push(burn_pc::pc_sgd_update(
+                        activity.clone(),
+                        own + child,
+                        &config.inference,
+                    ));
+                }
+                for (activity, update) in activities.iter_mut().skip(1).zip(updates) {
+                    *activity = apply_activity_mask(update, activity_mask.as_ref()).detach();
+                }
+            }
         }
-        for (activity, update) in activities.iter_mut().skip(1).zip(updates) {
-            *activity = update.detach();
+        LocalPredictiveCodingSolver::ReverseGaussSeidel => {
+            for _ in 0..config.inference.steps {
+                // Predictions are held fixed within one reverse sweep. Since
+                // each factor's parent has not yet been updated, this is a
+                // block Gauss-Seidel solve rather than a stale approximation.
+                let trace = feedforward_trace.take().unwrap_or_else(|| {
+                    forward_trace_batch(
+                        &plain,
+                        &activities,
+                        &factor_initial_rhos,
+                        neuron_mask.as_ref(),
+                        activity_mask.as_ref(),
+                    )
+                });
+                let terminal_hidden = plain.predictive_coding_hidden_from_activity(
+                    activities.last().expect("terminal PC activity").clone(),
+                );
+                let terminal = plain.predictive_coding_head_activity_vjp(
+                    terminal_hidden,
+                    targets.clone(),
+                    loss_mask.clone(),
+                );
+                if feedforward_loss.is_none() {
+                    feedforward_loss = Some(terminal.loss.clone());
+                }
+                local_vjp_calls = local_vjp_calls.saturating_add(1);
+                let terminal_grad = (terminal.grad_hidden
+                    * terminal.normalization.reshape([1, 1, 1]))
+                .reshape(activities.last().expect("terminal PC activity").shape());
+                let [batch, _, _, _] = activities[0].shape().dims::<4>();
+
+                for activity_index in (1..=layers).rev() {
+                    let own_offset = (activity_index - 1) * batch;
+                    let own = prediction_error(
+                        slice_batch(trace.next.clone(), own_offset, own_offset + batch),
+                        activities[activity_index].clone(),
+                        config.prediction_precision,
+                        scale,
+                    )
+                    .mul_scalar(-1.0);
+                    let child = if activity_index == layers {
+                        terminal_grad.clone().mul_scalar(scale)
+                    } else {
+                        let child_offset = activity_index * batch;
+                        let child_error = prediction_error(
+                            slice_batch(trace.next.clone(), child_offset, child_offset + batch),
+                            activities[activity_index + 1].clone(),
+                            config.prediction_precision,
+                            scale,
+                        );
+                        local_vjp_calls = local_vjp_calls.saturating_add(1);
+                        layer_activity_vjp(
+                            &plain,
+                            activity_index,
+                            &slice_trace_batch(&trace, child_offset, child_offset + batch),
+                            child_error,
+                            neuron_mask.as_ref(),
+                            activity_mask.as_ref(),
+                        )
+                    };
+                    activities[activity_index] = apply_activity_mask(
+                        burn_pc::pc_sgd_update(
+                            activities[activity_index].clone(),
+                            own + child,
+                            &config.inference,
+                        ),
+                        activity_mask.as_ref(),
+                    )
+                    .detach();
+                }
+            }
+        }
+        LocalPredictiveCodingSolver::FixedPrediction => {
+            unreachable!("fixed-prediction solver returns before activity inference")
         }
     }
 
@@ -554,24 +943,26 @@ where
         burn_pc::diagnostic_scalar_f32(total_energy(
             &plain,
             &activities,
+            &factor_initial_rhos,
             targets.clone(),
             loss_mask.clone(),
             config,
+            (neuron_mask.as_ref(), activity_mask.as_ref()),
         )) as f64
     });
 
-    let trace = forward_trace_batch(&plain, &activities);
+    let trace = forward_trace_batch(
+        &plain,
+        &activities,
+        &factor_initial_rhos,
+        neuron_mask.as_ref(),
+        activity_mask.as_ref(),
+    );
     let terminal_hidden = plain.predictive_coding_hidden_from_activity(
         activities.last().expect("terminal PC activity").clone(),
     );
     let terminal = plain.predictive_coding_head_vjp(terminal_hidden, targets, loss_mask.clone());
-    let normalization = loss_mask.map_or_else(
-        || {
-            let [batch, time] = inputs.shape().dims::<2>();
-            Tensor::<B::InnerBackend, 1>::full([1], (batch * time) as f32, &inputs.device())
-        },
-        |mask| mask.float().sum().clamp_min(1.0).reshape([1]),
-    );
+    let normalization = terminal.supervised_tokens.clone().clamp_min(1.0);
     let errors = prediction_error_gradient(
         trace.next.clone(),
         Tensor::cat(activities.iter().skip(1).cloned().collect(), 0),
@@ -579,15 +970,30 @@ where
         scale,
         normalization,
     );
-    let batched_vjp = plain.predictive_coding_layer_vjp(0, &trace, errors);
+    let batched_vjp = layer_parameter_vjp(
+        &plain,
+        0,
+        &trace,
+        errors,
+        neuron_mask.as_ref(),
+        activity_mask.as_ref(),
+    );
     local_vjp_calls = local_vjp_calls.saturating_add(layers);
     let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
-    let initial_vjp = plain.predictive_coding_initial_vjp(
-        inputs,
+    let initial_grad = apply_activity_mask(
         batched_vjp
             .grad_input
             .slice([0..batch, 0..streams, 0..time, 0..dim]),
+        activity_mask.as_ref(),
     );
+    let initial_vjp = match activity_mask.as_ref() {
+        Some(mask) => plain.predictive_coding_initial_vjp_with_activity_mask(
+            inputs,
+            initial_grad,
+            mask.clone(),
+        ),
+        None => plain.predictive_coding_initial_vjp(inputs, initial_grad),
+    };
     local_vjp_calls = local_vjp_calls.saturating_add(1);
     let grad_norm_gamma = batched_vjp.grad_norm_gamma + initial_vjp.grad_norm_gamma;
     let grad_norm_beta = batched_vjp.grad_norm_beta + initial_vjp.grad_norm_beta;
@@ -615,7 +1021,7 @@ where
     local_vjp_calls = local_vjp_calls.saturating_add(1);
 
     let report = LocalPredictiveCodingStepReport {
-        solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
+        solver: config.solver,
         inference_steps: config.inference.steps,
         factors,
         local_vjp_calls,
@@ -626,11 +1032,286 @@ where
         elapsed_ns: started.elapsed().as_nanos(),
     };
     profile.record(report);
-    LocalPredictiveCodingTrainStep {
+    LocalPredictiveCodingDerivatives {
         grads,
         loss,
+        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.supervised_tokens),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
         report,
     }
+}
+
+/// Produce one canonical Dragon predictive-coding derivative step without a
+/// global backward pass or run-scoped telemetry side effects.
+///
+/// This is the public experiment/integration boundary. Production training
+/// uses the same implementation with an entity-scoped profile sink.
+pub fn local_predictive_coding_derivatives<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingDerivatives<B>, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    validate_local_predictive_coding_derivative_request(
+        model,
+        &inputs,
+        &targets,
+        loss_mask.as_ref(),
+        config,
+    )?;
+    Ok(local_predictive_coding_train_step(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        config,
+        &LocalPredictiveCodingProfile::default(),
+    ))
+}
+
+/// Produce local derivatives for one truncated recurrent factor graph.
+///
+/// Incoming rho is treated as a clamped, detached parent. The returned state
+/// can be fed into the next chunk; its derivative is intentionally not
+/// propagated across this API boundary, matching canonical TBPTT truncation.
+pub fn local_predictive_coding_derivatives_with_state<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingDerivatives<B>, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    validate_local_predictive_coding_derivative_request(
+        model,
+        &inputs,
+        &targets,
+        loss_mask.as_ref(),
+        config,
+    )?;
+    validate_local_predictive_coding_state(model, &inputs, &initial_state)?;
+    Ok(
+        local_predictive_coding_train_step_with_state_and_context_masks(
+            model,
+            inputs,
+            targets,
+            loss_mask,
+            Some(initial_state),
+            LocalPredictiveCodingContextMasks::default(),
+            config,
+            &LocalPredictiveCodingProfile::default(),
+        ),
+    )
+}
+
+/// Produce factor-local derivatives under a fixed context-competition neuron mask.
+/// This is the explicit oracle-context upper bound used to separate the effect
+/// of prospective configuration from sparse neuron-space routing.
+pub fn local_predictive_coding_derivatives_with_neuron_mask<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    neuron_mask: Tensor<B, 4>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingDerivatives<B>, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    validate_local_predictive_coding_derivative_request(
+        model,
+        &inputs,
+        &targets,
+        loss_mask.as_ref(),
+        config,
+    )?;
+    model.predictive_coding_validate_neuron_mask(&neuron_mask)?;
+    Ok(local_predictive_coding_train_step_with_context_masks(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        LocalPredictiveCodingContextMasks {
+            neuron: Some(neuron_mask),
+            activity: None,
+        },
+        config,
+        &LocalPredictiveCodingProfile::default(),
+    ))
+}
+
+/// Produce factor-local derivatives under a context-selected Dragon
+/// subnetwork. The rho mask gates low-rank neuron channels and the activity
+/// mask gates residual-state channels at every recurrent layer boundary.
+pub fn local_predictive_coding_derivatives_with_subnetwork_masks<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    neuron_mask: Tensor<B, 4>,
+    activity_mask: Tensor<B, 4>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingDerivatives<B>, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    validate_local_predictive_coding_derivative_request(
+        model,
+        &inputs,
+        &targets,
+        loss_mask.as_ref(),
+        config,
+    )?;
+    model.predictive_coding_validate_neuron_mask(&neuron_mask)?;
+    model.predictive_coding_validate_activity_mask(&activity_mask)?;
+    Ok(local_predictive_coding_train_step_with_context_masks(
+        model,
+        inputs,
+        targets,
+        loss_mask,
+        LocalPredictiveCodingContextMasks {
+            neuron: Some(neuron_mask),
+            activity: Some(activity_mask),
+        },
+        config,
+        &LocalPredictiveCodingProfile::default(),
+    ))
+}
+
+/// Recurrent counterpart of
+/// [`local_predictive_coding_derivatives_with_subnetwork_masks`].
+#[allow(clippy::too_many_arguments)]
+pub fn local_predictive_coding_derivatives_with_state_and_subnetwork_masks<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    neuron_mask: Tensor<B, 4>,
+    activity_mask: Tensor<B, 4>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingDerivatives<B>, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    validate_local_predictive_coding_derivative_request(
+        model,
+        &inputs,
+        &targets,
+        loss_mask.as_ref(),
+        config,
+    )?;
+    validate_local_predictive_coding_state(model, &inputs, &initial_state)?;
+    model.predictive_coding_validate_neuron_mask(&neuron_mask)?;
+    model.predictive_coding_validate_activity_mask(&activity_mask)?;
+    Ok(
+        local_predictive_coding_train_step_with_state_and_context_masks(
+            model,
+            inputs,
+            targets,
+            loss_mask,
+            Some(initial_state),
+            LocalPredictiveCodingContextMasks {
+                neuron: Some(neuron_mask),
+                activity: Some(activity_mask),
+            },
+            config,
+            &LocalPredictiveCodingProfile::default(),
+        ),
+    )
+}
+
+fn validate_local_predictive_coding_state<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: &Tensor<B, 2, Int>,
+    state: &ModelState<B>,
+) -> Result<(), String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let support = model.predictive_coding_support()?;
+    if state.layers.len() != support.layers {
+        return Err(format!(
+            "local predictive-coding state has {} layers, expected {}",
+            state.layers.len(),
+            support.layers
+        ));
+    }
+    let batch = inputs.shape().dims::<2>()[0];
+    for (layer, layer_state) in state.layers.iter().enumerate() {
+        if let Some(rho) = layer_state.rho.as_ref() {
+            model
+                .predictive_coding_validate_rho_state(rho, batch)
+                .map_err(|error| format!("local predictive-coding state layer {layer}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_predictive_coding_derivative_request<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: &Tensor<B, 2, Int>,
+    targets: &Tensor<B, 2, Int>,
+    loss_mask: Option<&Tensor<B, 2, Int>>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<(), String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    model.predictive_coding_support()?;
+    config
+        .inference
+        .validate("local_predictive_coding_derivatives.inference")
+        .map_err(|error| error.to_string())?;
+    if config.prediction_precision <= 0.0 || !config.prediction_precision.is_finite() {
+        return Err(
+            "local_predictive_coding_derivatives.prediction_precision must be finite and > 0"
+                .to_string(),
+        );
+    }
+    if !matches!(
+        config.learning_schedule,
+        burn_pc::PcLearningSchedule::Equilibrium
+    ) {
+        return Err(
+            "local_predictive_coding_derivatives supports only learning_schedule=equilibrium"
+                .to_string(),
+        );
+    }
+    let input_shape = inputs.shape();
+    if input_shape.num_elements() == 0 {
+        return Err("local predictive coding requires at least one token".to_string());
+    }
+    if targets.shape() != input_shape {
+        return Err(format!(
+            "target shape {:?} does not match input shape {input_shape:?}",
+            targets.shape()
+        ));
+    }
+    if let Some(mask) = loss_mask
+        && mask.shape() != input_shape
+    {
+        return Err(format!(
+            "loss-mask shape {:?} does not match input shape {input_shape:?}",
+            mask.shape()
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

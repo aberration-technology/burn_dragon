@@ -21,7 +21,13 @@ use crate::kernel::{BlockPattern1d, relu_lowrank};
 #[derive(Debug)]
 pub struct LowRankResidualOutput<B: Backend> {
     pub next: Tensor<B, 4>,
+    /// Attention output before the shared normalization. Retained only by the
+    /// factor-trace variant used by analytic local VJPs.
+    pub attention_pre_norm: Option<Tensor<B, 4>>,
     pub attention_readout: Option<Tensor<B, 4>>,
+    /// Decoded residual branch before the shared normalization. Retained only
+    /// by the factor-trace variant used by analytic local VJPs.
+    pub residual_pre_norm: Option<Tensor<B, 4>>,
     pub residual_delta: Option<Tensor<B, 4>>,
     pub x_neuron: Tensor<B, 4>,
     pub y_gate: Tensor<B, 4>,
@@ -30,7 +36,9 @@ pub struct LowRankResidualOutput<B: Backend> {
 
 struct LowRankResidualInternal<B: Backend> {
     next: Tensor<B, 4>,
+    attention_pre_norm: Option<Tensor<B, 4>>,
     attention_readout: Option<Tensor<B, 4>>,
+    residual_pre_norm: Option<Tensor<B, 4>>,
     residual_delta: Option<Tensor<B, 4>>,
     x_neuron: Option<Tensor<B, 4>>,
     y_gate: Option<Tensor<B, 4>>,
@@ -367,14 +375,12 @@ where
         other => other,
     };
     let y_grad_input_executor = lowrank_grad_input_executor;
-    let sparse_mask = if use_fused_any && latent_pattern.is_sparse() {
-        sparse_mask.or_else(|| {
+    let sparse_mask = sparse_mask.or_else(|| {
+        (use_fused_any && latent_pattern.is_sparse()).then(|| {
             let latent = encoder.shape().dims::<4>()[3];
-            Some(latent_pattern.mask::<B>(latent, &current.device()))
+            latent_pattern.mask::<B>(latent, &current.device())
         })
-    } else {
-        None
-    };
+    });
 
     let x_projection_start = prof_enabled.then(Instant::now);
     let x_neuron = if use_fused_x {
@@ -396,7 +402,11 @@ where
         if apply_threshold && x_relu_threshold != 0.0 {
             x_latent = x_latent.sub_scalar(x_relu_threshold);
         }
-        apply_latent(x_latent)
+        let activated = apply_latent(x_latent);
+        match sparse_mask.as_ref() {
+            Some(mask) => activated * mask.clone(),
+            None => activated,
+        }
     };
     if let Some(start) = x_projection_start {
         x_projection_ns = start.elapsed().as_nanos();
@@ -407,6 +417,7 @@ where
     if let Some(start) = attention_mixer_start {
         attention_mixer_ns = start.elapsed().as_nanos();
     }
+    let attention_pre_norm = keep_metric_aux.then(|| attn.clone());
     let attention_post_norm_start = prof_enabled.then(Instant::now);
     let attn = apply_norm(attn);
     if let Some(start) = attention_post_norm_start {
@@ -447,7 +458,11 @@ where
         if apply_threshold && y_relu_threshold != 0.0 {
             y_latent = y_latent.sub_scalar(y_relu_threshold);
         }
-        apply_latent(y_latent)
+        let activated = apply_latent(y_latent);
+        match sparse_mask.as_ref() {
+            Some(mask) => activated * mask.clone(),
+            None => activated,
+        }
     };
     if let Some(start) = y_projection_start {
         y_projection_ns = start.elapsed().as_nanos();
@@ -499,6 +514,7 @@ where
         );
     }
 
+    let residual_pre_norm = keep_metric_aux.then(|| mlp_out.clone());
     let mlp_norm_start = prof_enabled.then(Instant::now);
     let mlp_out = apply_norm(mlp_out);
     if let Some(start) = mlp_norm_start {
@@ -545,7 +561,9 @@ where
 
     LowRankResidualInternal {
         next,
+        attention_pre_norm,
         attention_readout: attn_out,
+        residual_pre_norm,
         residual_delta: residual_delta_out,
         x_neuron: x_neuron_out,
         y_gate: y_gate_out,
@@ -602,7 +620,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),
@@ -764,7 +784,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),
@@ -823,7 +845,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),

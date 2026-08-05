@@ -126,7 +126,7 @@ pub fn reference_forward<B: Backend>(
 
     let mut activated = activation::relu(projected);
 
-    if layout.is_sparse() {
+    if sparse_mask.is_some() || layout.is_sparse() {
         let mask = sparse_mask.unwrap_or_else(|| layout.mask::<B>(latent, &device));
         activated = activated * mask;
     }
@@ -168,12 +168,12 @@ pub fn fused_forward_with_executor<B: Backend>(
 where
     B::FloatTensorPrimitive: 'static,
 {
-    let kernel_mask = if layout.is_sparse() {
-        let latent = weight.shape().dims::<4>()[3];
-        sparse_mask.or_else(|| Some(layout.mask::<B>(latent, &input.device())))
-    } else {
-        None
-    };
+    let kernel_mask = sparse_mask.or_else(|| {
+        layout.is_sparse().then(|| {
+            let latent = weight.shape().dims::<4>()[3];
+            layout.mask::<B>(latent, &input.device())
+        })
+    });
 
     if let Some(fused) = try_wgpu_fused_forward_with_executor(
         &input,
@@ -303,6 +303,34 @@ mod tests {
         assert_eq!(actual.len(), expected.len());
         for (a, b) in actual.into_iter().zip(expected) {
             assert!((a - b).abs() <= 1e-6, "head-aligned mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn explicit_mask_is_honored_with_dense_layout() {
+        type Backend = NdArray<f32>;
+        let device = burn::tensor::Device::<Backend>::default();
+        let input = Tensor::<Backend, 4>::ones([1, 1, 2, 3], &device);
+        let weight = Tensor::<Backend, 4>::ones([1, 2, 3, 4], &device);
+        let mask = Tensor::<Backend, 4>::from_data(
+            TensorData::new(vec![1.0_f32, 0.0, 1.0, 0.0], [1, 1, 1, 4]),
+            &device,
+        );
+
+        let actual = fused_forward(
+            input,
+            weight,
+            None,
+            0.0,
+            &BlockPattern1d::dense(4),
+            Some(mask),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .expect("masked output");
+
+        for channels in actual.chunks_exact(4) {
+            assert_eq!(channels, &[3.0, 0.0, 3.0, 0.0]);
         }
     }
 

@@ -27,9 +27,7 @@ use burn_dragon_language::{
     DatasetSourceConfig, DragonConfig, TrainingConfig, load_training_config,
 };
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
-use burn_dragon_universality::NcaCorpusConfig;
-#[cfg(feature = "native")]
-use burn_dragon_universality::RuliadCorpusConfig;
+use burn_dragon_universality::{NcaCorpusConfig, RuliadCorpusConfig};
 #[cfg(feature = "native")]
 use burn_p2p::BrowserEdgeSnapshot;
 
@@ -45,7 +43,10 @@ use crate::config::{
     DragonBrowserTrainingConfig, DragonBrowserTrainingObjectiveConfig,
 };
 #[cfg(feature = "native")]
-use crate::config::{DragonManifestSeed, DragonNativePeerConfig, DragonNativeTrainingOverrides};
+use crate::config::{
+    DragonManifestSeed, DragonNativePeerConfig, DragonNativeTrainingOverrides,
+    DragonPromotionConfig, DragonPromotionMode,
+};
 
 pub const DRAGON_PROFILE_VERSION_METADATA_KEY: &str = "dragon_profile_version";
 pub const DRAGON_PROFILE_JSON_METADATA_KEY: &str = "dragon_profile_json";
@@ -152,6 +153,35 @@ struct PortableUniversalityCorpus {
 }
 
 #[cfg(feature = "native")]
+fn resolve_local_profile_path(path: &Path) -> PathBuf {
+    if path.is_absolute() || path.is_file() {
+        return path.to_path_buf();
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let package_relative = manifest_dir.join(path);
+    if package_relative.is_file() {
+        return package_relative;
+    }
+
+    // Repository profiles historically use workspace-relative paths. Cargo test
+    // executes from the package directory, while operators commonly launch from
+    // the workspace root, so accept both without making the published profile
+    // depend on process cwd.
+    let workspace_relative = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|workspace| workspace.join(path));
+    if let Some(workspace_relative) = workspace_relative
+        && workspace_relative.is_file()
+    {
+        return workspace_relative;
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(feature = "native")]
 fn portable_universality_corpus(
     config: &TrainingConfig,
 ) -> Result<Option<PortableUniversalityCorpus>> {
@@ -161,11 +191,13 @@ fn portable_universality_corpus(
     let config_path = kind
         .config_path(&config.dataset.source)
         .expect("portable corpus source path");
-    let toml = fs::read_to_string(config_path).map_err(|error| {
+    let resolved_path = resolve_local_profile_path(config_path);
+    let toml = fs::read_to_string(&resolved_path).map_err(|error| {
         anyhow!(
-            "failed to read portable {} corpus config {}: {error}",
+            "failed to read portable {} corpus config {} (declared as {}): {error}",
             kind.label(),
-            config_path.display()
+            resolved_path.display(),
+            config_path.display(),
         )
     })?;
     Ok(Some(PortableUniversalityCorpus { kind, toml }))
@@ -263,9 +295,27 @@ pub struct DragonBrowserExperimentProfile {
     pub max_eval_batches: Option<usize>,
     #[serde(default)]
     pub capability_policy: DragonCapabilityPolicy,
+    #[serde(default)]
+    pub trainer_support: DragonBrowserTrainerSupport,
     pub train_source: DragonBrowserProfileTokenSource,
     #[serde(default)]
     pub eval_source: Option<DragonBrowserProfileTokenSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DragonBrowserTrainerSupport {
+    #[default]
+    Supported,
+    ObserverOnly {
+        reason: String,
+    },
+}
+
+impl DragonBrowserTrainerSupport {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -289,6 +339,14 @@ pub enum DragonBrowserProfileTokenSource {
         split: DragonBrowserDatasetSplit,
         #[serde(default)]
         max_documents: Option<usize>,
+    },
+    GeneratedRuliad {
+        corpus_toml: String,
+        split: DragonBrowserDatasetSplit,
+        #[serde(default)]
+        max_documents: Option<usize>,
+        #[serde(default)]
+        supervision: burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig,
     },
 }
 
@@ -326,6 +384,22 @@ fn normalized_browser_profile_source(
                 "max_documents": max_documents,
             })
         }
+        DragonBrowserProfileTokenSource::GeneratedRuliad {
+            corpus_toml,
+            split,
+            max_documents,
+            supervision,
+        } => {
+            let corpus: RuliadCorpusConfig = toml::from_str(corpus_toml)
+                .map_err(|error| anyhow!("invalid browser Ruliad corpus TOML: {error}"))?;
+            serde_json::json!({
+                "type": "generated_ruliad",
+                "corpus": corpus,
+                "split": split,
+                "max_documents": max_documents,
+                "supervision": supervision,
+            })
+        }
     })
 }
 
@@ -357,6 +431,18 @@ fn normalized_browser_runtime_source(source: &DragonBrowserTokenSource) -> serde
             "corpus": corpus,
             "split": split,
             "max_documents": max_documents,
+        }),
+        DragonBrowserTokenSource::GeneratedRuliad {
+            corpus,
+            split,
+            max_documents,
+            supervision,
+        } => serde_json::json!({
+            "type": "generated_ruliad",
+            "corpus": corpus,
+            "split": split,
+            "max_documents": max_documents,
+            "supervision": supervision,
         }),
     }
 }
@@ -510,7 +596,7 @@ fn ensure_portable_native_profile(
         (DatasetSourceConfig::UniversalityNca { .. }, DragonExperimentKind::NcaPrepretraining)
         | (
             DatasetSourceConfig::UniversalityRuliad { .. },
-            DragonExperimentKind::NcaPrepretraining,
+            DragonExperimentKind::RuliadPretraining,
         )
         | (
             DatasetSourceConfig::NemotronClimbMix { .. },
@@ -613,6 +699,7 @@ fn browser_profile_from_native_config(
                 max_train_batches: Some(window_tuning.max_train_batches),
                 max_eval_batches: Some(window_tuning.max_eval_batches),
                 capability_policy,
+                trainer_support: DragonBrowserTrainerSupport::Supported,
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,
@@ -642,6 +729,7 @@ fn browser_profile_from_native_config(
             max_train_batches: Some(config.training.max_iters.max(1)),
             max_eval_batches: None,
             capability_policy: DragonCapabilityPolicy::default(),
+            trainer_support: DragonBrowserTrainerSupport::Supported,
             train_source: DragonBrowserProfileTokenSource::ShardManifestHttp {
                 manifest_url: browser_climbmix_manifest_url
                     .map(str::trim)
@@ -655,6 +743,76 @@ fn browser_profile_from_native_config(
             },
             eval_source: None,
         })),
+        (
+            DatasetSourceConfig::UniversalityRuliad {
+                config: ruliad_config_path,
+            },
+            DragonExperimentKind::RuliadPretraining,
+        ) => {
+            let corpus_toml = match portable_corpus {
+                Some(PortableUniversalityCorpus {
+                    kind: PortableUniversalityCorpusKind::Ruliad,
+                    toml,
+                }) => toml.clone(),
+                _ => fs::read_to_string(ruliad_config_path).map_err(|error| {
+                    anyhow!(
+                        "failed to read portable Ruliad corpus config {}: {error}",
+                        ruliad_config_path.display()
+                    )
+                })?,
+            };
+            let browser_ruliad_corpus: RuliadCorpusConfig = toml::from_str(&corpus_toml)
+                .map_err(|error| anyhow!("invalid browser Ruliad corpus TOML: {error}"))?;
+            let window_tuning = DragonBrowserWindowTuning::nca_wgpu_from_native(config);
+            let capability_policy = DragonCapabilityPolicy {
+                browser_wgpu_memory_budget_bytes: Some(
+                    DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES,
+                ),
+                ..DragonCapabilityPolicy::default()
+            };
+            Ok(Some(DragonBrowserExperimentProfile {
+                model_config: model_config.clone(),
+                training_objective: config.training.objective.clone(),
+                optimizer,
+                execution_backend: DragonBrowserExecutionBackend::Auto,
+                block_size: config.training.block_size,
+                tbptt_chunk_size: config.training.tbptt_chunk_size,
+                tbptt_persist_across_steps: config.training.tbptt_persist_across_steps,
+                learning_rate: config.optimizer.learning_rate,
+                weight_decay: config.optimizer.weight_decay,
+                batch_size: window_tuning.batch_size,
+                max_train_batches: Some(window_tuning.max_train_batches),
+                max_eval_batches: Some(window_tuning.max_eval_batches),
+                capability_policy,
+                trainer_support: if config
+                    .training
+                    .ruliad_supervision
+                    .needs_ruliad_policy_batch()
+                {
+                    DragonBrowserTrainerSupport::ObserverOnly {
+                        reason: "the signed Ruliad objective requires verifier or denoising policy batches that are not implemented by the browser trainer".into(),
+                    }
+                } else if browser_ruliad_corpus.source_selection.enabled {
+                    DragonBrowserTrainerSupport::ObserverOnly {
+                        reason: "the signed Ruliad revision uses adaptive live source selection whose capability feedback state is not synchronized into browser leases".into(),
+                    }
+                } else {
+                    DragonBrowserTrainerSupport::Supported
+                },
+                train_source: DragonBrowserProfileTokenSource::GeneratedRuliad {
+                    corpus_toml: corpus_toml.clone(),
+                    split: DragonBrowserDatasetSplit::Train,
+                    max_documents: Some(window_tuning.train_document_pool),
+                    supervision: config.training.ruliad_supervision.token_supervision(),
+                },
+                eval_source: Some(DragonBrowserProfileTokenSource::GeneratedRuliad {
+                    corpus_toml,
+                    split: DragonBrowserDatasetSplit::Validation,
+                    max_documents: Some(window_tuning.eval_document_pool),
+                    supervision: config.training.ruliad_supervision.token_supervision(),
+                }),
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -895,14 +1053,31 @@ fn builtin_native_training_profile(
 fn manifest_seed_from_entry(
     default_seed: &DragonManifestSeed,
     entry: &ExperimentDirectoryEntry,
-) -> DragonManifestSeed {
+) -> Result<DragonManifestSeed> {
     let mut seed = default_seed.clone();
     seed.network_id = entry.network_id.as_str().to_owned();
     seed.study_id = entry.study_id.as_str().to_owned();
     seed.experiment_id = entry.experiment_id.as_str().to_owned();
     seed.revision_id = entry.current_revision_id.as_str().to_owned();
     seed.display_name = entry.display_name.clone();
-    seed
+    if let Some(topology) = entry.merge_topology_policy() {
+        seed.promotion = match topology.promotion_policy.mode {
+            burn_p2p::HeadPromotionMode::DiffusionSteadyState => DragonPromotionConfig {
+                mode: DragonPromotionMode::DiffusionSteadyState,
+                validator_quorum: 1,
+            },
+            burn_p2p::HeadPromotionMode::ValidatorQuorum => DragonPromotionConfig {
+                mode: DragonPromotionMode::ValidatorQuorum,
+                validator_quorum: topology.promotion_policy.validator_quorum,
+            },
+            burn_p2p::HeadPromotionMode::ReducerAuthority => {
+                anyhow::bail!(
+                    "network profile requests reducer-authority promotion, which Dragon does not expose"
+                )
+            }
+        };
+    }
+    Ok(seed)
 }
 
 #[cfg(feature = "native")]
@@ -949,7 +1124,7 @@ pub fn resolve_native_training_profile(
                         apply_native_training_overrides(config, &native.training_overrides)?;
                     return Ok(ResolvedNativeTrainingProfile {
                         config,
-                        manifest_seed: manifest_seed_from_entry(&native.manifest, &entry),
+                        manifest_seed: manifest_seed_from_entry(&native.manifest, &entry)?,
                         profile,
                         directory_entry: Some(entry),
                         source: DragonResolvedProfileSource::NetworkPublished,
@@ -1031,6 +1206,17 @@ fn browser_source_from_profile(
             split,
             max_documents,
         }),
+        DragonBrowserProfileTokenSource::GeneratedRuliad {
+            corpus_toml,
+            split,
+            max_documents,
+            supervision,
+        } => Ok(DragonBrowserTokenSource::GeneratedRuliad {
+            corpus: Box::new(toml::from_str(&corpus_toml)?),
+            split,
+            max_documents,
+            supervision,
+        }),
     }
 }
 
@@ -1048,6 +1234,9 @@ pub fn browser_training_config_from_profile(
     let Some(browser) = profile.browser.clone() else {
         return Ok(None);
     };
+    if !browser.trainer_support.is_supported() {
+        return Ok(None);
+    }
     Ok(Some(DragonBrowserTrainingConfig {
         experiment_kind: profile.experiment_kind,
         model_config: browser.model_config,
@@ -1203,10 +1392,12 @@ mod tests {
             max_train_batches: Some(3),
             max_eval_batches: Some(1),
             capability_policy: DragonCapabilityPolicy::default(),
+            trainer_support: DragonBrowserTrainerSupport::Supported,
             train_source: DragonBrowserProfileTokenSource::Inline {
                 records: vec![TokenWindowRecord {
                     inputs: vec![1; 8],
                     targets: vec![2; 8],
+                    loss_mask: None,
                     reset_stream_state: true,
                     stream_group_id: Some(1),
                     stream_row: Some(0),
@@ -1362,10 +1553,8 @@ prompt = "1 2 3"
                 ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
-            source_selection: RuliadSourceSelectionConfig {
-                enabled: true,
-                ..RuliadSourceSelectionConfig::default()
-            },
+            formal_generalization: Default::default(),
+            source_selection: RuliadSourceSelectionConfig::default(),
             families: compact_ruliad_families(),
             proof_tasks: None,
             lean_task_limit: None,
@@ -1418,7 +1607,7 @@ prompt = "[R2"
 
         let profile = build_profile_from_local_config(
             &config,
-            DragonExperimentKind::NcaPrepretraining,
+            DragonExperimentKind::RuliadPretraining,
             Some("ruliad-r1"),
             None,
         )
@@ -1426,7 +1615,26 @@ prompt = "[R2"
 
         assert!(profile.native.nca_corpus_toml.is_none());
         assert!(profile.native.ruliad_corpus_toml.is_some());
-        assert!(profile.browser.is_none());
+        let browser = profile.browser.as_ref().expect("Ruliad browser profile");
+        assert_eq!(
+            browser.trainer_support,
+            DragonBrowserTrainerSupport::Supported
+        );
+        assert!(matches!(
+            &browser.train_source,
+            DragonBrowserProfileTokenSource::GeneratedRuliad {
+                split: DragonBrowserDatasetSplit::Train,
+                supervision,
+                ..
+            } if *supervision == config.training.ruliad_supervision.token_supervision()
+        ));
+        assert!(matches!(
+            browser.eval_source.as_ref(),
+            Some(DragonBrowserProfileTokenSource::GeneratedRuliad {
+                split: DragonBrowserDatasetSplit::Validation,
+                ..
+            })
+        ));
         let portable_training: TrainingConfig =
             toml::from_str(&profile.native.training_toml).expect("portable training config");
         assert!(matches!(
@@ -1448,14 +1656,141 @@ prompt = "[R2"
             &profile,
         )
         .expect("materialized config");
-        let DatasetSourceConfig::UniversalityRuliad { config } = materialized.dataset.source else {
+        let DatasetSourceConfig::UniversalityRuliad {
+            config: materialized_config_path,
+        } = materialized.dataset.source
+        else {
             panic!("expected materialized ruliad source");
         };
-        assert!(config.is_file());
+        assert!(materialized_config_path.is_file());
         let corpus: burn_dragon_universality::RuliadCorpusConfig =
-            toml::from_str(&fs::read_to_string(&config).expect("read corpus"))
+            toml::from_str(&fs::read_to_string(&materialized_config_path).expect("read corpus"))
                 .expect("materialized corpus config");
         assert!(corpus.output_dir.ends_with("ruliad-generated"));
+
+        let adaptive_config_path = dir.path().join("ruliad-adaptive.toml");
+        let mut adaptive_corpus = ruliad_corpus.clone();
+        adaptive_corpus.source_selection.enabled = true;
+        fs::write(
+            &adaptive_config_path,
+            toml::to_string_pretty(&adaptive_corpus).expect("adaptive ruliad corpus toml"),
+        )
+        .expect("write adaptive ruliad corpus config");
+        let mut adaptive_config = config.clone();
+        adaptive_config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: adaptive_config_path,
+        };
+        let adaptive_profile = build_profile_from_local_config(
+            &adaptive_config,
+            DragonExperimentKind::RuliadPretraining,
+            Some("ruliad-r1-adaptive"),
+            None,
+        )
+        .expect("adaptive profile");
+        assert!(matches!(
+            adaptive_profile
+                .browser
+                .expect("adaptive browser profile")
+                .trainer_support,
+            DragonBrowserTrainerSupport::ObserverOnly { reason }
+                if reason.contains("adaptive live source selection")
+        ));
+
+        let mut auxiliary_config = config.clone();
+        auxiliary_config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .enabled = true;
+        auxiliary_config
+            .training
+            .ruliad_supervision
+            .verifier_reward
+            .weight = 0.1;
+        let auxiliary_profile = build_profile_from_local_config(
+            &auxiliary_config,
+            DragonExperimentKind::RuliadPretraining,
+            Some("ruliad-r1-auxiliary"),
+            None,
+        )
+        .expect("auxiliary profile");
+        assert!(matches!(
+            auxiliary_profile
+                .browser
+                .expect("observer browser profile")
+                .trainer_support,
+            DragonBrowserTrainerSupport::ObserverOnly { .. }
+        ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_r3_profile_binds_streaming_supervision_and_fails_closed_in_browser() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = burn_dragon_language::load_training_config(&[
+            manifest_dir.join("deploy/profiles/ruliad-r3.training.toml")
+        ])
+        .expect("load builtin R3 profile");
+        let DatasetSourceConfig::UniversalityRuliad {
+            config: corpus_path,
+        } = &config.dataset.source
+        else {
+            panic!("R3 profile must use the Ruliad source");
+        };
+        let corpus =
+            burn_dragon_universality::load_ruliad_config(&resolve_local_profile_path(corpus_path))
+                .expect("load builtin R3 corpus");
+        assert_eq!(
+            corpus.source_selection.formal_task_mix,
+            burn_dragon_universality::RuliadFormalTaskMixConfig {
+                advance_proof_weight: 2,
+                select_proof_action_weight: 0,
+                construct_proof_weight: 1,
+                check_proof_weight: 1,
+                proof_action_answer_contract: Default::default(),
+            }
+        );
+        let profile = build_profile_from_local_config(
+            &config,
+            DragonExperimentKind::RuliadPretraining,
+            Some("ruliad-r3"),
+            None,
+        )
+        .expect("build R3 P2P profile");
+        let browser = profile.browser.expect("R3 browser observer profile");
+
+        assert_eq!(browser.block_size, 512);
+        assert_eq!(browser.tbptt_chunk_size, Some(512));
+        assert!(browser.tbptt_persist_across_steps);
+        assert!(matches!(
+            browser.trainer_support,
+            DragonBrowserTrainerSupport::ObserverOnly { reason }
+                if reason.contains("adaptive live source selection")
+        ));
+        assert!(matches!(
+            browser.train_source,
+            DragonBrowserProfileTokenSource::GeneratedRuliad {
+                supervision: burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig {
+                    mode:
+                        burn_dragon_universality::ruliad::RuliadTokenSupervisionMode::TraceAndAnswer,
+                    mask_high_entropy_spans: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        let portable_corpus: burn_dragon_universality::RuliadCorpusConfig = toml::from_str(
+            profile
+                .native
+                .ruliad_corpus_toml
+                .as_deref()
+                .expect("embedded R3 corpus"),
+        )
+        .expect("parse embedded R3 corpus");
+        assert_eq!(
+            portable_corpus.source_selection.formal_task_mix,
+            corpus.source_selection.formal_task_mix
+        );
     }
 
     #[cfg(feature = "native")]

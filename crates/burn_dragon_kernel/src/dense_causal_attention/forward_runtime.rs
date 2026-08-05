@@ -129,7 +129,7 @@ where
         let prim_decay = decay.clone().into_primitive().tensor();
         let decay_ad: WgpuFusionAutodiffTensor<BT> = try_cast_primitive::<B, _>(prim_decay)?;
         let fusion_decay: FusionTensor<FusionCubeRuntime<WgpuRuntime>> =
-            <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay_ad);
+            <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay_ad.clone());
         let decay = fusion_client
             .resolve_tensor_float::<CubeBackend<WgpuRuntime, f32, i32, BT>>(fusion_decay);
         if decay.dtype != DType::F32 {
@@ -148,7 +148,12 @@ where
 
         let output = dense_causal_attention_runtime::<WgpuRuntime>(query, value, decay, meta);
         let output_fusion = register_fusion_float_tensor(&fusion_client, output);
-        let output_ad = wrap_fusion_autodiff_inner::<B, BT, WgpuRuntime>(output_fusion)?;
+        let output_ad = dense_causal_attention_autodiff_fusion_wgpu(
+            query_ad,
+            value_ad,
+            decay_ad,
+            output_fusion,
+        );
         let output_prim = try_cast_backend::<B, _>(output_ad)?;
         return Some(BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(
             output_prim,
@@ -181,7 +186,7 @@ where
         let prim_decay = decay.clone().into_primitive().tensor();
         let decay_ad: CudaFusionAutodiffTensor<BT> = try_cast_primitive::<B, _>(prim_decay)?;
         let fusion_decay: FusionTensor<FusionCubeRuntime<CudaRuntime>> =
-            <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay_ad);
+            <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay_ad.clone());
         let decay = fusion_client
             .resolve_tensor_float::<CubeBackend<CudaRuntime, f32, i32, BT>>(fusion_decay);
         if decay.dtype != DType::F32 {
@@ -200,61 +205,19 @@ where
 
         let output = dense_causal_attention_runtime::<CudaRuntime>(query, value, decay, meta);
         let output_fusion = register_fusion_float_tensor(&fusion_client, output);
-        let output_ad = wrap_fusion_autodiff_inner::<B, BT, CudaRuntime>(output_fusion)?;
+        let output_ad = dense_causal_attention_autodiff_fusion_cuda(
+            query_ad,
+            value_ad,
+            decay_ad,
+            output_fusion,
+        );
         let output_prim = try_cast_backend::<B, _>(output_ad)?;
         return Some(BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(
             output_prim,
         )));
     }
 
-    if !matches_autodiff_fusion_type::<B, BT, R>() {
-        return None;
-    }
-
-    let prim_query = query.clone().into_primitive().tensor();
-    let query_ad: B::FloatTensorPrimitive = try_cast_primitive::<B, _>(prim_query)?;
-    let fusion_query: FusionTensor<FusionCubeRuntime<R>> =
-        extract_fusion_autodiff_inner::<B, BT, R>(query_ad.clone())?;
-    let fusion_client = fusion_query.client.clone();
-    let query = fusion_client.resolve_tensor_float::<CubeBackend<R, f32, i32, BT>>(fusion_query);
-    if query.dtype != DType::F32 {
-        return None;
-    }
-
-    let prim_value = value.clone().into_primitive().tensor();
-    let value_ad: B::FloatTensorPrimitive = try_cast_primitive::<B, _>(prim_value)?;
-    let fusion_value: FusionTensor<FusionCubeRuntime<R>> =
-        extract_fusion_autodiff_inner::<B, BT, R>(value_ad.clone())?;
-    let value = fusion_client.resolve_tensor_float::<CubeBackend<R, f32, i32, BT>>(fusion_value);
-    if value.dtype != DType::F32 {
-        return None;
-    }
-
-    let prim_decay = decay.clone().into_primitive().tensor();
-    let decay_ad: B::FloatTensorPrimitive = try_cast_primitive::<B, _>(prim_decay)?;
-    let fusion_decay: FusionTensor<FusionCubeRuntime<R>> =
-        extract_fusion_autodiff_inner::<B, BT, R>(decay_ad)?;
-    let decay = fusion_client.resolve_tensor_float::<CubeBackend<R, f32, i32, BT>>(fusion_decay);
-    if decay.dtype != DType::F32 {
-        return None;
-    }
-
-    let prim_meta = meta.clone().into_primitive().tensor();
-    let meta_ad: B::FloatTensorPrimitive = try_cast_primitive::<B, _>(prim_meta)?;
-    let fusion_meta: FusionTensor<FusionCubeRuntime<R>> =
-        extract_fusion_autodiff_inner::<B, BT, R>(meta_ad)?;
-    let meta = fusion_client.resolve_tensor_float::<CubeBackend<R, f32, i32, BT>>(fusion_meta);
-    if meta.dtype != DType::F32 {
-        return None;
-    }
-
-    let output = dense_causal_attention_runtime::<R>(query, value, decay, meta);
-    let output_fusion = register_fusion_float_tensor(&fusion_client, output);
-    let output_ad = wrap_fusion_autodiff_inner::<B, BT, R>(output_fusion)?;
-    let output_prim = try_cast_backend::<B, _>(output_ad)?;
-    Some(BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(
-        output_prim,
-    )))
+    None
 }
 
 pub(crate) fn dense_causal_attention_runtime<R: CubeRuntime + 'static>(
@@ -342,14 +305,14 @@ fn dense_causal_attention_cube_runtime<R: CubeRuntime>(
         (batch * heads) as u32,
     );
 
-    dense_causal_attention_cube_kernel::launch::<R>(
+    dense_causal_attention_cube_kernel_v2::launch::<R>(
         &client,
         cube_count,
         cube_dim,
         query.clone().into_tensor_arg(),
         value.clone().into_tensor_arg(),
-        decay.clone().into_tensor_arg(),
         output.clone().into_tensor_arg(),
+        decay.clone().into_tensor_arg(),
         meta.clone().into_tensor_arg(),
         MAX_FUSED_TIME,
     );

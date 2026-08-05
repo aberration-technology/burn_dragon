@@ -66,7 +66,7 @@ burn_dragon_eggroll.workspace = true
 burn_dragon_time.workspace = true
 burn_dragon_universality = { workspace = true, optional = true, default-features = false }
 burn_eggroll.workspace = true
-burn_p2p = { workspace = true, features = ["tensor-identity"] }
+burn_p2p = { workspace = true, features = ["burn-module", "tensor-identity"] }
 burn_p2p_admin.workspace = true
 burn_p2p_app = { workspace = true, optional = true, features = ["readonly"] }
 burn_p2p_browser = { workspace = true, optional = true }
@@ -74,6 +74,7 @@ burn_p2p_checkpoint.workspace = true
 burn_p2p_publish.workspace = true
 burn_p2p_workload.workspace = true
 chrono.workspace = true
+ciborium = "0.2"
 clap.workspace = true
 hex.workspace = true
 log = "0.4"
@@ -120,6 +121,7 @@ wasm-bindgen-test = "0.3"
 [dev-dependencies]
 burn_p2p_browser.workspace = true
 burn_p2p_core.workspace = true
+futures = "0.3"
 tempfile.workspace = true
 
 [lib]

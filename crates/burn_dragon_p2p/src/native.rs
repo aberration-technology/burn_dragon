@@ -9,6 +9,7 @@ use crate::config::DragonNativePeerConfig;
 use crate::experiments::climbmix::prepare_climbmix_peer_for_backend;
 use crate::experiments::common::{PreparedNativePeer, assess_native_peer_for_backend};
 use crate::experiments::nca::prepare_nca_peer_for_backend;
+use crate::experiments::ruliad::prepare_ruliad_peer_for_backend;
 pub use crate::native_runtime::{ManagedRunningNativePeer, spawn_prepared_native_peer};
 
 pub type NativeCpuBackend = Autodiff<NdArray<f32>>;
@@ -49,6 +50,18 @@ pub fn prepare_climbmix_native_cpu(
     )
 }
 
+pub fn prepare_ruliad_native_cpu(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeCpuBackend>> {
+    prepare_ruliad_peer_for_backend::<NativeCpuBackend>(
+        native,
+        "cpu",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
 #[cfg(feature = "wgpu")]
 pub fn prepare_nca_native_wgpu(
     native: &DragonNativePeerConfig,
@@ -75,6 +88,19 @@ pub fn prepare_climbmix_native_wgpu(
     )
 }
 
+#[cfg(feature = "wgpu")]
+pub fn prepare_ruliad_native_wgpu(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeWgpuBackend>> {
+    prepare_ruliad_peer_for_backend::<NativeWgpuBackend>(
+        native,
+        "wgpu",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
 #[cfg(feature = "cuda")]
 pub fn prepare_nca_native_cuda(
     native: &DragonNativePeerConfig,
@@ -88,12 +114,38 @@ pub fn prepare_nca_native_cuda(
     )
 }
 
+#[cfg(feature = "cuda")]
+pub fn prepare_ruliad_native_cuda(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeCudaBackend>> {
+    prepare_ruliad_peer_for_backend::<NativeCudaBackend>(
+        native,
+        "cuda",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
 #[cfg(feature = "rocm")]
 pub fn prepare_nca_native_rocm(
     native: &DragonNativePeerConfig,
     auth_bundle: Option<&DragonNativeAuthBundle>,
 ) -> Result<PreparedNativePeer<NativeRocmBackend>> {
     prepare_nca_peer_for_backend::<NativeRocmBackend>(
+        native,
+        "rocm",
+        Default::default(),
+        auth_bundle,
+    )
+}
+
+#[cfg(feature = "rocm")]
+pub fn prepare_ruliad_native_rocm(
+    native: &DragonNativePeerConfig,
+    auth_bundle: Option<&DragonNativeAuthBundle>,
+) -> Result<PreparedNativePeer<NativeRocmBackend>> {
+    prepare_ruliad_peer_for_backend::<NativeRocmBackend>(
         native,
         "rocm",
         Default::default(),

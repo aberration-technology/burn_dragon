@@ -1,0 +1,31 @@
+extends = ["ruliad-r3.semantic-action-fixed-ablation.toml"]
+
+# Use the semantic-step language corpus for both autoregressive and energy supervision. Proof
+# choice is learned through a task-neutral low-rank query-key head over verifier-rendered semantic
+# actions. Each base state is paired with one verifier-valid alternate target under the same
+# candidate presentation inside the same eight-row budget, forcing the energy to depend on the
+# formal goal rather than candidate surface form or menu position.
+[model.sequence_score_head]
+enabled = true
+projection_dim = 64
+
+[training.ruliad_supervision.proof_policy]
+enabled = true
+mode = "static_expert"
+scoring = "semantic_energy"
+normalization = "candidate_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 0.25
+every_steps = 2
+start_after_steps = 128
+stratified_difficulty_levels = 4
+rollout_steps = 1
+max_rows_per_update = 8
+max_presentation_rows_per_update = 8
+counterfactual_targets_per_state = 1
+candidates = 4
+max_completion_tokens = 64
+
+[training.ruliad_policy_probe]
+scoring = "semantic_energy"

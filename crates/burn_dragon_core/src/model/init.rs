@@ -535,6 +535,16 @@ impl<'a> DragonInitializer<'a> {
         self.apply_projection_topology_prior(role, tensor, fan_in, fan_out, device)
     }
 
+    pub(crate) fn projection_standard_deviation(
+        &self,
+        role: DragonProjectionRole,
+        fan_in: usize,
+        fan_out: usize,
+        residual_depth: usize,
+    ) -> f32 {
+        self.projection_std(role, fan_in, fan_out, residual_depth) as f32
+    }
+
     pub fn activation_thresholds(
         &self,
         fan_in: usize,

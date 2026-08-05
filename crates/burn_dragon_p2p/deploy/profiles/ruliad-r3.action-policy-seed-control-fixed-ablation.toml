@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# Diagnostic control only. This reproduces the old seed-disjoint validation
+# contract so structural-holdout difficulty can be measured on matched runs.
+[dataset]
+cache_dir = "./cache/ruliad-r3-action-policy-seed-control"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.action-policy-seed-control.corpus.toml"

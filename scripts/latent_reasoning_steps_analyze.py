@@ -22,14 +22,42 @@ SUMMARY_COLUMNS = [
     "examples_per_sec",
     "stage_wall_tokens_per_sec",
     "stage_model_tokens_per_sec",
+    "stage_main_model_tokens_per_sec",
+    "stage_model_duty_fraction",
+    "stage_auxiliary_objective_fraction",
+    "stage_proof_policy_fraction",
+    "stage_train_compute_fraction",
+    "stage_optimizer_fraction",
+    "stage_metric_sync_fraction",
+    "stage_accounted_fraction",
+    "stage_validation_fraction",
+    "stage_checkpoint_fraction",
+    "stage_dataloader_cpu_thread_fraction",
+    "stage_dataloader_foreground_wait_fraction",
+    "stage_dataloader_cpu_ns",
+    "stage_dataloader_foreground_wait_ns",
+    "stage_total_ns",
     "stage_forward_ns",
+    "stage_auxiliary_objective_ns",
+    "stage_proof_policy_ns",
     "stage_backward_ns",
+    "stage_optimizer_ns",
+    "stage_metric_sync_ns",
     "stage_validation_ns",
+    "stage_checkpoint_ns",
     "stage_generation_ns",
     "stage_event_sink_ns",
     "gpu_util_mean",
     "gpu_util_p50",
     "gpu_power_mean",
+    "gpu_active_sample_fraction",
+    "gpu_active_util_mean",
+    "gpu_active_power_mean",
+    "gpu_active_sm_clock_mean_mhz",
+    "gpu_active_sm_clock_min_mhz",
+    "gpu_active_memory_util_mean",
+    "gpu_active_temperature_max_c",
+    "gpu_high_util_fraction",
     "peak_used_mb",
     "train_first",
     "train_last",
@@ -76,6 +104,7 @@ SUMMARY_COLUMNS = [
     "ruliad_missing_last",
     "ruliad_answer_field_accuracy_last",
     "ruliad_answer_field_coverage_last",
+    "ruliad_presented_action_rate_last",
     "ruliad_answer_termination_rate_last",
     "ruliad_completion_quality_last",
     "ruliad_expected_answer_distinct_last",
@@ -239,23 +268,77 @@ def percentile(values: list[float], q: float) -> float | None:
     return clean[lo] * (1.0 - frac) + clean[hi] * frac
 
 
-def gpu_stats(path: Path | None) -> tuple[float | None, float | None, float | None]:
+def gpu_stats(
+    path: Path | None,
+) -> tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+]:
     if path is None or not path.exists():
-        return None, None, None
+        return (None,) * 11
     util: list[float] = []
     power: list[float] = []
+    active_util: list[float] = []
+    active_power: list[float] = []
+    active_sm_clocks: list[float] = []
+    active_memory_util: list[float] = []
+    active_temperatures: list[float] = []
     with path.open() as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            util_value = finite(row.get(" utilization.gpu [%]") or row.get("utilization.gpu [%]"))
-            power_value = finite(row.get(" power.draw [W]") or row.get("power.draw [W]"))
+            def value_for(needle: str) -> float | None:
+                key = next((key for key in row if needle in key), None)
+                return finite(row.get(key)) if key else None
+
+            util_value = value_for("utilization.gpu")
+            power_value = value_for("power.draw")
             if util_value is not None:
                 util.append(util_value)
             if power_value is not None:
                 power.append(power_value)
+            if util_value is None or util_value < 50.0:
+                continue
+            active_util.append(util_value)
+            if power_value is not None:
+                active_power.append(power_value)
+            for needle, values in (
+                ("clocks.current.sm", active_sm_clocks),
+                ("utilization.memory", active_memory_util),
+                ("temperature.gpu", active_temperatures),
+            ):
+                value = value_for(needle)
+                if value is not None:
+                    values.append(value)
     util_mean = sum(util) / len(util) if util else None
     power_mean = sum(power) / len(power) if power else None
-    return util_mean, percentile(util, 0.5), power_mean
+    active_fraction = len(active_util) / len(util) if util else None
+    active_util_mean = sum(active_util) / len(active_util) if active_util else None
+    active_power_mean = sum(active_power) / len(active_power) if active_power else None
+    high_util_fraction = sum(u >= 80.0 for u in util) / len(util) if util else None
+    return (
+        util_mean,
+        percentile(util, 0.5),
+        power_mean,
+        active_fraction,
+        active_util_mean,
+        active_power_mean,
+        sum(active_sm_clocks) / len(active_sm_clocks) if active_sm_clocks else None,
+        min(active_sm_clocks) if active_sm_clocks else None,
+        sum(active_memory_util) / len(active_memory_util)
+        if active_memory_util
+        else None,
+        max(active_temperatures) if active_temperatures else None,
+        high_util_fraction,
+    )
 
 
 def parse_stage_profile(path: Path | None) -> dict[str, float]:
@@ -898,7 +981,19 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
     contract_summary = contract_probe_summary(run_dir, capability)
     gpu_log_path = Path(manifest["gpu_log_path"]) if manifest.get("gpu_log_path") else None
     log_path = Path(manifest["log_path"]) if manifest.get("log_path") else None
-    gpu_util_mean, gpu_util_p50, gpu_power_mean = gpu_stats(gpu_log_path)
+    (
+        gpu_util_mean,
+        gpu_util_p50,
+        gpu_power_mean,
+        gpu_active_sample_fraction,
+        gpu_active_util_mean,
+        gpu_active_power_mean,
+        gpu_active_sm_clock_mean,
+        gpu_active_sm_clock_min,
+        gpu_active_memory_util_mean,
+        gpu_active_temperature_max,
+        gpu_high_util_fraction,
+    ) = gpu_stats(gpu_log_path)
     stage_profile = parse_stage_profile(log_path)
 
     train_values = metric_values(events, "train", "Loss")
@@ -938,14 +1033,52 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "examples_per_sec": examples_per_sec,
         "stage_wall_tokens_per_sec": stage_profile.get("wall_tokens_per_second"),
         "stage_model_tokens_per_sec": stage_profile.get("model_tokens_per_second"),
+        "stage_main_model_tokens_per_sec": stage_profile.get(
+            "main_model_tokens_per_second"
+        ),
+        "stage_model_duty_fraction": stage_profile.get("model_duty_fraction"),
+        "stage_auxiliary_objective_fraction": stage_profile.get(
+            "auxiliary_objective_fraction"
+        ),
+        "stage_proof_policy_fraction": stage_profile.get("proof_policy_fraction"),
+        "stage_train_compute_fraction": stage_profile.get("train_compute_fraction"),
+        "stage_optimizer_fraction": stage_profile.get("optimizer_fraction"),
+        "stage_metric_sync_fraction": stage_profile.get("metric_sync_fraction"),
+        "stage_accounted_fraction": stage_profile.get("accounted_fraction"),
+        "stage_validation_fraction": stage_profile.get("validation_fraction"),
+        "stage_checkpoint_fraction": stage_profile.get("checkpoint_fraction"),
+        "stage_dataloader_cpu_thread_fraction": stage_profile.get(
+            "dataloader_cpu_thread_fraction"
+        ),
+        "stage_dataloader_foreground_wait_fraction": stage_profile.get(
+            "dataloader_foreground_wait_fraction"
+        ),
+        "stage_dataloader_cpu_ns": stage_profile.get("dataloader_cpu_ns"),
+        "stage_dataloader_foreground_wait_ns": stage_profile.get(
+            "dataloader_foreground_wait_ns"
+        ),
+        "stage_total_ns": stage_profile.get("total_ns"),
         "stage_forward_ns": stage_profile.get("forward_ns"),
+        "stage_auxiliary_objective_ns": stage_profile.get("auxiliary_objective_ns"),
+        "stage_proof_policy_ns": stage_profile.get("proof_policy_ns"),
         "stage_backward_ns": stage_profile.get("loss_backward_ns"),
+        "stage_optimizer_ns": stage_profile.get("optimizer_ns"),
+        "stage_metric_sync_ns": stage_profile.get("metric_sync_ns"),
         "stage_validation_ns": stage_profile.get("validation_ns"),
+        "stage_checkpoint_ns": stage_profile.get("checkpoint_ns"),
         "stage_generation_ns": stage_profile.get("generation_ns"),
         "stage_event_sink_ns": stage_profile.get("event_sink_ns"),
         "gpu_util_mean": gpu_util_mean,
         "gpu_util_p50": gpu_util_p50,
         "gpu_power_mean": gpu_power_mean,
+        "gpu_active_sample_fraction": gpu_active_sample_fraction,
+        "gpu_active_util_mean": gpu_active_util_mean,
+        "gpu_active_power_mean": gpu_active_power_mean,
+        "gpu_active_sm_clock_mean_mhz": gpu_active_sm_clock_mean,
+        "gpu_active_sm_clock_min_mhz": gpu_active_sm_clock_min,
+        "gpu_active_memory_util_mean": gpu_active_memory_util_mean,
+        "gpu_active_temperature_max_c": gpu_active_temperature_max,
+        "gpu_high_util_fraction": gpu_high_util_fraction,
         "peak_used_mb": manifest.get("peak_used_mb"),
         "train_first": train_first,
         "train_last": train_last,
@@ -992,6 +1125,9 @@ def summarize_manifest(path: Path) -> dict[str, Any]:
         "ruliad_missing_last": capability.get("missing_rate"),
         "ruliad_answer_field_accuracy_last": capability.get("answer_field_accuracy"),
         "ruliad_answer_field_coverage_last": capability.get("answer_field_coverage"),
+        "ruliad_presented_action_rate_last": last_metric(
+            events, "valid", "Ruliad Presented Action Rate"
+        ),
         "ruliad_answer_termination_rate_last": capability.get("answer_termination_rate"),
         "ruliad_completion_quality_last": last_metric(
             events, "valid", "Ruliad Mean Completion Quality"
@@ -1069,8 +1205,8 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
     rank_rows = sorted(rows, key=lambda row: finite(row.get("rank_score")) or -1e9, reverse=True)
     with md_path.open("w") as handle:
         handle.write("# Latent Reasoning Max Steps Ablation\n\n")
-        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | active d | mastered d | source lag | verifier | semantic | partial | schema wrong | malformed | field | coverage | term | completion | contract verifier | contract field | contract completion | contract dver | contract dfield | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | cap drop | rec frac | src rec | q rec | lag buckets | lag contracts | best eval steps | best eval verifier | extra steps | extra worst | extra dver | extra dcomp | extra dmal | extra lat CE | extra lat viol | extra lat H | extra lat rms | energy comps | step comps | out H | out d2 | gpu util | score |\n")
-        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        handle.write("| max_steps | status | wall tok/s | model tok/s | valid CE | active d | mastered d | source lag | verifier | semantic | partial | schema wrong | malformed | field | coverage | offered action | term | completion | contract verifier | contract field | contract completion | contract dver | contract dfield | comp d2 | comp period | cap gate | cap fails | cap first | cap auc | cap drop | rec frac | src rec | q rec | lag buckets | lag contracts | best eval steps | best eval verifier | extra steps | extra worst | extra dver | extra dcomp | extra dmal | extra lat CE | extra lat viol | extra lat H | extra lat rms | energy comps | step comps | out H | out d2 | gpu util | score |\n")
+        handle.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for row in rank_rows:
             handle.write(
                 "| "
@@ -1091,6 +1227,7 @@ def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> None:
                         fmt(row.get("ruliad_malformed_last")),
                         fmt(row.get("ruliad_answer_field_accuracy_last")),
                         fmt(row.get("ruliad_answer_field_coverage_last")),
+                        fmt(row.get("ruliad_presented_action_rate_last")),
                         fmt(row.get("ruliad_answer_termination_rate_last")),
                         fmt(row.get("completion_health_last")),
                         fmt(row.get("contract_probe_verifier_last")),

@@ -1,0 +1,5 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+[dataset]
+cache_dir = "./cache/ruliad-r3-semantic-action"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"

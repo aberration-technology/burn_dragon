@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# Conditional semantic objective for finite verifier actions. The existing
+# source-selected batch supervises only answer value tokens; candidate ranking
+# therefore receives every optimizer update without an auxiliary model pass.
+[training.ruliad_supervision]
+mode = "answer_values"

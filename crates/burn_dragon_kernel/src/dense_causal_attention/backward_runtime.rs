@@ -1,12 +1,45 @@
 use super::*;
 use burn::tensor::backend::AutodiffBackend;
 
-fn dense_causal_backward_impl<B: BackendTrait>(
+/// Plain-backend VJP for dense causal linear attention.
+#[derive(Debug, Clone)]
+pub struct DenseCausalAttentionVjp<B: BackendTrait> {
+    pub grad_query: BurnTensor<B, 4>,
+    pub grad_value: BurnTensor<B, 4>,
+    pub grad_decay: BurnTensor<B, 1>,
+    /// Derivative for an optional clamped recurrent state. The ordinary fused
+    /// dense-attention operation has no state input and therefore returns
+    /// `None`; recurrent local-factor callers receive the exact state VJP.
+    pub grad_initial_rho: Option<BurnTensor<B, 4>>,
+}
+
+pub fn dense_causal_attention_vjp<B: BackendTrait>(
     grad_output: BurnTensor<B, 4>,
     query: BurnTensor<B, 4>,
     value: BurnTensor<B, 4>,
     decay: BurnTensor<B, 1>,
-) -> (BurnTensor<B, 4>, BurnTensor<B, 4>, BurnTensor<B, 1>)
+) -> DenseCausalAttentionVjp<B>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    dense_causal_attention_vjp_with_initial_rho(grad_output, query, value, decay, None)
+}
+
+/// Plain-backend VJP for dense causal linear attention with a clamped incoming
+/// recurrent state.
+///
+/// The state follows Dragon's update convention: output row `t` reads
+/// `decay^t * rho_0` before adding the current token. Returning the state
+/// derivative keeps this primitive mathematically complete even when a
+/// truncated local factor intentionally detaches that derivative at a TBPTT
+/// boundary.
+pub fn dense_causal_attention_vjp_with_initial_rho<B: BackendTrait>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+) -> DenseCausalAttentionVjp<B>
 where
     B::FloatTensorPrimitive: 'static,
 {
@@ -63,20 +96,55 @@ where
         .reshape([batch, heads, time, time])
         .tril(-1);
     let grad_raw_scores = grad_scores.clone() * decay_matrix;
-    let grad_query = (grad_raw_scores.clone() + grad_raw_scores.swap_dims(2, 3))
+    let mut grad_query = (grad_raw_scores.clone() + grad_raw_scores.swap_dims(2, 3))
         .reshape([batch_heads, time, time])
         .matmul(query_flat)
         .reshape([batch, heads, time, latent]);
 
     let safe_decay = decay.clone().add_scalar(1.0e-12).reshape([1, heads, 1, 1]);
-    let grad_decay = ((grad_scores * gap) * scores)
+    let mut grad_decay = ((grad_scores * gap) * scores)
         .div(safe_decay)
         .sum_dim(0)
         .sum_dim(2)
         .sum_dim(3)
         .reshape([heads]);
 
-    (grad_query, grad_value, grad_decay)
+    let grad_initial_rho = initial_rho.map(|rho| {
+        assert_eq!(
+            rho.shape().dims::<4>(),
+            [batch, heads, latent, value_dim],
+            "dense causal attention initial rho shape mismatch"
+        );
+        let positions = BurnTensor::<B, 1, Int>::arange(0..time as i64, &query.device())
+            .float()
+            .reshape([1, 1, time, 1]);
+        let state_decay = decay
+            .clone()
+            .reshape([1, heads, 1, 1])
+            .repeat_dim(2, time)
+            .powf(positions.clone().repeat_dim(1, heads));
+        let state_query = query.clone() * state_decay.clone();
+        let initial_context = state_query.clone().matmul(rho.clone());
+
+        grad_query =
+            grad_query.clone() + grad_output.clone().matmul(rho.swap_dims(2, 3)) * state_decay;
+        grad_decay = grad_decay.clone()
+            + (grad_output.clone() * initial_context * positions)
+                .div(decay.clone().add_scalar(1.0e-12).reshape([1, heads, 1, 1]))
+                .sum_dim(0)
+                .sum_dim(2)
+                .sum_dim(3)
+                .reshape([heads]);
+
+        state_query.swap_dims(2, 3).matmul(grad_output)
+    });
+
+    DenseCausalAttentionVjp {
+        grad_query,
+        grad_value,
+        grad_decay,
+        grad_initial_rho,
+    }
 }
 
 fn dense_causal_attention_backward_impl<B: BackendTrait>(
@@ -96,17 +164,16 @@ fn dense_causal_attention_backward_impl<B: BackendTrait>(
     let value = BurnTensor::<B, 4>::from_primitive(TensorPrimitive::Float(value));
     let decay = BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(decay));
 
-    let (grad_query, grad_value, grad_decay) =
-        dense_causal_backward_impl(grad_output, query, value, decay);
+    let vjp = dense_causal_attention_vjp(grad_output, query, value, decay);
 
     if let Some(parent) = &ops.parents[0] {
-        grads.register::<B>(parent.id, grad_query.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_query.into_primitive().tensor());
     }
     if let Some(parent) = &ops.parents[1] {
-        grads.register::<B>(parent.id, grad_value.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_value.into_primitive().tensor());
     }
     if let Some(parent) = &ops.parents[2] {
-        grads.register::<B>(parent.id, grad_decay.into_primitive().tensor());
+        grads.register::<B>(parent.id, vjp.grad_decay.into_primitive().tensor());
     }
 }
 
@@ -123,6 +190,23 @@ impl Backward<WgpuCubeBackend, 3> for FusedDenseCausalAttentionBackward<WgpuCube
     }
 }
 
+impl<BT> Backward<WgpuFusionBackend<BT>, 3>
+    for FusedDenseCausalAttentionBackward<WgpuFusionBackend<BT>>
+where
+    BT: BoolElement + 'static,
+{
+    type State = DenseCausalAttentionBackwardState<FusionTensor<FusionCubeRuntime<WgpuRuntime>>>;
+
+    fn backward(
+        self,
+        ops: Ops<Self::State, 3>,
+        grads: &mut Gradients,
+        _checkpointer: &mut Checkpointer,
+    ) {
+        dense_causal_attention_backward_impl::<WgpuFusionBackend<BT>>(ops, grads);
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl Backward<CudaCubeBackend, 3> for FusedDenseCausalAttentionBackward<CudaCubeBackend> {
     type State = DenseCausalAttentionBackwardState<CubeTensor<CudaRuntime>>;
@@ -134,6 +218,85 @@ impl Backward<CudaCubeBackend, 3> for FusedDenseCausalAttentionBackward<CudaCube
         _checkpointer: &mut Checkpointer,
     ) {
         dense_causal_attention_backward_impl::<CudaCubeBackend>(ops, grads);
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<BT> Backward<CudaFusionBackend<BT>, 3>
+    for FusedDenseCausalAttentionBackward<CudaFusionBackend<BT>>
+where
+    BT: BoolElement + 'static,
+{
+    type State = DenseCausalAttentionBackwardState<FusionTensor<FusionCubeRuntime<CudaRuntime>>>;
+
+    fn backward(
+        self,
+        ops: Ops<Self::State, 3>,
+        grads: &mut Gradients,
+        _checkpointer: &mut Checkpointer,
+    ) {
+        dense_causal_attention_backward_impl::<CudaFusionBackend<BT>>(ops, grads);
+    }
+}
+
+pub(super) fn dense_causal_attention_autodiff_fusion_wgpu<BT>(
+    query: WgpuFusionAutodiffTensor<BT>,
+    value: WgpuFusionAutodiffTensor<BT>,
+    decay: WgpuFusionAutodiffTensor<BT>,
+    output: FusionTensor<FusionCubeRuntime<WgpuRuntime>>,
+) -> WgpuFusionAutodiffTensor<BT>
+where
+    BT: BoolElement + 'static,
+{
+    let query_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query.clone());
+    let value_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(value.clone());
+    let decay_inner = <WgpuFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay.clone());
+
+    match FusedDenseCausalAttentionBackward::<WgpuFusionBackend<BT>>(PhantomData)
+        .prepare::<NoCheckpointing>([query.node.clone(), value.node.clone(), decay.node.clone()])
+        .compute_bound()
+        .stateful()
+    {
+        OpsKind::Tracked(prep) => prep.finish(
+            DenseCausalAttentionBackwardState {
+                query: query_inner,
+                value: value_inner,
+                decay: decay_inner,
+            },
+            output,
+        ),
+        OpsKind::UnTracked(prep) => prep.finish(output),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn dense_causal_attention_autodiff_fusion_cuda<BT>(
+    query: CudaFusionAutodiffTensor<BT>,
+    value: CudaFusionAutodiffTensor<BT>,
+    decay: CudaFusionAutodiffTensor<BT>,
+    output: FusionTensor<FusionCubeRuntime<CudaRuntime>>,
+) -> CudaFusionAutodiffTensor<BT>
+where
+    BT: BoolElement + 'static,
+{
+    let query_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(query.clone());
+    let value_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(value.clone());
+    let decay_inner = <CudaFusionAutodiffBackend<BT> as AutodiffBackend>::inner(decay.clone());
+
+    match FusedDenseCausalAttentionBackward::<CudaFusionBackend<BT>>(PhantomData)
+        .prepare::<NoCheckpointing>([query.node.clone(), value.node.clone(), decay.node.clone()])
+        .compute_bound()
+        .stateful()
+    {
+        OpsKind::Tracked(prep) => prep.finish(
+            DenseCausalAttentionBackwardState {
+                query: query_inner,
+                value: value_inner,
+                decay: decay_inner,
+            },
+            output,
+        ),
+        OpsKind::UnTracked(prep) => prep.finish(output),
     }
 }
 

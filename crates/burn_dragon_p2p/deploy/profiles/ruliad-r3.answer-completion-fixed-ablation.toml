@@ -1,0 +1,8 @@
+extends = ["ruliad-r3.adamw-fixed-ablation.toml"]
+
+[training]
+tbptt_persist_across_steps = false
+
+[training.ruliad_supervision]
+mode = "answer_completion"
+mask_high_entropy_spans = true

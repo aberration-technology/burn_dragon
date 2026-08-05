@@ -1,0 +1,9 @@
+extends = ["ruliad-r3.action-policy-dagger-fixed-ablation.toml"]
+
+# Proper verifier-equivalent marginal likelihood over the complete vocabulary.
+# Unlike the candidate-conditional control, this objective also penalizes mass
+# assigned to tokens that cannot denote an action. Balanced rotation applies
+# the exact candidate-permutation symmetry and removes on-policy slot bias.
+[training.ruliad_supervision.proof_policy]
+normalization = "vocabulary_marginal"
+candidate_symmetry = "balanced_rotation"

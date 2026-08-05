@@ -1,0 +1,13 @@
+extends = ["ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml"]
+
+# Mechanistic exposure arm: make the paired target-conditioned objective present in every update
+# from initialization and spend a fixed 16 base + 16 counterfactual rows. This is intentionally
+# not a deployment default; it distinguishes insufficient objective exposure from a broken energy
+# model before any three-seed promotion run.
+[training.ruliad_supervision.proof_policy]
+weight = 1.0
+every_steps = 1
+start_after_steps = 0
+max_rows_per_update = 32
+max_presentation_rows_per_update = 32
+

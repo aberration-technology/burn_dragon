@@ -31,7 +31,33 @@ impl<B: Backend> DragonModel<B> {
         rho_state: Option<Tensor<B, 4>>,
         decay: Option<Tensor<B, 1>>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        recurrent_attention_dense_score_reference(query, value, rho_state, decay)
+        let time = query.shape().dims::<4>()[2];
+        recurrent_attention_dense_score_reference(
+            query,
+            value,
+            rho_state,
+            decay,
+            self.sequence_kernel.dense_score_row_chunk,
+            self.attention.dense_score_decay_cache(time),
+        )
+    }
+
+    pub(super) fn recurrent_attention_dense_score_context_reference(
+        &self,
+        query: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+        rho_state: Option<Tensor<B, 4>>,
+        decay: Option<Tensor<B, 1>>,
+    ) -> Tensor<B, 4> {
+        let time = query.shape().dims::<4>()[2];
+        recurrent_attention_dense_score_context_reference(
+            query,
+            value,
+            rho_state,
+            decay,
+            self.sequence_kernel.dense_score_row_chunk,
+            self.attention.dense_score_decay_cache(time),
+        )
     }
 
     pub(super) fn recurrent_attention_dense_score_final_rho_reference(
@@ -140,6 +166,9 @@ impl<B: Backend> DragonModel<B> {
                                 decay.clone(),
                                 value.shape().dims::<4>()[3],
                             );
+                        if !layer_state.retain_terminal_sequence_state {
+                            return initial_context + fused_context;
+                        }
                         let rho = self.recurrent_attention_dense_score_final_rho_reference(
                             query.clone(),
                             value.clone(),
@@ -149,6 +178,14 @@ impl<B: Backend> DragonModel<B> {
                         self.write_linear_attention_rho_state(layer_state, rho);
                         return initial_context + fused_context;
                     }
+                }
+                if !layer_state.retain_terminal_sequence_state {
+                    return self.recurrent_attention_dense_score_context_reference(
+                        query,
+                        value,
+                        initial_rho,
+                        decay,
+                    );
                 }
                 let (context, rho) = self.recurrent_attention_dense_score_reference(
                     query,

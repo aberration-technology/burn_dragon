@@ -13,8 +13,12 @@ use crate::ruliad::eval::{
     read_completion_records, write_eval_items_jsonl,
 };
 use crate::ruliad::generate::generate_ruliad_corpus;
+use crate::ruliad::runtime::OnlineRuliadCorpus;
 use crate::ruliad::search::{RuliadFrontierSampler, RuliadSamplerCandidate, RuliadSamplerConfig};
-use crate::ruliad::verification::verify_manifest;
+use crate::ruliad::source_selection::ruliad_source_buckets_for_difficulty;
+use crate::ruliad::supervision::RuliadTokenSupervisionConfig;
+use crate::ruliad::verification::{verify_formal_panel, verify_manifest};
+use crate::ruliad::{RuliadAnswerStatus, score_ruliad_item_completion};
 
 #[derive(Debug, Parser)]
 #[command(name = "bd-ruliad")]
@@ -45,6 +49,19 @@ enum Command {
         lean_mode: LeanMode,
         #[arg(long)]
         lean_project: Option<PathBuf>,
+    },
+    /// Replay a deterministic structural-holdout panel in the independent Lean checker.
+    VerifyLeanPanel {
+        #[arg(long, default_value_t = 1337)]
+        seed: u64,
+        #[arg(long, value_delimiter = ',', default_value = "0,1,4,16,64")]
+        difficulty_levels: Vec<usize>,
+        #[arg(long, default_value_t = 8)]
+        samples_per_domain: usize,
+        #[arg(long)]
+        lean_project: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Diagnose {
         #[arg(long)]
@@ -92,6 +109,44 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         candidates: usize,
     },
+    ProbeFrontier {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "0,1,2,4,8,16,32")]
+        levels: Vec<usize>,
+        #[arg(long, default_value_t = 8)]
+        samples_per_bucket: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    AuditSupervision {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "0,1")]
+        levels: Vec<usize>,
+        #[arg(long, default_value_t = 16)]
+        samples_per_bucket: usize,
+        #[arg(long, default_value_t = 512)]
+        block_size: usize,
+        #[arg(long, default_value_t = true)]
+        mask_high_entropy_spans: bool,
+        #[arg(long, default_value_t = false)]
+        balance_trace_answer_mass: bool,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    InspectSamples {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value = "validation")]
+        split: String,
+        #[arg(long, value_delimiter = ',', default_value = "0,1,4")]
+        levels: Vec<usize>,
+        #[arg(long, default_value_t = 1)]
+        samples_per_bucket: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 pub fn main() -> Result<()> {
@@ -119,6 +174,7 @@ pub fn main() -> Result<()> {
                     chunk_token_capacity: 1_048_576,
                     serialization: RuliadSerializationConfig::default(),
                     tokenization: RuliadTokenizationConfig::default(),
+                    formal_generalization: Default::default(),
                     source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
                     families: default_ruliad_families(),
                     proof_tasks: None,
@@ -163,6 +219,28 @@ pub fn main() -> Result<()> {
             if !report.failed.is_empty() {
                 std::process::exit(1);
             }
+        }
+        Command::VerifyLeanPanel {
+            seed,
+            difficulty_levels,
+            samples_per_domain,
+            lean_project,
+            out,
+        } => {
+            let report = verify_formal_panel(
+                seed,
+                &difficulty_levels,
+                samples_per_domain,
+                lean_project.as_deref(),
+            )?;
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out) = out {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&out, format!("{json}\n"))?;
+            }
+            println!("{json}");
         }
         Command::Diagnose {
             manifest,
@@ -266,6 +344,7 @@ pub fn main() -> Result<()> {
                     },
                     difficulty_level: index % 4,
                     params_hash: format!("{index:016x}"),
+                    answer_contract: String::new(),
                     prior: 1.0,
                     cost: 1.0 + (index % 5) as f32,
                     loss_ema: 1.0 + (index % 7) as f32 * 0.5,
@@ -283,6 +362,113 @@ pub fn main() -> Result<()> {
                 .collect::<Vec<_>>();
             let sampler = RuliadFrontierSampler::new(RuliadSamplerConfig::default(), candidates);
             println!("{}", serde_json::to_string_pretty(&sampler.snapshot())?);
+        }
+        Command::ProbeFrontier {
+            config,
+            levels,
+            samples_per_bucket,
+            out,
+        } => {
+            if levels.is_empty() {
+                return Err(anyhow!("probe-frontier requires at least one level"));
+            }
+            let corpus = OnlineRuliadCorpus::load(&config)?;
+            let reports = levels
+                .into_iter()
+                .map(|level| corpus.probe_frontier_feasibility(level, samples_per_bucket))
+                .collect::<Result<Vec<_>>>()?;
+            write_json_report(out, &reports)?;
+        }
+        Command::AuditSupervision {
+            config,
+            levels,
+            samples_per_bucket,
+            block_size,
+            mask_high_entropy_spans,
+            balance_trace_answer_mass,
+            out,
+        } => {
+            if levels.is_empty() {
+                return Err(anyhow!(
+                    "audit-supervision requires at least one difficulty level"
+                ));
+            }
+            let corpus = OnlineRuliadCorpus::load(&config)?;
+            let report = corpus.audit_frontier_supervision(
+                &levels,
+                samples_per_bucket,
+                block_size,
+                RuliadTokenSupervisionConfig {
+                    mask_high_entropy_spans,
+                    balance_trace_answer_mass,
+                    ..RuliadTokenSupervisionConfig::default()
+                },
+            )?;
+            write_json_report(out, &report)?;
+        }
+        Command::InspectSamples {
+            config,
+            split,
+            levels,
+            samples_per_bucket,
+            out,
+        } => {
+            if levels.is_empty() {
+                return Err(anyhow!(
+                    "inspect-samples requires at least one difficulty level"
+                ));
+            }
+            let corpus = OnlineRuliadCorpus::load(&config)?;
+            let splits = match parse_split(&split)? {
+                Some(split) => vec![split],
+                None => vec![
+                    crate::manifest::SampleSplit::Train,
+                    crate::manifest::SampleSplit::Validation,
+                ],
+            };
+            let mut samples = Vec::new();
+            for split in splits {
+                for difficulty_level in levels.iter().copied() {
+                    for bucket in
+                        ruliad_source_buckets_for_difficulty(corpus.config(), difficulty_level)
+                    {
+                        let bucket_label = bucket.label();
+                        for sample_index in 0..samples_per_bucket.max(1) {
+                            let item = corpus.generate_eval_item_for_source_bucket(
+                                split,
+                                0,
+                                sample_index,
+                                &bucket_label,
+                            )?;
+                            let completion = format!(
+                                "{}\n{}",
+                                item.expected_answer,
+                                item.document_close_marker()
+                            );
+                            let score = score_ruliad_item_completion(&item, Some(&completion));
+                            let close_marker = item.document_close_marker();
+                            samples.push(serde_json::json!({
+                                "split": format!("{split:?}").to_ascii_lowercase(),
+                                "bucket_label": &bucket_label,
+                                "difficulty_level": difficulty_level,
+                                "sample_index": sample_index,
+                                "family": &item.family,
+                                "task_kind": &item.task_kind,
+                                "math_domains": &item.math_domains,
+                                "reasoning_modes": &item.reasoning_modes,
+                                "prompt_tokens": corpus.encode_payload_tokens(&item.prompt).len(),
+                                "answer_tokens": corpus.encode_payload_tokens(&completion).len(),
+                                "prompt": &item.prompt,
+                                "expected_answer": &item.expected_answer,
+                                "close_marker": close_marker,
+                                "oracle_status": format!("{:?}", score.status),
+                                "oracle_verified": score.status == RuliadAnswerStatus::VerifierMatch,
+                            }));
+                        }
+                    }
+                }
+            }
+            write_json_report(out, &samples)?;
         }
     }
     Ok(())

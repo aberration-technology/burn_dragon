@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# The structured action completion has one semantic index token and four
+# schema/termination targets. A 4:1 token weight equalizes the total semantic
+# and structural likelihood mass while retaining free-completion grammar.
+[training.ruliad_supervision]
+answer_value_token_weight = 4

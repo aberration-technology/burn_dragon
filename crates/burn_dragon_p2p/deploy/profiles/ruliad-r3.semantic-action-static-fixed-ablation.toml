@@ -1,0 +1,19 @@
+extends = ["ruliad-r3.semantic-action-fixed-ablation.toml"]
+
+# Candidate-conditional behavior cloning over verifier-enumerated semantic proof actions. The
+# bounded row count keeps the auxiliary below one eighth of the base token workload at cadence.
+[training.ruliad_supervision.proof_policy]
+enabled = true
+mode = "static_expert"
+normalization = "candidate_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 0.25
+every_steps = 4
+start_after_steps = 128
+stratified_difficulty_levels = 4
+rollout_steps = 1
+max_rows_per_update = 8
+max_presentation_rows_per_update = 8
+candidates = 4
+max_completion_tokens = 64

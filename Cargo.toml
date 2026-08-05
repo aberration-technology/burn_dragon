@@ -34,7 +34,7 @@ burn-autodiff = { version = "0.21.0", default-features = false }
 burn-collective = "0.21.0"
 burn-communication = "0.21.0"
 burn-cubecl = { version = "0.21.0", default-features = false }
-burn-cuda = { version = "0.21.0", default-features = false }
+burn-cuda = { version = "0.21.0", default-features = false, features = ["fusion"] }
 burn-fusion = { version = "0.21.0", default-features = false }
 burn-ir = "0.21.0"
 burn-ndarray = { version = "0.21.0", default-features = false }
@@ -79,7 +79,7 @@ rand = "0.8"
 rayon = "1.11"
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sha2 = "0.10"
 tempfile = "3"
 wasm-bindgen-cli-support = "0.2"

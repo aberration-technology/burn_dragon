@@ -45,14 +45,20 @@ use burn_dragon_p2p::deployment::{
 use burn_dragon_p2p::experiments::common::PreparedNativePeer;
 use burn_dragon_p2p::native::{
     ManagedRunningNativePeer, assess_native_peer, prepare_climbmix_native_cpu,
-    prepare_nca_native_cpu, spawn_prepared_native_peer,
+    prepare_nca_native_cpu, prepare_ruliad_native_cpu, spawn_prepared_native_peer,
 };
 #[cfg(feature = "cuda")]
-use burn_dragon_p2p::native::{prepare_climbmix_native_cuda, prepare_nca_native_cuda};
+use burn_dragon_p2p::native::{
+    prepare_climbmix_native_cuda, prepare_nca_native_cuda, prepare_ruliad_native_cuda,
+};
 #[cfg(feature = "rocm")]
-use burn_dragon_p2p::native::{prepare_climbmix_native_rocm, prepare_nca_native_rocm};
+use burn_dragon_p2p::native::{
+    prepare_climbmix_native_rocm, prepare_nca_native_rocm, prepare_ruliad_native_rocm,
+};
 #[cfg(feature = "wgpu")]
-use burn_dragon_p2p::native::{prepare_climbmix_native_wgpu, prepare_nca_native_wgpu};
+use burn_dragon_p2p::native::{
+    prepare_climbmix_native_wgpu, prepare_nca_native_wgpu, prepare_ruliad_native_wgpu,
+};
 use burn_dragon_p2p::profile::DragonExperimentProfile;
 use burn_dragon_p2p::profile::build_profile_from_local_config;
 use burn_ndarray::NdArray;
@@ -160,7 +166,8 @@ enum ExperimentKindArg {
 impl ExperimentKindArg {
     fn into_config(self) -> DragonExperimentKind {
         match self {
-            Self::Nca | Self::Ruliad => DragonExperimentKind::NcaPrepretraining,
+            Self::Nca => DragonExperimentKind::NcaPrepretraining,
+            Self::Ruliad => DragonExperimentKind::RuliadPretraining,
             Self::Climbmix => DragonExperimentKind::ClimbMixPretraining,
         }
     }
@@ -202,6 +209,10 @@ macro_rules! with_prepared_native_peer {
                 let $prepared = prepare_nca_native_cpu($config, $auth_bundle)?;
                 $body
             }
+            (DragonExperimentKind::RuliadPretraining, BackendArg::Cpu) => {
+                let $prepared = prepare_ruliad_native_cpu($config, $auth_bundle)?;
+                $body
+            }
             (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cpu) => {
                 let $prepared = prepare_climbmix_native_cpu($config, $auth_bundle)?;
                 $body
@@ -209,6 +220,11 @@ macro_rules! with_prepared_native_peer {
             #[cfg(feature = "wgpu")]
             (DragonExperimentKind::NcaPrepretraining, BackendArg::Wgpu) => {
                 let $prepared = prepare_nca_native_wgpu($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "wgpu")]
+            (DragonExperimentKind::RuliadPretraining, BackendArg::Wgpu) => {
+                let $prepared = prepare_ruliad_native_wgpu($config, $auth_bundle)?;
                 $body
             }
             #[cfg(feature = "wgpu")]
@@ -222,6 +238,11 @@ macro_rules! with_prepared_native_peer {
                 $body
             }
             #[cfg(feature = "cuda")]
+            (DragonExperimentKind::RuliadPretraining, BackendArg::Cuda) => {
+                let $prepared = prepare_ruliad_native_cuda($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "cuda")]
             (DragonExperimentKind::ClimbMixPretraining, BackendArg::Cuda) => {
                 let $prepared = prepare_climbmix_native_cuda($config, $auth_bundle)?;
                 $body
@@ -229,6 +250,11 @@ macro_rules! with_prepared_native_peer {
             #[cfg(feature = "rocm")]
             (DragonExperimentKind::NcaPrepretraining, BackendArg::Rocm) => {
                 let $prepared = prepare_nca_native_rocm($config, $auth_bundle)?;
+                $body
+            }
+            #[cfg(feature = "rocm")]
+            (DragonExperimentKind::RuliadPretraining, BackendArg::Rocm) => {
+                let $prepared = prepare_ruliad_native_rocm($config, $auth_bundle)?;
                 $body
             }
             #[cfg(feature = "rocm")]
@@ -4474,6 +4500,8 @@ where
         experiment_entry.current_revision_id,
     );
     let mut served_head_id = None;
+    let mut served_head = None;
+    let mut evaluated_head_id = None;
 
     let status_interval = Duration::from_secs(status_interval_secs.max(1));
     let validation_interval = Duration::from_millis(validation_interval_millis.max(25));
@@ -4498,10 +4526,14 @@ where
                 initialize_head_on_start,
                 restore_head_on_start,
                 &mut served_head_id,
-                HeadProviderSyncMode::DirectoryCurrent,
+                if diffusion_promotion {
+                    HeadProviderSyncMode::LatestPromoted
+                } else {
+                    HeadProviderSyncMode::DirectoryCurrent
+                },
                 "validator",
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(head)) => served_head = Some(head),
                 Ok(None) => {
                     if head_sync_attempts == 1 || head_sync_attempts.is_multiple_of(12) {
                         let snapshot = running.snapshot();
@@ -4527,13 +4559,17 @@ where
         let snapshot = running.snapshot();
         if status_interval_secs > 0 && last_status.elapsed() >= status_interval {
             eprintln!(
-                "validator-status status={:?} node_state={:?} connected_peers={} served_head={} last_error={}",
+                "validator-status status={:?} node_state={:?} connected_peers={} served_head={} evaluated_head={} last_error={}",
                 snapshot.status,
                 snapshot.node_state,
                 snapshot.connected_peers,
                 served_head_id
                     .as_ref()
                     .map(|head_id| head_id.as_str())
+                    .unwrap_or("-"),
+                evaluated_head_id
+                    .as_ref()
+                    .map(|head_id: &burn_p2p::HeadId| head_id.as_str())
                     .unwrap_or("-"),
                 operator_visible_last_error(snapshot.last_error.as_deref())
                     .as_deref()
@@ -4560,11 +4596,45 @@ where
         }
 
         if last_validation.elapsed() >= validation_interval {
-            if served_head_id.is_none() {
+            if served_head.is_none() {
                 last_validation = Instant::now();
                 thread::sleep(STATUS_POLL_INTERVAL);
                 continue;
-            } else if diffusion_promotion {
+            }
+
+            if diffusion_promotion
+                && let Some(head) = served_head.as_ref()
+                && evaluated_head_id.as_ref() != Some(&head.head_id)
+            {
+                let started = Instant::now();
+                match running.evaluate_and_record_materialized_head(
+                    &experiment,
+                    head,
+                    burn_p2p::EvalSplit::Validation,
+                ) {
+                    Ok(evaluation) => {
+                        eprintln!(
+                            "validator-head-evaluated head_id={} revision={} global_step={} samples={} metrics={} elapsed_ms={}",
+                            head.head_id.as_str(),
+                            head.revision_id.as_str(),
+                            head.global_step,
+                            evaluation.report.sample_count,
+                            evaluation.report.metric_values.len(),
+                            started.elapsed().as_millis(),
+                        );
+                        evaluated_head_id = Some(head.head_id.clone());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "validator-head-evaluation-error head_id={} revision={} error={error}",
+                            head.head_id.as_str(),
+                            head.revision_id.as_str(),
+                        );
+                    }
+                }
+            }
+
+            if diffusion_promotion {
                 if let Err(error) = running.advance_diffusion_steady_state(&experiment, None, None)
                 {
                     eprintln!("validator-diffusion-pass-error: {error}");
@@ -4582,6 +4652,28 @@ where
                     Err(error) => {
                         eprintln!("validator-validation-pass-error: {error}");
                     }
+                }
+                let validation_snapshot = running.snapshot();
+                if let Some(local_peer_id) = validation_snapshot.local_peer_id.as_ref()
+                    && let Some(binding) = validation_snapshot
+                        .control_plane
+                        .reduction_certificate_announcements
+                        .iter()
+                        .filter(|announcement| {
+                            announcement.certificate.promoter_peer_id == *local_peer_id
+                        })
+                        .max_by_key(|announcement| announcement.certificate.issued_at)
+                        .and_then(|announcement| announcement.certificate.evaluation.as_ref())
+                    && evaluated_head_id.as_ref() != Some(&binding.head_id)
+                {
+                    eprintln!(
+                        "validator-head-attested head_id={} artifact={} eval_protocol={} eval_report={}",
+                        binding.head_id.as_str(),
+                        binding.artifact_id.as_str(),
+                        binding.eval_protocol_id.as_str(),
+                        binding.eval_report_id.as_str(),
+                    );
+                    evaluated_head_id = Some(binding.head_id.clone());
                 }
             }
             last_validation = Instant::now();

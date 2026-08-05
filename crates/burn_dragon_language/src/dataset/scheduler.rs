@@ -31,6 +31,21 @@ pub struct RuliadPolicyBatch {
     pub stop_token_id: Option<i64>,
 }
 
+/// Concrete source-selected windows and supervision aligned to their shifted targets.
+#[derive(Clone, Debug)]
+pub struct SourceSelectedBatch {
+    pub windows: Vec<Vec<u32>>,
+    pub loss_masks: Option<Vec<Vec<i64>>>,
+}
+
+/// One source-selected TBPTT chunk and its logical-document boundary state.
+#[derive(Clone, Debug)]
+pub struct SourceSelectedStreamBatch {
+    pub windows: Vec<Vec<u32>>,
+    pub loss_masks: Option<Vec<Vec<i64>>>,
+    pub document_complete: bool,
+}
+
 /// Abstraction over text corpora that can be converted into DragonModel-compatible batches.
 pub trait TokenSequenceDataset: Send + Sync {
     /// Return a shared tokenizer handle (cloned per call).
@@ -104,7 +119,7 @@ pub trait TokenSequenceDataset: Send + Sync {
         absolute_step: usize,
         batch_size: usize,
         block_size: usize,
-    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+    ) -> Option<SourceSelectedBatch> {
         let windows = self.source_selected_token_windows(
             split,
             epoch_index,
@@ -122,7 +137,10 @@ pub trait TokenSequenceDataset: Send + Sync {
                 })
                 .collect::<Vec<_>>()
         });
-        Some((windows, masks))
+        Some(SourceSelectedBatch {
+            windows,
+            loss_masks: masks,
+        })
     }
 
     /// Return ruliad prompt/eval metadata aligned to a live source-selected step, if available.
@@ -134,6 +152,7 @@ pub trait TokenSequenceDataset: Send + Sync {
         _epoch_index: usize,
         _absolute_step: usize,
         _batch_size: usize,
+        _stratified_difficulty_levels: usize,
     ) -> Option<RuliadPolicyBatch> {
         None
     }
@@ -165,7 +184,7 @@ pub trait TokenSequenceDataset: Send + Sync {
         chunk_index_in_document: usize,
         batch_size: usize,
         block_size: usize,
-    ) -> Option<(Vec<Vec<u32>>, Option<Vec<Vec<i64>>>)> {
+    ) -> Option<SourceSelectedStreamBatch> {
         let windows = self.source_selected_stream_token_windows(
             split,
             epoch_index,
@@ -184,7 +203,11 @@ pub trait TokenSequenceDataset: Send + Sync {
                 })
                 .collect::<Vec<_>>()
         });
-        Some((windows, masks))
+        Some(SourceSelectedStreamBatch {
+            windows,
+            loss_masks: masks,
+            document_complete: false,
+        })
     }
 
     /// Feed aggregate loss telemetry for a previously selected source bucket.
@@ -285,12 +308,13 @@ pub fn sample_batch<B: Backend, T: TokenSequenceDataset + ?Sized>(
     )
 }
 
-#[cfg(feature = "train")]
 #[allow(clippy::too_many_arguments)]
 fn fill_sampled_logical_document_row<T: TokenSequenceDataset + ?Sized>(
     dataset: &T,
     split: DatasetSplit,
     epoch_index: usize,
+    absolute_step: usize,
+    seed: u64,
     offset: usize,
     document_span: usize,
     num_documents: usize,
@@ -302,7 +326,7 @@ fn fill_sampled_logical_document_row<T: TokenSequenceDataset + ?Sized>(
     target_row: &mut [i64],
     mask_row: Option<&mut [i64]>,
 ) {
-    let mut rng = thread_rng();
+    let mut rng = deterministic_row_rng(seed, split, epoch_index, absolute_step, batch_idx);
     let doc_index = source_selected_documents
         .and_then(|indices| indices.get(batch_idx))
         .copied()
@@ -326,12 +350,14 @@ fn fill_sampled_logical_document_row<T: TokenSequenceDataset + ?Sized>(
     );
 }
 
-#[cfg(feature = "train")]
 #[allow(clippy::too_many_arguments)]
 fn fill_sampled_flat_row<T: TokenSequenceDataset + ?Sized>(
     dataset: &T,
     split: DatasetSplit,
     epoch_index: usize,
+    absolute_step: usize,
+    seed: u64,
+    batch_idx: usize,
     offset: usize,
     span: usize,
     block_size: usize,
@@ -339,7 +365,7 @@ fn fill_sampled_flat_row<T: TokenSequenceDataset + ?Sized>(
     target_row: &mut [i64],
     mask_row: Option<&mut [i64]>,
 ) {
-    let mut rng = thread_rng();
+    let mut rng = deterministic_row_rng(seed, split, epoch_index, absolute_step, batch_idx);
     let max_start = span.saturating_sub(block_size + 1);
     let start_offset = if max_start == 0 {
         0
@@ -354,7 +380,6 @@ fn fill_sampled_flat_row<T: TokenSequenceDataset + ?Sized>(
     );
 }
 
-#[cfg(feature = "train")]
 fn fill_rows_from_window<T: TokenSequenceDataset + ?Sized>(
     dataset: &T,
     window: &[u32],
@@ -372,37 +397,101 @@ fn fill_rows_from_window<T: TokenSequenceDataset + ?Sized>(
     }
 }
 
+fn deterministic_row_rng(
+    seed: u64,
+    split: DatasetSplit,
+    epoch_index: usize,
+    absolute_step: usize,
+    batch_idx: usize,
+) -> StdRng {
+    let split_tag = match split {
+        DatasetSplit::Train => 0xA076_1D64_78BD_642F,
+        DatasetSplit::Val => 0xE703_7ED1_A0B4_28DB,
+    };
+    let mut mixed = seed ^ split_tag;
+    for value in [epoch_index, absolute_step, batch_idx] {
+        mixed = mixed
+            .wrapping_add(value as u64)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mixed ^= mixed >> 31;
+    }
+    StdRng::seed_from_u64(mixed)
+}
+
 /// Sample a random batch with an explicit batch/block shape from any dataset implementing
 /// [`TokenSequenceDataset`].
-fn sample_host_batch_with_shape<T>(
-    dataset: &T,
+#[derive(Clone, Copy, Debug)]
+struct HostBatchRequest {
     split: DatasetSplit,
     batch_size: usize,
     block_size: usize,
     epoch_index: usize,
     absolute_step: usize,
+    seed: u64,
+    source_selection_enabled: bool,
     include_ruliad_policy_batch: bool,
-) -> HostSequenceBatch
+    ruliad_policy_stratified_difficulty_levels: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuliadPolicyBatchSchedule {
+    always: bool,
+    cadences: crate::config::RuliadPolicyBatchCadences,
+}
+
+impl RuliadPolicyBatchSchedule {
+    fn always() -> Self {
+        Self {
+            always: true,
+            ..Self::default()
+        }
+    }
+
+    fn training(supervision: crate::config::RuliadSupervisionConfig) -> Self {
+        Self {
+            always: false,
+            cadences: supervision.policy_batch_cadences(),
+        }
+    }
+
+    fn includes(self, absolute_step: usize) -> bool {
+        self.always || self.cadences.includes(absolute_step)
+    }
+}
+
+fn sample_host_batch_with_shape<T>(dataset: &T, request: HostBatchRequest) -> HostSequenceBatch
 where
     T: TokenSequenceDataset + ?Sized,
 {
+    let HostBatchRequest {
+        split,
+        batch_size,
+        block_size,
+        epoch_index,
+        absolute_step,
+        seed,
+        source_selection_enabled,
+        include_ruliad_policy_batch,
+        ruliad_policy_stratified_difficulty_levels,
+    } = request;
     let prof_enabled = crate::train::profile::enabled();
     let cpu_start = prof_enabled.then(Instant::now);
     let (offset, span) = dataset.split_offset_and_span(split);
 
-    #[cfg(not(feature = "train"))]
-    let mut rng = thread_rng();
     let mut inputs = vec![0i64; batch_size * block_size];
     let mut targets = vec![0i64; batch_size * block_size];
     let mut loss_mask = dataset
         .uses_target_loss_mask()
         .then(|| vec![0i64; batch_size * block_size]);
-    #[cfg(not(feature = "train"))]
-    let mut sample = vec![0u32; block_size + 1];
     let mut ruliad_policy_batch = None;
 
-    if let Some((source_windows, source_loss_masks)) = dataset
-        .source_selected_token_windows_with_loss_masks(
+    if source_selection_enabled
+        && let Some(SourceSelectedBatch {
+            windows: source_windows,
+            loss_masks: source_loss_masks,
+        }) = dataset.source_selected_token_windows_with_loss_masks(
             split,
             epoch_index,
             absolute_step,
@@ -447,8 +536,16 @@ where
     } else if let Some(logical_document_tokens) = dataset.preferred_logical_document_tokens(split) {
         let document_span = logical_document_tokens.saturating_add(1);
         let num_documents = (span / document_span).max(1);
-        let source_selected_documents =
-            dataset.source_selected_document_indices(split, epoch_index, absolute_step, batch_size);
+        let source_selected_documents = source_selection_enabled
+            .then(|| {
+                dataset.source_selected_document_indices(
+                    split,
+                    epoch_index,
+                    absolute_step,
+                    batch_size,
+                )
+            })
+            .flatten();
         let max_start_in_document = logical_document_tokens
             .saturating_sub(block_size)
             .min(document_span.saturating_sub(block_size + 1));
@@ -465,6 +562,8 @@ where
                             dataset,
                             split,
                             epoch_index,
+                            absolute_step,
+                            seed,
                             offset,
                             document_span,
                             num_documents,
@@ -487,6 +586,8 @@ where
                             dataset,
                             split,
                             epoch_index,
+                            absolute_step,
+                            seed,
                             offset,
                             document_span,
                             num_documents,
@@ -503,6 +604,8 @@ where
         }
         #[cfg(not(feature = "train"))]
         for batch_idx in 0..batch_size {
+            let mut rng = deterministic_row_rng(seed, split, epoch_index, absolute_step, batch_idx);
+            let mut sample = vec![0u32; block_size + 1];
             let doc_index = source_selected_documents
                 .as_ref()
                 .and_then(|indices| indices.get(batch_idx))
@@ -540,11 +643,15 @@ where
                     .par_chunks_mut(block_size)
                     .zip(targets.par_chunks_mut(block_size))
                     .zip(mask.par_chunks_mut(block_size))
-                    .for_each(|((input_row, target_row), mask_row)| {
+                    .enumerate()
+                    .for_each(|(batch_idx, ((input_row, target_row), mask_row))| {
                         fill_sampled_flat_row(
                             dataset,
                             split,
                             epoch_index,
+                            absolute_step,
+                            seed,
+                            batch_idx,
                             offset,
                             span,
                             block_size,
@@ -557,11 +664,15 @@ where
                 inputs
                     .par_chunks_mut(block_size)
                     .zip(targets.par_chunks_mut(block_size))
-                    .for_each(|(input_row, target_row)| {
+                    .enumerate()
+                    .for_each(|(batch_idx, (input_row, target_row))| {
                         fill_sampled_flat_row(
                             dataset,
                             split,
                             epoch_index,
+                            absolute_step,
+                            seed,
+                            batch_idx,
                             offset,
                             span,
                             block_size,
@@ -574,6 +685,8 @@ where
         }
         #[cfg(not(feature = "train"))]
         for batch_idx in 0..batch_size {
+            let mut rng = deterministic_row_rng(seed, split, epoch_index, absolute_step, batch_idx);
+            let mut sample = vec![0u32; block_size + 1];
             let max_start = span.saturating_sub(block_size + 1);
             let start_offset = if max_start == 0 {
                 0
@@ -595,9 +708,15 @@ where
         }
     }
 
-    if include_ruliad_policy_batch && ruliad_policy_batch.is_none() {
+    if source_selection_enabled && include_ruliad_policy_batch && ruliad_policy_batch.is_none() {
         ruliad_policy_batch = dataset
-            .source_selected_ruliad_policy_batch(split, epoch_index, absolute_step, batch_size)
+            .source_selected_ruliad_policy_batch(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                ruliad_policy_stratified_difficulty_levels,
+            )
             .map(Arc::new);
     }
 
@@ -622,14 +741,22 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
     epoch_index: usize,
     device: &B::Device,
 ) -> SequenceBatch<B> {
+    // One-off callers retain the public random-sampling contract. Training and
+    // validation loaders pass their configured seeds through their iterators.
+    let seed = thread_rng().next_u64();
     let host = sample_host_batch_with_shape(
         dataset,
-        split,
-        batch_size,
-        block_size,
-        epoch_index,
-        0,
-        false,
+        HostBatchRequest {
+            split,
+            batch_size,
+            block_size,
+            epoch_index,
+            absolute_step: 0,
+            seed,
+            source_selection_enabled: true,
+            include_ruliad_policy_batch: false,
+            ruliad_policy_stratified_difficulty_levels: 0,
+        },
     );
     if crate::train::profile::enabled() {
         crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);
@@ -682,11 +809,15 @@ impl RandomPrefetch {
         total_steps: Option<usize>,
         depth: usize,
         workers: usize,
-        include_ruliad_policy_batch: bool,
+        seed: u64,
+        source_selection_enabled: bool,
+        ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule,
+        ruliad_policy_stratified_difficulty_levels: usize,
     ) -> Self {
         let worker_count = workers.max(1);
         let current_epoch = absolute_step_start / steps_per_epoch.max(1);
-        let uses_live_source_selection = dataset.uses_live_source_selection();
+        let uses_live_source_selection =
+            source_selection_enabled && dataset.uses_live_source_selection();
         if !uses_live_source_selection {
             dataset.prepare_epoch(split, current_epoch);
             dataset.prefetch_epoch(split, current_epoch.saturating_add(1));
@@ -714,12 +845,18 @@ impl RandomPrefetch {
                     }
                     let batch = sample_host_batch_with_shape(
                         dataset.as_ref(),
-                        split,
-                        batch_size,
-                        block_size,
-                        epoch_index,
-                        task_index,
-                        include_ruliad_policy_batch,
+                        HostBatchRequest {
+                            split,
+                            batch_size,
+                            block_size,
+                            epoch_index,
+                            absolute_step: task_index,
+                            seed,
+                            source_selection_enabled,
+                            include_ruliad_policy_batch: ruliad_policy_batch_schedule
+                                .includes(task_index),
+                            ruliad_policy_stratified_difficulty_levels,
+                        },
                     );
                     if sender.send((task_index, batch)).is_err() {
                         return;
@@ -926,9 +1063,11 @@ pub struct RandomDataLoader<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
-    include_ruliad_policy_batch: bool,
+    ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule,
+    ruliad_policy_stratified_difficulty_levels: usize,
     prefetch: Arc<Mutex<Option<RandomPrefetch>>>,
     seed: u64,
+    source_selection_enabled: bool,
 }
 
 pub struct StreamingDataLoader<B: Backend> {
@@ -941,9 +1080,11 @@ pub struct StreamingDataLoader<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
-    include_ruliad_policy_batch: bool,
+    ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule,
+    ruliad_policy_stratified_difficulty_levels: usize,
     logical_document_tokens: usize,
     seed: u64,
+    source_selection_enabled: bool,
 }
 
 impl<B: Backend> Clone for RandomDataLoader<B> {
@@ -958,9 +1099,12 @@ impl<B: Backend> Clone for RandomDataLoader<B> {
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             prefetch: Arc::clone(&self.prefetch),
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         }
     }
 }
@@ -977,9 +1121,12 @@ impl<B: Backend> Clone for StreamingDataLoader<B> {
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         }
     }
 }
@@ -1012,10 +1159,24 @@ impl<B: Backend> RandomDataLoader<B> {
             total_steps,
             consumed_steps,
             summary_event_token_ids: None,
-            include_ruliad_policy_batch: false,
+            ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule::default(),
+            ruliad_policy_stratified_difficulty_levels: 0,
             prefetch: Arc::new(Mutex::new(None)),
             seed: 0,
+            source_selection_enabled: true,
         }
+    }
+
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
+    }
+
+    pub fn with_source_selection_enabled(mut self, enabled: bool) -> Self {
+        self.source_selection_enabled = enabled;
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
     }
 
     pub fn with_summary_event_token_ids(
@@ -1033,7 +1194,30 @@ impl<B: Backend> RandomDataLoader<B> {
     }
 
     pub fn with_ruliad_policy_batch(mut self, enabled: bool) -> Self {
-        self.include_ruliad_policy_batch = enabled;
+        self.ruliad_policy_batch_schedule = if enabled {
+            RuliadPolicyBatchSchedule::always()
+        } else {
+            RuliadPolicyBatchSchedule::default()
+        };
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
+    }
+
+    pub fn with_ruliad_policy_supervision(
+        mut self,
+        supervision: crate::config::RuliadSupervisionConfig,
+    ) -> Self {
+        self.ruliad_policy_batch_schedule = if supervision.needs_ruliad_policy_batch() {
+            RuliadPolicyBatchSchedule::training(supervision)
+        } else {
+            RuliadPolicyBatchSchedule::default()
+        };
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
+    }
+
+    pub fn with_ruliad_policy_stratified_difficulty_levels(mut self, levels: usize) -> Self {
+        self.ruliad_policy_stratified_difficulty_levels = levels;
         self.prefetch = Arc::new(Mutex::new(None));
         self
     }
@@ -1130,10 +1314,17 @@ impl<B: Backend> StreamingDataLoader<B> {
             total_steps,
             consumed_steps,
             summary_event_token_ids: None,
-            include_ruliad_policy_batch: false,
+            ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule::default(),
+            ruliad_policy_stratified_difficulty_levels: 0,
             logical_document_tokens,
             seed,
+            source_selection_enabled: true,
         }
+    }
+
+    pub fn with_source_selection_enabled(mut self, enabled: bool) -> Self {
+        self.source_selection_enabled = enabled;
+        self
     }
 
     pub fn with_summary_event_token_ids(
@@ -1150,7 +1341,28 @@ impl<B: Backend> StreamingDataLoader<B> {
     }
 
     pub fn with_ruliad_policy_batch(mut self, enabled: bool) -> Self {
-        self.include_ruliad_policy_batch = enabled;
+        self.ruliad_policy_batch_schedule = if enabled {
+            RuliadPolicyBatchSchedule::always()
+        } else {
+            RuliadPolicyBatchSchedule::default()
+        };
+        self
+    }
+
+    pub fn with_ruliad_policy_supervision(
+        mut self,
+        supervision: crate::config::RuliadSupervisionConfig,
+    ) -> Self {
+        self.ruliad_policy_batch_schedule = if supervision.needs_ruliad_policy_batch() {
+            RuliadPolicyBatchSchedule::training(supervision)
+        } else {
+            RuliadPolicyBatchSchedule::default()
+        };
+        self
+    }
+
+    pub fn with_ruliad_policy_stratified_difficulty_levels(mut self, levels: usize) -> Self {
+        self.ruliad_policy_stratified_difficulty_levels = levels;
         self
     }
 
@@ -1186,7 +1398,8 @@ where
             .as_ref()
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or_default();
-        let uses_live_source_selection = self.dataset.uses_live_source_selection();
+        let uses_live_source_selection =
+            self.source_selection_enabled && self.dataset.uses_live_source_selection();
         let prefetch_depth = if uses_live_source_selection {
             live_source_selection_prefetch_depth()
         } else {
@@ -1212,7 +1425,10 @@ where
                     self.total_steps,
                     prefetch_depth,
                     prefetch_workers,
-                    self.include_ruliad_policy_batch,
+                    self.seed,
+                    self.source_selection_enabled,
+                    self.ruliad_policy_batch_schedule,
+                    self.ruliad_policy_stratified_difficulty_levels,
                 ));
             } else if let Some(prefetch) = slot.as_mut() {
                 prefetch.seek_to(absolute_step_start);
@@ -1230,7 +1446,11 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.clone(),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
+            seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
             epoch_index: self
                 .consumed_steps
                 .as_ref()
@@ -1255,9 +1475,12 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             prefetch: Arc::clone(&self.prefetch),
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         })
     }
 
@@ -1278,9 +1501,12 @@ where
             total_steps,
             consumed_steps,
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             prefetch: Arc::new(Mutex::new(None)),
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         })
     }
 }
@@ -1296,7 +1522,8 @@ struct StreamingIterator<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
-    include_ruliad_policy_batch: bool,
+    ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule,
+    ruliad_policy_stratified_difficulty_levels: usize,
     steps_per_epoch: usize,
     logical_document_tokens: usize,
     chunks_per_document: usize,
@@ -1306,6 +1533,7 @@ struct StreamingIterator<B: Backend> {
     document_start: usize,
     document_stride: usize,
     epoch_index: usize,
+    source_selection_enabled: bool,
 }
 
 impl<B: Backend> Iterator for StreamingIterator<B> {
@@ -1347,17 +1575,24 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let document_span = self.logical_document_tokens + 1;
         let reset_stream_state = self.chunk_index_in_document == 0;
 
-        if let Some((source_windows, source_loss_masks)) = self
-            .dataset
-            .source_selected_stream_token_windows_with_loss_masks(
-                self.split,
-                self.epoch_index,
-                absolute_step,
-                self.chunk_index_in_document,
-                batch_size,
-                block_size,
-            )
+        let mut source_document_complete = None;
+        if self.source_selection_enabled
+            && let Some(SourceSelectedStreamBatch {
+                windows: source_windows,
+                loss_masks: source_loss_masks,
+                document_complete,
+            }) = self
+                .dataset
+                .source_selected_stream_token_windows_with_loss_masks(
+                    self.split,
+                    self.epoch_index,
+                    absolute_step,
+                    self.chunk_index_in_document,
+                    batch_size,
+                    block_size,
+                )
         {
+            source_document_complete = Some(document_complete);
             assert_eq!(
                 source_windows.len(),
                 batch_size,
@@ -1508,7 +1743,9 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         if prof_enabled {
             crate::train::profile::record_dataloader_foreground_wait(cpu_ns);
         }
-        let ruliad_policy_batch = if self.include_ruliad_policy_batch {
+        let ruliad_policy_batch = if self.source_selection_enabled
+            && self.ruliad_policy_batch_schedule.includes(absolute_step)
+        {
             let selection_step =
                 absolute_step.saturating_sub(self.chunk_index_in_document.min(absolute_step));
             self.dataset
@@ -1517,6 +1754,7 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
                     self.epoch_index,
                     selection_step,
                     batch_size,
+                    self.ruliad_policy_stratified_difficulty_levels,
                 )
                 .map(Arc::new)
         } else {
@@ -1559,7 +1797,9 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         }
 
         self.chunk_index_in_document += 1;
-        if self.chunk_index_in_document >= self.chunks_per_document {
+        if source_document_complete
+            .unwrap_or(self.chunk_index_in_document >= self.chunks_per_document)
+        {
             self.chunk_index_in_document = 0;
             self.next_document_group =
                 (self.next_document_group + batch_size) % self.num_documents.max(1);
@@ -1614,7 +1854,12 @@ where
         let step_in_epoch = consumed % self.steps_per_epoch.max(1);
         let (document_start, document_stride) =
             resolve_stream_document_permutation(self.seed, epoch_index, num_documents);
-        let chunk_index_in_document = step_in_epoch % chunks_per_document;
+        let chunk_index_in_document =
+            if self.source_selection_enabled && self.dataset.uses_live_source_selection() {
+                0
+            } else {
+                step_in_epoch % chunks_per_document
+            };
         let next_document_group = step_in_epoch
             .checked_div(chunks_per_document)
             .unwrap_or_default()
@@ -1632,7 +1877,9 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.clone(),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             steps_per_epoch: self.steps_per_epoch,
             logical_document_tokens,
             chunks_per_document,
@@ -1642,6 +1889,7 @@ where
             document_start,
             document_stride,
             epoch_index,
+            source_selection_enabled: self.source_selection_enabled,
         })
     }
 
@@ -1660,9 +1908,12 @@ where
             total_steps: self.total_steps,
             consumed_steps: self.consumed_steps.as_ref().map(Arc::clone),
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         })
     }
 
@@ -1683,9 +1934,12 @@ where
             total_steps,
             consumed_steps,
             summary_event_token_ids: self.summary_event_token_ids.clone(),
-            include_ruliad_policy_batch: self.include_ruliad_policy_batch,
+            ruliad_policy_batch_schedule: self.ruliad_policy_batch_schedule,
+            ruliad_policy_stratified_difficulty_levels: self
+                .ruliad_policy_stratified_difficulty_levels,
             logical_document_tokens: self.logical_document_tokens,
             seed: self.seed,
+            source_selection_enabled: self.source_selection_enabled,
         })
     }
 }
@@ -1751,7 +2005,7 @@ mod streaming_tests {
                 return false;
             }
             for t in 0..mask.len() {
-                mask[t] = i64::from(window[t + 1] % 2 == 0);
+                mask[t] = i64::from(window[t + 1].is_multiple_of(2));
             }
             true
         }
@@ -1925,12 +2179,17 @@ mod streaming_tests {
         for absolute_step in 0..16 {
             let host = sample_host_batch_with_shape(
                 &dataset,
-                DatasetSplit::Train,
-                dataset.batch_size,
-                dataset.block_size,
-                0,
-                absolute_step,
-                false,
+                HostBatchRequest {
+                    split: DatasetSplit::Train,
+                    batch_size: dataset.batch_size,
+                    block_size: dataset.block_size,
+                    epoch_index: 0,
+                    absolute_step,
+                    seed: 1337,
+                    source_selection_enabled: true,
+                    include_ruliad_policy_batch: false,
+                    ruliad_policy_stratified_difficulty_levels: 0,
+                },
             );
             for row in 0..dataset.batch_size {
                 let input_row =
@@ -2068,7 +2327,10 @@ struct RandomIterator<B: Backend> {
     total_steps: Option<usize>,
     consumed_steps: Option<Arc<AtomicUsize>>,
     summary_event_token_ids: Option<Vec<u32>>,
-    include_ruliad_policy_batch: bool,
+    ruliad_policy_batch_schedule: RuliadPolicyBatchSchedule,
+    ruliad_policy_stratified_difficulty_levels: usize,
+    seed: u64,
+    source_selection_enabled: bool,
     epoch_index: usize,
     prefetch: Option<Arc<Mutex<Option<RandomPrefetch>>>>,
 }
@@ -2100,12 +2362,20 @@ impl<B: Backend> Iterator for RandomIterator<B> {
                 .unwrap_or(self.step);
             let host = sample_host_batch_with_shape(
                 &*self.dataset,
-                self.split,
-                self.batch_size,
-                self.block_size,
-                self.epoch_index,
-                absolute_step,
-                self.include_ruliad_policy_batch,
+                HostBatchRequest {
+                    split: self.split,
+                    batch_size: self.batch_size,
+                    block_size: self.block_size,
+                    epoch_index: self.epoch_index,
+                    absolute_step,
+                    seed: self.seed,
+                    source_selection_enabled: self.source_selection_enabled,
+                    include_ruliad_policy_batch: self
+                        .ruliad_policy_batch_schedule
+                        .includes(absolute_step),
+                    ruliad_policy_stratified_difficulty_levels: self
+                        .ruliad_policy_stratified_difficulty_levels,
+                },
             );
             if prof_enabled {
                 crate::train::profile::record_dataloader_foreground_wait(host.dataloader_cpu_ns);
@@ -2253,12 +2523,41 @@ mod random_loader_tests {
             Some(vec![0; batch_size])
         }
 
+        fn source_selected_stream_token_windows(
+            &self,
+            _split: DatasetSplit,
+            _epoch_index: usize,
+            absolute_step: usize,
+            _chunk_index_in_document: usize,
+            batch_size: usize,
+            block_size: usize,
+        ) -> Option<Vec<Vec<u32>>> {
+            self.selected_steps
+                .lock()
+                .expect("selected steps lock")
+                .push(absolute_step);
+            Some(
+                (0..batch_size)
+                    .map(|row| {
+                        (0..=block_size)
+                            .map(|column| {
+                                300u32
+                                    .saturating_add(absolute_step as u32)
+                                    .saturating_add((row * (block_size + 1) + column) as u32)
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        }
+
         fn source_selected_ruliad_policy_batch(
             &self,
             _split: DatasetSplit,
             _epoch_index: usize,
             absolute_step: usize,
             batch_size: usize,
+            _stratified_difficulty_levels: usize,
         ) -> Option<RuliadPolicyBatch> {
             let policy_steps = self.policy_steps.as_ref()?;
             policy_steps
@@ -2377,6 +2676,129 @@ mod random_loader_tests {
     }
 
     #[test]
+    fn fixed_holdout_sampling_is_seeded_and_bypasses_live_source_selection() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 4,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::clone(&selected_steps),
+            policy_steps: None,
+        });
+
+        let sample = |seed| {
+            RandomDataLoader::<TestBackend>::new(
+                Arc::clone(&dataset),
+                DatasetSplit::Val,
+                &device,
+                2,
+                None,
+            )
+            .with_seed(seed)
+            .with_source_selection_enabled(false)
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .inputs
+                    .to_data()
+                    .convert::<i64>()
+                    .into_vec::<i64>()
+                    .expect("fixed holdout tokens")
+            })
+            .collect::<Vec<_>>()
+        };
+
+        let first = sample(41);
+        let repeated = sample(41);
+        let different_seed = sample(42);
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_seed);
+        assert!(
+            selected_steps
+                .lock()
+                .expect("selected steps lock")
+                .is_empty(),
+            "fixed holdout must not consult the live source policy"
+        );
+    }
+
+    #[test]
+    fn live_validation_sampling_remains_explicitly_available() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::clone(&selected_steps),
+            policy_steps: None,
+        });
+
+        let _ = RandomDataLoader::<TestBackend>::new(dataset, DatasetSplit::Val, &device, 1, None)
+            .with_source_selection_enabled(true)
+            .iter()
+            .next()
+            .expect("live validation batch");
+
+        assert_eq!(
+            selected_steps
+                .lock()
+                .expect("selected steps lock")
+                .as_slice(),
+            &[0]
+        );
+    }
+
+    #[test]
+    fn fixed_stream_holdout_bypasses_source_and_policy_selection() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let selected_steps = Arc::new(Mutex::new(Vec::new()));
+        let policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 2,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::clone(&selected_steps),
+            policy_steps: Some(Arc::clone(&policy_steps)),
+        });
+
+        let sample = || {
+            StreamingDataLoader::<TestBackend>::new(
+                Arc::clone(&dataset),
+                DatasetSplit::Val,
+                &device,
+                2,
+                None,
+                Some(8),
+                41,
+            )
+            .with_source_selection_enabled(false)
+            .with_ruliad_policy_batch(true)
+            .iter()
+            .flat_map(|batch| {
+                assert!(batch.ruliad_policy_batch.is_none());
+                batch
+                    .inputs
+                    .to_data()
+                    .convert::<i64>()
+                    .into_vec::<i64>()
+                    .expect("fixed stream tokens")
+            })
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sample(), sample());
+        assert!(
+            selected_steps
+                .lock()
+                .expect("selected steps lock")
+                .is_empty()
+        );
+        assert!(policy_steps.lock().expect("policy steps lock").is_empty());
+    }
+
+    #[test]
     fn random_loader_prefetches_bounded_live_source_selection_steps() {
         if live_source_selection_prefetch_depth() == 0 {
             return;
@@ -2447,6 +2869,76 @@ mod random_loader_tests {
         assert!(
             policy_steps.lock().expect("policy steps lock").contains(&0),
             "policy batch should be requested for the current absolute step"
+        );
+    }
+
+    #[test]
+    fn loaders_materialize_policy_metadata_only_on_scheduled_training_steps() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut supervision = crate::config::RuliadSupervisionConfig::default();
+        supervision.proof_policy.enabled = true;
+        supervision.proof_policy.weight = 0.25;
+        supervision.proof_policy.start_after_steps = 2;
+        supervision.proof_policy.every_steps = 2;
+
+        let random_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let random_dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&random_policy_steps)),
+        });
+        let random_attached = RandomDataLoader::<TestBackend>::new(
+            random_dataset,
+            DatasetSplit::Train,
+            &device,
+            6,
+            Some(6),
+        )
+        .with_ruliad_policy_supervision(supervision)
+        .iter()
+        .map(|batch| batch.ruliad_policy_batch.is_some())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            random_attached,
+            vec![false, false, true, false, true, false]
+        );
+        let mut random_policy_steps = random_policy_steps
+            .lock()
+            .expect("random policy steps lock")
+            .clone();
+        random_policy_steps.sort_unstable();
+        assert_eq!(random_policy_steps, vec![2, 4]);
+
+        let streaming_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let streaming_dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&streaming_policy_steps)),
+        });
+        let streaming_attached = StreamingDataLoader::<TestBackend>::new(
+            streaming_dataset,
+            DatasetSplit::Train,
+            &device,
+            6,
+            Some(6),
+            Some(4),
+            1337,
+        )
+        .with_ruliad_policy_supervision(supervision)
+        .iter()
+        .map(|batch| batch.ruliad_policy_batch.is_some())
+        .collect::<Vec<_>>();
+        assert_eq!(streaming_attached, random_attached);
+        assert_eq!(
+            streaming_policy_steps
+                .lock()
+                .expect("streaming policy steps lock")
+                .len(),
+            2
         );
     }
 

@@ -38,6 +38,12 @@ bootstrap_addrs = []
 revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
 require_signed_revision_contracts = true
 
+# Keep this identical across every peer in the signed revision. Use
+# `validator_quorum` with a quorum greater than one for untrusted public peers.
+[manifest.promotion]
+mode = "diffusion_steady_state"
+validator_quorum = 1
+
 [capability_policy]
 native_wgpu_memory_budget_bytes = 4294967296
 native_cuda_memory_budget_bytes = 6442450944

@@ -15,6 +15,7 @@ use burn_ndarray::NdArray;
 #[cfg(feature = "train")]
 #[derive(Debug, Default)]
 struct TrainingOverrides {
+    seed: Option<u64>,
     n_layer: Option<usize>,
     n_embd: Option<usize>,
     n_head: Option<usize>,
@@ -42,6 +43,14 @@ fn parse_usize_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Resul
 }
 
 #[cfg(feature = "train")]
+fn parse_u64_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u64> {
+    args.next()
+        .ok_or_else(|| anyhow!("{name} requires a value"))?
+        .parse::<u64>()
+        .map_err(|err| anyhow!("{name} requires a non-negative integer: {err}"))
+}
+
+#[cfg(feature = "train")]
 fn parse_args() -> Result<RunArgs> {
     let mut backend = String::from("cpu");
     let mut config_paths = Vec::new();
@@ -60,6 +69,7 @@ fn parse_args() -> Result<RunArgs> {
                     .ok_or_else(|| anyhow!("{arg} requires a path"))?;
                 config_paths.push(PathBuf::from(path));
             }
+            "--seed" => overrides.seed = Some(parse_u64_arg(&mut args, "--seed")?),
             "--n-layer" => overrides.n_layer = Some(parse_usize_arg(&mut args, "--n-layer")?),
             "--n-embd" => overrides.n_embd = Some(parse_usize_arg(&mut args, "--n-embd")?),
             "--n-head" => overrides.n_head = Some(parse_usize_arg(&mut args, "--n-head")?),
@@ -79,7 +89,7 @@ fn parse_args() -> Result<RunArgs> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p burn_dragon_language --example train_language --features train[,cuda] -- --backend <cpu|cuda> --config <path> [--config <path>...] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--block-size N] [--batch-size N] [--max-iters N] [--checkpoint-interval-iters N]"
+                    "usage: cargo run -p burn_dragon_language --example train_language --features train[,cuda] -- --backend <cpu|cuda> --config <path> [--config <path>...] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--block-size N] [--batch-size N] [--max-iters N] [--checkpoint-interval-iters N]"
                 );
                 std::process::exit(0);
             }
@@ -101,6 +111,9 @@ fn parse_args() -> Result<RunArgs> {
 
 #[cfg(feature = "train")]
 fn apply_overrides(config: &mut TrainingConfig, overrides: &TrainingOverrides) -> Result<()> {
+    if let Some(seed) = overrides.seed {
+        config.training.seed = seed;
+    }
     if let Some(n_layer) = overrides.n_layer {
         config.model.n_layer = Some(n_layer);
     }

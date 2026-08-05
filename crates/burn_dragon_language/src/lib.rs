@@ -44,17 +44,21 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingMode,
-            PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
-            SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-            SelfDistillationKlKind, TeacherRegularization, TrainingConfig, TrainingHyperparameters,
-            TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
+            LocalPredictiveCodingConfig, LocalPredictiveCodingSolver, PcGradientNormScope,
+            PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingFactorReduction,
+            PredictiveCodingMode, PredictiveCodingParameterUpdate, PredictiveCodingStateScope,
+            RepromptTruncation, RuliadProbeGenerationConfig, SdftObjectiveConfig,
+            SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+            TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
+            TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
+            TrainingValidationExecution, load_training_config,
         };
     }
 
     pub mod inference {
         pub use crate::generation::{
-            ContextStrategy, GenerationProfileSnapshot, GenerationSettings, generate_text,
+            ContextStrategy, GenerationProfileSnapshot, GenerationSettings,
+            generate_greedy_batch_equal_position, generate_greedy_batch_ragged, generate_text,
             generate_tokens, generate_tokens_chunked, generation_profile_reset,
             generation_profile_snapshot, prefill_state, resolve_context_strategy,
             sample_next_token,
@@ -71,9 +75,9 @@ pub mod api {
         pub use crate::checkpoint::{
             LanguageBurnpackExportReport, LanguageRunConfigSnapshot,
             apply_init_checkpoint_to_language_core, default_checkpoint_dir,
-            export_language_checkpoint_to_burnpack, load_language_core_from_checkpoint,
-            load_tokenizer_for_checkpoint, load_training_config_for_checkpoint,
-            write_training_snapshot,
+            ensure_random_scaffold_run_manifest, export_language_checkpoint_to_burnpack,
+            load_language_core_from_checkpoint, load_tokenizer_for_checkpoint,
+            load_training_config_for_checkpoint, write_training_snapshot,
         };
     }
 
@@ -82,6 +86,21 @@ pub mod api {
         pub use crate::dataset;
         pub use crate::stages;
         pub use crate::train;
+    }
+
+    /// Typed verifier-guided proof-action inference.
+    ///
+    /// This contract is intentionally separate from unconstrained text generation: the model
+    /// scores verifier-enumerated semantic actions and the selected action is rendered
+    /// deterministically. It is available with the training feature because it shares the
+    /// tensorized policy scorer used by training and evaluation.
+    #[cfg(feature = "train")]
+    pub mod formal_policy {
+        pub use crate::train::ruliad_policy::{
+            EncodedRuliadProofActionPresentation, EncodedRuliadProofActionRequest,
+            RuliadProofActionDecision, SemanticActionOrbitSummary,
+            select_ruliad_proof_actions_batch, select_ruliad_proof_actions_batch_with_scoring,
+        };
     }
 }
 
@@ -94,8 +113,9 @@ pub use burn_dragon_core::{
 pub use checkpoint::{
     LanguageBurnpackExportReport, LanguageRunConfigSnapshot,
     apply_init_checkpoint_to_language_core, default_checkpoint_dir,
-    export_language_checkpoint_to_burnpack, load_language_core_from_checkpoint,
-    load_tokenizer_for_checkpoint, load_training_config_for_checkpoint, write_training_snapshot,
+    ensure_random_scaffold_run_manifest, export_language_checkpoint_to_burnpack,
+    load_language_core_from_checkpoint, load_tokenizer_for_checkpoint,
+    load_training_config_for_checkpoint, write_training_snapshot,
 };
 pub use config::{
     ContextStrategyConfig, GenerationConfig, GenerationOutputFormat,
@@ -104,17 +124,21 @@ pub use config::{
 #[cfg(feature = "train")]
 pub use config::{
     DatasetConfig, DatasetSourceConfig, DynamicsAnchorConfig, DynamicsAnchorMask,
-    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, PredictiveCodingBackwardMode,
-    PredictiveCodingConfig, PredictiveCodingMode, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, RepromptTruncation, RuliadAnswerDenoisingConfig,
-    RuliadAnswerRankingConfig, RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig,
-    SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingConfig,
-    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind, load_training_config,
+    HuggingFaceDatasetConfig, HuggingFaceRecordFormat, LocalPredictiveCodingConfig,
+    LocalPredictiveCodingSolver, PcGradientNormScope, PredictiveCodingBackwardMode,
+    PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
+    PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
+    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadProbeGenerationConfig,
+    RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig, SdpoObjectiveConfig,
+    SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    TrainingValidationConfig, TrainingValidationExecution, load_training_config,
 };
 pub use generation::{
-    ContextStrategy, GenerationProfileSnapshot, GenerationSettings, generate_text, generate_tokens,
-    generate_tokens_chunked, generation_profile_reset, generation_profile_snapshot, prefill_state,
-    resolve_context_strategy, sample_next_token,
+    ContextStrategy, GenerationProfileSnapshot, GenerationSettings,
+    generate_greedy_batch_equal_position, generate_greedy_batch_ragged, generate_text,
+    generate_tokens, generate_tokens_chunked, generation_profile_reset,
+    generation_profile_snapshot, prefill_state, resolve_context_strategy, sample_next_token,
 };
 pub use inference::{
     WgpuFusedCoreOverride, apply_wgpu_fused_core_override, build_model_config,

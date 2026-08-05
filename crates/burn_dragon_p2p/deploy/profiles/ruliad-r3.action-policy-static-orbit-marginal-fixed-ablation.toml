@@ -1,0 +1,11 @@
+extends = ["ruliad-r3.action-policy-static-marginal-fixed-ablation.toml"]
+
+# Exact finite-group risk over the cyclic candidate-presentation orbit. Each
+# proof state keeps one semantic weight while all rotations are tensorized as
+# presentation rows, preventing a candidate index from becoming the policy.
+[training.ruliad_supervision.proof_policy]
+candidate_symmetry = "cyclic_orbit_average"
+max_presentation_rows_per_update = 32
+
+[training.ruliad_policy_probe]
+candidate_symmetry = "cyclic_orbit_average"

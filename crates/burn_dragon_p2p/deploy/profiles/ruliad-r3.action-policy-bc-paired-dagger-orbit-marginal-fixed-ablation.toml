@@ -1,0 +1,11 @@
+extends = ["ruliad-r3.action-policy-bc-paired-dagger-marginal-fixed-ablation.toml"]
+
+# Apply the same semantic orbit contract to both supervised action risk and
+# model-visited DAgger decisions. Presentation forwards are tensorized.
+[training.ruliad_supervision.proof_policy]
+candidate_symmetry = "cyclic_orbit_average"
+# Four cyclic presentations for each of four expert/visited trajectory pairs.
+max_presentation_rows_per_update = 64
+
+[training.ruliad_policy_probe]
+candidate_symmetry = "cyclic_orbit_average"

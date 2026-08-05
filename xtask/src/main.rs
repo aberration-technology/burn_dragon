@@ -339,7 +339,7 @@ fn local_browser_e2e_runner() -> local_browser_e2e::LocalBrowserE2eRunner {
 }
 
 fn wasm_training_smoke() -> Result<()> {
-    wasm_browser_test(Some("browser_training_smoke_generated_nca"))
+    wasm_browser_test(Some("browser_training_smoke_generated_"))
 }
 
 fn wasm_smoke() -> Result<()> {

@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-05",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "model": {
+    "parameters": 888194,
+    "layers": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "shared_layer_weights": true
+  },
+  "stream": {
+    "tasks": 4,
+    "updates_per_task": 128,
+    "eval_batches_per_task": 4,
+    "batch_size": 16,
+    "block_size": 16,
+    "model_tokens_per_arm": 131072
+  },
+  "routing": {
+    "mode": "selected_sparse_subnetwork",
+    "selector": "predictive_evidence",
+    "optimizer_state": "context_scoped",
+    "max_contexts": 8,
+    "active_fraction": 0.25
+  },
+  "outcomes": [
+    {
+      "seed": 17,
+      "learner": "backpropagation",
+      "final_accuracy": 0.9635416666666666,
+      "mean_forgetting": 0.013310185185185194,
+      "max_forgetting": 0.03993055555555558,
+      "tokens_per_second": 22472.72428041241,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 512,
+      "local_vjp_calls": 0,
+      "acquisition_gate": true
+    },
+    {
+      "seed": 17,
+      "learner": "fixed_prediction",
+      "final_accuracy": 0.9722222222222222,
+      "mean_forgetting": 0.013310185185185194,
+      "max_forgetting": 0.03645833333333337,
+      "tokens_per_second": 18147.804576721075,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 0,
+      "local_vjp_calls": 3072,
+      "acquisition_gate": true
+    },
+    {
+      "seed": 29,
+      "learner": "backpropagation",
+      "final_accuracy": 0.9947916666666667,
+      "mean_forgetting": 0.00694444444444442,
+      "max_forgetting": 0.01041666666666663,
+      "tokens_per_second": 23536.615370247673,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 512,
+      "local_vjp_calls": 0,
+      "acquisition_gate": true
+    },
+    {
+      "seed": 29,
+      "learner": "fixed_prediction",
+      "final_accuracy": 0.9973958333333334,
+      "mean_forgetting": 0.0028935185185184897,
+      "max_forgetting": 0.00868055555555547,
+      "tokens_per_second": 17835.600709156613,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 0,
+      "local_vjp_calls": 3072,
+      "acquisition_gate": true
+    },
+    {
+      "seed": 43,
+      "learner": "backpropagation",
+      "final_accuracy": 0.9856770833333333,
+      "mean_forgetting": 0.005787037037037053,
+      "max_forgetting": 0.01736111111111116,
+      "tokens_per_second": 23372.786995554787,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 512,
+      "local_vjp_calls": 0,
+      "acquisition_gate": true
+    },
+    {
+      "seed": 43,
+      "learner": "fixed_prediction",
+      "final_accuracy": 0.9991319444444444,
+      "mean_forgetting": 0.0,
+      "max_forgetting": 0.0,
+      "tokens_per_second": 18299.208205580297,
+      "selector_accuracy": 1.0,
+      "contexts_created": 4,
+      "global_backward_calls": 0,
+      "local_vjp_calls": 3072,
+      "acquisition_gate": true
+    }
+  ],
+  "means": {
+    "backpropagation": {
+      "final_accuracy": 0.9813368055555557,
+      "mean_forgetting": 0.008680555555555556,
+      "max_forgetting": 0.022569444444444458,
+      "tokens_per_second": 23127.375548738288
+    },
+    "fixed_prediction": {
+      "final_accuracy": 0.9895833333333334,
+      "mean_forgetting": 0.005401234567901228,
+      "max_forgetting": 0.01504629629629628,
+      "tokens_per_second": 18094.20449715266
+    },
+    "paired_fixed_minus_backpropagation": {
+      "final_accuracy": 0.00824652777777779,
+      "mean_forgetting": -0.0032793209876543273,
+      "throughput_ratio": 0.7827523429077958
+    }
+  },
+  "exact_resume": {
+    "checkpoint_epoch": 2,
+    "final_epoch": 4,
+    "canonical_state_artifacts_exact": 11,
+    "post_resume_events_exact": 50,
+    "semantic_context_optimizer_continuation_exact": true,
+    "context_optimizer_recorder_bytes_canonical_across_processes": false
+  },
+  "decision": "retain as an experimental convergence and retention control; require a longer fixed-holdout Ruliad matrix before local or decentralized default promotion"
+}

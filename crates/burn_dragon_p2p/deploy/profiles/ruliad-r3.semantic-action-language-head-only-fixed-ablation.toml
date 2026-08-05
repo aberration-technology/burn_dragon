@@ -1,0 +1,9 @@
+extends = ["ruliad-r3.semantic-action-static-fixed-ablation.toml"]
+
+# Connect verifier-equivalent semantic actions to the deployed decoder while isolating the
+# auxiliary gradient from Dragon's recurrent backbone. Every source state is paired with one
+# verifier-valid alternate target under the same candidate set, so target-independent action
+# priors cannot satisfy the objective. Ordinary cross entropy remains full-model.
+[training.ruliad_supervision.proof_policy]
+gradient_scope = "language_head_only"
+counterfactual_targets_per_state = 1

@@ -1,0 +1,40 @@
+extends = ["ruliad-r3.training.toml"]
+
+[model]
+n_layer = 2
+n_embd = 64
+n_head = 4
+latent_total = 256
+dropout = 0.05
+
+[training]
+block_size = 128
+tbptt_chunk_size = 128
+tbptt_persist_across_steps = true
+max_iters = 256
+checkpoint_interval_iters = 256
+log_frequency = 8
+batch_size = 4
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.dynamics]
+enabled = false
+
+[training.events]
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 32
+ruliad_correctness_probe_tokens = 128
+source_weighted_validation_batches = 2
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0

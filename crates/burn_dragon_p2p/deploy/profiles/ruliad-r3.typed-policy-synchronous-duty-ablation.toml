@@ -1,0 +1,19 @@
+extends = ["ruliad-r3.typed-policy-duty-base-ablation.toml"]
+
+# Systems control: intentionally run each bounded formal audit on the trainer.
+[training.events]
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 16
+ruliad_correctness_probe_tokens = 16
+ruliad_correctness_probe_hard_token_cap = 32
+
+[training.ruliad_policy_probe]
+enabled = true
+every_epochs = 1
+closed_loop_every_epochs = 1
+items = 4
+max_steps = 16
+
+[training.ruliad_policy_probe.promotion_gate]
+enabled = false
+

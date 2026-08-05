@@ -5,6 +5,7 @@ use burn_dragon_language::dataset::{DatasetSplit, TokenSequenceDataset, Universa
 use burn_dragon_language::tokenizer::{
     PretokenizedTokenizerConfig, TokenizerConfig, TokenizerKind,
 };
+use burn_dragon_universality::ruliad::formal_ruliad_families;
 use burn_dragon_universality::{
     FloatRangeConfig, NcaCorpusConfig, NcaSerializationConfig, NcaTokenizationConfig,
     RuliadCorpusConfig, RuliadSerializationConfig, RuliadSourceSelectionConfig,
@@ -80,6 +81,7 @@ fn ruliad_config(output_dir: &Path) -> RuliadCorpusConfig {
             ..RuliadSerializationConfig::default()
         },
         tokenization: RuliadTokenizationConfig::default(),
+        formal_generalization: Default::default(),
         source_selection,
         families: compact_ruliad_families(),
         proof_tasks: None,
@@ -123,6 +125,62 @@ fn build_ruliad_dataset(block_size: usize, batch_size: usize) -> BenchDataset {
         &pretokenized_tokenizer(),
     )
     .expect("ruliad dataset");
+    BenchDataset { _dir: dir, dataset }
+}
+
+fn build_formal_ruliad_dataset(block_size: usize, batch_size: usize) -> BenchDataset {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("ruliad-r3.toml");
+    let mut config = ruliad_config(dir.path());
+    config.name = "universality-loader-ruliad-r3".to_string();
+    config.families = formal_ruliad_families();
+    config.serialization.document_tokens = 8_193;
+    config.chunk_token_capacity = 16_384;
+    std::fs::write(
+        &config_path,
+        toml::to_string_pretty(&config).expect("formal ruliad config toml"),
+    )
+    .expect("write formal ruliad config");
+    let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+        &config_path,
+        block_size,
+        batch_size,
+        &pretokenized_tokenizer(),
+    )
+    .expect("formal ruliad dataset");
+    BenchDataset { _dir: dir, dataset }
+}
+
+fn build_far_formal_ruliad_dataset(
+    block_size: usize,
+    batch_size: usize,
+    difficulty: usize,
+) -> BenchDataset {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("ruliad-r3-far.toml");
+    let mut config = ruliad_config(dir.path());
+    config.name = format!("universality-loader-ruliad-r3-d{difficulty}");
+    config.families = formal_ruliad_families();
+    config.serialization.document_tokens = 1_048_576;
+    config.chunk_token_capacity = 2_097_152;
+    config.source_selection.difficulty_levels = UsizeRangeConfig {
+        min: difficulty,
+        max: difficulty,
+    };
+    config.source_selection.frontier_extension.enabled = false;
+    config.source_selection.cold_start.enabled = false;
+    std::fs::write(
+        &config_path,
+        toml::to_string_pretty(&config).expect("far formal ruliad config toml"),
+    )
+    .expect("write far formal ruliad config");
+    let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+        &config_path,
+        block_size,
+        batch_size,
+        &pretokenized_tokenizer(),
+    )
+    .expect("far formal ruliad dataset");
     BenchDataset { _dir: dir, dataset }
 }
 
@@ -176,6 +234,58 @@ fn bench_universality_loader(c: &mut Criterion) {
                     .dataset
                     .sample_batch::<BenchBackend>(DatasetSplit::Train, &device),
             );
+        })
+    });
+
+    let formal = build_formal_ruliad_dataset(block_size, 8);
+    let mut cold_step = 0usize;
+    c.bench_function("universality_loader/ruliad_r3_live_batch_cold", |b| {
+        b.iter(|| {
+            cold_step = cold_step.wrapping_add(1);
+            black_box(TokenSequenceDataset::source_selected_token_windows(
+                &formal.dataset,
+                DatasetSplit::Train,
+                0,
+                cold_step,
+                8,
+                block_size,
+            ));
+        })
+    });
+    let _ = TokenSequenceDataset::source_selected_token_windows(
+        &formal.dataset,
+        DatasetSplit::Train,
+        0,
+        17,
+        8,
+        block_size,
+    );
+    c.bench_function("universality_loader/ruliad_r3_live_batch_cached", |b| {
+        b.iter(|| {
+            black_box(TokenSequenceDataset::source_selected_token_windows(
+                &formal.dataset,
+                DatasetSplit::Train,
+                0,
+                17,
+                8,
+                block_size,
+            ));
+        })
+    });
+
+    let far = build_far_formal_ruliad_dataset(block_size, 8, 256);
+    let mut far_step = 0usize;
+    c.bench_function("universality_loader/ruliad_r3_d256_batch8_cold", |b| {
+        b.iter(|| {
+            far_step = far_step.wrapping_add(1);
+            black_box(TokenSequenceDataset::source_selected_token_windows(
+                &far.dataset,
+                DatasetSplit::Train,
+                0,
+                far_step,
+                8,
+                block_size,
+            ));
         })
     });
 }

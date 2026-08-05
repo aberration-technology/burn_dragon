@@ -42,11 +42,25 @@ pub enum RuliadFamilyKind {
     Algebra,
     Category,
     ProofTree,
+    FormalProof,
     LeanTask,
     HashNoise,
 }
 
 impl RuliadFamilyKind {
+    pub const ALL: [Self; 10] = [
+        Self::Eca,
+        Self::Simulation,
+        Self::Automaton,
+        Self::Rewrite,
+        Self::Algebra,
+        Self::Category,
+        Self::ProofTree,
+        Self::FormalProof,
+        Self::LeanTask,
+        Self::HashNoise,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Eca => "eca",
@@ -56,8 +70,25 @@ impl RuliadFamilyKind {
             Self::Algebra => "algebra",
             Self::Category => "category",
             Self::ProofTree => "proof_tree",
+            Self::FormalProof => "formal_proof",
             Self::LeanTask => "lean_task",
             Self::HashNoise => "hash_noise",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "eca" => Some(Self::Eca),
+            "simulation" => Some(Self::Simulation),
+            "automaton" => Some(Self::Automaton),
+            "rewrite" => Some(Self::Rewrite),
+            "algebra" => Some(Self::Algebra),
+            "category" => Some(Self::Category),
+            "proof_tree" => Some(Self::ProofTree),
+            "formal_proof" => Some(Self::FormalProof),
+            "lean_task" => Some(Self::LeanTask),
+            "hash_noise" => Some(Self::HashNoise),
+            _ => None,
         }
     }
 }
@@ -77,11 +108,35 @@ pub enum RuliadTaskKind {
     VerifyFunctorPreservation,
     VerifyNaturalitySquare,
     ProveTheorem,
+    ConstructProof,
+    AdvanceProof,
+    SelectProofAction,
+    CheckProof,
     CompleteProof,
     HashCanary,
 }
 
 impl RuliadTaskKind {
+    pub const ALL: [Self; 17] = [
+        Self::NextState,
+        Self::MultiStepState,
+        Self::VerifySimulation,
+        Self::EvaluateAutomaton,
+        Self::RewriteNormalForm,
+        Self::CheckAlgebraLaw,
+        Self::ComposeCategoryPath,
+        Self::VerifyCategoryLaw,
+        Self::VerifyFunctorPreservation,
+        Self::VerifyNaturalitySquare,
+        Self::ProveTheorem,
+        Self::ConstructProof,
+        Self::AdvanceProof,
+        Self::SelectProofAction,
+        Self::CheckProof,
+        Self::CompleteProof,
+        Self::HashCanary,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::NextState => "next_state",
@@ -95,8 +150,35 @@ impl RuliadTaskKind {
             Self::VerifyFunctorPreservation => "verify_functor_preservation",
             Self::VerifyNaturalitySquare => "verify_naturality_square",
             Self::ProveTheorem => "prove_theorem",
+            Self::ConstructProof => "construct_proof",
+            Self::AdvanceProof => "advance_proof",
+            Self::SelectProofAction => "select_proof_action",
+            Self::CheckProof => "check_proof",
             Self::CompleteProof => "complete_proof",
             Self::HashCanary => "hash_canary",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "next_state" => Some(Self::NextState),
+            "multi_step_state" => Some(Self::MultiStepState),
+            "verify_simulation" => Some(Self::VerifySimulation),
+            "evaluate_automaton" => Some(Self::EvaluateAutomaton),
+            "rewrite_normal_form" => Some(Self::RewriteNormalForm),
+            "check_algebra_law" => Some(Self::CheckAlgebraLaw),
+            "compose_category_path" => Some(Self::ComposeCategoryPath),
+            "verify_category_law" => Some(Self::VerifyCategoryLaw),
+            "verify_functor_preservation" => Some(Self::VerifyFunctorPreservation),
+            "verify_naturality_square" => Some(Self::VerifyNaturalitySquare),
+            "prove_theorem" => Some(Self::ProveTheorem),
+            "construct_proof" => Some(Self::ConstructProof),
+            "advance_proof" => Some(Self::AdvanceProof),
+            "select_proof_action" => Some(Self::SelectProofAction),
+            "check_proof" => Some(Self::CheckProof),
+            "complete_proof" => Some(Self::CompleteProof),
+            "hash_canary" => Some(Self::HashCanary),
+            _ => None,
         }
     }
 }
@@ -110,6 +192,9 @@ pub enum RuliadMathDomain {
     UniversalAlgebra,
     CategoryTheory,
     FormalProof,
+    Logic,
+    ProcessCalculus,
+    MetagraphRewriting,
     InformationTheory,
 }
 
@@ -122,6 +207,9 @@ impl RuliadMathDomain {
             Self::UniversalAlgebra => "universal_algebra",
             Self::CategoryTheory => "category_theory",
             Self::FormalProof => "formal_proof",
+            Self::Logic => "logic",
+            Self::ProcessCalculus => "process_calculus",
+            Self::MetagraphRewriting => "metagraph_rewriting",
             Self::InformationTheory => "information_theory",
         }
     }
@@ -141,6 +229,11 @@ pub enum RuliadReasoningMode {
     CompositionalReasoning,
     Associativity,
     FormalDeduction,
+    ProofConstruction,
+    ProofChecking,
+    PatternMatching,
+    Substitution,
+    DependencyClosure,
     EntropyCanary,
 }
 
@@ -158,6 +251,11 @@ impl RuliadReasoningMode {
             Self::CompositionalReasoning => "compositional_reasoning",
             Self::Associativity => "associativity",
             Self::FormalDeduction => "formal_deduction",
+            Self::ProofConstruction => "proof_construction",
+            Self::ProofChecking => "proof_checking",
+            Self::PatternMatching => "pattern_matching",
+            Self::Substitution => "substitution",
+            Self::DependencyClosure => "dependency_closure",
             Self::EntropyCanary => "entropy_canary",
         }
     }
@@ -297,6 +395,85 @@ pub fn ruliad_source_semantics(
             ],
             description: "verified synthetic theorem DAG over unnamed algebraic structure",
         },
+        (Family::FormalProof, Task::ConstructProof) => RuliadSourceSemantics {
+            math_domains: &[
+                Domain::SymbolicRewriting,
+                Domain::ComputationTheory,
+                Domain::UniversalAlgebra,
+                Domain::CategoryTheory,
+                Domain::FormalProof,
+                Domain::Logic,
+                Domain::ProcessCalculus,
+                Domain::MetagraphRewriting,
+            ],
+            reasoning_modes: &[
+                Mode::ProofConstruction,
+                Mode::PatternMatching,
+                Mode::Substitution,
+                Mode::DependencyClosure,
+                Mode::CompositionalReasoning,
+            ],
+            description: "construct a replayable proof certificate over the shared Ruliad IR",
+        },
+        (Family::FormalProof, Task::AdvanceProof) => RuliadSourceSemantics {
+            math_domains: &[
+                Domain::SymbolicRewriting,
+                Domain::ComputationTheory,
+                Domain::UniversalAlgebra,
+                Domain::CategoryTheory,
+                Domain::FormalProof,
+                Domain::Logic,
+                Domain::ProcessCalculus,
+                Domain::MetagraphRewriting,
+            ],
+            reasoning_modes: &[
+                Mode::ProofConstruction,
+                Mode::LocalRuleEvaluation,
+                Mode::PatternMatching,
+                Mode::Substitution,
+                Mode::DependencyClosure,
+            ],
+            description: "advance one verifier-backed edge of the shared formal proof DAG",
+        },
+        (Family::FormalProof, Task::SelectProofAction) => RuliadSourceSemantics {
+            math_domains: &[
+                Domain::SymbolicRewriting,
+                Domain::ComputationTheory,
+                Domain::UniversalAlgebra,
+                Domain::CategoryTheory,
+                Domain::FormalProof,
+                Domain::Logic,
+                Domain::ProcessCalculus,
+                Domain::MetagraphRewriting,
+            ],
+            reasoning_modes: &[
+                Mode::ProofConstruction,
+                Mode::LocalRuleEvaluation,
+                Mode::PatternMatching,
+                Mode::Substitution,
+                Mode::CompositionalReasoning,
+            ],
+            description: "select a verifier-backed action from a formal proof state",
+        },
+        (Family::FormalProof, Task::CheckProof) => RuliadSourceSemantics {
+            math_domains: &[
+                Domain::SymbolicRewriting,
+                Domain::ComputationTheory,
+                Domain::UniversalAlgebra,
+                Domain::CategoryTheory,
+                Domain::FormalProof,
+                Domain::Logic,
+                Domain::ProcessCalculus,
+                Domain::MetagraphRewriting,
+            ],
+            reasoning_modes: &[
+                Mode::ProofChecking,
+                Mode::PatternMatching,
+                Mode::DependencyClosure,
+                Mode::CounterexampleEvaluation,
+            ],
+            description: "replay or reject a proposed proof certificate with a localized failure",
+        },
         (Family::LeanTask, Task::CompleteProof) => RuliadSourceSemantics {
             math_domains: &[Domain::FormalProof, Domain::CategoryTheory],
             reasoning_modes: &[
@@ -329,6 +506,10 @@ fn family_default_domains(family: RuliadFamilyKind) -> &'static [RuliadMathDomai
         RuliadFamilyKind::Algebra => &[RuliadMathDomain::UniversalAlgebra],
         RuliadFamilyKind::Category => &[RuliadMathDomain::CategoryTheory],
         RuliadFamilyKind::ProofTree => &[RuliadMathDomain::FormalProof],
+        RuliadFamilyKind::FormalProof => &[
+            RuliadMathDomain::FormalProof,
+            RuliadMathDomain::MetagraphRewriting,
+        ],
         RuliadFamilyKind::LeanTask => &[RuliadMathDomain::FormalProof],
         RuliadFamilyKind::HashNoise => &[RuliadMathDomain::InformationTheory],
     }
@@ -347,6 +528,16 @@ fn task_default_reasoning_modes(task_kind: RuliadTaskKind) -> &'static [RuliadRe
         RuliadTaskKind::VerifyFunctorPreservation => &[RuliadReasoningMode::StructurePreservation],
         RuliadTaskKind::VerifyNaturalitySquare => &[RuliadReasoningMode::StructurePreservation],
         RuliadTaskKind::ProveTheorem => &[RuliadReasoningMode::FormalDeduction],
+        RuliadTaskKind::ConstructProof => &[RuliadReasoningMode::ProofConstruction],
+        RuliadTaskKind::AdvanceProof => &[
+            RuliadReasoningMode::ProofConstruction,
+            RuliadReasoningMode::LocalRuleEvaluation,
+        ],
+        RuliadTaskKind::SelectProofAction => &[
+            RuliadReasoningMode::ProofConstruction,
+            RuliadReasoningMode::CompositionalReasoning,
+        ],
+        RuliadTaskKind::CheckProof => &[RuliadReasoningMode::ProofChecking],
         RuliadTaskKind::CompleteProof => &[RuliadReasoningMode::FormalDeduction],
         RuliadTaskKind::HashCanary => &[RuliadReasoningMode::EntropyCanary],
     }
@@ -361,6 +552,29 @@ pub struct RuliadFamilyConfig {
     pub width: Option<UsizeRangeConfig>,
     #[serde(default)]
     pub steps: Option<UsizeRangeConfig>,
+}
+
+/// Defines what is held out by the generated formal-proof validation split.
+///
+/// This is versioned as part of the Ruliad semantic contract. Older corpora
+/// retain seed-disjoint validation, while promotion profiles can require a
+/// structural split that cannot be solved by memorizing semantic law names or
+/// the training proof-DAG topology.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadFormalGeneralizationContract {
+    #[default]
+    SeedDisjointV1,
+    StructuralHoldoutV1,
+}
+
+impl RuliadFormalGeneralizationContract {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SeedDisjointV1 => "seed_disjoint_v1",
+            Self::StructuralHoldoutV1 => "structural_holdout_v1",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -464,9 +678,56 @@ impl Default for RuliadFrontierExtensionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RuliadFormalTaskMixConfig {
+    #[serde(default)]
+    pub advance_proof_weight: usize,
+    #[serde(default)]
+    pub select_proof_action_weight: usize,
+    #[serde(default = "default_weight")]
+    pub construct_proof_weight: usize,
+    #[serde(default = "default_weight")]
+    pub check_proof_weight: usize,
+    #[serde(default)]
+    pub proof_action_answer_contract: RuliadProofActionAnswerContract,
+}
+
+impl Default for RuliadFormalTaskMixConfig {
+    fn default() -> Self {
+        Self {
+            advance_proof_weight: 0,
+            select_proof_action_weight: 0,
+            construct_proof_weight: default_weight(),
+            check_proof_weight: default_weight(),
+            proof_action_answer_contract: RuliadProofActionAnswerContract::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofActionAnswerContract {
+    /// Presentation-relative menu index retained only as an explicit ablation control.
+    #[default]
+    PresentationIndex,
+    /// Executable proof step, invariant to candidate-menu presentation order.
+    SemanticStep,
+}
+
+impl RuliadProofActionAnswerContract {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PresentationIndex => "presentation_index",
+            Self::SemanticStep => "semantic_step",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSourceSelectionConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_source_selection_feedback_updates_enabled")]
+    pub feedback_updates_enabled: bool,
     #[serde(default)]
     pub sampler: RuliadSamplerConfig,
     #[serde(default = "default_difficulty_levels")]
@@ -475,16 +736,20 @@ pub struct RuliadSourceSelectionConfig {
     pub frontier_extension: RuliadFrontierExtensionConfig,
     #[serde(default)]
     pub cold_start: RuliadSourceSelectionColdStartConfig,
+    #[serde(default)]
+    pub formal_task_mix: RuliadFormalTaskMixConfig,
 }
 
 impl Default for RuliadSourceSelectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            feedback_updates_enabled: default_source_selection_feedback_updates_enabled(),
             sampler: RuliadSamplerConfig::default(),
             difficulty_levels: default_difficulty_levels(),
             frontier_extension: RuliadFrontierExtensionConfig::default(),
             cold_start: RuliadSourceSelectionColdStartConfig::default(),
+            formal_task_mix: RuliadFormalTaskMixConfig::default(),
         }
     }
 }
@@ -549,6 +814,8 @@ pub struct RuliadCorpusConfig {
     #[serde(default)]
     pub tokenization: RuliadTokenizationConfig,
     #[serde(default)]
+    pub formal_generalization: RuliadFormalGeneralizationContract,
+    #[serde(default)]
     pub source_selection: RuliadSourceSelectionConfig,
     #[serde(default = "default_ruliad_families")]
     pub families: Vec<RuliadFamilyConfig>,
@@ -584,6 +851,61 @@ impl RuliadCorpusConfig {
         self.source_selection
             .difficulty_levels
             .validate("source_selection.difficulty_levels")?;
+        let sampler = &self.source_selection.sampler;
+        if !sampler.capability_frontier_min_coverage.is_finite()
+            || !(0.0..=1.0).contains(&sampler.capability_frontier_min_coverage)
+        {
+            return Err(anyhow!(
+                "source_selection.sampler.capability_frontier_min_coverage must be finite in [0, 1]"
+            ));
+        }
+        if sampler.capability_mastery.minimum_items == 0 {
+            return Err(anyhow!(
+                "source_selection.sampler.capability_mastery.minimum_items must be > 0"
+            ));
+        }
+        if !sampler.capability_mastery.confidence_z.is_finite()
+            || sampler.capability_mastery.confidence_z < 0.0
+        {
+            return Err(anyhow!(
+                "source_selection.sampler.capability_mastery.confidence_z must be finite and >= 0"
+            ));
+        }
+        for (name, value) in [
+            ("verifier_min", sampler.capability_mastery.verifier_min),
+            (
+                "completion_health_min",
+                sampler.capability_mastery.completion_health_min,
+            ),
+            (
+                "schema_wrong_max",
+                sampler.capability_mastery.schema_wrong_max,
+            ),
+            ("malformed_max", sampler.capability_mastery.malformed_max),
+            ("missing_max", sampler.capability_mastery.missing_max),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(anyhow!(
+                    "source_selection.sampler.capability_mastery.{name} must be finite in [0, 1]"
+                ));
+            }
+        }
+        let formal_task_weight = self
+            .source_selection
+            .formal_task_mix
+            .advance_proof_weight
+            .saturating_add(
+                self.source_selection
+                    .formal_task_mix
+                    .select_proof_action_weight,
+            )
+            .saturating_add(self.source_selection.formal_task_mix.construct_proof_weight)
+            .saturating_add(self.source_selection.formal_task_mix.check_proof_weight);
+        if formal_task_weight == 0 {
+            return Err(anyhow!(
+                "source_selection.formal_task_mix requires at least one non-zero task weight"
+            ));
+        }
         if self.source_selection.cold_start.enabled {
             if self.source_selection.cold_start.max_difficulty_level
                 < self.source_selection.difficulty_levels.min
@@ -857,6 +1179,10 @@ pub fn compact_ruliad_families() -> Vec<RuliadFamilyConfig> {
                 family.width = Some(UsizeRangeConfig { min: 5, max: 8 });
                 family.steps = Some(UsizeRangeConfig { min: 4, max: 6 });
             }
+            RuliadFamilyKind::FormalProof => {
+                family.width = Some(UsizeRangeConfig { min: 2, max: 3 });
+                family.steps = Some(UsizeRangeConfig { min: 2, max: 3 });
+            }
             RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => {
                 family.width = None;
                 family.steps = None;
@@ -864,6 +1190,15 @@ pub fn compact_ruliad_families() -> Vec<RuliadFamilyConfig> {
         }
     }
     families
+}
+
+pub fn formal_ruliad_families() -> Vec<RuliadFamilyConfig> {
+    vec![RuliadFamilyConfig {
+        kind: RuliadFamilyKind::FormalProof,
+        weight: 1,
+        width: Some(UsizeRangeConfig { min: 2, max: 4 }),
+        steps: Some(UsizeRangeConfig { min: 2, max: 4 }),
+    }]
 }
 
 fn default_seed() -> u64 {
@@ -892,6 +1227,10 @@ fn default_document_chunks() -> UsizeRangeConfig {
 
 fn default_difficulty_levels() -> UsizeRangeConfig {
     UsizeRangeConfig { min: 0, max: 0 }
+}
+
+fn default_source_selection_feedback_updates_enabled() -> bool {
+    true
 }
 
 fn default_cold_start_max_difficulty_level() -> usize {
@@ -982,7 +1321,7 @@ mod tests {
     #[test]
     fn default_config_validates() {
         let dir = tempdir().expect("tempdir");
-        let config = RuliadCorpusConfig {
+        let mut config = RuliadCorpusConfig {
             output_dir: dir.path().join("out"),
             seed: 1,
             name: "demo".to_string(),
@@ -991,6 +1330,7 @@ mod tests {
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig::default(),
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: RuliadSourceSelectionConfig::default(),
             families: default_ruliad_families(),
             proof_tasks: None,
@@ -998,6 +1338,67 @@ mod tests {
         };
 
         config.validate().expect("valid config");
+
+        config
+            .source_selection
+            .formal_task_mix
+            .construct_proof_weight = 0;
+        config.source_selection.formal_task_mix.check_proof_weight = 0;
+        let error = config
+            .validate()
+            .expect_err("empty formal task mix must fail");
+        assert!(error.to_string().contains("formal_task_mix"));
+    }
+
+    #[test]
+    fn canonical_family_and_task_labels_round_trip() {
+        for family in RuliadFamilyKind::ALL {
+            assert_eq!(RuliadFamilyKind::from_label(family.label()), Some(family));
+        }
+        for task in RuliadTaskKind::ALL {
+            assert_eq!(RuliadTaskKind::from_label(task.label()), Some(task));
+        }
+        assert_eq!(RuliadFamilyKind::from_label("unknown"), None);
+        assert_eq!(RuliadTaskKind::from_label("unknown"), None);
+    }
+
+    #[test]
+    fn structural_generalization_contract_round_trips_in_corpus_config() {
+        let mut config = RuliadCorpusConfig {
+            output_dir: "target/test-ruliad-structural-holdout".into(),
+            seed: 1,
+            name: "structural-holdout".to_string(),
+            train_samples: 8,
+            validation_samples: 2,
+            chunk_token_capacity: 1024,
+            serialization: RuliadSerializationConfig::default(),
+            tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: RuliadFormalGeneralizationContract::StructuralHoldoutV1,
+            source_selection: RuliadSourceSelectionConfig::default(),
+            families: formal_ruliad_families(),
+            proof_tasks: None,
+            lean_task_limit: None,
+        };
+        config
+            .source_selection
+            .formal_task_mix
+            .proof_action_answer_contract = RuliadProofActionAnswerContract::SemanticStep;
+        let encoded = toml::to_string(&config).expect("serialize config");
+        let decoded: RuliadCorpusConfig = toml::from_str(&encoded).expect("deserialize config");
+        assert_eq!(
+            decoded.formal_generalization,
+            RuliadFormalGeneralizationContract::StructuralHoldoutV1
+        );
+        assert_eq!(
+            decoded
+                .source_selection
+                .formal_task_mix
+                .proof_action_answer_contract,
+            RuliadProofActionAnswerContract::SemanticStep
+        );
+
+        config.formal_generalization = RuliadFormalGeneralizationContract::default();
+        assert_eq!(config.formal_generalization.label(), "seed_disjoint_v1");
     }
 
     #[test]
@@ -1022,6 +1423,7 @@ mod tests {
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig::default(),
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: RuliadSourceSelectionConfig::default(),
             families,
             proof_tasks: None,
@@ -1039,6 +1441,15 @@ mod tests {
     }
 
     #[test]
+    fn formal_families_use_only_the_shared_proof_ir() {
+        let families = formal_ruliad_families();
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].kind, RuliadFamilyKind::FormalProof);
+        assert!(families[0].width.is_some());
+        assert!(families[0].steps.is_some());
+    }
+
+    #[test]
     fn cold_start_mastery_gate_config_validates_thresholds() {
         let mut config = RuliadCorpusConfig {
             output_dir: "target/test-ruliad-cold-start".into(),
@@ -1049,6 +1460,7 @@ mod tests {
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig::default(),
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: RuliadSourceSelectionConfig {
                 enabled: true,
                 difficulty_levels: UsizeRangeConfig { min: 0, max: 4 },

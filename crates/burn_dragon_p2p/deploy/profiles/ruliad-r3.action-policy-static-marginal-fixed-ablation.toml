@@ -1,0 +1,11 @@
+extends = ["ruliad-r3.action-policy-static-fixed-ablation.toml"]
+
+# Dense behavior-cloning control for the practical pretraining path. The
+# source generator supplies stratified certificate states, so this condition
+# avoids sequential model rollouts while exercising 224 policy updates in a
+# 1,024-update run (the same count as the established 4,096-update schedule).
+[training.ruliad_supervision.proof_policy]
+normalization = "vocabulary_marginal"
+candidate_symmetry = "balanced_rotation"
+every_steps = 4
+start_after_steps = 128

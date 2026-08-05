@@ -1,0 +1,26 @@
+extends = ["ruliad-r3.typed-policy.training.toml"]
+
+# Bounded 10M-class systems profile for evaluator-placement comparisons.
+[model]
+n_layer = 4
+n_embd = 256
+n_head = 8
+latent_total = 4096
+
+[training]
+batch_size = 48
+max_iters = 128
+checkpoint_interval_iters = 32
+log_frequency = 32
+
+[training.auto_batch_size]
+enabled = false
+
+[training.gates]
+enabled = false
+
+[training.dynamics]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false

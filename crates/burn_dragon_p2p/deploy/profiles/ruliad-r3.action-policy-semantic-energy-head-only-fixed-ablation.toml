@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml"]
+
+# Isolate the semantic-policy auxiliary from Dragon's shared language backbone. Cross entropy
+# still updates every model parameter; only the semantic-energy objective stops at the hidden
+# representations and updates the query/key/score compatibility head.
+[training.ruliad_supervision.proof_policy]
+gradient_scope = "score_head_only"

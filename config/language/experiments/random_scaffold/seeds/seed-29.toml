@@ -1,0 +1,5 @@
+[model.random_scaffold]
+seed = 29
+
+[training]
+seed = 29

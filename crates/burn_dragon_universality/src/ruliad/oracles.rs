@@ -10,16 +10,29 @@ use crate::ruliad::category::{
     generate_category_fields, naturality_commutes, valid_finite_category, valid_functor,
 };
 use crate::ruliad::config::{
-    RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadTaskKind,
-    ruliad_source_semantics,
+    RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind, RuliadFormalGeneralizationContract,
+    RuliadFormalTaskMixConfig, RuliadMathDomain, RuliadProofActionAnswerContract,
+    RuliadReasoningMode, RuliadTaskKind, ruliad_source_semantics,
 };
 use crate::ruliad::eca;
+use crate::ruliad::formal::{
+    RuliadFormalGenerationSplit, RuliadFormalGeneratorConfig, corrupt_formal_certificate,
+    generate_formal_bundle,
+};
+use crate::ruliad::ir::{
+    RuliadFormalDomain, RuliadProofCertificate, RuliadProofProblem, RuliadProofSource,
+    RuliadRewriteDirection, RuliadTerm,
+};
+use crate::ruliad::kernel::{
+    RuliadKernelLimits, complexity_vector, replay_certificate, replay_goal_prefix,
+};
 use crate::ruliad::rng::{SplitMix64, mix_seed};
 use crate::ruliad::source_selection::RuliadSourceBucket;
 use crate::ruliad::stable_json::{sha256_hex, stable_json_hash};
+use crate::ruliad::wire::{encode_certificate, encode_model_certificate, encode_problem};
 use crate::stats::SampleStats;
 
-pub const RULIAD_VERIFIER_VERSION: u32 = 1;
+pub const RULIAD_VERIFIER_VERSION: u32 = 9;
 
 const TRAIN_SPLIT_TAG: u64 = 0xA11C_E5ED_D15C_A11A;
 const VAL_SPLIT_TAG: u64 = 0xBADC_0FFE_E5E1_7A1D;
@@ -154,6 +167,21 @@ pub enum RuliadSampleSpec {
         holds: bool,
         lemmas: Vec<String>,
         proof_steps: Vec<String>,
+        task: RuliadTaskKind,
+    },
+    FormalProof {
+        problem: RuliadProofProblem,
+        certificate: RuliadProofCertificate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate: Option<RuliadProofCertificate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof_step_index: Option<usize>,
+        /// Cyclic action-menu presentation used by `select_proof_action` documents.
+        /// Missing values preserve the version-7 canonical presentation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_presentation_rotation: Option<usize>,
+        #[serde(default)]
+        action_answer_contract: RuliadProofActionAnswerContract,
         task: RuliadTaskKind,
     },
     LeanTask {
@@ -291,10 +319,48 @@ pub fn generate_sample(
         RuliadFamilyKind::Algebra => generate_algebra_spec(&family_config, &mut rng),
         RuliadFamilyKind::Category => generate_category_spec(&family_config, &mut rng),
         RuliadFamilyKind::ProofTree => generate_proof_tree_spec(&family_config, &mut rng),
+        RuliadFamilyKind::FormalProof => {
+            let task = choose_formal_task(&config.source_selection.formal_task_mix, &mut rng);
+            generate_formal_spec(
+                &family_config,
+                task,
+                config
+                    .source_selection
+                    .formal_task_mix
+                    .proof_action_answer_contract,
+                formal_generation_split(config.formal_generalization, split),
+                &mut rng,
+            )
+        }
         RuliadFamilyKind::LeanTask => generate_lean_spec(proof_tasks, &mut rng),
         RuliadFamilyKind::HashNoise => generate_hash_noise_spec(&mut rng),
     }?;
     finalize_generated_spec(spec)
+}
+
+fn choose_formal_task(mix: &RuliadFormalTaskMixConfig, rng: &mut SplitMix64) -> RuliadTaskKind {
+    let weights = [
+        (RuliadTaskKind::AdvanceProof, mix.advance_proof_weight),
+        (
+            RuliadTaskKind::SelectProofAction,
+            mix.select_proof_action_weight,
+        ),
+        (RuliadTaskKind::ConstructProof, mix.construct_proof_weight),
+        (RuliadTaskKind::CheckProof, mix.check_proof_weight),
+    ];
+    let total = weights
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<usize>()
+        .max(1);
+    let mut draw = rng.next_usize(total);
+    for (task, weight) in weights {
+        if draw < weight {
+            return task;
+        }
+        draw = draw.saturating_sub(weight);
+    }
+    RuliadTaskKind::ConstructProof
 }
 
 pub fn generate_sample_for_source_bucket(
@@ -322,10 +388,37 @@ pub fn generate_sample_for_source_bucket(
             generate_category_spec_for_task(&bucket.family_config, bucket.id.task_kind, &mut rng)
         }
         RuliadFamilyKind::ProofTree => generate_proof_tree_spec(&bucket.family_config, &mut rng),
+        RuliadFamilyKind::FormalProof => generate_formal_spec(
+            &bucket.family_config,
+            bucket.id.task_kind,
+            config
+                .source_selection
+                .formal_task_mix
+                .proof_action_answer_contract,
+            formal_generation_split(config.formal_generalization, split),
+            &mut rng,
+        ),
         RuliadFamilyKind::LeanTask => generate_lean_spec(proof_tasks, &mut rng),
         RuliadFamilyKind::HashNoise => generate_hash_noise_spec(&mut rng),
     }?;
     finalize_generated_spec(spec)
+}
+
+fn formal_generation_split(
+    contract: RuliadFormalGeneralizationContract,
+    split: SampleSplit,
+) -> RuliadFormalGenerationSplit {
+    match (contract, split) {
+        (RuliadFormalGeneralizationContract::SeedDisjointV1, _) => {
+            RuliadFormalGenerationSplit::Shared
+        }
+        (RuliadFormalGeneralizationContract::StructuralHoldoutV1, SampleSplit::Train) => {
+            RuliadFormalGenerationSplit::StructuralTrainV1
+        }
+        (RuliadFormalGeneralizationContract::StructuralHoldoutV1, SampleSplit::Validation) => {
+            RuliadFormalGenerationSplit::StructuralValidationV1
+        }
+    }
 }
 
 fn finalize_generated_spec(spec: RuliadSampleSpec) -> Result<GeneratedRuliadSample> {
@@ -548,6 +641,77 @@ pub fn ruliad_categorical_presentation(spec: &RuliadSampleSpec) -> RuliadCategor
             answer: format!("holds={holds};lhs={lhs};rhs={rhs}"),
             categorical_core: true,
         },
+        RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            candidate,
+            proof_step_index,
+            action_presentation_rotation,
+            task,
+            ..
+        } => {
+            let candidate_report = candidate.as_ref().map(|candidate| {
+                replay_certificate(problem, candidate, RuliadKernelLimits::default())
+            });
+            RuliadCategoricalPresentation {
+                abstraction: "verified_derivation_category".to_string(),
+                source_family: RuliadFamilyKind::FormalProof.label().to_string(),
+                task_kind: task.label().to_string(),
+                presentation: format!("{}_proof_dag", problem.domain.label()),
+                objects: problem.goals.iter().map(|goal| goal.id.clone()).collect(),
+                morphisms: problem
+                    .axioms
+                    .iter()
+                    .map(|axiom| axiom.id.clone())
+                    .chain(
+                        problem
+                            .goals
+                            .iter()
+                            .enumerate()
+                            .map(|(index, _)| format!("lemma_{index}")),
+                    )
+                    .collect(),
+                functors: vec!["portable_replay_kernel".to_string()],
+                laws: vec![
+                    "substitution_preserves_equality".to_string(),
+                    "verified_derivations_compose".to_string(),
+                    "dependency_order_is_acyclic".to_string(),
+                ],
+                query: match task {
+                    RuliadTaskKind::ConstructProof => {
+                        "construct a certificate whose replay closes the root obligation"
+                            .to_string()
+                    }
+                    RuliadTaskKind::AdvanceProof => format!(
+                        "advance verifier-backed proof transition {} toward the root obligation",
+                        proof_step_index.unwrap_or_default()
+                    ),
+                    RuliadTaskKind::SelectProofAction => format!(
+                        "select verifier-backed proof action {} toward the root obligation under cyclic presentation {}",
+                        proof_step_index.unwrap_or_default(),
+                        action_presentation_rotation.unwrap_or_default()
+                    ),
+                    RuliadTaskKind::CheckProof => {
+                        "replay the proposed certificate and localize its first failure".to_string()
+                    }
+                    _ => "verify a formal Ruliad proof".to_string(),
+                },
+                answer: if *task == RuliadTaskKind::AdvanceProof {
+                    "one replayable proof-DAG edge".to_string()
+                } else if *task == RuliadTaskKind::SelectProofAction {
+                    "one selected verifier-backed proof action".to_string()
+                } else if let Some(report) = candidate_report {
+                    formal_check_answer(&report)
+                } else {
+                    format!(
+                        "certificate={};root={}",
+                        compact_text(&certificate.problem_hash, 16),
+                        problem.root
+                    )
+                },
+                categorical_core: true,
+            }
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             payload_hash,
@@ -820,6 +984,56 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
                 && proof_steps.len() >= 4;
             (ok, RuliadFamilyKind::ProofTree, *task)
         }
+        RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            candidate,
+            proof_step_index,
+            action_presentation_rotation,
+            task,
+            ..
+        } => {
+            let oracle = replay_certificate(problem, certificate, RuliadKernelLimits::default());
+            let task_shape_ok = match task {
+                RuliadTaskKind::ConstructProof => {
+                    candidate.is_none()
+                        && proof_step_index.is_none()
+                        && action_presentation_rotation.is_none()
+                }
+                RuliadTaskKind::AdvanceProof => {
+                    candidate.is_none()
+                        && action_presentation_rotation.is_none()
+                        && proof_step_index
+                            .is_some_and(|index| certificate.step_at(index).is_some())
+                }
+                RuliadTaskKind::SelectProofAction => {
+                    candidate.is_none()
+                        && proof_step_index.is_some_and(|index| {
+                            crate::ruliad::policy::oracle_proof_action_set(
+                                problem,
+                                certificate,
+                                index,
+                                crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+                            )
+                            .is_ok_and(|actions| {
+                                action_presentation_rotation
+                                    .is_none_or(|rotation| rotation < actions.candidates.len())
+                            })
+                        })
+                }
+                RuliadTaskKind::CheckProof => {
+                    candidate.is_some()
+                        && proof_step_index.is_none()
+                        && action_presentation_rotation.is_none()
+                }
+                _ => false,
+            };
+            (
+                oracle.accepted && task_shape_ok,
+                RuliadFamilyKind::FormalProof,
+                *task,
+            )
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
@@ -862,7 +1076,27 @@ pub fn verify_spec(spec: &RuliadSampleSpec) -> Result<RuliadOracleReport> {
 }
 
 pub fn sample_text(spec: &RuliadSampleSpec, oracle_hash: &str) -> String {
-    proof_tape_document(spec, oracle_hash).to_text()
+    match spec {
+        RuliadSampleSpec::FormalProof { .. } => formal_proof_document(spec, oracle_hash)
+            .unwrap_or_else(|error| format!("[R3 invalid]\nE:{error}\n[/R3]\n")),
+        _ => proof_tape_document(spec, oracle_hash).to_text(),
+    }
+}
+
+pub const RULIAD_V2_DOCUMENT_CLOSE_MARKER: &str = "[/R2]";
+pub const RULIAD_V3_DOCUMENT_CLOSE_MARKER: &str = "[/R3]";
+
+/// Return the document terminator belonging to the sample's wire format.
+///
+/// R3 formal proofs intentionally use a different textual envelope from the
+/// compact R2 proof tapes. Keeping this decision next to serialization avoids
+/// completion, evaluation, and stop-token paths drifting from the generator.
+pub fn ruliad_document_close_marker(spec: &RuliadSampleSpec) -> &'static str {
+    if matches!(spec, RuliadSampleSpec::FormalProof { .. }) {
+        RULIAD_V3_DOCUMENT_CLOSE_MARKER
+    } else {
+        RULIAD_V2_DOCUMENT_CLOSE_MARKER
+    }
 }
 
 pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
@@ -870,7 +1104,25 @@ pub fn ruliad_expected_answer(spec: &RuliadSampleSpec) -> String {
 }
 
 pub fn ruliad_answer_contract(spec: &RuliadSampleSpec) -> String {
-    compact_answer_keys(&compact_answer(spec))
+    match spec {
+        RuliadSampleSpec::FormalProof {
+            task: RuliadTaskKind::ConstructProof,
+            ..
+        } => "certificate".to_string(),
+        RuliadSampleSpec::FormalProof {
+            task: RuliadTaskKind::AdvanceProof,
+            ..
+        } => "proof_step".to_string(),
+        RuliadSampleSpec::FormalProof {
+            task: RuliadTaskKind::SelectProofAction,
+            action_answer_contract,
+            ..
+        } => match action_answer_contract {
+            RuliadProofActionAnswerContract::PresentationIndex => "action_index".to_string(),
+            RuliadProofActionAnswerContract::SemanticStep => "proof_action_step".to_string(),
+        },
+        _ => compact_answer_keys(&compact_answer(spec)),
+    }
 }
 
 pub fn ruliad_answer_values(spec: &RuliadSampleSpec) -> String {
@@ -884,6 +1136,452 @@ pub fn ruliad_prompt_prefix(spec: &RuliadSampleSpec, oracle_hash: &str) -> Strin
     } else {
         text
     }
+}
+
+fn formal_proof_document(spec: &RuliadSampleSpec, oracle_hash: &str) -> Result<String> {
+    let RuliadSampleSpec::FormalProof {
+        problem,
+        certificate,
+        candidate,
+        proof_step_index,
+        action_presentation_rotation,
+        action_answer_contract,
+        task,
+    } = spec
+    else {
+        return Err(anyhow!("formal document requires a formal proof spec"));
+    };
+    let problem_wire = encode_problem(problem)?;
+    let (query, answer) = match task {
+        RuliadTaskKind::ConstructProof => (
+            format!("?:root={}", problem.root),
+            encode_model_certificate(certificate)?,
+        ),
+        RuliadTaskKind::AdvanceProof => formal_advance_query(
+            problem,
+            certificate,
+            proof_step_index
+                .ok_or_else(|| anyhow!("advance-proof document requires proof_step_index"))?,
+        )?,
+        RuliadTaskKind::SelectProofAction => formal_select_action_query(
+            problem,
+            certificate,
+            proof_step_index
+                .ok_or_else(|| anyhow!("proof-action document requires proof_step_index"))?,
+            *action_presentation_rotation,
+            *action_answer_contract,
+        )?,
+        RuliadTaskKind::CheckProof => {
+            let candidate = candidate
+                .as_ref()
+                .ok_or_else(|| anyhow!("check-proof document requires candidate"))?;
+            (
+                format!("?:root={}", problem.root),
+                formal_check_answer(&replay_certificate(
+                    problem,
+                    candidate,
+                    RuliadKernelLimits::default(),
+                )),
+            )
+        }
+        _ => return Err(anyhow!("unsupported formal proof task {task:?}")),
+    };
+    let candidate_line = candidate
+        .as_ref()
+        .map(encode_certificate)
+        .transpose()?
+        .map(|payload| format!("C:{payload}\n"))
+        .unwrap_or_default();
+    Ok(format!(
+        "[R3 {} {}/{}]\nP:{}\n{}{}\n!:{}\n[/R3]\n",
+        compact_text(oracle_hash, 16),
+        problem.domain.label(),
+        task.label(),
+        problem_wire,
+        candidate_line,
+        query,
+        answer
+    ))
+}
+
+fn formal_advance_query(
+    problem: &RuliadProofProblem,
+    certificate: &RuliadProofCertificate,
+    step_index: usize,
+) -> Result<(String, String)> {
+    let prefix = certificate
+        .prefix_before(step_index)
+        .ok_or_else(|| anyhow!("advance-proof step index {step_index} is out of bounds"))?;
+    let next = certificate
+        .single_step_at(step_index)
+        .ok_or_else(|| anyhow!("advance-proof step index {step_index} is out of bounds"))?;
+    let next_goal = next
+        .goals
+        .first()
+        .ok_or_else(|| anyhow!("advance-proof transition has no goal"))?;
+    let local_prefix = prefix
+        .goals
+        .iter()
+        .find(|candidate| candidate.goal == next_goal.goal)
+        .map(|candidate| candidate.steps.as_slice())
+        .unwrap_or_default();
+    let current = replay_goal_prefix(
+        problem,
+        next_goal.goal,
+        local_prefix,
+        RuliadKernelLimits::default(),
+    )
+    .map_err(|failure| anyhow!("invalid advance-proof prefix: {}", failure.message))?;
+    let step = next_goal
+        .steps
+        .first()
+        .ok_or_else(|| anyhow!("advance-proof transition has no step"))?;
+    let mut advanced_prefix = local_prefix.to_vec();
+    advanced_prefix.push(step.clone());
+    let advanced = replay_goal_prefix(
+        problem,
+        next_goal.goal,
+        &advanced_prefix,
+        RuliadKernelLimits::default(),
+    )
+    .map_err(|failure| anyhow!("invalid advance-proof step: {}", failure.message))?;
+    current
+        .at_path(&step.path)
+        .ok_or_else(|| anyhow!("advance-proof rewrite path is absent before the step"))?;
+    advanced
+        .at_path(&step.path)
+        .ok_or_else(|| anyhow!("advance-proof rewrite path is absent after the step"))?;
+    let source = match &step.source {
+        RuliadProofSource::Axiom { id } => format!("a:{id}"),
+        RuliadProofSource::Lemma { goal } => format!("l:{goal}"),
+    };
+    let (source_lhs, source_rhs) = formal_proof_source_equality(problem, &step.source)?;
+    let (before_pattern, after_pattern) = match step.direction {
+        RuliadRewriteDirection::Forward => (source_lhs, source_rhs),
+        RuliadRewriteDirection::Reverse => (source_rhs, source_lhs),
+    };
+    let (before_focus, after_focus) = transition_pattern_focus(before_pattern, after_pattern);
+    let path = if step.path.is_empty() {
+        "-".to_string()
+    } else {
+        step.path
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let query = format!(
+        "?:advance;g={};p={};cur={};dst={};src={}",
+        next_goal.goal,
+        path,
+        bounded_transition_pattern(before_focus),
+        bounded_transition_pattern(after_focus),
+        source,
+    );
+    Ok((query, encode_model_certificate(&next)?))
+}
+
+fn formal_select_action_query(
+    problem: &RuliadProofProblem,
+    certificate: &RuliadProofCertificate,
+    step_index: usize,
+    presentation_rotation: Option<usize>,
+    answer_contract: RuliadProofActionAnswerContract,
+) -> Result<(String, String)> {
+    let actions = crate::ruliad::policy::oracle_proof_action_set(
+        problem,
+        certificate,
+        step_index,
+        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+    )?;
+    let actions = actions
+        .rotate_left(presentation_rotation.unwrap_or_default() % actions.candidates.len().max(1))?;
+    let answer = crate::ruliad::policy::proof_action_answer(
+        &actions,
+        actions.selected_index,
+        answer_contract,
+    )?;
+    Ok((ruliad_proof_action_query(problem, &actions)?, answer))
+}
+
+pub fn ruliad_proof_action_query(
+    problem: &RuliadProofProblem,
+    actions: &crate::ruliad::policy::RuliadProofActionSet,
+) -> Result<String> {
+    let candidates = actions
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let source = match &candidate.step.source {
+                RuliadProofSource::Axiom { id } => format!("a:{id}"),
+                RuliadProofSource::Lemma { goal } => format!("l:{goal}"),
+            };
+            let direction = match candidate.step.direction {
+                RuliadRewriteDirection::Forward => "f",
+                RuliadRewriteDirection::Reverse => "r",
+            };
+            let path = if candidate.step.path.is_empty() {
+                "-".to_string()
+            } else {
+                candidate
+                    .step
+                    .path
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            };
+            let (lhs, rhs) = formal_proof_source_equality(problem, &candidate.step.source)?;
+            let (before, after) = match candidate.step.direction {
+                RuliadRewriteDirection::Forward => (lhs, rhs),
+                RuliadRewriteDirection::Reverse => (rhs, lhs),
+            };
+            let (before, after) = transition_pattern_focus(before, after);
+            Ok(format!(
+                "c{index}={source}|{direction}|{path}|{}>{}",
+                bounded_transition_pattern(before),
+                bounded_transition_pattern(after)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    let (difference_path, current_focus, target_focus) =
+        first_state_difference(&actions.current, &actions.target);
+    let difference_path = if difference_path.is_empty() {
+        "-".to_string()
+    } else {
+        difference_path
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    Ok(format!(
+        "?:select;g={};cur={};{};dst={};at={}",
+        actions.goal,
+        bounded_policy_state(current_focus),
+        candidates,
+        bounded_policy_state(target_focus),
+        difference_path
+    ))
+}
+
+pub fn ruliad_proof_action_prompt(
+    problem: &RuliadProofProblem,
+    actions: &crate::ruliad::policy::RuliadProofActionSet,
+) -> Result<String> {
+    let problem_hash = problem.canonical_hash()?;
+    Ok(format!(
+        "[R3 {} {}/select_proof_action]\nP:{}\n{}\n!:",
+        compact_text(&problem_hash, 16),
+        problem.domain.label(),
+        encode_problem(problem)?,
+        ruliad_proof_action_query(problem, actions)?,
+    ))
+}
+
+fn first_state_difference<'a>(
+    current: &'a RuliadTerm,
+    target: &'a RuliadTerm,
+) -> (Vec<usize>, &'a RuliadTerm, &'a RuliadTerm) {
+    fn recurse<'a>(
+        current: &'a RuliadTerm,
+        target: &'a RuliadTerm,
+        path: &mut Vec<usize>,
+    ) -> (&'a RuliadTerm, &'a RuliadTerm) {
+        let (
+            RuliadTerm::Apply {
+                operator: current_operator,
+                arguments: current_arguments,
+            },
+            RuliadTerm::Apply {
+                operator: target_operator,
+                arguments: target_arguments,
+            },
+        ) = (current, target)
+        else {
+            return (current, target);
+        };
+        if current_operator != target_operator || current_arguments.len() != target_arguments.len()
+        {
+            return (current, target);
+        }
+        let Some((index, (current, target))) = current_arguments
+            .iter()
+            .zip(target_arguments)
+            .enumerate()
+            .find(|(_, (current, target))| current != target)
+        else {
+            return (current, target);
+        };
+        path.push(index);
+        recurse(current, target, path)
+    }
+
+    let mut path = Vec::new();
+    let (current, target) = recurse(current, target, &mut path);
+    (path, current, target)
+}
+
+fn bounded_policy_state(term: &RuliadTerm) -> String {
+    let canonical = term.canonical_text();
+    if canonical.chars().count() <= 96 {
+        return canonical;
+    }
+    let detailed = render_transition_pattern(term, 0, 4, 4, 12);
+    if detailed.chars().count() <= 96 {
+        detailed
+    } else {
+        render_transition_pattern(term, 0, 3, 3, 8)
+    }
+}
+
+fn formal_proof_source_equality<'a>(
+    problem: &'a RuliadProofProblem,
+    source: &RuliadProofSource,
+) -> Result<(&'a RuliadTerm, &'a RuliadTerm)> {
+    match source {
+        RuliadProofSource::Axiom { id } => problem
+            .axioms
+            .iter()
+            .find(|axiom| axiom.id == *id)
+            .map(|axiom| (&axiom.lhs, &axiom.rhs)),
+        RuliadProofSource::Lemma { goal } => problem
+            .goals
+            .get(*goal)
+            .map(|goal| (&goal.claim.lhs, &goal.claim.rhs)),
+    }
+    .ok_or_else(|| anyhow!("advance-proof transition references an unknown source"))
+}
+
+fn bounded_transition_pattern(term: &RuliadTerm) -> String {
+    let detailed = render_transition_pattern(term, 0, 2, 2, 12);
+    if detailed.chars().count() <= 24 {
+        return detailed;
+    }
+    let shallow = render_transition_pattern(term, 0, 1, 2, 8);
+    if shallow.chars().count() <= 24 {
+        return shallow;
+    }
+    match term {
+        RuliadTerm::Variable { index } => format!("?{index}"),
+        RuliadTerm::Atom { symbol } => bounded_transition_symbol(symbol, 24),
+        RuliadTerm::Apply { operator, .. } => {
+            format!("{}(_)", bounded_transition_symbol(operator, 20))
+        }
+    }
+}
+
+fn transition_pattern_focus<'a>(
+    before: &'a RuliadTerm,
+    after: &'a RuliadTerm,
+) -> (&'a RuliadTerm, &'a RuliadTerm) {
+    let (
+        RuliadTerm::Apply {
+            operator: before_operator,
+            arguments: before_arguments,
+        },
+        RuliadTerm::Apply {
+            operator: after_operator,
+            arguments: after_arguments,
+        },
+    ) = (before, after)
+    else {
+        return (before, after);
+    };
+    if before_operator != after_operator || before_arguments.len() != after_arguments.len() {
+        return (before, after);
+    }
+    let mut differences = before_arguments
+        .iter()
+        .zip(after_arguments)
+        .filter(|(left, right)| left != right);
+    let Some((different_before, different_after)) = differences.next() else {
+        return (before, after);
+    };
+    if differences.next().is_some() {
+        return (before, after);
+    }
+    transition_pattern_focus(different_before, different_after)
+}
+
+fn render_transition_pattern(
+    term: &RuliadTerm,
+    depth: usize,
+    max_depth: usize,
+    max_arguments: usize,
+    max_symbol_chars: usize,
+) -> String {
+    match term {
+        RuliadTerm::Variable { index } => format!("?{index}"),
+        RuliadTerm::Atom { symbol } => bounded_transition_symbol(symbol, max_symbol_chars),
+        RuliadTerm::Apply {
+            operator,
+            arguments,
+        } if depth < max_depth => {
+            let mut rendered = arguments
+                .iter()
+                .take(max_arguments)
+                .map(|argument| {
+                    render_transition_pattern(
+                        argument,
+                        depth.saturating_add(1),
+                        max_depth,
+                        max_arguments,
+                        max_symbol_chars,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if arguments.len() > rendered.len() {
+                rendered.push("_".to_string());
+            }
+            format!(
+                "{}({})",
+                bounded_transition_symbol(operator, max_symbol_chars),
+                rendered.join(",")
+            )
+        }
+        RuliadTerm::Apply { .. } => "_".to_string(),
+    }
+}
+
+fn bounded_transition_symbol(symbol: &str, max_chars: usize) -> String {
+    if symbol.chars().count() <= max_chars {
+        symbol.to_string()
+    } else {
+        let prefix = symbol
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        format!("{prefix}~")
+    }
+}
+
+fn formal_check_answer(report: &crate::ruliad::kernel::RuliadReplayReport) -> String {
+    let kind = report
+        .failure
+        .as_ref()
+        .map(|failure| failure.kind.label())
+        .unwrap_or("none");
+    let failed_goal = report
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.goal)
+        .map(|goal| goal.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let failed_step = report
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.step)
+        .map(|step| step.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "ok={};vg={};vs={};g={failed_goal};s={failed_step};k={kind}",
+        bit(report.accepted),
+        report.verified_goals,
+        report.verified_steps
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1026,6 +1724,14 @@ fn compact_query(spec: &RuliadSampleSpec) -> String {
         RuliadSampleSpec::ProofTree { modulus, .. } => {
             format!("ss:Z/{modulus}Z")
         }
+        RuliadSampleSpec::FormalProof { problem, task, .. } => {
+            format!(
+                "{}:root{}:{}",
+                problem.domain.label(),
+                problem.root,
+                task.label()
+            )
+        }
         RuliadSampleSpec::LeanTask { task_id, .. } => format!("ln:{task_id}"),
         RuliadSampleSpec::HashNoise { .. } => "sha:canary".to_string(),
     }
@@ -1120,6 +1826,7 @@ fn compact_proof_steps(spec: &RuliadSampleSpec) -> Vec<String> {
             }
             steps
         }
+        RuliadSampleSpec::FormalProof { .. } => Vec::new(),
         RuliadSampleSpec::LeanTask { .. } => vec!["h=1".to_string()],
         RuliadSampleSpec::HashNoise { .. } => vec!["h=1".to_string()],
     }
@@ -1147,6 +1854,60 @@ fn compact_answer(spec: &RuliadSampleSpec) -> String {
         } => {
             format!("ok={};l={lhs};r={rhs}", bit(*holds))
         }
+        RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            candidate,
+            proof_step_index,
+            action_presentation_rotation,
+            action_answer_contract,
+            task,
+        } => match task {
+            RuliadTaskKind::ConstructProof => encode_model_certificate(certificate)
+                .unwrap_or_else(|error| format!("invalid_certificate={error}")),
+            RuliadTaskKind::AdvanceProof => proof_step_index
+                .and_then(|index| certificate.single_step_at(index))
+                .and_then(|next| encode_model_certificate(&next).ok())
+                .unwrap_or_else(|| "invalid_transition".to_string()),
+            RuliadTaskKind::SelectProofAction => proof_step_index
+                .and_then(|index| {
+                    crate::ruliad::policy::oracle_proof_action_set(
+                        problem,
+                        certificate,
+                        index,
+                        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+                    )
+                    .ok()
+                })
+                .and_then(|actions| {
+                    actions
+                        .rotate_left(
+                            action_presentation_rotation.unwrap_or_default()
+                                % actions.candidates.len().max(1),
+                        )
+                        .ok()
+                })
+                .and_then(|actions| {
+                    crate::ruliad::policy::proof_action_answer(
+                        &actions,
+                        actions.selected_index,
+                        *action_answer_contract,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| "invalid_action_set".to_string()),
+            RuliadTaskKind::CheckProof => candidate
+                .as_ref()
+                .map(|candidate| {
+                    formal_check_answer(&replay_certificate(
+                        problem,
+                        candidate,
+                        RuliadKernelLimits::default(),
+                    ))
+                })
+                .unwrap_or_else(|| "invalid_candidate".to_string()),
+            _ => "invalid_formal_task".to_string(),
+        },
         RuliadSampleSpec::LeanTask { payload_hash, .. } => format!("sha={payload_hash}"),
         RuliadSampleSpec::HashNoise { payload_hash, .. } => format!("sha={payload_hash}"),
     }
@@ -1320,6 +2081,9 @@ fn compact_data(spec: &RuliadSampleSpec) -> Vec<String> {
             format!("sum={},{};dot={dot}", sum[0], sum[1]),
             format!("norms={norm_u},{norm_v},{norm_sum}"),
         ],
+        RuliadSampleSpec::FormalProof { problem, .. } => {
+            vec![encode_problem(problem).unwrap_or_else(|error| format!("invalid_problem={error}"))]
+        }
         RuliadSampleSpec::LeanTask {
             task_id,
             statement,
@@ -1701,6 +2465,7 @@ fn family_of_spec(spec: &RuliadSampleSpec) -> RuliadFamilyKind {
         RuliadSampleSpec::Algebra { .. } => RuliadFamilyKind::Algebra,
         RuliadSampleSpec::Category { .. } => RuliadFamilyKind::Category,
         RuliadSampleSpec::ProofTree { .. } => RuliadFamilyKind::ProofTree,
+        RuliadSampleSpec::FormalProof { .. } => RuliadFamilyKind::FormalProof,
         RuliadSampleSpec::LeanTask { .. } => RuliadFamilyKind::LeanTask,
         RuliadSampleSpec::HashNoise { .. } => RuliadFamilyKind::HashNoise,
     }
@@ -1715,9 +2480,38 @@ fn task_kind_of_spec(spec: &RuliadSampleSpec) -> RuliadTaskKind {
         | RuliadSampleSpec::Algebra { task, .. }
         | RuliadSampleSpec::Category { task, .. }
         | RuliadSampleSpec::ProofTree { task, .. }
+        | RuliadSampleSpec::FormalProof { task, .. }
         | RuliadSampleSpec::LeanTask { task, .. }
         | RuliadSampleSpec::HashNoise { task, .. } => *task,
     }
+}
+
+pub fn ruliad_sample_math_domains(spec: &RuliadSampleSpec) -> Vec<RuliadMathDomain> {
+    if let RuliadSampleSpec::FormalProof { problem, .. } = spec {
+        let domain = match problem.domain {
+            RuliadFormalDomain::Equational => vec![
+                RuliadMathDomain::SymbolicRewriting,
+                RuliadMathDomain::UniversalAlgebra,
+            ],
+            RuliadFormalDomain::Category => vec![RuliadMathDomain::CategoryTheory],
+            RuliadFormalDomain::Logic => vec![RuliadMathDomain::Logic],
+            RuliadFormalDomain::Automata => vec![RuliadMathDomain::ComputationTheory],
+            RuliadFormalDomain::Process => vec![RuliadMathDomain::ProcessCalculus],
+            RuliadFormalDomain::Metagraph => vec![RuliadMathDomain::MetagraphRewriting],
+        };
+        return domain
+            .into_iter()
+            .chain(std::iter::once(RuliadMathDomain::FormalProof))
+            .collect();
+    }
+    let semantics = ruliad_source_semantics(family_of_spec(spec), task_kind_of_spec(spec));
+    semantics.math_domains.to_vec()
+}
+
+pub fn ruliad_sample_reasoning_modes(spec: &RuliadSampleSpec) -> Vec<RuliadReasoningMode> {
+    ruliad_source_semantics(family_of_spec(spec), task_kind_of_spec(spec))
+        .reasoning_modes
+        .to_vec()
 }
 
 fn choose_family<'a>(
@@ -1746,7 +2540,11 @@ pub(crate) fn scale_family_for_difficulty(
         return family.clone();
     }
     let mut scaled = family.clone();
-    let level = difficulty_level.min(4096);
+    let level = if family.kind == RuliadFamilyKind::FormalProof {
+        difficulty_level.saturating_add(1).ilog2().saturating_add(1) as usize
+    } else {
+        difficulty_level.min(4096)
+    };
     if let Some(width) = scaled.width.as_mut() {
         let stride = (width.max.saturating_sub(width.min).max(1) / 2).max(1);
         let bump = stride.saturating_mul(level);
@@ -1772,6 +2570,7 @@ fn cap_scaled_family_for_payload(family: &mut RuliadFamilyConfig) {
         RuliadFamilyKind::Algebra => (Some(64), None),
         RuliadFamilyKind::Category => (Some(48), Some(64)),
         RuliadFamilyKind::ProofTree => (Some(4096), Some(4096)),
+        RuliadFamilyKind::FormalProof => (None, None),
         RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => (None, None),
     };
     if let (Some(width), Some(max_width)) = (family.width.as_mut(), max_width) {
@@ -2118,6 +2917,72 @@ fn generate_proof_tree_spec(
     })
 }
 
+fn generate_formal_spec(
+    family: &RuliadFamilyConfig,
+    task: RuliadTaskKind,
+    action_answer_contract: RuliadProofActionAnswerContract,
+    generation_split: RuliadFormalGenerationSplit,
+    rng: &mut SplitMix64,
+) -> Result<RuliadSampleSpec> {
+    if !matches!(
+        task,
+        RuliadTaskKind::ConstructProof
+            | RuliadTaskKind::AdvanceProof
+            | RuliadTaskKind::SelectProofAction
+            | RuliadTaskKind::CheckProof
+    ) {
+        return Err(anyhow!(
+            "formal proof family does not support task {task:?}"
+        ));
+    }
+    let leaf_count = range_or(family.width, 2, 4, rng).max(2);
+    let rewrite_depth = range_or(family.steps, 2, 4, rng).max(2);
+    let context_depth = 1usize.saturating_add(rewrite_depth.ilog2() as usize);
+    let bundle = generate_formal_bundle(
+        rng.next_u64(),
+        RuliadFormalGeneratorConfig {
+            domain: None,
+            rewrite_depth,
+            leaf_count,
+            context_depth,
+            distractor_axioms: rewrite_depth.div_ceil(2),
+            generation_split,
+        },
+    )?;
+    let candidate = if task == RuliadTaskKind::CheckProof {
+        Some(if rng.next_bool() {
+            bundle.certificate.clone()
+        } else {
+            corrupt_formal_certificate(&bundle.certificate)?
+        })
+    } else {
+        None
+    };
+    let proof_step_index = if matches!(
+        task,
+        RuliadTaskKind::AdvanceProof | RuliadTaskKind::SelectProofAction
+    ) {
+        let step_count = bundle.certificate.step_count();
+        if step_count == 0 {
+            return Err(anyhow!("advance-proof oracle certificate has no steps"));
+        }
+        Some(rng.next_usize(step_count))
+    } else {
+        None
+    };
+    let action_presentation_rotation = (task == RuliadTaskKind::SelectProofAction)
+        .then(|| rng.next_usize(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES));
+    Ok(RuliadSampleSpec::FormalProof {
+        problem: bundle.problem,
+        certificate: bundle.certificate,
+        candidate,
+        proof_step_index,
+        action_presentation_rotation,
+        action_answer_contract,
+        task,
+    })
+}
+
 fn generate_lean_spec(
     proof_tasks: &[LeanProofTask],
     rng: &mut SplitMix64,
@@ -2447,6 +3312,22 @@ fn sample_stats(spec: &RuliadSampleSpec, text: &str) -> SampleStats {
             *modulus,
             0.75,
         ),
+        RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            ..
+        } => {
+            let complexity = complexity_vector(problem, Some(certificate));
+            (
+                complexity.syntax_nodes.max(1),
+                complexity.proof_step_count.max(1),
+                complexity
+                    .proof_goal_count
+                    .saturating_add(complexity.axiom_count)
+                    .max(1),
+                1.0,
+            )
+        }
         RuliadSampleSpec::LeanTask { proof, .. } => (1, proof.lines().count().max(1), 2, 0.25),
         RuliadSampleSpec::HashNoise { .. } => (1, 1, 256, 1.0),
     };
@@ -2516,6 +3397,23 @@ fn semantic_difficulty_score(
             lemmas.len(),
             7,
         ),
+        RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            ..
+        } => {
+            let complexity = complexity_vector(problem, Some(certificate));
+            (
+                complexity.syntax_nodes,
+                complexity
+                    .proof_step_count
+                    .saturating_add(complexity.dependency_depth),
+                complexity
+                    .axiom_count
+                    .saturating_add(complexity.dependency_width),
+                10,
+            )
+        }
         RuliadSampleSpec::LeanTask { proof, .. } => (2, proof.lines().count().max(1), 2, 6),
         RuliadSampleSpec::HashNoise { bytes_hex, .. } => (bytes_hex.len(), 1, 256, 0),
     };
@@ -2569,6 +3467,7 @@ pub(crate) fn is_degenerate_spec(spec: &RuliadSampleSpec) -> bool {
         RuliadSampleSpec::Algebra { .. }
         | RuliadSampleSpec::Category { .. }
         | RuliadSampleSpec::ProofTree { .. }
+        | RuliadSampleSpec::FormalProof { .. }
         | RuliadSampleSpec::LeanTask { .. }
         | RuliadSampleSpec::HashNoise { .. } => false,
     }
@@ -2627,7 +3526,7 @@ mod tests {
     use crate::config::UsizeRangeConfig;
     use crate::ruliad::config::{
         RULIAD_REQUIRED_MATH_DOMAINS, RULIAD_REQUIRED_REASONING_MODES, RuliadSerializationConfig,
-        RuliadTokenizationConfig, default_ruliad_families,
+        RuliadTokenizationConfig, default_ruliad_families, formal_ruliad_families,
     };
 
     fn config() -> RuliadCorpusConfig {
@@ -2640,6 +3539,7 @@ mod tests {
             chunk_token_capacity: 1024,
             serialization: RuliadSerializationConfig::default(),
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
             families: default_ruliad_families(),
             proof_tasks: None,
@@ -2694,6 +3594,218 @@ mod tests {
     }
 
     #[test]
+    fn advance_proof_sample_exposes_local_state_and_one_replayable_edge() {
+        let mut config = config();
+        config.families = formal_ruliad_families();
+        config.source_selection.formal_task_mix = RuliadFormalTaskMixConfig {
+            advance_proof_weight: 1,
+            select_proof_action_weight: 0,
+            construct_proof_weight: 0,
+            check_proof_weight: 0,
+            proof_action_answer_contract: RuliadProofActionAnswerContract::default(),
+        };
+        let sample =
+            generate_sample(&config, &[], SampleSplit::Train, 0, 7).expect("advance sample");
+        assert_eq!(sample.task_kind, RuliadTaskKind::AdvanceProof);
+        assert!(sample.text.contains("?:advance;g="), "{}", sample.text);
+        assert!(sample.text.contains(";p="), "{}", sample.text);
+        assert!(sample.text.contains(";cur="), "{}", sample.text);
+        assert!(sample.text.contains(";dst="), "{}", sample.text);
+        let query = sample
+            .text
+            .lines()
+            .find(|line| line.starts_with("?:advance;"))
+            .expect("advance query");
+        assert!(query.chars().count() <= 120, "{query}");
+        assert!(!query.contains(".."), "{query}");
+        assert_eq!(query.matches('(').count(), query.matches(')').count());
+        assert_eq!(ruliad_answer_contract(&sample.spec), "proof_step");
+
+        let RuliadSampleSpec::FormalProof {
+            certificate,
+            proof_step_index: Some(step_index),
+            ..
+        } = &sample.spec
+        else {
+            panic!("expected advance formal proof spec");
+        };
+        let expected = certificate
+            .single_step_at(*step_index)
+            .and_then(|next| encode_model_certificate(&next).ok())
+            .expect("single replayable edge");
+        assert_eq!(ruliad_expected_answer(&sample.spec), expected);
+        assert!(verify_spec(&sample.spec).expect("verify").ok);
+    }
+
+    #[test]
+    fn proof_action_sample_hides_selection_behind_a_verifier_backed_menu() {
+        let mut config = config();
+        config.families = formal_ruliad_families();
+        config.source_selection.formal_task_mix = RuliadFormalTaskMixConfig {
+            advance_proof_weight: 0,
+            select_proof_action_weight: 1,
+            construct_proof_weight: 0,
+            check_proof_weight: 0,
+            proof_action_answer_contract: RuliadProofActionAnswerContract::default(),
+        };
+        let sample =
+            generate_sample(&config, &[], SampleSplit::Train, 0, 11).expect("proof action sample");
+        assert_eq!(sample.task_kind, RuliadTaskKind::SelectProofAction);
+        let query = sample
+            .text
+            .lines()
+            .find(|line| line.starts_with("?:select;"))
+            .expect("action query");
+        assert!(query.contains(";cur="), "{query}");
+        assert!(query.contains(";dst="), "{query}");
+        assert!(query.contains(";at="), "{query}");
+        assert!(query.contains(";c0="), "{query}");
+        assert!(query.contains(",c1="), "{query}");
+        let current = query
+            .split(";cur=")
+            .nth(1)
+            .and_then(|suffix| suffix.split(";c0=").next())
+            .expect("current focus");
+        let target = query
+            .split(";dst=")
+            .nth(1)
+            .and_then(|suffix| suffix.split(";at=").next())
+            .expect("target focus");
+        assert_ne!(
+            current, target,
+            "action state must expose a live obligation"
+        );
+        assert_eq!(ruliad_answer_contract(&sample.spec), "action_index");
+        let RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            proof_step_index: Some(step_index),
+            action_presentation_rotation: Some(rotation),
+            ..
+        } = &sample.spec
+        else {
+            panic!("expected presented proof-action spec");
+        };
+        let actions = crate::ruliad::policy::oracle_proof_action_set(
+            problem,
+            certificate,
+            *step_index,
+            crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        )
+        .and_then(|actions| actions.rotate_left(*rotation))
+        .expect("presented actions");
+        assert_eq!(
+            ruliad_expected_answer(&sample.spec),
+            format!("c={}", actions.selected_index)
+        );
+        assert!(verify_spec(&sample.spec).expect("verify").ok);
+    }
+
+    #[test]
+    fn semantic_proof_action_sample_emits_a_rotation_invariant_executable_step() {
+        let mut config = config();
+        config.families = formal_ruliad_families();
+        config.source_selection.formal_task_mix = RuliadFormalTaskMixConfig {
+            advance_proof_weight: 0,
+            select_proof_action_weight: 1,
+            construct_proof_weight: 0,
+            check_proof_weight: 0,
+            proof_action_answer_contract: RuliadProofActionAnswerContract::SemanticStep,
+        };
+        let sample =
+            generate_sample(&config, &[], SampleSplit::Train, 0, 11).expect("semantic action");
+        assert_eq!(ruliad_answer_contract(&sample.spec), "proof_action_step");
+        assert!(sample.text.contains("!:g"), "{}", sample.text);
+        assert!(!sample.text.contains("!:c="), "{}", sample.text);
+        let RuliadSampleSpec::FormalProof {
+            problem,
+            certificate,
+            proof_step_index: Some(step_index),
+            action_presentation_rotation: Some(rotation),
+            ..
+        } = &sample.spec
+        else {
+            panic!("expected semantic proof-action spec");
+        };
+        let actions = crate::ruliad::policy::oracle_proof_action_set(
+            problem,
+            certificate,
+            *step_index,
+            crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        )
+        .and_then(|actions| actions.rotate_left(*rotation))
+        .expect("presented semantic actions");
+        let expected = crate::ruliad::policy::proof_action_answer(
+            &actions,
+            actions.selected_index,
+            RuliadProofActionAnswerContract::SemanticStep,
+        )
+        .expect("semantic answer");
+        assert_eq!(ruliad_expected_answer(&sample.spec), expected);
+        let rerotated = actions.rotate_left(1).expect("rerotated actions");
+        assert_eq!(
+            crate::ruliad::policy::proof_action_answer(
+                &rerotated,
+                rerotated.selected_index,
+                RuliadProofActionAnswerContract::SemanticStep,
+            )
+            .expect("rerotated semantic answer"),
+            expected
+        );
+        assert!(verify_spec(&sample.spec).expect("verify").ok);
+    }
+
+    #[test]
+    fn proof_action_primary_stream_spans_every_cyclic_presentation() {
+        let mut config = config();
+        config.families = formal_ruliad_families();
+        config.source_selection.formal_task_mix = RuliadFormalTaskMixConfig {
+            advance_proof_weight: 0,
+            select_proof_action_weight: 1,
+            construct_proof_weight: 0,
+            check_proof_weight: 0,
+            proof_action_answer_contract: RuliadProofActionAnswerContract::default(),
+        };
+        let mut counts = [0usize; crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES];
+        for sample_index in 0..128 {
+            let sample = generate_sample(&config, &[], SampleSplit::Train, 0, sample_index)
+                .expect("proof action sample");
+            let RuliadSampleSpec::FormalProof {
+                action_presentation_rotation: Some(rotation),
+                ..
+            } = sample.spec
+            else {
+                panic!("expected presented proof-action spec");
+            };
+            counts[rotation] = counts[rotation].saturating_add(1);
+        }
+
+        assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
+        let minimum = counts.iter().copied().min().unwrap_or_default();
+        let maximum = counts.iter().copied().max().unwrap_or_default();
+        assert!(maximum - minimum <= 24, "{counts:?}");
+    }
+
+    #[test]
+    fn transition_pattern_focus_removes_only_shared_one_hole_context() {
+        let variable = RuliadTerm::variable(0);
+        let before = RuliadTerm::apply(
+            "context",
+            vec![RuliadTerm::apply(
+                "context",
+                vec![RuliadTerm::apply("identity", vec![variable.clone()])],
+            )],
+        );
+        let after = RuliadTerm::apply(
+            "context",
+            vec![RuliadTerm::apply("context", vec![variable.clone()])],
+        );
+        let (before_focus, after_focus) = transition_pattern_focus(&before, &after);
+        assert_eq!(before_focus.canonical_text(), "identity(?0)");
+        assert_eq!(after_focus, &variable);
+    }
+
+    #[test]
     fn corrupted_eca_trace_is_rejected() {
         let mut config = config();
         config.families = vec![RuliadFamilyConfig {
@@ -2742,6 +3854,7 @@ mod tests {
                     RuliadFamilyKind::Algebra => Some(UsizeRangeConfig { min: 3, max: 3 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 4, max: 4 }),
                     RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 5, max: 5 }),
+                    RuliadFamilyKind::FormalProof => Some(UsizeRangeConfig { min: 2, max: 2 }),
                     RuliadFamilyKind::LeanTask | RuliadFamilyKind::HashNoise => None,
                 },
                 steps: match family {
@@ -2752,6 +3865,7 @@ mod tests {
                     RuliadFamilyKind::Rewrite => Some(UsizeRangeConfig { min: 12, max: 12 }),
                     RuliadFamilyKind::Category => Some(UsizeRangeConfig { min: 3, max: 3 }),
                     RuliadFamilyKind::ProofTree => Some(UsizeRangeConfig { min: 4, max: 4 }),
+                    RuliadFamilyKind::FormalProof => Some(UsizeRangeConfig { min: 2, max: 2 }),
                     RuliadFamilyKind::Algebra
                     | RuliadFamilyKind::LeanTask
                     | RuliadFamilyKind::HashNoise => None,
@@ -2759,33 +3873,47 @@ mod tests {
             }];
             let sample = generate_sample(&config, &[], SampleSplit::Train, 0, 0).expect("sample");
             assert!(sample.categorical_presentation.categorical_core);
+            let expected_abstraction = if family == RuliadFamilyKind::FormalProof {
+                "verified_derivation_category"
+            } else {
+                "finite_category_reasoning"
+            };
             assert_eq!(
                 sample.categorical_presentation.abstraction,
-                "finite_category_reasoning"
+                expected_abstraction
             );
             assert_eq!(
                 sample.categorical_presentation.source_family,
                 family.label()
             );
-            assert!(sample.text.starts_with("[R2 "));
+            let formal = family == RuliadFamilyKind::FormalProof;
+            assert!(
+                sample
+                    .text
+                    .starts_with(if formal { "[R3 " } else { "[R2 " })
+            );
             assert!(sample.text.contains("\n?:"));
             assert!(sample.text.contains("\n!:"));
-            for forbidden in [
-                "category",
-                "finite",
-                "normalize",
-                "accepted",
-                "theorem",
-                "proof",
-                "omitted",
-                "steps",
-                "chain",
-                "expand",
-                "add_mod",
-                "affine_mod",
-                "commutativity",
-                "trace",
-            ] {
+            for forbidden in if formal {
+                &[][..]
+            } else {
+                &[
+                    "category",
+                    "finite",
+                    "normalize",
+                    "accepted",
+                    "theorem",
+                    "proof",
+                    "omitted",
+                    "steps",
+                    "chain",
+                    "expand",
+                    "add_mod",
+                    "affine_mod",
+                    "commutativity",
+                    "trace",
+                ][..]
+            } {
                 assert!(
                     !sample.text.contains(forbidden),
                     "{} sample retained rote prose anchor `{forbidden}`:\n{}",
@@ -2794,7 +3922,7 @@ mod tests {
                 );
             }
             assert!(
-                sample.text.len() <= 512,
+                sample.text.len() <= if formal { 8192 } else { 512 },
                 "{} sample exceeded trace-pretraining payload budget: {} bytes",
                 family.label(),
                 sample.text.len()
@@ -3206,6 +4334,12 @@ mod tests {
                     sample.categorical_presentation.abstraction,
                     "source_selection_canary"
                 );
+            } else if sample.family == RuliadFamilyKind::FormalProof {
+                assert!(sample.categorical_presentation.categorical_core);
+                assert_eq!(
+                    sample.categorical_presentation.abstraction,
+                    "verified_derivation_category"
+                );
             } else {
                 assert!(sample.categorical_presentation.categorical_core);
                 assert_eq!(
@@ -3270,6 +4404,15 @@ mod tests {
                     widths.insert(*modulus);
                     step_counts.insert(lemmas.len().saturating_add(proof_steps.len()));
                     algebra_outcomes.insert(*holds);
+                }
+                RuliadSampleSpec::FormalProof {
+                    problem,
+                    certificate,
+                    ..
+                } => {
+                    let complexity = complexity_vector(problem, Some(certificate));
+                    widths.insert(complexity.syntax_nodes);
+                    step_counts.insert(complexity.proof_step_count);
                 }
                 RuliadSampleSpec::LeanTask { .. } | RuliadSampleSpec::HashNoise { .. } => {}
             }
@@ -3382,5 +4525,52 @@ mod tests {
                 > near.steps.as_ref().expect("near steps").max,
             "far-out proof-tree depth range should exceed the legacy d32 clamp"
         );
+    }
+
+    #[test]
+    fn formal_sample_provenance_reports_the_concrete_ir_domain() {
+        for domain in RuliadFormalDomain::ALL {
+            let bundle = generate_formal_bundle(
+                101,
+                RuliadFormalGeneratorConfig {
+                    domain: Some(domain),
+                    ..RuliadFormalGeneratorConfig::default()
+                },
+            )
+            .expect("formal bundle");
+            let spec = RuliadSampleSpec::FormalProof {
+                problem: bundle.problem,
+                certificate: bundle.certificate,
+                candidate: None,
+                proof_step_index: None,
+                action_presentation_rotation: None,
+                action_answer_contract: RuliadProofActionAnswerContract::default(),
+                task: RuliadTaskKind::ConstructProof,
+            };
+            let domains = ruliad_sample_math_domains(&spec);
+            assert!(domains.contains(&RuliadMathDomain::FormalProof));
+            assert_eq!(
+                domains.len(),
+                if domain == RuliadFormalDomain::Equational {
+                    3
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                domains
+                    .iter()
+                    .filter(|candidate| **candidate == RuliadMathDomain::CategoryTheory)
+                    .count(),
+                usize::from(domain == RuliadFormalDomain::Category)
+            );
+            assert_eq!(
+                domains
+                    .iter()
+                    .filter(|candidate| **candidate == RuliadMathDomain::ProcessCalculus)
+                    .count(),
+                usize::from(domain == RuliadFormalDomain::Process)
+            );
+        }
     }
 }

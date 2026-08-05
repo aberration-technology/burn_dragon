@@ -7,6 +7,8 @@ use serde::de::Deserializer;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_DENSE_SCORE_ROW_CHUNK: usize = 512;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceMemorySystem {
@@ -41,6 +43,7 @@ impl SequenceMemorySystem {
 pub struct SequenceKernelConfig {
     pub memory_system: SequenceMemorySystem,
     pub executor: SequenceTrainingExecutor,
+    pub dense_score_row_chunk: usize,
 }
 
 impl Default for SequenceKernelConfig {
@@ -57,7 +60,13 @@ impl SequenceKernelConfig {
         Self {
             memory_system,
             executor,
+            dense_score_row_chunk: DEFAULT_DENSE_SCORE_ROW_CHUNK,
         }
+    }
+
+    pub const fn with_dense_score_row_chunk(mut self, row_chunk: usize) -> Self {
+        self.dense_score_row_chunk = row_chunk;
+        self
     }
 
     pub const fn reference(memory_system: SequenceMemorySystem) -> Self {
@@ -96,6 +105,9 @@ impl SequenceKernelConfig {
     }
 
     pub fn validate(self) -> Result<(), String> {
+        if self.dense_score_row_chunk == 0 {
+            return Err("dense_score_row_chunk must be > 0".to_string());
+        }
         if self.is_supported() {
             Ok(())
         } else {
@@ -116,7 +128,13 @@ enum SequenceKernelConfigSerde {
         memory_system: SequenceMemorySystem,
         #[serde(default)]
         executor: Option<SequenceTrainingExecutor>,
+        #[serde(default = "default_dense_score_row_chunk")]
+        dense_score_row_chunk: usize,
     },
+}
+
+const fn default_dense_score_row_chunk() -> usize {
+    DEFAULT_DENSE_SCORE_ROW_CHUNK
 }
 
 impl From<SequenceKernelConfigSerde> for SequenceKernelConfig {
@@ -128,10 +146,12 @@ impl From<SequenceKernelConfigSerde> for SequenceKernelConfig {
             SequenceKernelConfigSerde::Config {
                 memory_system,
                 executor,
+                dense_score_row_chunk,
             } => Self::new(
                 memory_system,
                 executor.unwrap_or_else(|| memory_system.default_executor()),
-            ),
+            )
+            .with_dense_score_row_chunk(dense_score_row_chunk),
         }
     }
 }
@@ -150,13 +170,16 @@ impl Serialize for SequenceKernelConfig {
     where
         S: Serializer,
     {
-        if self.executor == self.memory_system.default_executor() {
+        if self.executor == self.memory_system.default_executor()
+            && self.dense_score_row_chunk == DEFAULT_DENSE_SCORE_ROW_CHUNK
+        {
             return self.memory_system.serialize(serializer);
         }
 
-        let mut state = serializer.serialize_struct("SequenceKernelConfig", 2)?;
+        let mut state = serializer.serialize_struct("SequenceKernelConfig", 3)?;
         state.serialize_field("memory_system", &self.memory_system)?;
         state.serialize_field("executor", &self.executor)?;
+        state.serialize_field("dense_score_row_chunk", &self.dense_score_row_chunk)?;
         state.end()
     }
 }
@@ -308,8 +331,8 @@ impl ModuleDisplayDefault for SequenceKernelConfig {
         content
             .set_top_level_type("SequenceKernelConfig")
             .add_formatted(&format!(
-                "memory_system={:?}, executor={:?}",
-                self.memory_system, self.executor
+                "memory_system={:?}, executor={:?}, dense_score_row_chunk={}",
+                self.memory_system, self.executor, self.dense_score_row_chunk
             ))
             .optional()
     }
@@ -328,6 +351,7 @@ mod tests {
             SequenceKernelConfig {
                 memory_system: SequenceMemorySystem::LinearAttention,
                 executor: SequenceTrainingExecutor::Reference,
+                dense_score_row_chunk: DEFAULT_DENSE_SCORE_ROW_CHUNK,
             }
         );
     }
@@ -338,7 +362,8 @@ mod tests {
             SequenceKernelConfig::dense_score_short_context(),
             SequenceKernelConfig {
                 memory_system: SequenceMemorySystem::LinearAttention,
-                executor: SequenceTrainingExecutor::DenseScoreShortContext
+                executor: SequenceTrainingExecutor::DenseScoreShortContext,
+                dense_score_row_chunk: DEFAULT_DENSE_SCORE_ROW_CHUNK,
             },
         );
     }
@@ -349,8 +374,33 @@ mod tests {
             SequenceKernelConfig::gated_delta_chunk_wy(),
             SequenceKernelConfig {
                 memory_system: SequenceMemorySystem::GatedDeltaNet2,
-                executor: SequenceTrainingExecutor::GatedDeltaChunkWy
+                executor: SequenceTrainingExecutor::GatedDeltaChunkWy,
+                dense_score_row_chunk: DEFAULT_DENSE_SCORE_ROW_CHUNK,
             },
+        );
+    }
+
+    #[test]
+    fn dense_score_row_chunk_round_trips_when_overridden() {
+        let json = r#"{"memory_system":"linear_attention","executor":"dense_score_short_context","dense_score_row_chunk":256}"#;
+        let parsed: SequenceKernelConfig = serde_json::from_str(json).expect("sequence config");
+        assert_eq!(parsed.dense_score_row_chunk, 256);
+        assert_eq!(
+            serde_json::from_str::<SequenceKernelConfig>(
+                &serde_json::to_string(&parsed).expect("serialize sequence config")
+            )
+            .expect("round-trip sequence config"),
+            parsed
+        );
+    }
+
+    #[test]
+    fn dense_score_row_chunk_rejects_zero() {
+        let config =
+            SequenceKernelConfig::dense_score_short_context().with_dense_score_row_chunk(0);
+        assert_eq!(
+            config.validate().expect_err("zero row chunk must fail"),
+            "dense_score_row_chunk must be > 0"
         );
     }
 

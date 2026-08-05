@@ -39,7 +39,8 @@ pub mod kernels {
     /// Dense causal attention kernels used by the focused linear-attention path.
     pub mod attention {
         pub use crate::dense_causal_attention::{
-            CompiledDenseCausalAttentionPlan, supports_dense_causal_attention_backend,
+            CompiledDenseCausalAttentionPlan, DenseCausalAttentionVjp, dense_causal_attention_vjp,
+            dense_causal_attention_vjp_with_initial_rho, supports_dense_causal_attention_backend,
             try_fused_dense_causal_attention_wgpu, try_fused_dense_causal_attention_wgpu_with_plan,
         };
     }
@@ -58,12 +59,12 @@ pub mod kernels {
     pub mod projection {
         pub use crate::relu_lowrank::{
             LowrankForwardRouteProfileSnapshot, LowrankGradInputExecutor,
-            LowrankProjectionProfileSnapshot, relu_lowrank_forward_profile_reset,
+            LowrankProjectionProfileSnapshot, ReluLowrankVjp, relu_lowrank_forward_profile_reset,
             relu_lowrank_forward_profile_snapshot, relu_lowrank_forward_route_profile_reset,
             relu_lowrank_forward_route_profile_snapshot, relu_lowrank_grad_input_profile_reset,
             relu_lowrank_grad_input_profile_snapshot, relu_lowrank_grad_weight_profile_reset,
-            relu_lowrank_grad_weight_profile_snapshot, supports_relu_lowrank_projection_backend,
-            try_fused_relu_lowrank_projection_wgpu,
+            relu_lowrank_grad_weight_profile_snapshot, relu_lowrank_input_vjp, relu_lowrank_vjp,
+            supports_relu_lowrank_projection_backend, try_fused_relu_lowrank_projection_wgpu,
             try_fused_relu_lowrank_projection_wgpu_with_executor,
         };
     }

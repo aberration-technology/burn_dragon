@@ -1,0 +1,13 @@
+extends = "ruliad-screen.base.toml"
+
+[model.random_scaffold]
+enabled = true
+seed = 20260729
+distribution = "gaussian_clt12"
+rank = 8
+alpha = 16.0
+trainable_gain = true
+
+[run_layout]
+category = "random-scaffold"
+variant = "gaussian-rank8"

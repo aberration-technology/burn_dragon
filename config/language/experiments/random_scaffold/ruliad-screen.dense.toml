@@ -1,0 +1,5 @@
+extends = "ruliad-screen.base.toml"
+
+[run_layout]
+category = "dense"
+variant = "seed-20260729"

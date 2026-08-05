@@ -156,7 +156,8 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub fn supports_shared_lowrank_continual_backprop(&self) -> bool {
-        !self.y_neuron_recurrence.enabled
+        !self.uses_random_scaffold()
+            && !self.y_neuron_recurrence.enabled
             && !self.hierarchical_dragon.enabled
             && self.rollout_fast_steps_per_slow_step == 1
     }

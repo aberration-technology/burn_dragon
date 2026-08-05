@@ -1,0 +1,5 @@
+[training]
+# Local predictive-coding factors are truncated every eight tokens while rho
+# remains the detached causal continuation state between factors and batches.
+tbptt_chunk_size = 8
+tbptt_persist_across_steps = true

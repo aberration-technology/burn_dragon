@@ -1,8 +1,6 @@
 use super::*;
 use burn::tensor::{Distribution, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-#[cfg(feature = "cuda")]
-use burn_cuda::Cuda;
 use burn_wgpu::{CubeBackend, RuntimeOptions, Wgpu, graphics};
 
 type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
@@ -10,7 +8,7 @@ type AutodiffBackendImpl = Autodiff<Backend>;
 type FusionBackend = Wgpu<f32>;
 type FusionAutodiffBackendImpl = Autodiff<FusionBackend>;
 #[cfg(feature = "cuda")]
-type CudaBackend = Cuda<f32>;
+type CudaBackend = CudaCubeBackend;
 #[cfg(feature = "cuda")]
 type CudaAutodiffBackendImpl = Autodiff<CudaBackend>;
 
@@ -512,7 +510,7 @@ fn fused_relu_lowrank_matches_reference_gradients_on_cuda_autodiff() {
     let mask =
         Tensor::<CudaAutodiffBackendImpl, 1>::from_floats([1.0; 8], &device).reshape([1, 1, 1, 8]);
     let output_weights = Tensor::<CudaAutodiffBackendImpl, 4>::from_data(
-        TensorData::new(vec![0.05; 1 * 2 * 5 * 8], [1, 2, 5, 8]),
+        TensorData::new(vec![0.05; 2 * 5 * 8], [1, 2, 5, 8]),
         &device,
     );
 

@@ -6,6 +6,7 @@ mod diagnostics;
 mod interpretability;
 mod language_head;
 mod language_pipeline;
+mod predictive_coding;
 mod sequence_dispatch;
 pub use continual_backprop::{
     SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
@@ -19,10 +20,16 @@ pub use interpretability::{
     TensorComparisonDiagnostics, TensorDistributionDiagnostics, TensorStateDeltaDiagnostics,
     TensorStateSummaryDiagnostics, compare_model_states, summarize_model_state,
 };
+pub use predictive_coding::{
+    DragonPredictiveCodingHeadActivityVjp, DragonPredictiveCodingHeadVjp,
+    DragonPredictiveCodingInitialVjp, DragonPredictiveCodingLayerTrace,
+    DragonPredictiveCodingLayerVjp, DragonPredictiveCodingParameterIds,
+    DragonPredictiveCodingSupport,
+};
 
-use burn::module::{Module, Param};
+use burn::module::{AutodiffModule, Module, Param};
 use burn::nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
-use burn::tensor::backend::Backend;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData, activation};
 use burn_dragon_kernel::api::attention::{
     supports_dense_causal_attention_backend, try_fused_dense_causal_attention_wgpu,
@@ -38,6 +45,7 @@ use burn_dragon_time::Instant;
 use burn_gdn::{GatedDeltaNet2Executor, GatedDeltaNet2Memory, try_gdn2_chunk_wy};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -48,8 +56,8 @@ use super::attention_residual::{
     AttentionResidual, BlockAttentionResidual, ResidualConnectorKind, ResidualHistory,
 };
 use super::config::{
-    ClockedSlowMemoryConfig, DragonConfig, FusedKernelConfig, HierarchicalDragonConfig,
-    HierarchicalDragonSharing, LanguageHeadConfig, LatentReasoningConfig,
+    ClockedSlowMemoryConfig, DragonConfig, DragonRandomScaffoldConfig, FusedKernelConfig,
+    HierarchicalDragonConfig, HierarchicalDragonSharing, LanguageHeadConfig, LatentReasoningConfig,
     NextLatentTransitionConfig, SummaryMemoryConfig, YNeuronRecurrenceConfig,
 };
 #[cfg(any(feature = "probe", test))]
@@ -67,24 +75,28 @@ use super::init::{DragonFiringTargetKind, DragonInitializer, DragonProjectionRol
 use super::norm::DragonNorm;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::LowRankResidualOutput;
-#[cfg(any(feature = "viz", feature = "probe"))]
-use super::residual_stream::lowrank_residual_step_branch_thresholds_relu_native;
 use super::residual_stream::lowrank_residual_step_next_branch_thresholds;
 #[cfg(any(feature = "probe", test))]
 use super::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds;
 #[cfg(any(feature = "viz", feature = "probe"))]
-use super::residual_stream::{decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat};
+use super::residual_stream::{
+    decode_y_neuron_tail, lowrank_residual_step_branch_thresholds_relu_native,
+};
 #[cfg(not(any(feature = "viz", feature = "probe")))]
 use super::residual_stream::{
-    decode_y_neuron_tail, decode_y_neuron_tail_uses_legacy_flat,
-    lowrank_residual_step_next_branch_thresholds_relu_native,
+    decode_y_neuron_tail, lowrank_residual_step_next_branch_thresholds_relu_native,
+};
+use super::scaffold::{
+    DragonRandomScaffoldAdapters, DragonRandomScaffoldReport, build_report, fast_scaffold_paths,
+    initialize_scaffold_2d, initialize_scaffold_3d, slow_scaffold_paths,
 };
 use super::sequence::gdn2::{
     GatedDeltaNet2Implementation, GatedDeltaNet2Parameters, ResolvedGatedDeltaNet2Config,
     gated_deltanet2_reference, l2_normalize_last,
 };
 use super::sequence::linear::{
-    expand_attention_values_to_heads, recurrent_attention_dense_score_final_rho_reference,
+    expand_attention_values_to_heads, recurrent_attention_dense_score_context_reference,
+    recurrent_attention_dense_score_final_rho_reference,
     recurrent_attention_dense_score_initial_context_reference,
     recurrent_attention_dense_score_reference, recurrent_attention_reference,
 };
@@ -104,6 +116,88 @@ use super::widen::{
     widen_3d_last_dim_prefix_zero_tail,
 };
 use super::{ManifoldHyperConnections, mhc_merge_with_coefficients, mhc_split_with_coefficients};
+
+#[derive(Module, Debug)]
+struct SequenceScoreHead<B: Backend> {
+    query: Linear<B>,
+    candidate: Linear<B>,
+    score: Linear<B>,
+}
+
+impl<B: Backend> SequenceScoreHead<B> {
+    fn deterministic_linear(
+        input_dim: usize,
+        output_dim: usize,
+        seed: u64,
+        device: &B::Device,
+    ) -> Linear<B> {
+        let bound = (1.0 / input_dim.max(1) as f32).sqrt();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let weights = (0..input_dim.saturating_mul(output_dim))
+            .map(|_| rng.gen_range(-bound..bound))
+            .collect::<Vec<_>>();
+        let biases = (0..output_dim)
+            .map(|_| rng.gen_range(-bound..bound))
+            .collect::<Vec<_>>();
+        Linear {
+            weight: Param::from_tensor(Tensor::from_data(
+                TensorData::new(weights, [input_dim, output_dim]),
+                device,
+            )),
+            bias: Some(Param::from_tensor(Tensor::from_data(
+                TensorData::new(biases, [output_dim]),
+                device,
+            ))),
+        }
+    }
+
+    fn new(input_dim: usize, projection_dim: usize, device: &B::Device) -> Self {
+        assert!(
+            projection_dim > 0,
+            "sequence score projection_dim must be positive"
+        );
+        Self {
+            // Optional heads must not advance the backend-global RNG or alter initialization and
+            // dropout streams in matched baseline runs. Independent host RNGs preserve ordinary
+            // fan-in initialization while keeping the shared Dragon parameter contract invariant.
+            query: Self::deterministic_linear(
+                input_dim,
+                projection_dim,
+                0x7175_6572_795f_6b31,
+                device,
+            ),
+            candidate: Self::deterministic_linear(
+                input_dim,
+                projection_dim,
+                0x6361_6e64_5f6b_6579,
+                device,
+            ),
+            score: Self::deterministic_linear(projection_dim, 1, 0x7363_6f72_655f_7631, device),
+        }
+    }
+
+    fn forward_candidate(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.score.forward(self.candidate.forward(hidden))
+    }
+
+    fn forward_pair(
+        &self,
+        prompt_hidden: Tensor<B, 3>,
+        terminal_hidden: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        let query = self.query.forward(prompt_hidden);
+        let candidate = self.candidate.forward(terminal_hidden);
+        self.score.forward(query * candidate)
+    }
+
+    fn value_clone(&self) -> Self {
+        Self {
+            query: clone_linear_value(&self.query),
+            candidate: clone_linear_value(&self.candidate),
+            score: clone_linear_value(&self.score),
+        }
+    }
+}
 
 #[derive(Module, Debug)]
 pub struct DragonModel<B: Backend> {
@@ -127,6 +221,8 @@ pub struct DragonModel<B: Backend> {
     hierarchical_dragon: HierarchicalDragonConfig,
     latent_reasoning: LatentReasoningConfig,
     #[module(skip)]
+    random_scaffold_config: DragonRandomScaffoldConfig,
+    #[module(skip)]
     layer_latent_totals: Vec<usize>,
     #[module(skip)]
     shared_lowrank_continual_backprop: Option<SharedLowrankContinualBackpropRuntime>,
@@ -147,6 +243,7 @@ pub struct DragonModel<B: Backend> {
     slow_encoder: Option<Param<Tensor<B, 3>>>,
     slow_encoder_v: Option<Param<Tensor<B, 3>>>,
     slow_decoder: Option<Param<Tensor<B, 2>>>,
+    random_scaffold_adapters: Option<DragonRandomScaffoldAdapters<B>>,
     #[module(skip)]
     mamba_config: ResolvedMambaSequenceConfig,
     mamba: Option<MambaSequenceParameters<B>>,
@@ -157,6 +254,7 @@ pub struct DragonModel<B: Backend> {
     lm_head: Option<Param<Tensor<B, 2>>>,
     nca_factorized_lm_head: Option<Param<Tensor<B, 2>>>,
     nca_special_lm_head: Option<Param<Tensor<B, 2>>>,
+    sequence_score_head: Option<SequenceScoreHead<B>>,
     latent_refiner_in: Option<Linear<B>>,
     latent_refiner_out: Option<Linear<B>>,
     latent_refiner_gate: Option<Param<Tensor<B, 1>>>,
@@ -582,6 +680,10 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub fn new(config: DragonConfig, device: &B::Device) -> Self {
+        config
+            .random_scaffold
+            .validate_for_model(config.n_embd, config.n_head, config.latent_total())
+            .unwrap_or_else(|message| panic!("invalid model.random_scaffold: {message}"));
         let initializer = DragonInitializer::new(&config.initialization);
         let embed = EmbeddingConfig::new(config.vocab_size, config.n_embd)
             .with_initializer(initializer.embedding_initializer(config.n_embd))
@@ -605,39 +707,70 @@ impl<B: Backend> DragonModel<B> {
             DragonFiringTargetKind::Disabled
         );
         let shared_relu_threshold = config.fused_kernels.relu_threshold;
-        let encoder = Param::from_tensor(initializer.headwise_projection_tensor::<B>(
-            DragonProjectionRole::Encoder,
-            config.n_head,
-            config.n_embd,
-            latent_per_head,
-            residual_depth,
-            device,
-        ));
+        let (encoder_path, encoder_v_path, decoder_path) = fast_scaffold_paths();
+        let encoder = Param::from_tensor(if config.random_scaffold.enabled {
+            initialize_scaffold_3d(
+                &config,
+                encoder_path,
+                [config.n_head, config.n_embd, latent_per_head],
+                device,
+            )
+        } else {
+            initializer.headwise_projection_tensor::<B>(
+                DragonProjectionRole::Encoder,
+                config.n_head,
+                config.n_embd,
+                latent_per_head,
+                residual_depth,
+                device,
+            )
+        });
 
-        let encoder_v = Param::from_tensor(initializer.headwise_projection_tensor::<B>(
-            DragonProjectionRole::EncoderValue,
-            config.n_head,
-            config.n_embd,
-            latent_per_head,
-            residual_depth,
-            device,
-        ));
+        let encoder_v = Param::from_tensor(if config.random_scaffold.enabled {
+            initialize_scaffold_3d(
+                &config,
+                encoder_v_path,
+                [config.n_head, config.n_embd, latent_per_head],
+                device,
+            )
+        } else {
+            initializer.headwise_projection_tensor::<B>(
+                DragonProjectionRole::EncoderValue,
+                config.n_head,
+                config.n_embd,
+                latent_per_head,
+                residual_depth,
+                device,
+            )
+        });
 
-        let decoder = Param::from_tensor(initializer.projection_tensor::<B>(
-            DragonProjectionRole::Decoder,
-            latent_total,
-            config.n_embd,
-            residual_depth,
-            device,
-        ));
+        let decoder = Param::from_tensor(if config.random_scaffold.enabled {
+            initialize_scaffold_2d(&config, decoder_path, [latent_total, config.n_embd], device)
+        } else {
+            initializer.projection_tensor::<B>(
+                DragonProjectionRole::Decoder,
+                latent_total,
+                config.n_embd,
+                residual_depth,
+                device,
+            )
+        });
         let hierarchical_dragon = config.hierarchical_dragon.clone();
         let (slow_encoder, slow_encoder_v, slow_decoder) = if hierarchical_dragon.enabled
             && matches!(
                 hierarchical_dragon.weight_sharing,
                 HierarchicalDragonSharing::Split
             ) {
+            let (slow_encoder_path, slow_encoder_v_path, slow_decoder_path) = slow_scaffold_paths();
             (
-                Some(Param::from_tensor(
+                Some(Param::from_tensor(if config.random_scaffold.enabled {
+                    initialize_scaffold_3d(
+                        &config,
+                        slow_encoder_path,
+                        [config.n_head, config.n_embd, latent_per_head],
+                        device,
+                    )
+                } else {
                     initializer.headwise_projection_tensor::<B>(
                         DragonProjectionRole::Encoder,
                         config.n_head,
@@ -645,9 +778,16 @@ impl<B: Backend> DragonModel<B> {
                         latent_per_head,
                         residual_depth,
                         device,
-                    ),
-                )),
-                Some(Param::from_tensor(
+                    )
+                })),
+                Some(Param::from_tensor(if config.random_scaffold.enabled {
+                    initialize_scaffold_3d(
+                        &config,
+                        slow_encoder_v_path,
+                        [config.n_head, config.n_embd, latent_per_head],
+                        device,
+                    )
+                } else {
                     initializer.headwise_projection_tensor::<B>(
                         DragonProjectionRole::EncoderValue,
                         config.n_head,
@@ -655,16 +795,26 @@ impl<B: Backend> DragonModel<B> {
                         latent_per_head,
                         residual_depth,
                         device,
-                    ),
-                )),
-                Some(Param::from_tensor(Tensor::<B, 2>::zeros(
-                    [latent_total, config.n_embd],
-                    device,
-                ))),
+                    )
+                })),
+                Some(Param::from_tensor(if config.random_scaffold.enabled {
+                    initialize_scaffold_2d(
+                        &config,
+                        slow_decoder_path,
+                        [latent_total, config.n_embd],
+                        device,
+                    )
+                } else {
+                    Tensor::<B, 2>::zeros([latent_total, config.n_embd], device)
+                })),
             )
         } else {
             (None, None, None)
         };
+        let random_scaffold_adapters = config
+            .random_scaffold
+            .enabled
+            .then(|| DragonRandomScaffoldAdapters::new(&config, &config.random_scaffold, device));
         let residual_connector = config.resolved_residual_connector_kind();
         let mhc_first_layer = config
             .mhc
@@ -776,6 +926,13 @@ impl<B: Backend> DragonModel<B> {
                 ))
             })
         });
+        let sequence_score_head = config.sequence_score_head.enabled.then(|| {
+            SequenceScoreHead::new(
+                config.n_embd,
+                config.sequence_score_head.projection_dim,
+                device,
+            )
+        });
         let latent_reasoning = config.latent_reasoning.clone();
         let latent_refiner_hidden =
             config.n_embd * latent_reasoning.refiner_hidden_multiplier.max(1);
@@ -874,6 +1031,7 @@ impl<B: Backend> DragonModel<B> {
             summary_memory: config.summary_memory,
             hierarchical_dragon,
             latent_reasoning,
+            random_scaffold_config: config.random_scaffold.clone(),
             layer_latent_totals,
             shared_lowrank_continual_backprop: None,
             embed,
@@ -893,6 +1051,7 @@ impl<B: Backend> DragonModel<B> {
             slow_encoder,
             slow_encoder_v,
             slow_decoder,
+            random_scaffold_adapters,
             mamba_config,
             mamba,
             gated_deltanet2_config,
@@ -901,6 +1060,7 @@ impl<B: Backend> DragonModel<B> {
             lm_head,
             nca_factorized_lm_head,
             nca_special_lm_head,
+            sequence_score_head,
             latent_refiner_in,
             latent_refiner_out,
             latent_refiner_gate,
@@ -932,7 +1092,139 @@ impl<B: Backend> DragonModel<B> {
         }
     }
 
+    pub fn shared_lowrank_effective_weights(&self) -> SharedLowrankWeights<B> {
+        let scaffold = self.shared_lowrank_weights();
+        self.random_scaffold_adapters
+            .as_ref()
+            .map(|adapters| adapters.effective_fast(scaffold.clone()))
+            .unwrap_or(scaffold)
+    }
+
+    pub fn uses_random_scaffold(&self) -> bool {
+        self.random_scaffold_adapters.is_some()
+    }
+
+    pub fn random_scaffold_report(&self) -> Option<DragonRandomScaffoldReport> {
+        self.random_scaffold_adapters.as_ref().map(|adapters| {
+            let mut config = DragonConfig {
+                n_layer: self.n_layer,
+                n_embd: self.n_embd,
+                n_head: self.n_head,
+                mlp_internal_dim_multiplier: self.mlp_internal_dim_multiplier,
+                vocab_size: self.vocab_size,
+                random_scaffold: self.random_scaffold_config.clone(),
+                hierarchical_dragon: self.hierarchical_dragon.clone(),
+                ..DragonConfig::default()
+            };
+            config.n_expert = 1;
+            build_report(&config, adapters)
+        })
+    }
+
+    pub fn random_scaffold_trainable_param_ids(&self) -> Vec<burn::module::ParamId> {
+        self.random_scaffold_adapters
+            .as_ref()
+            .map(|adapters| adapters.trainable_ids(self.random_scaffold_config.trainable_gain))
+            .unwrap_or_default()
+    }
+
+    /// Folds the immutable scaffold and trained adapters into dense projection
+    /// tensors for an ephemeral inference model.
+    ///
+    /// Training and distributed artifacts must retain the scaffold contract.
+    /// Folding is intended only after `valid()` conversion, where it avoids
+    /// rematerializing `A * B` for every autoregressive token.
+    pub fn materialize_random_scaffold_for_inference(mut self) -> Self {
+        let Some(adapters) = self.random_scaffold_adapters.as_ref() else {
+            return self;
+        };
+        let fast = adapters.effective_fast(self.shared_lowrank_weights());
+        let slow = if self.hierarchical_dragon.enabled
+            && self.hierarchical_dragon.weight_sharing == HierarchicalDragonSharing::Split
+        {
+            let scaffold = SharedLowrankWeights {
+                encoder: self
+                    .slow_encoder
+                    .as_ref()
+                    .expect("split hierarchical slow encoder missing")
+                    .val(),
+                encoder_v: self
+                    .slow_encoder_v
+                    .as_ref()
+                    .expect("split hierarchical slow encoder_v missing")
+                    .val(),
+                decoder: self
+                    .slow_decoder
+                    .as_ref()
+                    .expect("split hierarchical slow decoder missing")
+                    .val(),
+            };
+            Some(adapters.effective_slow(scaffold))
+        } else {
+            None
+        };
+
+        self.encoder = Self::replace_param_value(self.encoder, fast.encoder);
+        self.encoder_v = Self::replace_param_value(self.encoder_v, fast.encoder_v);
+        self.decoder = Self::replace_param_value(self.decoder, fast.decoder);
+        if let Some(slow) = slow {
+            self.slow_encoder = self
+                .slow_encoder
+                .map(|parameter| Self::replace_param_value(parameter, slow.encoder));
+            self.slow_encoder_v = self
+                .slow_encoder_v
+                .map(|parameter| Self::replace_param_value(parameter, slow.encoder_v));
+            self.slow_decoder = self
+                .slow_decoder
+                .map(|parameter| Self::replace_param_value(parameter, slow.decoder));
+        }
+        self.random_scaffold_adapters = None;
+        self.random_scaffold_config.enabled = false;
+        self
+    }
+
+    /// Returns all deterministic immutable random-scaffold parameters.
+    ///
+    /// Downstream checkpoint and distributed-training integrations use these
+    /// IDs to derive a backend-independent catalog of mutable tensor paths.
+    pub fn random_scaffold_frozen_param_ids(&self) -> Vec<burn::module::ParamId> {
+        if !self.uses_random_scaffold() {
+            return Vec::new();
+        }
+        let mut ids = vec![self.encoder.id, self.encoder_v.id, self.decoder.id];
+        ids.extend(self.slow_encoder.as_ref().map(|parameter| parameter.id));
+        ids.extend(self.slow_encoder_v.as_ref().map(|parameter| parameter.id));
+        ids.extend(self.slow_decoder.as_ref().map(|parameter| parameter.id));
+        if !self.random_scaffold_config.trainable_gain {
+            ids.extend(
+                self.random_scaffold_adapters
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(DragonRandomScaffoldAdapters::gain_ids),
+            );
+        }
+        ids
+    }
+
+    pub(crate) fn random_scaffold_encoder_param_ids(&self) -> Vec<burn::module::ParamId> {
+        self.random_scaffold_adapters
+            .as_ref()
+            .map(|adapters| adapters.encoder_ids(self.random_scaffold_config.trainable_gain))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn random_scaffold_decoder_param_ids(&self) -> Vec<burn::module::ParamId> {
+        self.random_scaffold_adapters
+            .as_ref()
+            .map(|adapters| adapters.decoder_ids(self.random_scaffold_config.trainable_gain))
+            .unwrap_or_default()
+    }
+
     pub fn with_shared_lowrank_weights(mut self, weights: SharedLowrankWeights<B>) -> Self {
+        assert!(
+            !self.uses_random_scaffold(),
+            "with_shared_lowrank_weights cannot replace an immutable random scaffold"
+        );
         assert_eq!(
             weights.encoder.shape().dims::<3>(),
             self.encoder.val().shape().dims::<3>(),
@@ -955,10 +1247,22 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub fn supports_shared_lowrank_population_forward(&self) -> bool {
-        !self.y_neuron_recurrence.enabled
+        !self.uses_random_scaffold()
+            && !self.y_neuron_recurrence.enabled
             && !self.hierarchical_dragon.enabled
             && self.rollout_fast_steps_per_slow_step == 1
             && self.language_head.uses_flat_token_logits()
+    }
+
+    /// Reports whether one sequence invocation can omit terminal recurrent-state materialization.
+    pub fn supports_terminal_sequence_state_elision(&self) -> bool {
+        self.sequence_kernel.memory_system == SequenceMemorySystem::LinearAttention
+            && self.sequence_kernel.executor == SequenceTrainingExecutor::DenseScoreShortContext
+            && self.rollout_fast_steps_per_slow_step == 1
+            && !self.y_neuron_recurrence.enabled
+            && !self.hierarchical_dragon.enabled
+            && !self.clocked_slow_memory.enabled
+            && !self.summary_memory.enabled
     }
 
     pub fn widen_latent_total(
@@ -974,6 +1278,12 @@ impl<B: Backend> DragonModel<B> {
         &self,
         fresh: Self,
     ) -> Result<(Self, DragonLatentWidenReport), String> {
+        if self.uses_random_scaffold() || fresh.uses_random_scaffold() {
+            return Err(
+                "random-scaffold models do not support in-process latent widening; the scaffold growth history must be an explicit model contract"
+                    .to_string(),
+            );
+        }
         let old_latent_total = self.latent_total_capacity();
         let old_latent_per_head = self.latent_per_head_capacity();
         let new_latent_total = fresh.latent_total_capacity();
@@ -1094,6 +1404,10 @@ impl<B: Backend> DragonModel<B> {
             .nca_special_lm_head
             .as_ref()
             .map(|head| Param::from_tensor(head.val()));
+        widened.sequence_score_head = self
+            .sequence_score_head
+            .as_ref()
+            .map(SequenceScoreHead::value_clone);
         widened.latent_refiner_in = self.latent_refiner_in.as_ref().map(clone_linear_value);
         widened.latent_refiner_out = self.latent_refiner_out.as_ref().map(clone_linear_value);
         widened.latent_refiner_gate = self
@@ -1504,6 +1818,10 @@ impl<B: Backend> DragonModel<B> {
         ModelState::new_ephemeral(self.n_layer)
     }
 
+    pub fn init_state_stateless(&self) -> ModelState<B> {
+        ModelState::new_stateless(self.n_layer)
+    }
+
     fn layer_latent_total(&self, layer_idx: usize) -> usize {
         self.layer_latent_totals
             .get(layer_idx)
@@ -1520,7 +1838,7 @@ impl<B: Backend> DragonModel<B> {
     }
 
     fn write_linear_attention_rho_state(&self, layer_state: &mut LayerState<B>, rho: Tensor<B, 4>) {
-        layer_state.rho = Some(rho);
+        layer_state.rho = layer_state.retain_terminal_sequence_state.then_some(rho);
         layer_state.rho_norm = None;
         layer_state.sequence_aux = None;
     }
@@ -1535,24 +1853,22 @@ impl<B: Backend> DragonModel<B> {
         total / self.n_head
     }
 
-    fn layer_lowrank_weights_from_params(
+    fn layer_lowrank_weights_from_tensors(
         &self,
         layer_idx: usize,
-        encoder_param: &Param<Tensor<B, 3>>,
-        encoder_v_param: &Param<Tensor<B, 3>>,
-        decoder_param: &Param<Tensor<B, 2>>,
+        weights: SharedLowrankWeights<B>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
         let latent_per_head = self.layer_latent_per_head(layer_idx);
         let capacity_per_head = self.latent_per_head_capacity();
-        let encoder = encoder_param
-            .val()
+        let encoder = weights
+            .encoder
             .slice([0..self.n_head, 0..self.n_embd, 0..latent_per_head])
             .reshape([1, self.n_head, self.n_embd, latent_per_head]);
-        let encoder_v = encoder_v_param
-            .val()
+        let encoder_v = weights
+            .encoder_v
             .slice([0..self.n_head, 0..self.n_embd, 0..latent_per_head])
             .reshape([1, self.n_head, self.n_embd, latent_per_head]);
-        let decoder_capacity = decoder_param.val();
+        let decoder_capacity = weights.decoder;
         let decoder = Tensor::cat(
             (0..self.n_head)
                 .map(|head| {
@@ -1571,12 +1887,7 @@ impl<B: Backend> DragonModel<B> {
         &self,
         layer_idx: usize,
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2>, usize) {
-        self.layer_lowrank_weights_from_params(
-            layer_idx,
-            &self.encoder,
-            &self.encoder_v,
-            &self.decoder,
-        )
+        self.layer_lowrank_weights_from_tensors(layer_idx, self.shared_lowrank_effective_weights())
     }
 
     fn layer_lowrank_weights_for_hierarchical_branch(
@@ -1590,18 +1901,29 @@ impl<B: Backend> DragonModel<B> {
                 HierarchicalDragonSharing::Split
             )
         {
-            return self.layer_lowrank_weights_from_params(
-                layer_idx,
-                self.slow_encoder
+            let scaffold = SharedLowrankWeights {
+                encoder: self
+                    .slow_encoder
                     .as_ref()
-                    .expect("split hierarchical slow encoder missing"),
-                self.slow_encoder_v
+                    .expect("split hierarchical slow encoder missing")
+                    .val(),
+                encoder_v: self
+                    .slow_encoder_v
                     .as_ref()
-                    .expect("split hierarchical slow encoder_v missing"),
-                self.slow_decoder
+                    .expect("split hierarchical slow encoder_v missing")
+                    .val(),
+                decoder: self
+                    .slow_decoder
                     .as_ref()
-                    .expect("split hierarchical slow decoder missing"),
-            );
+                    .expect("split hierarchical slow decoder missing")
+                    .val(),
+            };
+            let weights = self
+                .random_scaffold_adapters
+                .as_ref()
+                .map(|adapters| adapters.effective_slow(scaffold.clone()))
+                .unwrap_or(scaffold);
+            return self.layer_lowrank_weights_from_tensors(layer_idx, weights);
         }
         self.layer_lowrank_weights(layer_idx)
     }
@@ -2286,25 +2608,12 @@ impl<B: Backend> DragonModel<B> {
         );
         assert_eq!(decoder_dim, self.n_embd, "population decoder dim mismatch");
 
-        if decode_y_neuron_tail_uses_legacy_flat() {
-            let mixed = y_neuron
-                .reshape([population, per_population_batch, heads, time, latent])
-                .swap_dims(2, 3)
-                .reshape([population, per_population_batch * time, heads * latent]);
-            return mixed
-                .matmul(decoder)
-                .reshape([population, per_population_batch, time, self.n_embd])
-                .reshape([flat_batch, 1, time, self.n_embd]);
-        }
-
-        let y_by_head = y_neuron
+        let mixed = y_neuron
             .reshape([population, per_population_batch, heads, time, latent])
-            .swap_dims(1, 2)
-            .reshape([population, heads, per_population_batch * time, latent]);
-        let decoder_by_head = decoder.reshape([population, heads, latent, self.n_embd]);
-        y_by_head
-            .matmul(decoder_by_head)
-            .sum_dim(1)
+            .swap_dims(2, 3)
+            .reshape([population, per_population_batch * time, heads * latent]);
+        mixed
+            .matmul(decoder)
             .reshape([population, per_population_batch, time, self.n_embd])
             .reshape([flat_batch, 1, time, self.n_embd])
     }
@@ -3046,6 +3355,7 @@ impl<B: Backend> DragonModel<B> {
             (!mhc.coefficient_policy().uses_dynamic_stream_controller()).then(|| mhc.coefficients())
         });
         let mut residual_history = self.initialize_language_residual_history(&current);
+        let shared_lowrank_weights = self.shared_lowrank_effective_weights();
 
         for (layer_idx, layer_state) in state.layers.iter_mut().enumerate() {
             let connector = self.residual_connector_for_layer(layer_idx);
@@ -3073,7 +3383,8 @@ impl<B: Backend> DragonModel<B> {
                 branch_input.shape().dims::<4>();
             let flat_batch = branch_batch * branch_views;
             let branch_flat = branch_input.reshape([flat_batch, 1, branch_time, branch_dim]);
-            let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_idx);
+            let (encoder, encoder_v, decoder, latent) =
+                self.layer_lowrank_weights_from_tensors(layer_idx, shared_lowrank_weights.clone());
             let heads = self.n_head;
             let latent_pattern = &self.kernel.block_sparse.latent;
             let sparse_mask = if fused && latent_pattern.is_sparse() {
@@ -3688,6 +3999,37 @@ impl<B: Backend> DragonModel<B> {
             .map(|head| head.forward(hidden))
     }
 
+    pub fn sequence_score_head_enabled(&self) -> bool {
+        self.sequence_score_head.is_some()
+    }
+
+    /// Score complete sequence representations without projecting through the vocabulary head.
+    pub fn sequence_scores_from_hidden(&self, hidden: Tensor<B, 3>) -> Option<Tensor<B, 3>> {
+        self.sequence_score_head
+            .as_ref()
+            .map(|head| head.forward_candidate(hidden))
+    }
+
+    /// Score prompt-candidate compatibility in a learned low-rank query-key space.
+    ///
+    /// A terminal-only linear score can rank candidate surface forms but cannot represent a
+    /// changed preference when the candidate set is fixed and only the requested target changes.
+    /// Independent prompt and candidate projections form a general low-rank bilinear map. This
+    /// keeps prompt conditioning in the score contract without adding task-specific outputs or
+    /// changing the Dragon backbone width.
+    pub fn sequence_scores_from_hidden_pair(
+        &self,
+        prompt_hidden: Tensor<B, 3>,
+        terminal_hidden: Tensor<B, 3>,
+    ) -> Option<Tensor<B, 3>> {
+        if prompt_hidden.shape() != terminal_hidden.shape() {
+            return None;
+        }
+        self.sequence_score_head
+            .as_ref()
+            .map(|head| head.forward_pair(prompt_hidden, terminal_hidden))
+    }
+
     fn project_hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         assert!(
             self.language_head.uses_flat_token_logits(),
@@ -3891,15 +4233,34 @@ impl<B: Backend> DragonModel<B> {
     }
 }
 
+impl<B: AutodiffBackend> DragonModel<B> {
+    /// Run a read-only auxiliary backbone pass without building an autodiff graph or sampling
+    /// training-time dropout.
+    ///
+    /// `Tensor::inner` and `Tensor::from_inner` preserve the backend allocation, so CUDA callers do
+    /// not cross the host boundary. The returned tensor is a detached feature view suitable for a
+    /// task head whose parameters remain on the autodiff model.
+    pub fn forward_hidden_deterministic_auxiliary(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.valid().forward_hidden(tokens.inner());
+        Tensor::from_inner(hidden)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::init::{
         DragonInitializationConfig, DragonInitializationKind, DragonReservoirInitializationConfig,
     };
+    use burn::optim::GradientsParams;
+    use burn_autodiff::Autodiff;
     use burn_ndarray::NdArray;
 
     type TestBackend = NdArray<f32>;
+    type TestAutodiffBackend = Autodiff<TestBackend>;
 
     fn tensor_values<const D: usize>(tensor: Tensor<TestBackend, D>) -> Vec<f32> {
         tensor
@@ -3939,6 +4300,207 @@ mod tests {
             .zip(rhs)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn optional_sequence_score_head_preserves_shared_initialization_and_backend_rng() {
+        const ISOLATED_ENV: &str = "BURN_DRAGON_ISOLATED_SCORE_HEAD_RNG_TEST";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            // NdArray's RNG is process-global, so a seed-sequence assertion must not share a
+            // process with parallel tests that initialize unrelated models.
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current core test executable"),
+            )
+            .arg("model::dragon::tests::optional_sequence_score_head_preserves_shared_initialization_and_backend_rng")
+            .arg("--exact")
+            .env(ISOLATED_ENV, "1")
+            .status()
+            .expect("run isolated score-head RNG test");
+            assert!(status.success(), "isolated score-head RNG test failed");
+            return;
+        }
+
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.latent_reasoning.enabled = true;
+        config.latent_reasoning.max_steps = 2;
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+
+        TestBackend::seed(&device, 4_211);
+        let without_head = DragonModel::<TestBackend>::new(config.clone(), &device);
+        let without_head_logits = tensor_values(without_head.forward(tokens.clone()));
+        let without_head_rng = tensor_values(Tensor::<TestBackend, 1>::random(
+            [16],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+
+        TestBackend::seed(&device, 4_211);
+        config.sequence_score_head.enabled = true;
+        let with_head = DragonModel::<TestBackend>::new(config, &device);
+        let with_head_logits = tensor_values(with_head.forward(tokens));
+        let with_head_rng = tensor_values(Tensor::<TestBackend, 1>::random(
+            [16],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+
+        assert_eq!(
+            max_abs_diff(without_head_logits, with_head_logits),
+            0.0,
+            "optional score head perturbed shared Dragon initialization"
+        );
+        assert_eq!(
+            max_abs_diff(without_head_rng, with_head_rng),
+            0.0,
+            "optional score head advanced the backend-global RNG"
+        );
+    }
+
+    fn tiny_random_scaffold_config(seed: u64) -> DragonConfig {
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.dropout = 0.0;
+        config.random_scaffold.enabled = true;
+        config.random_scaffold.seed = seed;
+        config.random_scaffold.rank = 4;
+        config.random_scaffold.alpha = 16.0;
+        config
+    }
+
+    #[test]
+    fn random_scaffold_zero_b_is_end_to_end_function_preserving() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model = DragonModel::<TestBackend>::new(tiny_random_scaffold_config(31), &device);
+        let adapters = model.random_scaffold_adapters.take();
+        let raw = model.shared_lowrank_weights();
+        model.random_scaffold_adapters = adapters;
+        let effective = model.shared_lowrank_effective_weights();
+        assert_eq!(
+            tensor_values(raw.encoder),
+            tensor_values(effective.encoder),
+            "zero-B encoder adapter changed the scaffold"
+        );
+        assert_eq!(
+            tensor_values(raw.encoder_v),
+            tensor_values(effective.encoder_v),
+            "zero-B encoder-v adapter changed the scaffold"
+        );
+        assert_eq!(
+            tensor_values(raw.decoder),
+            tensor_values(effective.decoder),
+            "zero-B decoder adapter changed the scaffold"
+        );
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let adapters = model.random_scaffold_adapters.take();
+        let expected = model.forward(tokens.clone());
+        model.random_scaffold_adapters = adapters;
+        let actual = model.forward(tokens);
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(actual));
+        assert!(diff <= 1.0e-6, "zero-B scaffold adapter drifted by {diff}");
+    }
+
+    #[test]
+    fn random_scaffold_record_round_trip_preserves_logits_and_manifest() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let config = tiny_random_scaffold_config(37);
+        let model = DragonModel::<TestBackend>::new(config.clone(), &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let expected = model.forward(tokens.clone());
+        let expected_identity = model
+            .random_scaffold_report()
+            .expect("scaffold report")
+            .manifest
+            .canonical_identity()
+            .expect("manifest identity");
+        let record = model.into_record();
+        let reloaded = DragonModel::<TestBackend>::new(config, &device).load_record(record);
+        let actual = reloaded.forward(tokens);
+        let actual_identity = reloaded
+            .random_scaffold_report()
+            .expect("scaffold report")
+            .manifest
+            .canonical_identity()
+            .expect("manifest identity");
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(actual));
+        assert!(diff <= 1.0e-6, "scaffold checkpoint drifted by {diff}");
+        assert_eq!(actual_identity, expected_identity);
+    }
+
+    #[test]
+    fn random_scaffold_inference_materialization_preserves_logits() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let model = DragonModel::<TestBackend>::new(tiny_random_scaffold_config(39), &device);
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let expected = model.forward(tokens.clone());
+        let materialized = model.materialize_random_scaffold_for_inference();
+        assert!(!materialized.uses_random_scaffold());
+        let actual = materialized.forward(tokens);
+        let diff = max_abs_diff(tensor_values(expected), tensor_values(actual));
+        assert!(
+            diff <= 1.0e-6,
+            "materialized scaffold inference drifted by {diff}"
+        );
+    }
+
+    #[test]
+    fn random_scaffold_backward_excludes_base_and_reaches_adapter() {
+        let device = burn::tensor::Device::<TestAutodiffBackend>::default();
+        let model =
+            DragonModel::<TestAutodiffBackend>::new(tiny_random_scaffold_config(41), &device);
+        let tokens = Tensor::<TestAutodiffBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let loss = model.forward(tokens).powf_scalar(2.0).mean();
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        let base_ids = model.shared_lowrank_param_ids();
+        assert!(
+            grads.get::<TestBackend, 3>(base_ids.encoder).is_none(),
+            "immutable encoder scaffold received a gradient"
+        );
+        assert!(
+            grads.get::<TestBackend, 3>(base_ids.encoder_v).is_none(),
+            "immutable encoder-v scaffold received a gradient"
+        );
+        assert!(
+            grads.get::<TestBackend, 2>(base_ids.decoder).is_none(),
+            "immutable decoder scaffold received a gradient"
+        );
+
+        let adapters = model
+            .random_scaffold_adapters
+            .as_ref()
+            .expect("scaffold adapters");
+        assert!(
+            grads
+                .get::<TestBackend, 3>(adapters.fast.encoder.b.id)
+                .is_some(),
+            "encoder adapter B did not receive a gradient"
+        );
+        assert!(
+            grads
+                .get::<TestBackend, 2>(adapters.fast.decoder.b.id)
+                .is_some(),
+            "decoder adapter B did not receive a gradient"
+        );
+        assert!(
+            grads
+                .get::<TestBackend, 1>(adapters.fast.encoder.gain.id)
+                .is_some(),
+            "scaffold gain did not receive a gradient"
+        );
     }
 
     #[test]

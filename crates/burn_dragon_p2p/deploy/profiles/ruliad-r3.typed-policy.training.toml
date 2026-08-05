@@ -1,0 +1,73 @@
+extends = ["ruliad-r3.training.toml"]
+
+# Production candidate for verifier-guided formal proof construction. The model scores semantic
+# actions while the verifier owns enumeration, application, and deterministic rendering. This is
+# intentionally distinct from unconstrained free-text proof generation.
+[dataset]
+cache_dir = "./cache/ruliad-r3-semantic-action"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"
+
+[training]
+block_size = 512
+tbptt_chunk_size = 512
+tbptt_persist_across_steps = false
+
+[training.ruliad_supervision]
+mode = "answer_completion"
+mask_high_entropy_spans = true
+
+[training.ruliad_supervision.proof_policy]
+enabled = true
+mode = "static_expert"
+normalization = "candidate_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 0.25
+every_steps = 2
+start_after_steps = 128
+stratified_difficulty_levels = 4
+rollout_steps = 1
+max_rows_per_update = 8
+max_presentation_rows_per_update = 8
+candidates = 4
+max_completion_tokens = 64
+
+[training.events]
+ruliad_correctness_probe_every_epochs = 2
+ruliad_correctness_probe_items = 128
+ruliad_correctness_probe_tokens = 32
+ruliad_correctness_probe_hard_token_cap = 64
+
+[training.ruliad_probe_generation]
+enabled = true
+max_batch_rows = 64
+minimum_batch_rows = 2
+maximum_prompt_position_span = 32
+device_buffer_tokens = 4
+
+[training.ruliad_policy_probe]
+enabled = true
+every_epochs = 4
+# Closed-loop verifier search is a production audit, not an optimizer hot-path metric. Keep the
+# cheaper constrained-action diagnostics at the cadence above while avoiding long synchronous
+# evaluator pauses on every validation cycle.
+closed_loop_every_epochs = 16
+items = 16
+max_steps = 64
+candidates = 4
+beam_width = 1
+scoring_batch_rows = 32
+scoring_token_budget = 32768
+scoring_pipeline_depth = 2
+stratified_difficulty_levels = 4
+candidate_symmetry = "cyclic_orbit_average"
+
+[training.ruliad_policy_probe.promotion_gate]
+enabled = true
+minimum_items = 16
+minimum_solve_rate = 0.50
+minimum_goal_completion_rate = 0.80
+minimum_valid_action_rate = 0.95
+maximum_invalid_action_rate = 0.05
+maximum_repeated_state_rate = 0.35
+maximum_backtrack_rate = 0.25

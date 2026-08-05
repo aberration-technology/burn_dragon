@@ -21,7 +21,13 @@ use crate::kernel::{BlockPattern1d, relu_lowrank};
 #[derive(Debug)]
 pub struct LowRankResidualOutput<B: Backend> {
     pub next: Tensor<B, 4>,
+    /// Attention output before the shared normalization. Retained only by the
+    /// factor-trace variant used by analytic local VJPs.
+    pub attention_pre_norm: Option<Tensor<B, 4>>,
     pub attention_readout: Option<Tensor<B, 4>>,
+    /// Decoded residual branch before the shared normalization. Retained only
+    /// by the factor-trace variant used by analytic local VJPs.
+    pub residual_pre_norm: Option<Tensor<B, 4>>,
     pub residual_delta: Option<Tensor<B, 4>>,
     pub x_neuron: Tensor<B, 4>,
     pub y_gate: Tensor<B, 4>,
@@ -30,7 +36,9 @@ pub struct LowRankResidualOutput<B: Backend> {
 
 struct LowRankResidualInternal<B: Backend> {
     next: Tensor<B, 4>,
+    attention_pre_norm: Option<Tensor<B, 4>>,
     attention_readout: Option<Tensor<B, 4>>,
+    residual_pre_norm: Option<Tensor<B, 4>>,
     residual_delta: Option<Tensor<B, 4>>,
     x_neuron: Option<Tensor<B, 4>>,
     y_gate: Option<Tensor<B, 4>>,
@@ -56,6 +64,13 @@ impl LowRankResidualStepMode {
         Self {
             native_projection_relu_fused: true,
             ..Self::full_output()
+        }
+    }
+    const fn full_output_with_metrics_relu_native() -> Self {
+        Self {
+            native_projection_relu_fused: true,
+            keep_aux: true,
+            keep_metric_aux: true,
         }
     }
     #[cfg(any(feature = "probe", test))]
@@ -151,7 +166,6 @@ static LOWRANK_RESIDUAL_MEMORY_PROFILE: OnceLock<Mutex<LowRankResidualMemoryProf
 static LOWRANK_RESIDUAL_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOWRANK_RESIDUAL_MEMORY_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOWRANK_RESIDUAL_MEMORY_PROFILE_SYNC_ENABLED: OnceLock<bool> = OnceLock::new();
-static LEGACY_FLAT_DECODER_TAIL_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn lowrank_residual_profile_enabled() -> bool {
     *LOWRANK_RESIDUAL_PROFILE_ENABLED
@@ -166,15 +180,6 @@ fn lowrank_residual_memory_profile_enabled() -> bool {
 fn lowrank_residual_memory_profile_sync_enabled() -> bool {
     *LOWRANK_RESIDUAL_MEMORY_PROFILE_SYNC_ENABLED
         .get_or_init(|| std::env::var_os("DragonModel_STAGE_PROFILE_MEMORY_SYNC").is_some())
-}
-
-fn legacy_flat_decoder_tail_enabled() -> bool {
-    *LEGACY_FLAT_DECODER_TAIL_ENABLED
-        .get_or_init(|| std::env::var_os("BURN_DRAGON_LEGACY_FLAT_DECODER_TAIL").is_some())
-}
-
-pub(super) fn decode_y_neuron_tail_uses_legacy_flat() -> bool {
-    legacy_flat_decoder_tail_enabled()
 }
 
 fn lowrank_residual_profile_state() -> &'static Mutex<LowRankResidualProfileSnapshot> {
@@ -301,47 +306,18 @@ fn lowrank_residual_memory_record_stage<B: Backend>(
     }
 }
 
-fn decode_y_neuron_tail_flat<B: Backend>(
+pub(super) fn decode_y_neuron_tail<B: Backend>(
     y_neuron: Tensor<B, 4>,
     decoder: Tensor<B, 2>,
 ) -> Tensor<B, 4> {
     let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
     let dim = decoder.shape().dims::<2>()[1];
+    // Decoder rows already concatenate the head-latent axis; one GEMM is the exact headwise sum.
     y_neuron
         .swap_dims(1, 2)
         .reshape([batch * time, heads * latent])
         .matmul(decoder)
         .reshape([batch, 1, time, dim])
-}
-
-fn decode_y_neuron_tail_headwise<B: Backend>(
-    y_neuron: Tensor<B, 4>,
-    decoder: Tensor<B, 2>,
-) -> Tensor<B, 4> {
-    let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
-    let dim = decoder.shape().dims::<2>()[1];
-    if heads == 1 {
-        return decode_y_neuron_tail_flat(y_neuron, decoder);
-    }
-    let decoder_by_head = decoder.reshape([heads, latent, dim]);
-    let mixed_by_head = y_neuron
-        .swap_dims(0, 1)
-        .reshape([heads, batch * time, latent]);
-    mixed_by_head
-        .matmul(decoder_by_head)
-        .sum_dim(0)
-        .reshape([batch, 1, time, dim])
-}
-
-pub(super) fn decode_y_neuron_tail<B: Backend>(
-    y_neuron: Tensor<B, 4>,
-    decoder: Tensor<B, 2>,
-) -> Tensor<B, 4> {
-    if legacy_flat_decoder_tail_enabled() {
-        decode_y_neuron_tail_flat(y_neuron, decoder)
-    } else {
-        decode_y_neuron_tail_headwise(y_neuron, decoder)
-    }
 }
 
 fn lowrank_residual_step_impl<B, FAttn, FNorm, FAct>(
@@ -399,14 +375,12 @@ where
         other => other,
     };
     let y_grad_input_executor = lowrank_grad_input_executor;
-    let sparse_mask = if use_fused_any && latent_pattern.is_sparse() {
-        sparse_mask.or_else(|| {
+    let sparse_mask = sparse_mask.or_else(|| {
+        (use_fused_any && latent_pattern.is_sparse()).then(|| {
             let latent = encoder.shape().dims::<4>()[3];
-            Some(latent_pattern.mask::<B>(latent, &current.device()))
+            latent_pattern.mask::<B>(latent, &current.device())
         })
-    } else {
-        None
-    };
+    });
 
     let x_projection_start = prof_enabled.then(Instant::now);
     let x_neuron = if use_fused_x {
@@ -428,7 +402,11 @@ where
         if apply_threshold && x_relu_threshold != 0.0 {
             x_latent = x_latent.sub_scalar(x_relu_threshold);
         }
-        apply_latent(x_latent)
+        let activated = apply_latent(x_latent);
+        match sparse_mask.as_ref() {
+            Some(mask) => activated * mask.clone(),
+            None => activated,
+        }
     };
     if let Some(start) = x_projection_start {
         x_projection_ns = start.elapsed().as_nanos();
@@ -439,6 +417,7 @@ where
     if let Some(start) = attention_mixer_start {
         attention_mixer_ns = start.elapsed().as_nanos();
     }
+    let attention_pre_norm = keep_metric_aux.then(|| attn.clone());
     let attention_post_norm_start = prof_enabled.then(Instant::now);
     let attn = apply_norm(attn);
     if let Some(start) = attention_post_norm_start {
@@ -479,7 +458,11 @@ where
         if apply_threshold && y_relu_threshold != 0.0 {
             y_latent = y_latent.sub_scalar(y_relu_threshold);
         }
-        apply_latent(y_latent)
+        let activated = apply_latent(y_latent);
+        match sparse_mask.as_ref() {
+            Some(mask) => activated * mask.clone(),
+            None => activated,
+        }
     };
     if let Some(start) = y_projection_start {
         y_projection_ns = start.elapsed().as_nanos();
@@ -531,6 +514,7 @@ where
         );
     }
 
+    let residual_pre_norm = keep_metric_aux.then(|| mlp_out.clone());
     let mlp_norm_start = prof_enabled.then(Instant::now);
     let mlp_out = apply_norm(mlp_out);
     if let Some(start) = mlp_norm_start {
@@ -577,7 +561,9 @@ where
 
     LowRankResidualInternal {
         next,
+        attention_pre_norm,
         attention_readout: attn_out,
+        residual_pre_norm,
         residual_delta: residual_delta_out,
         x_neuron: x_neuron_out,
         y_gate: y_gate_out,
@@ -634,7 +620,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),
@@ -669,6 +657,106 @@ where
     FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
     FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
 {
+    lowrank_residual_step_branch_thresholds_relu_native_impl(
+        current,
+        encoder,
+        encoder_v,
+        decoder,
+        dropout,
+        use_fused_x,
+        use_fused_y,
+        x_relu_threshold,
+        y_relu_threshold,
+        apply_threshold,
+        latent_pattern,
+        lowrank_grad_input_executor,
+        sparse_mask,
+        false,
+        attention,
+        apply_latent,
+        apply_norm,
+    )
+}
+
+/// Full ReLU-native residual trace including the intermediate tensors needed
+/// by local factor VJPs. Ordinary full-output callers avoid retaining these
+/// additional tensors.
+#[allow(clippy::too_many_arguments)]
+pub fn lowrank_residual_step_with_metrics_branch_thresholds_relu_native<B, FAttn, FNorm, FAct>(
+    current: Tensor<B, 4>,
+    encoder: Tensor<B, 4>,
+    encoder_v: Tensor<B, 4>,
+    decoder: Tensor<B, 2>,
+    dropout: &Dropout,
+    use_fused_x: bool,
+    use_fused_y: bool,
+    x_relu_threshold: f32,
+    y_relu_threshold: f32,
+    apply_threshold: bool,
+    latent_pattern: &BlockPattern1d,
+    lowrank_grad_input_executor: LowrankGradInputExecutor,
+    sparse_mask: Option<Tensor<B, 4>>,
+    attention: FAttn,
+    apply_latent: FAct,
+    apply_norm: FNorm,
+) -> LowRankResidualOutput<B>
+where
+    B: Backend,
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+    FAttn: FnMut(Tensor<B, 4>, Tensor<B, 4>) -> Tensor<B, 4>,
+    FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+    FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+{
+    lowrank_residual_step_branch_thresholds_relu_native_impl(
+        current,
+        encoder,
+        encoder_v,
+        decoder,
+        dropout,
+        use_fused_x,
+        use_fused_y,
+        x_relu_threshold,
+        y_relu_threshold,
+        apply_threshold,
+        latent_pattern,
+        lowrank_grad_input_executor,
+        sparse_mask,
+        true,
+        attention,
+        apply_latent,
+        apply_norm,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lowrank_residual_step_branch_thresholds_relu_native_impl<B, FAttn, FNorm, FAct>(
+    current: Tensor<B, 4>,
+    encoder: Tensor<B, 4>,
+    encoder_v: Tensor<B, 4>,
+    decoder: Tensor<B, 2>,
+    dropout: &Dropout,
+    use_fused_x: bool,
+    use_fused_y: bool,
+    x_relu_threshold: f32,
+    y_relu_threshold: f32,
+    apply_threshold: bool,
+    latent_pattern: &BlockPattern1d,
+    lowrank_grad_input_executor: LowrankGradInputExecutor,
+    sparse_mask: Option<Tensor<B, 4>>,
+    keep_metric_aux: bool,
+    attention: FAttn,
+    apply_latent: FAct,
+    apply_norm: FNorm,
+) -> LowRankResidualOutput<B>
+where
+    B: Backend,
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+    FAttn: FnMut(Tensor<B, 4>, Tensor<B, 4>) -> Tensor<B, 4>,
+    FNorm: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+    FAct: Fn(Tensor<B, 4>) -> Tensor<B, 4>,
+{
     let output = lowrank_residual_step_impl(
         current,
         LowRankResidualStepConfig {
@@ -684,7 +772,11 @@ where
             latent_pattern,
             lowrank_grad_input_executor,
             sparse_mask,
-            mode: LowRankResidualStepMode::full_output_relu_native(),
+            mode: if keep_metric_aux {
+                LowRankResidualStepMode::full_output_with_metrics_relu_native()
+            } else {
+                LowRankResidualStepMode::full_output_relu_native()
+            },
         },
         attention,
         apply_latent,
@@ -692,7 +784,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),
@@ -751,7 +845,9 @@ where
     );
     LowRankResidualOutput {
         next: output.next,
+        attention_pre_norm: output.attention_pre_norm,
         attention_readout: output.attention_readout,
+        residual_pre_norm: output.residual_pre_norm,
         residual_delta: output.residual_delta,
         x_neuron: output.x_neuron.expect("x_neuron for full residual output"),
         y_gate: output.y_gate.expect("y_gate for full residual output"),
@@ -952,4 +1048,153 @@ where
         apply_latent,
         apply_norm,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = NdArray<f32>;
+    type TestAutodiffBackend = Autodiff<TestBackend>;
+
+    fn assert_close<const D: usize, B: Backend>(
+        lhs: Tensor<B, D>,
+        rhs: Tensor<B, D>,
+        tolerance: f32,
+    ) {
+        let lhs = lhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lhs values");
+        let rhs = rhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("rhs values");
+        assert_eq!(lhs.len(), rhs.len(), "tensor length mismatch");
+        let max_error = lhs
+            .into_iter()
+            .zip(rhs)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error <= tolerance,
+            "tensor mismatch: max_error={max_error}, tolerance={tolerance}"
+        );
+    }
+
+    fn decode_y_neuron_tail_headwise_reference<B: Backend>(
+        y_neuron: Tensor<B, 4>,
+        decoder: Tensor<B, 2>,
+    ) -> Tensor<B, 4> {
+        let [batch, heads, time, latent] = y_neuron.shape().dims::<4>();
+        let dim = decoder.shape().dims::<2>()[1];
+        y_neuron
+            .swap_dims(0, 1)
+            .reshape([heads, batch * time, latent])
+            .matmul(decoder.reshape([heads, latent, dim]))
+            .sum_dim(0)
+            .reshape([batch, 1, time, dim])
+    }
+
+    #[test]
+    fn flat_decoder_matches_headwise_sum_reference() {
+        let device = Default::default();
+        let batch = 2;
+        let heads = 3;
+        let time = 4;
+        let latent = 5;
+        let dim = 7;
+        let y_neuron = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * heads * time * latent))
+                    .map(|index| ((index * 17) % 47) as f32 / 47.0 - 0.5)
+                    .collect(),
+                [batch, heads, time, latent],
+            ),
+            &device,
+        );
+        let decoder = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                (0..(heads * latent * dim))
+                    .map(|index| ((index * 19) % 53) as f32 / 53.0 - 0.5)
+                    .collect(),
+                [heads * latent, dim],
+            ),
+            &device,
+        );
+        let reference = decode_y_neuron_tail_headwise_reference(y_neuron.clone(), decoder.clone());
+
+        assert_close(decode_y_neuron_tail(y_neuron, decoder), reference, 2.0e-5);
+    }
+
+    #[test]
+    fn flat_decoder_matches_headwise_activation_and_weight_gradients() {
+        let device = burn::tensor::Device::<TestAutodiffBackend>::default();
+        let batch = 2;
+        let heads = 3;
+        let time = 4;
+        let latent = 5;
+        let dim = 7;
+        let y_neuron = Tensor::<TestAutodiffBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * heads * time * latent))
+                    .map(|index| ((index * 17) % 47) as f32 / 47.0 - 0.5)
+                    .collect(),
+                [batch, heads, time, latent],
+            ),
+            &device,
+        )
+        .require_grad();
+        let decoder = Tensor::<TestAutodiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..(heads * latent * dim))
+                    .map(|index| ((index * 19) % 53) as f32 / 53.0 - 0.5)
+                    .collect(),
+                [heads * latent, dim],
+            ),
+            &device,
+        )
+        .require_grad();
+        let output_weight = Tensor::<TestAutodiffBackend, 4>::from_data(
+            TensorData::new(
+                (0..(batch * time * dim))
+                    .map(|index| ((index * 23) % 59) as f32 / 59.0 - 0.5)
+                    .collect(),
+                [batch, 1, time, dim],
+            ),
+            &device,
+        );
+
+        let flat_grads = (decode_y_neuron_tail(y_neuron.clone(), decoder.clone())
+            * output_weight.clone())
+        .sum()
+        .backward();
+        let headwise_grads =
+            (decode_y_neuron_tail_headwise_reference(y_neuron.clone(), decoder.clone())
+                * output_weight)
+                .sum()
+                .backward();
+
+        assert_close(
+            y_neuron
+                .grad(&flat_grads)
+                .expect("flat activation gradient"),
+            y_neuron
+                .grad(&headwise_grads)
+                .expect("headwise activation gradient"),
+            2.0e-5,
+        );
+        assert_close(
+            decoder.grad(&flat_grads).expect("flat decoder gradient"),
+            decoder
+                .grad(&headwise_grads)
+                .expect("headwise decoder gradient"),
+            2.0e-5,
+        );
+    }
 }

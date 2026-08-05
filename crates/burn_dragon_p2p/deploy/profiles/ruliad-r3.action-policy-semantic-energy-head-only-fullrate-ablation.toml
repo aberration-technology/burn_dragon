@@ -1,0 +1,7 @@
+extends = ["ruliad-r3.action-policy-semantic-energy-fullrate-ablation.toml"]
+
+# Mechanistic ceiling arm: maximize paired semantic-policy exposure while preserving the shared
+# Dragon trajectory. This is intentionally not a deployment profile; it distinguishes an
+# undertrained compatibility head from a representation that requires shared-backbone adaptation.
+[training.ruliad_supervision.proof_policy]
+gradient_scope = "score_head_only"

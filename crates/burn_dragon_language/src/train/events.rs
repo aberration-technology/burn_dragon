@@ -1,20 +1,23 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use burn_dragon_train::train::events::{
     BurnInterrupterControl, DynamicsEquilibriumPlugin, ModelCapacityConfig, ModelCapacityState,
-    TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext, TrainingRunOptions,
-    TrainingRuntimeThread,
+    PredictiveCodingSample, TrainingEventBusConfig, TrainingEventMetricLogger, TrainingRunContext,
+    TrainingRunOptions, TrainingRuntimeThread,
 };
 use burn_ecs::bevy_ecs;
 use burn_ecs::prelude::{
     App, Component, IntoScheduleConfigs, MessageReader, MessageWriter, Plugin, Query, Res,
-    SourceSelectionBucketMetric, SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt,
-    TrainingMetricSample, TrainingMetricSplit, TrainingPlugins, TrainingRunId, TrainingRunRegistry,
-    TrainingSet, Update,
+    SourceSelectionBucketMetric, SourceSelectionCapabilityCoverageMetric,
+    SourceSelectionGroupMetric, SourceSelectionSample, TrainingAppExt, TrainingMetricSample,
+    TrainingMetricSplit, TrainingPlugins, TrainingRunCheckpointExt, TrainingRunId,
+    TrainingRunRegistry, TrainingRunStateCheckpoint, TrainingSet, Update,
 };
 
-use crate::config::TrainingHyperparameters;
+use crate::config::{LocalPredictiveCodingSolver, TrainingAlgorithm, TrainingHyperparameters};
 use crate::dataset::Dataset;
 use crate::train::dynamics::{DragonDynamicsControlPlugin, DragonDynamicsControlSlot};
 use crate::train::neuron_scaling::{DragonNeuronScalingPlugin, NeuronScaleRequestSlot};
@@ -37,6 +40,111 @@ impl RuliadSourceSelectionConfig {
 pub struct TrainingEventHandles {
     pub interrupter: burn_train::Interrupter,
     pub metric_logger: TrainingEventMetricLogger,
+}
+
+const TRAINING_ECS_STATE_PREFIX: &str = "training-ecs-state";
+
+pub(crate) fn training_event_state_checkpoint_path(run_dir: &Path, epoch: usize) -> PathBuf {
+    run_dir
+        .join("checkpoint")
+        .join(format!("{TRAINING_ECS_STATE_PREFIX}-{epoch}.json"))
+}
+
+fn load_training_event_state_checkpoint(
+    run_name: &str,
+    run_dir: &Path,
+    training: &TrainingHyperparameters,
+) -> Result<Option<TrainingRunStateCheckpoint>> {
+    if !matches!(
+        training.launch_mode,
+        burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+    ) {
+        return Ok(None);
+    }
+    let (_, epoch) = crate::checkpoint::resolve_checkpoint_base(
+        &run_dir.join("checkpoint"),
+        training.resume_checkpoint_epoch,
+    )?;
+    let path = training_event_state_checkpoint_path(run_dir, epoch);
+    if !path.is_file() {
+        return Err(anyhow!(
+            "exact resume requires training ECS state checkpoint {}",
+            path.display()
+        ));
+    }
+    let checkpoint: TrainingRunStateCheckpoint = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if checkpoint.run_id.as_str() != run_name {
+        return Err(anyhow!(
+            "training ECS checkpoint {} belongs to run {}, expected {}",
+            path.display(),
+            checkpoint.run_id,
+            run_name
+        ));
+    }
+    Ok(Some(checkpoint))
+}
+
+pub(crate) fn save_training_event_state_checkpoint(
+    handles: &TrainingEventHandles,
+    run_name: &str,
+    run_dir: &Path,
+    epoch: usize,
+) -> Result<()> {
+    let checkpoint = handles.metric_logger.bus().snapshot_run_state(run_name)?;
+    let path = training_event_state_checkpoint_path(run_dir, epoch);
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&checkpoint).context("serialize training ECS state")?,
+    )
+    .with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("replace {} from {}", path.display(), temporary.display()))
+}
+
+/// Run-scoped observable state for predictive-context routing.
+///
+/// GPU masks, recurrent tensors, and optimizers remain owned by the training thread. This ECS
+/// component is the control-plane projection used by dashboards, gates, and external observers,
+/// so multiple runs can coexist without sharing context lifecycle state.
+#[derive(Clone, Component, Debug, Default, PartialEq)]
+pub struct PredictiveContextRoutingTelemetryState {
+    pub current_context: usize,
+    pub current_generation: u64,
+    pub known_contexts: usize,
+    pub probes: u64,
+    pub creations: u64,
+    pub replacements: u64,
+    pub novelty_deferrals: u64,
+    pub probe_tokens: u64,
+    pub selected_loss: Option<f64>,
+    pub last_absolute_step: usize,
+}
+
+#[derive(Clone, Component)]
+struct LocalPredictiveCodingTelemetryConfig {
+    profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
+    solver: LocalPredictiveCodingSolver,
+}
+
+fn local_predictive_coding_event_contract(
+    solver: LocalPredictiveCodingSolver,
+) -> (&'static str, &'static str) {
+    match solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium => {
+            ("local_factor_vjp_v1", "equilibrium_layer_activities")
+        }
+        LocalPredictiveCodingSolver::ReverseGaussSeidel => (
+            "local_prospective_gauss_seidel_v1",
+            "settled_layer_activities",
+        ),
+        LocalPredictiveCodingSolver::FixedPrediction => {
+            ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
+        }
+    }
 }
 
 pub fn train_loss_metric_frequency(
@@ -62,6 +170,31 @@ pub fn build_training_event_handles(
     neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
     dynamics_control_slot: Option<DragonDynamicsControlSlot>,
 ) -> Result<TrainingEventHandles> {
+    build_training_event_handles_with_local_predictive_coding(
+        run_name,
+        run_dir,
+        steps_per_epoch,
+        training,
+        source_selection_dataset,
+        neuron_scaling_slot,
+        dynamics_control_slot,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_training_event_handles_with_local_predictive_coding(
+    run_name: &str,
+    run_dir: &std::path::Path,
+    steps_per_epoch: usize,
+    training: &TrainingHyperparameters,
+    source_selection_dataset: Option<Arc<Dataset>>,
+    neuron_scaling_slot: Option<(usize, NeuronScaleRequestSlot)>,
+    dynamics_control_slot: Option<DragonDynamicsControlSlot>,
+    local_predictive_coding_profile: Option<
+        crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
+    >,
+) -> Result<TrainingEventHandles> {
     let interrupter = burn_train::Interrupter::new();
     let control = BurnInterrupterControl::new(interrupter.clone());
     let run = TrainingRunContext::new(run_name, run_name, run_dir, steps_per_epoch);
@@ -69,6 +202,15 @@ pub fn build_training_event_handles(
         .filter(|dataset| dataset.uses_live_source_selection())
         .map(|dataset| {
             RuliadSourceSelectionConfig::new(dataset, training.events.source_selection_every_steps)
+        });
+    let local_predictive_coding = local_predictive_coding_profile
+        .filter(|_| matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding))
+        .map(|profile| {
+            profile.reset();
+            LocalPredictiveCodingTelemetryConfig {
+                profile,
+                solver: training.local_predictive_coding.solver,
+            }
         });
     let neuron_scaling = (training
         .neuron_scaling
@@ -94,6 +236,8 @@ pub fn build_training_event_handles(
         capacity,
     };
     let dynamics_enabled = training.dynamics.enabled;
+    let context_routing_enabled = training.predictive_context_routing.enabled;
+    let restored_event_state = load_training_event_state_checkpoint(run_name, run_dir, training)?;
     let event_thread = TrainingRuntimeThread::spawn(
         move || {
             let mut app = App::new();
@@ -101,6 +245,12 @@ pub fn build_training_event_handles(
                 .insert_training_control(control);
             if source_selection.is_some() {
                 app.add_plugins(RuliadSourceSelectionTelemetryPlugin);
+            }
+            if local_predictive_coding.is_some() {
+                app.add_plugins(DragonLocalPredictiveCodingTelemetryPlugin);
+            }
+            if context_routing_enabled {
+                app.add_plugins(DragonPredictiveContextRoutingTelemetryPlugin);
             }
             if neuron_scaling.is_some() {
                 app.add_plugins(DragonNeuronScalingPlugin);
@@ -112,10 +262,23 @@ pub fn build_training_event_handles(
                 }
             }
             let run_entity = app.try_add_training_run_with(run, options)?;
+            if let Some(checkpoint) = restored_event_state {
+                app.restore_training_run_state(checkpoint)?;
+            }
             if let Some(source_selection) = source_selection {
                 app.world_mut()
                     .entity_mut(run_entity)
                     .insert(source_selection);
+            }
+            if let Some(local_predictive_coding) = local_predictive_coding {
+                app.world_mut()
+                    .entity_mut(run_entity)
+                    .insert(local_predictive_coding);
+            }
+            if context_routing_enabled {
+                app.world_mut()
+                    .entity_mut(run_entity)
+                    .insert(PredictiveContextRoutingTelemetryState::default());
             }
             if let Some((config, (_, request_slot))) = neuron_scaling {
                 app.world_mut().entity_mut(run_entity).insert(
@@ -138,6 +301,133 @@ pub fn build_training_event_handles(
         interrupter,
         metric_logger,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DragonPredictiveContextRoutingTelemetryPlugin;
+
+impl Plugin for DragonPredictiveContextRoutingTelemetryPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            record_predictive_context_routing_from_metrics.in_set(TrainingSet::Telemetry),
+        );
+    }
+}
+
+fn record_predictive_context_routing_from_metrics(
+    mut metrics: MessageReader<TrainingMetricSample>,
+    registry: Res<TrainingRunRegistry>,
+    mut runs: Query<&mut PredictiveContextRoutingTelemetryState>,
+) {
+    for sample in metrics.read() {
+        if sample.split != TrainingMetricSplit::Train
+            || !sample.name.starts_with("Predictive Context ")
+        {
+            continue;
+        }
+        let Some(mut state) = registry.get_query_mut(&sample.run_id, &mut runs) else {
+            continue;
+        };
+        apply_predictive_context_routing_metric(&mut state, sample);
+    }
+}
+
+fn apply_predictive_context_routing_metric(
+    state: &mut PredictiveContextRoutingTelemetryState,
+    sample: &TrainingMetricSample,
+) {
+    state.last_absolute_step = sample.absolute_step;
+    match sample.name.as_str() {
+        "Predictive Context Index" => state.current_context = sample.value.max(0.0) as usize,
+        "Predictive Context Generation" => {
+            state.current_generation = sample.value.max(0.0) as u64;
+        }
+        "Predictive Context Count" => state.known_contexts = sample.value.max(0.0) as usize,
+        "Predictive Context Created" if sample.value > 0.5 => {
+            state.creations = state.creations.saturating_add(1);
+        }
+        "Predictive Context Replaced" if sample.value > 0.5 => {
+            state.replacements = state.replacements.saturating_add(1);
+        }
+        "Predictive Context Novelty Deferred" if sample.value > 0.5 => {
+            state.novelty_deferrals = state.novelty_deferrals.saturating_add(1);
+        }
+        "Predictive Context Probe Tokens" => {
+            state.probes = state.probes.saturating_add(1);
+            state.probe_tokens = state
+                .probe_tokens
+                .saturating_add(sample.value.max(0.0) as u64);
+        }
+        "Predictive Context Selected Loss" => state.selected_loss = Some(sample.value),
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DragonLocalPredictiveCodingTelemetryPlugin;
+
+impl Plugin for DragonLocalPredictiveCodingTelemetryPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            record_local_predictive_coding_from_loss.in_set(TrainingSet::Telemetry),
+        );
+    }
+}
+
+fn record_local_predictive_coding_from_loss(
+    mut metrics: MessageReader<TrainingMetricSample>,
+    registry: Res<TrainingRunRegistry>,
+    runs: Query<&LocalPredictiveCodingTelemetryConfig>,
+    mut output: MessageWriter<PredictiveCodingSample>,
+) {
+    for sample in metrics.read() {
+        if sample.split != TrainingMetricSplit::Train
+            || (sample.name != "Loss" && sample.name != "Stream Warm Loss")
+        {
+            continue;
+        }
+        let Some(config) = registry.get_query(&sample.run_id, &runs) else {
+            continue;
+        };
+        let snapshot = config.profile.take();
+        if snapshot.steps == 0 {
+            continue;
+        }
+        let (learning_contract, observation_contract) =
+            local_predictive_coding_event_contract(config.solver);
+        output.write(PredictiveCodingSample {
+            run_id: sample.run_id.clone(),
+            epoch: Some(sample.epoch),
+            absolute_step: sample.absolute_step,
+            optimizer_step: sample.absolute_step,
+            learning_contract: learning_contract.to_string(),
+            global_autodiff_graph: false,
+            observation_contract: observation_contract.to_string(),
+            deployment_aligned: false,
+            chunks_seen: snapshot.steps as usize,
+            chunks_corrected: snapshot.steps as usize,
+            inference_steps: snapshot.inference_steps as usize,
+            skipped_empty_state: 0,
+            factors: snapshot.factors as usize,
+            local_vjp_calls: snapshot.local_vjp_calls as usize,
+            global_backward_calls: snapshot.global_backward_calls as usize,
+            gradient_tensors: snapshot.gradient_tensors as usize,
+            energy_before: snapshot.last_energy_before,
+            energy_after: snapshot.last_energy_after,
+            energy_delta: snapshot
+                .last_energy_before
+                .zip(snapshot.last_energy_after)
+                .map(|(before, after)| before - after),
+            grad_norm_mean: None,
+            grad_norm_max: None,
+            delta_rms_mean: None,
+            amortization_components: 0,
+            amortization_loss: None,
+            elapsed_ms: snapshot.elapsed_ns as f64 / 1_000_000.0,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -223,6 +513,13 @@ pub(crate) fn source_selection_sample_from_snapshot(
         capability_malformed_ema: snapshot.capability_malformed_ema as f64,
         capability_missing_ema: snapshot.capability_missing_ema as f64,
         capability_lagging_probability: snapshot.capability_lagging_probability as f64,
+        capability_frontier_allowed_max_difficulty: snapshot
+            .capability_frontier_allowed_max_difficulty,
+        capability_frontier_coverage: snapshot
+            .capability_frontier_coverage
+            .iter()
+            .map(source_selection_capability_coverage_metric)
+            .collect(),
         frontier_extension_count: snapshot.frontier_extension_count,
         frontier_saturated: snapshot.frontier_saturated,
         unbounded_frontier: snapshot.frontier_unbounded,
@@ -272,6 +569,20 @@ pub(crate) fn source_selection_sample_from_snapshot(
     }
 }
 
+fn source_selection_capability_coverage_metric(
+    coverage: &burn_dragon_universality::RuliadCapabilityCoverageMetric,
+) -> SourceSelectionCapabilityCoverageMetric {
+    SourceSelectionCapabilityCoverageMetric {
+        difficulty_level: coverage.difficulty_level,
+        candidate_coverage: coverage.candidate_coverage as f64,
+        family_coverage: coverage.family_coverage as f64,
+        task_coverage: coverage.task_coverage as f64,
+        contract_coverage: coverage.contract_coverage as f64,
+        observed_items: coverage.observed_items,
+        mastered: coverage.mastered,
+    }
+}
+
 fn source_selection_group_metric(
     group: &burn_dragon_universality::RuliadGroupMetric,
 ) -> SourceSelectionGroupMetric {
@@ -290,5 +601,84 @@ fn source_selection_group_metric(
         capability_malformed_ema: group.capability_malformed_ema as f64,
         capability_missing_ema: group.capability_missing_ema as f64,
         capability_lagging_probability: group.capability_lagging_probability as f64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_frontier_coverage_survives_the_ecs_event_boundary() {
+        let metric = source_selection_capability_coverage_metric(
+            &burn_dragon_universality::RuliadCapabilityCoverageMetric {
+                difficulty_level: 7,
+                candidate_coverage: 0.75,
+                family_coverage: 1.0,
+                task_coverage: 0.5,
+                contract_coverage: 0.25,
+                observed_items: 128,
+                mastered: false,
+            },
+        );
+
+        assert_eq!(metric.difficulty_level, 7);
+        assert_eq!(metric.observed_items, 128);
+        assert_eq!(metric.candidate_coverage, 0.75);
+        assert_eq!(metric.family_coverage, 1.0);
+        assert_eq!(metric.task_coverage, 0.5);
+        assert_eq!(metric.contract_coverage, 0.25);
+        assert!(!metric.mastered);
+    }
+
+    #[test]
+    fn local_pc_event_contract_distinguishes_error_solvers() {
+        assert_eq!(
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::SynchronousEquilibrium
+            ),
+            ("local_factor_vjp_v1", "equilibrium_layer_activities")
+        );
+        assert_eq!(
+            local_predictive_coding_event_contract(LocalPredictiveCodingSolver::FixedPrediction),
+            ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
+        );
+    }
+
+    #[test]
+    fn predictive_context_metrics_update_entity_scoped_lifecycle_state() {
+        let mut state = PredictiveContextRoutingTelemetryState::default();
+        let sample = |name: &str, value: f64, absolute_step: usize| TrainingMetricSample {
+            run_id: "run-a".into(),
+            split: TrainingMetricSplit::Train,
+            epoch: 2,
+            step_in_epoch: 3,
+            absolute_step,
+            name: name.to_string(),
+            value,
+            running_value: value,
+        };
+        for metric in [
+            sample("Predictive Context Index", 3.0, 11),
+            sample("Predictive Context Generation", 2.0, 11),
+            sample("Predictive Context Count", 4.0, 11),
+            sample("Predictive Context Created", 1.0, 11),
+            sample("Predictive Context Replaced", 1.0, 11),
+            sample("Predictive Context Novelty Deferred", 1.0, 11),
+            sample("Predictive Context Probe Tokens", 128.0, 11),
+            sample("Predictive Context Selected Loss", 0.75, 11),
+        ] {
+            apply_predictive_context_routing_metric(&mut state, &metric);
+        }
+        assert_eq!(state.current_context, 3);
+        assert_eq!(state.current_generation, 2);
+        assert_eq!(state.known_contexts, 4);
+        assert_eq!(state.probes, 1);
+        assert_eq!(state.creations, 1);
+        assert_eq!(state.replacements, 1);
+        assert_eq!(state.novelty_deferrals, 1);
+        assert_eq!(state.probe_tokens, 128);
+        assert_eq!(state.selected_loss, Some(0.75));
+        assert_eq!(state.last_absolute_step, 11);
     }
 }

@@ -1,0 +1,66 @@
+output_dir = "./generated/ruliad-r3-action-policy"
+seed = 1337
+name = "burn-dragon-ruliad-ir-v3-action-policy"
+train_samples = 256
+validation_samples = 256
+chunk_token_capacity = 2097152
+formal_generalization = "structural_holdout_v1"
+
+[serialization]
+document_tokens = 1048576
+preview_samples = 8
+document_mode = "single_sample"
+document_chunks = { min = 1, max = 1 }
+
+[tokenization]
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
+
+[source_selection]
+enabled = true
+difficulty_levels = { min = 0, max = 1 }
+
+[source_selection.formal_task_mix]
+# A single, non-leaky capability arm for fixed action-policy ablations. The
+# promoted mixed curriculum is selected only after this arm clears its gates.
+advance_proof_weight = 0
+select_proof_action_weight = 1
+construct_proof_weight = 0
+check_proof_weight = 0
+
+[source_selection.frontier_extension]
+enabled = true
+levels_per_extension = 1
+extend_when_normalized_difficulty_at_least = 0.88
+extend_when_max_difficulty_probability_at_least = 0.25
+max_materialized_levels = 0
+
+[source_selection.cold_start]
+enabled = true
+max_difficulty_level = 0
+hold_steps = 2048
+ramp_steps = 8192
+release_requires_mastery = true
+mastery_min_feedback_count = 8
+mastery_verifier_min = 0.60
+mastery_completion_health_min = 0.80
+mastery_schema_wrong_max = 0.20
+mastery_malformed_max = 0.05
+mastery_missing_max = 0.05
+
+[source_selection.sampler]
+exploration_floor = 0.01
+mastery_escape_weight = 4.0
+mastery_escape_threshold = 0.70
+mastery_min_normalized_difficulty = 0.90
+mastery_min_max_difficulty_probability = 0.35
+mastery_hash_noise_max_probability = 0.0
+max_answer_contract_probability = 1.0
+min_answer_contract_probability = 0.0
+
+[[families]]
+kind = "formal_proof"
+weight = 1
+width = { min = 2, max = 4 }
+steps = { min = 2, max = 4 }

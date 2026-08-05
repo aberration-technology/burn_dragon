@@ -520,6 +520,21 @@ pub enum PredictiveCodingMode {
     RecurrentState,
 }
 
+/// Observation contract for recurrent-state inference.
+///
+/// `ObservedPrefix` uses tokens already present in the causal stream to infer a
+/// detached recurrent-state teacher. Training amortizes that inference into the
+/// ordinary Dragon transition, which remains the state used by later chunks and
+/// by deployment. The oracle variant is retained solely to reproduce historical
+/// negative controls.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingObservationContract {
+    #[default]
+    ObservedPrefix,
+    OracleNextTokenNegativeControl,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PredictiveCodingStateScope {
@@ -545,6 +560,137 @@ pub enum PredictiveCodingParameterUpdate {
     StateOnlyControl,
 }
 
+/// Algorithm responsible for producing parameter derivatives or updates.
+///
+/// This is deliberately separate from `optimizer`: AdamW can transform either
+/// globally backpropagated gradients or local predictive-coding derivatives.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingAlgorithm {
+    /// Preserve existing profiles: EGGROLL selects its forward-only executor;
+    /// every gradient optimizer selects global backpropagation.
+    #[default]
+    Auto,
+    Backpropagation,
+    PredictiveCoding,
+    Eggroll,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveCodingFactorReduction {
+    #[default]
+    Sum,
+    Mean,
+}
+
+/// Activity/error solver used by canonical layer-local predictive coding.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPredictiveCodingSolver {
+    /// Parallel block-Jacobi activity relaxation. Credit advances through the
+    /// depth graph over repeated inference rounds.
+    #[default]
+    SynchronousEquilibrium,
+    /// Reverse block Gauss-Seidel activity relaxation. Each sweep updates
+    /// activities from the terminal factor toward the clamped input, so an
+    /// already-updated child error can influence every shallower activity in
+    /// the same sweep while parameter learning remains factor-local.
+    ReverseGaussSeidel,
+    /// Solve the fixed-prediction triangular error system with one reverse
+    /// local-VJP wave. This is a backprop-equivalent PC control, but it never
+    /// creates a global autodiff graph or calls global backward.
+    FixedPrediction,
+}
+
+/// Canonical layer-local predictive-coding learning configuration.
+///
+/// This is distinct from [`PredictiveCodingConfig`], which is the historical
+/// recurrent-state replay auxiliary used inside global backpropagation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LocalPredictiveCodingConfig {
+    pub solver: LocalPredictiveCodingSolver,
+    pub inference: burn_pc::PcInferenceConfig,
+    pub learning_schedule: burn_pc::PcLearningSchedule,
+    pub prediction_precision: f32,
+    pub factor_reduction: PredictiveCodingFactorReduction,
+    pub sync_diagnostics: bool,
+}
+
+impl Default for LocalPredictiveCodingConfig {
+    fn default() -> Self {
+        Self {
+            solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
+            inference: burn_pc::PcInferenceConfig {
+                steps: 4,
+                step_size: 0.05,
+                latent_decay: 0.0,
+                max_grad_norm: Some(1.0),
+                gradient_norm_scope: burn_pc::PcGradientNormScope::PerRow,
+                eps: 1.0e-8,
+            },
+            learning_schedule: burn_pc::PcLearningSchedule::Equilibrium,
+            prediction_precision: 1.0,
+            factor_reduction: PredictiveCodingFactorReduction::Sum,
+            sync_diagnostics: false,
+        }
+    }
+}
+
+fn default_predictive_context_probe_every_steps() -> usize {
+    8
+}
+
+fn default_predictive_context_probe_tokens() -> usize {
+    16
+}
+
+fn default_predictive_context_novelty_confirmations() -> u64 {
+    3
+}
+
+fn default_predictive_context_active_fraction() -> f32 {
+    0.25
+}
+
+/// Run-scoped causal context discovery and sparse subnetwork routing.
+///
+/// Contexts own optimizer moments and recurrent stream state. Model weights
+/// remain one shared Dragon parameter set; deterministic sparse masks isolate
+/// the selected low-rank and residual channels.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PredictiveContextRoutingConfig {
+    pub enabled: bool,
+    #[serde(default = "default_predictive_context_probe_every_steps")]
+    pub probe_every_steps: usize,
+    #[serde(default = "default_predictive_context_probe_tokens")]
+    pub probe_tokens: usize,
+    #[serde(default = "default_predictive_context_novelty_confirmations")]
+    pub novelty_confirmations: u64,
+    #[serde(default = "default_predictive_context_active_fraction")]
+    pub active_fraction: f32,
+    pub bank: burn_pc::PredictiveContextBankConfig,
+}
+
+impl Default for PredictiveContextRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_every_steps: default_predictive_context_probe_every_steps(),
+            probe_tokens: default_predictive_context_probe_tokens(),
+            novelty_confirmations: default_predictive_context_novelty_confirmations(),
+            active_fraction: default_predictive_context_active_fraction(),
+            bank: burn_pc::PredictiveContextBankConfig {
+                max_contexts: 8,
+                capacity_policy: burn_pc::PredictiveContextCapacityPolicy::ReplaceLeastRecentlyUsed,
+                ..burn_pc::PredictiveContextBankConfig::default()
+            },
+        }
+    }
+}
+
 fn default_predictive_coding_step_size() -> f32 {
     0.03
 }
@@ -561,6 +707,14 @@ fn default_predictive_coding_apply_every_chunks() -> usize {
     1
 }
 
+fn default_predictive_coding_amortization_tolerance() -> f32 {
+    0.05
+}
+
+fn default_predictive_coding_amortization_max_state_slots() -> usize {
+    128
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PredictiveCodingConfig {
@@ -569,16 +723,27 @@ pub struct PredictiveCodingConfig {
     pub state_scope: PredictiveCodingStateScope,
     pub backward_mode: PredictiveCodingBackwardMode,
     pub parameter_update: PredictiveCodingParameterUpdate,
+    pub observation_contract: PredictiveCodingObservationContract,
+    /// Required acknowledgement for the non-causal historical ablation.
+    pub allow_oracle_target_leak: bool,
     pub steps: usize,
     #[serde(default = "default_predictive_coding_step_size")]
     pub step_size: f32,
     pub latent_decay: f32,
     #[serde(default = "default_predictive_coding_max_grad_norm")]
     pub max_grad_norm: Option<f32>,
+    /// Clipping geometry for independent recurrent-state corrections.
+    pub gradient_norm_scope: burn_pc::PcGradientNormScope,
     #[serde(default = "default_predictive_coding_eps")]
     pub eps: f32,
     #[serde(default = "default_predictive_coding_apply_every_chunks")]
     pub apply_every_chunks: usize,
+    /// Relative RMS state error tolerated before the amortization constraint activates.
+    #[serde(default = "default_predictive_coding_amortization_tolerance")]
+    pub amortization_tolerance: f32,
+    /// Uniformly sampled recurrent slots used by the amortization constraint.
+    #[serde(default = "default_predictive_coding_amortization_max_state_slots")]
+    pub amortization_max_state_slots: usize,
     pub warmup_steps: usize,
     pub sync_diagnostics: bool,
 }
@@ -591,14 +756,32 @@ impl Default for PredictiveCodingConfig {
             state_scope: PredictiveCodingStateScope::default(),
             backward_mode: PredictiveCodingBackwardMode::default(),
             parameter_update: PredictiveCodingParameterUpdate::default(),
+            observation_contract: PredictiveCodingObservationContract::default(),
+            allow_oracle_target_leak: false,
             steps: 1,
             step_size: default_predictive_coding_step_size(),
             latent_decay: 0.0,
             max_grad_norm: default_predictive_coding_max_grad_norm(),
+            gradient_norm_scope: burn_pc::PcGradientNormScope::PerSample,
             eps: default_predictive_coding_eps(),
             apply_every_chunks: default_predictive_coding_apply_every_chunks(),
+            amortization_tolerance: default_predictive_coding_amortization_tolerance(),
+            amortization_max_state_slots: default_predictive_coding_amortization_max_state_slots(),
             warmup_steps: 0,
             sync_diagnostics: false,
+        }
+    }
+}
+
+impl PredictiveCodingConfig {
+    pub fn inference_config(&self) -> burn_pc::PcInferenceConfig {
+        burn_pc::PcInferenceConfig {
+            steps: self.steps,
+            step_size: self.step_size,
+            latent_decay: self.latent_decay,
+            max_grad_norm: self.max_grad_norm,
+            gradient_norm_scope: self.gradient_norm_scope,
+            eps: self.eps,
         }
     }
 }
@@ -902,13 +1085,141 @@ impl Default for LatentReasoningTrainingConfig {
     }
 }
 
+/// Selects where validation and checkpoint promotion are executed.
+///
+/// External evaluator mode keeps the trainer's epoch boundary limited to checkpoint and
+/// telemetry persistence. A separate evaluator must consume those checkpoints and own all
+/// validation, gating, and promotion decisions.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingValidationExecution {
+    #[default]
+    Local,
+    ExternalEvaluator,
+}
+
+impl TrainingValidationExecution {
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
+/// Selects the distribution used by the primary teacher-forced validation loss.
+///
+/// Fixed holdout validation is independent of the live curriculum policy, which makes validation
+/// losses comparable across epochs and repeated runs. Live source selection is retained as an
+/// explicit compatibility/diagnostic mode; prefer `training.events.source_weighted_validation_batches`
+/// when both a stable promotion metric and current-policy telemetry are needed.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingValidationSampling {
+    #[default]
+    FixedHoldout,
+    LiveSourceSelection,
+}
+
+impl TrainingValidationSampling {
+    pub fn uses_live_source_selection(self) -> bool {
+        matches!(self, Self::LiveSourceSelection)
+    }
+}
+
+fn default_validation_seed() -> u64 {
+    0xD12A_60A5
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TrainingValidationConfig {
+    pub execution: TrainingValidationExecution,
+    pub sampling: TrainingValidationSampling,
+    /// Sampling seed for the fixed teacher-forced holdout. This is deliberately independent of
+    /// the training seed so training-seed ablations evaluate identical examples.
+    pub seed: u64,
+}
+
+impl Default for TrainingValidationConfig {
+    fn default() -> Self {
+        Self {
+            execution: TrainingValidationExecution::default(),
+            sampling: TrainingValidationSampling::default(),
+            seed: default_validation_seed(),
+        }
+    }
+}
+
+/// Selects how token blocks are presented to the training step independently of whether recurrent
+/// state is retained between steps.
+///
+/// `Auto` preserves the historical behavior: persistent TBPTT uses a streaming loader and all
+/// other modes use random windows. Explicit `Streaming` is useful for matched carry ablations where
+/// every arm must consume the same ordered blocks even when one arm deliberately resets rho.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceBatchingMode {
+    #[default]
+    Auto,
+    Random,
+    Streaming,
+}
+
+impl SequenceBatchingMode {
+    pub fn uses_streaming_loader(self, persist_across_steps: bool) -> bool {
+        match self {
+            Self::Auto => persist_across_steps,
+            Self::Random => false,
+            Self::Streaming => true,
+        }
+    }
+}
+
+fn default_sequence_state_probe_paired_batches() -> usize {
+    4
+}
+
+fn default_sequence_state_probe_max_rho_slots() -> usize {
+    64
+}
+
+/// Validation-only diagnostics for the recurrent sequence state.
+///
+/// The paired loss probe evaluates the same continuation block with the live stream state and a
+/// reset state. It never contributes gradients or changes checkpoint promotion semantics.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SequenceStateProbeConfig {
+    pub enabled: bool,
+    #[serde(default = "default_sequence_state_probe_paired_batches")]
+    pub paired_batches: usize,
+    #[serde(default = "default_sequence_state_probe_max_rho_slots")]
+    pub max_rho_slots: usize,
+}
+
+impl Default for SequenceStateProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paired_batches: default_sequence_state_probe_paired_batches(),
+            max_rho_slots: default_sequence_state_probe_max_rho_slots(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
+    #[serde(default)]
+    pub algorithm: TrainingAlgorithm,
     pub block_size: usize,
     #[serde(default)]
     pub tbptt_chunk_size: Option<usize>,
     #[serde(default)]
     pub tbptt_persist_across_steps: bool,
+    #[serde(default)]
+    pub sequence_batching: SequenceBatchingMode,
+    /// Retain a terminal recurrent state even when the training step cannot otherwise consume it.
+    /// This is primarily a compatibility and performance-ablation override.
+    #[serde(default)]
+    pub retain_ephemeral_terminal_sequence_state: bool,
     #[serde(default)]
     pub min_logical_block_size: Option<usize>,
     pub batch_size: usize,
@@ -957,9 +1268,17 @@ pub struct TrainingHyperparameters {
     #[serde(default)]
     pub predictive_coding: PredictiveCodingConfig,
     #[serde(default)]
+    pub local_predictive_coding: LocalPredictiveCodingConfig,
+    #[serde(default)]
+    pub predictive_context_routing: PredictiveContextRoutingConfig,
+    #[serde(default)]
     pub latent_reasoning: LatentReasoningTrainingConfig,
     #[serde(default)]
     pub ruliad_supervision: RuliadSupervisionConfig,
+    #[serde(default)]
+    pub ruliad_probe_generation: RuliadProbeGenerationConfig,
+    #[serde(default)]
+    pub ruliad_policy_probe: RuliadPolicyProbeConfig,
     #[serde(default)]
     pub module_lr_scales: Vec<ModuleLrScaleEntry>,
     #[serde(default = "default_context_strategy")]
@@ -973,9 +1292,255 @@ pub struct TrainingHyperparameters {
     #[serde(default)]
     pub events: burn_dragon_train::TrainingEventsConfig,
     #[serde(default)]
+    pub validation: TrainingValidationConfig,
+    #[serde(default)]
+    pub sequence_state_probe: SequenceStateProbeConfig,
+    #[serde(default)]
     pub gates: burn_dragon_train::TrainingGatesConfig,
     #[serde(default)]
     pub dynamics: burn_dragon_train::train::events::DynamicsEquilibriumPolicy,
+}
+
+fn default_ruliad_probe_generation_max_batch_rows() -> usize {
+    32
+}
+
+fn default_ruliad_probe_generation_minimum_batch_rows() -> usize {
+    2
+}
+
+fn default_ruliad_probe_generation_maximum_prompt_position_span() -> usize {
+    32
+}
+
+fn default_ruliad_probe_generation_device_buffer_tokens() -> usize {
+    4
+}
+
+fn default_ruliad_probe_generation_max_in_flight_rows() -> usize {
+    16
+}
+
+/// Exact free-run verifier generation policy.
+///
+/// Ragged rows share one absolute recurrent position: rows still in prefill consume prompt tokens
+/// while completed prompts consume model argmax tokens. Small tails use the independent decoder.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuliadProbeGenerationConfig {
+    pub enabled: bool,
+    #[serde(default = "default_ruliad_probe_generation_max_batch_rows")]
+    pub max_batch_rows: usize,
+    #[serde(default = "default_ruliad_probe_generation_minimum_batch_rows")]
+    pub minimum_batch_rows: usize,
+    /// Maximum prompt-length difference inside one ragged cohort. This bounds the token-at-a-time
+    /// tail after the cohort's common multi-token prefill.
+    #[serde(default = "default_ruliad_probe_generation_maximum_prompt_position_span")]
+    pub maximum_prompt_position_span: usize,
+    /// Greedy steps retained on the accelerator before resolving stop tokens on the host.
+    #[serde(default = "default_ruliad_probe_generation_device_buffer_tokens")]
+    pub device_buffer_tokens: usize,
+    /// Maximum evaluator rows resident at once. The runtime additionally caps this at the
+    /// training batch size, so validation cannot silently select a larger row batch than the
+    /// already-qualified training configuration.
+    #[serde(default = "default_ruliad_probe_generation_max_in_flight_rows")]
+    pub max_in_flight_rows: usize,
+}
+
+impl Default for RuliadProbeGenerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_batch_rows: default_ruliad_probe_generation_max_batch_rows(),
+            minimum_batch_rows: default_ruliad_probe_generation_minimum_batch_rows(),
+            maximum_prompt_position_span:
+                default_ruliad_probe_generation_maximum_prompt_position_span(),
+            device_buffer_tokens: default_ruliad_probe_generation_device_buffer_tokens(),
+            max_in_flight_rows: default_ruliad_probe_generation_max_in_flight_rows(),
+        }
+    }
+}
+
+fn default_ruliad_policy_probe_items() -> usize {
+    4
+}
+
+fn default_ruliad_policy_probe_max_steps() -> usize {
+    256
+}
+
+fn default_ruliad_policy_probe_candidates() -> usize {
+    4
+}
+
+fn default_ruliad_policy_probe_beam_width() -> usize {
+    1
+}
+
+fn default_ruliad_policy_probe_scoring_batch_rows() -> usize {
+    4
+}
+
+fn default_ruliad_policy_probe_scoring_token_budget() -> usize {
+    32_768
+}
+
+fn default_ruliad_policy_probe_scoring_pipeline_depth() -> usize {
+    2
+}
+
+fn default_ruliad_policy_probe_stratified_difficulty_levels() -> usize {
+    0
+}
+
+fn default_ruliad_policy_probe_every_epochs() -> usize {
+    1
+}
+
+fn default_ruliad_policy_probe_candidate_symmetry() -> RuliadProofPolicyCandidateSymmetry {
+    RuliadProofPolicyCandidateSymmetry::BalancedRotation
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadPolicyProbeConfig {
+    pub enabled: bool,
+    /// Model contract used to rank verifier-enumerated proof actions.
+    #[serde(default)]
+    pub scoring: RuliadProofPolicyScoring,
+    /// Run the same-item and counterfactual constrained-action scorers every N validation epochs.
+    /// Teacher-forced and free-generation validation retain their own cadence.
+    #[serde(default = "default_ruliad_policy_probe_every_epochs")]
+    pub every_epochs: usize,
+    /// Run the substantially more expensive verifier-backed closed-loop rollout every N
+    /// validation epochs. `None` preserves the legacy behavior by using `every_epochs`.
+    #[serde(default)]
+    pub closed_loop_every_epochs: Option<usize>,
+    #[serde(default = "default_ruliad_policy_probe_items")]
+    pub items: usize,
+    #[serde(default = "default_ruliad_policy_probe_max_steps")]
+    pub max_steps: usize,
+    #[serde(default = "default_ruliad_policy_probe_candidates")]
+    pub candidates: usize,
+    #[serde(default = "default_ruliad_policy_probe_beam_width")]
+    pub beam_width: usize,
+    /// Maximum active proof states scored in one model forward. This is an inference-only
+    /// evaluator batch and does not change the training batch size.
+    #[serde(default = "default_ruliad_policy_probe_scoring_batch_rows")]
+    pub scoring_batch_rows: usize,
+    /// Maximum padded prompt tokens in one proof-policy scoring forward. The row and token
+    /// limits jointly bound evaluator memory across native and browser backends.
+    #[serde(default = "default_ruliad_policy_probe_scoring_token_budget")]
+    pub scoring_token_budget: usize,
+    /// Maximum queued scoring forwards before resolving CUDA results. In-flight padded tokens are
+    /// bounded by `scoring_pipeline_depth * scoring_token_budget`.
+    #[serde(default = "default_ruliad_policy_probe_scoring_pipeline_depth")]
+    pub scoring_pipeline_depth: usize,
+    /// Evaluate evenly over materialized difficulty levels `[0, n)` instead of
+    /// inheriting the live sampler's current distribution. Zero disables it.
+    #[serde(default = "default_ruliad_policy_probe_stratified_difficulty_levels")]
+    pub stratified_difficulty_levels: usize,
+    /// Candidate indices are presentation details. Balanced rotation prevents a deterministic
+    /// proof-menu order from becoming an evaluator shortcut while preserving action semantics.
+    #[serde(default = "default_ruliad_policy_probe_candidate_symmetry")]
+    pub candidate_symmetry: RuliadProofPolicyCandidateSymmetry,
+    #[serde(default)]
+    pub promotion_gate: RuliadPolicyPromotionGateConfig,
+}
+
+impl Default for RuliadPolicyProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scoring: RuliadProofPolicyScoring::default(),
+            every_epochs: default_ruliad_policy_probe_every_epochs(),
+            closed_loop_every_epochs: None,
+            items: default_ruliad_policy_probe_items(),
+            max_steps: default_ruliad_policy_probe_max_steps(),
+            candidates: default_ruliad_policy_probe_candidates(),
+            beam_width: default_ruliad_policy_probe_beam_width(),
+            scoring_batch_rows: default_ruliad_policy_probe_scoring_batch_rows(),
+            scoring_token_budget: default_ruliad_policy_probe_scoring_token_budget(),
+            scoring_pipeline_depth: default_ruliad_policy_probe_scoring_pipeline_depth(),
+            stratified_difficulty_levels: default_ruliad_policy_probe_stratified_difficulty_levels(
+            ),
+            candidate_symmetry: RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+            promotion_gate: RuliadPolicyPromotionGateConfig::default(),
+        }
+    }
+}
+
+impl RuliadPolicyProbeConfig {
+    pub fn effective_closed_loop_every_epochs(&self) -> usize {
+        self.closed_loop_every_epochs.unwrap_or(self.every_epochs)
+    }
+}
+
+fn default_ruliad_policy_gate_minimum_items() -> usize {
+    16
+}
+
+fn default_ruliad_policy_gate_minimum_solve_rate() -> f64 {
+    0.50
+}
+
+fn default_ruliad_policy_gate_minimum_goal_completion_rate() -> f64 {
+    0.80
+}
+
+fn default_ruliad_policy_gate_minimum_valid_action_rate() -> f64 {
+    0.95
+}
+
+fn default_ruliad_policy_gate_maximum_invalid_action_rate() -> f64 {
+    0.05
+}
+
+fn default_ruliad_policy_gate_maximum_repeated_state_rate() -> f64 {
+    0.35
+}
+
+fn default_ruliad_policy_gate_maximum_backtrack_rate() -> f64 {
+    0.25
+}
+
+/// Closed-loop acceptance criteria for promoting a proof-action objective.
+///
+/// These are deliberately separate from token-level capability gates: a model
+/// must keep making verifier-valid progress after its own earlier decisions.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadPolicyPromotionGateConfig {
+    pub enabled: bool,
+    #[serde(default = "default_ruliad_policy_gate_minimum_items")]
+    pub minimum_items: usize,
+    #[serde(default = "default_ruliad_policy_gate_minimum_solve_rate")]
+    pub minimum_solve_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_minimum_goal_completion_rate")]
+    pub minimum_goal_completion_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_minimum_valid_action_rate")]
+    pub minimum_valid_action_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_maximum_invalid_action_rate")]
+    pub maximum_invalid_action_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_maximum_repeated_state_rate")]
+    pub maximum_repeated_state_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_maximum_backtrack_rate")]
+    pub maximum_backtrack_rate: f64,
+}
+
+impl Default for RuliadPolicyPromotionGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minimum_items: default_ruliad_policy_gate_minimum_items(),
+            minimum_solve_rate: default_ruliad_policy_gate_minimum_solve_rate(),
+            minimum_goal_completion_rate: default_ruliad_policy_gate_minimum_goal_completion_rate(),
+            minimum_valid_action_rate: default_ruliad_policy_gate_minimum_valid_action_rate(),
+            maximum_invalid_action_rate: default_ruliad_policy_gate_maximum_invalid_action_rate(),
+            maximum_repeated_state_rate: default_ruliad_policy_gate_maximum_repeated_state_rate(),
+            maximum_backtrack_rate: default_ruliad_policy_gate_maximum_backtrack_rate(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -985,6 +1550,7 @@ pub enum RuliadSupervisionMode {
     FullDocument,
     AnswerWindow,
     AnswerCompletion,
+    AnswerValues,
     TraceAndAnswer,
     Mixed,
 }
@@ -993,7 +1559,7 @@ impl RuliadSupervisionMode {
     pub fn uses_answer_target_mask(self) -> bool {
         matches!(
             self,
-            Self::AnswerCompletion | Self::TraceAndAnswer | Self::Mixed
+            Self::AnswerCompletion | Self::AnswerValues | Self::TraceAndAnswer | Self::Mixed
         )
     }
 
@@ -1011,6 +1577,7 @@ impl RuliadSupervisionMode {
             Self::FullDocument => false,
             Self::AnswerWindow => true,
             Self::AnswerCompletion => true,
+            Self::AnswerValues => true,
             Self::TraceAndAnswer => false,
             Self::Mixed => validation || (epoch_index.wrapping_add(absolute_step) & 1) == 0,
         }
@@ -1022,6 +1589,8 @@ impl RuliadSupervisionMode {
 pub struct RuliadSupervisionConfig {
     pub mode: RuliadSupervisionMode,
     pub mask_high_entropy_spans: bool,
+    /// Equalize aggregate trace and answer target mass from observed targets in each mixed window.
+    pub balance_trace_answer_mass: bool,
     pub answer_close_marker_stride: usize,
     pub answer_close_marker_weight: i64,
     pub answer_schema_token_weight: i64,
@@ -1031,6 +1600,7 @@ pub struct RuliadSupervisionConfig {
     pub answer_denoising: RuliadAnswerDenoisingConfig,
     pub answer_contract: RuliadAnswerContractConfig,
     pub verifier_reward: RuliadVerifierRewardConfig,
+    pub proof_policy: RuliadProofPolicyTrainingConfig,
 }
 
 impl Default for RuliadSupervisionConfig {
@@ -1038,6 +1608,7 @@ impl Default for RuliadSupervisionConfig {
         Self {
             mode: RuliadSupervisionMode::default(),
             mask_high_entropy_spans: false,
+            balance_trace_answer_mass: false,
             answer_close_marker_stride: 1,
             answer_close_marker_weight: 1,
             answer_schema_token_weight: 1,
@@ -1047,11 +1618,134 @@ impl Default for RuliadSupervisionConfig {
             answer_denoising: RuliadAnswerDenoisingConfig::default(),
             answer_contract: RuliadAnswerContractConfig::default(),
             verifier_reward: RuliadVerifierRewardConfig::default(),
+            proof_policy: RuliadProofPolicyTrainingConfig::default(),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuliadPolicyBatchCadence {
+    every_steps: usize,
+    start_after_steps: usize,
+}
+
+impl RuliadPolicyBatchCadence {
+    fn new(enabled: bool, weight: f32, every_steps: usize, start_after_steps: usize) -> Self {
+        if enabled && weight > 0.0 && every_steps > 0 {
+            Self {
+                every_steps,
+                start_after_steps,
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    fn includes(self, absolute_step: usize) -> bool {
+        self.every_steps > 0
+            && absolute_step >= self.start_after_steps
+            && absolute_step.is_multiple_of(self.every_steps)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuliadPolicyBatchCadences {
+    values: [RuliadPolicyBatchCadence; 7],
+}
+
+impl RuliadPolicyBatchCadences {
+    pub(crate) fn enabled(self) -> bool {
+        self.values.iter().any(|cadence| cadence.every_steps > 0)
+    }
+
+    pub(crate) fn includes(self, absolute_step: usize) -> bool {
+        self.values
+            .iter()
+            .any(|cadence| cadence.includes(absolute_step))
+    }
+}
+
 impl RuliadSupervisionConfig {
+    pub(crate) fn policy_batch_cadences(self) -> RuliadPolicyBatchCadences {
+        let verifier = self.verifier_reward;
+        let denoising = self.answer_denoising;
+        let contract = self.answer_contract;
+        let proof_policy = self.proof_policy;
+        RuliadPolicyBatchCadences {
+            values: [
+                RuliadPolicyBatchCadence::new(
+                    verifier.enabled,
+                    verifier.weight,
+                    verifier.every_steps,
+                    verifier.start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    verifier.enabled,
+                    verifier.structured_contrast_weight,
+                    verifier.structured_contrast_every_steps,
+                    verifier.structured_contrast_start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    verifier.enabled,
+                    verifier.field_binding_contrast_weight,
+                    verifier.field_binding_contrast_every_steps,
+                    verifier.field_binding_contrast_start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    verifier.enabled,
+                    verifier
+                        .rollout_imitation_weight
+                        .max(verifier.rollout_recovery_weight),
+                    verifier.rollout_imitation_every_steps,
+                    verifier.rollout_imitation_start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    denoising.enabled,
+                    denoising.structured_recovery_weight,
+                    denoising.structured_recovery_every_steps,
+                    denoising.structured_recovery_start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    contract.enabled,
+                    contract.weight,
+                    contract.every_steps,
+                    contract.start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new(
+                    proof_policy.enabled,
+                    proof_policy.weight,
+                    proof_policy.every_steps,
+                    proof_policy.start_after_steps,
+                ),
+            ],
+        }
+    }
+
+    pub fn token_supervision(
+        self,
+    ) -> burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig {
+        use burn_dragon_universality::ruliad::RuliadTokenSupervisionMode as PortableMode;
+
+        let mode = match self.mode {
+            RuliadSupervisionMode::FullDocument => PortableMode::FullDocument,
+            RuliadSupervisionMode::AnswerWindow => PortableMode::AnswerWindow,
+            RuliadSupervisionMode::AnswerCompletion => PortableMode::AnswerCompletion,
+            RuliadSupervisionMode::AnswerValues => PortableMode::AnswerValues,
+            RuliadSupervisionMode::TraceAndAnswer => PortableMode::TraceAndAnswer,
+            RuliadSupervisionMode::Mixed => PortableMode::Mixed,
+        };
+        burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig {
+            mode,
+            mask_high_entropy_spans: self.mask_high_entropy_spans,
+            balance_trace_answer_mass: self.balance_trace_answer_mass,
+            answer_close_marker_stride: self.answer_close_marker_stride,
+            answer_close_marker_weight: self.answer_close_marker_weight,
+            answer_schema_token_weight: self.answer_schema_token_weight,
+            answer_schema_start_token_weight: self.answer_schema_start_token_weight,
+            answer_value_token_weight: self.answer_value_token_weight,
+        }
+    }
+
     pub fn uses_answer_target_mask(self) -> bool {
         self.mode.uses_answer_target_mask()
     }
@@ -1065,15 +1759,13 @@ impl RuliadSupervisionConfig {
     }
 
     pub fn needs_ruliad_policy_batch(self) -> bool {
-        (self.verifier_reward.enabled
-            && (self.verifier_reward.weight > 0.0
-                || self.verifier_reward.structured_contrast_weight > 0.0
-                || self.verifier_reward.field_binding_contrast_weight > 0.0
-                || self.verifier_reward.rollout_imitation_weight > 0.0
-                || self.verifier_reward.rollout_recovery_weight > 0.0))
-            || (self.answer_denoising.enabled
-                && self.answer_denoising.structured_recovery_weight > 0.0)
-            || (self.answer_contract.enabled && self.answer_contract.weight > 0.0)
+        self.policy_batch_cadences().enabled()
+    }
+
+    /// Returns whether a training batch at `absolute_step` needs the expensive formal-policy
+    /// metadata sidecar. Validation never consumes this sidecar and should leave it disabled.
+    pub fn needs_ruliad_policy_batch_at_step(self, absolute_step: usize) -> bool {
+        self.policy_batch_cadences().includes(absolute_step)
     }
 
     pub fn prefer_answer_window(
@@ -1084,6 +1776,210 @@ impl RuliadSupervisionConfig {
     ) -> bool {
         self.mode
             .prefer_answer_window(validation, epoch_index, absolute_step)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyTrainingMode {
+    /// Supervise the source-selected certificate state without a model rollout.
+    StaticExpert,
+    /// Roll the current model through visited states and relabel each state with the verifier.
+    #[default]
+    Dagger,
+    /// Begin with expert states, then pair every model-visited row with a fresh expert row.
+    StaticThenPairedDagger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuliadProofPolicyEffectiveMode {
+    StaticExpert,
+    Dagger,
+    PairedDagger,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyScoring {
+    /// Rank candidates by normalized autoregressive completion likelihood.
+    #[default]
+    CompletionLikelihood,
+    /// Rank complete semantic actions with Dragon's task-neutral scalar sequence head.
+    ///
+    /// This keeps proof choice off the vocabulary projection and leaves ordinary language-model
+    /// cross entropy responsible for serialization.
+    SemanticEnergy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyGradientScope {
+    /// Allow the proof-policy objective to update both Dragon and its sequence-score head.
+    #[default]
+    FullModel,
+    /// Stop the proof-policy gradient at Dragon's hidden representations.
+    ///
+    /// Language-model cross entropy still updates the complete model in the same optimizer step;
+    /// only the auxiliary semantic-policy objective is restricted to the score head.
+    ScoreHeadOnly,
+    /// Stop the completion-policy gradient at Dragon's hidden representations.
+    ///
+    /// The verifier-equivalent completion objective updates only the untied language projection.
+    /// Ordinary language-model cross entropy still updates the complete model in the same
+    /// optimizer step. Tied input/output embeddings are rejected because they would make this
+    /// scope modify the recurrent model's input interface.
+    LanguageHeadOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyNormalization {
+    /// Optimize the verifier-equivalent probability conditioned on the finite candidate set.
+    #[default]
+    CandidateConditional,
+    /// Optimize every verifier-relevant branch in the semantic candidate trie.
+    ///
+    /// Each proof state has unit weight regardless of action length or trie depth, preventing
+    /// late suffix likelihood from hiding an incorrect early goal/source decision.
+    PrefixConditional,
+    /// Optimize the full-vocabulary marginal probability of every verifier-equivalent action.
+    VocabularyMarginal,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyCandidateSymmetry {
+    /// Preserve the deterministic action-menu order emitted by the proof kernel.
+    #[default]
+    Canonical,
+    /// Apply a label-preserving rotation so each auxiliary batch presents balanced target slots.
+    BalancedRotation,
+    /// Average the exact cyclic presentation orbit for each proof state.
+    ///
+    /// Training minimizes the mean risk over every candidate rotation. Evaluation maps every
+    /// rotated prediction back to the semantic action set before averaging probabilities, making
+    /// the resulting decision invariant to cyclic menu position.
+    CyclicOrbitAverage,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyPresentationRisk {
+    /// Minimize the expected verifier-equivalent negative log-likelihood across presentations.
+    #[default]
+    Mean,
+    /// Minimize the maximum verifier-equivalent negative log-likelihood in each exact orbit.
+    ///
+    /// This finite-group distributionally robust objective prevents a strong orbit average from
+    /// hiding a presentation on which the policy fails.
+    Worst,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RuliadProofPolicyTrainingConfig {
+    pub enabled: bool,
+    pub mode: RuliadProofPolicyTrainingMode,
+    pub scoring: RuliadProofPolicyScoring,
+    pub gradient_scope: RuliadProofPolicyGradientScope,
+    pub normalization: RuliadProofPolicyNormalization,
+    pub candidate_symmetry: RuliadProofPolicyCandidateSymmetry,
+    pub presentation_risk: RuliadProofPolicyPresentationRisk,
+    pub weight: f32,
+    pub every_steps: usize,
+    pub start_after_steps: usize,
+    /// Absolute optimizer step where `static_then_paired_dagger` adds model rollouts.
+    pub dagger_start_after_steps: usize,
+    /// Number of materialized proof-policy difficulty levels represented in each auxiliary
+    /// metadata batch. Zero preserves the live source-selected bucket only.
+    pub stratified_difficulty_levels: usize,
+    pub rollout_steps: usize,
+    /// Semantic proof states retained across one optimizer update. DAgger distributes this budget
+    /// across rollout depth so later states are drawn from model-visited trajectories.
+    #[serde(alias = "max_rows_per_step")]
+    pub max_rows_per_update: usize,
+    /// Hard cap on tensorized presentation rows. Orbit averaging may present one semantic state
+    /// several times, but must remain within this explicit compute and memory budget.
+    pub max_presentation_rows_per_update: usize,
+    /// Verifier-valid alternate goals paired with each sampled proof state.
+    ///
+    /// Counterfactual rows preserve the formal laws, current term, and candidate actions while
+    /// changing only the target and its verifier-equivalent label. They prevent semantic-energy
+    /// training from solving candidate ranking with a target-independent completion shortcut.
+    pub counterfactual_targets_per_state: usize,
+    pub candidates: usize,
+    pub max_completion_tokens: usize,
+}
+
+impl Default for RuliadProofPolicyTrainingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: RuliadProofPolicyTrainingMode::Dagger,
+            scoring: RuliadProofPolicyScoring::CompletionLikelihood,
+            gradient_scope: RuliadProofPolicyGradientScope::FullModel,
+            normalization: RuliadProofPolicyNormalization::CandidateConditional,
+            candidate_symmetry: RuliadProofPolicyCandidateSymmetry::Canonical,
+            presentation_risk: RuliadProofPolicyPresentationRisk::Mean,
+            weight: 1.0,
+            every_steps: 16,
+            start_after_steps: 256,
+            dagger_start_after_steps: 512,
+            stratified_difficulty_levels: 0,
+            rollout_steps: 8,
+            max_rows_per_update: 32,
+            max_presentation_rows_per_update: 32,
+            counterfactual_targets_per_state: 0,
+            candidates: burn_dragon_universality::ruliad::DEFAULT_PROOF_ACTION_CANDIDATES,
+            max_completion_tokens: 16,
+        }
+    }
+}
+
+impl RuliadProofPolicyTrainingConfig {
+    pub fn presentations_per_state(self) -> usize {
+        match self.candidate_symmetry {
+            RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => self.candidates.max(1),
+            RuliadProofPolicyCandidateSymmetry::Canonical
+            | RuliadProofPolicyCandidateSymmetry::BalancedRotation => 1,
+        }
+    }
+
+    pub fn target_variants_per_state(self) -> usize {
+        self.counterfactual_targets_per_state.saturating_add(1)
+    }
+
+    pub fn semantic_rows_per_update(self) -> usize {
+        let available = self.max_rows_per_update.min(
+            self.max_presentation_rows_per_update
+                .checked_div(self.presentations_per_state())
+                .unwrap_or_default(),
+        );
+        let variants = self.target_variants_per_state();
+        available.checked_div(variants).unwrap_or_default() * variants
+    }
+
+    pub fn base_semantic_rows_per_update(self) -> usize {
+        self.semantic_rows_per_update()
+            .checked_div(self.target_variants_per_state())
+            .unwrap_or_default()
+    }
+
+    pub fn effective_mode(self, absolute_step: usize) -> RuliadProofPolicyEffectiveMode {
+        match self.mode {
+            RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+                if absolute_step < self.dagger_start_after_steps =>
+            {
+                RuliadProofPolicyEffectiveMode::StaticExpert
+            }
+            RuliadProofPolicyTrainingMode::StaticThenPairedDagger => {
+                RuliadProofPolicyEffectiveMode::PairedDagger
+            }
+            RuliadProofPolicyTrainingMode::StaticExpert => {
+                RuliadProofPolicyEffectiveMode::StaticExpert
+            }
+            RuliadProofPolicyTrainingMode::Dagger => RuliadProofPolicyEffectiveMode::Dagger,
+        }
     }
 }
 
@@ -1183,15 +2079,11 @@ impl Default for RuliadAnswerDenoisingConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuliadVerifierRewardMode {
+    #[default]
     Scalar,
     VpoIndependent,
-}
-
-impl Default for RuliadVerifierRewardMode {
-    fn default() -> Self {
-        Self::Scalar
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]

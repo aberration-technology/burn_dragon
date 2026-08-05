@@ -1,6 +1,6 @@
 use burn::module::{
     AutodiffModule, Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
-    ModuleVisitor, Param,
+    ModuleVisitor, Param, ParamId,
 };
 use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -194,7 +194,19 @@ pub struct DragonNorm<B: Backend> {
     shift: Param<Tensor<B, 1>>,
 }
 
+pub(crate) struct DragonNormVjp<B: Backend, const D: usize> {
+    pub grad_input: Tensor<B, D>,
+    pub grad_gamma: Tensor<B, 1>,
+    pub grad_beta: Tensor<B, 1>,
+    pub grad_alpha: Tensor<B, 1>,
+    pub grad_shift: Tensor<B, 1>,
+}
+
 impl<B: Backend> DragonNorm<B> {
+    pub(crate) fn parameter_ids(&self) -> (ParamId, ParamId, ParamId, ParamId) {
+        (self.gamma.id, self.beta.id, self.alpha.id, self.shift.id)
+    }
+
     fn param_rms<const D: usize>(tensor: Tensor<B, D>) -> f32 {
         let values = tensor
             .powf_scalar(2.0)
@@ -315,6 +327,139 @@ impl<B: Backend> DragonNorm<B> {
         output.mul(gamma).add(beta)
     }
 
+    /// Plain-backend VJP for only the normalization input.
+    pub(crate) fn vjp_input<const D: usize>(
+        &self,
+        input: Tensor<B, D>,
+        grad_output: Tensor<B, D>,
+    ) -> Tensor<B, D> {
+        let width = input.shape().dims::<D>()[D - 1].max(1);
+        let gamma = self.param_view::<D>(self.gamma.val());
+        let grad = grad_output.clone() * gamma;
+
+        match self.kind {
+            DragonNormKind::LayerNorm => {
+                let (variance, mean) = input.clone().var_mean_bias(D - 1);
+                let inverse_std = variance.add_scalar(self.eps).sqrt().recip();
+                let centered = input - mean;
+                let normalized = centered * inverse_std.clone();
+                let grad_sum = grad.clone().sum_dim(D - 1);
+                let grad_normalized_sum = (grad.clone() * normalized.clone()).sum_dim(D - 1);
+                (grad.mul_scalar(width as f32) - grad_sum - normalized * grad_normalized_sum)
+                    * inverse_std.mul_scalar(1.0 / width as f32)
+            }
+            DragonNormKind::RmsNorm => {
+                let mean_square = input.clone().square().mean_dim(D - 1);
+                let inverse_rms = mean_square.add_scalar(self.eps).sqrt().recip();
+                let projected = (grad.clone() * input.clone()).mean_dim(D - 1);
+                grad * inverse_rms.clone() - input * projected * inverse_rms.powf_scalar(3.0)
+            }
+            DragonNormKind::DynamicTanh => {
+                let alpha = self.scalar_param_view::<D>(self.alpha.val());
+                let activated = (input.clone() * alpha.clone()).tanh();
+                let activation_derivative =
+                    activated.clone().square().mul_scalar(-1.0).add_scalar(1.0);
+                grad * alpha * activation_derivative
+            }
+            DragonNormKind::Derf => {
+                let alpha = self.scalar_param_view::<D>(self.alpha.val());
+                let shift = self.scalar_param_view::<D>(self.shift.val());
+                let preactivation = input.clone() * alpha.clone() + shift;
+                let erf_derivative = preactivation
+                    .square()
+                    .mul_scalar(-1.0)
+                    .exp()
+                    .mul_scalar(2.0 / std::f32::consts::PI.sqrt());
+                let grad_preactivation = grad * erf_derivative;
+                grad_preactivation * alpha
+            }
+        }
+    }
+
+    /// Plain-backend VJP for the input and every normalization parameter.
+    ///
+    /// The four parameter tensors are returned in `(gamma, beta, alpha, shift)`
+    /// order. Parameters unused by the selected normalization kind receive an
+    /// exact zero derivative, preserving one stable optimizer/checkpoint schema.
+    pub(crate) fn vjp_with_parameters<const D: usize>(
+        &self,
+        input: Tensor<B, D>,
+        grad_output: Tensor<B, D>,
+    ) -> DragonNormVjp<B, D> {
+        let width = input.shape().dims::<D>()[D - 1].max(1);
+        let grad_input = self.vjp_input(input.clone(), grad_output.clone());
+        let gamma = self.param_view::<D>(self.gamma.val());
+        let grad = grad_output.clone() * gamma;
+        let reduce_width = |tensor: Tensor<B, D>| {
+            let rows = tensor
+                .shape()
+                .dims::<D>()
+                .into_iter()
+                .take(D - 1)
+                .product::<usize>()
+                .max(1);
+            tensor.reshape([rows, width]).sum_dim(0).reshape([width])
+        };
+        let grad_beta = reduce_width(grad_output.clone());
+        let zero_alpha = self.alpha.val().zeros_like();
+        let zero_shift = self.shift.val().zeros_like();
+
+        let (grad_gamma, grad_alpha, grad_shift) = match self.kind {
+            DragonNormKind::LayerNorm => {
+                let (variance, mean) = input.clone().var_mean_bias(D - 1);
+                let normalized = (input - mean) * variance.add_scalar(self.eps).sqrt().recip();
+                (
+                    reduce_width(grad_output * normalized),
+                    zero_alpha,
+                    zero_shift,
+                )
+            }
+            DragonNormKind::RmsNorm => {
+                let mean_square = input.clone().square().mean_dim(D - 1);
+                let normalized = input * mean_square.add_scalar(self.eps).sqrt().recip();
+                (
+                    reduce_width(grad_output * normalized),
+                    zero_alpha,
+                    zero_shift,
+                )
+            }
+            DragonNormKind::DynamicTanh => {
+                let alpha = self.scalar_param_view::<D>(self.alpha.val());
+                let activated = (input.clone() * alpha).tanh();
+                let derivative = activated.clone().square().mul_scalar(-1.0).add_scalar(1.0);
+                (
+                    reduce_width(grad_output * activated),
+                    (grad * derivative * input).sum().reshape([1]),
+                    zero_shift,
+                )
+            }
+            DragonNormKind::Derf => {
+                let alpha = self.scalar_param_view::<D>(self.alpha.val());
+                let shift = self.scalar_param_view::<D>(self.shift.val());
+                let preactivation = input.clone() * alpha + shift;
+                let activated = preactivation.clone().erf();
+                let grad_preactivation = grad
+                    * preactivation
+                        .square()
+                        .mul_scalar(-1.0)
+                        .exp()
+                        .mul_scalar(2.0 / std::f32::consts::PI.sqrt());
+                (
+                    reduce_width(grad_output * activated),
+                    (grad_preactivation.clone() * input).sum().reshape([1]),
+                    grad_preactivation.sum().reshape([1]),
+                )
+            }
+        };
+        DragonNormVjp {
+            grad_input,
+            grad_gamma,
+            grad_beta,
+            grad_alpha,
+            grad_shift,
+        }
+    }
+
     fn param_view<const D: usize>(&self, param: Tensor<B, 1>) -> Tensor<B, D> {
         let [width] = param.shape().dims::<1>();
         let mut shape = [1; D];
@@ -331,10 +476,13 @@ impl<B: Backend> DragonNorm<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::optim::GradientsParams;
     use burn::tensor::TensorData;
+    use burn_autodiff::Autodiff;
     use burn_ndarray::NdArray;
 
     type Backend = NdArray<f32>;
+    type AutodiffBackend = Autodiff<Backend>;
 
     fn device() -> burn::tensor::Device<Backend> {
         burn::tensor::Device::<Backend>::default()
@@ -485,5 +633,97 @@ mod tests {
 
         assert!((dyt.resolved_alpha_init() - 0.5).abs() < 1e-6);
         assert!((derf.resolved_alpha_init() - 0.886_226_95).abs() < 1e-6);
+    }
+
+    fn max_abs_diff<const D: usize>(left: Tensor<Backend, D>, right: Tensor<Backend, D>) -> f32 {
+        (left - right)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 difference")[0]
+    }
+
+    #[test]
+    fn plain_vjp_matches_autodiff_for_every_norm_kind() {
+        let device = burn::tensor::Device::<AutodiffBackend>::default();
+        for kind in [
+            DragonNormKind::LayerNorm,
+            DragonNormKind::RmsNorm,
+            DragonNormKind::DynamicTanh,
+            DragonNormKind::Derf,
+        ] {
+            let norm = DragonNorm::<AutodiffBackend>::new(
+                &DragonNormConfig {
+                    kind,
+                    ..Default::default()
+                },
+                3,
+                &device,
+            );
+            let ids = norm.parameter_ids();
+            let input = Tensor::<AutodiffBackend, 2>::from_data(
+                TensorData::new(vec![-0.8, 0.3, 1.2, 0.5, -1.1, 0.7], [2, 3]),
+                &device,
+            )
+            .require_grad();
+            let grad_output = Tensor::<AutodiffBackend, 2>::from_data(
+                TensorData::new(vec![0.2, -0.4, 0.7, -0.3, 0.6, 0.1], [2, 3]),
+                &device,
+            );
+            let mut raw_grads = (norm.forward(input.clone()) * grad_output.clone())
+                .sum()
+                .backward();
+            let grad_input = input
+                .grad_remove(&mut raw_grads)
+                .expect("normalization input gradient");
+            let parameter_grads = GradientsParams::from_grads(raw_grads, &norm);
+
+            let plain = norm.valid();
+            let vjp = plain.vjp_with_parameters(input.detach().inner(), grad_output.inner());
+            let gamma_grad = parameter_grads
+                .get::<Backend, 1>(ids.0)
+                .expect("gamma gradient");
+            let beta_grad = parameter_grads
+                .get::<Backend, 1>(ids.1)
+                .expect("beta gradient");
+
+            assert!(
+                max_abs_diff(grad_input, vjp.grad_input) < 2.0e-4,
+                "{kind:?} input VJP mismatch"
+            );
+            assert!(
+                max_abs_diff(gamma_grad, vjp.grad_gamma) < 2.0e-4,
+                "{kind:?} gamma VJP mismatch"
+            );
+            assert!(
+                max_abs_diff(beta_grad, vjp.grad_beta) < 2.0e-4,
+                "{kind:?} beta VJP mismatch"
+            );
+
+            match kind {
+                DragonNormKind::LayerNorm | DragonNormKind::RmsNorm => {
+                    assert_eq!(vjp.grad_alpha.abs().sum().into_scalar(), 0.0);
+                    assert_eq!(vjp.grad_shift.abs().sum().into_scalar(), 0.0);
+                }
+                DragonNormKind::DynamicTanh => {
+                    let alpha_grad = parameter_grads
+                        .get::<Backend, 1>(ids.2)
+                        .expect("alpha gradient");
+                    assert!(max_abs_diff(alpha_grad, vjp.grad_alpha) < 2.0e-4);
+                    assert_eq!(vjp.grad_shift.abs().sum().into_scalar(), 0.0);
+                }
+                DragonNormKind::Derf => {
+                    let alpha_grad = parameter_grads
+                        .get::<Backend, 1>(ids.2)
+                        .expect("alpha gradient");
+                    let shift_grad = parameter_grads
+                        .get::<Backend, 1>(ids.3)
+                        .expect("shift gradient");
+                    assert!(max_abs_diff(alpha_grad, vjp.grad_alpha) < 2.0e-4);
+                    assert!(max_abs_diff(shift_grad, vjp.grad_shift) < 2.0e-4);
+                }
+            }
+        }
     }
 }

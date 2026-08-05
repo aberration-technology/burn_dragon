@@ -178,6 +178,7 @@ FIELD_BINDING_CONTRAST_METRIC_COLUMNS = [
     "field_binding_prompt_pairs",
     "field_binding_contrast_pairs",
     "field_binding_candidate_pairs",
+    "field_binding_filtered_presented_action_candidates",
     "field_binding_discriminative_tokens",
     "field_binding_negative_pool_size",
     "field_binding_replay_pool_size",
@@ -192,6 +193,10 @@ FIELD_BINDING_CONTRAST_METRIC_COLUMNS = [
     "field_binding_margin_satisfied_token_fraction",
     "field_binding_exact_pair_rank_fraction",
     "field_binding_exact_pair_margin_fraction",
+    "field_binding_sequence_rank_metric_pairs",
+    "field_binding_sequence_log_probability_margin_mean",
+    "field_binding_positive_sequence_fraction",
+    "field_binding_sequence_margin_satisfied_fraction",
     "field_binding_weight",
     "field_binding_margin",
 ]
@@ -794,6 +799,9 @@ def read_field_binding_contrast_telemetry(run_dir: str | None) -> dict[str, floa
         "field_binding_prompt_pairs": sum_value("prompt_pairs"),
         "field_binding_contrast_pairs": sum_value("contrast_pairs"),
         "field_binding_candidate_pairs": sum_value("candidate_pairs"),
+        "field_binding_filtered_presented_action_candidates": sum_value(
+            "filtered_presented_action_candidates"
+        ),
         "field_binding_discriminative_tokens": sum_value("contrast_discriminative_tokens"),
         "field_binding_negative_pool_size": last_value("negative_pool_size"),
         "field_binding_replay_pool_size": last_value("replay_pool_size"),
@@ -821,6 +829,18 @@ def read_field_binding_contrast_telemetry(run_dir: str | None) -> dict[str, floa
         ),
         "field_binding_exact_pair_margin_fraction": weighted_mean(
             "exact_pair_margin_fraction", "rank_metric_pairs"
+        ),
+        "field_binding_sequence_rank_metric_pairs": sum_value(
+            "sequence_rank_metric_pairs"
+        ),
+        "field_binding_sequence_log_probability_margin_mean": weighted_mean(
+            "sequence_log_probability_margin_mean", "sequence_rank_metric_pairs"
+        ),
+        "field_binding_positive_sequence_fraction": weighted_mean(
+            "positive_sequence_fraction", "sequence_rank_metric_pairs"
+        ),
+        "field_binding_sequence_margin_satisfied_fraction": weighted_mean(
+            "sequence_margin_satisfied_fraction", "sequence_rank_metric_pairs"
         ),
         "field_binding_weight": last_value("field_binding_contrast_weight"),
         "field_binding_margin": last_value("field_binding_contrast_margin"),
@@ -2005,6 +2025,9 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         field_binding_expected_rank_metrics = value(
             row, "field_binding_config_expected_rank_metric_steps_mean", 0.0
         )
+        field_binding_pair_weight = value(
+            row, "field_binding_config_pair_weight_mean", 0.0
+        )
         field_binding_pairs = value(row, "field_binding_contrast_pairs_mean", 0.0)
         field_binding_rank_tokens = value(row, "field_binding_rank_metric_tokens_mean", 0.0)
         field_binding_positive_fraction = value(
@@ -2012,6 +2035,12 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
         )
         field_binding_exact_pair_fraction = value(
             row, "field_binding_exact_pair_rank_fraction_mean", 1.0
+        )
+        field_binding_sequence_rank_pairs = value(
+            row, "field_binding_sequence_rank_metric_pairs_mean", 0.0
+        )
+        field_binding_positive_sequence_fraction = value(
+            row, "field_binding_positive_sequence_fraction_mean", 1.0
         )
         generated_attractor_capacity = value(
             row, "generated_attractor_config_capacity_mean", 0.0
@@ -2425,6 +2454,21 @@ def add_gate_decisions(rows: list[dict[str, Any]], args: argparse.Namespace) -> 
             < args.min_field_binding_exact_pair_rank_fraction
         ):
             reasons.append("field_binding_pair_rank_weak")
+        if (
+            field_binding_weight > 0.0
+            and field_binding_pair_weight > 0.0
+            and field_binding_expected_rank_metrics > 0.0
+            and field_binding_sequence_rank_pairs <= 0.0
+        ):
+            reasons.append("field_binding_sequence_rank_metrics_missing")
+        if (
+            field_binding_weight > 0.0
+            and field_binding_pair_weight > 0.0
+            and field_binding_sequence_rank_pairs > 0.0
+            and field_binding_positive_sequence_fraction
+            < args.min_field_binding_exact_pair_rank_fraction
+        ):
+            reasons.append("field_binding_sequence_rank_weak")
         if mature_enough and generated_attractor_capacity > 0.0:
             if generated_attractor_observed <= 0.0:
                 reasons.append("generated_attractor_generation_inactive")

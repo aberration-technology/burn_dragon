@@ -1,0 +1,6 @@
+extends = ["ruliad-r3.semantic-action-static-fixed-ablation.toml"]
+
+# Contrast only genuine decision points in the verifier candidate trie. Each semantic proof state
+# receives unit total weight, independent of action length and number of branch points.
+[training.ruliad_supervision.proof_policy]
+normalization = "prefix_conditional"

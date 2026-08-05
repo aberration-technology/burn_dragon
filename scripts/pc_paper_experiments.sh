@@ -9,11 +9,15 @@ PROFILE="${BURN_DRAGON_PC_PAPER_PROFILE:-}"
 OUT_DIR="${BURN_DRAGON_PC_PAPER_OUT_DIR:-$ROOT_DIR/target/pc-paper/$(date -u +%Y%m%dT%H%M%SZ)}"
 MATRIX="${BURN_DRAGON_PC_PAPER_MATRIX:-smoke}"
 BATCH_SIZE="${BURN_DRAGON_PC_PAPER_BATCH_SIZE:-}"
+TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-64}"
 CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-512}"
 LOG_FREQUENCY="${BURN_DRAGON_PC_PAPER_LOG_FREQUENCY:-16}"
 SOURCE_SELECTION_EVERY_STEPS="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_EVERY_STEPS:-16}"
+SOURCE_WEIGHTED_VALIDATION_BATCHES="${BURN_DRAGON_PC_PAPER_SOURCE_WEIGHTED_VALIDATION_BATCHES:-1}"
 DEGENERACY_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_DEGENERACY_PROBE_EVERY_EPOCHS:-1}"
 RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS:-1}"
+RULIAD_CORRECTNESS_PROBE_ITEMS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_ITEMS:-32}"
+PC_AMORTIZATION_TOLERANCE="${BURN_DRAGON_PC_PAPER_AMORTIZATION_TOLERANCE:-0.05}"
 TIMEOUT_SECONDS="${BURN_DRAGON_PC_PAPER_TIMEOUT_SECONDS:-0}"
 WALL_CLOCK_SECONDS="${BURN_DRAGON_PC_PAPER_WALL_CLOCK_SECONDS:-0}"
 MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION:-0.90}"
@@ -32,7 +36,7 @@ Usage:
 
 Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
-                               pc-optimizer | hparam | nextlat-tbptt
+                               local-factor | hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
@@ -44,7 +48,7 @@ Options:
   --timeout-seconds <n>        Hard wall timeout per trial. 0 disables.
   --wall-clock-seconds <n>     Treat timeout as successful fixed-wall-clock completion.
   --dry-run                    Write overlays/manifests and print commands without launching training.
-  --no-build                   Skip the release build step.
+  --no-build                   Reuse the existing release executable without invoking Cargo.
 
 Safety guards:
   BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION  Default: 0.90
@@ -53,6 +57,9 @@ Safety guards:
 The runner isolates every trial under its own BURN_DRAGON_RUN_ROOT and writes
 one JSON manifest per trial. Raw checkpoints and metric events remain under
 the generated Dragon run directory.
+
+Set BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE to preserve a production chunk
+geometry in systems matrices. The default remains 64 for historical parity.
 USAGE
 }
 
@@ -129,6 +136,7 @@ fi
 
 RUSTUP_CARGO="$(rustup which cargo)"
 RUSTUP_RUSTC="$(rustup which rustc)"
+TRAIN_BINARY="$ROOT_DIR/target/release/examples/train_language"
 
 matrix_defaults() {
   case "$MATRIX" in
@@ -146,7 +154,7 @@ matrix_defaults() {
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623,20260624,20260625}"
       : "${ITERS_CSV:=2048,8192}"
-      : "${ARMS_CSV:=adamw,adamwpc,adamwpc_every_chunk}"
+      : "${ARMS_CSV:=adamw,adamwpc,adamwpc_every4}"
       : "${BATCH_SIZE:=64}"
       ;;
     controls)
@@ -160,7 +168,7 @@ matrix_defaults() {
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=100000000}"
-      : "${ARMS_CSV:=adamw,adamwpc}"
+      : "${ARMS_CSV:=adamw,adamwpc_every4}"
       : "${BATCH_SIZE:=64}"
       if [[ "$WALL_CLOCK_SECONDS" == "0" ]]; then
         WALL_CLOCK_SECONDS=3600
@@ -173,7 +181,7 @@ matrix_defaults() {
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622}"
       : "${ITERS_CSV:=100000000}"
-      : "${ARMS_CSV:=adamw,adamwpc}"
+      : "${ARMS_CSV:=adamw,adamwpc_every4}"
       : "${BATCH_SIZE:=64}"
       if [[ "$WALL_CLOCK_SECONDS" == "0" ]]; then
         WALL_CLOCK_SECONDS=21600
@@ -182,18 +190,27 @@ matrix_defaults() {
         TIMEOUT_SECONDS="$WALL_CLOCK_SECONDS"
       fi
       ;;
-    pc-optimizer)
-      : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
-      : "${SEEDS_CSV:=20260621,20260622,20260623}"
-      : "${ITERS_CSV:=512,2048}"
-      : "${ARMS_CSV:=pcopt_sgd,pcopt_momentum,pcopt_adamw,pcopt_diagonal_natural}"
-      : "${BATCH_SIZE:=64}"
+    local-factor)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128}"
+      : "${ARMS_CSV:=local_backprop,local_pc_steps1,local_pc_steps2,local_pc_steps4}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=128
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
       ;;
     hparam)
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
       : "${ITERS_CSV:=512}"
-      : "${ARMS_CSV:=adamwpc,adamwpc_step003,adamwpc_step03,adamwpc_steps2,adamwpc_allstate,adamwpc_block}"
+      : "${ARMS_CSV:=adamwpc,adamwpc_step003,adamwpc_step03,adamwpc_steps2,adamwpc_allstate,adamwpc_oracle_block_negative_control}"
       : "${BATCH_SIZE:=64}"
       ;;
     nextlat-tbptt)
@@ -220,7 +237,7 @@ if (( DRY_RUN == 1 && BUILD_RELEASE == 1 )); then
   BUILD_RELEASE=0
 fi
 
-mkdir -p "$OUT_DIR/overlays" "$OUT_DIR/logs" "$OUT_DIR/manifests" "$OUT_DIR/run_roots"
+mkdir -p "$OUT_DIR/overlays" "$OUT_DIR/logs" "$OUT_DIR/manifests" "$OUT_DIR/run_roots" "$OUT_DIR/gpu"
 RUN_INDEX="$OUT_DIR/run-index.tsv"
 if [[ ! -f "$RUN_INDEX" ]]; then
   printf "trial_key\tmatrix\titers\tarm\tseed\tbatch_size\tstatus\telapsed_seconds\tpeak_used_mb\tmin_available_mb\trun_dir\tmanifest\tlog\n" > "$RUN_INDEX"
@@ -234,6 +251,11 @@ if (( BUILD_RELEASE == 1 )); then
     export CARGO="$RUSTUP_CARGO"
     "$RUSTUP_CARGO" build --release -p burn_dragon_language --example train_language --features "$FEATURES"
   )
+fi
+if (( DRY_RUN == 0 )) && [[ ! -x "$TRAIN_BINARY" ]]; then
+  echo "release train_language executable is missing: $TRAIN_BINARY" >&2
+  echo "rerun without --no-build" >&2
+  exit 2
 fi
 
 mem_total_kb() {
@@ -271,6 +293,7 @@ MONITOR_ELAPSED_SECONDS=0
 monitor_process() {
   local pid="$1"
   local log_path="$2"
+  local gpu_path="$3"
   local max_fraction_bps
   local total_kb
   local min_available_kb
@@ -288,6 +311,11 @@ monitor_process() {
   started="$(date +%s)"
 
   while kill -0 "$pid" 2>/dev/null; do
+    if [[ -n "$gpu_path" ]]; then
+      nvidia-smi \
+        --query-gpu=timestamp,index,utilization.gpu,utilization.memory,power.draw,power.limit,clocks.current.graphics,clocks.current.memory,temperature.gpu \
+        --format=csv,noheader,nounits >> "$gpu_path" 2>/dev/null || true
+    fi
     local available_kb
     local used_kb
     available_kb="$(mem_available_kb)"
@@ -351,6 +379,9 @@ write_pc_block() {
   local step_size="$7"
   local apply_every_chunks="$8"
   local warmup_steps="${9:-0}"
+  local observation_contract="${10:-observed_prefix}"
+  local gradient_norm_scope="${11:-per_sample}"
+  local sync_diagnostics="${12:-false}"
   {
     echo "[training.predictive_coding]"
     echo "enabled = $enabled"
@@ -358,14 +389,21 @@ write_pc_block() {
     echo "state_scope = \"$state_scope\""
     echo "backward_mode = \"$backward_mode\""
     echo "parameter_update = \"$parameter_update\""
+    echo "observation_contract = \"$observation_contract\""
+    if [[ "$observation_contract" == "oracle_next_token_negative_control" ]]; then
+      echo "allow_oracle_target_leak = true"
+    fi
     echo "steps = $steps"
     echo "step_size = $step_size"
     echo "latent_decay = 0.0"
     echo "max_grad_norm = 1.0"
+    echo "gradient_norm_scope = \"$gradient_norm_scope\""
     echo "eps = 1.0e-8"
     echo "apply_every_chunks = $apply_every_chunks"
+    echo "amortization_tolerance = $PC_AMORTIZATION_TOLERANCE"
+    echo "amortization_max_state_slots = 128"
     echo "warmup_steps = $warmup_steps"
-    echo "sync_diagnostics = false"
+    echo "sync_diagnostics = $sync_diagnostics"
   } >> "$path"
 }
 
@@ -375,25 +413,40 @@ write_overlay() {
   local seed="$3"
   local iters="$4"
   local batch_size="$5"
+  local algorithm_line=""
+  local tbptt_line=""
+
+  case "$arm" in
+    local_backprop)
+      algorithm_line='algorithm = "backpropagation"'
+      ;;
+    local_pc*)
+      algorithm_line='algorithm = "predictive_coding"'
+      ;;
+  esac
+  if (( TBPTT_CHUNK_SIZE > 0 )); then
+    tbptt_line="tbptt_chunk_size = $TBPTT_CHUNK_SIZE"
+  fi
 
   cat > "$path" <<EOF
 [training]
+${algorithm_line}
 batch_size = $batch_size
 max_iters = $iters
 checkpoint_interval_iters = $CHECKPOINT_INTERVAL_ITERS
 log_frequency = $LOG_FREQUENCY
 seed = $seed
-tbptt_chunk_size = 64
+${tbptt_line}
 launch_mode = "fresh"
 
 [training.events]
 flush_every_steps = 8
 source_selection_every_steps = $SOURCE_SELECTION_EVERY_STEPS
-source_weighted_validation_batches = 1
+source_weighted_validation_batches = $SOURCE_WEIGHTED_VALIDATION_BATCHES
 degeneracy_probe_every_epochs = $DEGENERACY_PROBE_EVERY_EPOCHS
 degeneracy_probe_tokens = 64
 ruliad_correctness_probe_every_epochs = $RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS
-ruliad_correctness_probe_items = 32
+ruliad_correctness_probe_items = $RULIAD_CORRECTNESS_PROBE_ITEMS
 ruliad_correctness_probe_tokens = 64
 
 [training.continual_backprop]
@@ -408,6 +461,83 @@ enabled = false
 EOF
 
   case "$arm" in
+    local_backprop)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      ;;
+    local_pc_steps1|local_pc_steps2|local_pc_steps4|local_pc_steps8|local_pc_steps16|local_pc_steps32|local_pc_steps64|local_pc_steps128)
+      local local_steps="${arm#local_pc_steps}"
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+
+EOF
+      ;;
+    local_pc_fixed_prediction)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+
+EOF
+      ;;
+    local_pc_steps4_eta05_lr003|local_pc_steps4_eta05_lr01)
+      local local_lr="0.003"
+      if [[ "$arm" == *_lr01 ]]; then
+        local_lr="0.01"
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = 4
+step_size = 0.5
+
+EOF
+      ;;
+    local_pc_steps*_eta*)
+      if [[ ! "$arm" =~ ^local_pc_steps(1|2|4|8|16|32|64|128)_eta(01|02|05|10)$ ]]; then
+        echo "unknown local PC arm: $arm" >&2
+        return 2
+      fi
+      local local_steps="${BASH_REMATCH[1]}"
+      local eta_code="${BASH_REMATCH[2]}"
+      local local_eta=""
+      case "$eta_code" in
+        01) local_eta="0.1" ;;
+        02) local_eta="0.2" ;;
+        05) local_eta="0.5" ;;
+        10) local_eta="1.0" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
+
+EOF
+      ;;
     adamw)
       cat >> "$path" <<EOF
 [optimizer]
@@ -428,6 +558,16 @@ weight_decay = 0.01
 EOF
       write_pc_block "$path" true core chunked optimizer 1 0.01 2
       ;;
+    adamwpc_oracle_negative_control)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 0.01 2 0 oracle_next_token_negative_control
+      ;;
     adamwpc_every_chunk)
       cat >> "$path" <<EOF
 [optimizer]
@@ -437,6 +577,56 @@ weight_decay = 0.01
 
 EOF
       write_pc_block "$path" true core chunked optimizer 1 0.01 1
+      ;;
+    adamwpc_every4|adamwpc_every8)
+      local apply_every="${arm#adamwpc_every}"
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 0.01 "$apply_every"
+      ;;
+    adamwpc_every4_global)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 0.01 4 0 observed_prefix global
+      ;;
+    adamwpc_every4_diagnostics|adamwpc_every4_step*_diagnostics)
+      local pc_step_size="0.01"
+      if [[ "$arm" =~ ^adamwpc_every4_step([0-9]+)_diagnostics$ ]]; then
+        pc_step_size="${BASH_REMATCH[1]}.0"
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 "$pc_step_size" 4 0 observed_prefix per_sample true
+      ;;
+    adamwpc_every4_step*)
+      if [[ ! "$arm" =~ ^adamwpc_every4_step([0-9]+)$ ]]; then
+        echo "unknown arm: $arm" >&2
+        return 2
+      fi
+      local pc_step_size="${BASH_REMATCH[1]}.0"
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+
+EOF
+      write_pc_block "$path" true core chunked optimizer 1 "$pc_step_size" 4
       ;;
     adamwpc_warm1024)
       cat >> "$path" <<EOF
@@ -508,7 +698,7 @@ weight_decay = 0.01
 EOF
       write_pc_block "$path" true all chunked optimizer 1 0.01 2
       ;;
-    adamwpc_block)
+    adamwpc_block|adamwpc_oracle_block_negative_control)
       cat >> "$path" <<EOF
 [optimizer]
 name = "adamw"
@@ -516,25 +706,7 @@ learning_rate = 0.001
 weight_decay = 0.01
 
 EOF
-      write_pc_block "$path" true core block optimizer 1 0.01 2
-      ;;
-    pcopt_sgd|pcopt_momentum|pcopt_adamw|pcopt_diagonal_natural)
-      local transform="${arm#pcopt_}"
-      cat >> "$path" <<EOF
-[optimizer]
-name = "predictive_coding"
-learning_rate = 0.001
-weight_decay = 0.01
-
-[optimizer.predictive_coding]
-transform = "$transform"
-momentum = 0.9
-fisher_decay = 0.95
-damping = 0.001
-nesterov = false
-
-EOF
-      write_pc_block "$path" true core chunked optimizer 1 0.01 2
+      write_pc_block "$path" true core block optimizer 1 0.01 2 0 oracle_next_token_negative_control
       ;;
     *)
       echo "unknown arm: $arm" >&2
@@ -559,6 +731,7 @@ write_manifest() {
   local peak_used_mb="${13}"
   local min_available_mb="${14}"
   local exit_note="${15:-}"
+  local gpu_path="${16:-}"
   local git_sha
   local git_branch
   local dirty
@@ -584,6 +757,7 @@ write_manifest() {
   "run_root": $(json_escape "$run_root"),
   "run_dir": $(json_escape "$run_dir"),
   "log_path": $(json_escape "$log_path"),
+  "gpu_path": $(json_escape "$gpu_path"),
   "status": $(json_escape "$status"),
   "elapsed_seconds": $elapsed,
   "peak_used_mb": $peak_used_mb,
@@ -625,13 +799,13 @@ run_trial() {
   local run_root="$OUT_DIR/run_roots/${trial_key}"
   local run_dir=""
   local status="not_started"
+  local gpu_path=""
 
   mkdir -p "$run_root"
   write_overlay "$overlay" "$arm" "$seed" "$iters" "$BATCH_SIZE"
 
   local cmd=(
-    "$RUSTUP_CARGO" run --release -p burn_dragon_language --example train_language
-    --features "$FEATURES" --
+    "$TRAIN_BINARY"
     --backend "$BACKEND"
     --config "$PROFILE"
     --config "$overlay"
@@ -644,27 +818,30 @@ run_trial() {
 
   if (( DRY_RUN == 1 )); then
     status="dry_run"
-    write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "" "$log_path" "$status" 0 0 0 "not launched"
+    write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "" "$log_path" "$status" 0 0 0 "not launched" ""
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$trial_key" "$MATRIX" "$iters" "$arm" "$seed" "$BATCH_SIZE" "$status" 0 0 0 "" "$manifest" "$log_path" \
       | tee -a "$RUN_INDEX"
     return 0
   fi
 
+  if [[ "$BACKEND" == "cuda" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_path="$OUT_DIR/gpu/${trial_key}.gpu.csv"
+    printf "timestamp,index,utilization_gpu,utilization_memory,power_w,power_limit_w,graphics_clock_mhz,memory_clock_mhz,temperature_c\n" > "$gpu_path"
+  fi
+
   (
     cd "$ROOT_DIR"
-    export RUSTC="$RUSTUP_RUSTC"
-    export CARGO="$RUSTUP_CARGO"
     export BURN_DRAGON_RUN_ROOT="$run_root"
     export DragonModel_STAGE_PROFILE=1
     exec "${cmd[@]}"
   ) >> "$log_path" 2>&1 &
   local pid=$!
 
-  monitor_process "$pid" "$log_path"
+  monitor_process "$pid" "$log_path" "$gpu_path"
   status="$MONITOR_STATUS"
   run_dir="$(latest_run_dir_for_root "$run_root" || true)"
-  write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "$run_dir" "$log_path" "$status" "$MONITOR_ELAPSED_SECONDS" "$MONITOR_PEAK_USED_MB" "$MONITOR_MIN_AVAILABLE_MB" ""
+  write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "$run_dir" "$log_path" "$status" "$MONITOR_ELAPSED_SECONDS" "$MONITOR_PEAK_USED_MB" "$MONITOR_MIN_AVAILABLE_MB" "" "$gpu_path"
 
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "$trial_key" "$MATRIX" "$iters" "$arm" "$seed" "$BATCH_SIZE" "$status" "$MONITOR_ELAPSED_SECONDS" "$MONITOR_PEAK_USED_MB" "$MONITOR_MIN_AVAILABLE_MB" "$run_dir" "$manifest" "$log_path" \
@@ -681,12 +858,17 @@ echo "pc paper matrix: matrix=$MATRIX backend=$BACKEND profile=$PROFILE batch_si
 echo "seeds=$SEEDS_CSV iters=$ITERS_CSV arms=$ARMS_CSV"
 echo "guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB timeout_seconds=$TIMEOUT_SECONDS"
 
+matrix_status=0
 for iters in "${ITERS[@]}"; do
   for arm in "${ARMS[@]}"; do
     for seed in "${SEEDS[@]}"; do
-      run_trial "$arm" "$seed" "$iters"
+      if ! run_trial "$arm" "$seed" "$iters"; then
+        matrix_status=1
+        echo "trial failed; continuing matrix: arm=$arm seed=$seed iters=$iters" >&2
+      fi
     done
   done
 done
 
 echo "matrix complete: $RUN_INDEX"
+exit "$matrix_status"

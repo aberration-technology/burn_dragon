@@ -1,0 +1,18 @@
+extends = "ruliad-r1.training.toml"
+
+[dataset]
+cache_dir = "./cache/ruliad-r3"
+type = "universality_ruliad"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.corpus.toml"
+
+[training]
+block_size = 512
+tbptt_chunk_size = 512
+tbptt_persist_across_steps = true
+
+[training.ruliad_supervision]
+mode = "trace_and_answer"
+mask_high_entropy_spans = true
+
+[generation]
+prompt = "[R3"

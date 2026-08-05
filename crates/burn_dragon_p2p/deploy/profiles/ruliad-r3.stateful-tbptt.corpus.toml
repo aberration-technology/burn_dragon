@@ -1,0 +1,42 @@
+output_dir = "./generated/ruliad-r3-stateful-tbptt"
+seed = 1337
+name = "burn-dragon-ruliad-stateful-tbptt-v1"
+train_samples = 512
+validation_samples = 128
+chunk_token_capacity = 1048576
+formal_generalization = "structural_holdout_v1"
+
+[serialization]
+# One canonical R3 proof problem is the coherent long-horizon unit. The 6,144
+# payload-token envelope is twelve exact 512-token windows and exceeds the
+# exhaustive panel's 5,830-character maximum without truncating supervision.
+document_tokens = 6145
+preview_samples = 8
+document_mode = "single_sample"
+document_chunks = { min = 1, max = 1 }
+
+[tokenization]
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
+
+[source_selection]
+# Keep compact live document streaming, but freeze the source distribution.
+# Every arm observes the same deterministic bucket/document stream per seed.
+enabled = true
+feedback_updates_enabled = false
+difficulty_levels = { min = 0, max = 0 }
+
+[source_selection.frontier_extension]
+enabled = false
+
+[source_selection.formal_task_mix]
+advance_proof_weight = 2
+construct_proof_weight = 1
+check_proof_weight = 1
+
+[[families]]
+kind = "formal_proof"
+weight = 1
+width = { min = 4, max = 6 }
+steps = { min = 6, max = 10 }

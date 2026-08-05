@@ -345,6 +345,8 @@ pub struct ModelSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dragon_reservoir_initialization: Option<ReservoirInitializationSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random_scaffold: Option<burn_eggroll::ScaffoldAdapterManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_deltanet2: Option<GatedDeltaNet2Spec>,
 }
 

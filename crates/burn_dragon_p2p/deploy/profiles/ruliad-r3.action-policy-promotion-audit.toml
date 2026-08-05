@@ -1,0 +1,12 @@
+extends = ["ruliad-r3.action-policy-fixed-ablation.toml"]
+
+# Explicit, expensive checkpoint-promotion audit. Keep this out of routine
+# training profiles: proof search is verifier-coupled and therefore has a
+# sequential transition boundary even though candidate scoring is batched.
+[training.ruliad_policy_probe]
+every_epochs = 1
+items = 64
+max_steps = 256
+
+[training.ruliad_policy_probe.promotion_gate]
+minimum_items = 64

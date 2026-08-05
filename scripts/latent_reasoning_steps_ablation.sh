@@ -68,10 +68,13 @@ STRUCTURED_RECOVERY_TEMPLATE_NEGATIVE_COUNT="${BURN_DRAGON_LR_STEPS_STRUCTURED_R
 STRUCTURED_RECOVERY_SCHEMA_NEGATIVE_COUNT="${BURN_DRAGON_LR_STEPS_STRUCTURED_RECOVERY_SCHEMA_NEGATIVE_COUNT:-inherit}"
 FIELD_BINDING_CONTRAST_WEIGHT="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_WEIGHT:-inherit}"
 FIELD_BINDING_CONTRAST_EVERY_STEPS="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_EVERY_STEPS:-inherit}"
+FIELD_BINDING_CONTRAST_START_AFTER="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_START_AFTER:-inherit}"
 FIELD_BINDING_CONTRAST_MARGIN="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_MARGIN:-inherit}"
 FIELD_BINDING_CONTRAST_PAIR_WEIGHT="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_PAIR_WEIGHT:-inherit}"
 FIELD_BINDING_CONTRAST_MAX_PAIRS="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_MAX_PAIRS:-inherit}"
 FIELD_BINDING_CONTRAST_REPLAY_CAPACITY="${BURN_DRAGON_LR_STEPS_FIELD_BINDING_CONTRAST_REPLAY_CAPACITY:-inherit}"
+VERIFIER_REWARD_ENABLED="${BURN_DRAGON_LR_STEPS_VERIFIER_REWARD_ENABLED:-inherit}"
+VERIFIER_REWARD_WEIGHT="${BURN_DRAGON_LR_STEPS_VERIFIER_REWARD_WEIGHT:-inherit}"
 GENERATED_ATTRACTOR_REPLAY_CAPACITY="${BURN_DRAGON_LR_STEPS_GENERATED_ATTRACTOR_REPLAY_CAPACITY:-inherit}"
 GENERATED_ATTRACTOR_REPLAY_MIN_COUNT="${BURN_DRAGON_LR_STEPS_GENERATED_ATTRACTOR_REPLAY_MIN_COUNT:-inherit}"
 GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES="${BURN_DRAGON_LR_STEPS_GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES:-inherit}"
@@ -111,6 +114,18 @@ LOG_FREQUENCY="${BURN_DRAGON_LR_STEPS_LOG_FREQUENCY:-16}"
 CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_LR_STEPS_CHECKPOINT_INTERVAL_ITERS:-128}"
 RULIAD_PROBE_ITEMS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_ITEMS:-128}"
 RULIAD_PROBE_TOKENS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_TOKENS:-64}"
+RULIAD_PROBE_EVERY_EPOCHS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_EVERY_EPOCHS:-1}"
+RULIAD_PROBE_BATCHING="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_BATCHING:-inherit}"
+RULIAD_PROBE_MAX_BATCH_ROWS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_MAX_BATCH_ROWS:-inherit}"
+RULIAD_PROBE_MINIMUM_BATCH_ROWS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_MINIMUM_BATCH_ROWS:-inherit}"
+RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN:-inherit}"
+RULIAD_PROBE_DEVICE_BUFFER_TOKENS="${BURN_DRAGON_LR_STEPS_RULIAD_PROBE_DEVICE_BUFFER_TOKENS:-inherit}"
+RULIAD_POLICY_PROBE_EVERY_EPOCHS="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_EVERY_EPOCHS:-inherit}"
+RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-inherit}"
+RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY:-inherit}"
+RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS:-inherit}"
+RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET:-inherit}"
+RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH="${BURN_DRAGON_LR_STEPS_RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH:-inherit}"
 TIMEOUT_SECONDS="${BURN_DRAGON_LR_STEPS_TIMEOUT_SECONDS:-2400}"
 MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_LR_STEPS_MAX_SYSTEM_MEMORY_FRACTION:-0.80}"
 MIN_AVAILABLE_MB="${BURN_DRAGON_LR_STEPS_MIN_AVAILABLE_MB:-24576}"
@@ -186,6 +201,26 @@ Options:
                             Override answer_denoising.structured_recovery_template_negative_count.
   --structured-recovery-schema-negatives <n|inherit>
                             Override answer_denoising.structured_recovery_schema_negative_count.
+  --verifier-reward <inherit|true|false>
+                            Override the verifier-reward objective master switch. Positive child
+                            objective overrides automatically resolve inherit to true.
+  --verifier-reward-weight <x|inherit>
+                            Override the scalar rollout reward. Auto-enabling only a child
+                            objective resolves an inherited scalar weight to zero.
+  --field-binding-weight <x|inherit>
+                            Override verifier_reward.field_binding_contrast_weight.
+  --field-binding-every <n|inherit>
+                            Override field-binding update cadence.
+  --field-binding-start <n|inherit>
+                            Override field-binding warmup steps.
+  --field-binding-margin <x|inherit>
+                            Override the first-divergence and sequence ranking margin.
+  --field-binding-pair-weight <x|inherit>
+                            Override the paired sequence log-probability term weight.
+  --field-binding-max-pairs <n|inherit>
+                            Override the bounded pairs per update.
+  --field-binding-replay-capacity <n|inherit>
+                            Override cross-batch answer replay capacity.
   --generated-attractor-capacity <n|inherit>
                             Override verifier_reward.generated_attractor_replay_capacity.
   --generated-attractor-min-count <n|inherit>
@@ -220,6 +255,28 @@ Options:
   --timeout-seconds <n>       Per-trial timeout. Default: 2400.
   --probe-items <n>           Ruliad correctness probe items. Default: 128.
   --probe-tokens <n>          Ruliad correctness generation tokens. Default: 64.
+  --probe-batching <inherit|true|false>
+                            Toggle ragged correctness-probe batching.
+  --probe-batch-rows <inherit|n>
+                            Maximum correctness-probe rows in one recurrent batch.
+  --probe-min-batch-rows <inherit|n>
+                            Minimum rows required for batching.
+  --probe-max-position-span <inherit|n>
+                            Maximum prompt-length span inside one ragged cohort.
+  --probe-device-buffer-tokens <inherit|n>
+                            Greedy steps retained on device between stop-token reads.
+  --policy-probe-every-epochs <inherit|n>
+                            Override constrained proof-policy scoring cadence.
+  --policy-probe-closed-loop-every-epochs <inherit|n>
+                            Override verifier-backed closed-loop rollout cadence.
+  --policy-probe-symmetry <inherit|canonical|balanced_rotation|cyclic_orbit_average>
+                            Override only the proof-policy evaluator presentation contract.
+  --policy-probe-scoring-rows <inherit|n>
+                            Maximum proof presentations in one scoring batch.
+  --policy-probe-token-budget <inherit|n>
+                            Maximum padded prompt tokens in one scoring batch.
+  --policy-probe-pipeline-depth <inherit|n>
+                            Maximum queued proof-scoring batches before CUDA readback.
   --dynamics <inherit|true|false>
                             Override training.dynamics.enabled. Default: inherit.
   --backend <cuda|cpu>        Backend. Default: cuda.
@@ -291,6 +348,15 @@ while [[ $# -gt 0 ]]; do
     --structured-recovery-negatives) STRUCTURED_RECOVERY_NEGATIVE_COUNT="$2"; shift 2 ;;
     --structured-recovery-template-negatives) STRUCTURED_RECOVERY_TEMPLATE_NEGATIVE_COUNT="$2"; shift 2 ;;
     --structured-recovery-schema-negatives) STRUCTURED_RECOVERY_SCHEMA_NEGATIVE_COUNT="$2"; shift 2 ;;
+    --field-binding-weight) FIELD_BINDING_CONTRAST_WEIGHT="$2"; shift 2 ;;
+    --field-binding-every) FIELD_BINDING_CONTRAST_EVERY_STEPS="$2"; shift 2 ;;
+    --field-binding-start) FIELD_BINDING_CONTRAST_START_AFTER="$2"; shift 2 ;;
+    --field-binding-margin) FIELD_BINDING_CONTRAST_MARGIN="$2"; shift 2 ;;
+    --field-binding-pair-weight) FIELD_BINDING_CONTRAST_PAIR_WEIGHT="$2"; shift 2 ;;
+    --field-binding-max-pairs) FIELD_BINDING_CONTRAST_MAX_PAIRS="$2"; shift 2 ;;
+    --field-binding-replay-capacity) FIELD_BINDING_CONTRAST_REPLAY_CAPACITY="$2"; shift 2 ;;
+    --verifier-reward) VERIFIER_REWARD_ENABLED="$2"; shift 2 ;;
+    --verifier-reward-weight) VERIFIER_REWARD_WEIGHT="$2"; shift 2 ;;
     --generated-attractor-capacity) GENERATED_ATTRACTOR_REPLAY_CAPACITY="$2"; shift 2 ;;
     --generated-attractor-min-count) GENERATED_ATTRACTOR_REPLAY_MIN_COUNT="$2"; shift 2 ;;
     --generated-attractor-max-candidates) GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES="$2"; shift 2 ;;
@@ -330,6 +396,17 @@ while [[ $# -gt 0 ]]; do
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
     --probe-items) RULIAD_PROBE_ITEMS="$2"; shift 2 ;;
     --probe-tokens) RULIAD_PROBE_TOKENS="$2"; shift 2 ;;
+    --probe-batching) RULIAD_PROBE_BATCHING="$2"; shift 2 ;;
+    --probe-batch-rows) RULIAD_PROBE_MAX_BATCH_ROWS="$2"; shift 2 ;;
+    --probe-min-batch-rows) RULIAD_PROBE_MINIMUM_BATCH_ROWS="$2"; shift 2 ;;
+    --probe-max-position-span) RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN="$2"; shift 2 ;;
+    --probe-device-buffer-tokens) RULIAD_PROBE_DEVICE_BUFFER_TOKENS="$2"; shift 2 ;;
+    --policy-probe-every-epochs) RULIAD_POLICY_PROBE_EVERY_EPOCHS="$2"; shift 2 ;;
+    --policy-probe-closed-loop-every-epochs) RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="$2"; shift 2 ;;
+    --policy-probe-symmetry) RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY="$2"; shift 2 ;;
+    --policy-probe-scoring-rows) RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS="$2"; shift 2 ;;
+    --policy-probe-token-budget) RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET="$2"; shift 2 ;;
+    --policy-probe-pipeline-depth) RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH="$2"; shift 2 ;;
     --dynamics) DYNAMICS_ENABLED="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
     --features) FEATURES="$2"; shift 2 ;;
@@ -388,6 +465,45 @@ case "$ANSWER_DENOISING" in
   inherit|true|false) ;;
   *) echo "--answer-denoising must be inherit, true, or false" >&2; exit 2 ;;
 esac
+case "$VERIFIER_REWARD_ENABLED" in
+  inherit|true|false) ;;
+  *) echo "--verifier-reward must be inherit, true, or false" >&2; exit 2 ;;
+esac
+if [[ "$VERIFIER_REWARD_WEIGHT" != "inherit" ]] && ! awk -v value="$VERIFIER_REWARD_WEIGHT" 'BEGIN { exit !(value == value && value >= 0) }'; then
+  echo "--verifier-reward-weight must be inherit or a finite non-negative number" >&2
+  exit 2
+fi
+
+numeric_positive() {
+  awk -v value="$1" 'BEGIN { exit !((value + 0) > 0) }'
+}
+
+VERIFIER_REWARD_CHILD_REQUESTED=false
+VERIFIER_REWARD_AUTO_ENABLED=false
+for verifier_child in \
+  "$FIELD_BINDING_CONTRAST_WEIGHT" \
+  "$GENERATED_ATTRACTOR_REPLAY_CAPACITY" \
+  "$VERIFIER_ROLLOUT_IMITATION_WEIGHT" \
+  "$VERIFIER_ROLLOUT_RECOVERY_WEIGHT"
+do
+  if [[ "$verifier_child" != "inherit" ]] && numeric_positive "$verifier_child"; then
+    VERIFIER_REWARD_CHILD_REQUESTED=true
+    break
+  fi
+done
+if [[ "$VERIFIER_REWARD_CHILD_REQUESTED" == "true" ]]; then
+  if [[ "$VERIFIER_REWARD_ENABLED" == "false" ]]; then
+    echo "positive verifier-reward child objective conflicts with --verifier-reward false" >&2
+    exit 2
+  fi
+  if [[ "$VERIFIER_REWARD_ENABLED" == "inherit" ]]; then
+    VERIFIER_REWARD_ENABLED=true
+    VERIFIER_REWARD_AUTO_ENABLED=true
+  fi
+  if [[ "$VERIFIER_REWARD_AUTO_ENABLED" == "true" && "$VERIFIER_REWARD_WEIGHT" == "inherit" ]]; then
+    VERIFIER_REWARD_WEIGHT=0.0
+  fi
+fi
 case "$ROLLOUT_UNLIKELIHOOD" in
   true|false) ;;
   *) echo "--rollout-unlikelihood must be true or false" >&2; exit 2 ;;
@@ -411,6 +527,54 @@ if ! [[ "$CHECKPOINT_INTERVAL_ITERS" =~ ^[1-9][0-9]*$ ]]; then
   echo "checkpoint_interval_iters must be a positive integer" >&2
   exit 2
 fi
+if ! [[ "$RULIAD_PROBE_EVERY_EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "BURN_DRAGON_LR_STEPS_RULIAD_PROBE_EVERY_EPOCHS must be a positive integer" >&2
+  exit 2
+fi
+case "$RULIAD_PROBE_BATCHING" in
+  inherit|true|false) ;;
+  *) echo "--probe-batching must be inherit, true, or false" >&2; exit 2 ;;
+esac
+for probe_generation_override in \
+  "$RULIAD_PROBE_MAX_BATCH_ROWS" \
+  "$RULIAD_PROBE_MINIMUM_BATCH_ROWS" \
+  "$RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN" \
+  "$RULIAD_PROBE_DEVICE_BUFFER_TOKENS"; do
+  if [[ "$probe_generation_override" != "inherit" ]] && ! [[ "$probe_generation_override" =~ ^[1-9][0-9]*$ ]]; then
+    echo "correctness-probe generation overrides must be inherit or a positive integer" >&2
+    exit 2
+  fi
+done
+if [[ "$RULIAD_PROBE_MAX_BATCH_ROWS" != "inherit" \
+  && "$RULIAD_PROBE_MINIMUM_BATCH_ROWS" != "inherit" \
+  && "$RULIAD_PROBE_MINIMUM_BATCH_ROWS" -gt "$RULIAD_PROBE_MAX_BATCH_ROWS" ]]; then
+  echo "--probe-min-batch-rows must be <= --probe-batch-rows" >&2
+  exit 2
+fi
+if [[ "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" != "inherit" ]] && ! [[ "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--policy-probe-every-epochs must be inherit or a positive integer" >&2
+  exit 2
+fi
+if [[ "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" != "inherit" ]] && ! [[ "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--policy-probe-closed-loop-every-epochs must be inherit or a positive integer" >&2
+  exit 2
+fi
+case "$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY" in
+  inherit|canonical|balanced_rotation|cyclic_orbit_average) ;;
+  *)
+    echo "--policy-probe-symmetry must be inherit, canonical, balanced_rotation, or cyclic_orbit_average" >&2
+    exit 2
+    ;;
+esac
+for policy_probe_override in \
+  "$RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS" \
+  "$RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET" \
+  "$RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH"; do
+  if [[ "$policy_probe_override" != "inherit" ]] && ! [[ "$policy_probe_override" =~ ^[1-9][0-9]*$ ]]; then
+    echo "proof-policy scoring overrides must be inherit or a positive integer" >&2
+    exit 2
+  fi
+done
 if (( ROLLOUT_UNLIKELIHOOD_EVERY_STEPS <= 0 )); then
   echo "--rollout-every must be > 0" >&2
   exit 2
@@ -669,9 +833,36 @@ EOF
 [training.events]
 flush_every_steps = 1
 source_selection_every_steps = 16
-ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_every_epochs = $RULIAD_PROBE_EVERY_EPOCHS
 ruliad_correctness_probe_items = $RULIAD_PROBE_ITEMS
 ruliad_correctness_probe_tokens = $RULIAD_PROBE_TOKENS
+EOF
+  if [[ "$RULIAD_PROBE_BATCHING" != "inherit" \
+    || "$RULIAD_PROBE_MAX_BATCH_ROWS" != "inherit" \
+    || "$RULIAD_PROBE_MINIMUM_BATCH_ROWS" != "inherit" \
+    || "$RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN" != "inherit" \
+    || "$RULIAD_PROBE_DEVICE_BUFFER_TOKENS" != "inherit" ]]; then
+    {
+      echo
+      echo "[training.ruliad_probe_generation]"
+      if [[ "$RULIAD_PROBE_BATCHING" != "inherit" ]]; then
+        echo "enabled = $RULIAD_PROBE_BATCHING"
+      fi
+      if [[ "$RULIAD_PROBE_MAX_BATCH_ROWS" != "inherit" ]]; then
+        echo "max_batch_rows = $RULIAD_PROBE_MAX_BATCH_ROWS"
+      fi
+      if [[ "$RULIAD_PROBE_MINIMUM_BATCH_ROWS" != "inherit" ]]; then
+        echo "minimum_batch_rows = $RULIAD_PROBE_MINIMUM_BATCH_ROWS"
+      fi
+      if [[ "$RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN" != "inherit" ]]; then
+        echo "maximum_prompt_position_span = $RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN"
+      fi
+      if [[ "$RULIAD_PROBE_DEVICE_BUFFER_TOKENS" != "inherit" ]]; then
+        echo "device_buffer_tokens = $RULIAD_PROBE_DEVICE_BUFFER_TOKENS"
+      fi
+    } >> "$path"
+  fi
+  cat >> "$path" <<EOF
 
 [training.latent_reasoning]
 eval_step_sweep = $(csv_to_toml_array "$EVAL_STEPS_CSV")
@@ -682,6 +873,35 @@ jepa_start_after_steps = 0
 every_steps = $NEXTLAT_EVERY_STEPS
 start_after_steps = $NEXTLAT_START_AFTER
 EOF
+  if [[ "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" != "inherit" \
+    || "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" != "inherit" \
+    || "$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY" != "inherit" \
+    || "$RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS" != "inherit" \
+    || "$RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET" != "inherit" \
+    || "$RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH" != "inherit" ]]; then
+    {
+      echo
+      echo "[training.ruliad_policy_probe]"
+      if [[ "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" != "inherit" ]]; then
+        echo "every_epochs = $RULIAD_POLICY_PROBE_EVERY_EPOCHS"
+      fi
+      if [[ "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" != "inherit" ]]; then
+        echo "closed_loop_every_epochs = $RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS"
+      fi
+      if [[ "$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY" != "inherit" ]]; then
+        echo "candidate_symmetry = \"$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY\""
+      fi
+      if [[ "$RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS" != "inherit" ]]; then
+        echo "scoring_batch_rows = $RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS"
+      fi
+      if [[ "$RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET" != "inherit" ]]; then
+        echo "scoring_token_budget = $RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET"
+      fi
+      if [[ "$RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH" != "inherit" ]]; then
+        echo "scoring_pipeline_depth = $RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH"
+      fi
+    } >> "$path"
+  fi
   if [[ "$ENERGY_MODEL" != "inherit" || -n "$ENERGY_START_AFTER" || -n "$ENERGY_EVERY_STEPS" ]]; then
     {
       echo
@@ -818,15 +1038,24 @@ EOF
       echo "batch_prompts = $ROLLOUT_UNLIKELIHOOD_BATCH_PROMPTS"
     } >> "$path"
   fi
-  if [[ "$FIELD_BINDING_CONTRAST_WEIGHT" != "inherit" || "$FIELD_BINDING_CONTRAST_EVERY_STEPS" != "inherit" || "$FIELD_BINDING_CONTRAST_MARGIN" != "inherit" || "$FIELD_BINDING_CONTRAST_PAIR_WEIGHT" != "inherit" || "$FIELD_BINDING_CONTRAST_MAX_PAIRS" != "inherit" || "$FIELD_BINDING_CONTRAST_REPLAY_CAPACITY" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_CAPACITY" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MIN_COUNT" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MIN_DISTINCT" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MAX_DOMINANT" != "inherit" || "$VERIFIER_ROLLOUT_IMITATION_WEIGHT" != "inherit" || "$VERIFIER_ROLLOUT_RECOVERY_WEIGHT" != "inherit" || "$VERIFIER_ROLLOUT_EVERY_STEPS" != "inherit" || "$VERIFIER_ROLLOUT_START_AFTER" != "inherit" || "$VERIFIER_ROLLOUT_MIN_PARTIAL_PROGRESS_PPM" != "inherit" || "$VERIFIER_ROLLOUT_MIN_COMPLETION_QUALITY_PPM" != "inherit" || "$VERIFIER_ROLLOUT_MAX_ROWS_PER_STEP" != "inherit" ]]; then
+  if [[ "$VERIFIER_REWARD_ENABLED" != "inherit" || "$VERIFIER_REWARD_WEIGHT" != "inherit" || "$FIELD_BINDING_CONTRAST_WEIGHT" != "inherit" || "$FIELD_BINDING_CONTRAST_EVERY_STEPS" != "inherit" || "$FIELD_BINDING_CONTRAST_START_AFTER" != "inherit" || "$FIELD_BINDING_CONTRAST_MARGIN" != "inherit" || "$FIELD_BINDING_CONTRAST_PAIR_WEIGHT" != "inherit" || "$FIELD_BINDING_CONTRAST_MAX_PAIRS" != "inherit" || "$FIELD_BINDING_CONTRAST_REPLAY_CAPACITY" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_CAPACITY" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MIN_COUNT" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MIN_DISTINCT" != "inherit" || "$GENERATED_ATTRACTOR_REPLAY_MAX_DOMINANT" != "inherit" || "$VERIFIER_ROLLOUT_IMITATION_WEIGHT" != "inherit" || "$VERIFIER_ROLLOUT_RECOVERY_WEIGHT" != "inherit" || "$VERIFIER_ROLLOUT_EVERY_STEPS" != "inherit" || "$VERIFIER_ROLLOUT_START_AFTER" != "inherit" || "$VERIFIER_ROLLOUT_MIN_PARTIAL_PROGRESS_PPM" != "inherit" || "$VERIFIER_ROLLOUT_MIN_COMPLETION_QUALITY_PPM" != "inherit" || "$VERIFIER_ROLLOUT_MAX_ROWS_PER_STEP" != "inherit" ]]; then
     {
       echo
       echo "[training.ruliad_supervision.verifier_reward]"
+      if [[ "$VERIFIER_REWARD_ENABLED" != "inherit" ]]; then
+        echo "enabled = $VERIFIER_REWARD_ENABLED"
+      fi
+      if [[ "$VERIFIER_REWARD_WEIGHT" != "inherit" ]]; then
+        echo "weight = $VERIFIER_REWARD_WEIGHT"
+      fi
       if [[ "$FIELD_BINDING_CONTRAST_WEIGHT" != "inherit" ]]; then
         echo "field_binding_contrast_weight = $FIELD_BINDING_CONTRAST_WEIGHT"
       fi
       if [[ "$FIELD_BINDING_CONTRAST_EVERY_STEPS" != "inherit" ]]; then
         echo "field_binding_contrast_every_steps = $FIELD_BINDING_CONTRAST_EVERY_STEPS"
+      fi
+      if [[ "$FIELD_BINDING_CONTRAST_START_AFTER" != "inherit" ]]; then
+        echo "field_binding_contrast_start_after_steps = $FIELD_BINDING_CONTRAST_START_AFTER"
       fi
       if [[ "$FIELD_BINDING_CONTRAST_MARGIN" != "inherit" ]]; then
         echo "field_binding_contrast_margin = $FIELD_BINDING_CONTRAST_MARGIN"
@@ -970,10 +1199,13 @@ write_manifest() {
   "structured_recovery_schema_negative_count": $(json_bool_or_string "$STRUCTURED_RECOVERY_SCHEMA_NEGATIVE_COUNT"),
   "field_binding_contrast_weight": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_WEIGHT"),
   "field_binding_contrast_every_steps": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_EVERY_STEPS"),
+  "field_binding_contrast_start_after_steps": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_START_AFTER"),
   "field_binding_contrast_margin": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_MARGIN"),
   "field_binding_contrast_pair_weight": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_PAIR_WEIGHT"),
   "field_binding_contrast_max_pairs": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_MAX_PAIRS"),
   "field_binding_contrast_replay_capacity": $(json_bool_or_string "$FIELD_BINDING_CONTRAST_REPLAY_CAPACITY"),
+  "verifier_reward_enabled": $(json_bool_or_string "$VERIFIER_REWARD_ENABLED"),
+  "verifier_reward_weight": $(json_bool_or_string "$VERIFIER_REWARD_WEIGHT"),
   "generated_attractor_replay_capacity": $(json_bool_or_string "$GENERATED_ATTRACTOR_REPLAY_CAPACITY"),
   "generated_attractor_replay_min_count": $(json_bool_or_string "$GENERATED_ATTRACTOR_REPLAY_MIN_COUNT"),
   "generated_attractor_replay_max_candidates": $(json_bool_or_string "$GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES"),
@@ -1009,6 +1241,17 @@ write_manifest() {
   "nextlat_start_after_steps": $NEXTLAT_START_AFTER,
   "ruliad_probe_items": $RULIAD_PROBE_ITEMS,
   "ruliad_probe_tokens": $RULIAD_PROBE_TOKENS,
+  "ruliad_probe_batching": $(json_bool_or_string "$RULIAD_PROBE_BATCHING"),
+  "ruliad_probe_max_batch_rows": $(json_bool_or_string "$RULIAD_PROBE_MAX_BATCH_ROWS"),
+  "ruliad_probe_minimum_batch_rows": $(json_bool_or_string "$RULIAD_PROBE_MINIMUM_BATCH_ROWS"),
+  "ruliad_probe_maximum_prompt_position_span": $(json_bool_or_string "$RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN"),
+  "ruliad_probe_device_buffer_tokens": $(json_bool_or_string "$RULIAD_PROBE_DEVICE_BUFFER_TOKENS"),
+  "ruliad_policy_probe_every_epochs": $(json_bool_or_string "$RULIAD_POLICY_PROBE_EVERY_EPOCHS"),
+  "ruliad_policy_probe_closed_loop_every_epochs": $(json_bool_or_string "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS"),
+  "ruliad_policy_probe_candidate_symmetry": $(json_escape "$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY"),
+  "ruliad_policy_probe_scoring_batch_rows": $(json_bool_or_string "$RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS"),
+  "ruliad_policy_probe_scoring_token_budget": $(json_bool_or_string "$RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET"),
+  "ruliad_policy_probe_scoring_pipeline_depth": $(json_bool_or_string "$RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH"),
   "dynamics_enabled": $(json_bool_or_string "$DYNAMICS_ENABLED"),
   "backend": $(json_escape "$BACKEND"),
   "features": $(json_escape "$FEATURES"),
@@ -1054,7 +1297,7 @@ run_trial() {
   answer_denoise_weight_key="${ANSWER_DENOISING_WEIGHT//./p}"
   answer_denoise_prob_key="${ANSWER_DENOISING_PROBABILITY//./p}"
   local structured_recovery_key="srw${STRUCTURED_RECOVERY_WEIGHT//./p}e${STRUCTURED_RECOVERY_EVERY_STEPS}s${STRUCTURED_RECOVERY_START_AFTER}t${STRUCTURED_RECOVERY_MAX_COMPLETION_TOKENS}n${STRUCTURED_RECOVERY_NEGATIVE_COUNT}u${STRUCTURED_RECOVERY_TEMPLATE_NEGATIVE_COUNT}c${STRUCTURED_RECOVERY_SCHEMA_NEGATIVE_COUNT}"
-  local field_binding_key="fbw${FIELD_BINDING_CONTRAST_WEIGHT//./p}p${FIELD_BINDING_CONTRAST_PAIR_WEIGHT//./p}e${FIELD_BINDING_CONTRAST_EVERY_STEPS}m${FIELD_BINDING_CONTRAST_MAX_PAIRS}"
+  local field_binding_key="vre${VERIFIER_REWARD_ENABLED}vrw${VERIFIER_REWARD_WEIGHT//./p}w${FIELD_BINDING_CONTRAST_WEIGHT//./p}p${FIELD_BINDING_CONTRAST_PAIR_WEIGHT//./p}e${FIELD_BINDING_CONTRAST_EVERY_STEPS}s${FIELD_BINDING_CONTRAST_START_AFTER}m${FIELD_BINDING_CONTRAST_MAX_PAIRS}"
   local generated_attractor_key="gac${GENERATED_ATTRACTOR_REPLAY_CAPACITY}n${GENERATED_ATTRACTOR_REPLAY_MIN_COUNT}m${GENERATED_ATTRACTOR_REPLAY_MAX_CANDIDATES}d${GENERATED_ATTRACTOR_REPLAY_MIN_DISTINCT}q${GENERATED_ATTRACTOR_REPLAY_MAX_DOMINANT}"
   local verifier_rollout_imitation_key="${VERIFIER_ROLLOUT_IMITATION_WEIGHT//./p}"
   local verifier_rollout_recovery_key="${VERIFIER_ROLLOUT_RECOVERY_WEIGHT//./p}"
@@ -1070,7 +1313,7 @@ run_trial() {
     local rollout_target_entropy_key="${ROLLOUT_UNLIKELIHOOD_TARGET_ENTROPY_BITS//./p}"
     rollout_key="onw${rollout_weight_key}c${rollout_cycle_key}s${rollout_sequence_key}h${rollout_entropy_key}b${rollout_target_entropy_key}e${ROLLOUT_UNLIKELIHOOD_EVERY_STEPS}t${ROLLOUT_UNLIKELIHOOD_ROLLOUT_TOKENS}"
   fi
-  full_trial_key="latent-steps-ms${steps}-seed${seed}-i${MAX_ITERS}-b${BATCH_SIZE}-bs${BLOCK_SIZE}-l${N_LAYER}-e${N_EMBD}-h${N_HEAD}-z${LATENT_TOTAL}-ckpt${CHECKPOINT_INTERVAL_ITERS}-rs${RULIAD_SUPERVISION_MODE}m${RULIAD_MASK_HIGH_ENTROPY_SPANS}${answer_close_key}${answer_value_key}-ar${ANSWER_RANKING}w${answer_rank_key}-ad${ANSWER_DENOISING}w${answer_denoise_weight_key}p${answer_denoise_prob_key}-${structured_recovery_key}-${field_binding_key}-${generated_attractor_key}-${verifier_rollout_key}-ru${rollout_key}-${BACKEND}"
+  full_trial_key="latent-steps-ms${steps}-seed${seed}-i${MAX_ITERS}-b${BATCH_SIZE}-bs${BLOCK_SIZE}-l${N_LAYER}-e${N_EMBD}-h${N_HEAD}-z${LATENT_TOTAL}-ckpt${CHECKPOINT_INTERVAL_ITERS}-rs${RULIAD_SUPERVISION_MODE}m${RULIAD_MASK_HIGH_ENTROPY_SPANS}${answer_close_key}${answer_value_key}-pg${RULIAD_PROBE_BATCHING}r${RULIAD_PROBE_MAX_BATCH_ROWS}m${RULIAD_PROBE_MINIMUM_BATCH_ROWS}s${RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN}t${RULIAD_PROBE_DEVICE_BUFFER_TOKENS}-ppc${RULIAD_POLICY_PROBE_EVERY_EPOCHS}l${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS}-ppe${RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY}-ppr${RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS}t${RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET}d${RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH}-ar${ANSWER_RANKING}w${answer_rank_key}-ad${ANSWER_DENOISING}w${answer_denoise_weight_key}p${answer_denoise_prob_key}-${structured_recovery_key}-${field_binding_key}-${generated_attractor_key}-${verifier_rollout_key}-ru${rollout_key}-${BACKEND}"
   trial_digest="$(short_digest "$full_trial_key")"
   trial_key="latent-steps-ms${steps}-seed${seed}-i${MAX_ITERS}-b${BATCH_SIZE}-bs${BLOCK_SIZE}-l${N_LAYER}-e${N_EMBD}-h${N_HEAD}-z${LATENT_TOTAL}-cfg${trial_digest}-${BACKEND}"
   overlay="$OUT_DIR/overlays/${trial_key}.toml"
@@ -1103,7 +1346,7 @@ run_trial() {
     local gpu_pid=""
     if command -v nvidia-smi >/dev/null 2>&1; then
       nvidia-smi \
-        --query-gpu=timestamp,index,utilization.gpu,power.draw,memory.used,memory.total \
+        --query-gpu=timestamp,index,pstate,utilization.gpu,utilization.memory,power.draw,clocks.current.sm,temperature.gpu,memory.used,memory.total \
         --format=csv \
         -l "$GPU_TELEMETRY_SECONDS" > "$gpu_log" 2>/dev/null &
       gpu_pid="$!"
@@ -1139,7 +1382,7 @@ IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
 echo "latent reasoning max_steps ablation output: $OUT_DIR"
 echo "base_profile=$BASE_PROFILE"
 echo "shape: n_layer=$N_LAYER n_embd=$N_EMBD n_head=$N_HEAD latent_total=$LATENT_TOTAL block_size=$BLOCK_SIZE batch_size=$BATCH_SIZE energy_head=$ENERGY_HEAD residual_gate=$RESIDUAL_GATE residual_gate_init=$RESIDUAL_GATE_INIT normalize_steps=$NORMALIZE_STEPS step_decoder=$STEP_CONDITIONED_DECODER energy_model=$ENERGY_MODEL step_contract=$STEP_CONTRACT ruliad_mode=$RULIAD_SUPERVISION_MODE ruliad_mask_high_entropy=$RULIAD_MASK_HIGH_ENTROPY_SPANS ruliad_answer_close_stride=$RULIAD_ANSWER_CLOSE_MARKER_STRIDE ruliad_answer_close_weight=$RULIAD_ANSWER_CLOSE_MARKER_WEIGHT ruliad_answer_schema_weight=$RULIAD_ANSWER_SCHEMA_WEIGHT ruliad_answer_schema_start_weight=$RULIAD_ANSWER_SCHEMA_START_WEIGHT ruliad_answer_value_weight=$RULIAD_ANSWER_VALUE_WEIGHT answer_ranking=$ANSWER_RANKING answer_ranking_weight=$ANSWER_RANKING_WEIGHT answer_denoising=$ANSWER_DENOISING answer_denoising_weight=$ANSWER_DENOISING_WEIGHT rollout_unlikelihood=$ROLLOUT_UNLIKELIHOOD rollout_weight=$ROLLOUT_UNLIKELIHOOD_WEIGHT rollout_cycle_weight=$ROLLOUT_UNLIKELIHOOD_CYCLE_WEIGHT"
-echo "schedules: max_iters=$MAX_ITERS epochs=$EPOCHS checkpoint_interval=$CHECKPOINT_INTERVAL_ITERS jepa_every=$JEPA_EVERY_STEPS nextlat_every=$NEXTLAT_EVERY_STEPS nextlat_start=$NEXTLAT_START_AFTER energy_every=${ENERGY_EVERY_STEPS:-profile} energy_start=${ENERGY_START_AFTER:-profile} step_contract_every=${STEP_CONTRACT_EVERY_STEPS:-profile} step_contract_start=${STEP_CONTRACT_START_AFTER:-profile} step_contract_ce=${STEP_CONTRACT_CE_WEIGHT:-profile} step_contract_mono=${STEP_CONTRACT_MONOTONIC_CE_WEIGHT:-profile} step_contract_contract=${STEP_CONTRACT_CONTRACTIVE_WEIGHT:-profile} probe_items=$RULIAD_PROBE_ITEMS probe_tokens=$RULIAD_PROBE_TOKENS"
+echo "schedules: max_iters=$MAX_ITERS epochs=$EPOCHS checkpoint_interval=$CHECKPOINT_INTERVAL_ITERS jepa_every=$JEPA_EVERY_STEPS nextlat_every=$NEXTLAT_EVERY_STEPS nextlat_start=$NEXTLAT_START_AFTER energy_every=${ENERGY_EVERY_STEPS:-profile} energy_start=${ENERGY_START_AFTER:-profile} step_contract_every=${STEP_CONTRACT_EVERY_STEPS:-profile} step_contract_start=${STEP_CONTRACT_START_AFTER:-profile} step_contract_ce=${STEP_CONTRACT_CE_WEIGHT:-profile} step_contract_mono=${STEP_CONTRACT_MONOTONIC_CE_WEIGHT:-profile} step_contract_contract=${STEP_CONTRACT_CONTRACTIVE_WEIGHT:-profile} probe_every_epochs=$RULIAD_PROBE_EVERY_EPOCHS probe_items=$RULIAD_PROBE_ITEMS probe_tokens=$RULIAD_PROBE_TOKENS probe_batching=$RULIAD_PROBE_BATCHING probe_batch_rows=$RULIAD_PROBE_MAX_BATCH_ROWS probe_min_batch_rows=$RULIAD_PROBE_MINIMUM_BATCH_ROWS probe_max_position_span=$RULIAD_PROBE_MAXIMUM_PROMPT_POSITION_SPAN probe_device_buffer_tokens=$RULIAD_PROBE_DEVICE_BUFFER_TOKENS policy_probe_every_epochs=$RULIAD_POLICY_PROBE_EVERY_EPOCHS policy_probe_closed_loop_every_epochs=$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS policy_probe_symmetry=$RULIAD_POLICY_PROBE_CANDIDATE_SYMMETRY policy_probe_scoring_rows=$RULIAD_POLICY_PROBE_SCORING_BATCH_ROWS policy_probe_token_budget=$RULIAD_POLICY_PROBE_SCORING_TOKEN_BUDGET policy_probe_pipeline_depth=$RULIAD_POLICY_PROBE_SCORING_PIPELINE_DEPTH"
 echo "rollout schedule: every=$ROLLOUT_UNLIKELIHOOD_EVERY_STEPS prompt_tokens=$ROLLOUT_UNLIKELIHOOD_PROMPT_TOKENS rollout_tokens=$ROLLOUT_UNLIKELIHOOD_ROLLOUT_TOKENS history_tokens=$ROLLOUT_UNLIKELIHOOD_HISTORY_TOKENS batch_prompts=$ROLLOUT_UNLIKELIHOOD_BATCH_PROMPTS recovery_only=$ROLLOUT_UNLIKELIHOOD_RECOVERY_ONLY"
 echo "latent eval step sweep=$EVAL_STEPS_CSV"
 echo "RAM guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB dynamics=$DYNAMICS_ENABLED"

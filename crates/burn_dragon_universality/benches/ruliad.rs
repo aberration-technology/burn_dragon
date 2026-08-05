@@ -1,3 +1,10 @@
+use burn_dragon_universality::ruliad::formal::{
+    RuliadFormalGeneratorConfig, generate_formal_bundle,
+};
+use burn_dragon_universality::ruliad::{
+    DEFAULT_PROOF_ACTION_CANDIDATES, RuliadKernelLimits, RuliadProofPolicyState, encode_problem,
+    oracle_proof_action_set, replay_certificate,
+};
 use burn_dragon_universality::{
     OnlineRuliadCorpus, RuliadCorpusConfig, RuliadFamilyConfig, RuliadFamilyKind,
     RuliadFrontierSampler, RuliadSamplerCandidate, RuliadSamplerConfig, RuliadSerializationConfig,
@@ -20,6 +27,7 @@ fn ruliad_config() -> RuliadCorpusConfig {
             ..RuliadSerializationConfig::default()
         },
         tokenization: RuliadTokenizationConfig::default(),
+        formal_generalization: Default::default(),
         source_selection: RuliadSourceSelectionConfig::default(),
         families: vec![
             RuliadFamilyConfig {
@@ -66,6 +74,7 @@ fn sampler_candidates(count: usize) -> Vec<RuliadSamplerCandidate> {
             } else {
                 "multi_step_state".to_string()
             },
+            answer_contract: String::new(),
             difficulty_level: index % 4,
             params_hash: format!("{index:016x}"),
             prior: 1.0,
@@ -83,6 +92,23 @@ fn sampler_candidates(count: usize) -> Vec<RuliadSamplerCandidate> {
             capability_missing_ema: 0.0,
         })
         .collect()
+}
+
+fn reconstruct_prefix_through_action_menus(
+    problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+    certificate: &burn_dragon_universality::ruliad::RuliadProofCertificate,
+    step_index: usize,
+) -> RuliadProofPolicyState {
+    let mut state = RuliadProofPolicyState::new(problem);
+    for index in 0..step_index {
+        let actions =
+            oracle_proof_action_set(problem, certificate, index, DEFAULT_PROOF_ACTION_CANDIDATES)
+                .expect("proof action menu");
+        state
+            .apply(&actions, actions.selected_index)
+            .expect("apply oracle action");
+    }
+    state
 }
 
 fn bench_ruliad(c: &mut Criterion) {
@@ -135,6 +161,63 @@ fn bench_ruliad(c: &mut Criterion) {
     c.bench_function("ruliad/source_plan_1k", |b| {
         b.iter(|| plan_epoch_source_buckets(&buckets, &probabilities, 1_024, 1337, 0, 3))
     });
+
+    for (label, difficulty) in [("d0", 0), ("d32", 32), ("d256", 256)] {
+        let config = RuliadFormalGeneratorConfig::for_difficulty(difficulty);
+        let mut seed = 1_337u64;
+        c.bench_function(&format!("ruliad/r3_generate_{label}"), |b| {
+            b.iter(|| {
+                seed = seed.wrapping_add(1);
+                generate_formal_bundle(seed, config).expect("formal bundle")
+            })
+        });
+        let bundle = generate_formal_bundle(1_337, config).expect("formal bundle");
+        c.bench_function(&format!("ruliad/r3_replay_{label}"), |b| {
+            b.iter(|| {
+                replay_certificate(
+                    &bundle.problem,
+                    &bundle.certificate,
+                    RuliadKernelLimits::default(),
+                )
+            })
+        });
+        c.bench_function(&format!("ruliad/r3_encode_problem_{label}"), |b| {
+            b.iter(|| encode_problem(&bundle.problem).expect("compact problem"))
+        });
+        let step_index = bundle.certificate.step_count() / 2;
+        c.bench_function(&format!("ruliad/r3_action_menu_{label}"), |b| {
+            b.iter(|| {
+                oracle_proof_action_set(
+                    &bundle.problem,
+                    &bundle.certificate,
+                    step_index,
+                    DEFAULT_PROOF_ACTION_CANDIDATES,
+                )
+                .expect("proof action menu")
+            })
+        });
+        if difficulty <= 32 {
+            c.bench_function(&format!("ruliad/r3_prefix_direct_{label}"), |b| {
+                b.iter(|| {
+                    RuliadProofPolicyState::from_certificate_prefix(
+                        &bundle.problem,
+                        &bundle.certificate,
+                        step_index,
+                    )
+                    .expect("direct certificate prefix")
+                })
+            });
+            c.bench_function(&format!("ruliad/r3_prefix_action_menus_{label}"), |b| {
+                b.iter(|| {
+                    reconstruct_prefix_through_action_menus(
+                        &bundle.problem,
+                        &bundle.certificate,
+                        step_index,
+                    )
+                })
+            });
+        }
+    }
 }
 
 criterion_group!(benches, bench_ruliad);

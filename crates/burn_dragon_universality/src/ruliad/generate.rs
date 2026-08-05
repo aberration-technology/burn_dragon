@@ -301,6 +301,7 @@ mod tests {
                 ..RuliadSerializationConfig::default()
             },
             tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
             source_selection: crate::ruliad::config::RuliadSourceSelectionConfig::default(),
             families: default_ruliad_families(),
             proof_tasks: None,

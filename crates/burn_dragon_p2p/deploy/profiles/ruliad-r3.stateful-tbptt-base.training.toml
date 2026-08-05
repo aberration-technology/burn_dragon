@@ -1,0 +1,92 @@
+[dataset]
+cache_dir = "./cache/ruliad-r3-stateful-tbptt"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.stateful-tbptt.corpus.toml"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 272
+eos_id = 271
+
+[model]
+n_layer = 4
+n_embd = 128
+n_head = 4
+latent_total = 512
+dropout = 0.0
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+block_size = 512
+tbptt_chunk_size = 512
+tbptt_persist_across_steps = false
+sequence_batching = "streaming"
+batch_size = 32
+max_iters = 512
+checkpoint_interval_iters = 512
+log_frequency = 32
+seed = 1337
+
+[training.ruliad_supervision]
+mode = "trace_and_answer"
+mask_high_entropy_spans = true
+balance_trace_answer_mass = true
+
+[training.sequence_state_probe]
+enabled = true
+paired_batches = 8
+max_rho_slots = 64
+
+[training.ruliad_probe_generation]
+enabled = true
+max_batch_rows = 32
+# A one-row cohort still uses the device-buffered greedy decoder. This avoids
+# falling back to a host synchronization for every generated token.
+minimum_batch_rows = 1
+# The measured knee for the canonical formal panel: 32 under-batches while
+# 256 spends too many recurrent steps bridging prompt tails.
+maximum_prompt_position_span = 128
+# A 16/32/64/128 CUDA screen at this 128-token probe budget placed the
+# throughput knee at 64: fewer host synchronizations without decoding the
+# entire budget speculatively after an early stop.
+device_buffer_tokens = 64
+max_in_flight_rows = 32
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.gates]
+enabled = false
+
+[training.dynamics]
+enabled = false
+
+[training.events]
+flush_every_steps = 32
+source_selection_every_steps = 32
+continual_backprop_every_steps = 256
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 128
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 32
+ruliad_correctness_probe_tokens = 128
+source_weighted_validation_batches = 0
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0
+
+[generation]
+prompt = "[R2"
+max_tokens = 128
+temperature = 0.8

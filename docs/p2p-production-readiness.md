@@ -23,11 +23,11 @@ describe the public training network as adversarially production-ready.
 | --- | --- | --- |
 | revision identity | hardware-neutral signed contract, strict trust validation, atomic live rollout, and authority rotation tooling | execute the rotation and disaster-recovery drill against staging |
 | initial weights | signed full-head genesis, content-addressed artifact verification, and canonical decoded-tensor verification on native and browser loaders | clean-storage staging canary using the production artifact |
-| native training | one-shot/continuous windows, a protocol-aware managed trainer daemon, head reconcile, TBPTT state, capability downgrade/upgrade, exact three-peer candidate/root replay, and three-seed DiLoCo convergence parity | run a 24-hour restart and partition soak |
-| browser training | ArtifactWindows WebGPU AdamW and forward-only seeded-fitness paths, WASM/WebGPU compile, lease-scoped Firefox execution, clean no-WebGPU downgrade, and fail-closed DiLoCo selection | deployed Chrome/Pages/edge/WebGPU training canary against a signed ArtifactWindows production contract; implement browser DiLoCo before claiming mixed-protocol trainer parity |
-| compact updates | bounded seeded-fitness publication, deterministic reconstruction, authenticated lease recovery, and independent sampled fitness replay | untrusted multi-validator quorum and quarantine drill |
+| native training | one-shot/continuous windows, a protocol-aware managed trainer daemon, head reconcile, TBPTT state, capability downgrade/upgrade, exact three-peer candidate/root replay, corrected formal-Ruliad convergence parity, and three-seed DiLoCo parity | run a 24-hour restart and partition soak |
+| browser training | ArtifactWindows WebGPU AdamW and forward-only seeded-fitness paths, real Chrome/WebGPU generated NCA and formal-Ruliad windows, clean no-WebGPU downgrade, and fail-closed DiLoCo selection | deployed Pages/edge/WebGPU training canary against a signed production contract; implement browser DiLoCo before claiming mixed-protocol trainer parity |
+| compact updates | bounded seeded-fitness publication, deterministic reconstruction, authenticated lease recovery, independent sampled fitness replay, and a generation-bound context-sparse codec | untrusted multi-validator quorum and quarantine drill; activate routed-PC only after its local Ruliad quality gate |
 | capability policy | conservative preflight, persistent downgrade, revisioned live roles, memory-headroom re-probe, success hysteresis, and bounded backoff | device-loss/recreation drill on each supported GPU backend |
-| read-only peers | observer/verifier scopes, projections, and role replacement rather than stale-role union | public UI authorization drill |
+| read-only peers | observer/verifier scopes, projections, role replacement rather than stale-role union, retrospective diffusion evaluation, pre-promotion validator-quorum evaluation bound to the exact head/artifact/protocol/report, a real two-validator Ruliad quorum, a CUDA-trainer/CPU-validator promotion gate, and a concurrent 10M CUDA/CPU-peer duty stress | network-coupled large-model/WAN evaluator soak, untrusted disagreement/quarantine drill, and public UI authorization drill |
 | ECS integration | run-scoped lifecycle, capability, window, reconcile, and bounded ingress state | sustained multi-run ingress soak |
 | checkpoint scaling | deterministic GDN2 widening and versioned metadata | mixed-width network activation and rollback drill |
 | bandwidth | measured canonical payload sizes, topology simulations, networked DiLoCo, persistent outer SGD/momentum state, and FP32/FP16/int8 DiLoCo quality matrix | live WAN and heterogeneous native measurements; browser DiLoCo quality is not implemented |
@@ -36,6 +36,17 @@ Unit tests prove contract mechanics and deterministic behavior. The release
 matrix provides bounded local convergence evidence; it does not prove
 long-horizon convergence, Byzantine robustness, or acceptable production
 economics.
+
+The context-sparse codec is currently a protocol capability, not an advertised
+distributed learning mode. It signs the dynamic context family, slot,
+generation, and parameter catalog; native and browser builds share the same
+decoder and stale-generation rejection. Dragon's local routed fixed-prediction
+pipeline now checkpoints its context bank, optimizer moments, recurrent state,
+curriculum, and ECS gate state exactly. A three-seed 888,194-parameter CUDA
+control reaches convergence/retention parity with matched routed AdamW while
+retaining 78.3% throughput. A longer fixed-holdout Ruliad matrix, restart soak,
+and measured wire-volume comparison are still required before a revision may
+select this codec for decentralized training.
 
 ## one revision, heterogeneous execution
 
@@ -62,9 +73,77 @@ That contract permits:
 Every contribution remains bound to an exact revision, base head, window,
 lease, dataset view, and update codec.
 
+Read-only evaluation uses the same binding. The generic `burn_p2p` node API
+materializes a requested head, checks network/study/experiment and revision
+scope, evaluates the requested split, persists a content-addressed
+`HeadEvalReport` and `EvalProtocolManifest`, and announces the resulting metric
+cursor. In diffusion mode Dragon's validator daemon follows each newly
+promoted head once. In validator-quorum mode validators instead evaluate the
+merged candidate before promotion and attest to the exact head ID, artifact
+ID, protocol ID, and report ID. Trainer and reducer roles do not run this
+formal generation path.
+
+The backend-neutral contract is exercised end to end, not only by manifest
+comparison. An operator-invoked native gate starts a CUDA trainer and a CPU-only
+validator from distinct signed release artifacts, transfers a real Ruliad
+candidate through the swarm, evaluates it on the CPU peer, and promotes it with
+exact decoded-tensor equality. The candidate was 12,918,148 bytes and the
+content-addressed four-sample formal report was 2,595 JSON bytes. The report is
+loaded by its complete head/artifact/protocol/report binding and its identity is
+recomputed before the test passes. The CUDA window took 64.01 s in this tiny
+model gate because it includes first-use kernel compilation; it is a portability
+and protocol result, not a throughput claim. Network-coupled large-model duty
+and live-WAN latency remain separate release gates.
+
+A separate warm co-location stress ran the 10M-class release CUDA trainer while
+the complete CPU peer/validator quorum gate executed on the same unified-memory
+host. This is more contentious than the intended remote-validator placement
+because it also includes a CPU trainer. CUDA throughput changed from 28,391 to
+27,572 tokens/s (-2.89%), while sampled utilization remained continuously at
+95-96%, model duty was 95.38%, foreground loader wait was 0.0013%, and local
+validation remained zero. No sample fell below 80% utilization. This closes the
+local ECS/P2P scheduling-stall hypothesis; the small throughput cost is shared
+host-memory contention and does not substitute for a network-coupled WAN soak.
+
+Dragon's formal evaluator also passes a real quorum-two gate. One trainer
+published a 6,448,259-byte candidate to two read-only validators. The first
+validator emitted a reduction but could not promote. After the second
+independent evaluation, both peers converged on exactly one quorum certificate
+and one promoted head. The two 2,542-byte reports have distinct content IDs but
+bind the same head, artifact, and protocol; both cover four samples and agree on
+verifier accuracy, partial credit, answer-field accuracy, and completion
+quality. The promoted decoded-tensor digest equals the trainer candidate. This
+closes trusted local quorum mechanics, not malicious-validator quarantine.
+
 ## measured 1M convergence
 
-### Artifact-window baseline
+### Corrected formal-Ruliad artifact window
+
+The current signed release gate uses a 926,210-parameter Dragon, three native
+peers, two rounds, nine local steps per peer per round, and 54 aggregate
+peer-local steps. Ruliad fixed-document padding is target-masked and each peer
+receives a disjoint, nonempty, bounded stream-segment lease.
+
+| genesis | P2P final | synchronized final | P2P/synchronized progress | restart recovery |
+| ---: | ---: | ---: | ---: | ---: |
+| 5.718210 | 2.258732 | 1.930078 | 91.324% | 3.176 s |
+
+The synchronized reference consumes the same examples with the same 18
+optimizer updates and gradient accumulation three. P2P clears the hard 90%
+progress threshold. Every candidate tensor, promoted tensor, validation value,
+and merge result matches the independent oracle exactly. The signed revision,
+shared data/objective, disjoint lease, three-receipt merge, restart, and
+convergence gates all pass.
+
+The restart drill removes one trainer after round one, keeps it offline for two
+seconds, then recovers the same peer identity, canonical head, tensor digest,
+and validation loss in 3.176 seconds. The schema-6 report is
+`target/experiments/p2p-ruliad-parity/release-r2-s9-signed-restart/seed-1337.json`.
+
+This is a bounded local result. It does not establish long-duration stability,
+WAN behavior, heterogeneous-device parity, or adversarial robustness.
+
+### Historical artifact-window baseline
 
 The release-only parity harness trains a 926,210-parameter Dragon model with
 three native CPU peers. It uses two layers, embedding width 256, latent width
@@ -90,7 +169,12 @@ Both conditions start at validation loss 5.689760 and process 216 records. The
 nine-step condition is better in both learning progress and protocol duty.
 More frequent promotion did not recover the gap.
 
-This result has two distinct conclusions:
+These figures predate target-loss-mask propagation for fixed-size Ruliad
+documents. Repeated EOS fill was supervised, so they are retained only as
+historical protocol evidence and must not be used as current quality evidence.
+The artifact-window matrix needs a corrected-objective rerun.
+
+The historical result had two distinct conclusions:
 
 - transport, artifact publication, merge replay, and validation are exact;
   candidate and canonical tensors match the oracle every round
@@ -104,70 +188,86 @@ merge are identical.
 
 The report's default convergence promotion threshold is 90% of matched central
 progress. Set `BURN_DRAGON_P2P_PARITY_REQUIRE_CONVERGENCE=1` to make that
-threshold a hard test assertion. The current result fails that learning-quality
-gate, so the artifact-window AdamW protocol is not the production
+threshold a hard test assertion. Artifact-window AdamW is not the production
 continual-pretraining default.
 
 ### DiLoCo parity
 
-The protocol-aware DiLoCo path uses persistent outer SGD state, rotating
-reducers, content-addressed cohort commitments, a two-stage ready barrier, exact
-base-parameter checksums, and transport-decoded pseudo-gradients. The matched
-reference applies AdamW to gradients accumulated over the same three peer
-microbatches at each local-step index.
+The protocol-aware DiLoCo path uses persistent peer-local AdamW and scheduler
+records, outer SGD state, rotating reducers, content-addressed cohort
+commitments, a two-stage ready barrier, exact base-parameter checksums, and
+transport-decoded pseudo-gradients. The matched reference accumulates the same
+three peer microbatch gradients into each AdamW update.
 
-The release matrix uses four outer rounds, nine local AdamW steps per peer per
-round, batch size 4 per peer, and outer SGD learning rate 1.0 without momentum.
-Peer identities are deterministically derived from seed and role so lease
-partitioning and batch order remain fixed across conditions.
+The corrected matrix uses a 1,012,229-parameter random-scaffold model, six
+outer rounds, one local AdamW step per peer per round, batch size 4 per peer,
+and outer SGD learning rate 1.20 without momentum. Only 225,797 mutable values
+(22.31%) are synchronized. Fixed-document EOS fill is masked on native and
+browser paths. Each promoted run consumed 18 unique nonempty-supervision
+batches with no duplicates.
 
-| seed | genesis | P2P final | matched final | P2P/matched progress |
-| ---: | ---: | ---: | ---: | ---: |
-| 1337 | 5.710400 | 2.638148 | 2.585947 | 98.33% |
-| 1338 | 5.687529 | 2.534715 | 2.357901 | 94.69% |
-| 1339 | 5.670796 | 2.562618 | 2.457294 | 96.72% |
+| seed | genesis | P2P final | matched final | endpoint progress | trailing progress |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1337 | 5.677486 | 3.689056 | 3.568502 | 94.284% | 94.098% |
+| 1338 | 5.662974 | 3.655515 | 3.473025 | 91.667% | 91.635% |
+| 1339 | 5.676928 | 3.539646 | 3.385779 | 93.284% | 92.890% |
 
-Mean progress parity is 96.58%; the minimum seed clears the 90% promotion
-threshold. Across all 12 rounds, network parameters and aggregates exactly
-match the independent codec-aware protocol oracle, every peer applies the same
-parameter pack, all three contributions are committed, and hard DiLoCo request
-failures remain zero. The convergence assertion was enabled for every row, so a
-below-threshold seed could not emit a passing test result. Mean loopback
-network-round time is 8.53 seconds, mean compute duty is 76.4%, and aggregate
-peer-local throughput is 3.17 inner steps per network second.
+Mean endpoint parity is 93.08%; mean trailing parity is 92.87%; and the minimum
+seed clears the 90% promotion threshold. Across all 18 rounds, network
+parameters and aggregates exactly match the independent codec-aware protocol
+oracle, every peer applies the same parameter pack, all three contributions
+are committed, validation is monotonic, and hard DiLoCo request failures
+remain zero.
 
-The same-binary seed-1338 codec ablation used release executable SHA-256
-`2633d3dd42da98ae9bf89c5cbc3e1a1af960ff8a698ca3b7dba6a4b19a780aa6`:
+All three release-profile confirmations explicitly omitted the outer
+learning-rate environment override. Mean aggregate throughput was 1.031 peer
+inner steps per network second, and each condition completed in 71.19-72.64
+seconds. Native peers permit two established routes during simultaneous dial
+reconciliation; this removed the prior timeout-scale request stalls.
 
-| codec | local gradient payload | vs FP32 | P2P final | progress parity | network seconds |
+The matched three-seed codec matrix is:
+
+| codec | estimated wire payload/run | vs FP32 | mean P2P final | mean trailing progress | mean peer steps/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 44,458,080 | 100.0% | 2.534715 | 94.690% | 34.70 |
-| FP16 | 22,229,040 | 50.0% | 2.534802 | 94.687% | 34.42 |
-| blockwise int8/256 | 11,375,088 | 25.6% | 2.535125 | 94.677% | 33.45 |
+| FP32 | 21,676,512 | 100.0% | 3.628072 | 92.874% | 1.0312 |
+| FP16 | 10,838,256 | 50.0% | 3.628078 | 92.874% | 1.0138 |
 
-FP16 and int8 preserve the bounded-run learning trajectory while reducing
-payload. They do not improve loopback wall time because model compute and
-fixed control work dominate. WAN bandwidth/latency, mixed hardware, and longer
-training remain separate required measurements.
+FP16 preserves the bounded-run trajectory to a `+0.0000061` mean final-CE
+difference while halving payload. Loopback throughput is 1.69% lower because
+codec overhead is exposed when bandwidth is free, so FP16 is a bandwidth
+option rather than a local speed optimization. It remains opt-in pending a
+constrained real-network and browser measurement. WAN bandwidth/latency, mixed
+hardware, and longer training remain separate required measurements.
 
-The machine-readable reports for the final enforced matrix are under
-`target/test-artifacts/p2p-diloco-release-enforced-final-v2/`. Every report uses
-schema version 3, records the release build profile and ndarray CPU backend,
-contains 17 enforced gate assertions, and was produced by the executable above.
-The current-stack seed-1337 rerun independently reproduced `2.638148` P2P
-loss, `2.585947` synchronized loss, `98.329%` progress parity, all 17 passing
-gates, 108 peer-local inner updates, 3.030 aggregate inner steps per network
-second, and 59,277,440 estimated wire payload bytes excluding control
-overhead.
+A newer single-seed source-matched FP16 comparison separates the transport
+benefit of random scaffolds from absolute model quality:
+
+| model | total params | synchronized values | final P2P | synchronized final | trailing parity | wire bytes | wall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| dense | 926,210 | 926,210 | 3.260373 | 3.066923 | 92.767% | 44,458,080 | 24.657 s |
+| random scaffold rank 16 | 1,012,229 | 225,797 | 3.613970 | 3.495448 | 94.374% | 10,838,256 | 17.254 s |
+
+The scaffold reduces wire bytes by 75.62% and network wall time by 30.0% at
+fixed rounds. It has slightly better synchronized-progress parity but worse
+absolute loss. Compactness is therefore promoted as a bandwidth mechanism,
+not as an accuracy win.
+
+Machine-readable reports are under
+`target/test-artifacts/random-scaffold-diloco/masked-route2/` and
+`target/test-artifacts/random-scaffold-diloco/release-contract-final/`. The
+final release reports use schema version 5 and record the corrected objective,
+supervision fingerprints, dual-route native transport, release build profile,
+gates asserting the signed persistent optimizer/scheduler policies, and hard
+convergence assertions.
 
 ### Local transport and recovery gate
 
 The convergence matrix runs above the complete local protocol suites:
 
-- `burn_p2p_swarm`: 84 serial tests, including rendezvous registration,
+- `burn_p2p_swarm`: serial tests including rendezvous registration,
   Kademlia recovery, relay reservation, 192 KiB relayed transfer, direct-route
-  handoff, and post-transfer single-route reconciliation
-- `burn_p2p`: 266 serial tests, including DiLoCo cohort/reducer behavior,
+  handoff, and bounded connection reconciliation
+- `burn_p2p`: tests including DiLoCo cohort/reducer behavior,
   runtime restart, security-state restoration, diffusion, and control-plane
   projection
 - the four-peer rotating-reducer authority scenario passed eight consecutive
@@ -236,6 +336,36 @@ This is role and resource-fit recovery, not portable GPU hot-plug. Backend
 device loss/recreation still needs a staging drill for CUDA, ROCm, native WGPU,
 and browser WebGPU before claiming transparent hardware migration.
 
+The shipped native experiment manifest now grants `Validator` and `Evaluator`
+roles the `Validate` scope. In diffusion mode the validator daemon follows
+`LatestPromoted`, evaluates each exact head once, and retries failed
+evaluations without advancing its local evaluated-head cursor. This closes the
+former condition where a validator could join and serve artifacts but never
+produce model-quality reports.
+
+Validator-quorum mode is a separate promotion path. Dragon selects
+`microcohort_reduce_plus_validator_promotion`, advertises the configured
+quorum, and leaves formal generation off the trainer. Each validator
+materializes the candidate from a synchronized canonical base, runs the fixed
+formal panel, and emits a reduction certificate bound to the exact head,
+artifact, protocol, and report. Quorum observation verifies the visible
+backing reductions rather than trusting a coordinator-supplied ID list; report
+IDs must be distinct and authorized attesters must satisfy the configured
+quorum. Missing or mismatched evidence fails closed.
+
+The local Dragon gate trains one real Ruliad window, transfers the half-record
+artifact to a non-training validator, promotes it with quorum one, verifies the
+canonical decoded-tensor digest exactly, and resolves the attested report by
+its content ID. A generic two-validator native gate requires two distinct
+reports over the same head/artifact/protocol. A one-candidate weighted merge
+now returns the candidate exactly instead of recomputing
+`base + (candidate - base)`, which avoids cancellation and bit drift. JSON
+metric persistence enables exact floating-point round trips and verifies the
+canonical report identity before publication. The complete generic P2P library
+suite passes 241 tests with these contracts. Heterogeneous validators over a
+real WAN, quorum loss, disagreement, and adversarial authorization remain
+staging gates.
+
 ## native and browser coherence
 
 Native and browser execution share:
@@ -251,6 +381,13 @@ Native and browser execution share:
 The browser AdamW path uses WebGPU autodiff. The browser EGGROLL path uses a
 plain forward backend and does not retain reverse-mode graphs. Native
 validators reconstruct browser compact updates from the canonical base model.
+
+Generated NCA and generated formal Ruliad are shared browser/native source
+contracts. The real Chrome/WebGPU Ruliad gate checks formal-family metadata,
+the structured 272-token vocabulary, target masks, and stream/TBPTT behavior
+over two train and two evaluation batches. Browser AdamW aggregates detached
+scalar losses on the GPU and performs one asynchronous read at the window
+boundary rather than one synchronization per training step.
 
 Browser CPU remains a development smoke path, not a production trainer.
 
@@ -281,14 +418,13 @@ This matters for both correctness and multi-run hosting. Two Dragon pipelines
 in one process must not share rho state, optimizer state, scheduler cursor,
 checkpoint files, or event sinks merely because they use the same model type.
 
-The current artifact-window parity profile declares both optimizer and
-scheduler state as `reset_per_window`. This is implemented behavior, not merely
-metadata. No optimizer moments are silently transferred between peers or
-attached to the canonical head. It also means the current protocol cannot
-claim optimizer-state equivalence with centralized AdamW. A stateful protocol
-must choose and implement either peer-local state invalidated on reconcile,
-canonical optimizer artifacts, or an explicit outer optimizer such as
-DiLoCo/FedOpt; changing that choice creates a new signed training contract.
+The artifact-window parity profile declares optimizer and scheduler state as
+`reset_per_window`. The protocol-aware DiLoCo profile instead declares both as
+`peer_local_persistent`: records survive reconciliation on the same peer but
+are not transferred when that peer adopts another model. Both behaviors are
+implemented and bound into distinct signed training contracts. No optimizer
+moments are silently attached to a canonical head or transferred between
+peers.
 
 ## shard partition and capacity
 
@@ -403,17 +539,21 @@ The following bounded checks have passed on the current ARM development host.
 Unless explicitly identified as a learning matrix above, they are
 wiring/correctness evidence rather than convergence claims:
 
-- complete `burn_dragon_p2p` library suite: 72 tests
-- all 18 non-ignored native integration tests, including shard-backed NCA,
-  live-source Ruliad, mixed native/browser roles, persistence, and diffusion
-- strict native and WASM package Clippy for the P2P surfaces
-- real headless Chromium WebGPU execution of generated NCA browser training
-  from the WASM package
+- complete `burn_dragon_p2p` suite: 96 library tests, 18 native-CLI tests, and
+  19 non-ignored integration tests; 14 named release/scale tests remain
+  operator-invoked and ignored by default
+- native integration coverage includes shard-backed NCA, live-source Ruliad,
+  mixed native/browser roles, persistence, and diffusion
+- 158 `burn_dragon_universality` tests and 184 focused language Ruliad tests
+- strict native P2P, language-training, universality, xtask, and WASM package
+  Clippy for the exercised surfaces
+- real headless Chrome/WebGPU execution of generated NCA and generated formal
+  Ruliad browser training from the WASM package; both source tests pass
 - production Pages shell build with the WebGPU WASM bundle and auth callback
   routes
 - real Firefox WASM execution for lease-scoped shard selection
 - real Firefox no-WebGPU downgrade to a read-only role
-- signed three-peer restart recovery in 3.008 seconds with persistent peer
+- signed three-peer restart recovery in 3.176 seconds with persistent peer
   identity and exact head/tensor/validation recovery
 - strict signature, conflicting-contract, exact-artifact, decoded-tensor,
   lease, wrong-owner, batch-digest, unleased-record, and forged-fitness checks
@@ -421,14 +561,20 @@ wiring/correctness evidence rather than convergence claims:
   matrix in `burn_p2p_testkit`
 - non-ignored NCA and ClimbMix mixed-fleet smokes plus the explicit ignored
   medium rung
+- operator-invoked CUDA-trainer/CPU-validator Ruliad promotion with an exact
+  cross-backend tensor digest and content-addressed formal report
+- real Ruliad quorum-two promotion requiring distinct exact-head reports from
+  both read-only validators
 - deployment workflow contract checks and WebGPU WASM target check
 - strict 1M-parameter three-peer DiLoCo bulk exchange
-- three-seed, four-round release DiLoCo convergence parity
-- same-binary FP32/FP16/blockwise-int8 codec quality and payload ablation
+- corrected-objective three-seed, six-round DiLoCo convergence parity
+- matched FP32/FP16 random-scaffold codec quality and payload ablation
 
-The current Firefox runner did not expose WebGPU. Its successful downgrade is
-valid role/capability evidence, not a browser GPU training result. A deployed
-Chrome/WebGPU canary remains mandatory.
+The local Chrome result is a real browser GPU training result, but it uses the
+locally built WASM package and local source contracts. The current Firefox
+runner did not expose WebGPU; its successful downgrade remains valid
+role/capability evidence. A deployed Pages/edge Chrome/WebGPU canary against a
+signed production contract is still mandatory.
 
 The canonical 100M-parameter bandwidth ablation measured:
 
@@ -462,12 +608,14 @@ At minimum, expose per revision and peer class:
 - canonical head, speculative head, and lag
 - windows started/completed/failed and reconcile count
 - lease, data-fetch, compute, publication, validation, and promotion latency
+- evaluator head/revision, report/protocol IDs, sample count, and evaluation latency
 - artifact and update bytes
 - decoded norm, non-finite, clipping, and replay-verification status
 - tokens/samples processed and accepted
 - browser WebGPU availability and device-loss rate
 - auth denial, replay rejection, quarantine, and validator disagreement
 - Dragon loss, verifier accuracy, output degeneracy, and ruliad difficulty
+- trainer model duty and wall tokens/s, separated from evaluator compute duty
 
 Read-only metric peers should consume these projections without receiving
 `Train`, `Validate`, `Archive`, or `Admin` authority unless explicitly granted.

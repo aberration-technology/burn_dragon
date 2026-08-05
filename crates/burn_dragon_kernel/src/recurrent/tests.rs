@@ -2,8 +2,6 @@ use super::*;
 use burn::tensor::{Distribution, Tensor};
 use burn_autodiff::Autodiff;
 use burn_cubecl::cubecl::Runtime;
-#[cfg(feature = "cuda")]
-use burn_cuda::Cuda;
 use burn_wgpu::{CubeBackend, RuntimeOptions, graphics};
 
 type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
@@ -340,7 +338,7 @@ fn fused_recurrent_memory_stays_bounded_across_repeated_calls() {
 #[cfg(feature = "cuda")]
 #[test]
 fn recurrent_attention_supports_cuda_backend_types() {
-    type CudaBackend = Cuda<f32, i32>;
+    type CudaBackend = CudaCubeBackend;
     type CudaAutodiffBackend = Autodiff<CudaBackend>;
 
     assert!(supports_backend::<CudaBackend>());
@@ -350,7 +348,7 @@ fn recurrent_attention_supports_cuda_backend_types() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fused_recurrent_matches_reference_with_decay_on_cuda() {
-    type CudaBackend = Cuda<f32, i32>;
+    type CudaBackend = CudaCubeBackend;
 
     let device = burn::tensor::Device::<CudaBackend>::default();
     <CudaBackend as BackendTrait>::seed(&device, 7);
@@ -375,7 +373,7 @@ fn fused_recurrent_matches_reference_with_decay_on_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fused_recurrent_matches_reference_query_value_gradients_on_cuda_autodiff() {
-    type CudaBackend = Cuda<f32, i32>;
+    type CudaBackend = CudaCubeBackend;
     type CudaAutodiffBackend = Autodiff<CudaBackend>;
 
     let device = burn::tensor::Device::<CudaAutodiffBackend>::default();

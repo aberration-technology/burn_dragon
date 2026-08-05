@@ -963,6 +963,7 @@ pub fn generate_tokens<B: Backend>(
 /// Routed predictive coding has a distinct recurrent state and fixed neuron/activity masks for
 /// each context. Keeping this path explicit prevents verifier probes from accidentally evaluating
 /// the dense model while training updates only the selected subnetwork.
+#[cfg(any(feature = "train", test))]
 pub(crate) fn generate_greedy_tokens_with_subnetwork_masks<B: Backend>(
     model: &DragonModel<B>,
     prompt_tokens: Vec<i64>,

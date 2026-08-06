@@ -16,6 +16,11 @@ pub struct DatasetConfig {
     pub train_split_ratio: f32,
     #[serde(default)]
     pub validation: Option<ValidationDatasetConfig>,
+    /// Optional run-level override for live Ruliad curriculum feedback.
+    /// `false` produces an open-loop, seed-deterministic source stream for
+    /// controlled optimizer and training-algorithm comparisons.
+    #[serde(default)]
+    pub ruliad_source_selection_feedback_updates_enabled: Option<bool>,
     #[serde(flatten)]
     pub source: DatasetSourceConfig,
     #[serde(default)]

@@ -33,6 +33,7 @@ SEEDS_CSV="${BURN_DRAGON_PC_PAPER_SEEDS:-}"
 ITERS_CSV="${BURN_DRAGON_PC_PAPER_ITERS:-}"
 ARMS_CSV="${BURN_DRAGON_PC_PAPER_ARMS:-}"
 LOCAL_LEARNING_RATE="${BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE:-0.001}"
+SOURCE_SELECTION_FEEDBACK_UPDATES="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
 
 usage() {
   cat <<'USAGE'
@@ -41,7 +42,8 @@ Usage:
 
 Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
-                               local-factor | local-solver-promotion | local-solver-recurrent |
+                               local-factor | local-solver-promotion | local-solver-open-loop |
+                               local-solver-recurrent |
                                hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
@@ -66,6 +68,7 @@ Local-factor controls:
   BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING            auto | random | streaming
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE         true for recurrent matrices
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES  Default: 8
+  BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES    true | false | unset
 
 The runner isolates every trial under its own BURN_DRAGON_RUN_ROOT and writes
 one JSON manifest per trial. Raw checkpoints and metric events remain under
@@ -225,6 +228,25 @@ matrix_defaults() {
       : "${ITERS_CSV:=128,512}"
       : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_layer_prediction}"
       : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-solver-open-loop)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}" ]]; then
+        SOURCE_SELECTION_FEEDBACK_UPDATES=false
+      fi
       if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
         CHECKPOINT_INTERVAL_ITERS=512
       fi
@@ -523,8 +545,21 @@ write_overlay() {
   if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" ]]; then
     tbptt_persist_line="tbptt_persist_across_steps = true"
   fi
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+    if [[ "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "true" && "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
+      echo "BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES must be true or false" >&2
+      return 2
+    fi
+    cat > "$path" <<EOF
+[dataset]
+ruliad_source_selection_feedback_updates_enabled = $SOURCE_SELECTION_FEEDBACK_UPDATES
 
-  cat > "$path" <<EOF
+EOF
+  else
+    : > "$path"
+  fi
+
+  cat >> "$path" <<EOF
 [training]
 ${algorithm_line}
 batch_size = $batch_size
@@ -857,12 +892,16 @@ write_manifest() {
   local git_sha
   local git_branch
   local dirty
+  local source_feedback_json="null"
   git_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
   git_branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [[ -z "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
     dirty=false
   else
     dirty=true
+  fi
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+    source_feedback_json="$SOURCE_SELECTION_FEEDBACK_UPDATES"
   fi
   cat > "$manifest" <<EOF
 {
@@ -878,6 +917,7 @@ write_manifest() {
   "sequence_batching": $(json_escape "$SEQUENCE_BATCHING"),
   "sequence_state_probe": $SEQUENCE_STATE_PROBE,
   "sequence_state_probe_paired_batches": $SEQUENCE_STATE_PROBE_PAIRED_BATCHES,
+  "source_selection_feedback_updates_enabled": $source_feedback_json,
   "backend": $(json_escape "$BACKEND"),
   "features": $(json_escape "$FEATURES"),
   "profile": $(json_escape "$PROFILE"),
@@ -987,6 +1027,7 @@ echo "seeds=$SEEDS_CSV iters=$ITERS_CSV arms=$ARMS_CSV"
 echo "local_learning_rate=$LOCAL_LEARNING_RATE"
 echo "tbptt_chunk_size=$TBPTT_CHUNK_SIZE tbptt_persist_across_steps=$TBPTT_PERSIST_ACROSS_STEPS sequence_batching=$SEQUENCE_BATCHING"
 echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_PROBE_PAIRED_BATCHES"
+echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"
 echo "guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB timeout_seconds=$TIMEOUT_SECONDS"
 
 matrix_status=0

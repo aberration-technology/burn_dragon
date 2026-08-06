@@ -174,6 +174,7 @@ MANIFEST_COLUMNS = [
     "sequence_batching",
     "sequence_state_probe",
     "sequence_state_probe_paired_batches",
+    "source_selection_feedback_updates_enabled",
     "backend",
     "features",
     "profile",

@@ -38,12 +38,66 @@ pub struct SourceSelectedBatch {
     pub loss_masks: Option<Vec<Vec<i64>>>,
 }
 
+impl SourceSelectedBatch {
+    /// Stable content fingerprint for open-loop data-stream conformance checks.
+    /// This is intentionally computed only when requested, never on the loader
+    /// hot path.
+    pub fn fingerprint(&self) -> u64 {
+        source_selected_content_fingerprint(&self.windows, self.loss_masks.as_deref())
+    }
+}
+
 /// One source-selected TBPTT chunk and its logical-document boundary state.
 #[derive(Clone, Debug)]
 pub struct SourceSelectedStreamBatch {
     pub windows: Vec<Vec<u32>>,
     pub loss_masks: Option<Vec<Vec<i64>>>,
     pub document_complete: bool,
+}
+
+impl SourceSelectedStreamBatch {
+    /// Stable content fingerprint for one streamed TBPTT batch.
+    pub fn fingerprint(&self) -> u64 {
+        let mut fingerprint =
+            source_selected_content_fingerprint(&self.windows, self.loss_masks.as_deref());
+        fingerprint = fnv1a_u64(fingerprint, u64::from(self.document_complete));
+        fingerprint
+    }
+}
+
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_u64(mut state: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(FNV1A_PRIME);
+    }
+    state
+}
+
+fn source_selected_content_fingerprint(
+    windows: &[Vec<u32>],
+    loss_masks: Option<&[Vec<i64>]>,
+) -> u64 {
+    let mut state = fnv1a_u64(FNV1A_OFFSET_BASIS, windows.len() as u64);
+    for window in windows {
+        state = fnv1a_u64(state, window.len() as u64);
+        for &token in window {
+            state = fnv1a_u64(state, u64::from(token));
+        }
+    }
+    state = fnv1a_u64(state, u64::from(loss_masks.is_some()));
+    if let Some(loss_masks) = loss_masks {
+        state = fnv1a_u64(state, loss_masks.len() as u64);
+        for mask in loss_masks {
+            state = fnv1a_u64(state, mask.len() as u64);
+            for &value in mask {
+                state = fnv1a_u64(state, value as u64);
+            }
+        }
+    }
+    state
 }
 
 /// Abstraction over text corpora that can be converted into DragonModel-compatible batches.
@@ -3154,5 +3208,33 @@ mod random_loader_tests {
             vec![0, 0],
             "all chunks from one streamed logical document should use the same source-selection policy step"
         );
+    }
+
+    #[test]
+    fn source_selected_fingerprint_covers_tokens_masks_and_stream_boundary() {
+        let batch = SourceSelectedBatch {
+            windows: vec![vec![1, 2, 3], vec![4, 5, 6]],
+            loss_masks: Some(vec![vec![1, 1], vec![1, 0]]),
+        };
+        assert_eq!(batch.fingerprint(), batch.clone().fingerprint());
+
+        let mut changed_token = batch.clone();
+        changed_token.windows[1][2] = 7;
+        assert_ne!(batch.fingerprint(), changed_token.fingerprint());
+
+        let mut changed_mask = batch.clone();
+        changed_mask.loss_masks.as_mut().expect("mask")[1][1] = 1;
+        assert_ne!(batch.fingerprint(), changed_mask.fingerprint());
+
+        let complete = SourceSelectedStreamBatch {
+            windows: batch.windows.clone(),
+            loss_masks: batch.loss_masks.clone(),
+            document_complete: true,
+        };
+        let incomplete = SourceSelectedStreamBatch {
+            document_complete: false,
+            ..complete.clone()
+        };
+        assert_ne!(complete.fingerprint(), incomplete.fingerprint());
     }
 }

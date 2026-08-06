@@ -73,6 +73,11 @@ pub fn build_dataset(
                     training.source_selection_state_path.as_deref(),
                 )
             })
+            .map(|dataset| {
+                dataset.with_source_selection_feedback_updates_enabled(
+                    cfg.ruliad_source_selection_feedback_updates_enabled,
+                )
+            })
             .map(|dataset| dataset.with_ruliad_supervision(training.ruliad_supervision))
             .with_context(|| {
                 format!(
@@ -93,13 +98,16 @@ pub fn build_dataset(
             ds.train_split_ratio()
         ),
         Dataset::Universality(ds) => format!(
-            "Prepared {} {} from {} with batch_size={}, block_size={}, split_ratio={}{}",
+            "Prepared {} {} from {} with batch_size={}, block_size={}, split_ratio={}{}{}",
             ds.source_kind_label(),
             ds.dataset_name(),
             ds.source_path().display(),
             ds.batch_size(),
             ds.block_size(),
             ds.train_split_ratio(),
+            ds.source_selection_feedback_updates_enabled()
+                .map(|enabled| format!(", source_selection_feedback_updates={enabled}"))
+                .unwrap_or_default(),
             ds.train_probe_summary().map(|summary| format!(
                 ", train_docs={}, val_docs={}, doc_tokens={}, probe_mean_gzip={:.4}, probe_complexity={:.2}, runtime_doc_cache_limit={}",
                 summary.sample_count,

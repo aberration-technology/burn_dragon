@@ -2807,6 +2807,19 @@ impl TrainingConfig {
                 "training.source_selection_state_path requires dataset.type=\"universality_ruliad\""
             ));
         }
+        if self
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled
+            .is_some()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "dataset.ruliad_source_selection_feedback_updates_enabled requires dataset.type=\"universality_ruliad\""
+            ));
+        }
         if !(0.0 < self.dataset.train_split_ratio && self.dataset.train_split_ratio <= 1.0) {
             return Err(anyhow!(
                 "dataset.train_split_ratio must be in (0, 1] (got {})",
@@ -7715,6 +7728,35 @@ start_policy = "capability_gate"
         config
             .validate()
             .expect("ruliad source-selection state should validate");
+    }
+
+    #[test]
+    fn ruliad_source_feedback_override_requires_ruliad_dataset() {
+        let mut config = parse_config("");
+        config
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled = Some(false);
+        let err = config
+            .validate()
+            .expect_err("source-feedback override should reject non-ruliad datasets");
+        assert!(
+            err.to_string().contains("universality_ruliad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_source_feedback_override_validates_for_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled = Some(false);
+        config
+            .validate()
+            .expect("ruliad source-feedback override should validate");
     }
 
     #[test]

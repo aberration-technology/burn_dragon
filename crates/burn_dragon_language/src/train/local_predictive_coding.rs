@@ -1503,7 +1503,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::module::Module;
     use burn::optim::{AdamWConfig, Optimizer};
+    use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
     use burn::tensor::TensorData;
     use burn_autodiff::Autodiff;
     use burn_dragon_core::{DragonConfig, SequenceTrainingExecutor};
@@ -1552,6 +1554,24 @@ mod tests {
                 TensorData::new(vec![2_i64, 3, 1, 2, 3, 1, 2, 3], [2, 4]),
                 device,
             ),
+        )
+    }
+
+    fn batch_for_step(
+        device: &burn::tensor::Device<TestBackend>,
+        step: usize,
+    ) -> (Tensor<TestBackend, 2, Int>, Tensor<TestBackend, 2, Int>) {
+        let inputs = (0..8)
+            .map(|index| ((index * 3 + step * 5) % 15 + 1) as i64)
+            .collect::<Vec<_>>();
+        let targets = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, value)| ((value + index as i64 + 1) % 15) + 1)
+            .collect::<Vec<_>>();
+        (
+            Tensor::from_data(TensorData::new(inputs, [2, 4]), device),
+            Tensor::from_data(TensorData::new(targets, [2, 4]), device),
         )
     }
 
@@ -1630,6 +1650,78 @@ mod tests {
             (reported - expected).abs() < 1.0e-6,
             "reported={reported} expected={expected}"
         );
+    }
+
+    #[test]
+    fn fixed_prediction_tracks_backpropagation_across_optimizer_steps() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260806);
+        let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
+        let bytes = recorder
+            .record(model(&device).into_record(), ())
+            .expect("serialize shared initial model");
+        let mut backprop_model = model(&device).load_record(
+            recorder
+                .load(bytes.clone(), &device)
+                .expect("load backprop control"),
+        );
+        let mut fixed_model = model(&device).load_record(
+            recorder
+                .load(bytes, &device)
+                .expect("load fixed-prediction control"),
+        );
+        let initial_backprop_loss = loss(&backprop_model, &device);
+        let repeated_backprop_loss = loss(&backprop_model, &device);
+        let initial_fixed_loss = loss(&fixed_model, &device);
+        assert_eq!(
+            initial_backprop_loss, repeated_backprop_loss,
+            "the deterministic test model must have repeatable forwards"
+        );
+        assert_eq!(
+            initial_backprop_loss, initial_fixed_loss,
+            "serialized controls must start identically"
+        );
+        let mut backprop_optimizer =
+            AdamWConfig::new().init::<TestBackend, DragonModel<TestBackend>>();
+        let mut fixed_optimizer =
+            AdamWConfig::new().init::<TestBackend, DragonModel<TestBackend>>();
+        let config = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::FixedPrediction,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let profile = LocalPredictiveCodingProfile::default();
+        let learning_rate = 1.0e-3;
+
+        for step_index in 0..16 {
+            let (inputs, targets) = batch_for_step(&device, step_index);
+            let logits = backprop_model.forward(inputs.clone());
+            let training_loss = burn_dragon_core::objective::masked_token_mean(
+                backprop_model.language_token_losses_from_logits(logits, targets.clone()),
+                None,
+            );
+            let grads = GradientsParams::from_grads(training_loss.backward(), &backprop_model);
+            let fixed = local_predictive_coding_train_step(
+                &fixed_model,
+                inputs,
+                targets,
+                None,
+                &config,
+                &profile,
+            );
+            assert_eq!(fixed.report.global_backward_calls, 0);
+            backprop_model = backprop_optimizer.step(learning_rate, backprop_model, grads);
+            fixed_model = fixed_optimizer.step(learning_rate, fixed_model, fixed.grads);
+
+            let backprop_loss = loss(&backprop_model, &device);
+            let fixed_loss = loss(&fixed_model, &device);
+            assert!(
+                (backprop_loss - fixed_loss).abs() < 2.0e-4,
+                "optimizer trajectories diverged at step {step_index}: backprop={backprop_loss} fixed={fixed_loss}"
+            );
+        }
+
+        assert_eq!(profile.snapshot().steps, 16);
+        assert_eq!(profile.snapshot().global_backward_calls, 0);
     }
 
     #[test]

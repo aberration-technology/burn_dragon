@@ -144,9 +144,10 @@ fn parse_args() -> Result<Args> {
                     }
                     "reverse_gauss_seidel" => LocalPredictiveCodingSolver::ReverseGaussSeidel,
                     "fixed_prediction" => LocalPredictiveCodingSolver::FixedPrediction,
+                    "layer_local_prediction" => LocalPredictiveCodingSolver::LayerLocalPrediction,
                     value => {
                         return Err(anyhow!(
-                            "unsupported --solver {value}; expected synchronous_equilibrium, reverse_gauss_seidel, or fixed_prediction"
+                            "unsupported --solver {value}; expected synchronous_equilibrium, reverse_gauss_seidel, fixed_prediction, or layer_local_prediction"
                         ));
                     }
                 }
@@ -188,7 +189,7 @@ fn parse_args() -> Result<Args> {
             "--mask-period" => parsed.mask_period = parse_value(&mut args, "--mask-period")?,
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--solver <synchronous_equilibrium|reverse_gauss_seidel|fixed_prediction>] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
+                    "usage: cargo run -p burn_dragon_language --release --example pc_gradient_fidelity --features train[,cuda] -- --backend <cpu|cuda> [--solver <synchronous_equilibrium|reverse_gauss_seidel|fixed_prediction|layer_local_prediction>] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--vocab-size N] [--batch-size N] [--block-size N] [--inference-steps 1,2,4,8] [--step-sizes 0.01,0.05,0.1] [--max-grad-norm <N|none>] [--mask-period N]"
                 );
                 std::process::exit(0);
             }
@@ -298,7 +299,8 @@ where
                     .map(move |&step_size| Some((steps, step_size)))
             })
             .collect::<Vec<_>>(),
-        LocalPredictiveCodingSolver::FixedPrediction => vec![None],
+        LocalPredictiveCodingSolver::FixedPrediction
+        | LocalPredictiveCodingSolver::LayerLocalPrediction => vec![None],
     };
     let mut arms = Vec::with_capacity(settings.len());
     for setting in settings {
@@ -306,13 +308,22 @@ where
             solver: args.solver,
             ..LocalPredictiveCodingConfig::default()
         };
+        if matches!(
+            args.solver,
+            LocalPredictiveCodingSolver::LayerLocalPrediction
+        ) {
+            config.factor_reduction = burn_dragon_language::PredictiveCodingFactorReduction::Mean;
+        }
         if let Some((steps, step_size)) = setting {
             config.inference.steps = steps;
             config.inference.step_size = step_size;
         }
         let applied_max_grad_norm = setting.and(args.max_grad_norm);
         config.inference.max_grad_norm = applied_max_grad_norm;
-        config.sync_diagnostics = true;
+        config.sync_diagnostics = !matches!(
+            args.solver,
+            LocalPredictiveCodingSolver::LayerLocalPrediction
+        );
         let report = local_predictive_coding_gradient_fidelity(
             &model,
             batch.inputs.clone(),

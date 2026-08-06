@@ -8801,6 +8801,31 @@ fn emit_predictive_context_routing_metrics<B>(
             running_value: loss,
         });
     }
+    if let Some(loss) = decision.reserve_loss {
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string().into(),
+            split: TrainingMetricSplit::Train,
+            epoch,
+            step_in_epoch,
+            absolute_step,
+            name: "Predictive Context Reserve Loss".to_string(),
+            value: loss,
+            running_value: loss,
+        });
+    }
+    if let Some(supported) = decision.reserve_supported_novelty {
+        let value = f64::from(supported);
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string().into(),
+            split: TrainingMetricSplit::Train,
+            epoch,
+            step_in_epoch,
+            absolute_step,
+            name: "Predictive Context Reserve Supports Novelty".to_string(),
+            value,
+            running_value: value,
+        });
+    }
 }
 
 fn emit_predictive_coding_telemetry<B>(

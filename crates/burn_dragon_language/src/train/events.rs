@@ -144,6 +144,9 @@ fn local_predictive_coding_event_contract(
         LocalPredictiveCodingSolver::FixedPrediction => {
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
         }
+        LocalPredictiveCodingSolver::LayerLocalPrediction => {
+            ("local_layer_prediction_v1", "detached_layer_predictions")
+        }
     }
 }
 
@@ -642,6 +645,12 @@ mod tests {
         assert_eq!(
             local_predictive_coding_event_contract(LocalPredictiveCodingSolver::FixedPrediction),
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
+        );
+        assert_eq!(
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::LayerLocalPrediction
+            ),
+            ("local_layer_prediction_v1", "detached_layer_predictions")
         );
     }
 

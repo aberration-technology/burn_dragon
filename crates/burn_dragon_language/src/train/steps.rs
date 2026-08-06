@@ -13658,21 +13658,8 @@ mod objective_step_tests {
     }
 
     #[test]
-    fn local_predictive_coding_tbptt_carries_and_resets_rho_state() {
+    fn feedforward_local_pc_solvers_carry_and_reset_tbptt_rho_state() {
         let device = burn::tensor::Device::<TestBackend>::default();
-        let mut config = tiny_model_config();
-        config.n_layer = 2;
-        config.sequence_kernel =
-            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
-        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
-        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
-            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
-            .with_local_predictive_coding(LocalPredictiveCodingConfig {
-                solver: LocalPredictiveCodingSolver::FixedPrediction,
-                ..LocalPredictiveCodingConfig::default()
-            })
-            .with_tbptt_chunk_size(Some(2))
-            .with_tbptt_persist_across_steps(true);
         let batch = |reset_stream_state| SequenceBatch {
             inputs: Tensor::from_data(
                 TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
@@ -13688,33 +13675,65 @@ mod objective_step_tests {
             reset_stream_state,
         };
 
-        let first = burn_train::TrainStep::step(&model, batch(true));
-        assert_eq!(first.grads.len(), 9);
-        let first_state = model
-            .peek_step_state_for_test()
-            .expect("persistent local PC state after first step");
-        assert_eq!(first_state.position, 8);
-        assert!(first_state.layers.iter().all(|layer| layer.rho.is_some()));
+        for solver in [
+            LocalPredictiveCodingSolver::FixedPrediction,
+            LocalPredictiveCodingSolver::LayerLocalPrediction,
+        ] {
+            let mut model_config = tiny_model_config();
+            model_config.n_layer = 2;
+            model_config.sequence_kernel =
+                burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+            model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+            let factor_reduction =
+                if matches!(solver, LocalPredictiveCodingSolver::LayerLocalPrediction) {
+                    PredictiveCodingFactorReduction::Mean
+                } else {
+                    PredictiveCodingFactorReduction::Sum
+                };
+            let model =
+                LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+                    .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+                    .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                        solver,
+                        factor_reduction,
+                        ..LocalPredictiveCodingConfig::default()
+                    })
+                    .with_tbptt_chunk_size(Some(2))
+                    .with_tbptt_persist_across_steps(true);
 
-        let second = burn_train::TrainStep::step(&model, batch(false));
-        assert_eq!(second.grads.len(), 9);
-        assert_eq!(
-            model
+            let first = burn_train::TrainStep::step(&model, batch(true));
+            assert_eq!(first.grads.len(), 9, "solver={solver:?}");
+            let first_state = model
                 .peek_step_state_for_test()
-                .expect("persistent local PC state after second step")
-                .position,
-            16
-        );
+                .expect("persistent local PC state after first step");
+            assert_eq!(first_state.position, 8, "solver={solver:?}");
+            assert!(
+                first_state.layers.iter().all(|layer| layer.rho.is_some()),
+                "solver={solver:?}"
+            );
 
-        let reset = burn_train::TrainStep::step(&model, batch(true));
-        assert_eq!(reset.grads.len(), 9);
-        assert_eq!(
-            model
-                .peek_step_state_for_test()
-                .expect("reset local PC state")
-                .position,
-            8
-        );
+            let second = burn_train::TrainStep::step(&model, batch(false));
+            assert_eq!(second.grads.len(), 9, "solver={solver:?}");
+            assert_eq!(
+                model
+                    .peek_step_state_for_test()
+                    .expect("persistent local PC state after second step")
+                    .position,
+                16,
+                "solver={solver:?}"
+            );
+
+            let reset = burn_train::TrainStep::step(&model, batch(true));
+            assert_eq!(reset.grads.len(), 9, "solver={solver:?}");
+            assert_eq!(
+                model
+                    .peek_step_state_for_test()
+                    .expect("reset local PC state")
+                    .position,
+                8,
+                "solver={solver:?}"
+            );
+        }
     }
 
     #[test]

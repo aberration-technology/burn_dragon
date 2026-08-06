@@ -1,0 +1,4 @@
+[training.local_predictive_coding]
+solver = "layer_local_prediction"
+factor_reduction = "mean"
+sync_diagnostics = false

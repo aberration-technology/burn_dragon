@@ -8,8 +8,8 @@ active_fraction = 0.25
 [training.predictive_context_routing.bank]
 max_contexts = 8
 minimum_observations = 8
-calibration_update_rate = 0.1
-novelty_standard_deviations = 4.0
+calibration_update_rate = 0.5
+novelty_standard_deviations = 3.0
 novelty_absolute_margin = 0.25
 minimum_loss_scale = 0.05
-capacity_policy = "replace_least_recently_used"
+capacity_policy = "reject"

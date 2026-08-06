@@ -69,6 +69,8 @@ pub struct DragonPredictiveCodingInitialVjp<B: Backend> {
 #[derive(Debug, Clone)]
 pub struct DragonPredictiveCodingHeadVjp<B: Backend> {
     pub loss: Tensor<B, 1>,
+    /// Masked negative log likelihood before reduction, shaped `[batch, time]`.
+    pub masked_token_losses: Tensor<B, 2>,
     pub grad_hidden: Tensor<B, 3>,
     pub grad_lm_head: Tensor<B, 2>,
     /// Raw number of supervised tokens before denominator clamping. This lets
@@ -1029,7 +1031,9 @@ where
         );
         let supervised_tokens = mask.clone().sum();
         let denominator = supervised_tokens.clone().clamp_min(1.0);
-        let loss = (selected.mul_scalar(-1.0) * mask.clone())
+        let masked_token_losses = selected.mul_scalar(-1.0) * mask.clone();
+        let loss = masked_token_losses
+            .clone()
             .sum()
             .div(denominator.clone())
             .reshape([1]);
@@ -1048,6 +1052,7 @@ where
 
         DragonPredictiveCodingHeadVjp {
             loss,
+            masked_token_losses,
             grad_hidden,
             grad_lm_head,
             supervised_tokens: supervised_tokens.reshape([1]),

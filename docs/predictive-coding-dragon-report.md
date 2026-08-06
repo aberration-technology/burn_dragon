@@ -1,22 +1,78 @@
 # Predictive Coding in Dragon Training
 
-Date: 2026-08-05
+Date: 2026-08-06
 
 ## Status
 
-This document records two separate mechanisms: canonical layer-local predictive coding and the
-older recurrent-state correction auxiliary. AdamW remains the default training algorithm. Plain
-prospective layer-local PC still trails AdamW quality and throughput; fixed prediction reaches
-backpropagation-equivalent convergence without a global backward call but is slower. Exact local
-factors now accept detached recurrent rho state and run through the production TBPTT state path.
+This document records canonical local predictive-coding solvers and the older recurrent-state
+correction auxiliary as separate mechanisms. AdamW backpropagation remains the default training
+algorithm. Fixed prediction reaches backpropagation-equivalent convergence without a global
+backward call but is slower. The new depth-batched layer-local prediction solver is substantially
+more sample efficient than matched terminal-loss backpropagation on a bounded non-ceiling modular
+stream while retaining 95-97% throughput. It is not a terminal-gradient approximation, and its
+positive result requires sparse context routing plus context-scoped optimizer state.
 
-The current positive continual-learning result belongs to a complementary system, not the PC
-derivative alone. Task-ID-free context selection, balanced sparse routing, and context-scoped
-optimizer state nearly eliminate forgetting for both backpropagation and fixed-prediction PC. That
-controlled result is recorded below; production and Ruliad promotion remain open.
-The family-aware selector used by the original result has now been replaced in the follow-up
-benchmark by causal predictive-loss discovery with sequential novelty confirmation. That result is
-also controlled benchmark evidence, not yet an automatic production Ruliad router.
+The continual-learning result remains a complementary-system result. Task-ID-free context
+selection, balanced sparse routing, and context-scoped optimizer state are responsible for
+retention; layer-local prediction improves acquisition inside that system. A dense shared-state
+control forgets more under the same local derivative. Production and Ruliad promotion remain open.
+
+## 2026-08-06 depth-batched layer-local prediction
+
+`solver = "layer_local_prediction"` attaches a next-token factor to every shared Dragon layer use.
+Intermediate activities are detached. Layer depth is folded into the batch axis, producing one
+batched head VJP, one batched shared-body VJP, and one embedding VJP per update. Shared-body credit
+is summed over the physical uses of Dragon's shared weights; the shared readout is averaged over
+the auxiliary local readouts. The terminal loss and supervised-token count remain exactly the
+ordinary masked terminal cross entropy. Recurrent rho continuation is the ordinary feed-forward
+terminal state, so TBPTT does not carry transient inferred activities.
+
+The full 891,266-parameter CUDA geometry reports terminal-loss error below `5e-7`, gradient norm
+ratio `1.012`, and global cosine `0.6222` against terminal backpropagation. The modest cosine is
+expected: this is a layer-local semi-gradient with direct supervised factors, not an approximation
+to the terminal derivative. A small CPU geometry reaches cosine `0.9531`, showing that similarity
+depends on depth and operating point. The implementation makes zero global backward calls.
+
+The release-CUDA continual matrix uses four shared layer uses, embedding 96, four heads, latent
+width 3,072, batch 16, block 16, modulus 32, four sequential recurrence tasks, four holdout batches,
+and paired seeds 17/29/43/59/71. Train and holdout initial conditions are disjoint. Both learners use
+learning rate `0.003`, the same model initialization, token stream, sparse masks, and context-scoped
+optimizer lifecycle. Intervals are two-sided paired or per-arm 95% Student-t intervals.
+
+| Updates/task | Learner | Acq | Final accuracy | Mean forgetting | Tokens/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | AdamW backprop | 5/5 | 0.4952 +/- 0.1037 | 0.0198 +/- 0.0225 | 23,843 +/- 590 |
+| 128 | Layer-local PC | 5/5 | **0.7692 +/- 0.0626** | 0.0175 +/- 0.0232 | 22,758 +/- 275 |
+| 256 | AdamW backprop | 5/5 | 0.7241 +/- 0.1348 | 0.0102 +/- 0.0159 | 23,242 +/- 485 |
+| 256 | Layer-local PC | 5/5 | **0.9876 +/- 0.0107** | 0.0043 +/- 0.0038 | 22,495 +/- 691 |
+
+At 128 updates, the paired layer-local accuracy delta is `+0.2740 +/- 0.0627`; at 256 it is
+`+0.2635 +/- 0.1363`. Every paired seed has the same positive direction. Forgetting differences
+cross zero at both budgets. Layer-local PC retains 95.5% and 96.8% of backpropagation throughput,
+respectively, while making three local VJP launches per update and no global backward call.
+
+The dense shared-state control prevents an intrinsic-PC claim. At 128 updates, dense AdamW and
+dense layer-local PC reach `0.2786` and `0.2956` accuracy, a paired delta of only
+`+0.0170 +/- 0.0603`. Layer-local mean forgetting is worse (`0.9296` versus `0.5318`). Sparse
+context isolation is therefore part of the successful training system rather than an optional
+evaluation convenience.
+
+Long-budget testing exposed and resolved a selector failure. A fixed sequential novelty threshold
+eventually treated a stationary hard sample as a new task; conservative calibration avoided that
+false positive but under-discovered contexts at the shorter budget. The router now evaluates one
+deterministic unallocated reserve subnetwork only after every existing expert rejects a prefix. A
+new context is confirmed only if that reserve is within the best expert's calibrated loss scale.
+With the responsive calibration, both 128- and 256-update five-seed matrices discover exactly four
+contexts with selector accuracy 1.0 and no duplicate allocation. Rejected reserve tests update the
+selected expert's calibration, and the production probe does not materialize checkpoint state.
+Automatic least-recently-used replacement is no longer the default because a full bank has no true
+unallocated control.
+
+The machine-readable result is
+`docs/experiments/predictive-coding-layer-local-20260806.json`. Raw reports are under
+`target/pc-layer-local-20260806/`. This is strong bounded structured-recurrence evidence, not a
+state-of-the-art claim. Text/Ruliad fixed-holdout convergence, longer context churn, larger models,
+TBPTT quality, and decentralized synchronization remain required promotion gates.
 
 ## 2026-08-04 Lifelong Context-Routing Result
 
@@ -133,10 +189,10 @@ The first context-selector follow-up also failed: a generic token-transition has
 provide a stable novelty margin. That negative result is retained as evidence against fixed random
 descriptors, but it has been superseded by the causal predictive-loss selector described below.
 
-**Decision:** the supported local-PC solver surface remains synchronous equilibrium,
-reverse-Gauss-Seidel, and fixed prediction. Fixed prediction is the numerical/convergence control;
-the other two are research controls. No tested PC derivative beats matched backpropagation on both
-quality and throughput, and there is no state-of-the-art claim.
+**Decision at the time of this screen:** the supported local-PC solver surface was synchronous
+equilibrium, reverse-Gauss-Seidel, and fixed prediction. Fixed prediction was the
+numerical/convergence control; the other two were research controls. The 2026-08-06 section records
+the later layer-local solver and supersedes this historical surface decision.
 
 Raw feedback-screen reports are under `target/pc-feedback-screen-20260805/`.
 

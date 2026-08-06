@@ -30,6 +30,8 @@ SUMMARY_COLUMNS = [
     "seed",
     "wall_s",
     "tok_s",
+    "model_tok_s",
+    "model_duty_fraction",
     "train_first",
     "train_last",
     "valid_last",
@@ -44,6 +46,7 @@ SUMMARY_COLUMNS = [
     "pc_ms_mean",
     "pc_corrected_fraction",
     "source_loss",
+    "source_loss_cadence_mean",
     "source_mean_difficulty",
     "source_norm_difficulty",
     "verifier_failures",
@@ -84,6 +87,8 @@ EVENT_SUMMARY_COLUMNS = [
     "stream_carry_nll_gain_last",
     "stream_carry_relative_gain_last",
     "source_loss_last",
+    "source_loss_cadence_mean",
+    "source_loss_observations",
     "source_entropy_bits_last",
     "source_mean_difficulty_last",
     "source_norm_difficulty_last",
@@ -523,6 +528,13 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
 
 
 def update_source(summary: dict[str, Any], event: dict[str, Any]) -> None:
+    loss = as_float(event.get("loss"))
+    if loss is not None:
+        absolute_step = as_int(event.get("absolute_step"))
+        if absolute_step is None:
+            summary["_source_loss_unkeyed"].append(loss)
+        else:
+            summary["_source_loss_by_step"][absolute_step] = loss
     fields = {
         "source_loss_last": "loss",
         "source_entropy_bits_last": "entropy_bits",
@@ -551,6 +563,8 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["pc_global_backward_calls_total"] = 0
     summary["pc_local_vjp_calls_total"] = 0
     summary["_pc_ms_values"] = []
+    summary["_source_loss_by_step"] = {}
+    summary["_source_loss_unkeyed"] = []
     return summary
 
 
@@ -659,6 +673,12 @@ def collect_event_summaries(
     for summary in summaries.values():
         pc_values = summary.pop("_pc_ms_values", [])
         summary["pc_ms_mean"] = stats(pc_values).mean if pc_values else ""
+        source_loss_values = list(summary.pop("_source_loss_by_step", {}).values())
+        source_loss_values.extend(summary.pop("_source_loss_unkeyed", []))
+        summary["source_loss_cadence_mean"] = (
+            stats(source_loss_values).mean if source_loss_values else ""
+        )
+        summary["source_loss_observations"] = len(source_loss_values)
         manifest = manifest_by_run.get(summary["run"])
         if manifest:
             for key in (
@@ -708,6 +728,8 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 "wall_s": as_float(event.get("training_wall_seconds"))
                 or as_float(event.get("elapsed_seconds")),
                 "tok_s": as_float(event.get("wall_tokens_per_second")),
+                "model_tok_s": as_float(event.get("model_tokens_per_second")),
+                "model_duty_fraction": as_float(event.get("model_duty_fraction")),
                 "train_first": as_float(event.get("train_loss_first")),
                 "train_last": as_float(event.get("train_loss_last")),
                 "valid_last": as_float(event.get("valid_loss_last")),
@@ -730,6 +752,9 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 ),
                 "pc_ms_mean": as_float(event.get("pc_ms_mean")),
                 "source_loss": as_float(event.get("source_loss_last")),
+                "source_loss_cadence_mean": as_float(
+                    event.get("source_loss_cadence_mean")
+                ),
                 "source_mean_difficulty": as_float(
                     event.get("source_mean_difficulty_last")
                 ),
@@ -932,6 +957,8 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     metrics = [
         "wall_s",
         "tok_s",
+        "model_tok_s",
+        "model_duty_fraction",
         "train_last",
         "valid_last",
         "valid_mean",
@@ -942,6 +969,7 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "stream_carry_nll_gain",
         "stream_carry_relative_gain",
         "source_loss",
+        "source_loss_cadence_mean",
         "source_mean_difficulty",
         "source_norm_difficulty",
         "ruliad_verifier_accuracy",
@@ -980,9 +1008,12 @@ def paired_deltas(rows: list[dict[str, Any]], baseline: str, compare: str) -> li
         "stream_carry_nll_gain",
         "stream_carry_relative_gain",
         "source_loss",
+        "source_loss_cadence_mean",
         "train_last",
         "wall_s",
         "tok_s",
+        "model_tok_s",
+        "model_duty_fraction",
         "ruliad_verifier_accuracy",
         "ruliad_partial_progress",
         "capability_allowed_max_difficulty",
@@ -1032,14 +1063,14 @@ def write_markdown(
     lines.append("## Fixed-Token Summary")
     lines.append("")
     lines.append(
-        "| Iters | Arm | Runs | Seeds | Cold valid | Stream warm | Validation objective | Verifier acc | Partial progress | Tok/s | PC ms |"
+        "| Iters | Arm | Runs | Seeds | Cold valid | Stream warm | Validation objective | Source cadence | Verifier acc | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
     )
     lines.append(
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for row in summary_rows:
         lines.append(
-            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {warm} | {objective} | {verifier} | {partial} | {tok} | {pc} |".format(
+            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {warm} | {objective} | {source} | {verifier} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
                 iters=row.get("iters", ""),
                 arm=row.get("arm", ""),
                 runs=row.get("runs", ""),
@@ -1047,9 +1078,12 @@ def write_markdown(
                 valid=fmt_mean_ci(row, "valid_mean"),
                 warm=fmt_mean_ci(row, "stream_warm_loss"),
                 objective=fmt_mean_ci(row, "validation_objective_loss"),
+                source=fmt_mean_ci(row, "source_loss_cadence_mean"),
                 verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
                 partial=fmt_mean_ci(row, "ruliad_partial_progress"),
                 tok=fmt_mean_ci(row, "tok_s"),
+                model_tok=fmt_mean_ci(row, "model_tok_s"),
+                duty=fmt_mean_ci(row, "model_duty_fraction"),
                 pc=fmt_mean_ci(row, "pc_ms_mean"),
             )
         )
@@ -1183,6 +1217,8 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
             for metric in [
                 "wall_s",
                 "tok_s",
+                "model_tok_s",
+                "model_duty_fraction",
                 "train_last",
                 "valid_last",
                 "valid_mean",
@@ -1193,6 +1229,7 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
                 "stream_carry_nll_gain",
                 "stream_carry_relative_gain",
                 "source_loss",
+                "source_loss_cadence_mean",
                 "source_mean_difficulty",
                 "source_norm_difficulty",
                 "ruliad_verifier_accuracy",
@@ -1314,6 +1351,24 @@ def self_test() -> None:
                     "run_id": "run-a",
                     "absolute_step": 4,
                     "loss": 0.6,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "source_selection",
+                    "run_id": "run-a",
+                    "absolute_step": 3,
+                    "loss": 0.4,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "source_selection",
+                    "run_id": "run-a",
+                    "absolute_step": 4,
+                    "loss": 0.6,
                     "entropy_bits": 3.0,
                     "mean_difficulty_level": 5.0,
                     "normalized_difficulty_score": 0.5,
@@ -1410,10 +1465,14 @@ def self_test() -> None:
         assert event_rows[0]["trial_key"] == "pc-smoke-run-a"
         assert event_rows[0]["arm"] == "adamwpc"
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
+        assert event_rows[0]["model_tokens_per_second"] == "640.0"
+        assert event_rows[0]["model_duty_fraction"] == "0.8"
         assert event_rows[0]["valid_loss_mean"] == "0.45"
         assert event_rows[0]["stream_warm_loss_mean"] == "0.55"
         assert event_rows[0]["validation_objective_loss_last"] == "0.55"
         assert event_rows[0]["source_loss_last"] == "0.6"
+        assert event_rows[0]["source_loss_cadence_mean"] == "0.5"
+        assert event_rows[0]["source_loss_observations"] == "2"
         assert event_rows[0]["source_capability_allowed_max_difficulty_last"] == "5.0"
         assert event_rows[0]["pc_learning_contract_last"] == "local_factor_vjp_v1"
         assert event_rows[0]["pc_global_autodiff_graph_last"] == "False"
@@ -1422,6 +1481,9 @@ def self_test() -> None:
         normalized = list(csv.DictReader((out / "normalized_summary.csv").open()))
         event_normalized = next(row for row in normalized if row["run"] == "run-a")
         assert event_normalized["tok_s"] == "512.0"
+        assert event_normalized["model_tok_s"] == "640.0"
+        assert event_normalized["model_duty_fraction"] == "0.8"
+        assert event_normalized["source_loss_cadence_mean"] == "0.5"
         assert event_normalized["ruliad_verifier_accuracy"] == "0.25"
         assert event_normalized["ruliad_partial_progress"] == "0.5"
         coverage = list(csv.DictReader((out / "source_capability_coverage.csv").open()))

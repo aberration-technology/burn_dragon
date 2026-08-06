@@ -458,6 +458,48 @@ where
     Some((shape, grad_projected))
 }
 
+fn relu_lowrank_linearized_output_from_activation<B: BackendTrait>(
+    input: &BurnTensor<B, 4>,
+    weight: &BurnTensor<B, 4>,
+    activation: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<(LowrankProjectionShape, BurnTensor<B, 4>)>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let shape =
+        LowrankProjectionShape::from_tensors(input, weight, 0.0, None, grad_input_executor)?;
+    let output_shape = [shape.batch, shape.heads, shape.time, shape.latent];
+    if shape.weight_batch != 1
+        || activation.shape().dims::<4>() != output_shape
+        || grad_output.shape().dims::<4>() != output_shape
+    {
+        return None;
+    }
+    if let Some(mask) = sparse_mask.as_ref() {
+        let [mask_batch, mask_heads, mask_time, mask_latent] = mask.shape().dims::<4>();
+        if mask_batch != 1
+            || (mask_heads != 1 && mask_heads != shape.heads)
+            || mask_time != 1
+            || mask_latent != shape.latent
+        {
+            return None;
+        }
+    }
+
+    // The retained activation is post-threshold, post-ReLU, and post-mask.
+    // Its non-zero support recovers the ReLU derivative wherever the mask can
+    // contribute a gradient. Multiplying by the original mask then preserves
+    // non-binary and signed mask derivatives; a zero mask needs no support.
+    let mut grad_projected = grad_output * activation.not_equal_elem(0.0).float();
+    if let Some(mask) = sparse_mask {
+        grad_projected = grad_projected * mask;
+    }
+    Some((shape, grad_projected))
+}
+
 fn relu_lowrank_grad_input_from_projected<B: BackendTrait>(
     grad_projected: &BurnTensor<B, 4>,
     weight: &BurnTensor<B, 4>,
@@ -578,6 +620,37 @@ where
     ))
 }
 
+/// Plain-backend projection-input VJP using a retained forward activation.
+///
+/// This avoids recomputing `input * weight` merely to recover the ReLU
+/// derivative mask. `activation` must be the exact post-ReLU, post-mask output
+/// produced by the corresponding forward projection.
+pub fn relu_lowrank_input_vjp_from_activation<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+    activation: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<BurnTensor<B, 4>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (shape, grad_projected) = relu_lowrank_linearized_output_from_activation(
+        &input,
+        &weight,
+        activation,
+        grad_output,
+        sparse_mask,
+        grad_input_executor,
+    )?;
+    Some(relu_lowrank_grad_input_from_projected(
+        &grad_projected,
+        &weight,
+        shape,
+    ))
+}
+
 pub fn relu_lowrank_vjp<B: BackendTrait>(
     input: BurnTensor<B, 4>,
     weight: BurnTensor<B, 4>,
@@ -599,6 +672,39 @@ where
     )?;
     let grad_input = relu_lowrank_grad_input_from_projected(&grad_projected, &weight, shape);
 
+    let grad_weight = relu_lowrank_grad_weight_from_projected(input, grad_projected, shape);
+
+    Some(ReluLowrankVjp {
+        grad_input,
+        grad_weight,
+    })
+}
+
+/// Plain-backend input and weight VJP using a retained forward activation.
+///
+/// This is numerically equivalent to [`relu_lowrank_vjp`] when `activation`
+/// comes from the matching forward projection, while removing the redundant
+/// projection used only to reconstruct ReLU support.
+pub fn relu_lowrank_vjp_from_activation<B: BackendTrait>(
+    input: BurnTensor<B, 4>,
+    weight: BurnTensor<B, 4>,
+    activation: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    sparse_mask: Option<BurnTensor<B, 4>>,
+    grad_input_executor: LowrankGradInputExecutor,
+) -> Option<ReluLowrankVjp<B>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (shape, grad_projected) = relu_lowrank_linearized_output_from_activation(
+        &input,
+        &weight,
+        activation,
+        grad_output,
+        sparse_mask,
+        grad_input_executor,
+    )?;
+    let grad_input = relu_lowrank_grad_input_from_projected(&grad_projected, &weight, shape);
     let grad_weight = relu_lowrank_grad_weight_from_projected(input, grad_projected, shape);
 
     Some(ReluLowrankVjp {

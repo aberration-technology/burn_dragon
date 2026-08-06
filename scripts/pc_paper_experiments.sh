@@ -43,7 +43,7 @@ Usage:
 Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
                                local-factor | local-solver-promotion | local-solver-open-loop |
-                               local-solver-recurrent |
+                               local-solver-recurrent | local-solver-recurrent-open-loop |
                                hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
@@ -257,14 +257,26 @@ matrix_defaults() {
         TIMEOUT_SECONDS=1800
       fi
       ;;
-    local-solver-recurrent)
+    local-solver-recurrent|local-solver-recurrent-open-loop)
       : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
       : "${SEEDS_CSV:=20260804,20260805,20260806}"
-      : "${ITERS_CSV:=128}"
-      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_layer_prediction}"
+      if [[ "$MATRIX" == "local-solver-recurrent-open-loop" ]]; then
+        : "${ITERS_CSV:=128,512}"
+        : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction}"
+        if [[ -z "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}" ]]; then
+          SOURCE_SELECTION_FEEDBACK_UPDATES=false
+        fi
+      else
+        : "${ITERS_CSV:=128}"
+        : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_layer_prediction}"
+      fi
       : "${BATCH_SIZE:=32}"
       if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
-        CHECKPOINT_INTERVAL_ITERS=128
+        if [[ "$MATRIX" == "local-solver-recurrent-open-loop" ]]; then
+          CHECKPOINT_INTERVAL_ITERS=512
+        else
+          CHECKPOINT_INTERVAL_ITERS=128
+        fi
       fi
       if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
         TBPTT_CHUNK_SIZE=8

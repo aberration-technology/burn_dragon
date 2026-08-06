@@ -6,13 +6,16 @@ Date: 2026-08-06
 
 This document records canonical local predictive-coding solvers and the older recurrent-state
 correction auxiliary as separate mechanisms. AdamW backpropagation remains the default training
-algorithm. Fixed prediction reaches backpropagation-equivalent convergence without a global
-backward call. It matches bounded three-seed text and Ruliad terminal cross entropy under both
-stateless and document-contiguous recurrent training, but remains slower: about 62% of AdamW
-throughput when stateless and 94% when eight-token recurrent factors amortize the local VJPs.
-The previously reported Ruliad selector-feedback loss difference came from a closed-loop
-curriculum and did not isolate the learner. A matched open-loop matrix removes that difference but
-still establishes only objective parity, not a general quality promotion. The depth-batched
+algorithm. Fixed prediction reaches bounded held-out parity without a global backward call. It
+matches three-seed text and Ruliad terminal cross entropy under both stateless and
+document-contiguous recurrent training, but remains slower: about 62% of AdamW throughput when
+stateless and 96% in the matched open-loop matrix when eight-token recurrent factors amortize the
+local VJPs. The recurrent control also exposes a higher observed-stream training loss despite
+held-out parity, so this is not optimization-trajectory parity.
+The previously reported stateless Ruliad selector-feedback loss difference came from a closed-loop
+curriculum and did not isolate the learner. The matched stateless open-loop matrix removes that
+difference but still establishes only held-out parity, not a general quality promotion. The
+depth-batched
 layer-local prediction solver is substantially more sample efficient on a bounded modular stream,
 but its direct intermediate token supervision does not transfer to text or Ruliad. It remains an
 experimental routed-recurrence result, not a general pretraining candidate.
@@ -23,7 +26,7 @@ retention; layer-local prediction improves acquisition inside that system. A den
 control forgets more under the same local derivative. AdamW remains the production default because
 neither local solver has established a quality or long-horizon continual-learning advantage.
 
-## 2026-08-06 open-loop solver control
+## 2026-08-06 stateless open-loop solver control
 
 The live Ruliad selector is intentionally a closed-loop controller: losses and verifier feedback
 change subsequent source probabilities. That is useful for training, but it invalidates a paired
@@ -74,6 +77,60 @@ The machine-readable record is
 
 ```bash
 scripts/pc_paper_experiments.sh --matrix local-solver-open-loop
+```
+
+## 2026-08-06 trace-aware recurrent open-loop control
+
+The fixed-prediction reverse wave now consumes the exact post-threshold, post-ReLU, post-mask
+projection activations retained in each Dragon layer trace. It no longer recomputes the x and y
+low-rank projections merely to recover derivative support. The kernel API preserves the existing
+single-weight-batch restriction and remains equivalent for binary, fractional, and signed masks;
+an NdArray test compares both input and weight VJPs against projection recomputation. On the
+937,154-parameter release-CUDA fidelity geometry, the optimized path is unchanged: loss error is
+zero, global gradient cosine is `0.9999999878`, norm ratio is `0.99999669`, relative L2 error is
+`2.007e-4`, and the solver makes zero global backward calls.
+
+A same-seed 512-update stateless A/B screen moved wall throughput from 43,304 to 43,371 tokens/s
+and model-compute throughput from 49,832 to 49,992 tokens/s (`+0.15%` and `+0.32%`). Local-learning
+time fell from 42.084 s to 41.950 s. This single-seed change is directionally consistent with
+removing redundant projections, but is too small to resolve from run variance by itself.
+
+The matched recurrent matrix uses the same 891,266-parameter model as the stateless control,
+batch 32, block 128, streaming document batches, persistent detached rho, and eight-token TBPTT
+factors. AdamW and fixed prediction run for 128 and 512 updates over seeds 20260804/5/6. Source
+selection feedback, continual backpropagation, neuron scaling, and dynamics controllers are
+disabled. The source-selector checkpoint digest is byte-identical across all six trials at each
+budget (`82dab4ac...dfbe` at 128 and `b9685bde...1c08` at 512), establishing the same open-loop
+curriculum state.
+
+| Updates | Learner | Cold validation | Stream warm | Source cadence loss | Verifier | Partial progress | Wall tok/s | Model tok/s | Duty |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | AdamW backprop | 2.294 +/- 0.0866 | 1.329 +/- 0.0799 | 2.655 +/- 0.0733 | 0.1979 +/- 0.1950 | 0.3628 +/- 0.2150 | 12,001 +/- 326 | 13,684 +/- 355 | 0.8771 +/- 0.0011 |
+| 128 | Fixed prediction | 2.343 +/- 0.0655 | 1.354 +/- 0.0745 | 2.873 +/- 0.0791 | 0.1146 +/- 0.1616 | 0.4106 +/- 0.0727 | 11,458 +/- 367 | 13,223 +/- 336 | 0.8666 +/- 0.0083 |
+| 512 | AdamW backprop | 2.111 +/- 0.1312 | 1.111 +/- 0.0778 | 1.154 +/- 0.0420 | 0.3229 +/- 0.0448 | 0.4505 +/- 0.0553 | 13,018 +/- 40 | 13,844 +/- 46 | 0.9404 +/- 0.0006 |
+| 512 | Fixed prediction | 2.115 +/- 0.0917 | 1.109 +/- 0.0309 | 1.346 +/- 0.0316 | 0.2604 +/- 0.2372 | 0.3811 +/- 0.2299 | 12,505 +/- 194 | 13,406 +/- 241 | 0.9327 +/- 0.0024 |
+
+At 512 updates, fixed prediction minus AdamW is `+0.00452 +/- 0.06357` cold validation,
+`-0.00213 +/- 0.07297` stream-warm validation, `+0.00056 +/- 0.00926` rho-carry NLL gain,
+`-0.0625 +/- 0.2054` verifier accuracy, and `-0.06944 +/- 0.21548` partial progress. None resolves
+a held-out quality or carry difference. Fixed prediction retains `96.05% +/- 1.20%` wall
+throughput and `96.84% +/- 1.42%` model-compute throughput. Its mean GPU utilization and power are
+71.2% and 36.1 W versus AdamW's 77.1% and 38.2 W on this GB10.
+
+The observed training stream does differ. Fixed prediction's cadence-mean source loss is
+`+0.19167 +/- 0.06022` above AdamW, and its final train loss is `+0.24016 +/- 0.04769`; the gap is
+present over all 32 cadence observations rather than only the final sample. This is not caused by
+source-selection feedback, and it does not appear on the fixed or stream-warm holdouts. It may be
+implicit regularization or weaker fitting of the sampled stream, but there is no verifier gain to
+support the former interpretation. The defensible result is therefore held-out and rho-carry
+parity at near-throughput parity, not a stronger optimizer. AdamW remains the default.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-recurrent-open-loop-20260806.json`. Raw artifacts are under
+`target/pc-local-solver-recurrent-open-loop-20260806/`. Reproduce with:
+
+```bash
+scripts/pc_paper_experiments.sh --matrix local-solver-recurrent-open-loop
 ```
 
 ## 2026-08-06 depth-batched layer-local prediction
@@ -1176,9 +1233,9 @@ Supported by current evidence:
    result without a family-specific descriptor.
 10. Exact local-PC factors carry detached linear-attention rho through TBPTT and match the
     corresponding stateful autodiff/numerical contracts.
-11. Fixed-prediction local VJPs match bounded three-seed AdamW convergence on fixed-holdout text
-    and Ruliad data without a global autodiff graph; recurrent eight-token factors retain about
-    94% of AdamW throughput.
+11. Fixed-prediction local VJPs match bounded three-seed AdamW held-out loss on text and Ruliad
+    data without a global autodiff graph; matched open-loop recurrent eight-token factors retain
+    about 96% of AdamW throughput, although their observed-stream training loss remains higher.
 12. Matched byte-text and Ruliad continuation probes show positive rho carry gain under both AdamW
     and fixed-prediction learning; neither paired carry-gain delta resolves a solver difference.
 13. Direct layer-local next-token supervision does not transfer to general text or Ruliad in the

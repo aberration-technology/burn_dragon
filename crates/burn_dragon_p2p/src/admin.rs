@@ -2,7 +2,10 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use burn_p2p::{ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadDescriptor, HeadId};
+use burn_p2p::{
+    ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadDescriptor, HeadId,
+    directory_revision_contract_matches,
+};
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
 #[cfg(feature = "native")]
 use burn_p2p_publish::{PeerArtifactMirrorRequest, PeerArtifactMirrorResponse};
@@ -63,6 +66,7 @@ pub fn preserve_directory_entry_current_head(
             entry.study_id == replacement.study_id
                 && entry.experiment_id == replacement.experiment_id
                 && entry.current_revision_id == replacement.current_revision_id
+                && directory_revision_contract_matches(entry, replacement)
         })
         .and_then(|entry| entry.current_head_id.clone())?;
     replacement.current_head_id = Some(current_head_id.clone());
@@ -322,6 +326,19 @@ mod tests {
         existing.current_head_id = Some(HeadId::new("head-1"));
         existing.current_revision_id = RevisionId::new("old-revision");
         let mut replacement = sample_entry();
+
+        let preserved = preserve_directory_entry_current_head(&[existing], &mut replacement);
+
+        assert!(preserved.is_none());
+        assert!(replacement.current_head_id.is_none());
+    }
+
+    #[test]
+    fn preserve_directory_entry_current_head_rejects_revision_contract_collision() {
+        let mut existing = sample_entry();
+        existing.current_head_id = Some(HeadId::new("head-1"));
+        let mut replacement = sample_entry();
+        replacement.model_schema_hash = ContentId::new("new-schema");
 
         let preserved = preserve_directory_entry_current_head(&[existing], &mut replacement);
 

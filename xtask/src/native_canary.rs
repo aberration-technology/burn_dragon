@@ -64,10 +64,9 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
-    let initialize_head_on_start = head_before.get("head_id").and_then(Value::as_str).is_none()
-        || is_deferred_unbacked_preflight_head(head_provider_before.as_ref());
-    let replace_unbacked_preflight_head =
-        is_deferred_unbacked_preflight_head(head_provider_before.as_ref());
+    let head_start_policy = canary_head_start_policy(head_provider_before.as_ref());
+    let initialize_head_on_start = head_start_policy.allow_initialization;
+    let replace_unbacked_preflight_head = head_start_policy.replace_preflight_head;
 
     enroll_static_principal(
         &config,
@@ -95,7 +94,6 @@ pub fn run() -> Result<()> {
             &validator_bundle,
             &validator_storage,
             &config.artifact_dir.join("validator.log"),
-            initialize_head_on_start,
         )?);
     }
 
@@ -549,7 +547,6 @@ fn start_validator(
     auth_bundle: &Path,
     storage_root: &Path,
     log_path: &Path,
-    initialize_head_on_start: bool,
 ) -> Result<Child> {
     let mut command = vec![
         config.binary.clone(),
@@ -567,7 +564,7 @@ fn start_validator(
         "--validation-interval-millis".to_owned(),
         "500".to_owned(),
         "--initialize-head-on-start".to_owned(),
-        initialize_head_on_start.to_string(),
+        "false".to_owned(),
         "--restore-head-on-start".to_owned(),
         "true".to_owned(),
     ];
@@ -1089,6 +1086,21 @@ fn is_deferred_unbacked_preflight_head(signal: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanaryHeadStartPolicy {
+    allow_initialization: bool,
+    replace_preflight_head: bool,
+}
+
+fn canary_head_start_policy(head_provider_signal: Option<&Value>) -> CanaryHeadStartPolicy {
+    CanaryHeadStartPolicy {
+        // Canary trainers use a fresh storage root. Sync remains preferred, but
+        // incompatibility or unavailability must be allowed to create a new root.
+        allow_initialization: true,
+        replace_preflight_head: is_deferred_unbacked_preflight_head(head_provider_signal),
+    }
+}
+
 fn restore_head_on_start(replace_unbacked_preflight_head: bool, window_index: usize) -> bool {
     !(replace_unbacked_preflight_head && window_index == 0)
 }
@@ -1431,6 +1443,31 @@ mod tests {
         assert!(is_deferred_unbacked_preflight_head(Some(&signal)));
         assert!(!is_deferred_unbacked_preflight_head(Some(&ordinary_signal)));
         assert!(!is_deferred_unbacked_preflight_head(None));
+    }
+
+    #[test]
+    fn fresh_canary_trainer_can_fallback_from_any_unrestorable_head() {
+        let edge_backed = json!({
+            "edge_provider": true,
+        });
+        let deferred = json!({
+            "deferred_unbacked_preflight_head": true,
+        });
+
+        assert_eq!(
+            canary_head_start_policy(Some(&edge_backed)),
+            CanaryHeadStartPolicy {
+                allow_initialization: true,
+                replace_preflight_head: false,
+            }
+        );
+        assert_eq!(
+            canary_head_start_policy(Some(&deferred)),
+            CanaryHeadStartPolicy {
+                allow_initialization: true,
+                replace_preflight_head: true,
+            }
+        );
     }
 
     #[test]

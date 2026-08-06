@@ -68,7 +68,7 @@ use burn_p2p::{
     ExperimentScope, HeadAnnouncement, HeadDescriptor, HeadId, HeadPromotionMode,
     LiveControlPlaneEvent, MetricValue, NativeControlPlaneShell, NetworkId, PeerId, PeerRole,
     PeerRoleSet, PrincipalId, ProtocolSet, RuntimeStatus, RuntimeTransportPolicy, SwarmAddress,
-    TrainingProtocolStepOutcome,
+    TrainingProtocolStepOutcome, directory_revision_contract_matches,
 };
 use burn_p2p_admin::AdminResult;
 use burn_p2p_core::operator_visible_last_error;
@@ -882,7 +882,7 @@ struct RunValidatorDaemonArgs {
     status_interval_secs: u64,
     #[arg(long, default_value_t = DEFAULT_VALIDATION_INTERVAL_MILLIS)]
     validation_interval_millis: u64,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     initialize_head_on_start: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     restore_head_on_start: bool,
@@ -945,6 +945,7 @@ struct AdminRolloutReport {
     preserved_current_head_id: Option<String>,
     recovered_current_head_id: Option<String>,
     reset_current_head_id: Option<String>,
+    revision_contract_changed: bool,
     directory_entries: usize,
     result: AdminResult,
 }
@@ -1571,15 +1572,26 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         .context("failed to build async runtime for admin rollout")?;
     let mut directory_entries =
         runtime.block_on(fetch_signed_directory_entries(&edge_base_url, &session_id))?;
-    let preserved_current_head_id = if args.reset_current_head_to_visible_root {
-        None
-    } else {
-        preserve_directory_entry_current_head(&directory_entries, &mut replacement)
-    };
+    let revision_contract_changed = directory_entries
+        .iter()
+        .find(|entry| {
+            entry.study_id == replacement.study_id
+                && entry.experiment_id == replacement.experiment_id
+                && entry.current_revision_id == replacement.current_revision_id
+        })
+        .is_some_and(|existing| !directory_revision_contract_matches(existing, &replacement));
+    let preserved_current_head_id =
+        if args.reset_current_head_to_visible_root || revision_contract_changed {
+            None
+        } else {
+            preserve_directory_entry_current_head(&directory_entries, &mut replacement)
+        };
     let mut recovered_current_head_id = None;
     let mut reset_current_head_id = None;
-    if args.reset_current_head_to_visible_root
-        || (replacement.current_head_id.is_none() && args.recover_current_head_from_visible_root)
+    if !revision_contract_changed
+        && (args.reset_current_head_to_visible_root
+            || (replacement.current_head_id.is_none()
+                && args.recover_current_head_from_visible_root))
     {
         let snapshot = runtime.block_on(fetch_edge_snapshot(&edge_base_url))?;
         let recovered =
@@ -1599,6 +1611,9 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
         } else {
             recovered_current_head_id = recovered;
         }
+    }
+    if revision_contract_changed {
+        replacement.current_head_id = None;
     }
     upsert_directory_entry(&mut directory_entries, replacement.clone());
     let result = runtime.block_on(rollout_directory_entries(
@@ -1627,6 +1642,7 @@ fn admin_rollout_profile(args: AdminRolloutProfileArgs) -> Result<()> {
             reset_current_head_id: reset_current_head_id
                 .as_ref()
                 .map(|head_id| head_id.as_str().to_owned()),
+            revision_contract_changed,
             directory_entries: directory_entries.len(),
             result,
         },
@@ -2771,6 +2787,7 @@ fn run_head_mirror(args: RunHeadMirrorArgs) -> Result<()> {
 }
 
 fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
+    ensure_validator_read_only(args.initialize_head_on_start)?;
     let mut config = resolved_config(
         args.config.as_deref(),
         args.config_format,
@@ -2805,10 +2822,19 @@ fn run_validator_daemon(args: RunValidatorDaemonArgs) -> Result<()> {
             args.backend,
             args.status_interval_secs,
             args.validation_interval_millis,
-            args.initialize_head_on_start,
+            false,
             args.restore_head_on_start,
         )
     )
+}
+
+fn ensure_validator_read_only(initialize_head_on_start: bool) -> Result<()> {
+    if initialize_head_on_start {
+        bail!(
+            "validator daemons are read-only and cannot initialize model heads; start a trainer or head mirror to bootstrap the revision"
+        );
+    }
+    Ok(())
 }
 
 fn mark_runtime_failure(args: MarkRuntimeFailureArgs) -> Result<()> {
@@ -5328,6 +5354,26 @@ mod tests {
         );
         assert_eq!(trainer_daemon.max_protocol_steps, 2);
         assert_eq!(trainer_daemon.training_overrides.batch_size, Some(3));
+
+        let validator = Cli::try_parse_from([
+            "burn_dragon_p2p_native",
+            "run-validator-daemon",
+            "--experiment-kind",
+            "nca",
+        ])
+        .expect("parse validator daemon defaults");
+        let CommandKind::RunValidatorDaemon(validator) = validator.command else {
+            panic!("expected run-validator-daemon command");
+        };
+        assert!(!validator.initialize_head_on_start);
+        assert!(validator.restore_head_on_start);
+        assert!(ensure_validator_read_only(false).is_ok());
+        assert!(
+            ensure_validator_read_only(true)
+                .expect_err("validator initialization must fail closed")
+                .to_string()
+                .contains("read-only")
+        );
 
         let doctor = Cli::try_parse_from(["burn_dragon_p2p_native", "doctor"])
             .expect("parse doctor defaults");

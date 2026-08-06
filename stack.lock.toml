@@ -10,7 +10,7 @@ revision = "115cdfe8cd4212c529ab11be1f38887abf558ba0"
 name = "burn_p2p"
 path = "../burn_p2p"
 url = "https://github.com/aberration-technology/burn_p2p.git"
-revision = "39b1cf079d637fb287b27e50eafe078563d34f60"
+revision = "6d8f5400b171fafe0f20550f51eb79db3d84c4bf"
 
 [[repositories]]
 name = "burn_eggroll"

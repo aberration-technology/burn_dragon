@@ -7,15 +7,20 @@ Date: 2026-08-06
 This document records canonical local predictive-coding solvers and the older recurrent-state
 correction auxiliary as separate mechanisms. AdamW backpropagation remains the default training
 algorithm. Fixed prediction reaches backpropagation-equivalent convergence without a global
-backward call but is slower. The new depth-batched layer-local prediction solver is substantially
-more sample efficient than matched terminal-loss backpropagation on a bounded non-ceiling modular
-stream while retaining 95-97% throughput. It is not a terminal-gradient approximation, and its
-positive result requires sparse context routing plus context-scoped optimizer state.
+backward call. It matches bounded three-seed text and Ruliad terminal cross entropy under both
+stateless and document-contiguous recurrent training, but remains slower: about 62% of AdamW
+throughput when stateless and 94% when eight-token recurrent factors amortize the local VJPs.
+Ruliad selector-feedback loss telemetry remains materially worse under fixed prediction, so this
+is objective parity rather than a general quality promotion. The depth-batched
+layer-local prediction solver is substantially more sample efficient on a bounded modular stream,
+but its direct intermediate token supervision does not transfer to text or Ruliad. It remains an
+experimental routed-recurrence result, not a general pretraining candidate.
 
 The continual-learning result remains a complementary-system result. Task-ID-free context
 selection, balanced sparse routing, and context-scoped optimizer state are responsible for
 retention; layer-local prediction improves acquisition inside that system. A dense shared-state
-control forgets more under the same local derivative. Production and Ruliad promotion remain open.
+control forgets more under the same local derivative. AdamW remains the production default because
+neither local solver has established a quality or long-horizon continual-learning advantage.
 
 ## 2026-08-06 depth-batched layer-local prediction
 
@@ -71,8 +76,85 @@ unallocated control.
 The machine-readable result is
 `docs/experiments/predictive-coding-layer-local-20260806.json`. Raw reports are under
 `target/pc-layer-local-20260806/`. This is strong bounded structured-recurrence evidence, not a
-state-of-the-art claim. Text/Ruliad fixed-holdout convergence, longer context churn, larger models,
-TBPTT quality, and decentralized synchronization remain required promotion gates.
+state-of-the-art claim. Longer context churn, larger models, longer horizons, and decentralized
+synchronization remain required promotion gates.
+The text/Ruliad and bounded TBPTT gates below reject general promotion of this layer-local objective.
+
+## 2026-08-06 fixed-holdout and recurrent promotion gate
+
+This gate tests whether the structured-recurrence result transfers to ordinary autoregressive text
+and live Ruliad data. Every arm uses the same 891,266-parameter shared-layer Dragon, embedding 96,
+four heads, latent width 3,072, batch 32, block 128, three paired seeds, and a fixed validation
+holdout. Intervals are two-sided 95% Student-t intervals. The byte-text corpus contains 1,114,624
+raw-byte tokens from pinned Tiny Shakespeare, split into 1,960 train and 217 validation documents
+of 512 tokens. Ruliad uses the production live source selector, but 512 updates remain inside its
+difficulty-0 cold start; these runs test acquisition and solver correctness, not curriculum scaling.
+
+Stateless 512-update results:
+
+| Dataset | Learner | Cold validation | Tokens/s |
+| --- | --- | ---: | ---: |
+| Ruliad | AdamW backprop | 2.0849 +/- 0.0494 | 64,572 +/- 2,528 |
+| Ruliad | Fixed-prediction local VJP | 2.0652 +/- 0.0760 | 40,401 +/- 2,037 |
+| Ruliad | Layer-local prediction | 2.1293 +/- 0.0438 | 33,552 +/- 607 |
+| Byte text | AdamW backprop | 1.6300 +/- 0.0272 | 67,394 +/- 1,137 |
+| Byte text | Fixed-prediction local VJP | 1.6234 +/- 0.0115 | 41,618 +/- 1,644 |
+| Byte text | Layer-local prediction | 1.7613 +/- 0.0402 | 34,600 +/- 847 |
+
+Fixed prediction is statistically at parity with AdamW on both holdouts, but retains only 61.8-62.6%
+of throughput. Layer-local prediction is materially worse on text and offers no Ruliad advantage;
+the same intermediate token target that helps the modular stream is therefore not a general local
+credit-assignment objective. A learning-rate screen from `3e-4` through `1e-2` and a terminal-head
+negative control did not remove the text regression.
+
+The recurrent gate uses eight-token factors, retains detached rho across contiguous 512-token
+documents, resets at document boundaries, and evaluates both random-cold and stream-warm holdouts.
+The loader now masks the final partial next-token pair instead of crossing into the next document.
+
+| Dataset | Learner | Cold validation | Stream warm | Tokens/s |
+| --- | --- | ---: | ---: | ---: |
+| Ruliad | AdamW backprop | 2.1009 +/- 0.0929 | 1.0885 +/- 0.0314 | 12,779 +/- 424 |
+| Ruliad | Fixed-prediction local VJP | 2.0979 +/- 0.0785 | 1.0913 +/- 0.0508 | 11,969 +/- 136 |
+| Byte text | AdamW backprop | 1.6287 +/- 0.0169 | 1.6118 +/- 0.0209 | 12,509 +/- 242 |
+| Byte text | Fixed-prediction local VJP | 1.6260 +/- 0.0034 | 1.6092 +/- 0.0096 | 11,804 +/- 22 |
+
+On byte text, fixed prediction minus AdamW is `-0.0027 +/- 0.0170` cold NLL and
+`-0.0025 +/- 0.0129` stream-warm NLL. It reaches 94.4% of AdamW throughput with zero global
+backward calls. Matched continuation probes show positive rho carry for both learners: AdamW gains
+`0.01734 +/- 0.00166` NLL (`1.066% +/- 0.099%`) and fixed prediction gains
+`0.01735 +/- 0.00287` (`1.068% +/- 0.183%`). On Ruliad, AdamW gains
+`0.02320 +/- 0.01092` NLL and fixed prediction gains `0.02527 +/- 0.01829`; the paired carry-gain
+delta is `+0.00207 +/- 0.01063`. Fixed prediction is therefore at parity on both the warm objective
+and measured benefit from carried rho, while retaining 93.7% of AdamW throughput.
+
+The Ruliad recurrent arms tie on cold/warm loss and carry. Verifier and partial-progress deltas are
+too noisy to resolve with three seeds, but fixed prediction has materially higher latest
+cadence-aligned loss fed to live source selection:
+`0.5271 +/- 0.1412` versus `0.1401 +/- 0.0128`, with paired delta
+`+0.3870 +/- 0.1539`. This top-level event field is the sampled training loss supplied to the
+selector, not a bucket EMA or a verifier score. Its divergence can alter live curriculum dynamics
+and rejects promotion despite terminal holdout parity. No bounded result here shows better
+long-horizon retention, verifier correctness, or wall-clock quality than AdamW.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-generalization-20260806.json`. Raw local artifacts are under
+`target/pc-fixed-stateless-*`, `target/pc-fixed-recurrent-ruliad-maskfix-*-20260806`, and
+`target/pc-fixed-recurrent-byte-text-512-20260806`. The decision is to keep AdamW as default,
+retain fixed prediction as the exact no-global-backward research path, and keep layer-local
+prediction out of general language/Ruliad profiles.
+
+Reproduce the canonical matrices with:
+
+```bash
+scripts/pc_paper_experiments.sh --matrix local-solver-promotion
+scripts/pc_paper_experiments.sh --matrix local-solver-recurrent
+scripts/pc_paper_experiments.sh \
+  --matrix local-solver-recurrent \
+  --profile config/language/experiments/predictive_coding/local-pc-byte-text-1m.toml
+```
+
+`local-solver-recurrent` explicitly records streaming batching, persistent state, chunk size, and
+matched carry-probe settings in each trial manifest.
 
 ## 2026-08-04 Lifelong Context-Routing Result
 
@@ -994,7 +1076,7 @@ The analyzer writes:
 
 Primary outcome metrics:
 
-- validation loss at fixed tokens
+- random-cold, stream-warm, and matched carry validation loss at fixed tokens
 - validation loss at fixed wall clock
 - ruliad source loss
 - normalized and mean source difficulty
@@ -1012,7 +1094,7 @@ Efficiency metrics:
 Statistical rules:
 
 - Use paired seed deltas for AdamW+PC vs AdamW.
-- Report mean, standard deviation, and 95% CI.
+- Report mean, standard deviation, and two-sided 95% Student-t intervals for small matrices.
 - Keep fixed-token and fixed-wall-clock conclusions separate.
 - Do not claim improvement unless quality and wall-clock results both support it.
 
@@ -1039,6 +1121,14 @@ Supported by current evidence:
    result without a family-specific descriptor.
 10. Exact local-PC factors carry detached linear-attention rho through TBPTT and match the
     corresponding stateful autodiff/numerical contracts.
+11. Fixed-prediction local VJPs match bounded three-seed AdamW convergence on fixed-holdout text
+    and Ruliad data without a global autodiff graph; recurrent eight-token factors retain about
+    94% of AdamW throughput.
+12. Matched byte-text continuation probes show a small positive rho carry gain under both AdamW
+    and fixed-prediction learning. The larger Ruliad stream-warm loss comes from harder document
+    regions rather than a negative matched carry effect.
+13. Direct layer-local next-token supervision does not transfer to general text or Ruliad in the
+    current form and should not be promoted outside the routed modular-recurrence experiment.
 
 Not yet supported:
 
@@ -1051,7 +1141,7 @@ Not yet supported:
 6. The historical recurrent-state replay auxiliary is layer-local PC or parallelizes credit
    assignment across Dragon layers.
 7. The predictive context bank is ready as a default Ruliad routing policy; production still lacks
-   run-scoped subnetwork/optimizer checkpoint integration and a Ruliad holdout promotion matrix.
+   long-horizon Ruliad routing promotion and decentralized checkpoint/synchronization evidence.
 8. Fixed-prediction PC exceeds matched Backpropagation throughput or establishes a quality advantage
    away from the controlled benchmark's ceiling.
 

@@ -33,6 +33,13 @@ SUMMARY_COLUMNS = [
     "train_first",
     "train_last",
     "valid_last",
+    "valid_mean",
+    "stream_warm_loss",
+    "validation_objective_loss",
+    "stream_paired_warm_loss",
+    "stream_paired_cold_loss",
+    "stream_carry_nll_gain",
+    "stream_carry_relative_gain",
     "lr_last",
     "pc_ms_mean",
     "pc_corrected_fraction",
@@ -69,6 +76,13 @@ EVENT_SUMMARY_COLUMNS = [
     "train_loss_first",
     "train_loss_last",
     "valid_loss_last",
+    "valid_loss_mean",
+    "stream_warm_loss_mean",
+    "validation_objective_loss_last",
+    "stream_paired_warm_loss_last",
+    "stream_paired_cold_loss_last",
+    "stream_carry_nll_gain_last",
+    "stream_carry_relative_gain_last",
     "source_loss_last",
     "source_entropy_bits_last",
     "source_mean_difficulty_last",
@@ -154,6 +168,12 @@ MANIFEST_COLUMNS = [
     "arm",
     "seed",
     "batch_size",
+    "local_learning_rate",
+    "tbptt_chunk_size",
+    "tbptt_persist_across_steps",
+    "sequence_batching",
+    "sequence_state_probe",
+    "sequence_state_probe_paired_batches",
     "backend",
     "features",
     "profile",
@@ -245,7 +265,54 @@ def stats(values: Iterable[float | None]) -> MetricStats:
     if len(clean) == 1:
         return MetricStats(1, clean[0], 0.0, 0.0)
     std = statistics.stdev(clean)
-    return MetricStats(len(clean), statistics.mean(clean), std, 1.96 * std / math.sqrt(len(clean)))
+    critical = student_t_critical_95(len(clean) - 1)
+    return MetricStats(
+        len(clean),
+        statistics.mean(clean),
+        std,
+        critical * std / math.sqrt(len(clean)),
+    )
+
+
+def student_t_critical_95(degrees_of_freedom: int) -> float:
+    """Two-sided 95% Student-t critical value for small experiment matrices."""
+    table = (
+        12.706,
+        4.303,
+        3.182,
+        2.776,
+        2.571,
+        2.447,
+        2.365,
+        2.306,
+        2.262,
+        2.228,
+        2.201,
+        2.179,
+        2.160,
+        2.145,
+        2.131,
+        2.120,
+        2.110,
+        2.101,
+        2.093,
+        2.086,
+        2.080,
+        2.074,
+        2.069,
+        2.064,
+        2.060,
+        2.056,
+        2.052,
+        2.048,
+        2.045,
+        2.042,
+    )
+    if degrees_of_freedom <= 0:
+        return math.nan
+    if degrees_of_freedom <= len(table):
+        return table[degrees_of_freedom - 1]
+    return 1.96
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -325,6 +392,13 @@ def normalize_summary_row(row: dict[str, str]) -> dict[str, Any]:
         "train_first": ["train_first"],
         "train_last": ["train_last"],
         "valid_last": ["valid_last"],
+        "valid_mean": ["valid_mean", "valid_last"],
+        "stream_warm_loss": ["stream_warm_loss"],
+        "validation_objective_loss": ["validation_objective_loss"],
+        "stream_paired_warm_loss": ["stream_paired_warm_loss"],
+        "stream_paired_cold_loss": ["stream_paired_cold_loss"],
+        "stream_carry_nll_gain": ["stream_carry_nll_gain"],
+        "stream_carry_relative_gain": ["stream_carry_relative_gain"],
         "lr_last": ["lr_last"],
         "pc_ms_mean": ["pc_ms_mean"],
         "pc_corrected_fraction": ["pc_corrected_fraction", "pc_events"],
@@ -404,6 +478,7 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
     split = event.get("split")
     name = event.get("name")
     value = as_float(event.get("value"))
+    running_value = as_float(event.get("running_value"))
     if value is None:
         return
     if split == "train" and name in {"Loss", "Stream Warm Loss"}:
@@ -412,6 +487,21 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
         summary["train_loss_last"] = value
     elif split == "valid" and name == "Loss":
         summary["valid_loss_last"] = value
+        summary["valid_loss_mean"] = running_value if running_value is not None else value
+    elif split == "valid" and name == "Random Cold Loss":
+        summary["valid_loss_mean"] = value
+    elif split == "valid" and name == "Stream Warm Loss":
+        summary["stream_warm_loss_mean"] = (
+            running_value if running_value is not None else value
+        )
+    elif split == "valid" and name == "Stream Paired Warm Loss":
+        summary["stream_paired_warm_loss_last"] = value
+    elif split == "valid" and name == "Stream Paired Cold Loss":
+        summary["stream_paired_cold_loss_last"] = value
+    elif split == "valid" and name == "Stream Carry NLL Gain":
+        summary["stream_carry_nll_gain_last"] = value
+    elif split == "valid" and name == "Stream Carry Relative Gain":
+        summary["stream_carry_relative_gain_last"] = value
     elif split == "valid" and name == "Ruliad Verifier Accuracy":
         summary["ruliad_verifier_accuracy_last"] = value
     elif split == "valid" and name in {
@@ -513,6 +603,8 @@ def collect_event_summaries(
                     latest_source_by_run[run] = event
             elif event_type == "metric":
                 update_metric(summary, event)
+            elif event_type == "validation_finished":
+                summary["validation_objective_loss_last"] = as_float(event.get("loss"))
             elif event_type == "output_degeneracy":
                 summary["output_entropy_bits_last"] = as_float(event.get("entropy_bits"))
                 summary["output_mean_max_probability_last"] = as_float(event.get("mean_max_probability"))
@@ -618,6 +710,23 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 "train_first": as_float(event.get("train_loss_first")),
                 "train_last": as_float(event.get("train_loss_last")),
                 "valid_last": as_float(event.get("valid_loss_last")),
+                "valid_mean": as_float(event.get("valid_loss_mean")),
+                "stream_warm_loss": as_float(event.get("stream_warm_loss_mean")),
+                "validation_objective_loss": as_float(
+                    event.get("validation_objective_loss_last")
+                ),
+                "stream_paired_warm_loss": as_float(
+                    event.get("stream_paired_warm_loss_last")
+                ),
+                "stream_paired_cold_loss": as_float(
+                    event.get("stream_paired_cold_loss_last")
+                ),
+                "stream_carry_nll_gain": as_float(
+                    event.get("stream_carry_nll_gain_last")
+                ),
+                "stream_carry_relative_gain": as_float(
+                    event.get("stream_carry_relative_gain_last")
+                ),
                 "pc_ms_mean": as_float(event.get("pc_ms_mean")),
                 "source_loss": as_float(event.get("source_loss_last")),
                 "source_mean_difficulty": as_float(
@@ -824,6 +933,13 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "tok_s",
         "train_last",
         "valid_last",
+        "valid_mean",
+        "stream_warm_loss",
+        "validation_objective_loss",
+        "stream_paired_warm_loss",
+        "stream_paired_cold_loss",
+        "stream_carry_nll_gain",
+        "stream_carry_relative_gain",
         "source_loss",
         "source_mean_difficulty",
         "source_norm_difficulty",
@@ -855,7 +971,13 @@ def paired_deltas(rows: list[dict[str, Any]], baseline: str, compare: str) -> li
         by_key[(row.get("iters"), row.get("seed"))][row.get("arm")] = row
 
     metrics = [
-        "valid_last",
+        "valid_mean",
+        "stream_warm_loss",
+        "validation_objective_loss",
+        "stream_paired_warm_loss",
+        "stream_paired_cold_loss",
+        "stream_carry_nll_gain",
+        "stream_carry_relative_gain",
         "source_loss",
         "train_last",
         "wall_s",
@@ -909,17 +1031,21 @@ def write_markdown(
     lines.append("## Fixed-Token Summary")
     lines.append("")
     lines.append(
-        "| Iters | Arm | Runs | Seeds | Valid loss | Verifier acc | Partial progress | Tok/s | PC ms |"
+        "| Iters | Arm | Runs | Seeds | Cold valid | Stream warm | Validation objective | Verifier acc | Partial progress | Tok/s | PC ms |"
     )
-    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )
     for row in summary_rows:
         lines.append(
-            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {verifier} | {partial} | {tok} | {pc} |".format(
+            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {warm} | {objective} | {verifier} | {partial} | {tok} | {pc} |".format(
                 iters=row.get("iters", ""),
                 arm=row.get("arm", ""),
                 runs=row.get("runs", ""),
                 seeds=row.get("seeds", ""),
-                valid=fmt_mean_ci(row, "valid_last"),
+                valid=fmt_mean_ci(row, "valid_mean"),
+                warm=fmt_mean_ci(row, "stream_warm_loss"),
+                objective=fmt_mean_ci(row, "validation_objective_loss"),
                 verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
                 partial=fmt_mean_ci(row, "ruliad_partial_progress"),
                 tok=fmt_mean_ci(row, "tok_s"),
@@ -969,13 +1095,20 @@ def write_markdown(
                     )
                 )
             lines.append("")
-        lines.append("| Run | Valid loss | Source difficulty | Verifier acc | Output entropy | Gates | Fatal gates |")
-        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        lines.append(
+            "| Run | Cold valid | Stream warm | Objective | Carry gain | Source difficulty | Verifier acc | Output entropy | Gates | Fatal gates |"
+        )
+        lines.append(
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        )
         for row in event_rows[:40]:
             lines.append(
-                "| {run} | {valid} | {difficulty} | {verifier} | {entropy} | {gates} | {fatal} |".format(
+                "| {run} | {valid} | {warm} | {objective} | {carry} | {difficulty} | {verifier} | {entropy} | {gates} | {fatal} |".format(
                     run=row.get("run", ""),
-                    valid=fmt_scalar(row.get("valid_loss_last")),
+                    valid=fmt_scalar(row.get("valid_loss_mean")),
+                    warm=fmt_scalar(row.get("stream_warm_loss_mean")),
+                    objective=fmt_scalar(row.get("validation_objective_loss_last")),
+                    carry=fmt_scalar(row.get("stream_carry_nll_gain_last")),
                     difficulty=fmt_scalar(row.get("source_mean_difficulty_last")),
                     verifier=fmt_scalar(row.get("ruliad_verifier_accuracy_last")),
                     entropy=fmt_scalar(row.get("output_entropy_bits_last")),
@@ -1051,6 +1184,13 @@ def run_analysis(inputs: list[str], out_dir: Path, baseline: str, compare: str) 
                 "tok_s",
                 "train_last",
                 "valid_last",
+                "valid_mean",
+                "stream_warm_loss",
+                "validation_objective_loss",
+                "stream_paired_warm_loss",
+                "stream_paired_cold_loss",
+                "stream_carry_nll_gain",
+                "stream_carry_relative_gain",
                 "source_loss",
                 "source_mean_difficulty",
                 "source_norm_difficulty",
@@ -1110,6 +1250,26 @@ def self_test() -> None:
                     "split": "valid",
                     "name": "Loss",
                     "value": 0.4,
+                    "running_value": 0.45,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Stream Warm Loss",
+                    "value": 0.6,
+                    "running_value": 0.55,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "validation_finished",
+                    "run_id": "run-a",
+                    "loss": 0.55,
                 }
             )
             + "\n"
@@ -1249,6 +1409,9 @@ def self_test() -> None:
         assert event_rows[0]["trial_key"] == "pc-smoke-run-a"
         assert event_rows[0]["arm"] == "adamwpc"
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
+        assert event_rows[0]["valid_loss_mean"] == "0.45"
+        assert event_rows[0]["stream_warm_loss_mean"] == "0.55"
+        assert event_rows[0]["validation_objective_loss_last"] == "0.55"
         assert event_rows[0]["source_loss_last"] == "0.6"
         assert event_rows[0]["source_capability_allowed_max_difficulty_last"] == "5.0"
         assert event_rows[0]["pc_learning_contract_last"] == "local_factor_vjp_v1"
@@ -1265,6 +1428,8 @@ def self_test() -> None:
         gpu = list(csv.DictReader((out / "gpu_summary.csv").open()))
         assert gpu[0]["arm"] == "adamwpc"
         assert gpu[0]["util_mean"] == "90.0"
+        three_sample_stats = stats([1.0, 2.0, 3.0])
+        assert math.isclose(three_sample_stats.ci95, 4.303 / math.sqrt(3.0))
         markdown = (out / "paper_tables.md").read_text()
         assert "Fixed-Token Summary" in markdown
         assert "Local Learning Contract" in markdown

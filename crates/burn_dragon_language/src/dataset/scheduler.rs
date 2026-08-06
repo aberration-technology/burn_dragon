@@ -397,6 +397,56 @@ fn fill_rows_from_window<T: TokenSequenceDataset + ?Sized>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fill_stream_row_from_document<T: TokenSequenceDataset + ?Sized>(
+    dataset: &T,
+    split: DatasetSplit,
+    epoch_index: usize,
+    document_start: usize,
+    logical_document_tokens: usize,
+    chunk_index_in_document: usize,
+    block_size: usize,
+    input_row: &mut [i64],
+    target_row: &mut [i64],
+    mask_row: Option<&mut [i64]>,
+) {
+    let chunk_offset = chunk_index_in_document.saturating_mul(block_size);
+    let valid_pairs = logical_document_tokens
+        .saturating_sub(chunk_offset)
+        .min(block_size);
+    assert!(
+        valid_pairs > 0,
+        "stream chunk must contain at least one next-token pair"
+    );
+
+    let copied_tokens = valid_pairs + 1;
+    let mut sample = vec![0u32; block_size + 1];
+    dataset.copy_token_range_with_epoch(
+        split,
+        epoch_index,
+        document_start + chunk_offset,
+        &mut sample[..copied_tokens],
+    );
+    let terminal = sample[copied_tokens - 1];
+    sample[copied_tokens..].fill(terminal);
+
+    match mask_row {
+        Some(mask_row) => {
+            for t in 0..block_size {
+                input_row[t] = sample[t] as i64;
+                target_row[t] = sample[t + 1] as i64;
+            }
+            if !dataset.target_loss_mask_for_window(&sample, mask_row)
+                && !dataset.uses_target_loss_mask()
+            {
+                mask_row[..valid_pairs].fill(1);
+            }
+            mask_row[valid_pairs..].fill(0);
+        }
+        None => fill_rows_from_window(dataset, &sample, block_size, input_row, target_row, None),
+    }
+}
+
 fn deterministic_row_rng(
     seed: u64,
     split: DatasetSplit,
@@ -1566,12 +1616,17 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let block_size = self.block_size;
         let mut inputs = vec![0i64; batch_size * block_size];
         let mut targets = vec![0i64; batch_size * block_size];
-        let mut loss_mask = self
-            .dataset
-            .uses_target_loss_mask()
-            .then(|| vec![0i64; batch_size * block_size]);
-        #[cfg(not(feature = "train"))]
-        let mut sample = vec![0u32; block_size + 1];
+        let dataset_uses_target_loss_mask = self.dataset.uses_target_loss_mask();
+        let chunk_offset = self.chunk_index_in_document.saturating_mul(block_size);
+        let partial_document_chunk = self
+            .logical_document_tokens
+            .saturating_sub(chunk_offset)
+            .min(block_size)
+            < block_size;
+        let mut loss_mask = (dataset_uses_target_loss_mask || partial_document_chunk).then(|| {
+            let initial = i64::from(!dataset_uses_target_loss_mask);
+            vec![initial; batch_size * block_size]
+        });
         let document_span = self.logical_document_tokens + 1;
         let reset_stream_state = self.chunk_index_in_document == 0;
 
@@ -1660,18 +1715,13 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
                                 .wrapping_add(doc_rank.wrapping_mul(document_stride)))
                                 % num_documents;
                             let doc_start = offset + doc_idx.saturating_mul(document_span);
-                            let start =
-                                doc_start + chunk_index_in_document.saturating_mul(block_size);
-                            let mut sample = vec![0u32; block_size + 1];
-                            self.dataset.copy_token_range_with_epoch(
+                            fill_stream_row_from_document(
+                                self.dataset.as_ref(),
                                 self.split,
                                 self.epoch_index,
-                                start,
-                                &mut sample,
-                            );
-                            fill_rows_from_window(
-                                self.dataset.as_ref(),
-                                &sample,
+                                doc_start,
+                                self.logical_document_tokens,
+                                chunk_index_in_document,
                                 block_size,
                                 input_row,
                                 target_row,
@@ -1689,18 +1739,13 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
                                 .wrapping_add(doc_rank.wrapping_mul(document_stride)))
                                 % num_documents;
                             let doc_start = offset + doc_idx.saturating_mul(document_span);
-                            let start =
-                                doc_start + chunk_index_in_document.saturating_mul(block_size);
-                            let mut sample = vec![0u32; block_size + 1];
-                            self.dataset.copy_token_range_with_epoch(
+                            fill_stream_row_from_document(
+                                self.dataset.as_ref(),
                                 self.split,
                                 self.epoch_index,
-                                start,
-                                &mut sample,
-                            );
-                            fill_rows_from_window(
-                                self.dataset.as_ref(),
-                                &sample,
+                                doc_start,
+                                self.logical_document_tokens,
+                                chunk_index_in_document,
                                 block_size,
                                 input_row,
                                 target_row,
@@ -1717,23 +1762,23 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
                     .wrapping_add(doc_rank.wrapping_mul(self.document_stride)))
                     % self.num_documents.max(1);
                 let doc_start = offset + doc_idx.saturating_mul(document_span);
-                let start = doc_start + self.chunk_index_in_document.saturating_mul(block_size);
-                self.dataset.copy_token_range_with_epoch(
+                let input_row = &mut inputs[batch_idx * block_size..(batch_idx + 1) * block_size];
+                let target_row = &mut targets[batch_idx * block_size..(batch_idx + 1) * block_size];
+                let mask_row = loss_mask
+                    .as_mut()
+                    .map(|mask| &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size]);
+                fill_stream_row_from_document(
+                    self.dataset.as_ref(),
                     self.split,
                     self.epoch_index,
-                    start,
-                    &mut sample,
+                    doc_start,
+                    self.logical_document_tokens,
+                    self.chunk_index_in_document,
+                    block_size,
+                    input_row,
+                    target_row,
+                    mask_row,
                 );
-                for t in 0..block_size {
-                    inputs[batch_idx * block_size + t] = sample[t] as i64;
-                    targets[batch_idx * block_size + t] = sample[t + 1] as i64;
-                }
-                if let Some(mask) = loss_mask.as_mut() {
-                    self.dataset.target_loss_mask_for_window(
-                        &sample,
-                        &mut mask[batch_idx * block_size..(batch_idx + 1) * block_size],
-                    );
-                }
             }
         }
 
@@ -2007,7 +2052,7 @@ mod streaming_tests {
             for t in 0..mask.len() {
                 mask[t] = i64::from(window[t + 1].is_multiple_of(2));
             }
-            true
+            mask.contains(&1)
         }
     }
 
@@ -2055,6 +2100,103 @@ mod streaming_tests {
         assert!(first.reset_stream_state);
         assert!(!second.reset_stream_state);
         assert!(third.reset_stream_state);
+    }
+
+    #[test]
+    fn streaming_loader_masks_partial_final_chunk_without_crossing_split_boundary() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let dataset = Arc::new(TinyDataset {
+            tokens: Arc::new(vec![
+                10, 11, 12, 13, 14, 15, 16, 255, 20, 21, 22, 23, 24, 25, 26, 255,
+            ]),
+            train_len: 8,
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: Some(7),
+            mask_even_targets: false,
+        });
+        let loader = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Val,
+            &device,
+            2,
+            Some(2),
+            None,
+            1337,
+        );
+        let mut iter = loader.iter();
+        let first = iter.next().expect("first validation chunk");
+        let second = iter.next().expect("partial validation chunk");
+
+        assert!(first.reset_stream_state);
+        assert!(!second.reset_stream_state);
+        assert!(first.loss_mask.is_none());
+        assert_eq!(
+            second
+                .inputs
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("inputs"),
+            vec![24, 25, 26, 255]
+        );
+        assert_eq!(
+            second
+                .targets
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("targets"),
+            vec![25, 26, 255, 255]
+        );
+        assert_eq!(
+            second
+                .loss_mask
+                .expect("partial chunk mask")
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("loss mask"),
+            vec![1, 1, 1, 0]
+        );
+    }
+
+    #[test]
+    fn streaming_loader_preserves_empty_dataset_mask_on_partial_final_chunk() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let dataset = Arc::new(TinyDataset {
+            tokens: Arc::new(vec![
+                10, 11, 13, 15, 17, 19, 21, 255, 20, 21, 23, 25, 27, 29, 31, 255,
+            ]),
+            train_len: 8,
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            preferred_logical_document_tokens: Some(7),
+            mask_even_targets: true,
+        });
+        let loader = StreamingDataLoader::<TestBackend>::new(
+            Arc::clone(&dataset),
+            DatasetSplit::Val,
+            &device,
+            2,
+            Some(2),
+            None,
+            1337,
+        );
+        let second = loader.iter().nth(1).expect("partial validation chunk");
+
+        assert_eq!(
+            second
+                .loss_mask
+                .expect("dataset-owned partial chunk mask")
+                .to_data()
+                .convert::<i64>()
+                .into_vec::<i64>()
+                .expect("loss mask"),
+            vec![0, 0, 0, 0]
+        );
     }
 
     #[test]

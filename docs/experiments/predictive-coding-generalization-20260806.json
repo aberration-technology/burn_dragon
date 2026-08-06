@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-06",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "confidence_interval": {
+    "kind": "two_sided_student_t_95_percent",
+    "paired_for_deltas": true,
+    "seeds": [20260804, 20260805, 20260806]
+  },
+  "model": {
+    "parameters": 891266,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "block_size": 128,
+    "batch_size": 32
+  },
+  "solvers": {
+    "backpropagation": {
+      "optimizer": "adamw",
+      "learning_rate": 0.001
+    },
+    "fixed_prediction": {
+      "optimizer": "adamw applied to analytic local VJP gradients",
+      "learning_rate": 0.001,
+      "learning_contract": "local_fixed_prediction_v1",
+      "global_autodiff_graph": false,
+      "global_backward_calls": 0
+    },
+    "layer_local_prediction": {
+      "learning_contract": "local_layer_prediction_v1",
+      "intermediate_activity_contract": "detached next-token prediction at every shared layer use",
+      "global_autodiff_graph": false,
+      "global_backward_calls": 0
+    }
+  },
+  "datasets": {
+    "ruliad": {
+      "profile": "config/language/experiments/predictive_coding/local-pc-1m.toml",
+      "corpus_config": "crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.corpus.toml",
+      "validation": "fixed_holdout",
+      "difficulty_note": "512 updates remain inside the difficulty-0 cold-start hold",
+      "selector_feedback_loss_semantics": "latest cadence-aligned training loss supplied to live source selection; not a bucket EMA or verifier score"
+    },
+    "byte_text": {
+      "profile": "config/language/experiments/predictive_coding/local-pc-byte-text-1m.toml",
+      "source": "Tiny Shakespeare",
+      "source_commit": "6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e",
+      "source_sha256": "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2dc565ed",
+      "materialized_sha256": "c4407ef8c95bac39bc61c808b462276fdae5fd5cd19eb75d2924aed878ea296a",
+      "tokens": 1114624,
+      "train_documents": 1960,
+      "validation_documents": 217,
+      "document_tokens": 512,
+      "vocabulary": "raw bytes 0..255"
+    }
+  },
+  "stateless_512_updates": {
+    "ruliad": {
+      "backpropagation": {
+        "cold_validation_mean": 2.0848609283566475,
+        "cold_validation_ci95": 0.0493743928861724,
+        "tokens_per_second_mean": 64572.46,
+        "tokens_per_second_ci95": 2527.800877089007
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.0651983693242073,
+        "cold_validation_ci95": 0.07595661300339723,
+        "tokens_per_second_mean": 40400.967,
+        "tokens_per_second_ci95": 2036.7920108007843
+      },
+      "layer_local_prediction": {
+        "cold_validation_mean": 2.1292706032594046,
+        "cold_validation_ci95": 0.04376936752692361,
+        "tokens_per_second_mean": 33552.10533333333,
+        "tokens_per_second_ci95": 606.8670575426037
+      }
+    },
+    "byte_text": {
+      "backpropagation": {
+        "cold_validation_mean": 1.629979772227151,
+        "cold_validation_ci95": 0.02718091655840457,
+        "tokens_per_second_mean": 67393.52566666667,
+        "tokens_per_second_ci95": 1136.506079317915
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 1.623396220661345,
+        "cold_validation_ci95": 0.011507561721020824,
+        "tokens_per_second_mean": 41618.301666666666,
+        "tokens_per_second_ci95": 1643.774189012305
+      },
+      "layer_local_prediction": {
+        "cold_validation_mean": 1.7612540069080536,
+        "cold_validation_ci95": 0.04024837373558738,
+        "tokens_per_second_mean": 34599.996,
+        "tokens_per_second_ci95": 846.738368974214
+      }
+    }
+  },
+  "recurrent_512_updates": {
+    "geometry": {
+      "tbptt_chunk_size": 8,
+      "persist_across_steps": true,
+      "sequence_batching": "streaming",
+      "document_tokens": 512,
+      "state_detached_between_factors_and_batches": true
+    },
+    "ruliad": {
+      "backpropagation": {
+        "cold_validation_mean": 2.1009066899617515,
+        "cold_validation_ci95": 0.09292810478571309,
+        "stream_warm_mean": 1.0885048906008403,
+        "stream_warm_ci95": 0.03139606337801662,
+        "carry_nll_gain_mean": 0.02320132404565811,
+        "carry_nll_gain_ci95": 0.01091992422943317,
+        "tokens_per_second_mean": 12778.591333333334,
+        "tokens_per_second_ci95": 424.0039741550126,
+        "verifier_accuracy_mean": 0.2708333333333333,
+        "verifier_accuracy_ci95": 0.044822916666666664,
+        "partial_progress_mean": 0.40104156732559204,
+        "partial_progress_ci95": 0.08460139993481781,
+        "last_selector_feedback_loss_mean": 0.14010634666666666,
+        "last_selector_feedback_loss_ci95": 0.012763755421112844
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.097862516840299,
+        "cold_validation_ci95": 0.07846035933704512,
+        "stream_warm_mean": 1.0912531558424234,
+        "stream_warm_ci95": 0.0507891590506376,
+        "carry_nll_gain_mean": 0.02527359127998352,
+        "carry_nll_gain_ci95": 0.018293181363351087,
+        "tokens_per_second_mean": 11969.417,
+        "tokens_per_second_ci95": 135.97733992642378,
+        "verifier_accuracy_mean": 0.15625,
+        "verifier_accuracy_ci95": 0.2689375,
+        "partial_progress_mean": 0.34461794296900433,
+        "partial_progress_ci95": 0.36519520395776267,
+        "last_selector_feedback_loss_mean": 0.5270941433333334,
+        "last_selector_feedback_loss_ci95": 0.14120312376260152
+      },
+      "paired_fixed_minus_backpropagation": {
+        "cold_validation_mean": -0.0030441731214523315,
+        "cold_validation_ci95": 0.07846242014880651,
+        "stream_warm_mean": 0.0027482652415831885,
+        "stream_warm_ci95": 0.06756716524255578,
+        "carry_nll_gain_mean": 0.002072267234325409,
+        "carry_nll_gain_ci95": 0.010633408830014937,
+        "tokens_per_second_mean": -809.174333333333,
+        "tokens_per_second_ci95": 339.7371239016812,
+        "verifier_accuracy_mean": -0.11458333333333333,
+        "verifier_accuracy_ci95": 0.2939235205215782,
+        "partial_progress_mean": -0.05642362435658773,
+        "partial_progress_ci95": 0.4249485154140956,
+        "last_selector_feedback_loss_mean": 0.38698779666666666,
+        "last_selector_feedback_loss_ci95": 0.15387473509939242
+      }
+    },
+    "byte_text": {
+      "backpropagation": {
+        "cold_validation_mean": 1.6286928753058116,
+        "cold_validation_ci95": 0.016892260482639133,
+        "stream_warm_mean": 1.611761095977965,
+        "stream_warm_ci95": 0.02089715934190279,
+        "carry_nll_gain_mean": 0.01734068989753723,
+        "carry_nll_gain_ci95": 0.001660906253787305,
+        "tokens_per_second_mean": 12509.072333333334
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 1.6259899508385431,
+        "cold_validation_ci95": 0.0033588016168293834,
+        "stream_warm_mean": 1.6092475113414582,
+        "stream_warm_ci95": 0.009576490181538845,
+        "carry_nll_gain_mean": 0.017349888881047566,
+        "carry_nll_gain_ci95": 0.0028726636004114655,
+        "tokens_per_second_mean": 11804.041666666666
+      },
+      "paired_fixed_minus_backpropagation": {
+        "cold_validation_mean": -0.0027029244672685,
+        "cold_validation_ci95": 0.017,
+        "stream_warm_mean": -0.0025135846365068,
+        "stream_warm_ci95": 0.0129,
+        "carry_nll_gain_mean": 0.0000091989835103,
+        "carry_nll_gain_ci95": 0.00296,
+        "tokens_per_second_mean": -705.030666666668,
+        "tokens_per_second_ci95": 221.0
+      }
+    }
+  },
+  "streaming_boundary_fix": {
+    "failure": "the final partial chunk requested block_size + 1 tokens past the last fixed document; the first repair also replaced an intentionally empty dataset-owned mask with ones",
+    "resolution": "copy only valid pairs plus one target, pad with the terminal token, zero-mask padded pairs, and synthesize an all-one fallback only for datasets that do not own target masks",
+    "coverage": "dedicated split-boundary and empty-mask regressions, 20 streaming scheduler tests, and a three-seed release-CUDA E2E matrix"
+  },
+  "decision": {
+    "default": "backpropagation with AdamW",
+    "fixed_prediction": "retain as exact no-global-backward research path; bounded recurrent quality parity is established but no quality advantage is established",
+    "layer_local_prediction": "retain only as an experimental routed-recurrence solver; do not use in general language or Ruliad profiles"
+  }
+}

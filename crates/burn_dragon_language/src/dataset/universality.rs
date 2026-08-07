@@ -4,7 +4,7 @@ use std::io;
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -210,7 +210,7 @@ struct LiveSourceSelectionState {
     corpus_config: burn_dragon_universality::RuliadCorpusConfig,
     frontier_extension: burn_dragon_universality::RuliadFrontierExtensionConfig,
     cold_start: burn_dragon_universality::RuliadSourceSelectionColdStartConfig,
-    feedback_updates_enabled: bool,
+    feedback_updates_enabled: AtomicBool,
     frontier_extension_count: AtomicUsize,
     absolute_step_offset: AtomicUsize,
     pending: Mutex<HashMap<usize, String>>,
@@ -544,7 +544,7 @@ impl LiveSourceSelectionState {
             corpus_config,
             frontier_extension: source_selection.frontier_extension,
             cold_start: source_selection.cold_start,
-            feedback_updates_enabled: source_selection.feedback_updates_enabled,
+            feedback_updates_enabled: AtomicBool::new(source_selection.feedback_updates_enabled),
             frontier_extension_count: AtomicUsize::new(0),
             absolute_step_offset: AtomicUsize::new(0),
             pending: Mutex::new(HashMap::new()),
@@ -588,7 +588,7 @@ impl LiveSourceSelectionState {
             corpus_config,
             frontier_extension: source_selection.frontier_extension,
             cold_start: source_selection.cold_start,
-            feedback_updates_enabled: source_selection.feedback_updates_enabled,
+            feedback_updates_enabled: AtomicBool::new(source_selection.feedback_updates_enabled),
             frontier_extension_count: AtomicUsize::new(snapshot.frontier_extension_count),
             absolute_step_offset: AtomicUsize::new(snapshot.absolute_step_offset),
             pending: Mutex::new(HashMap::new()),
@@ -687,7 +687,7 @@ impl LiveSourceSelectionState {
     }
 
     fn apply_dynamics_control(&self, difficulty_pressure: f32, hash_noise_max_probability: f32) {
-        if !self.feedback_updates_enabled {
+        if !self.feedback_updates_enabled.load(Ordering::Relaxed) {
             return;
         }
         let mut control = self
@@ -810,7 +810,7 @@ impl LiveSourceSelectionState {
     }
 
     fn record_pending(&self, absolute_step: usize, bucket_label: &str) {
-        if !self.feedback_updates_enabled {
+        if !self.feedback_updates_enabled.load(Ordering::Relaxed) {
             return;
         }
         let mut pending = self
@@ -833,7 +833,7 @@ impl LiveSourceSelectionState {
         absolute_step: usize,
         loss: f32,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
-        if !self.feedback_updates_enabled {
+        if !self.feedback_updates_enabled.load(Ordering::Relaxed) {
             return Some(self.snapshot());
         }
         let bucket_label = self
@@ -875,7 +875,7 @@ impl LiveSourceSelectionState {
         feedback: &[burn_dragon_universality::RuliadCapabilityFeedback],
         absolute_step: Option<usize>,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
-        if !self.feedback_updates_enabled {
+        if !self.feedback_updates_enabled.load(Ordering::Relaxed) {
             return Some(self.snapshot());
         }
         let mut sampler = self
@@ -936,7 +936,9 @@ impl LiveSourceSelectionState {
         &self,
         sampler: &mut burn_dragon_universality::RuliadFrontierSampler,
     ) {
-        if !self.feedback_updates_enabled || !self.frontier_extension.enabled {
+        if !self.feedback_updates_enabled.load(Ordering::Relaxed)
+            || !self.frontier_extension.enabled
+        {
             return;
         }
         let snapshot = self.snapshot_locked(sampler);
@@ -1617,6 +1619,31 @@ impl UniversalityDataset {
     pub fn with_ruliad_supervision(mut self, supervision: RuliadSupervisionConfig) -> Self {
         self.ruliad_supervision = supervision;
         self
+    }
+
+    pub fn with_source_selection_feedback_updates_enabled(self, enabled: Option<bool>) -> Self {
+        if let Some(enabled) = enabled
+            && let UniversalityStorage::OnTheFly(storage) = &self.storage
+            && let Some(source_selection) = &storage.source_selection
+        {
+            source_selection
+                .feedback_updates_enabled
+                .store(enabled, Ordering::Relaxed);
+        }
+        self
+    }
+
+    pub fn source_selection_feedback_updates_enabled(&self) -> Option<bool> {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => None,
+            UniversalityStorage::OnTheFly(storage) => {
+                storage.source_selection.as_ref().map(|source_selection| {
+                    source_selection
+                        .feedback_updates_enabled
+                        .load(Ordering::Relaxed)
+                })
+            }
+        }
     }
 
     fn emits_target_loss_mask(&self) -> bool {
@@ -5816,35 +5843,78 @@ mod tests {
     fn static_live_ruliad_source_selection_ignores_training_feedback() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("ruliad-static-live.toml");
-        let mut config = live_ruliad_runtime_config();
-        config.source_selection.feedback_updates_enabled = false;
+        let config = live_ruliad_runtime_config();
         fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
             .expect("write config");
 
-        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
-            &config_path,
-            32,
-            2,
-            &pretokenized_tokenizer(),
-        )
-        .expect("load static live ruliad dataset");
+        let make_dataset = || {
+            UniversalityDataset::new_ruliad_on_the_fly(
+                &config_path,
+                32,
+                2,
+                &pretokenized_tokenizer(),
+            )
+            .expect("load static live ruliad dataset")
+            .with_source_selection_feedback_updates_enabled(Some(false))
+        };
+        let dataset = make_dataset();
+        let comparison = make_dataset();
+        assert_eq!(
+            dataset.source_selection_feedback_updates_enabled(),
+            Some(false)
+        );
         let wrapped = crate::dataset::Dataset::from_universality(dataset.clone());
+        let comparison_wrapped = crate::dataset::Dataset::from_universality(comparison.clone());
         let before = dataset.source_selection_snapshot().expect("snapshot");
-        let windows = crate::dataset::TokenSequenceDataset::source_selected_token_windows(
-            &wrapped,
-            DatasetSplit::Train,
-            0,
-            0,
-            2,
-            32,
-        )
-        .expect("source-selected windows");
-        assert_eq!(windows.len(), 2);
+        let mut fingerprints = HashSet::new();
+        for absolute_step in 0..32 {
+            let left = crate::dataset::TokenSequenceDataset::source_selected_token_windows_with_loss_masks(
+                &wrapped,
+                DatasetSplit::Train,
+                0,
+                absolute_step,
+                2,
+                32,
+            )
+            .expect("left source-selected batch");
+            let right = crate::dataset::TokenSequenceDataset::source_selected_token_windows_with_loss_masks(
+                &comparison_wrapped,
+                DatasetSplit::Train,
+                0,
+                absolute_step,
+                2,
+                32,
+            )
+            .expect("right source-selected batch");
+            let left_fingerprint = left.fingerprint();
+            let right_fingerprint = right.fingerprint();
+            assert_eq!(
+                left_fingerprint, right_fingerprint,
+                "open-loop batches diverged at absolute step {absolute_step}"
+            );
+            fingerprints.insert(left_fingerprint);
 
-        let after =
-            crate::dataset::TokenSequenceDataset::record_source_selection_loss(&wrapped, 0, 9.0)
-                .expect("static snapshot");
-        assert_eq!(after, before);
+            let left_snapshot = crate::dataset::TokenSequenceDataset::record_source_selection_loss(
+                &wrapped,
+                absolute_step,
+                0.01 + absolute_step as f32,
+            )
+            .expect("left static snapshot");
+            let right_snapshot =
+                crate::dataset::TokenSequenceDataset::record_source_selection_loss(
+                    &comparison_wrapped,
+                    absolute_step,
+                    1000.0 - absolute_step as f32,
+                )
+                .expect("right static snapshot");
+            assert_eq!(left_snapshot, before);
+            assert_eq!(right_snapshot, before);
+        }
+        assert!(
+            fingerprints.len() >= 24,
+            "open-loop stream should remain diverse across steps: unique={}",
+            fingerprints.len()
+        );
     }
 
     #[test]

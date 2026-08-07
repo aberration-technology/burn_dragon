@@ -615,6 +615,7 @@ fn validation_dataset_config_for(
             .train_split_ratio
             .unwrap_or(dataset_cfg.train_split_ratio),
         validation: None,
+        ruliad_source_selection_feedback_updates_enabled: None,
         source: validation_cfg.source.clone(),
         tokenizer: dataset_cfg.tokenizer.clone(),
     }

@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-06",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "confidence_interval": {
+    "kind": "two_sided_student_t_95_percent",
+    "paired_for_deltas": true,
+    "seeds": [20260804, 20260805, 20260806]
+  },
+  "control_contract": {
+    "dataset": "ruliad",
+    "source_selection_feedback_updates_enabled": false,
+    "sequence_batching": "streaming",
+    "tbptt_chunk_size": 8,
+    "tbptt_persist_across_steps": true,
+    "sequence_state_probe": true,
+    "selector_checkpoint_sha256": {
+      "128_updates_all_arms_and_seeds": "82dab4ac65f91cc61ae575fd0df0d0062a66d1395160ae4d323c670d0734dfbe",
+      "512_updates_all_arms_and_seeds": "b9685bdec60a97d23a33ecd1a42d024b3e12a85dccfac02eb9077c3c1b561c08"
+    }
+  },
+  "model": {
+    "parameters": 891266,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "block_size": 128,
+    "batch_size": 32
+  },
+  "training": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-1m.toml",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "validation": "fixed_holdout_plus_stream_continuation",
+    "continual_backprop_enabled": false,
+    "neuron_scaling_enabled": false,
+    "dynamics_enabled": false
+  },
+  "objective_alignment": {
+    "invalid_control": "chunked AdamW weighted each masked chunk mean by raw chunk length while fixed prediction weighted by supervised-token count",
+    "resolution": "weight primary token cross entropy by supervised tokens over the complete block and retain raw-time weighting for auxiliary regularizers",
+    "runtime_contract": "memory-bounded chunk backward with one device-side full-mask reduction and no host synchronization",
+    "single_seed_128_block_backward_control": {
+      "backpropagation_source_loss": 2.89140829,
+      "fixed_prediction_source_loss": 2.89504246,
+      "backpropagation_cold_validation": 2.37268442,
+      "fixed_prediction_cold_validation": 2.37023351,
+      "backpropagation_stream_warm": 1.38227485,
+      "fixed_prediction_stream_warm": 1.3812470,
+      "old_chunk_weighted_backpropagation_source_loss": 2.63020848
+    },
+    "regression_tests": [
+      "masked reduction reports exact supervised count including zero-mask chunks",
+      "primary and auxiliary TBPTT weighting contracts are separated",
+      "chunked loss and all active parameter gradients match a globally masked detached-boundary objective"
+    ]
+  },
+  "results": {
+    "128": {
+      "backpropagation": {
+        "cold_validation_mean": 2.366395592689514,
+        "cold_validation_ci95": 0.02467771182358488,
+        "stream_warm_mean": 1.3638234237829845,
+        "stream_warm_ci95": 0.039867621644724204,
+        "source_loss_cadence_mean": 2.874975716666667,
+        "source_loss_cadence_ci95": 0.07164537958780048,
+        "verifier_accuracy_mean": 0.11458333333333333,
+        "verifier_accuracy_ci95": 0.044822916666666664,
+        "partial_progress_mean": 0.4392360250155131,
+        "partial_progress_ci95": 0.014941000719865165,
+        "wall_tokens_per_second_mean": 11623.889,
+        "wall_tokens_per_second_ci95": 774.4726376258393,
+        "model_tokens_per_second_mean": 13308.633666666667,
+        "model_tokens_per_second_ci95": 810.7234450950001,
+        "model_duty_fraction_mean": 0.8733776666666667,
+        "model_duty_fraction_ci95": 0.006081646402705728
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.344355324904124,
+        "cold_validation_ci95": 0.06814736646891045,
+        "stream_warm_mean": 1.3541986818114917,
+        "stream_warm_ci95": 0.07450635887725711,
+        "source_loss_cadence_mean": 2.873394579166667,
+        "source_loss_cadence_ci95": 0.07933099456179103,
+        "verifier_accuracy_mean": 0.11458333333333333,
+        "verifier_accuracy_ci95": 0.1616113243575161,
+        "partial_progress_mean": 0.40277769168217975,
+        "partial_progress_ci95": 0.0861538610443067,
+        "wall_tokens_per_second_mean": 10946.006333333333,
+        "wall_tokens_per_second_ci95": 594.8634878940147,
+        "model_tokens_per_second_mean": 12709.158,
+        "model_tokens_per_second_ci95": 630.3781240577226,
+        "model_duty_fraction_mean": 0.8612476666666666,
+        "model_duty_fraction_ci95": 0.004653162369265781
+      }
+    },
+    "512": {
+      "backpropagation": {
+        "cold_validation_mean": 2.112884685397148,
+        "cold_validation_ci95": 0.08430663703847882,
+        "stream_warm_mean": 1.1105075782785814,
+        "stream_warm_ci95": 0.04488292535936774,
+        "source_loss_cadence_mean": 1.34858161125,
+        "source_loss_cadence_ci95": 0.013279584394312791,
+        "verifier_accuracy_mean": 0.25,
+        "verifier_accuracy_ci95": 0.2054044084936977,
+        "partial_progress_mean": 0.37673600514729816,
+        "partial_progress_ci95": 0.1949854132911881,
+        "wall_tokens_per_second_mean": 12275.047666666667,
+        "wall_tokens_per_second_ci95": 177.2436380039745,
+        "model_tokens_per_second_mean": 13034.985666666666,
+        "model_tokens_per_second_ci95": 182.76372138757404,
+        "model_duty_fraction_mean": 0.9417,
+        "model_duty_fraction_ci95": 0.002080153754024537
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.1334426229198775,
+        "cold_validation_ci95": 0.08120714746163114,
+        "stream_warm_mean": 1.1234890042493741,
+        "stream_warm_ci95": 0.0414226658534596,
+        "source_loss_cadence_mean": 1.343032765625,
+        "source_loss_cadence_ci95": 0.030293214199093546,
+        "verifier_accuracy_mean": 0.21875,
+        "verifier_accuracy_ci95": 0.2054044084936977,
+        "partial_progress_mean": 0.34635405739148456,
+        "partial_progress_ci95": 0.18218648020416148,
+        "wall_tokens_per_second_mean": 11671.757333333333,
+        "wall_tokens_per_second_ci95": 56.00009308935664,
+        "model_tokens_per_second_mean": 12572.597666666667,
+        "model_tokens_per_second_ci95": 67.57553699639364,
+        "model_duty_fraction_mean": 0.9283496666666666,
+        "model_duty_fraction_ci95": 0.0026578544991421866
+      },
+      "paired_fixed_minus_backpropagation": {
+        "cold_validation_mean": 0.020557937522729237,
+        "cold_validation_ci95": 0.07187840161438336,
+        "stream_first_pass_mean": 0.022835491846005123,
+        "stream_first_pass_ci95": 0.013550317553613241,
+        "stream_warm_mean": 0.01298142597079277,
+        "stream_warm_ci95": 0.03372214754026019,
+        "stream_carry_nll_gain_mean": 0.002619180828332901,
+        "stream_carry_nll_gain_ci95": 0.0042673683149243415,
+        "source_loss_cadence_mean": -0.005548845624999983,
+        "source_loss_cadence_ci95": 0.023129017836664698,
+        "train_last_mean": -0.010215868552525839,
+        "train_last_ci95": 0.03398719129703768,
+        "verifier_accuracy_mean": -0.03125,
+        "verifier_accuracy_ci95": 0.35577087160971665,
+        "partial_progress_mean": -0.0303819477558136,
+        "partial_progress_ci95": 0.31471504042286513,
+        "wall_throughput_retention_percent_mean": 95.08789784657402,
+        "wall_throughput_retention_percent_ci95": 1.7367313460246272,
+        "model_throughput_retention_percent_mean": 96.45508219794597,
+        "model_throughput_retention_percent_ci95": 1.6310411023061775
+      }
+    }
+  },
+  "gpu_512": {
+    "backpropagation": {
+      "utilization_mean_percent": 77.77797537619699,
+      "utilization_ci95": 0.32989812467951685,
+      "power_mean_watts": 37.422755585955315,
+      "power_ci95": 0.2748308940692783
+    },
+    "fixed_prediction": {
+      "utilization_mean_percent": 72.77777777777777,
+      "utilization_ci95": 0.768394079131434,
+      "power_mean_watts": 35.080740740740744,
+      "power_ci95": 0.41368583070766923
+    }
+  },
+  "evidence": {
+    "raw_artifacts": "target/pc-recurrent-objective-aligned-20260806",
+    "analysis": "target/pc-recurrent-objective-aligned-analysis-20260806",
+    "reproduction": "scripts/pc_paper_experiments.sh --matrix local-solver-recurrent-open-loop"
+  },
+  "decision": {
+    "default": "backpropagation with AdamW",
+    "fixed_prediction": "retain as an exact no-global-backward research path",
+    "supported": "sampled-objective and most held-out parity at approximately 95 percent wall and 96 percent model throughput",
+    "caveat": "a small paired cold-stream disadvantage remains at 512 updates",
+    "not_supported": "verifier advantage, continual-learning advantage, or replacement of AdamW"
+  }
+}

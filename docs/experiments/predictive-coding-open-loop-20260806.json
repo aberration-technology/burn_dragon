@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-06",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "confidence_interval": {
+    "kind": "two_sided_student_t_95_percent",
+    "paired_for_deltas": true,
+    "seeds": [20260804, 20260805, 20260806]
+  },
+  "control_contract": {
+    "dataset": "ruliad",
+    "source_selection_feedback_updates_enabled": false,
+    "stream_pairing": "same seed produces the same source-selected token and loss-mask stream across learners",
+    "fingerprint": "stable FNV-1a over tokens, masks, and streamed document boundary; computed only on request",
+    "conformance_test_steps": 32,
+    "minimum_distinct_fingerprints": 24,
+    "opposing_feedback_changes_stream": false,
+    "checkpoint_state_sha256": {
+      "128_updates_all_arms_and_seeds": "82dab4ac65f91cc61ae575fd0df0d0062a66d1395160ae4d323c670d0734dfbe",
+      "512_updates_all_arms_and_seeds": "b9685bdec60a97d23a33ecd1a42d024b3e12a85dccfac02eb9077c3c1b561c08"
+    }
+  },
+  "model": {
+    "parameters": 891266,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "block_size": 128,
+    "batch_size": 32
+  },
+  "training": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-1m.toml",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "validation": "fixed_holdout"
+  },
+  "results": {
+    "128": {
+      "backpropagation": {
+        "validation_objective_mean": 1.999039113521576,
+        "validation_objective_ci95": 0.06316682996992294,
+        "last_validation_mean": 2.0141595602035522,
+        "last_validation_ci95": 0.09768581105304464,
+        "source_loss_mean": 0.9208663766666667,
+        "source_loss_ci95": 0.06774875537602564,
+        "verifier_accuracy_mean": 0.15625,
+        "verifier_accuracy_ci95": 0.35577087160971665,
+        "tokens_per_second_mean": 57001.80566666667,
+        "tokens_per_second_ci95": 1287.7824299644196
+      },
+      "fixed_prediction": {
+        "validation_objective_mean": 1.998184358080228,
+        "validation_objective_ci95": 0.038688979431183,
+        "last_validation_mean": 2.0178681214650473,
+        "last_validation_ci95": 0.027176690543734287,
+        "source_loss_mean": 0.9276411999999999,
+        "source_loss_ci95": 0.0838969334715406,
+        "verifier_accuracy_mean": 0.08333333333333333,
+        "verifier_accuracy_ci95": 0.22411458333333334,
+        "tokens_per_second_mean": 38000.36466666667,
+        "tokens_per_second_ci95": 756.3709488141044
+      },
+      "paired_fixed_minus_backpropagation": {
+        "validation_objective_mean": -0.0008547554413477579,
+        "validation_objective_ci95": 0.025419476328898793,
+        "source_loss_mean": 0.006774823333333309,
+        "source_loss_ci95": 0.01825335430176088,
+        "verifier_accuracy_mean": -0.07291666666666667,
+        "verifier_accuracy_ci95": 0.1616113243575161,
+        "partial_progress_mean": -0.0538194477558136,
+        "partial_progress_ci95": 0.21818424906409797,
+        "tokens_per_second_mean": -19001.441000000003,
+        "tokens_per_second_ci95": 1301.7248796016331
+      }
+    },
+    "512": {
+      "backpropagation": {
+        "validation_objective_mean": 2.0306837409734726,
+        "validation_objective_ci95": 0.07338165668468874,
+        "last_validation_mean": 1.8776955207188923,
+        "last_validation_ci95": 0.04086515169802482,
+        "source_loss_mean": 0.23433115,
+        "source_loss_ci95": 0.007697837839871128,
+        "verifier_accuracy_mean": 0.23958333333333334,
+        "verifier_accuracy_ci95": 0.27264715799867956,
+        "partial_progress_mean": 0.42187489072481793,
+        "partial_progress_ci95": 0.2731839491804731,
+        "tokens_per_second_mean": 69099.56966666668,
+        "tokens_per_second_ci95": 3850.764412626911
+      },
+      "fixed_prediction": {
+        "validation_objective_mean": 2.0560963302850723,
+        "validation_objective_ci95": 0.06284580244552361,
+        "last_validation_mean": 1.8891853888829548,
+        "last_validation_ci95": 0.10239054552776393,
+        "source_loss_mean": 0.23641986,
+        "source_loss_ci95": 0.03270555501721035,
+        "verifier_accuracy_mean": 0.2604166666666667,
+        "verifier_accuracy_ci95": 0.044822916666666664,
+        "partial_progress_mean": 0.42447905739148456,
+        "partial_progress_ci95": 0.0810642655792999,
+        "tokens_per_second_mean": 42642.93866666667,
+        "tokens_per_second_ci95": 1424.72467147572
+      },
+      "paired_fixed_minus_backpropagation": {
+        "validation_objective_mean": 0.02541258931159973,
+        "validation_objective_ci95": 0.12423078470632254,
+        "source_loss_mean": 0.0020887100000000214,
+        "source_loss_ci95": 0.025028106773788413,
+        "verifier_accuracy_mean": 0.020833333333333332,
+        "verifier_accuracy_ci95": 0.27264715799867956,
+        "partial_progress_mean": 0.0026041666666666665,
+        "partial_progress_ci95": 0.22383426800544787,
+        "tokens_per_second_mean": -26456.631000000005,
+        "tokens_per_second_ci95": 2433.3551620427897
+      }
+    }
+  },
+  "fixed_prediction_fidelity": {
+    "parameters": 937154,
+    "vocabulary_size": 272,
+    "batch_size": 8,
+    "block_size": 32,
+    "loss_absolute_error": 0.0,
+    "global_gradient_cosine": 0.9999999877513812,
+    "gradient_norm_ratio": 0.9999966927990875,
+    "relative_l2_error": 0.00020070181576179559,
+    "local_vjp_calls": 6,
+    "global_backward_calls": 0
+  },
+  "rejected_candidate": {
+    "name": "inverse_residual_variance_precision",
+    "screen": "937154-parameter CUDA synchronous-equilibrium diagnostic, 8 inference steps",
+    "fixed_precision_gradient_cosine": 0.4321089341260142,
+    "candidate_gradient_cosine": 0.22019697013730896,
+    "decision": "rejected and removed before the training matrix"
+  },
+  "decision": {
+    "default": "backpropagation with AdamW",
+    "fixed_prediction": "retain as a no-global-backward numerical and bounded-convergence control",
+    "quality_claim": "no resolved quality, verifier, or continual-learning advantage over AdamW",
+    "performance_blocker": "stateless fixed prediction retains 61.7 percent of AdamW token throughput because exact depth credit remains a serial reverse local-VJP wave"
+  }
+}

@@ -681,39 +681,53 @@ mod tests {
             report.global
         );
 
-        let local = super::super::local_predictive_coding_derivatives_with_state(
-            &model,
-            inputs.clone(),
-            targets,
-            Some(mask),
-            incoming.clone(),
-            &pc_config,
-        )
-        .expect("recurrent local derivatives");
-        let mut reference_state = incoming;
-        let _ = model.forward_with_state(inputs, &mut reference_state);
-        assert_eq!(local.terminal_state.position, reference_state.position);
-        for (layer, (local_layer, reference_layer)) in local
-            .terminal_state
-            .layers
-            .iter()
-            .zip(&reference_state.layers)
-            .enumerate()
-        {
-            let local_rho = local_layer.rho.clone().expect("local terminal rho");
-            let reference_rho = reference_layer.rho.clone().expect("reference terminal rho");
-            let max_error = (local_rho - reference_rho)
-                .abs()
-                .max()
-                .inner()
-                .to_data()
-                .convert::<f32>()
-                .into_vec::<f32>()
-                .expect("terminal rho error")[0];
-            assert!(
-                max_error < 1.0e-5,
-                "layer {layer} terminal rho mismatch: {max_error}"
+        for config in [
+            pc_config,
+            LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction,
+                factor_reduction: crate::config::PredictiveCodingFactorReduction::Mean,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        ] {
+            let local = super::super::local_predictive_coding_derivatives_with_state(
+                &model,
+                inputs.clone(),
+                targets.clone(),
+                Some(mask.clone()),
+                incoming.clone(),
+                &config,
+            )
+            .expect("recurrent local derivatives");
+            let mut reference_state = incoming.clone();
+            let _ = model.forward_with_state(inputs.clone(), &mut reference_state);
+            assert_eq!(
+                local.terminal_state.position, reference_state.position,
+                "solver={:?}",
+                config.solver
             );
+            for (layer, (local_layer, reference_layer)) in local
+                .terminal_state
+                .layers
+                .iter()
+                .zip(&reference_state.layers)
+                .enumerate()
+            {
+                let local_rho = local_layer.rho.clone().expect("local terminal rho");
+                let reference_rho = reference_layer.rho.clone().expect("reference terminal rho");
+                let max_error = (local_rho - reference_rho)
+                    .abs()
+                    .max()
+                    .inner()
+                    .to_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .expect("terminal rho error")[0];
+                assert!(
+                    max_error < 1.0e-5,
+                    "solver={:?} layer {layer} terminal rho mismatch: {max_error}",
+                    config.solver
+                );
+            }
         }
     }
 

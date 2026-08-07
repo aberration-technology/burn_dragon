@@ -166,6 +166,8 @@ pub(crate) struct PredictiveContextRoutingDecision {
     pub probed: bool,
     pub probe_tokens: usize,
     pub selected_loss: Option<f64>,
+    pub reserve_loss: Option<f64>,
+    pub reserve_supported_novelty: Option<bool>,
     pub candidates: Vec<burn_pc::PredictiveContextCandidate>,
 }
 
@@ -279,39 +281,47 @@ where
         }
     }
 
+    fn build_slot(&self, slot: usize) -> Result<(DragonContextMasks<B>, Vec<f32>, Vec<f32>)> {
+        let neuron_values = balanced_context_mask(
+            self.seed ^ 0xA11C_E5E1_7A11_0001,
+            slot,
+            self.n_head.saturating_mul(self.latent_per_head),
+            self.config.active_fraction,
+            &self.neuron_mask_values,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let activity_values = balanced_context_mask(
+            self.seed ^ 0xAC71_0171_5EED_0002,
+            slot,
+            self.n_embd,
+            self.config.active_fraction,
+            &self.activity_mask_values,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let neuron = Tensor::<B, 4>::from_data(
+            TensorData::new(
+                neuron_values.clone(),
+                [1, self.n_head, 1, self.latent_per_head],
+            ),
+            &self.device,
+        );
+        let activity = Tensor::<B, 4>::from_data(
+            TensorData::new(activity_values.clone(), [1, 1, 1, self.n_embd]),
+            &self.device,
+        );
+        Ok((
+            DragonContextMasks { neuron, activity },
+            neuron_values,
+            activity_values,
+        ))
+    }
+
     fn ensure_slot(&mut self, context_index: usize) -> Result<()> {
         while self.masks.len() <= context_index {
-            let slot = self.masks.len();
-            let neuron_values = balanced_context_mask(
-                self.seed ^ 0xA11C_E5E1_7A11_0001,
-                slot,
-                self.n_head.saturating_mul(self.latent_per_head),
-                self.config.active_fraction,
-                &self.neuron_mask_values,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let activity_values = balanced_context_mask(
-                self.seed ^ 0xAC71_0171_5EED_0002,
-                slot,
-                self.n_embd,
-                self.config.active_fraction,
-                &self.activity_mask_values,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let neuron = Tensor::<B, 4>::from_data(
-                TensorData::new(
-                    neuron_values.clone(),
-                    [1, self.n_head, 1, self.latent_per_head],
-                ),
-                &self.device,
-            );
-            let activity = Tensor::<B, 4>::from_data(
-                TensorData::new(activity_values.clone(), [1, 1, 1, self.n_embd]),
-                &self.device,
-            );
+            let (masks, neuron_values, activity_values) = self.build_slot(self.masks.len())?;
             self.neuron_mask_values.push(neuron_values);
             self.activity_mask_values.push(activity_values);
-            self.masks.push(DragonContextMasks { neuron, activity });
+            self.masks.push(masks);
             self.stream_states.push(None);
             self.optimizers.push(self.fresh_optimizer.clone());
         }
@@ -555,6 +565,8 @@ where
                         .probe_tokens
                         .min(batch.inputs.shape().dims::<2>()[1]),
                 selected_loss: Some(selected_loss),
+                reserve_loss: None,
+                reserve_supported_novelty: None,
                 candidates: Vec::new(),
             });
         }
@@ -573,17 +585,42 @@ where
                 probed: false,
                 probe_tokens: 0,
                 selected_loss: None,
+                reserve_loss: None,
+                reserve_supported_novelty: None,
                 candidates: Vec::new(),
             });
         }
 
         let mut losses = self.probe_losses(model, batch)?;
+        let mut probe_evaluations = losses.len();
         let mut selection = self
             .bank
             .select(&losses, true)
             .map_err(anyhow::Error::msg)?;
         let mut novelty_deferred = false;
+        let mut reserve_loss = None;
+        let mut reserve_supported_novelty = None;
         if selection.created {
+            if selection.replacement.is_none()
+                && self.bank.known_contexts() < self.bank.config().max_contexts
+            {
+                let masks = self.build_slot(self.bank.known_contexts())?.0;
+                let loss = Self::read_losses(vec![model.predictive_context_probe_loss(
+                    batch,
+                    masks.neuron,
+                    masks.activity,
+                    self.config.probe_tokens,
+                )])?[0];
+                let supported = self
+                    .bank
+                    .reserve_supports_novelty(&selection, loss)
+                    .map_err(anyhow::Error::msg)?;
+                reserve_loss = Some(loss);
+                reserve_supported_novelty = Some(supported);
+                selection.novel_evidence &= supported;
+                losses.push(loss);
+                probe_evaluations += 1;
+            }
             if !self.novelty_gate.observe(selection.novel_evidence) {
                 let fallback = selection
                     .candidates
@@ -593,7 +630,7 @@ where
                 selection.context_index = fallback.context_index;
                 selection.created = false;
                 selection.replacement = None;
-                novelty_deferred = true;
+                novelty_deferred = selection.novel_evidence;
             }
         } else {
             self.novelty_gate.observe(selection.novel_evidence);
@@ -601,18 +638,24 @@ where
 
         let (identity, replaced, selected_loss) = if selection.created {
             let allocation = self.allocate(&selection, absolute_step)?;
-            let masks = self.masks[allocation.identity.context_index].clone();
-            let loss = Self::read_losses(vec![model.predictive_context_probe_loss(
-                batch,
-                masks.neuron,
-                masks.activity,
-                self.config.probe_tokens,
-            )])?[0];
-            if allocation.identity.context_index == losses.len() {
-                losses.push(loss);
+            let loss = if let Some(loss) = reserve_loss {
+                loss
             } else {
-                losses[allocation.identity.context_index] = loss;
-            }
+                let masks = self.masks[allocation.identity.context_index].clone();
+                let loss = Self::read_losses(vec![model.predictive_context_probe_loss(
+                    batch,
+                    masks.neuron,
+                    masks.activity,
+                    self.config.probe_tokens,
+                )])?[0];
+                if allocation.identity.context_index == losses.len() {
+                    losses.push(loss);
+                } else {
+                    losses[allocation.identity.context_index] = loss;
+                }
+                probe_evaluations += 1;
+                loss
+            };
             (allocation.identity, allocation.replaced, loss)
         } else {
             let identity = self
@@ -636,10 +679,10 @@ where
             replaced,
             novelty_deferred,
             probed: true,
-            probe_tokens: self.bank.known_contexts()
-                * batch_size
-                * self.config.probe_tokens.min(block_size),
+            probe_tokens: probe_evaluations * batch_size * self.config.probe_tokens.min(block_size),
             selected_loss: Some(selected_loss),
+            reserve_loss,
+            reserve_supported_novelty,
             candidates: selection.candidates,
         })
     }

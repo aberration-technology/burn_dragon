@@ -10,6 +10,10 @@ OUT_DIR="${BURN_DRAGON_PC_PAPER_OUT_DIR:-$ROOT_DIR/target/pc-paper/$(date -u +%Y
 MATRIX="${BURN_DRAGON_PC_PAPER_MATRIX:-smoke}"
 BATCH_SIZE="${BURN_DRAGON_PC_PAPER_BATCH_SIZE:-}"
 TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-64}"
+TBPTT_PERSIST_ACROSS_STEPS="${BURN_DRAGON_PC_PAPER_TBPTT_PERSIST_ACROSS_STEPS:-}"
+SEQUENCE_BATCHING="${BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING:-}"
+SEQUENCE_STATE_PROBE="${BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE:-}"
+SEQUENCE_STATE_PROBE_PAIRED_BATCHES="${BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES:-8}"
 CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-512}"
 LOG_FREQUENCY="${BURN_DRAGON_PC_PAPER_LOG_FREQUENCY:-16}"
 SOURCE_SELECTION_EVERY_STEPS="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_EVERY_STEPS:-16}"
@@ -28,6 +32,8 @@ DRY_RUN=0
 SEEDS_CSV="${BURN_DRAGON_PC_PAPER_SEEDS:-}"
 ITERS_CSV="${BURN_DRAGON_PC_PAPER_ITERS:-}"
 ARMS_CSV="${BURN_DRAGON_PC_PAPER_ARMS:-}"
+LOCAL_LEARNING_RATE="${BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE:-0.001}"
+SOURCE_SELECTION_FEEDBACK_UPDATES="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
 
 usage() {
   cat <<'USAGE'
@@ -36,7 +42,9 @@ Usage:
 
 Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
-                               local-factor | hparam | nextlat-tbptt
+                               local-factor | local-solver-promotion | local-solver-open-loop |
+                               local-solver-recurrent | local-solver-recurrent-open-loop |
+                               hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|cpu>         Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
@@ -53,6 +61,14 @@ Options:
 Safety guards:
   BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION  Default: 0.90
   BURN_DRAGON_PC_PAPER_MIN_AVAILABLE_MB            Default: 12288
+
+Local-factor controls:
+  BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE          Default: 0.001
+  BURN_DRAGON_PC_PAPER_TBPTT_PERSIST_ACROSS_STEPS  true for recurrent matrices
+  BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING            auto | random | streaming
+  BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE         true for recurrent matrices
+  BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES  Default: 8
+  BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES    true | false | unset
 
 The runner isolates every trial under its own BURN_DRAGON_RUN_ROOT and writes
 one JSON manifest per trial. Raw checkpoints and metric events remain under
@@ -206,6 +222,78 @@ matrix_defaults() {
         TIMEOUT_SECONDS=1800
       fi
       ;;
+    local-solver-promotion)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_layer_prediction}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-solver-open-loop)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}" ]]; then
+        SOURCE_SELECTION_FEEDBACK_UPDATES=false
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-solver-recurrent|local-solver-recurrent-open-loop)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      if [[ "$MATRIX" == "local-solver-recurrent-open-loop" ]]; then
+        : "${ITERS_CSV:=128,512}"
+        : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction}"
+        if [[ -z "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}" ]]; then
+          SOURCE_SELECTION_FEEDBACK_UPDATES=false
+        fi
+      else
+        : "${ITERS_CSV:=128}"
+        : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_layer_prediction}"
+      fi
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        if [[ "$MATRIX" == "local-solver-recurrent-open-loop" ]]; then
+          CHECKPOINT_INTERVAL_ITERS=512
+        else
+          CHECKPOINT_INTERVAL_ITERS=128
+        fi
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=8
+      fi
+      if [[ -z "$TBPTT_PERSIST_ACROSS_STEPS" ]]; then
+        TBPTT_PERSIST_ACROSS_STEPS=true
+      fi
+      if [[ -z "$SEQUENCE_BATCHING" ]]; then
+        SEQUENCE_BATCHING=streaming
+      fi
+      if [[ -z "$SEQUENCE_STATE_PROBE" ]]; then
+        SEQUENCE_STATE_PROBE=true
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
     hparam)
       : "${PROFILE:=crates/burn_dragon_p2p/deploy/profiles/ruliad-1m.jepa.training.toml}"
       : "${SEEDS_CSV:=20260621,20260622,20260623}"
@@ -232,6 +320,43 @@ matrix_defaults() {
 }
 
 matrix_defaults
+
+: "${TBPTT_PERSIST_ACROSS_STEPS:=false}"
+: "${SEQUENCE_BATCHING:=auto}"
+: "${SEQUENCE_STATE_PROBE:=false}"
+case "$TBPTT_PERSIST_ACROSS_STEPS" in
+  true|false) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_TBPTT_PERSIST_ACROSS_STEPS must be true or false" >&2
+    exit 2
+    ;;
+esac
+case "$SEQUENCE_STATE_PROBE" in
+  true|false) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE must be true or false" >&2
+    exit 2
+    ;;
+esac
+if (( SEQUENCE_STATE_PROBE_PAIRED_BATCHES <= 0 )); then
+  echo "BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES must be positive" >&2
+  exit 2
+fi
+case "$SEQUENCE_BATCHING" in
+  auto|random|streaming) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING must be auto, random, or streaming" >&2
+    exit 2
+    ;;
+esac
+if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" && "$TBPTT_CHUNK_SIZE" == "0" ]]; then
+  echo "persistent TBPTT requires a positive TBPTT chunk size" >&2
+  exit 2
+fi
+if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" && "$SEQUENCE_BATCHING" == "random" ]]; then
+  echo "persistent TBPTT requires auto or streaming sequence batching" >&2
+  exit 2
+fi
 
 if (( DRY_RUN == 1 && BUILD_RELEASE == 1 )); then
   BUILD_RELEASE=0
@@ -415,6 +540,8 @@ write_overlay() {
   local batch_size="$5"
   local algorithm_line=""
   local tbptt_line=""
+  local tbptt_persist_line=""
+  local sequence_batching_line="sequence_batching = \"$SEQUENCE_BATCHING\""
 
   case "$arm" in
     local_backprop)
@@ -427,8 +554,24 @@ write_overlay() {
   if (( TBPTT_CHUNK_SIZE > 0 )); then
     tbptt_line="tbptt_chunk_size = $TBPTT_CHUNK_SIZE"
   fi
+  if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" ]]; then
+    tbptt_persist_line="tbptt_persist_across_steps = true"
+  fi
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+    if [[ "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "true" && "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
+      echo "BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES must be true or false" >&2
+      return 2
+    fi
+    cat > "$path" <<EOF
+[dataset]
+ruliad_source_selection_feedback_updates_enabled = $SOURCE_SELECTION_FEEDBACK_UPDATES
 
-  cat > "$path" <<EOF
+EOF
+  else
+    : > "$path"
+  fi
+
+  cat >> "$path" <<EOF
 [training]
 ${algorithm_line}
 batch_size = $batch_size
@@ -437,6 +580,8 @@ checkpoint_interval_iters = $CHECKPOINT_INTERVAL_ITERS
 log_frequency = $LOG_FREQUENCY
 seed = $seed
 ${tbptt_line}
+${tbptt_persist_line}
+${sequence_batching_line}
 launch_mode = "fresh"
 
 [training.events]
@@ -460,12 +605,22 @@ enabled = false
 
 EOF
 
+  if [[ "$SEQUENCE_STATE_PROBE" == "true" ]]; then
+    cat >> "$path" <<EOF
+[training.sequence_state_probe]
+enabled = true
+paired_batches = $SEQUENCE_STATE_PROBE_PAIRED_BATCHES
+max_rho_slots = 64
+
+EOF
+  fi
+
   case "$arm" in
     local_backprop)
       cat >> "$path" <<EOF
 [optimizer]
 name = "adamw"
-learning_rate = 0.001
+learning_rate = $LOCAL_LEARNING_RATE
 weight_decay = 0.01
 
 EOF
@@ -475,7 +630,7 @@ EOF
       cat >> "$path" <<EOF
 [optimizer]
 name = "adamw"
-learning_rate = 0.001
+learning_rate = $LOCAL_LEARNING_RATE
 weight_decay = 0.01
 
 [training.local_predictive_coding.inference]
@@ -487,11 +642,25 @@ EOF
       cat >> "$path" <<EOF
 [optimizer]
 name = "adamw"
-learning_rate = 0.001
+learning_rate = $LOCAL_LEARNING_RATE
 weight_decay = 0.01
 
 [training.local_predictive_coding]
 solver = "fixed_prediction"
+
+EOF
+      ;;
+    local_pc_layer_prediction)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "layer_local_prediction"
+factor_reduction = "mean"
+sync_diagnostics = false
 
 EOF
       ;;
@@ -735,12 +904,16 @@ write_manifest() {
   local git_sha
   local git_branch
   local dirty
+  local source_feedback_json="null"
   git_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
   git_branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [[ -z "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
     dirty=false
   else
     dirty=true
+  fi
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+    source_feedback_json="$SOURCE_SELECTION_FEEDBACK_UPDATES"
   fi
   cat > "$manifest" <<EOF
 {
@@ -750,6 +923,13 @@ write_manifest() {
   "seed": $seed,
   "iters": $iters,
   "batch_size": $batch_size,
+  "local_learning_rate": $LOCAL_LEARNING_RATE,
+  "tbptt_chunk_size": $TBPTT_CHUNK_SIZE,
+  "tbptt_persist_across_steps": $TBPTT_PERSIST_ACROSS_STEPS,
+  "sequence_batching": $(json_escape "$SEQUENCE_BATCHING"),
+  "sequence_state_probe": $SEQUENCE_STATE_PROBE,
+  "sequence_state_probe_paired_batches": $SEQUENCE_STATE_PROBE_PAIRED_BATCHES,
+  "source_selection_feedback_updates_enabled": $source_feedback_json,
   "backend": $(json_escape "$BACKEND"),
   "features": $(json_escape "$FEATURES"),
   "profile": $(json_escape "$PROFILE"),
@@ -856,6 +1036,10 @@ IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
 
 echo "pc paper matrix: matrix=$MATRIX backend=$BACKEND profile=$PROFILE batch_size=$BATCH_SIZE out_dir=$OUT_DIR"
 echo "seeds=$SEEDS_CSV iters=$ITERS_CSV arms=$ARMS_CSV"
+echo "local_learning_rate=$LOCAL_LEARNING_RATE"
+echo "tbptt_chunk_size=$TBPTT_CHUNK_SIZE tbptt_persist_across_steps=$TBPTT_PERSIST_ACROSS_STEPS sequence_batching=$SEQUENCE_BATCHING"
+echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_PROBE_PAIRED_BATCHES"
+echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"
 echo "guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB timeout_seconds=$TIMEOUT_SECONDS"
 
 matrix_status=0

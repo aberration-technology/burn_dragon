@@ -4,7 +4,9 @@ use crate::model::residual_stream::lowrank_residual_step_with_metrics_branch_thr
 use burn::module::ParamId;
 use burn::tensor::TensorPrimitive;
 use burn_dragon_kernel::api::attention::dense_causal_attention_vjp_with_initial_rho;
-use burn_dragon_kernel::api::projection::{relu_lowrank_input_vjp, relu_lowrank_vjp};
+use burn_dragon_kernel::api::projection::{
+    relu_lowrank_input_vjp_from_activation, relu_lowrank_vjp_from_activation,
+};
 
 /// Exact subset of Dragon currently covered by the plain-backend local VJPs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub struct DragonPredictiveCodingInitialVjp<B: Backend> {
 #[derive(Debug, Clone)]
 pub struct DragonPredictiveCodingHeadVjp<B: Backend> {
     pub loss: Tensor<B, 1>,
+    /// Masked negative log likelihood before reduction, shaped `[batch, time]`.
+    pub masked_token_losses: Tensor<B, 2>,
     pub grad_hidden: Tensor<B, 3>,
     pub grad_lm_head: Tensor<B, 2>,
     /// Raw number of supervised tokens before denominator clamping. This lets
@@ -670,11 +674,11 @@ where
 
         let grad_x_from_product = grad_y.clone() * trace.y_gate.clone();
         let grad_y_gate = grad_y * trace.x_neuron.clone();
-        let y_vjp = relu_lowrank_vjp(
+        let y_vjp = relu_lowrank_vjp_from_activation(
             trace.attention_readout.clone(),
             encoder_v,
+            trace.y_gate.clone(),
             grad_y_gate,
-            self.y_relu_threshold,
             sparse_mask.clone(),
             self.kernel.lowrank_grad_input_executor,
         )
@@ -703,11 +707,11 @@ where
             trace.initial_rho.clone(),
         );
         let grad_x = grad_x_from_product + attention_vjp.grad_query;
-        let x_vjp = relu_lowrank_vjp(
+        let x_vjp = relu_lowrank_vjp_from_activation(
             trace.input.clone(),
             encoder,
+            trace.x_neuron.clone(),
             grad_x,
-            self.x_relu_threshold,
             sparse_mask,
             self.kernel.lowrank_grad_input_executor,
         )
@@ -821,11 +825,11 @@ where
             .swap_dims(1, 2);
         let grad_x_from_product = grad_y.clone() * trace.y_gate.clone();
         let grad_y_gate = grad_y * trace.x_neuron.clone();
-        let grad_attention_readout = relu_lowrank_input_vjp(
+        let grad_attention_readout = relu_lowrank_input_vjp_from_activation(
             trace.attention_readout.clone(),
             encoder_v,
+            trace.y_gate.clone(),
             grad_y_gate,
-            self.y_relu_threshold,
             sparse_mask.clone(),
             self.kernel.lowrank_grad_input_executor,
         )
@@ -848,11 +852,11 @@ where
             trace.initial_rho.clone(),
         );
         let grad_x = grad_x_from_product + attention_vjp.grad_query;
-        let grad_projection_input = relu_lowrank_input_vjp(
+        let grad_projection_input = relu_lowrank_input_vjp_from_activation(
             trace.input.clone(),
             encoder,
+            trace.x_neuron.clone(),
             grad_x,
-            self.x_relu_threshold,
             sparse_mask,
             self.kernel.lowrank_grad_input_executor,
         )
@@ -1029,7 +1033,9 @@ where
         );
         let supervised_tokens = mask.clone().sum();
         let denominator = supervised_tokens.clone().clamp_min(1.0);
-        let loss = (selected.mul_scalar(-1.0) * mask.clone())
+        let masked_token_losses = selected.mul_scalar(-1.0) * mask.clone();
+        let loss = masked_token_losses
+            .clone()
             .sum()
             .div(denominator.clone())
             .reshape([1]);
@@ -1048,6 +1054,7 @@ where
 
         DragonPredictiveCodingHeadVjp {
             loss,
+            masked_token_losses,
             grad_hidden,
             grad_lm_head,
             supervised_tokens: supervised_tokens.reshape([1]),

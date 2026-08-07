@@ -1,4 +1,7 @@
 use crate::config::train::NeuronScalingStabilizationConfig;
+use crate::train::objective::{
+    NextTokenLossParts, masked_token_mean_with_count, supervised_token_count,
+};
 use crate::train::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::backend::Backend;
@@ -2862,15 +2865,24 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         loss_mask: Option<Tensor<B, 2, Int>>,
         step: usize,
     ) -> Tensor<B, 1> {
-        if let Some(mask) = loss_mask {
-            return masked_token_mean(
-                self.model
-                    .language_token_losses_from_hidden_for_latent_step(hidden, targets, step),
-                Some(mask),
-            );
-        }
-        self.model
-            .language_loss_from_hidden_for_latent_step(hidden, targets, step)
+        self.language_loss_with_supervised_tokens_from_hidden_for_latent_step(
+            hidden, targets, loss_mask, step,
+        )
+        .0
+    }
+
+    fn language_loss_with_supervised_tokens_from_hidden_for_latent_step(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        step: usize,
+    ) -> (Tensor<B, 1>, Tensor<B, 1>) {
+        masked_token_mean_with_count(
+            self.model
+                .language_token_losses_from_hidden_for_latent_step(hidden, targets, step),
+            loss_mask,
+        )
     }
 
     fn language_loss_from_logits(
@@ -4081,16 +4093,37 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         loss_mask: Option<Tensor<B, 2, Int>>,
         dynamics_teacher_logits: Option<Tensor<B, 3>>,
     ) -> Tensor<B, 1> {
+        self.next_token_loss_parts_from_logits(
+            logits,
+            targets,
+            clean_inputs,
+            loss_mask,
+            dynamics_teacher_logits,
+        )
+        .total()
+    }
+
+    fn next_token_loss_parts_from_logits(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        dynamics_teacher_logits: Option<Tensor<B, 3>>,
+    ) -> NextTokenLossParts<B> {
         let [batch_size, time, vocab] = logits.shape().dims();
         let log_probs = log_probs_from_logits(logits.clone());
-        let mut loss =
-            next_token_loss_from_log_probs(log_probs.clone(), targets.clone(), loss_mask.clone());
+        let (primary, supervised_tokens) = masked_token_mean_with_count(
+            selected_token_log_probs(log_probs.clone(), targets.clone()).mul_scalar(-1.0),
+            loss_mask.clone(),
+        );
+        let mut parts = NextTokenLossParts::new(primary, supervised_tokens);
         if let Some(answer_ranking_loss) = self.ruliad_answer_ranking_loss_from_logits(
             logits.clone(),
             targets.clone(),
             loss_mask.clone(),
         ) {
-            loss = loss + answer_ranking_loss;
+            parts.add_auxiliary(answer_ranking_loss);
         }
         let weight = self.repeat_unlikelihood_weight();
         let cycle_weight = self.repeat_cycle_weight();
@@ -4134,14 +4167,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     });
                 }
                 if let Some(total_loss) = total_loss {
-                    loss = loss
-                        + total_loss
+                    parts.add_auxiliary(
+                        total_loss
                             .div(
                                 total_hits
                                     .expect("repeat unlikelihood hit accumulator")
                                     .clamp_min(1.0),
                             )
-                            .mul_scalar(weight);
+                            .mul_scalar(weight),
+                    );
                 }
             }
             if cycle_weight > f32::EPSILON || cycle_margin_weight > f32::EPSILON {
@@ -4216,39 +4250,41 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     }
                 }
                 if let Some(total_cycle) = total_cycle {
-                    loss = loss
-                        + total_cycle
+                    parts.add_auxiliary(
+                        total_cycle
                             .div(
                                 total_cycle_hits
                                     .expect("repeat cycle hit accumulator")
                                     .clamp_min(1.0),
                             )
-                            .mul_scalar(cycle_weight);
+                            .mul_scalar(cycle_weight),
+                    );
                 }
                 if let Some(total_cycle_margin) = total_cycle_margin {
-                    loss = loss
-                        + total_cycle_margin
+                    parts.add_auxiliary(
+                        total_cycle_margin
                             .div(
                                 total_cycle_margin_hits
                                     .expect("repeat cycle margin hit accumulator")
                                     .clamp_min(1.0),
                             )
-                            .mul_scalar(cycle_margin_weight);
+                            .mul_scalar(cycle_margin_weight),
+                    );
                 }
             }
         }
         if let Some(entropy_floor_loss) =
             self.logit_entropy_floor_loss(log_probs.clone(), targets.clone())
         {
-            loss = loss + entropy_floor_loss;
+            parts.add_auxiliary(entropy_floor_loss);
         }
         if let Some(teacher_logits) = dynamics_teacher_logits
             && let Some(anchor_loss) =
                 self.dynamics_anchor_loss_from_log_probs(log_probs, teacher_logits, loss_mask)
         {
-            loss = loss + anchor_loss;
+            parts.add_auxiliary(anchor_loss);
         }
-        loss
+        parts
     }
 
     fn repeat_unlikelihood_lags(&self, time: usize) -> Vec<usize> {
@@ -4306,6 +4342,24 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         loss_mask: Option<Tensor<B, 2, Int>>,
         dynamics_teacher_logits: Option<Tensor<B, 3>>,
     ) -> Tensor<B, 1> {
+        self.next_token_loss_parts_from_hidden(
+            hidden,
+            targets,
+            clean_inputs,
+            loss_mask,
+            dynamics_teacher_logits,
+        )
+        .total()
+    }
+
+    fn next_token_loss_parts_from_hidden(
+        &self,
+        hidden: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        clean_inputs: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        dynamics_teacher_logits: Option<Tensor<B, 3>>,
+    ) -> NextTokenLossParts<B> {
         if (self.repeat_unlikelihood_weight() <= f32::EPSILON
             && self.repeat_cycle_weight() <= f32::EPSILON
             && self.repeat_cycle_margin_weight() <= f32::EPSILON
@@ -4317,25 +4371,31 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             && dynamics_teacher_logits.is_none())
             || self.model.uses_factorized_language_head()
         {
-            let mut loss =
-                self.language_loss_from_hidden(hidden.clone(), targets.clone(), loss_mask.clone());
+            let (primary, supervised_tokens) = self
+                .language_loss_with_supervised_tokens_from_hidden_for_latent_step(
+                    hidden.clone(),
+                    targets.clone(),
+                    loss_mask.clone(),
+                    self.model.latent_reasoning_config().max_steps,
+                );
+            let mut parts = NextTokenLossParts::new(primary, supervised_tokens);
             if let Some(aux) = self.latent_reasoning_auxiliary_loss(
                 hidden,
                 clean_inputs.clone(),
                 Some(targets.clone()),
                 loss_mask.clone(),
             ) {
-                loss = loss + aux;
+                parts.add_auxiliary(aux);
             }
             if let Some(denoising) =
                 self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
             {
-                loss = loss + denoising;
+                parts.add_auxiliary(denoising);
             }
-            return loss;
+            return parts;
         }
         let logits = self.model.logits_from_hidden(hidden.clone());
-        let mut loss = self.next_token_loss_from_logits(
+        let mut parts = self.next_token_loss_parts_from_logits(
             logits,
             targets.clone(),
             clean_inputs.clone(),
@@ -4348,13 +4408,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             Some(targets.clone()),
             loss_mask.clone(),
         ) {
-            loss = loss + aux;
+            parts.add_auxiliary(aux);
         }
         if let Some(denoising) = self.ruliad_answer_denoising_loss(clean_inputs, targets, loss_mask)
         {
-            loss = loss + denoising;
+            parts.add_auxiliary(denoising);
         }
-        loss
+        parts
     }
 
     fn ruliad_answer_ranking_weight(&self) -> f32 {
@@ -11988,6 +12048,13 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 let mut accumulator = GradientsAccumulator::new();
                 let mut predictive_coding_step_report = PredictiveCodingChunkReport::default();
                 let chunks_per_step = block_size.div_ceil(chunk_size);
+                let total_supervised_tokens = supervised_token_count(
+                    loss_mask.clone(),
+                    batch_size,
+                    block_size,
+                    &targets.device(),
+                )
+                .clamp_min(1.0);
 
                 for (chunk_index, start) in (0..block_size).step_by(chunk_size).enumerate() {
                     let end = (start + chunk_size).min(block_size);
@@ -12057,13 +12124,13 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     };
 
                     let chunk_forward_start = Instant::now();
-                    let chunk_loss = if let Some(mask) = chunk_summary_event_mask.clone() {
+                    let chunk_loss_parts = if let Some(mask) = chunk_summary_event_mask.clone() {
                         let hidden = self.model.forward_hidden_with_state_and_summary_event_mask(
                             chunk_inputs,
                             mask,
                             &mut step_state,
                         );
-                        self.next_token_loss_from_hidden(
+                        self.next_token_loss_parts_from_hidden(
                             hidden,
                             chunk_targets.clone(),
                             chunk_clean_inputs.clone(),
@@ -12074,7 +12141,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         let hidden = self
                             .model
                             .forward_hidden_with_state(chunk_inputs, &mut step_state);
-                        self.next_token_loss_from_hidden(
+                        self.next_token_loss_parts_from_hidden(
                             hidden,
                             chunk_targets.clone(),
                             chunk_clean_inputs.clone(),
@@ -12082,13 +12149,18 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                             chunk_teacher_logits,
                         )
                     };
-                    let chunk_loss =
-                        self.add_latent_rho_memory_auxiliary_loss(chunk_loss, &step_state);
-                    let mut chunk_loss = self.add_latent_dragon_state_auxiliary_loss(
-                        chunk_loss,
+                    let chunk_weight = (end - start) as f32 / block_size as f32;
+                    let mut chunk_loss = chunk_loss_parts
+                        .tbptt_weighted(total_supervised_tokens.clone(), chunk_weight);
+                    if let Some(auxiliary) = self.latent_rho_memory_auxiliary_loss(&step_state) {
+                        chunk_loss = chunk_loss + auxiliary.mul_scalar(chunk_weight);
+                    }
+                    if let Some(auxiliary) = self.latent_dragon_state_auxiliary_loss(
                         &step_state,
                         recurrent_teacher_state.as_ref(),
-                    );
+                    ) {
+                        chunk_loss = chunk_loss + auxiliary.mul_scalar(chunk_weight);
+                    }
                     total_forward_ns += chunk_forward_start.elapsed().as_nanos();
 
                     if let Some(entry_state) = observed_pc_entry {
@@ -12119,7 +12191,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                                             constraint.clone().detach().inner(),
                                         ));
                                     }
-                                    chunk_loss = chunk_loss + constraint;
+                                    chunk_loss = chunk_loss + constraint.mul_scalar(chunk_weight);
                                 }
                             } else {
                                 // This explicitly non-learning control retains online state
@@ -12134,8 +12206,6 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         }
                     }
 
-                    let chunk_weight = (end - start) as f32 / block_size as f32;
-                    let chunk_loss = chunk_loss.mul_scalar(chunk_weight);
                     total_loss = Some(match total_loss {
                         Some(accumulated) => accumulated + chunk_loss.clone().detach(),
                         None => chunk_loss.clone().detach(),
@@ -13339,17 +13409,6 @@ fn answer_prefix_input_mask<B: BackendTrait>(loss_mask: Tensor<B, 2, Int>) -> Te
     Tensor::cat(vec![head, previous_targets], 1)
 }
 
-fn next_token_loss_from_log_probs<B: BackendTrait>(
-    log_probs: Tensor<B, 3>,
-    targets: Tensor<B, 2, Int>,
-    loss_mask: Option<Tensor<B, 2, Int>>,
-) -> Tensor<B, 1> {
-    masked_token_mean(
-        selected_token_log_probs(log_probs, targets).mul_scalar(-1.0),
-        loss_mask,
-    )
-}
-
 fn entropy_floor_loss_from_logits<B: BackendTrait>(
     logits: Tensor<B, 3>,
     target_entropy_bits: f32,
@@ -13658,21 +13717,8 @@ mod objective_step_tests {
     }
 
     #[test]
-    fn local_predictive_coding_tbptt_carries_and_resets_rho_state() {
+    fn feedforward_local_pc_solvers_carry_and_reset_tbptt_rho_state() {
         let device = burn::tensor::Device::<TestBackend>::default();
-        let mut config = tiny_model_config();
-        config.n_layer = 2;
-        config.sequence_kernel =
-            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
-        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
-        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
-            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
-            .with_local_predictive_coding(LocalPredictiveCodingConfig {
-                solver: LocalPredictiveCodingSolver::FixedPrediction,
-                ..LocalPredictiveCodingConfig::default()
-            })
-            .with_tbptt_chunk_size(Some(2))
-            .with_tbptt_persist_across_steps(true);
         let batch = |reset_stream_state| SequenceBatch {
             inputs: Tensor::from_data(
                 TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
@@ -13688,33 +13734,65 @@ mod objective_step_tests {
             reset_stream_state,
         };
 
-        let first = burn_train::TrainStep::step(&model, batch(true));
-        assert_eq!(first.grads.len(), 9);
-        let first_state = model
-            .peek_step_state_for_test()
-            .expect("persistent local PC state after first step");
-        assert_eq!(first_state.position, 8);
-        assert!(first_state.layers.iter().all(|layer| layer.rho.is_some()));
+        for solver in [
+            LocalPredictiveCodingSolver::FixedPrediction,
+            LocalPredictiveCodingSolver::LayerLocalPrediction,
+        ] {
+            let mut model_config = tiny_model_config();
+            model_config.n_layer = 2;
+            model_config.sequence_kernel =
+                burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+            model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+            let factor_reduction =
+                if matches!(solver, LocalPredictiveCodingSolver::LayerLocalPrediction) {
+                    PredictiveCodingFactorReduction::Mean
+                } else {
+                    PredictiveCodingFactorReduction::Sum
+                };
+            let model =
+                LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+                    .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+                    .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                        solver,
+                        factor_reduction,
+                        ..LocalPredictiveCodingConfig::default()
+                    })
+                    .with_tbptt_chunk_size(Some(2))
+                    .with_tbptt_persist_across_steps(true);
 
-        let second = burn_train::TrainStep::step(&model, batch(false));
-        assert_eq!(second.grads.len(), 9);
-        assert_eq!(
-            model
+            let first = burn_train::TrainStep::step(&model, batch(true));
+            assert_eq!(first.grads.len(), 9, "solver={solver:?}");
+            let first_state = model
                 .peek_step_state_for_test()
-                .expect("persistent local PC state after second step")
-                .position,
-            16
-        );
+                .expect("persistent local PC state after first step");
+            assert_eq!(first_state.position, 8, "solver={solver:?}");
+            assert!(
+                first_state.layers.iter().all(|layer| layer.rho.is_some()),
+                "solver={solver:?}"
+            );
 
-        let reset = burn_train::TrainStep::step(&model, batch(true));
-        assert_eq!(reset.grads.len(), 9);
-        assert_eq!(
-            model
-                .peek_step_state_for_test()
-                .expect("reset local PC state")
-                .position,
-            8
-        );
+            let second = burn_train::TrainStep::step(&model, batch(false));
+            assert_eq!(second.grads.len(), 9, "solver={solver:?}");
+            assert_eq!(
+                model
+                    .peek_step_state_for_test()
+                    .expect("persistent local PC state after second step")
+                    .position,
+                16,
+                "solver={solver:?}"
+            );
+
+            let reset = burn_train::TrainStep::step(&model, batch(true));
+            assert_eq!(reset.grads.len(), 9, "solver={solver:?}");
+            assert_eq!(
+                model
+                    .peek_step_state_for_test()
+                    .expect("reset local PC state")
+                    .position,
+                8,
+                "solver={solver:?}"
+            );
+        }
     }
 
     #[test]
@@ -13797,6 +13875,133 @@ mod objective_step_tests {
             (expected_loss - chunked_loss).abs() < 1.0e-5,
             "expected={expected_loss} chunked={chunked_loss}"
         );
+    }
+
+    #[test]
+    fn backprop_tbptt_matches_global_masked_objective_with_uneven_supervision() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 73);
+        let mut config = tiny_model_config();
+        config.n_layer = 2;
+        config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let base = DragonModel::<TestBackend>::new(config, &device);
+        let reference = LanguageTrainModel::new(base.clone());
+        let chunked = LanguageTrainModel::new(base).with_tbptt_chunk_size(Some(2));
+        let batch = || SequenceBatch {
+            inputs: Tensor::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
+                &device,
+            ),
+            targets: Tensor::from_data(
+                TensorData::new(vec![2_i64, 3, 4, 5, 6, 7, 8, 9], [1, 8]),
+                &device,
+            ),
+            loss_mask: Some(Tensor::from_data(
+                TensorData::new(vec![1_i64, 0, 0, 0, 1, 1, 1, 1], [1, 8]),
+                &device,
+            )),
+            summary_event_mask: None,
+            ruliad_policy_batch: None,
+            reset_stream_state: true,
+        };
+
+        let source = batch();
+        TestBackend::seed(&device, stochastic_step_seed(0, 0, STOCHASTIC_STREAM_MAIN));
+        let mut state = reference.model.init_state_ephemeral();
+        let mut hidden_chunks = Vec::new();
+        for start in (0..8).step_by(2) {
+            let end = start + 2;
+            hidden_chunks.push(reference.model.forward_hidden_with_state(
+                LanguageTrainModel::<TestBackend>::slice_tokens(
+                    source.inputs.clone(),
+                    1,
+                    start,
+                    end,
+                ),
+                &mut state,
+            ));
+            if end < 8 {
+                state.detach_in_place();
+            }
+        }
+        let reference_loss = reference.language_loss_from_hidden(
+            Tensor::cat(hidden_chunks, 1),
+            source.targets,
+            source.loss_mask,
+        );
+        let expected_loss = tensor_scalar(reference_loss.clone());
+        let reference_grads = GradientsParams::from_grads(reference_loss.backward(), &reference);
+
+        let output = burn_train::TrainStep::step(&chunked, batch());
+        let actual_loss = {
+            let synced = output.item.sync();
+            let loss: LossValue<TestInnerBackend> = synced.adapt();
+            loss.value()
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("chunked loss")[0]
+        };
+        assert!(
+            (expected_loss - actual_loss).abs() < 1.0e-5,
+            "global={expected_loss} chunked={actual_loss}"
+        );
+
+        let parameter_ids = reference
+            .model
+            .predictive_coding_parameter_ids()
+            .expect("test model parameter ids");
+        let chunked_grads = output.grads;
+        macro_rules! assert_gradient_close {
+            ($name:literal, $id:expr, $rank:literal) => {{
+                match (
+                    reference_grads.get::<TestInnerBackend, $rank>($id),
+                    chunked_grads.get::<TestInnerBackend, $rank>($id),
+                ) {
+                    (Some(expected), Some(actual)) => {
+                        let max_error = (expected.clone() - actual)
+                            .abs()
+                            .max()
+                            .to_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .expect("gradient error")[0];
+                        let reference_scale = expected
+                            .abs()
+                            .max()
+                            .to_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .expect("gradient scale")[0]
+                            .max(1.0e-7);
+                        assert!(
+                            max_error / reference_scale < 1.0e-4,
+                            "{} relative max gradient error: {}",
+                            $name,
+                            max_error / reference_scale
+                        );
+                    }
+                    (None, None) => {}
+                    (expected, actual) => panic!(
+                        "{} gradient presence mismatch: reference={} chunked={}",
+                        $name,
+                        expected.is_some(),
+                        actual.is_some()
+                    ),
+                }
+            }};
+        }
+        assert_gradient_close!("embedding", parameter_ids.embedding, 2);
+        assert_gradient_close!("shared encoder", parameter_ids.encoder, 3);
+        assert_gradient_close!("shared value encoder", parameter_ids.encoder_v, 3);
+        assert_gradient_close!("shared decoder", parameter_ids.decoder, 2);
+        assert_gradient_close!("norm gamma", parameter_ids.norm_gamma, 1);
+        assert_gradient_close!("norm beta", parameter_ids.norm_beta, 1);
+        assert_gradient_close!("norm alpha", parameter_ids.norm_alpha, 1);
+        assert_gradient_close!("norm shift", parameter_ids.norm_shift, 1);
+        assert_gradient_close!("language head", parameter_ids.lm_head, 2);
     }
 
     #[test]

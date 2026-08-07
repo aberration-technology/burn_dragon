@@ -2807,6 +2807,19 @@ impl TrainingConfig {
                 "training.source_selection_state_path requires dataset.type=\"universality_ruliad\""
             ));
         }
+        if self
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled
+            .is_some()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "dataset.ruliad_source_selection_feedback_updates_enabled requires dataset.type=\"universality_ruliad\""
+            ));
+        }
         if !(0.0 < self.dataset.train_split_ratio && self.dataset.train_split_ratio <= 1.0) {
             return Err(anyhow!(
                 "dataset.train_split_ratio must be in (0, 1] (got {})",
@@ -3617,6 +3630,26 @@ impl TrainingConfig {
                 "Dragon local PC currently supports learning_schedule=equilibrium; incremental updates require an in-executor optimizer state"
             ));
         }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+        ) && !matches!(
+            pc.factor_reduction,
+            crate::config::PredictiveCodingFactorReduction::Mean
+        ) {
+            return Err(anyhow!(
+                "training.local_predictive_coding.solver=layer_local_prediction requires factor_reduction=mean so the auxiliary readout update is invariant to shared depth"
+            ));
+        }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+        ) && pc.sync_diagnostics
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.solver=layer_local_prediction does not define equilibrium-energy diagnostics; set sync_diagnostics=false"
+            ));
+        }
         if !matches!(self.optimizer.name, OptimizerKind::Adamw) {
             return Err(anyhow!(
                 "training.algorithm=predictive_coding currently requires optimizer.name=adamw; AdamW is only the local-derivative update transform"
@@ -3744,9 +3777,10 @@ impl TrainingConfig {
         if !matches!(
             self.training.local_predictive_coding.solver,
             crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
         ) {
             return Err(anyhow!(
-                "training.predictive_context_routing currently requires local_predictive_coding.solver=fixed_prediction"
+                "training.predictive_context_routing requires a feed-forward local solver: fixed_prediction or layer_local_prediction"
             ));
         }
         if self.training.dynamics.enabled
@@ -4472,7 +4506,44 @@ start_policy = "capability_gate"
     }
 
     #[test]
-    fn predictive_context_routing_requires_fixed_prediction_and_validates_bounded_bank() {
+    fn local_layer_prediction_validates_only_with_its_normalized_contract() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction;
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Mean;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+
+        config
+            .validate()
+            .expect("normalized layer-local prediction contract should validate");
+
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Sum;
+        assert!(
+            config
+                .validate()
+                .expect_err("unnormalized layer-local factors must fail closed")
+                .to_string()
+                .contains("factor_reduction=mean")
+        );
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Mean;
+        config.training.local_predictive_coding.sync_diagnostics = true;
+        assert!(
+            config
+                .validate()
+                .expect_err("undefined equilibrium diagnostics must fail closed")
+                .to_string()
+                .contains("sync_diagnostics=false")
+        );
+    }
+
+    #[test]
+    fn predictive_context_routing_accepts_feedforward_local_solvers() {
         let mut config = parse_config("");
         config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
         config.training.local_predictive_coding.solver =
@@ -4487,13 +4558,21 @@ start_policy = "capability_gate"
             .expect("bounded predictive context routing contract should validate");
 
         config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction;
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Mean;
+        config
+            .validate()
+            .expect("routed layer-local prediction contract should validate");
+
+        config.training.local_predictive_coding.solver =
             crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium;
         assert!(
             config
                 .validate()
                 .expect_err("non-triangular context learner must fail closed")
                 .to_string()
-                .contains("solver=fixed_prediction")
+                .contains("feed-forward local solver")
         );
 
         config.training.local_predictive_coding.solver =
@@ -6882,6 +6961,50 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn local_layer_prediction_overlay_selects_the_normalized_solver() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let paths = [
+            root.join("local-pc-1m.toml"),
+            root.join("pc-layer-local-prediction.overlay.toml"),
+        ];
+        let config = load_training_config(&paths).expect("load layer-local PC overlay");
+        config.validate().expect("validate layer-local PC overlay");
+        assert_eq!(
+            config.training.local_predictive_coding.solver,
+            crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+        );
+        assert_eq!(
+            config.training.local_predictive_coding.factor_reduction,
+            crate::config::PredictiveCodingFactorReduction::Mean
+        );
+        assert!(!config.training.local_predictive_coding.sync_diagnostics);
+    }
+
+    #[test]
+    fn routed_layer_prediction_overlays_use_reserve_validated_discovery_defaults() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let paths = [
+            root.join("local-pc-1m.toml"),
+            root.join("pc-layer-local-prediction.overlay.toml"),
+            root.join("pc-context-routing.overlay.toml"),
+        ];
+        let config = load_training_config(&paths).expect("load routed layer-local PC overlays");
+        config
+            .validate()
+            .expect("validate routed layer-local PC overlays");
+        let routing = &config.training.predictive_context_routing;
+        assert!(routing.enabled);
+        assert_eq!(routing.bank.calibration_update_rate, 0.5);
+        assert_eq!(routing.bank.novelty_standard_deviations, 3.0);
+        assert_eq!(
+            routing.bank.capacity_policy,
+            burn_pc::PredictiveContextCapacityPolicy::Reject
+        );
+    }
+
+    #[test]
     fn local_recurrent_predictive_coding_overlay_loads_and_validates() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../config/language/experiments/predictive_coding");
@@ -7605,6 +7728,35 @@ start_policy = "capability_gate"
         config
             .validate()
             .expect("ruliad source-selection state should validate");
+    }
+
+    #[test]
+    fn ruliad_source_feedback_override_requires_ruliad_dataset() {
+        let mut config = parse_config("");
+        config
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled = Some(false);
+        let err = config
+            .validate()
+            .expect_err("source-feedback override should reject non-ruliad datasets");
+        assert!(
+            err.to_string().contains("universality_ruliad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ruliad_source_feedback_override_validates_for_ruliad_dataset() {
+        let mut config = parse_config("");
+        config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: "target/test-ruliad.toml".into(),
+        };
+        config
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled = Some(false);
+        config
+            .validate()
+            .expect("ruliad source-feedback override should validate");
     }
 
     #[test]

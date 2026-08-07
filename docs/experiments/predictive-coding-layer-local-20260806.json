@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-06",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "confidence_interval": {
+    "kind": "two_sided_student_t_95_percent",
+    "paired_for_deltas": true,
+    "seeds": [17, 29, 43, 59, 71],
+    "degrees_of_freedom": 4,
+    "critical_value": 2.776
+  },
+  "model": {
+    "parameters": 891266,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072
+  },
+  "stream": {
+    "tasks": 4,
+    "payload_modulus": 32,
+    "batch_size": 16,
+    "block_size": 16,
+    "eval_batches_per_task": 4,
+    "train_holdout_disjoint": true
+  },
+  "routing": {
+    "selector": "predictive_evidence_with_unallocated_reserve_control",
+    "active_fraction": 0.25,
+    "optimizer_state": "context_scoped",
+    "calibration_update_rate": 0.5,
+    "novelty_standard_deviations": 3.0,
+    "novelty_confirmations": 3,
+    "contexts_created": 4,
+    "selector_accuracy": 1.0,
+    "capacity_policy": "reject"
+  },
+  "solver": {
+    "name": "layer_local_prediction",
+    "activity_contract": "detached_layer_predictions",
+    "shared_body_credit": "sum_over_shared_layer_uses",
+    "readout_credit": "mean_over_local_readouts",
+    "local_vjp_launches_per_update": 3,
+    "global_backward_calls": 0
+  },
+  "routed_results": [
+    {
+      "updates_per_task": 128,
+      "model_tokens_per_arm": 131072,
+      "backpropagation": {
+        "acquisition": "5/5",
+        "final_accuracy_mean": 0.4952256944444445,
+        "final_accuracy_ci95": 0.10369298203491314,
+        "mean_forgetting_mean": 0.01979166666666666,
+        "mean_forgetting_ci95": 0.022498771714301737,
+        "tokens_per_second_mean": 23842.52330625104,
+        "tokens_per_second_ci95": 589.8952779302035
+      },
+      "layer_local_prediction": {
+        "acquisition": "5/5",
+        "final_accuracy_mean": 0.7691840277777777,
+        "final_accuracy_ci95": 0.06261731702143244,
+        "mean_forgetting_mean": 0.01747685185185186,
+        "mean_forgetting_ci95": 0.023199061074890847,
+        "tokens_per_second_mean": 22758.26513909817,
+        "tokens_per_second_ci95": 274.56906925175565,
+        "local_vjp_calls_per_arm": 1536
+      },
+      "paired_layer_local_minus_backpropagation": {
+        "final_accuracy_mean": 0.27395833333333325,
+        "final_accuracy_ci95": 0.06274238317254864,
+        "mean_forgetting_mean": -0.0023148148148148,
+        "mean_forgetting_ci95": 0.01835189769260265,
+        "throughput_ratio": 0.9545241854972372
+      }
+    },
+    {
+      "updates_per_task": 256,
+      "model_tokens_per_arm": 262144,
+      "backpropagation": {
+        "acquisition": "5/5",
+        "final_accuracy_mean": 0.7241319444444445,
+        "final_accuracy_ci95": 0.13481076774293876,
+        "mean_forgetting_mean": 0.010185185185185193,
+        "mean_forgetting_ci95": 0.015859479400296302,
+        "tokens_per_second_mean": 23242.256557360313,
+        "tokens_per_second_ci95": 485.2315935275061
+      },
+      "layer_local_prediction": {
+        "acquisition": "5/5",
+        "final_accuracy_mean": 0.9875868055555556,
+        "final_accuracy_ci95": 0.010685970183720413,
+        "mean_forgetting_mean": 0.004282407407407403,
+        "mean_forgetting_ci95": 0.003753807908893635,
+        "tokens_per_second_mean": 22494.92284311007,
+        "tokens_per_second_ci95": 691.387017799384,
+        "local_vjp_calls_per_arm": 3072
+      },
+      "paired_layer_local_minus_backpropagation": {
+        "final_accuracy_mean": 0.26345486111111105,
+        "final_accuracy_ci95": 0.13633364180398977,
+        "mean_forgetting_mean": -0.00590277777777779,
+        "mean_forgetting_ci95": 0.01654285957282974,
+        "throughput_ratio": 0.9678459054779869
+      }
+    }
+  ],
+  "dense_shared_negative_control": {
+    "updates_per_task": 128,
+    "backpropagation_final_accuracy_mean": 0.2785590277777778,
+    "backpropagation_mean_forgetting_mean": 0.5318287037037037,
+    "layer_local_final_accuracy_mean": 0.29557291666666663,
+    "layer_local_mean_forgetting_mean": 0.9296296296296296,
+    "paired_final_accuracy_mean": 0.017013888888888884,
+    "paired_final_accuracy_ci95": 0.060345862971762324,
+    "paired_mean_forgetting_mean": 0.397800925925926,
+    "paired_mean_forgetting_ci95": 0.2654851484959765
+  },
+  "routing_ablation": {
+    "aggressive_without_reserve_u256": "failed: duplicate context inside stationary task A",
+    "conservative_without_reserve_u128": "failed: only 2-4 contexts discovered; layer-local acquisition 1/5",
+    "aggressive_with_reserve_u128": "passed 10/10 arms with four contexts and selector accuracy 1.0",
+    "aggressive_with_reserve_u256": "passed 10/10 arms with four contexts and selector accuracy 1.0"
+  },
+  "numerical_fidelity": {
+    "cuda_loss_absolute_error": 4.77e-7,
+    "cuda_global_cosine_to_terminal_backprop": 0.6222,
+    "cuda_gradient_norm_ratio": 1.012,
+    "small_cpu_global_cosine_to_terminal_backprop": 0.9531,
+    "interpretation": "The solver is a calibrated layer-local semi-gradient, not a terminal-backprop approximation."
+  },
+  "decision": "Promising local continual-learning candidate. Retain AdamW backpropagation as the default until text and Ruliad fixed-holdout, longer-horizon, larger-model, and decentralized convergence gates pass."
+}

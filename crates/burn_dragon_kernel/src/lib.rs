@@ -63,8 +63,10 @@ pub mod kernels {
             relu_lowrank_forward_profile_snapshot, relu_lowrank_forward_route_profile_reset,
             relu_lowrank_forward_route_profile_snapshot, relu_lowrank_grad_input_profile_reset,
             relu_lowrank_grad_input_profile_snapshot, relu_lowrank_grad_weight_profile_reset,
-            relu_lowrank_grad_weight_profile_snapshot, relu_lowrank_input_vjp, relu_lowrank_vjp,
-            supports_relu_lowrank_projection_backend, try_fused_relu_lowrank_projection_wgpu,
+            relu_lowrank_grad_weight_profile_snapshot, relu_lowrank_input_vjp,
+            relu_lowrank_input_vjp_from_activation, relu_lowrank_vjp,
+            relu_lowrank_vjp_from_activation, supports_relu_lowrank_projection_backend,
+            try_fused_relu_lowrank_projection_wgpu,
             try_fused_relu_lowrank_projection_wgpu_with_executor,
         };
     }

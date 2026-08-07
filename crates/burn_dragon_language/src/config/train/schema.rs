@@ -16,6 +16,11 @@ pub struct DatasetConfig {
     pub train_split_ratio: f32,
     #[serde(default)]
     pub validation: Option<ValidationDatasetConfig>,
+    /// Optional run-level override for live Ruliad curriculum feedback.
+    /// `false` produces an open-loop, seed-deterministic source stream for
+    /// controlled optimizer and training-algorithm comparisons.
+    #[serde(default)]
+    pub ruliad_source_selection_feedback_updates_enabled: Option<bool>,
     #[serde(flatten)]
     pub source: DatasetSourceConfig,
     #[serde(default)]
@@ -601,6 +606,12 @@ pub enum LocalPredictiveCodingSolver {
     /// local-VJP wave. This is a backprop-equivalent PC control, but it never
     /// creates a global autodiff graph or calls global backward.
     FixedPrediction,
+    /// Attach a supervised next-token prediction factor to every shared
+    /// Dragon layer use. Activities between factors are detached, while all
+    /// local readout and shared-parameter VJPs are batched over layer depth.
+    /// This removes the reverse depth chain at the cost of optimizing a
+    /// layer-local semi-gradient rather than the terminal-loss derivative.
+    LayerLocalPrediction,
 }
 
 /// Canonical layer-local predictive-coding learning configuration.
@@ -684,7 +695,8 @@ impl Default for PredictiveContextRoutingConfig {
             active_fraction: default_predictive_context_active_fraction(),
             bank: burn_pc::PredictiveContextBankConfig {
                 max_contexts: 8,
-                capacity_policy: burn_pc::PredictiveContextCapacityPolicy::ReplaceLeastRecentlyUsed,
+                calibration_update_rate: 0.5,
+                novelty_standard_deviations: 3.0,
                 ..burn_pc::PredictiveContextBankConfig::default()
             },
         }

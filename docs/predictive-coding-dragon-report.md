@@ -95,39 +95,55 @@ and model-compute throughput from 49,832 to 49,992 tokens/s (`+0.15%` and `+0.32
 time fell from 42.084 s to 41.950 s. This single-seed change is directionally consistent with
 removing redundant projections, but is too small to resolve from run variance by itself.
 
-The matched recurrent matrix uses the same 891,266-parameter model as the stateless control,
-batch 32, block 128, streaming document batches, persistent detached rho, and eight-token TBPTT
-factors. AdamW and fixed prediction run for 128 and 512 updates over seeds 20260804/5/6. Source
-selection feedback, continual backpropagation, neuron scaling, and dynamics controllers are
+The first recurrent matrix exposed an objective mismatch rather than a learner difference. AdamW
+formed a masked mean inside each TBPTT chunk and then weighted that mean by raw chunk length. Fixed
+prediction weighted by the number of supervised tokens. Sparse Ruliad masks therefore let a chunk
+with one target contribute as much as a chunk with many targets in the AdamW path. A one-seed
+block-backward control, which computes the globally masked objective, matched fixed prediction:
+source loss `2.8914` versus `2.8950`, cold validation `2.3727` versus `2.3702`, and stream-warm
+validation `1.3823` versus `1.3812`. The old chunked AdamW source loss was `2.6302`; its apparent
+fitting advantage was not comparable.
+
+Chunked AdamW now treats token cross entropy and time-local regularizers separately. Cross entropy
+is weighted by supervised-token count over the complete block, while auxiliary objectives retain
+their prior raw-time weighting. This remains memory-bounded TBPTT and adds no host synchronization.
+An exact NdArray regression compares the chunked loss and every active parameter-gradient family
+against a globally masked objective with detached recurrent boundaries, including chunks with zero
+supervised tokens.
+
+The objective-aligned recurrent matrix uses the same 891,266-parameter model as the stateless
+control, batch 32, block 128, streaming document batches, persistent detached rho, and eight-token
+TBPTT factors. AdamW and fixed prediction run for 128 and 512 updates over seeds 20260804/5/6.
+Source selection feedback, continual backpropagation, neuron scaling, and dynamics controllers are
 disabled. The source-selector checkpoint digest is byte-identical across all six trials at each
 budget (`82dab4ac...dfbe` at 128 and `b9685bde...1c08` at 512), establishing the same open-loop
 curriculum state.
 
 | Updates | Learner | Cold validation | Stream warm | Source cadence loss | Verifier | Partial progress | Wall tok/s | Model tok/s | Duty |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | AdamW backprop | 2.294 +/- 0.0866 | 1.329 +/- 0.0799 | 2.655 +/- 0.0733 | 0.1979 +/- 0.1950 | 0.3628 +/- 0.2150 | 12,001 +/- 326 | 13,684 +/- 355 | 0.8771 +/- 0.0011 |
-| 128 | Fixed prediction | 2.343 +/- 0.0655 | 1.354 +/- 0.0745 | 2.873 +/- 0.0791 | 0.1146 +/- 0.1616 | 0.4106 +/- 0.0727 | 11,458 +/- 367 | 13,223 +/- 336 | 0.8666 +/- 0.0083 |
-| 512 | AdamW backprop | 2.111 +/- 0.1312 | 1.111 +/- 0.0778 | 1.154 +/- 0.0420 | 0.3229 +/- 0.0448 | 0.4505 +/- 0.0553 | 13,018 +/- 40 | 13,844 +/- 46 | 0.9404 +/- 0.0006 |
-| 512 | Fixed prediction | 2.115 +/- 0.0917 | 1.109 +/- 0.0309 | 1.346 +/- 0.0316 | 0.2604 +/- 0.2372 | 0.3811 +/- 0.2299 | 12,505 +/- 194 | 13,406 +/- 241 | 0.9327 +/- 0.0024 |
+| 128 | AdamW backprop | 2.366 +/- 0.0247 | 1.364 +/- 0.0399 | 2.875 +/- 0.0716 | 0.1146 +/- 0.0448 | 0.4392 +/- 0.0149 | 11,624 +/- 774 | 13,309 +/- 811 | 0.8734 +/- 0.0061 |
+| 128 | Fixed prediction | 2.344 +/- 0.0681 | 1.354 +/- 0.0745 | 2.873 +/- 0.0793 | 0.1146 +/- 0.1616 | 0.4028 +/- 0.0862 | 10,946 +/- 595 | 12,709 +/- 630 | 0.8612 +/- 0.0047 |
+| 512 | AdamW backprop | 2.113 +/- 0.0843 | 1.111 +/- 0.0449 | 1.349 +/- 0.0133 | 0.2500 +/- 0.2054 | 0.3767 +/- 0.1950 | 12,275 +/- 177 | 13,035 +/- 183 | 0.9417 +/- 0.0021 |
+| 512 | Fixed prediction | 2.133 +/- 0.0812 | 1.123 +/- 0.0414 | 1.343 +/- 0.0303 | 0.2188 +/- 0.2054 | 0.3464 +/- 0.1822 | 11,672 +/- 56 | 12,573 +/- 68 | 0.9283 +/- 0.0027 |
 
-At 512 updates, fixed prediction minus AdamW is `+0.00452 +/- 0.06357` cold validation,
-`-0.00213 +/- 0.07297` stream-warm validation, `+0.00056 +/- 0.00926` rho-carry NLL gain,
-`-0.0625 +/- 0.2054` verifier accuracy, and `-0.06944 +/- 0.21548` partial progress. None resolves
-a held-out quality or carry difference. Fixed prediction retains `96.05% +/- 1.20%` wall
-throughput and `96.84% +/- 1.42%` model-compute throughput. Its mean GPU utilization and power are
-71.2% and 36.1 W versus AdamW's 77.1% and 38.2 W on this GB10.
+At 512 updates, fixed prediction minus AdamW is `+0.02056 +/- 0.07188` fixed-holdout validation,
+`+0.01298 +/- 0.03372` stream-warm validation, `+0.00262 +/- 0.00427` rho-carry NLL gain,
+`-0.03125 +/- 0.35577` verifier accuracy, and `-0.03038 +/- 0.31472` partial progress. These
+intervals cross zero. The paired first-pass streaming loss is a small exception: fixed prediction
+is worse by `+0.02284 +/- 0.01355`. Three seeds are too few to promote that into a broad quality
+claim, but it is a real bounded disadvantage to track in longer studies.
 
-The observed training stream does differ. Fixed prediction's cadence-mean source loss is
-`+0.19167 +/- 0.06022` above AdamW, and its final train loss is `+0.24016 +/- 0.04769`; the gap is
-present over all 32 cadence observations rather than only the final sample. This is not caused by
-source-selection feedback, and it does not appear on the fixed or stream-warm holdouts. It may be
-implicit regularization or weaker fitting of the sampled stream, but there is no verifier gain to
-support the former interpretation. The defensible result is therefore held-out and rho-carry
-parity at near-throughput parity, not a stronger optimizer. AdamW remains the default.
+The sampled-stream objective is aligned: cadence-mean source loss differs by
+`-0.00555 +/- 0.02313` and final train loss by `-0.01022 +/- 0.03399`. Fixed prediction retains
+`95.09% +/- 1.74%` wall throughput and `96.46% +/- 1.63%` model-compute throughput. Its mean GPU
+utilization and power are 72.8% and 35.1 W versus AdamW's 77.8% and 37.4 W on this GB10. The
+defensible result is objective and most held-out metrics at near-throughput parity, with a small
+cold-stream caveat, not a stronger optimizer. AdamW remains the default.
 
-The machine-readable record is
-`docs/experiments/predictive-coding-recurrent-open-loop-20260806.json`. Raw artifacts are under
-`target/pc-local-solver-recurrent-open-loop-20260806/`. Reproduce with:
+The objective-aligned machine-readable record is
+`docs/experiments/predictive-coding-recurrent-objective-aligned-20260806.json`. The original
+record is retained as diagnosis of the invalid chunk-weighted control. Raw corrected artifacts are
+under `target/pc-recurrent-objective-aligned-20260806/`. Reproduce with:
 
 ```bash
 scripts/pc_paper_experiments.sh --matrix local-solver-recurrent-open-loop

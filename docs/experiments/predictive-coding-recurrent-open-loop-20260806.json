@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "date": "2026-08-06",
+  "status": "superseded_invalid_chunk_weighted_control",
+  "superseded_by": "predictive-coding-recurrent-objective-aligned-20260806.json",
   "backend": "cuda",
   "device": "NVIDIA GB10",
   "confidence_interval": {
